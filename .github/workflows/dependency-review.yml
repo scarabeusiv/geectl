@@ -6,6 +6,12 @@ on:
 permissions:
   contents: read
 
+# Cancel a superseded run on the same ref: this workflow is PR-only,
+# so a rapid push supersedes the previous run. Matches test.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   dependency-review:
     runs-on: ubuntu-latest
@@ -30,4 +36,4 @@ jobs:
           # the binary); its LGPL-3.0 license does not affect the
           # Apache-2.0 project, so it is allowlisted here. The deny list
           # above is unchanged.
-          allow-dependencies-licenses: 'pkg:githubactions/Swatinem/rust-cache'
+          allow-dependencies-licenses: 'pkg:githubactions/swatinem/rust-cache'

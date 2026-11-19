@@ -25,7 +25,7 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 100
-    # The dtolnay/rust-toolchain SHA is pinned to the stable branch and
-    # gets garbage-collected upstream, so Dependabot must not move it.
-    ignore:
-      - dependency-name: "dtolnay/rust-toolchain"
+    # The dtolnay/rust-toolchain SHA is pinned to the v1 tag's commit
+    # (immutable), so Dependabot tracks it and proposes updates when
+    # the tag moves. No ignore: freezing it would forfeit security
+    # updates and leave a garbage-collected SHA in place.

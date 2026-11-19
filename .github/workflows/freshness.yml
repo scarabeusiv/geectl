@@ -35,13 +35,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      # Pinned to the stable-branch HEAD (2026-11-15) so the toolchain
-      # action is reproducible; update the SHA to move it. The toolchain
-      # itself comes from rust-toolchain.toml (stable + rustfmt/clippy),
-      # so CI and local developers use the same compiler.
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+      # Pinned to the v1 tag's commit so the action cannot move under us
+      # and the SHA cannot be garbage-collected; Dependabot tracks SHA
+      # pins and proposes updates. No `toolchain` input: the action
+      # reads rust-toolchain.toml (1.99.1 + rustfmt/clippy), so CI and
+      # local developers use the same compiler.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: stable
           components: rustfmt, clippy
       # Cache the cargo registry and target dir so repeat runs do not
       # re-download and rebuild every dependency. Pinned to the v2
