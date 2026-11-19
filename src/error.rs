@@ -16,8 +16,7 @@ use std::fmt;
 
 /// The kinds of error geectl can produce. One variant per failure mode;
 /// new failure modes get a new variant here, never a free-text string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// The requested resource does not exist (OBS project/package/request).
     NotFound,
@@ -127,12 +126,13 @@ impl ErrorKind {
 /// A geectl error: a kind from the store plus the context of this instance
 /// (what resource, what request). The context is data, never a second
 /// error identity — callers match on `kind`, not on the context string.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct GeectlError {
     pub kind: ErrorKind,
     /// Context for this instance (e.g. the URL, the package name). May be
     /// empty. Never contains a credential or raw document content.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    /// `to_json()` omits it when empty; there is no serde field attribute
+    /// here because `Serialize` is implemented manually (see below).
     pub context: String,
 }
 
@@ -165,6 +165,20 @@ impl GeectlError {
             error["context"] = serde_json::Value::String(self.context.clone());
         }
         serde_json::json!({ "error": error })
+    }
+}
+
+/// `Serialize` delegates to [`GeectlError::to_json`], so the serde
+/// form is the same stable shape as the JSON payload on stdout
+/// (`{"error": {"code", "message", "remediation", "context"}}`). A
+/// derived `Serialize` would instead emit `{"kind", "context"}` and
+/// diverge from the contract.
+impl Serialize for GeectlError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_json().serialize(serializer)
     }
 }
 
@@ -214,6 +228,21 @@ mod tests {
             err.to_string(),
             "not_found: the requested resource does not exist"
         );
+    }
+
+    #[test]
+    fn serialize_matches_to_json() {
+        // The serde form must be the same shape as to_json(): a
+        // derived Serialize would emit {"kind", "context"} instead.
+        let err = GeectlError::new(ErrorKind::NotFound, "test context");
+        let via_serde: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
+        assert_eq!(via_serde, err.to_json());
+        // And the empty-context omission holds in both forms.
+        let err = GeectlError::new(ErrorKind::NotFound, "");
+        let via_serde: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
+        assert_eq!(via_serde, err.to_json());
     }
 
     #[test]

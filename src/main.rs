@@ -7,8 +7,9 @@
 //! one exit path: the error kind's exit code.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use geectl::error::GeectlError;
+use geectl::error::{ErrorKind, GeectlError};
 use serde_json::json;
+use std::io::Write;
 use std::process::ExitCode;
 
 /// The output format. JSON is the default; it is the only format an agent
@@ -59,15 +60,63 @@ fn run(cli: Cli) -> Result<String, GeectlError> {
     })
 }
 
+/// Write a payload to stdout. A closed pipe (`BrokenPipe`, e.g. the
+/// output piped to `head`) is not an error — the consumer just stopped
+/// reading. Any other write failure is an internal error. `println!`
+/// would panic on either; this is the single stdout writer.
+fn write_payload(payload: &str) -> Result<(), GeectlError> {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    match writeln!(handle, "{payload}") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(GeectlError::new(ErrorKind::InternalError, e.to_string())),
+    }
+}
+
+/// Write a JSON error payload to stderr. A failure to write to stderr
+/// is ignored: there is nowhere else to report it, and panicking while
+/// already handling an error helps no one.
+fn write_error(err: &GeectlError) {
+    let stderr = std::io::stderr();
+    let mut handle = stderr.lock();
+    let _ = writeln!(handle, "{}", err.to_json());
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match run(cli) {
-        Ok(payload) => {
-            println!("{payload}");
-            ExitCode::from(0)
+    // Parse errors go through the single JSON error path, not clap's
+    // default (usage on stderr, exit 2, no JSON). Help and version are
+    // the exception: they print clap's text to stdout and exit 0.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind as ClapErrorKind;
+            match e.kind() {
+                ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion => {
+                    // Help/version text is the payload here. It already
+                    // ends with a newline, so trim it before writeln!
+                    // adds exactly one.
+                    let _ = write_payload(e.render().to_string().trim_end());
+                    return ExitCode::from(0);
+                }
+                _ => {
+                    let err = GeectlError::new(ErrorKind::InvalidInput, e.to_string());
+                    write_error(&err);
+                    return ExitCode::from(err.exit_code() as u8);
+                }
+            }
         }
+    };
+    match run(cli) {
+        Ok(payload) => match write_payload(&payload) {
+            Ok(()) => ExitCode::from(0),
+            Err(err) => {
+                write_error(&err);
+                ExitCode::from(err.exit_code() as u8)
+            }
+        },
         Err(err) => {
-            eprintln!("{}", err.to_json());
+            write_error(&err);
             ExitCode::from(err.exit_code() as u8)
         }
     }

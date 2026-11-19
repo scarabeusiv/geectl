@@ -59,10 +59,16 @@ fn text_format_prints_human_readable_version() {
 }
 
 #[test]
-fn unknown_flag_fails_with_usage_on_stderr() {
+fn unknown_flag_fails_with_json_error_on_stderr() {
     let out = geectl().arg("--no-such-flag").output().unwrap();
     assert!(!out.status.success());
-    // clap writes usage to stderr and exits 2.
+    // Parse errors go through the single JSON error path (exit 2,
+    // InvalidInput), not clap's default usage text. Stdout stays
+    // empty: it carries only the result payload.
     assert_eq!(out.status.code(), Some(2));
-    assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(value["error"]["message"].is_string());
 }

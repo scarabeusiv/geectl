@@ -23,6 +23,11 @@ on:
     # Weekly, Mondays 05:00 UTC.
     - cron: "0 5 * * 1"
 
+# Cancel a superseded run of the same workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   security-events: write

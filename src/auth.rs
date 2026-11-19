@@ -16,10 +16,17 @@
 //! store.
 
 use crate::error::GeectlError;
+use std::fmt;
+use std::path::PathBuf;
 
 /// The credentials a provider supplies, as data. The HTTP client applies
 /// them to a request; the provider never touches a request itself.
-#[derive(Debug, Clone)]
+///
+/// This type deliberately does NOT derive `Debug`: it carries secrets
+/// (password, token), and a derived `Debug` would print them into any
+/// log line or error that formats the value. The manual `Debug` below
+/// shows the variant and the non-secret fields, and redacts the secrets.
+#[derive(Clone)]
 pub enum Credentials {
     /// No credentials. Public reads only.
     None,
@@ -29,7 +36,25 @@ pub enum Credentials {
     Bearer { token: String },
     /// An SSH key, for git operations only. It cannot authenticate an
     /// HTTP request — the HTTP client refuses it (see `http.rs`).
-    SshKey { path: String },
+    SshKey { path: PathBuf },
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Credentials::None => write!(f, "None"),
+            Credentials::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"[redacted]")
+                .finish(),
+            Credentials::Bearer { .. } => f
+                .debug_struct("Bearer")
+                .field("token", &"[redacted]")
+                .finish(),
+            Credentials::SshKey { path } => f.debug_struct("SshKey").field("path", path).finish(),
+        }
+    }
 }
 
 /// Supplies credentials to the HTTP client. Implementations read from
@@ -56,5 +81,32 @@ mod tests {
     fn no_auth_supplies_no_credentials() {
         let auth = NoAuth;
         assert!(matches!(auth.credentials().unwrap(), Credentials::None));
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets() {
+        // A derived Debug would print the password and token. The
+        // manual impl must never let a secret reach a log line.
+        let basic = Credentials::Basic {
+            username: "user".to_string(),
+            password: "s3cr3t".to_string(),
+        };
+        let rendered = format!("{basic:?}");
+        assert!(rendered.contains("user"));
+        assert!(!rendered.contains("s3cr3t"));
+        assert!(rendered.contains("[redacted]"));
+
+        let bearer = Credentials::Bearer {
+            token: "tok3n".to_string(),
+        };
+        let rendered = format!("{bearer:?}");
+        assert!(!rendered.contains("tok3n"));
+        assert!(rendered.contains("[redacted]"));
+
+        let key = Credentials::SshKey {
+            path: PathBuf::from("/home/user/.ssh/id_ed25519"),
+        };
+        let rendered = format!("{key:?}");
+        assert!(rendered.contains("id_ed25519"));
     }
 }

@@ -14,6 +14,8 @@
 //!   because a query string decodes `+` as a space.
 //! - No raw-string query path: query pairs go through the encoder.
 
+use crate::error::{ErrorKind, GeectlError};
+
 /// Percent-encode a path segment. Alphanumerics and `-_.~:` pass through;
 /// everything else (including `/`) is percent-encoded per byte.
 pub fn encode_path_segment(segment: &str) -> String {
@@ -48,8 +50,9 @@ pub fn encode_query_value(value: &str) -> String {
 /// A URL built from a base, path segments, and query pairs. Segments are
 /// appended in order, each encoded as one element; query pairs are encoded
 /// as `name=value`. The base is used verbatim (it is a constant, not
-/// caller input); only segments and query values are encoded.
-#[derive(Debug, Clone, Default)]
+/// caller input); only segments and query values are encoded. The base
+/// must be `https://` (enforced in `new`).
+#[derive(Debug, Clone)]
 pub struct UrlBuilder {
     base: String,
     segments: Vec<String>,
@@ -57,12 +60,22 @@ pub struct UrlBuilder {
 }
 
 impl UrlBuilder {
-    pub fn new(base: impl Into<String>) -> Self {
-        UrlBuilder {
-            base: base.into(),
+    /// Create a builder for `base`. The base must be `https://`: an
+    /// `http://` base would send credentials in cleartext, so it fails
+    /// fast here instead of at the first request.
+    pub fn new(base: impl Into<String>) -> Result<Self, GeectlError> {
+        let base = base.into();
+        if !base.starts_with("https://") {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "URL base must use https://",
+            ));
+        }
+        Ok(UrlBuilder {
+            base,
             segments: Vec::new(),
             query: Vec::new(),
-        }
+        })
     }
 
     /// Append one path segment. The segment is encoded as exactly one
@@ -112,6 +125,7 @@ mod tests {
         // A segment containing `/` must become one element (%2F), never
         // two path elements — this is the injection the builder prevents.
         let url = UrlBuilder::new("https://api.opensuse.org")
+            .unwrap()
             .segment("public")
             .segment("source")
             .segment("openSUSE:Factory")
@@ -137,6 +151,7 @@ mod tests {
         // `+` in a query value decodes as a space, so it must be encoded.
         assert_eq!(encode_query_value("gcc-c++"), "gcc-c%2B%2B");
         let url = UrlBuilder::new("https://example.com")
+            .unwrap()
             .segment("search")
             .query("name", "gcc-c++")
             .build();
@@ -148,5 +163,13 @@ mod tests {
         // No strip/lstrip on segments: a leading or trailing `/` in a
         // segment is encoded, not silently removed.
         assert_eq!(encode_path_segment("/foo/"), "%2Ffoo%2F");
+    }
+
+    #[test]
+    fn http_base_is_rejected() {
+        // An http base would send credentials in cleartext.
+        assert!(UrlBuilder::new("http://api.opensuse.org").is_err());
+        assert!(UrlBuilder::new("api.opensuse.org").is_err());
+        assert!(UrlBuilder::new("https://api.opensuse.org").is_ok());
     }
 }

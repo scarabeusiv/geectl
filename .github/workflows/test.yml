@@ -21,9 +21,14 @@ jobs:
       # Pinned to the v4 tag's commit so the action cannot move under us;
       # Dependabot tracks SHA pins and proposes updates.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # Pinned to the stable-branch HEAD (2026-11-15) so the toolchain
-      # version is reproducible; update the SHA to move it.
+      # The action itself is pinned by SHA; the toolchain version
+      # comes from rust-toolchain.toml, so CI and local developers
+      # use the same compiler.
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+      # Cache the cargo registry and target dir so repeat runs do not
+      # re-download and rebuild every dependency. Pinned to the v2
+      # tag's commit; Dependabot tracks SHA pins and proposes updates.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Run the test suite
         run: cargo test --locked
       - name: Check formatting

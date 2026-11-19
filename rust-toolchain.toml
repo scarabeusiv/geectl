@@ -1,0 +1,7 @@
+# The toolchain is pinned here, not in the workflows: the dtolnay
+# action reads this file, and local `cargo` does too, so CI and
+# developers use the same compiler. Bump the channel deliberately
+# (and `rust-version` in Cargo.toml with it).
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
