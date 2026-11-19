@@ -1,0 +1,38 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel a superseded run of the same workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Pinned to the v4 tag's commit so the action cannot move under us;
+      # Dependabot tracks SHA pins and proposes updates.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Pinned to the stable-branch HEAD (2026-11-15) so the toolchain
+      # version is reproducible; update the SHA to move it.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+      - name: Run the test suite
+        run: cargo test --locked
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      # Pinned version (with --locked) so the tool is reproducible:
+      # an unpinned `cargo install` floats to whatever is latest.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny@0.21.0 --locked
+      - name: Licenses, advisories, sources
+        run: cargo deny check

@@ -1,0 +1,41 @@
+# cargo-deny policy for geectl (cargo-deny 0.21 schema).
+#
+# Strictness is intentional: only the permissive licenses already in
+# the dependency tree are allowed. A new dependency bringing any other
+# license fails `cargo deny check` in the weekly freshness workflow,
+# and the fix is a deliberate PR (add the license here with a reason,
+# or replace the dependency) — never a silent relaxation.
+#
+# The allow list below is exactly the set of SPDX identifiers present
+# in the tree (see `cargo metadata --format-version 1`): the bulk of
+# the tree is MIT / Apache-2.0, plus the small permissive set used by
+# transitive crates (unicode data, ring/webpki, etc.). Anything not in
+# `allow` — copyleft, proprietary, or unlicensed — is denied.
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    # One transitive crate is licensed this way.
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[advisories]
+# `vulnerability` has no setting any more (cargo-deny always checks
+# vulnerabilities, and a hit fails the check). Scope "all": check every
+# crate (workspace and transitive) for unmaintained / unsound
+# advisories. A hit fails the check.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

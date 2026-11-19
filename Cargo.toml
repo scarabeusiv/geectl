@@ -1,0 +1,22 @@
+[package]
+name = "geectl"
+version = "0.1.0"
+edition = "2021"
+description = "Geeko Controller — a machine-first CLI for agents (OBS + src.opensuse.org)"
+license = "Apache-2.0"
+repository = "https://github.com/scarabeusiv/geectl"
+
+[lib]
+name = "geectl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "geectl"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.23"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"

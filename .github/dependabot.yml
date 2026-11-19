@@ -1,0 +1,27 @@
+# Dependabot configuration for geectl.
+#
+# Strictness is intentional: every dependency update gets its own PR
+# (no grouping — nothing hidden in a group), weekly, and the open-PR
+# limit is set high enough that no update is ever suppressed. Each PR
+# goes through the same branch protection as any other change (green CI
+# + at least 1 approving review); Dependabot PRs are NOT auto-merged.
+# The repo is kept green by merging Dependabot PRs promptly, not by
+# relaxing the checks.
+
+version: 2
+updates:
+  # Rust dependencies (Cargo.toml / Cargo.lock).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # No `groups`: each dependency update is its own PR.
+    # Effectively unlimited: every update is surfaced, none suppressed.
+    open-pull-requests-limit: 100
+
+  # GitHub Actions used by the workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 100

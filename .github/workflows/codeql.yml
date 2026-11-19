@@ -1,0 +1,49 @@
+# CodeQL code scanning.
+#
+# Runs on every PR, on push to main, and weekly. Findings appear in the
+# repo's Security tab, and the workflow fails the PR when it finds
+# issues (default behaviour — not suppressed).
+#
+# Rust is extracted without a build (`build-mode: none`): CodeQL does
+# not support `autobuild` for Rust, so there is deliberately no
+# autobuild step here. That is the correct CodeQL setup for Rust, not a
+# weakening.
+#
+# Query suite is `security-and-quality` (security plus code quality),
+# the strictest suite — not security-only. No rule is disabled or
+# weakened.
+
+name: CodeQL
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, Mondays 05:00 UTC.
+    - cron: "0 5 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Pinned to the v4 tag's commit so the actions cannot move under us;
+      # Dependabot tracks SHA pins and proposes updates.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
+        with:
+          languages: rust
+          build-mode: none
+          queries: security-and-quality
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
+        with:
+          category: "/language:rust"

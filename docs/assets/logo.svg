@@ -1,0 +1,17 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 2048 2048" role="img" aria-label="geectl logo">
+<path fill="#FFFFFF" d="M 0 0 L 2048 0 L 2048 2048 L 0 2048 L 0 0 z"/>
+<rect x="272" y="272" width="1504" height="1504" rx="336" fill="#081E26"/>
+<!-- gecko, line art in the openSUSE green and white, facing right.
+     Body: a gentle rising curve. Tail: a curl off the body's left end.
+     Head: a circle with a green eye. Legs: two bent strokes with toe pads. -->
+<polyline points="520,1250 750,1080 1050,1040 1300,1080" fill="none" stroke="#FFFFFF" stroke-width="90" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="520,1250 420,1150 430,1000 520,880" fill="none" stroke="#73BA25" stroke-width="80" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="1420" cy="1030" r="130" fill="#FFFFFF"/>
+<circle cx="1460" cy="990" r="48" fill="#73BA25"/>
+<circle cx="1460" cy="990" r="20" fill="#081E26"/>
+<polyline points="1180,1120 1220,1300 1180,1380" fill="none" stroke="#FFFFFF" stroke-width="70" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="820,1140 780,1320 820,1400" fill="none" stroke="#FFFFFF" stroke-width="70" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="1180" cy="1380" r="28" fill="#73BA25"/>
+<circle cx="820" cy="1400" r="28" fill="#73BA25"/>
+</svg>
