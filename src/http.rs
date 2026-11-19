@@ -60,6 +60,40 @@ impl Default for Timeout {
     }
 }
 
+impl Timeout {
+    /// Create a timeout, enforcing the invariants `Default` upholds:
+    /// every timeout is non-zero, and the total deadline exceeds a
+    /// single read. A manually built `Timeout` with a zero, or with a
+    /// total no larger than a read, would compile to an immediate
+    /// deadline, so it fails here instead of at the first request.
+    pub fn new(connect: Duration, read: Duration, total: Duration) -> Result<Self, GeectlError> {
+        let timeout = Timeout {
+            connect,
+            read,
+            total,
+        };
+        timeout.validate()?;
+        Ok(timeout)
+    }
+
+    /// Enforce the timeout invariants: non-zero, and total exceeds read.
+    pub fn validate(&self) -> Result<(), GeectlError> {
+        if self.connect.is_zero() || self.read.is_zero() || self.total.is_zero() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "timeouts must be non-zero",
+            ));
+        }
+        if self.total <= self.read {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "total timeout must exceed the read timeout",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The retry policy, as a single documented constant. `max_retries` is the
 /// number of retries after the first attempt; `backoff_base` is the delay
 /// before the first retry, doubled on each subsequent retry.
@@ -97,18 +131,25 @@ pub struct UreqClient {
 }
 
 impl UreqClient {
-    pub fn new(timeout: Timeout) -> Self {
+    pub fn new(timeout: Timeout) -> Result<Self, GeectlError> {
         UreqClient::with_auth(timeout, None)
     }
 
-    pub fn with_auth(timeout: Timeout, auth: Option<Box<dyn AuthProvider>>) -> Self {
+    pub fn with_auth(
+        timeout: Timeout,
+        auth: Option<Box<dyn AuthProvider>>,
+    ) -> Result<Self, GeectlError> {
+        // A manually built Timeout bypasses `Timeout::new`, so validate
+        // here too: an invalid timeout would otherwise compile to an
+        // immediate deadline at the first request.
+        timeout.validate()?;
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(timeout.connect))
             .timeout_per_read(Some(timeout.read))
             .timeout_global(Some(timeout.total))
             .build();
         let agent: ureq::Agent = config.into();
-        UreqClient { agent, auth }
+        Ok(UreqClient { agent, auth })
     }
 
     fn apply_auth<B>(
@@ -144,16 +185,19 @@ fn has_control_chars(value: &str) -> bool {
     value.chars().any(|c| c.is_control())
 }
 
-/// Validate a Bearer token. Trailing whitespace/control is trimmed (a
-/// pasted token with a trailing newline must not corrupt auth); any
-/// control character anywhere else is rejected. The token itself is
-/// never included in the error — it is a secret.
+/// Validate a Bearer token. Trailing CR/LF is trimmed (a pasted token
+/// with a trailing newline must not corrupt auth); any control character
+/// anywhere else is rejected. Only CR/LF is stripped: a trailing space
+/// is legitimate token content, and stripping all whitespace would
+/// corrupt a token that ends in one (and empty a whitespace-only
+/// token). The token itself is never included in the error — it is a
+/// secret.
 fn validate_bearer_token(token: &str) -> Result<String, GeectlError> {
-    let token = token.trim_end();
-    if token.is_empty() {
+    let token = token.trim_end_matches(['\r', '\n']);
+    if token.trim().is_empty() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "bearer token is empty",
+            "bearer token is empty or whitespace-only",
         ));
     }
     if has_control_chars(token) {
@@ -165,20 +209,21 @@ fn validate_bearer_token(token: &str) -> Result<String, GeectlError> {
     Ok(token.to_string())
 }
 
-/// Validate Basic credentials. Trailing whitespace/control is trimmed
-/// from both values (credentials come from environment variables or
-/// mounted secret files, where a trailing newline is a paste artifact,
-/// not part of the secret); any control character anywhere else is
-/// rejected. The username must not contain `:` — RFC 7617 reserves the
-/// colon as the separator between user-id and password, so one in the
-/// username would corrupt the credential.
+/// Validate Basic credentials. Trailing CR/LF is trimmed from both
+/// values (credentials come from environment variables or mounted secret
+/// files, where a trailing newline is a paste artifact, not part of the
+/// secret); any control character anywhere else is rejected. Only CR/LF
+/// is stripped: a trailing space is legitimate credential content. The
+/// username must not contain `:` — RFC 7617 reserves the colon as the
+/// separator between user-id and password, so one in the username would
+/// corrupt the credential.
 fn validate_basic(username: &str, password: &str) -> Result<(String, String), GeectlError> {
-    let username = username.trim_end();
-    let password = password.trim_end();
-    if username.is_empty() {
+    let username = username.trim_end_matches(['\r', '\n']);
+    let password = password.trim_end_matches(['\r', '\n']);
+    if username.trim().is_empty() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "basic auth username is empty",
+            "basic auth username is empty or whitespace-only",
         ));
     }
     if has_control_chars(username) || has_control_chars(password) {
@@ -211,7 +256,11 @@ fn sanitize_url_for_error(url: &str) -> String {
     // fragment is data, not a credential separator, and must be left
     // alone (stripping at it would misname the resource).
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let Some(at) = rest[..authority_end].find('@') else {
+    // Userinfo ends at the LAST `@` in the authority (RFC 3986): a
+    // password may itself contain `@` (e.g. user:p@ss@host), so
+    // stripping at the first `@` would leave part of the password in
+    // the sanitized URL.
+    let Some(at) = rest[..authority_end].rfind('@') else {
         return url.to_string();
     };
     let mut out = String::with_capacity(url.len());
@@ -223,20 +272,29 @@ fn sanitize_url_for_error(url: &str) -> String {
 /// Read a response body with a cap. Reads at most `MAX_BODY_BYTES + 1`
 /// bytes; a body longer than the cap fails with `ServerError` instead
 /// of growing the process without bound. The `+ 1` distinguishes "at
-/// the cap" (accepted) from "over the cap" (rejected).
+/// the cap" (accepted) from "over the cap" (rejected). Bytes are read
+/// first and converted to UTF-8 after the cap check: converting while
+/// reading would split a multi-byte character at the cap (and report
+/// the over-cap body as a network error), and an in-cap body that is
+/// not valid UTF-8 is a server error, not a transport failure.
 fn read_body_capped(reader: impl Read) -> Result<String, GeectlError> {
-    let mut body = String::new();
+    let mut bytes = Vec::new();
     reader
         .take(MAX_BODY_BYTES as u64 + 1)
-        .read_to_string(&mut body)
+        .read_to_end(&mut bytes)
         .map_err(|e| GeectlError::new(ErrorKind::NetworkError, e.to_string()))?;
-    if body.len() > MAX_BODY_BYTES {
+    if bytes.len() > MAX_BODY_BYTES {
         return Err(GeectlError::new(
             ErrorKind::ServerError,
             format!("response body exceeds the {MAX_BODY_BYTES}-byte limit"),
         ));
     }
-    Ok(body)
+    String::from_utf8(bytes).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("response body is not valid UTF-8: {e}"),
+        )
+    })
 }
 
 /// What to do with a non-2xx status. `Return` ends the call with this
@@ -247,18 +305,31 @@ enum StatusAction {
 }
 
 /// Map a non-2xx status to an error and a retry decision. Only
-/// transient failures retry (429, 5xx). Anything the caller can fix
+/// transient failures retry (408, 429, 5xx). Anything the caller can fix
 /// (other 4xx) is returned immediately as `InvalidInput` with the
-/// right exit code, instead of collapsing into `ServerError`.
+/// right exit code, instead of collapsing into `ServerError`. 407 is
+/// an auth failure and 410 is a not-found, like 401/403 and 404.
 fn status_action(code: u16, safe_url: &str) -> StatusAction {
     match code {
         404 => StatusAction::Return(GeectlError::new(
             ErrorKind::NotFound,
             format!("{safe_url} returned 404"),
         )),
-        401 | 403 => StatusAction::Return(GeectlError::new(
+        401 | 403 | 407 => StatusAction::Return(GeectlError::new(
             ErrorKind::AuthFailed,
             format!("{safe_url} returned {code}"),
+        )),
+        // 408 is the server timing out on the request: retry it as a
+        // timeout, not as a caller error.
+        408 => StatusAction::Retry(GeectlError::new(
+            ErrorKind::Timeout,
+            format!("{safe_url} returned 408"),
+        )),
+        // 410 means the resource is gone for good: the same terminal
+        // answer as 404, not a caller error to fix and retry.
+        410 => StatusAction::Return(GeectlError::new(
+            ErrorKind::NotFound,
+            format!("{safe_url} returned 410"),
         )),
         // 429 and 5xx are transient: the server is telling us to wait,
         // or is itself at fault. Retry; if retries run out the caller
@@ -340,12 +411,15 @@ impl HttpClient for UreqClient {
                     last_error = Some(GeectlError::new(ErrorKind::ServerError, e.to_string()));
                 }
             }
-            // Only idempotent methods retry (GET is one). The gate is
-            // here so the policy is enforced in one place, not assumed
-            // by the caller.
-            if !is_retryable_method("GET") {
-                break;
-            }
+            // Only idempotent methods retry. This function only ever
+            // issues GET (which is retryable), so the gate is a
+            // debug_assert: it documents the policy and fails a debug
+            // build if the method ever changes, without dead code in
+            // release. A future method must gate on its real method.
+            debug_assert!(
+                is_retryable_method("GET"),
+                "GET must stay retryable; a new method needs its own gate"
+            );
             if attempt < RETRY_POLICY.max_retries {
                 std::thread::sleep(RETRY_POLICY.backoff_base * 2u32.pow(attempt));
             }
@@ -383,6 +457,53 @@ mod tests {
     }
 
     #[test]
+    fn timeout_new_rejects_invalid() {
+        assert!(Timeout::new(
+            Duration::ZERO,
+            Duration::from_secs(30),
+            Duration::from_secs(60)
+        )
+        .is_err());
+        assert!(Timeout::new(
+            Duration::from_secs(10),
+            Duration::ZERO,
+            Duration::from_secs(60)
+        )
+        .is_err());
+        assert!(Timeout::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::ZERO
+        )
+        .is_err());
+        // Total must exceed a single read.
+        assert!(Timeout::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(30)
+        )
+        .is_err());
+        assert!(Timeout::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60)
+        )
+        .is_ok());
+        assert!(Timeout::default().validate().is_ok());
+    }
+
+    #[test]
+    fn client_rejects_invalid_timeout() {
+        let bad = Timeout {
+            connect: Duration::ZERO,
+            read: Duration::from_secs(30),
+            total: Duration::from_secs(60),
+        };
+        assert!(UreqClient::new(bad).is_err());
+        assert!(UreqClient::with_auth(Timeout::default(), None).is_ok());
+    }
+
+    #[test]
     fn userinfo_is_stripped_from_error_urls() {
         // A URL with embedded credentials must never reach an error message.
         assert_eq!(
@@ -396,6 +517,17 @@ mod tests {
         assert_eq!(
             sanitize_url_for_error("https://user@example.com/"),
             "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn at_sign_in_password_is_stripped_with_last_at() {
+        // RFC 3986: userinfo ends at the LAST `@` in the authority — a
+        // password may itself contain `@`. Stripping at the first `@`
+        // would leave part of the password in the sanitized URL.
+        assert_eq!(
+            sanitize_url_for_error("https://user:p@ss@example.com/path"),
+            "https://example.com/path"
         );
     }
 
@@ -438,9 +570,40 @@ mod tests {
     }
 
     #[test]
+    fn body_over_cap_with_split_utf8_is_server_error() {
+        // A multi-byte character split by the cap must not be reported
+        // as a network error: the body is over the cap, so it is a
+        // server error. (Reading into a String first produced an
+        // invalid-UTF-8 I/O error mapped to NetworkError.)
+        let mut data = vec![b'a'; MAX_BODY_BYTES];
+        data.push(0xC3); // first byte of a 2-byte UTF-8 sequence
+        let err = read_body_capped(std::io::Cursor::new(data)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn in_cap_invalid_utf8_is_server_error() {
+        // A body within the cap that is not valid UTF-8 is a server
+        // error, not a transport failure.
+        let data = vec![0xFF; 4];
+        let err = read_body_capped(std::io::Cursor::new(data)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn valid_multibyte_body_is_accepted() {
+        let data = "h\u{e9}llo w\u{f6}rld".repeat(10);
+        let body = read_body_capped(std::io::Cursor::new(data.clone())).unwrap();
+        assert_eq!(body, data);
+    }
+
+    #[test]
     fn bearer_token_trailing_newline_is_trimmed() {
         assert_eq!(validate_bearer_token("abc123\n").unwrap(), "abc123");
-        assert_eq!(validate_bearer_token("abc123  ").unwrap(), "abc123");
+        assert_eq!(validate_bearer_token("abc123\r\n").unwrap(), "abc123");
+        // A trailing space is legitimate token content, not an
+        // artifact: it must be preserved, not trimmed.
+        assert_eq!(validate_bearer_token("abc123  ").unwrap(), "abc123  ");
     }
 
     #[test]
@@ -450,6 +613,10 @@ mod tests {
         assert!(validate_bearer_token("abc\rdef").is_err());
         assert!(validate_bearer_token("abc\ndef").is_err());
         assert!(validate_bearer_token("").is_err());
+        // Only CR/LF is trimmed, so a CR/LF-only token is empty after
+        // trimming and rejected.
+        assert!(validate_bearer_token("\r\n").is_err());
+        // A whitespace-only token is never a real credential.
         assert!(validate_bearer_token("   ").is_err());
     }
 
@@ -464,6 +631,15 @@ mod tests {
         let (username, password) = validate_basic("user\n", "pass\n").unwrap();
         assert_eq!(username, "user");
         assert_eq!(password, "pass");
+        let (username, password) = validate_basic("user\r\n", "pass\r\n").unwrap();
+        assert_eq!(username, "user");
+        assert_eq!(password, "pass");
+        // A trailing space is legitimate credential content.
+        let (username, password) = validate_basic("user ", "pass ").unwrap();
+        assert_eq!(username, "user ");
+        assert_eq!(password, "pass ");
+        // A whitespace-only username is never a real credential.
+        assert!(validate_basic("   ", "pass").is_err());
         assert!(validate_basic("user", "pa\0ss").is_err());
         assert!(validate_basic("", "pass").is_err());
     }
@@ -479,6 +655,16 @@ mod tests {
         );
         assert!(
             matches!(status_action(403, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::AuthFailed)
+        );
+        // 407 is an auth failure; 410 is gone (not-found); 408 retries.
+        assert!(
+            matches!(status_action(407, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::AuthFailed)
+        );
+        assert!(
+            matches!(status_action(410, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::NotFound)
+        );
+        assert!(
+            matches!(status_action(408, "u"), StatusAction::Retry(e) if e.kind() == ErrorKind::Timeout)
         );
         // Other 4xx are the caller's fault: InvalidInput, no retry.
         assert!(
