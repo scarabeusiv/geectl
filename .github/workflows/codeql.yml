@@ -4,10 +4,10 @@
 # repo's Security tab, and the workflow fails the PR when it finds
 # issues (default behaviour — not suppressed).
 #
-# Rust is extracted without a build (`build-mode: none`): CodeQL does
-# not support `autobuild` for Rust, so there is deliberately no
-# autobuild step here. That is the correct CodeQL setup for Rust, not a
-# weakening.
+# Rust and GitHub Actions are both analysed (matching rpmcrab's matrix):
+# CodeQL does not support `autobuild` for Rust, so both languages are
+# extracted without a build (`build-mode: none`). That is the correct
+# CodeQL setup, not a weakening.
 #
 # Query suite is `security-and-quality` (security plus code quality),
 # the strictest suite — not security-only. No rule is disabled or
@@ -23,32 +23,45 @@ on:
     # Weekly, Mondays 05:00 UTC.
     - cron: "0 5 * * 1"
 
-# Cancel a superseded run of the same workflow on the same ref.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
-  security-events: write
-  actions: read
+
+# Cancel a superseded run of the same workflow on the same ref, but only
+# for pull requests: a push to main must never cancel a running main
+# build. Added per plusky's review of PR #1.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   analyze:
     name: Analyze
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: actions
+            build-mode: none
     steps:
       # Pinned to the v4 tag's commit so the actions cannot move under us;
       # Dependabot tracks SHA pins and proposes updates.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Initialize CodeQL
         uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
-          languages: rust
-          build-mode: none
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
           queries: security-and-quality
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
-          category: "/language:rust"
+          category: "/language:${{ matrix.language }}"

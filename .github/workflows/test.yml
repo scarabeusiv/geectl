@@ -5,39 +5,167 @@ on:
   push:
     branches: [main]
 
-# Cancel a superseded run of the same workflow on the same ref.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
+
+# Cancel a superseded run of the same workflow on the same ref, but only
+# for pull requests: a push to main must never cancel a running main
+# build. Matches rpmcrab's ci.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       # Pinned to the v4 tag's commit so the action cannot move under us;
       # Dependabot tracks SHA pins and proposes updates.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # The action itself is pinned by SHA; the toolchain version
-      # comes from rust-toolchain.toml, so CI and local developers
-      # use the same compiler.
+        with:
+          persist-credentials: false
+      # Pinned to the stable-branch HEAD (2026-11-15) so the toolchain
+      # action is reproducible; update the SHA to move it. The toolchain
+      # itself comes from rust-toolchain.toml (stable + rustfmt/clippy),
+      # so CI and local developers use the same compiler.
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
-      # Cache the cargo registry and target dir so repeat runs do not
-      # re-download and rebuild every dependency. Pinned to the v2
-      # tag's commit; Dependabot tracks SHA pins and proposes updates.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      # Pinned to the v2 tag's commit; Dependabot tracks SHA pins and
+      # proposes updates. Plain cache (no OS-release scoping): geectl
+      # is pure Rust with no bindgen or system libraries, so the cache
+      # is not tied to a distro release the way rpmcrab's is.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          workspaces: . -> target
       - name: Run the test suite
         run: cargo test --locked
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
-      # Pinned version (with --locked) so the tool is reproducible:
-      # an unpinned `cargo install` floats to whatever is latest.
+
+  # Devel (beta) compiler, non-failing: an early-warning leg for upcoming
+  # toolchain breaks. rust-toolchain.toml outranks the dtolnay default, so
+  # the beta toolchain is selected via RUSTUP_TOOLCHAIN at job level and
+  # asserted. Matches rpmcrab's rust-beta job.
+  rust-beta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: beta
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: beta
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          workspaces: . -> target
+          # This leg is expected to fail sometimes; with main the only
+          # cache writer, a beta break would otherwise freeze the cache.
+          cache-on-failure: true
+      - name: Assert beta toolchain
+        run: |
+          rustc --version
+          rustc --version | grep -q beta
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Run the test suite
+        run: cargo test --locked
+
+  # Minimum supported Rust version, read from Cargo.toml `rust-version`
+  # and enforced here. Matches rpmcrab's rust-msrv job (minus its RPM
+  # toolchain install, which geectl does not need).
+  rust-msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$msrv" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
+          echo "value=$msrv" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: ${{ steps.msrv.outputs.value }}
+      # dtolnay/rust-toolchain sets the rustup default, which
+      # rust-toolchain.toml outranks; export RUSTUP_TOOLCHAIN so the MSRV
+      # is actually used, and assert.
+      - name: Assert MSRV toolchain
+        run: |
+          export RUSTUP_TOOLCHAIN="${{ steps.msrv.outputs.value }}"
+          rustc --version
+          rustc --version | grep -q "${{ steps.msrv.outputs.value }}"
+      # cargo check, not build, over --all-targets: an MSRV break in test
+      # code or a dev-dependency otherwise passes here and only bites a
+      # contributor.
+      - name: cargo check at MSRV
+        run: |
+          export RUSTUP_TOOLCHAIN="${{ steps.msrv.outputs.value }}"
+          cargo check --all-targets --locked
+
+  # Platform spread: the CLI must build and pass its tests on macOS too.
+  # Clippy is platform-independent and Linux clippy covers it, so macOS
+  # runs only the test suite. Matches rpmcrab's rust-macos job.
+  rust-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          workspaces: . -> target
+      - name: Run the test suite
+        run: cargo test --locked
+
+  # Dependency policy as a CI gate (not only the weekly freshness
+  # workflow): licenses, advisories, sources. Matches rpmcrab's
+  # rust-deny job. cargo-deny 0.21.0 because deny.toml is the 0.21
+  # schema (rpmcrab uses 0.20.2).
+  rust-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # The EmbarkStudios/cargo-deny-action Docker image pulls
+      # rust:1.85.0-alpine3.20 from Docker Hub at build time, which fails
+      # on GitHub-hosted runners with 429 rate limits. Install the
+      # upstream prebuilt cargo-deny binary directly instead.
       - name: Install cargo-deny
-        run: cargo install cargo-deny@0.21.0 --locked
-      - name: Licenses, advisories, sources
-        run: cargo deny check
+        env:
+          CARGO_DENY_VERSION: 0.21.0
+          # Pinned sha256 of cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          # (upstream release artifact); the checksum no longer comes over the wire.
+          CARGO_DENY_SHA256: a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903
+        run: |
+          set -euo pipefail
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -sSLf --retry 3 -o /tmp/cargo-deny.tar.gz "$url"
+          echo "${CARGO_DENY_SHA256}  /tmp/cargo-deny.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/cargo-deny
+          tar -xzf /tmp/cargo-deny.tar.gz -C /tmp/cargo-deny
+          sudo install -m 755 "/tmp/cargo-deny/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny" /usr/local/bin/cargo-deny
+          cargo-deny --version
+      - name: cargo deny check
+        run: cargo-deny --manifest-path Cargo.toml check
