@@ -95,9 +95,16 @@ fn main() -> ExitCode {
                 ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion => {
                     // Help/version text is the payload here. It already
                     // ends with a newline, so trim it before writeln!
-                    // adds exactly one.
-                    let _ = write_payload(e.render().to_string().trim_end());
-                    return ExitCode::from(0);
+                    // adds exactly one. A write failure is handled like
+                    // the normal path (InternalError + its exit code),
+                    // not swallowed: ENOSPC/EIO must not exit 0.
+                    match write_payload(e.render().to_string().trim_end()) {
+                        Ok(()) => return ExitCode::from(0),
+                        Err(err) => {
+                            write_error(&err);
+                            return ExitCode::from(err.exit_code() as u8);
+                        }
+                    }
                 }
                 _ => {
                     let err = GeectlError::new(ErrorKind::InvalidInput, e.to_string());

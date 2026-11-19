@@ -60,15 +60,28 @@ pub struct UrlBuilder {
 }
 
 impl UrlBuilder {
-    /// Create a builder for `base`. The base must be `https://`: an
-    /// `http://` base would send credentials in cleartext, so it fails
-    /// fast here instead of at the first request.
+    /// Create a builder for `base`. The base must be `https://` with a
+    /// host: an `http://` base would send credentials in cleartext,
+    /// and a hostless `https://` names no server, so both fail fast
+    /// here instead of at the first request.
     pub fn new(base: impl Into<String>) -> Result<Self, GeectlError> {
         let base = base.into();
         if !base.starts_with("https://") {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 "URL base must use https://",
+            ));
+        }
+        // The base must carry a host: `https://` and `https:///path`
+        // pass the scheme check but name no server.
+        let after_scheme = &base["https://".len()..];
+        let host_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        if after_scheme[..host_end].is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "URL base must have a host",
             ));
         }
         Ok(UrlBuilder {
@@ -170,6 +183,16 @@ mod tests {
         // An http base would send credentials in cleartext.
         assert!(UrlBuilder::new("http://api.opensuse.org").is_err());
         assert!(UrlBuilder::new("api.opensuse.org").is_err());
+        assert!(UrlBuilder::new("https://api.opensuse.org").is_ok());
+    }
+
+    #[test]
+    fn https_base_without_host_is_rejected() {
+        // `https://` and `https:///path` pass the scheme check but name
+        // no server; they must fail fast here, not at the first request.
+        assert!(UrlBuilder::new("https://").is_err());
+        assert!(UrlBuilder::new("https:///path").is_err());
+        assert!(UrlBuilder::new("https://?q=1").is_err());
         assert!(UrlBuilder::new("https://api.opensuse.org").is_ok());
     }
 }
