@@ -1008,6 +1008,23 @@ mod tests {
         }
     }
 
+    /// A recorded request with the Authorization header value
+    /// redacted, for assert messages: the raw request carries the
+    /// fixture token, which must not be printed on failure.
+    fn redact_authorization(request: &str) -> String {
+        request
+            .lines()
+            .map(|l| {
+                if l.to_ascii_lowercase().starts_with("authorization:") {
+                    "Authorization: [redacted]"
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
     #[test]
     fn post_json_does_not_retry_transient_failures() {
         // A 429 or a 500 must surface as ServerError after exactly
@@ -1073,13 +1090,15 @@ mod tests {
         // exactly what a Gitea create-repo call needs.
         assert!(
             request.starts_with("POST /test HTTP/1.1\r\n"),
-            "POST method line wrong; request: {request}"
+            "POST method line wrong; request: {}",
+            redact_authorization(&request)
         );
         assert!(
             request
                 .lines()
                 .any(|l| l.eq_ignore_ascii_case("content-type: application/json")),
-            "POST must carry Content-Type: application/json; request: {request}"
+            "POST must carry Content-Type: application/json; request: {}",
+            redact_authorization(&request)
         );
         let (_, sent_body) = request.split_once("\r\n\r\n").expect("request has a body");
         assert_eq!(sent_body, body);
@@ -1087,7 +1106,8 @@ mod tests {
             request
                 .lines()
                 .any(|l| l.eq_ignore_ascii_case("authorization: Bearer tok-123")),
-            "POST must carry the Bearer <redacted> request: {request}"
+            "POST must carry the Bearer <redacted> request: {}",
+            redact_authorization(&request)
         );
     }
 
@@ -1232,7 +1252,11 @@ mod tests {
         // the target saw none (joining its handle waits out the
         // 5s accept deadline, so this test is slow by design).
         let first = redirect.request().expect("redirector recorded the request");
-        assert!(first.starts_with("GET /test HTTP/1.1\r\n"), "{first}");
+        assert!(
+            first.starts_with("GET /test HTTP/1.1\r\n"),
+            "redirector saw a different request; request: {}",
+            redact_authorization(&first)
+        );
         assert_eq!(target.request(), None);
     }
 
