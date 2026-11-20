@@ -51,6 +51,20 @@ CONTAINER_NAME="geectl-gitea-live"
 VOLUME_NAME="geectl-gitea-data"
 IMAGE="gitea/gitea:1.24.7"
 GITEA_PORT="${GITEA_PORT:-3001}"
+# A port is 1-65535: anything else (a hostname, a path, an empty
+# string) would be interpolated into the container's -p mapping and
+# the base URL below. Digits-only and at most 5 digits first, so the
+# arithmetic comparison cannot overflow on a long digit string.
+case "$GITEA_PORT" in
+    ''|*[!0-9]*)
+        echo "GITEA_PORT must be a port number (1-65535); got '$GITEA_PORT'" >&2
+        exit 1
+        ;;
+esac
+if [ "${#GITEA_PORT}" -gt 5 ] || [ "$GITEA_PORT" -lt 1 ] || [ "$GITEA_PORT" -gt 65535 ]; then
+    echo "GITEA_PORT must be a port number (1-65535); got '$GITEA_PORT'" >&2
+    exit 1
+fi
 BASE_URL="http://127.0.0.1:${GITEA_PORT}"
 GITEA_USER="${GITEA_USER:-geectl}"
 GITEA_PASSWORD="${GITEA_PASSWORD:-geectl-live-test}"
