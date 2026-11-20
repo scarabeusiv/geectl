@@ -52,7 +52,7 @@
 use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{parse_status_ok, DryRun, ObsClient, SrFiling, SrPayload};
+use geectl::obs::{DryRun, ObsClient, SrFiling, SrPayload};
 
 /// Whether `url` points at a loopback host.
 ///
@@ -352,6 +352,34 @@ fn request_xml(base: &str, id: &str) -> String {
         .expect("GET the filed request back from the server")
 }
 
+/// True when `body` is a `<status code="ok"/>` document. The harness
+/// cannot use the crate-internal `parse_status_ok` (integration tests
+/// cannot see `pub(crate)` items), so it carries this small check:
+/// the `<status` tag must carry the `code="ok"` attribute.
+fn response_is_status_ok(body: &str) -> bool {
+    let Some(pos) = body.find("<status") else {
+        return false;
+    };
+    let after_tag = &body[pos + "<status".len()..];
+    let first = match after_tag.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return false;
+    }
+    let Some(end) = after_tag.find('>') else {
+        return false;
+    };
+    // The token must be exactly the attribute: `code="okx"` must not
+    // match, so a bare prefix check is not enough.
+    after_tag[..end].split_whitespace().any(|token| {
+        token == "code=\"ok\""
+            || token.starts_with("code=\"ok\"/")
+            || token.starts_with("code=\"ok\">")
+    })
+}
+
 /// Accept submit request `id` as the admin: the maintainer-side
 /// state change the accept-cleanup test exercises. There is no
 /// library accept operation (an agent files requests; accepting one
@@ -370,7 +398,7 @@ fn accept_request(base: &str, id: &str) {
         )
         .expect("accept the request on the temporal instance");
     assert!(
-        parse_status_ok(&body),
+        response_is_status_ok(&body),
         "accepting request {id} did not return <status code=\"ok\"/>; body: {body}"
     );
 }

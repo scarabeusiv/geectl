@@ -1065,7 +1065,7 @@ impl<'a> ObsClient<'a> {
 /// None — a truncated 200 body must not read as "no devel project".
 /// A `<devel>` element without a `project` attribute is skipped, not
 /// an error: only the directory envelope itself is validated here.
-pub fn parse_devel_project(body: &str) -> Result<Option<String>, GeectlError> {
+pub(crate) fn parse_devel_project(body: &str) -> Result<Option<String>, GeectlError> {
     let malformed = || {
         GeectlError::new(
             ErrorKind::ServerError,
@@ -1131,7 +1131,7 @@ pub fn parse_devel_project(body: &str) -> Result<Option<String>, GeectlError> {
 }
 
 /// Extract the Version field from a spec file. Returns None if absent.
-pub fn parse_spec_version(spec_text: &str) -> Option<String> {
+pub(crate) fn parse_spec_version(spec_text: &str) -> Option<String> {
     for line in spec_text.lines() {
         if let Some(rest) = line.strip_prefix("Version:") {
             let version = rest.trim().to_string();
@@ -1146,7 +1146,7 @@ pub fn parse_spec_version(spec_text: &str) -> Option<String> {
 /// Extract the `matches` count from an OBS search response
 /// (`<collection matches="N">...</collection>`). None when the
 /// response does not carry a count.
-pub fn parse_search_matches(body: &str) -> Option<u32> {
+pub(crate) fn parse_search_matches(body: &str) -> Option<u32> {
     let marker = "matches=\"";
     let pos = body.find(marker)?;
     let start = pos + marker.len();
@@ -1186,7 +1186,7 @@ fn request_tag_id(element: &str) -> Option<String> {
 /// (`<request id="1234567" ...>`). The id is read from inside the
 /// request tag, so the attribute order does not matter and either
 /// quote style works. None when the response carries no numeric id.
-pub fn parse_request_id(body: &str) -> Option<String> {
+pub(crate) fn parse_request_id(body: &str) -> Option<String> {
     let mut rest = body;
     while let Some(pos) = rest.find("<request") {
         let after_tag = &rest[pos + "<request".len()..];
@@ -1219,7 +1219,7 @@ pub fn parse_request_id(body: &str) -> Option<String> {
 /// and refusing on that would be a false refusal. The id is read
 /// from inside each request tag, so the attribute order does not
 /// matter and either quote style works.
-pub fn parse_request_ids(body: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_request_ids(body: &str) -> Option<Vec<String>> {
     if !body.contains("<collection") {
         return None;
     }
@@ -1267,7 +1267,7 @@ pub fn parse_request_ids(body: &str) -> Option<Vec<String>> {
 /// as [`parse_request_ids`]. A collection whose requests are all
 /// non-submit reads as an empty list, not an error: that is the
 /// answer "no open submit request".
-pub fn parse_submit_request_ids(body: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_submit_request_ids(body: &str) -> Option<Vec<String>> {
     if !body.contains("<collection") {
         return None;
     }
@@ -1370,7 +1370,7 @@ fn action_tag_type(element: &str) -> Option<String> {
 /// The write endpoints (request `changestate`, source delete) answer
 /// `render_ok` on success; any other status code in the body — or no
 /// status element at all — reads as failure, never success.
-pub fn parse_status_ok(body: &str) -> bool {
+pub(crate) fn parse_status_ok(body: &str) -> bool {
     let Some(pos) = body.find("<status") else {
         return false;
     };
@@ -1420,7 +1420,7 @@ pub fn parse_status_ok(body: &str) -> bool {
 /// through `pass_to_backend`, so the upload response is a revision
 /// document, not a `<status code="ok"/>` — `parse_status_ok` would
 /// read every successful upload as a failure.
-pub fn parse_revision(body: &str) -> Option<u64> {
+pub(crate) fn parse_revision(body: &str) -> Option<u64> {
     let pos = body.find("<revision")?;
     let after_tag = &body[pos + "<revision".len()..];
     // The tag name must end here: `<revisions>` is not a revision
