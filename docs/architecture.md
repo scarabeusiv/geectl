@@ -70,6 +70,9 @@ to encode.
 - Retry policy, as a single documented constant: only idempotent methods
   are retried (GET, HEAD, PUT, DELETE), up to 3 times with doubling
   backoff. POST is never retried without an explicit idempotency key.
+  `post_json` (JSON body, `Content-Type: application/json`) never
+  retries at all: a retried mutation can create a duplicate, so every
+  non-2xx status is returned immediately.
 - Non-2xx statuses are converted to a `GeectlError` at this layer, before
   any caller sees the body, so callers never have to remember to check
   the status. 404 maps to `NotFound`, 401/403 to `AuthFailed`, other
@@ -138,19 +141,30 @@ Rules that hold:
 
 ## Testing
 
-Two layers, by design:
+Three layers, by design:
 
 1. **Fixtures per-PR (gating).** Fast, deterministic, recorded responses.
    Every PR runs them; they gate the merge.
-2. **Scheduled live tests against a temporal instance (independent CI
-   job).** We spin up our own (temporary) OBS instance, connect to it,
-   and collect responses. The key assertion is on **server state**:
+2. **Live Gitea tests per-PR (gating).** A disposable Gitea container
+   is provisioned in the `test` job, and `tests/gitea.rs` authenticates
+   against it with geectl's own `EnvGiteaAuth` and does real API calls
+   (read the user, create a repository, read it back, list it),
+   asserting on server state. This is the auth validation the fixtures
+   cannot do: the unit tests prove geectl sends the right `Authorization`
+   header; these prove a real Gitea accepts the token and returns valid
+   responses. They gate because they are fast (~20s end to end: a
+   single prebuilt image), unlike the OBS temporal job.
+3. **Scheduled live tests against a temporal OBS instance (independent
+   CI job).** We spin up our own (temporary) OBS instance, connect to
+   it, and collect responses. The key assertion is on **server state**:
    whatever change the CLI did must actually show up on the server —
    that proves the CLI did what it claimed, not just that it printed
    the right thing. This runs on a schedule, **not** per-PR. It is an
    independent CI job: when it regresses, it is fixed independently; it
    does not block PRs. It exists to catch drift as the server changes
-   underneath us, which fixtures alone cannot do.
+   underneath us, which fixtures alone cannot do. The OBS instance is
+   slow on purpose (source checkout + frontend build, minutes); that is
+   why it is scheduled while the Gitea test gates.
 
 ## Distribution
 
