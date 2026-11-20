@@ -19,8 +19,20 @@ TOKEN_FILE="$SCRIPT_DIR/.gitea-token"
 # midway: remove it on any exit, not only on the happy path.
 trap 'rm -f "$TOKEN_FILE"' EXIT
 
-$CONTAINER stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-$CONTAINER rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
-$CONTAINER volume rm "$VOLUME_NAME" >/dev/null 2>&1 || true
+# Try the configured runtime first, then the other well-known one:
+# the instance may have been provisioned with either (CONTAINER
+# defaults to docker, but a local run may have used podman), and
+# teardown must not leave it behind.
+runtimes=("$CONTAINER")
+for candidate in docker podman; do
+    if [ "$candidate" != "$CONTAINER" ]; then
+        runtimes+=("$candidate")
+    fi
+done
+for runtime in "${runtimes[@]}"; do
+    "$runtime" stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    "$runtime" rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    "$runtime" volume rm "$VOLUME_NAME" >/dev/null 2>&1 || true
+done
 rm -f "$TOKEN_FILE"
 echo "Disposable Gitea instance torn down (container, volume, and token file removed)."
