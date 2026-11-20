@@ -1751,6 +1751,20 @@ fn read_file(base: &str, project: &str, package: &str, filename: &str) -> String
     .expect("GET the file back from the server")
 }
 
+/// Read a source file back from the server through a link's
+/// expansion, authenticated. A plain file GET serves the package's
+/// own files only; the expanded read is what a link serves.
+fn read_expanded_file(base: &str, project: &str, package: &str, filename: &str) -> String {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    http.get_with(
+        &format!("{base}/source/{project}/{package}/{filename}?expand=1"),
+        &temporal_credentials(),
+    )
+    .expect("GET the expanded file back from the server")
+}
+
 /// Read a package's `_meta` back from the server, authenticated.
 fn read_meta(base: &str, project: &str, package: &str) -> String {
     let http = Box::leak(Box::new(
@@ -2288,6 +2302,112 @@ fn live_link_package_project_link_target_takes_explicit_link() {
         xml_attr(&link, "package").as_deref(),
         Some(package.as_str()),
         "the link must point at the source package; link: {link}"
+    );
+}
+
+/// PUT a package's `_link` directly. The harness writes the link
+/// (test setup, like `set_project_link`): breaking a link with a
+/// bad patch is the setup; the library operation is `repair_link`.
+fn put_link(base: &str, project: &str, package: &str, link: &str) {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    http.put_file(
+        &format!("{base}/source/{project}/{package}/_link"),
+        link,
+        &temporal_credentials(),
+    )
+    .expect("PUT the _link on the temporal instance");
+}
+
+/// Read a package's directory listing back from the server,
+/// authenticated, at the latest revision.
+fn read_directory(base: &str, project: &str, package: &str) -> String {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    http.get_with(
+        &format!("{base}/source/{project}/{package}?rev=latest"),
+        &temporal_credentials(),
+    )
+    .expect("GET the directory back from the server")
+}
+
+#[test]
+fn temporal_repair_link_repairs_broken_link() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (source_project, package, filename, content) = setup_copy_source(&client);
+    let target_project = format!("geectl-tmp-repair-{}", unique_suffix());
+    client
+        .create_project(
+            &target_project,
+            "geectl temporal test repair target",
+            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create repair target project on the temporal instance");
+    client
+        .link_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &LinkOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("link a package on the temporal instance");
+    // Break the link: a patch file that is not a patch at all, plus
+    // an apply entry for it. The link stops expanding.
+    client
+        .upload_file(
+            &target_project,
+            &package,
+            "bad.patch",
+            "this is not a patch\n",
+            &DryRun::new(false),
+        )
+        .expect("upload a bad patch file into the linked package");
+    put_link(
+        &base,
+        &target_project,
+        &package,
+        &format!(
+            "<link project=\"{source_project}\" package=\"{package}\"><patches><apply name=\"bad.patch\"/></patches></link>"
+        ),
+    );
+    let directory = read_directory(&base, &target_project, &package);
+    assert!(
+        directory.contains("error=\""),
+        "the link must be broken before the repair; directory: {directory}"
+    );
+    client
+        .repair_link(&target_project, &package, &DryRun::new(false))
+        .expect("repair a broken link on the temporal instance");
+    // The repaired link expands again, carries no apply entry, and
+    // is pinned at a baserev.
+    let directory = read_directory(&base, &target_project, &package);
+    assert!(
+        !directory.contains("error=\""),
+        "the link must expand after the repair; directory: {directory}"
+    );
+    let link = read_link(&base, &target_project, &package);
+    assert!(
+        !link.contains("<apply"),
+        "the repaired link must carry no apply patch; link: {link}"
+    );
+    assert!(
+        link.contains("baserev=\""),
+        "the repaired link must be pinned at a baserev; link: {link}"
+    );
+    // The spec file from the source still reads back through the
+    // repaired link.
+    assert_eq!(
+        read_expanded_file(&base, &target_project, &package, &filename),
+        content,
+        "the source file must read back through the repaired link"
     );
 }
 

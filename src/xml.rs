@@ -68,7 +68,7 @@ fn parse_name(xml: &str, start: usize) -> Option<(String, usize)> {
 /// `>`, respecting quoted attribute values (a `>` inside quotes does
 /// not end the tag). Returns the end index and whether the tag is
 /// self-closing (`/>`). None when the tag never closes.
-fn scan_tag(xml: &str, start: usize) -> Option<(usize, bool)> {
+pub(crate) fn scan_tag(xml: &str, start: usize) -> Option<(usize, bool)> {
     let bytes = xml.as_bytes();
     let mut i = start + 1;
     let mut quote: Option<u8> = None;
@@ -115,7 +115,7 @@ fn element_name(entry: &str) -> Option<&str> {
 /// with its quotes stripped, unescaped. The name must match exactly
 /// and be preceded by whitespace, so `project=` does not match
 /// `target_project=`. None when the attribute is absent or malformed.
-fn find_attr(tag: &str, name: &str) -> Option<String> {
+pub(crate) fn find_attr(tag: &str, name: &str) -> Option<String> {
     let mut rest = tag;
     let needle = format!("{name}=");
     while let Some(pos) = rest.find(&needle) {
@@ -386,6 +386,40 @@ impl XmlDoc {
         self.root_open.push('"');
     }
 
+    /// The raw text of the first child element named `name`, or None
+    /// when there is no such child. Text, comments, and processing
+    /// instructions are never elements, so they are never returned.
+    pub(crate) fn child(&self, name: &str) -> Option<String> {
+        self.children
+            .iter()
+            .find(|child| element_name(child) == Some(name))
+            .cloned()
+    }
+
+    /// Drop the first child element named one of `names` and
+    /// everything after it. True when anything was dropped; false
+    /// when no child carries one of the names. Entries before the
+    /// first match survive untouched, including the text between them.
+    pub(crate) fn truncate_at_element(&mut self, names: &[&str]) -> bool {
+        let Some(at) = self
+            .children
+            .iter()
+            .position(|child| element_name(child).is_some_and(|name| names.contains(&name)))
+        else {
+            return false;
+        };
+        self.children.truncate(at);
+        true
+    }
+
+    /// True when any child is an element (as opposed to text, a
+    /// comment, or a processing instruction).
+    pub(crate) fn has_elements(&self) -> bool {
+        self.children
+            .iter()
+            .any(|child| element_name(child).is_some())
+    }
+
     /// Remove every child element named `name`. Opaque entries
     /// (comments, text) are never elements, so they survive.
     pub(crate) fn remove_elements(&mut self, name: &str) {
@@ -474,6 +508,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn child_returns_the_first_matching_element() {
+        let doc = XmlDoc::parse(META).unwrap();
+        assert_eq!(
+            doc.child("devel").as_deref(),
+            Some("<devel project=\"test:devel\"/>")
+        );
+        assert_eq!(
+            doc.child("person").as_deref(),
+            Some("<person userid=\"alice\" role=\"maintainer\"/>")
+        );
+        assert!(doc.child("missing").is_none());
+    }
+
+    #[test]
+    fn truncate_at_element_drops_the_match_and_after() {
+        let mut inner =
+            XmlDoc::parse("<patches><topadd name=\"top.patch\"/><apply name=\"bad.patch\"/><delete name=\"gone\"/></patches>")
+                .unwrap();
+        assert!(inner.truncate_at_element(&["apply", "delete"]));
+        assert_eq!(
+            inner.render(),
+            "<patches><topadd name=\"top.patch\"/></patches>"
+        );
+        assert!(inner.has_elements());
+        // A second truncation finds nothing more to drop.
+        assert!(!inner.truncate_at_element(&["apply", "delete"]));
+    }
+
+    #[test]
+    fn truncate_at_element_false_without_a_match() {
+        let mut inner = XmlDoc::parse("<patches><topadd name=\"top.patch\"/></patches>").unwrap();
+        assert!(!inner.truncate_at_element(&["apply", "delete"]));
+        assert_eq!(
+            inner.render(),
+            "<patches><topadd name=\"top.patch\"/></patches>"
+        );
+    }
+
+    #[test]
+    fn has_elements_ignores_text_and_comments() {
+        let doc = XmlDoc::parse("<package>text<!-- comment --></package>").unwrap();
+        assert!(!doc.has_elements());
+        assert!(doc.child("title").is_none());
+        let doc = XmlDoc::parse("<package><title>Test</title></package>").unwrap();
+        assert!(doc.has_elements());
+    }
 
     #[test]
     fn remove_elements_drops_only_the_named_ones() {

@@ -110,7 +110,7 @@ use crate::auth::Credentials;
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{is_loopback_url, HttpClient};
 use crate::url::{encode_path_segment, encode_query_value, UrlBuilder};
-use crate::xml::XmlDoc;
+use crate::xml::{find_attr, scan_tag, XmlDoc};
 use std::cell::RefCell;
 use std::fmt;
 
@@ -3494,6 +3494,242 @@ impl<'a> ObsClient<'a> {
             )),
         }
     }
+
+    /// The `srcmd5` the link in `project`/`package` last expanded
+    /// at, from its own previous revisions: the first revision
+    /// before the current one whose directory listing expands
+    /// without an error. Up to five revisions back; a revision
+    /// that cannot be read stops the walk. None when no previous
+    /// revision expands, or when the current revision cannot be
+    /// read from the directory.
+    fn last_working_baserev(
+        &self,
+        project: &str,
+        package: &str,
+        directory: &str,
+    ) -> Result<Option<String>, GeectlError> {
+        let Some(current) = XmlDoc::parse(directory)
+            .ok()
+            .and_then(|doc| doc.root_attr("rev"))
+            .and_then(|rev| rev.parse::<u64>().ok())
+        else {
+            return Ok(None);
+        };
+        for rev in (1..current).rev().take(5) {
+            let rev_text = rev.to_string();
+            let url = build_url(
+                &self.base,
+                &["source", project, package],
+                &[("rev", rev_text.as_str())],
+            );
+            let Ok(prior_directory) = self.http.get_with(&url, &self.credentials) else {
+                break;
+            };
+            let Ok(prior_info) = parse_linkinfo(&prior_directory) else {
+                break;
+            };
+            let Some(prior_info) = prior_info else {
+                continue;
+            };
+            if prior_info.error.is_some() {
+                continue;
+            }
+            if let Some(srcmd5) = prior_info.srcmd5 {
+                return Ok(Some(srcmd5));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Repair a broken source link in `project`/`package` on OBS:
+    /// strip the apply/delete patches that fail to apply and pin
+    /// the link at a revision where it expands, by editing its
+    /// `_link` and PUTting it back. Requires credentials; without
+    /// them the call fails loudly before any request. In dry-run
+    /// the repair is recorded in the plan and nothing is repaired
+    /// — the guard runs before the credentials check, like
+    /// `create_package`.
+    ///
+    /// An agent repairs a link when a linked package stops
+    /// expanding — usually because the link target moved on and a
+    /// patch no longer applies — and the package must work again
+    /// without a merge: the patch is dropped rather than fixed,
+    /// and the link is pinned at the last revision where it
+    /// expanded. The patch files themselves stay in the package
+    /// as inert files; deleting them is a separate step.
+    ///
+    /// The breakage is confirmed first from the directory
+    /// listing: its `<linkinfo>` carries the expansion error, and
+    /// a package that is not a link, or whose link is not broken,
+    /// is refused without writing anything. The pin revision is
+    /// then resolved the way the server's own repair does: when
+    /// the link still expands at its base, the existing baserev
+    /// stands — it already names the target revision the link was
+    /// based at. Otherwise the last revision where the link
+    /// worked supplies it, through the target revision that
+    /// expansion resolved to (the `srcmd5` of the linkinfo at the
+    /// last-working revision — a target revision, not the linked
+    /// package's expanded one). When the server records no
+    /// last-working revision — the breakage came from the link
+    /// itself, and the server only records workings of the
+    /// current `_link` — the link's own previous revisions are
+    /// walked back instead, and the first that still expands
+    /// supplies the pin. A link with no apply/delete patch
+    /// is not a patch failure and is refused: stripping cannot
+    /// fix it, and the server's error is reported instead.
+    ///
+    /// Success is the backend's `<revision>` document on the
+    /// `_link` PUT; any other body is a server error, never
+    /// success. A missing package reads as `NotFound` from the
+    /// directory GET, before anything is written.
+    pub fn repair_link(
+        &self,
+        project: &str,
+        package: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        // The dry-run guard: in dry-run the repair is recorded in
+        // the plan and nothing is repaired — not even the
+        // credentials check runs.
+        if !dry_run.allow(&format!("repair link {project}/{package}")) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot repair a link without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let directory_url = build_url(
+            &self.base,
+            &["source", project, package],
+            &[("rev", "latest")],
+        );
+        let directory = self.http.get_with(&directory_url, &self.credentials)?;
+        let linkinfo = parse_linkinfo(&directory)?.ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("package {project}/{package} is not a source link"),
+            )
+        })?;
+        let Some(server_error) = linkinfo.error.clone() else {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("source link {project}/{package} is not broken"),
+            ));
+        };
+        // The baserev the repaired link is pinned at, when it
+        // changes: None keeps the link's existing baserev.
+        let mut new_baserev: Option<String> = None;
+        let mut base_ok = false;
+        if linkinfo.baserev.is_some() {
+            let base_url = build_url(
+                &self.base,
+                &["source", project, package],
+                &[("rev", "latest"), ("linkrev", "base")],
+            );
+            let base_directory = self.http.get_with(&base_url, &self.credentials)?;
+            if let Some(base_info) = parse_linkinfo(&base_directory)? {
+                base_ok = base_info.error.is_none();
+            }
+        }
+        if !base_ok {
+            let lastworking_url = build_url(
+                &self.base,
+                &["source", project, package],
+                &[("lastworking", "1")],
+            );
+            let lastworking_directory = self.http.get_with(&lastworking_url, &self.credentials)?;
+            let lastworking_info = parse_linkinfo(&lastworking_directory)?.ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("unexpected OBS directory response for package {project}/{package}"),
+                )
+            })?;
+            if lastworking_info.error.is_none() {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("source link {project}/{package} is not broken"),
+                ));
+            }
+            new_baserev = Some(match lastworking_info.lastworking {
+                Some(lastworking) => {
+                    let working_url = build_url(
+                        &self.base,
+                        &["source", project, package],
+                        &[("rev", lastworking.as_str())],
+                    );
+                    let working_directory = self.http.get_with(&working_url, &self.credentials)?;
+                    let working_info = parse_linkinfo(&working_directory)?.ok_or_else(|| {
+                        GeectlError::new(
+                            ErrorKind::ServerError,
+                            format!(
+                                "unexpected OBS directory response for package {project}/{package}"
+                            ),
+                        )
+                    })?;
+                    if working_info.error.is_some() {
+                        return Err(GeectlError::new(
+                            ErrorKind::ServerError,
+                            format!(
+                                "working revision of source link {project}/{package} is not working"
+                            ),
+                        ));
+                    }
+                    working_info.srcmd5.ok_or_else(|| {
+                        GeectlError::new(
+                            ErrorKind::ServerError,
+                            format!(
+                                "unexpected OBS directory response for package {project}/{package}"
+                            ),
+                        )
+                    })?
+                }
+                None => {
+                    // No last-working revision is recorded: the
+                    // breakage came from the link itself. Walk back
+                    // through the link's own revisions and take the
+                    // first that still expands.
+                    let Some(pin) = self.last_working_baserev(project, package, &directory)? else {
+                        return Err(GeectlError::new(
+                            ErrorKind::InvalidInput,
+                            format!("source link {project}/{package} never worked"),
+                        ));
+                    };
+                    pin
+                }
+            });
+        }
+        let link_url = build_url(&self.base, &["source", project, package, "_link"], &[]);
+        let link_body = self.http.get_with(&link_url, &self.credentials)?;
+        let mut doc = XmlDoc::parse(&link_body)?;
+        if !repair_link_doc(&mut doc, new_baserev.as_deref())? {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "source link {project}/{package} has no apply/delete patch to repair (server error: {server_error})"
+                ),
+            ));
+        }
+        let body = self
+            .http
+            .put_file(&link_url, &doc.render(), &self.credentials)?;
+        if parse_revision(&body).is_none() {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS link response for package {project}/{package}"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Extract the devel project from an OBS directory listing
@@ -4123,6 +4359,139 @@ fn link_option_suffix(options: &LinkOptions) -> String {
     } else {
         format!(" ({})", parts.join(", "))
     }
+}
+
+/// A package's `<linkinfo>` from an OBS directory listing: the link
+/// target, the revisions the link was expanded at, and the expansion
+/// error when the link is broken. All fields are optional: a
+/// directory without a link carries no linkinfo at all, and a
+/// working link carries no error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LinkInfo {
+    /// The project the link points at.
+    pub project: Option<String>,
+    /// The package the link points at.
+    pub package: Option<String>,
+    /// The link target's srcmd5 at this expansion.
+    pub srcmd5: Option<String>,
+    /// The target revision the link is based at (the link's baserev).
+    pub baserev: Option<String>,
+    /// The linked package's expanded srcmd5.
+    pub xsrcmd5: Option<String>,
+    /// The linked package's srcmd5 at the last revision where the
+    /// link expanded, when the server was asked for it.
+    pub lastworking: Option<String>,
+    /// The expansion error when the link is broken; absent when the
+    /// link expands.
+    pub error: Option<String>,
+}
+
+/// Read the `<linkinfo>` element from an OBS directory listing.
+/// None when the listing carries no linkinfo (the package is not a
+/// link). An error when the body is not a `<directory>` document at
+/// all — a truncated 200 body must not read as "not a link". The
+/// attributes are read from the open tag only, so a linkinfo with
+/// `<linked>` children still parses.
+pub(crate) fn parse_linkinfo(body: &str) -> Result<Option<LinkInfo>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS directory response: not a <directory> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<directory") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = after_open.find('>') else {
+        return Err(malformed());
+    };
+    if after_open[..end].trim_end().ends_with('/') {
+        // Self-closing `<directory .../>`: no children, no linkinfo.
+        return Ok(None);
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</directory>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</directory>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let mut rest = &inner[..close];
+    while let Some(pos) = rest.find("<linkinfo") {
+        let after_tag = &rest[pos + "<linkinfo".len()..];
+        let Some(first) = after_tag.chars().next() else {
+            return Err(malformed());
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        // The tag end is scanned quote-aware: a `>` inside an
+        // attribute value (the free-form `error` text) must not end
+        // the tag, or a broken link would read as unbroken.
+        let Some((end, _)) = scan_tag(rest, pos) else {
+            return Err(malformed());
+        };
+        let tag = &rest[pos..end];
+        let mut info = LinkInfo::default();
+        if let Some(value) = find_attr(tag, "project") {
+            info.project = Some(value);
+        }
+        if let Some(value) = find_attr(tag, "package") {
+            info.package = Some(value);
+        }
+        if let Some(value) = find_attr(tag, "srcmd5") {
+            info.srcmd5 = Some(value);
+        }
+        if let Some(value) = find_attr(tag, "baserev") {
+            info.baserev = Some(value);
+        }
+        if let Some(value) = find_attr(tag, "xsrcmd5") {
+            info.xsrcmd5 = Some(value);
+        }
+        if let Some(value) = find_attr(tag, "lastworking") {
+            info.lastworking = Some(value);
+        }
+        if let Some(value) = find_attr(tag, "error") {
+            info.error = Some(value);
+        }
+        return Ok(Some(info));
+    }
+    Ok(None)
+}
+
+/// Strip the apply/delete patches from a parsed `_link` document,
+/// mirroring what the server's repair does to the link: the first
+/// apply or delete entry and everything after it is dropped — later
+/// entries are based on the broken state — while entries before it
+/// (add, topadd) survive. Sets `baserev` when `new_baserev` is
+/// given. Returns true when a patch was stripped; false when the
+/// link has no apply/delete patch at all, which means the breakage
+/// is not a patch failure and this repair cannot fix it.
+fn repair_link_doc(doc: &mut XmlDoc, new_baserev: Option<&str>) -> Result<bool, GeectlError> {
+    let Some(patches) = doc.child("patches") else {
+        return Ok(false);
+    };
+    let mut inner = XmlDoc::parse(&patches)?;
+    if !inner.truncate_at_element(&["apply", "delete"]) {
+        return Ok(false);
+    }
+    if inner.has_elements() {
+        doc.replace_or_insert_element("patches", &inner.render())?;
+    } else {
+        doc.remove_elements("patches");
+    }
+    if let Some(baserev) = new_baserev {
+        doc.set_root_attr("baserev", baserev);
+    }
+    Ok(true)
 }
 
 pub(crate) fn parse_revision(body: &str) -> Option<u64> {
@@ -10542,6 +10911,474 @@ mod tests {
             http.put_calls()[1].1,
             "<link project=\"test:factory\" package=\"test-pkgA\" rev=\"abc123\" vrev=\"2\" cicount=\"3\" missingok=\"1\"/>"
         );
+    }
+
+    #[test]
+    fn repair_link_repairs_broken_link_at_base() {
+        let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><entry name=\"bad.patch\" md5=\"cccccccccccccccccccccccccccccccc\" size=\"40\" mtime=\"1700000001\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" xsrcmd5=\"ffffffffffffffffffffffffffffffff\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let base_ok = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" xsrcmd5=\"11111111111111111111111111111111\"/></directory>";
+        let link = "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"><patches><apply name=\"bad.patch\"/></patches></link>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+                broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest&linkrev=base",
+                base_ok,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                "<revision rev=\"3\" vrev=\"1\" srcmd5=\"22222222222222222222222222222222\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .is_ok());
+        // The patches are stripped; the existing baserev stands.
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"></link>"
+        );
+    }
+
+    #[test]
+    fn repair_link_repairs_via_lastworking_without_baserev() {
+        let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" xsrcmd5=\"ffffffffffffffffffffffffffffffff\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let lastworking = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" xsrcmd5=\"ffffffffffffffffffffffffffffffff\" error=\"patch bad.patch failed to apply\" lastworking=\"33333333333333333333333333333333\"/></directory>";
+        let working = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"33333333333333333333333333333333\"><entry name=\"_link\" md5=\"44444444444444444444444444444444\" size=\"100\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"55555555555555555555555555555555\" xsrcmd5=\"33333333333333333333333333333333\"/></directory>";
+        let link = "<link project=\"test:factory\" package=\"test-pkgA\"><patches><apply name=\"bad.patch\"/></patches></link>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+                broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?lastworking=1",
+                lastworking,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=33333333333333333333333333333333",
+                working,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                "<revision rev=\"3\" vrev=\"1\" srcmd5=\"22222222222222222222222222222222\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .is_ok());
+        // The repaired link is pinned at the target revision the
+        // last working expansion resolved to.
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"55555555555555555555555555555555\"></link>"
+        );
+    }
+
+    #[test]
+    fn repair_link_repairs_via_previous_revision_without_lastworking() {
+        let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" xsrcmd5=\"ffffffffffffffffffffffffffffffff\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let prior = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"33333333333333333333333333333333\"><entry name=\"_link\" md5=\"44444444444444444444444444444444\" size=\"100\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"55555555555555555555555555555555\" xsrcmd5=\"33333333333333333333333333333333\"/></directory>";
+        let link = "<link project=\"test:factory\" package=\"test-pkgA\"><patches><apply name=\"bad.patch\"/></patches></link>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+                broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?lastworking=1",
+                broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=1",
+                prior,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                "<revision rev=\"3\" vrev=\"1\" srcmd5=\"22222222222222222222222222222222\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .is_ok());
+        // No last-working revision is recorded (the breakage came
+        // from the link itself), so the pin comes from the link's
+        // previous revision, which still expands.
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"55555555555555555555555555555555\"></link>"
+        );
+    }
+    #[test]
+    fn repair_link_broken_base_falls_back_to_lastworking() {
+        let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" xsrcmd5=\"ffffffffffffffffffffffffffffffff\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let base_broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let lastworking = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" error=\"patch bad.patch failed to apply\" lastworking=\"33333333333333333333333333333333\"/></directory>";
+        let working = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"33333333333333333333333333333333\"><entry name=\"_link\" md5=\"44444444444444444444444444444444\" size=\"100\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"55555555555555555555555555555555\" xsrcmd5=\"33333333333333333333333333333333\"/></directory>";
+        let link = "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"><patches><apply name=\"bad.patch\"/></patches></link>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+                broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest&linkrev=base",
+                base_broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?lastworking=1",
+                lastworking,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=33333333333333333333333333333333",
+                working,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                "<revision rev=\"3\" vrev=\"1\" srcmd5=\"22222222222222222222222222222222\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .is_ok());
+        // The base was broken too, so the pin comes from the last
+        // working expansion, replacing the old baserev.
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"55555555555555555555555555555555\"></link>"
+        );
+    }
+
+    #[test]
+    fn repair_link_not_a_link_is_refused() {
+        let directory = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"test-pkgA.spec\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"100\" mtime=\"1700000000\"/></directory>";
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+            directory,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn repair_link_unbroken_link_is_refused() {
+        let directory = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"100\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" xsrcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/></directory>";
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+            directory,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn repair_link_without_patches_is_not_a_patch_failure() {
+        let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" error=\"linked package does not exist\"/></directory>";
+        let base_ok = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" xsrcmd5=\"11111111111111111111111111111111\"/></directory>";
+        let link = "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"/>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+                broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest&linkrev=base",
+                base_ok,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                link,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn repair_link_never_worked_is_refused() {
+        let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let lastworking = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+                broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?lastworking=1",
+                lastworking,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn repair_link_working_revision_broken_is_error() {
+        let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let lastworking = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" error=\"patch bad.patch failed to apply\" lastworking=\"33333333333333333333333333333333\"/></directory>";
+        let working_broken = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"33333333333333333333333333333333\"><entry name=\"_link\" md5=\"44444444444444444444444444444444\" size=\"100\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"55555555555555555555555555555555\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+                broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?lastworking=1",
+                lastworking,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=33333333333333333333333333333333",
+                working_broken,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn repair_link_topadd_before_apply_survives() {
+        let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let base_ok = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" xsrcmd5=\"11111111111111111111111111111111\"/></directory>";
+        let link = "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"><patches><topadd name=\"top.patch\"/><apply name=\"bad.patch\"/><delete name=\"gone\"/></patches></link>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+                broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest&linkrev=base",
+                base_ok,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                "<revision rev=\"3\" vrev=\"1\" srcmd5=\"22222222222222222222222222222222\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .is_ok());
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"><patches><topadd name=\"top.patch\"/></patches></link>"
+        );
+    }
+
+    #[test]
+    fn repair_link_dry_run_records_plan_and_repairs_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .repair_link("test:factory", "test-pkgA", &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: repair link test:factory/test-pkgA".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn repair_link_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+            "<directory name=\"test:factory/test-pkgA\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .is_err());
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn repair_link_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .repair_link("test/factory", "test-pkgA", &DryRun::new(false))
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn repair_link_missing_package_is_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn repair_link_non_revision_body_is_error_not_success() {
+        let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let base_ok = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" xsrcmd5=\"11111111111111111111111111111111\"/></directory>";
+        let link = "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"><patches><apply name=\"bad.patch\"/></patches></link>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest",
+                broken,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest&linkrev=base",
+                base_ok,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_link",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .repair_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn parse_linkinfo_reads_the_attributes() {
+        let body = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" xsrcmd5=\"ffffffffffffffffffffffffffffffff\" lastworking=\"33333333333333333333333333333333\" error=\"patch bad.patch failed to apply\"/></directory>";
+        let info = parse_linkinfo(body).unwrap().unwrap();
+        assert_eq!(info.project.as_deref(), Some("test:factory"));
+        assert_eq!(info.package.as_deref(), Some("test-pkgA"));
+        assert_eq!(
+            info.srcmd5.as_deref(),
+            Some("dddddddddddddddddddddddddddddddd")
+        );
+        assert_eq!(
+            info.baserev.as_deref(),
+            Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+        );
+        assert_eq!(
+            info.xsrcmd5.as_deref(),
+            Some("ffffffffffffffffffffffffffffffff")
+        );
+        assert_eq!(
+            info.lastworking.as_deref(),
+            Some("33333333333333333333333333333333")
+        );
+        assert_eq!(
+            info.error.as_deref(),
+            Some("patch bad.patch failed to apply")
+        );
+    }
+
+    #[test]
+    fn parse_linkinfo_none_without_linkinfo() {
+        let body = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"test-pkgA.spec\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"100\" mtime=\"1700000000\"/></directory>";
+        assert_eq!(parse_linkinfo(body).unwrap(), None);
+        let body = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/>";
+        assert_eq!(parse_linkinfo(body).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_linkinfo_malformed_body_is_error_not_none() {
+        assert!(parse_linkinfo("garbage").is_err());
+        assert!(parse_linkinfo("<directory name=\"x\">").is_err());
+        assert!(parse_linkinfo("<collection/>").is_err());
+    }
+
+    #[test]
+    fn parse_linkinfo_unescapes_the_error() {
+        let body = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" error=\"patch &quot;bad.patch&quot; failed\"/></directory>";
+        let info = parse_linkinfo(body).unwrap().unwrap();
+        assert_eq!(info.error.as_deref(), Some("patch \"bad.patch\" failed"));
+    }
+
+    #[test]
+    fn parse_linkinfo_reads_an_error_containing_an_angle_bracket() {
+        // A `>` inside the error text is legal XML and must not end
+        // the tag: truncating there drops the error, and a broken
+        // link would read as unbroken.
+        let body = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" error=\"patch failed: a > b\"/></directory>";
+        let info = parse_linkinfo(body).unwrap().unwrap();
+        assert_eq!(info.error.as_deref(), Some("patch failed: a > b"));
+    }
+
+    #[test]
+    fn parse_linkinfo_reads_attrs_with_linked_children() {
+        let body = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" error=\"patch failed\"><linked project=\"test:factory\" package=\"test-pkgB\"/></linkinfo></directory>";
+        let info = parse_linkinfo(body).unwrap().unwrap();
+        assert_eq!(
+            info.srcmd5.as_deref(),
+            Some("dddddddddddddddddddddddddddddddd")
+        );
+        assert_eq!(info.error.as_deref(), Some("patch failed"));
+    }
+
+    #[test]
+    fn repair_link_doc_strips_patches_and_sets_baserev() {
+        let mut doc = XmlDoc::parse("<link project=\"test:factory\" package=\"test-pkgA\"><patches><apply name=\"bad.patch\"/><delete name=\"gone\"/></patches></link>").unwrap();
+        assert!(repair_link_doc(&mut doc, Some("55555555555555555555555555555555")).unwrap());
+        assert_eq!(
+            doc.render(),
+            "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"55555555555555555555555555555555\"></link>"
+        );
+    }
+
+    #[test]
+    fn repair_link_doc_false_without_apply_or_delete() {
+        let mut doc = XmlDoc::parse("<link project=\"test:factory\" package=\"test-pkgA\"><patches><topadd name=\"top.patch\"/></patches></link>").unwrap();
+        assert!(!repair_link_doc(&mut doc, None).unwrap());
+        assert_eq!(
+            doc.render(),
+            "<link project=\"test:factory\" package=\"test-pkgA\"><patches><topadd name=\"top.patch\"/></patches></link>"
+        );
+        let mut doc =
+            XmlDoc::parse("<link project=\"test:factory\" package=\"test-pkgA\"/>").unwrap();
+        assert!(!repair_link_doc(&mut doc, None).unwrap());
     }
 
     #[test]
