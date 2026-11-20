@@ -269,17 +269,19 @@ Three layers, by design:
    header; these prove a real Gitea accepts the token and returns valid
    responses. They gate because they are fast (~20s end to end: a
    single prebuilt image), unlike the OBS temporal job.
-3. **Scheduled live tests against a temporal OBS instance (independent
-   CI job).** We spin up our own (temporary) OBS instance, connect to
-   it, and collect responses. The key assertion is on **server state**:
+3. **Live tests against a temporal OBS instance (independent CI job).**
+   We spin up our own (temporary) OBS instance, connect to it, and
+   collect responses. The key assertion is on **server state**:
    whatever change the CLI did must actually show up on the server —
    that proves the CLI did what it claimed, not just that it printed
-   the right thing. This runs on a schedule, **not** per-PR. It is an
-   independent CI job: when it regresses, it is fixed independently; it
-   does not block PRs. It exists to catch drift as the server changes
-   underneath us, which fixtures alone cannot do. The OBS instance is
-   slow on purpose (source checkout + frontend build, minutes); that is
-   why it is scheduled while the Gitea test gates.
+   the right thing. This runs on every pull request and on a schedule.
+   It is an independent CI job: when it regresses, it is fixed
+   independently; it does not block PRs. It exists to catch drift as
+   the server changes underneath us, which fixtures alone cannot do.
+   The OBS instance is slow on purpose (source checkout + frontend
+   build, minutes); the frontend build reuses a BuildKit cache in CI,
+   but the job stays non-gating — a slow or flaky run must never
+   block a PR.
 
 ### The temporal layer in detail
 
@@ -301,11 +303,16 @@ frontend and the database; project writes go to the backend).
 the job exists to catch drift, so it tracks the newest OBS, not a
 stable release.
 
-**Schedule.** The `temporal` workflow runs weekly (Mondays 06:00 UTC,
-the same slot as `freshness`) and on demand (`workflow_dispatch`), on a
-GitHub-hosted runner. It has no `pull_request` trigger and is not a
-required status check. It is slow on purpose (source checkout, frontend
-build, bootstrap); the timeout is 60 minutes.
+**Schedule.** The `temporal` workflow runs on every pull request,
+weekly (Mondays 06:00 UTC, the same slot as `freshness`) and on demand
+(`workflow_dispatch`), on a GitHub-hosted runner. It is not a required
+status check. It is slow on purpose (source checkout, frontend build,
+bootstrap); the timeout is 60 minutes. The frontend image build reuses
+BuildKit's GitHub Actions cache (`tests/temporal/docker-compose.cache.yml`,
+loaded only when `TEMPORAL_CACHE` is set — the workflow sets it, local
+runs do not), so repeat runs skip the gem install when the OBS source
+has not changed; the cache is content-addressed, so a changed OBS
+master still rebuilds the affected layers and drift is caught.
 
 **Harness (`tests/temporal.rs`, `tests/temporal_obs.rs`).** The tests are env-gated on
 `GEECTL_TEMPORAL_URL`: without it they skip, so `cargo test` stays

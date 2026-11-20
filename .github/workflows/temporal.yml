@@ -8,20 +8,25 @@
 # is what catches drift as OBS changes underneath us. Fixtures alone
 # cannot do that.
 #
-# This job is INDEPENDENT and does NOT gate PRs: it has no
-# `pull_request` trigger and is not a required status check. When it
-# regresses, it is fixed independently. It runs weekly (Mondays 06:00
-# UTC, the same slot as the freshness workflow) and on demand.
+# This job is INDEPENDENT and does NOT gate PRs: it is not a required
+# status check. When it regresses, it is fixed independently. It runs
+# on every pull request, weekly (Mondays 06:00 UTC, the same slot as
+# the freshness workflow), and on demand.
 #
 # It is slow on purpose: the OBS source checkout plus the frontend
 # image build take several minutes, and the bootstrap plus readiness
-# wait add more. The timeout is 60 minutes. If it proves too slow or
-# flaky on GitHub-hosted runners, the alternative is a dedicated host —
-# that is a decision for the maintainer, not something to guess here.
+# wait add more. The timeout is 60 minutes. The frontend image build
+# reuses BuildKit's GitHub Actions cache (see
+# `tests/temporal/docker-compose.cache.yml`), so repeat runs skip the
+# gem install when the OBS source has not changed. If it proves too
+# slow or flaky on GitHub-hosted runners, the alternative is a
+# dedicated host — that is a decision for the maintainer, not
+# something to guess here.
 
 name: temporal
 
 on:
+  pull_request:
   schedule:
     # Weekly, Mondays 06:00 UTC.
     - cron: "0 6 * * 1"
@@ -29,6 +34,13 @@ on:
 
 permissions:
   contents: read
+
+# Cancel a superseded run of the same workflow on the same ref, but only
+# for pull requests: a push to main must never cancel a running main
+# build. Matches test.yml (and rpmcrab's ci.yml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   temporal:
@@ -57,7 +69,27 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: . -> target
+      # Buildx with a docker-container builder, so the frontend image
+      # build can export its layers to the GitHub Actions cache (the
+      # gha cache exporter needs a builder that supports it, and this
+      # also guarantees a current Buildx/BuildKit — the v2 cache API
+      # needs Buildx >= 0.21 / BuildKit >= 0.20). Pinned to the v3
+      # tag's commit; Dependabot tracks SHA pins and proposes updates.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      # Expose the GitHub Actions runtime (ACTIONS_CACHE_URL /
+      # ACTIONS_RUNTIME_TOKEN) to the following steps: BuildKit's
+      # `type=gha` cache backend reads them from the environment, and
+      # a plain `run:` step does not provide them — without this step
+      # the frontend build silently skips both the cache import and
+      # the cache export (no error, no cache). Pinned to the v4 tag's
+      # commit; Dependabot tracks SHA pins and proposes updates.
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4
       - name: Provision temporal OBS instance
+        env:
+          # Enables the BuildKit GitHub Actions cache for the frontend
+          # image build (see tests/temporal/docker-compose.cache.yml).
+          # Local runs leave it unset and build uncached, as before.
+          TEMPORAL_CACHE: "1"
         run: bash tests/temporal/provision.sh
       - name: Run live tests against the temporal instance
         env:

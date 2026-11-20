@@ -1,8 +1,9 @@
 # Temporal OBS instance — live tests
 
-The scheduled live tests (layer 2 of the testing design) run against a
-real, temporary OBS instance. This directory holds the provisioning for
-it: the container setup, the bootstrap, and the teardown.
+The live tests (layer 2 of the testing design) run against a
+real, temporary OBS instance — on every pull request, weekly, and on
+demand. This directory holds the provisioning for it: the container
+setup, the bootstrap, and the teardown.
 
 ## What it is
 
@@ -23,6 +24,14 @@ The instance tracks OBS master (`obs/server/unstable`). That is
 deliberate: the temporal job exists to catch drift as OBS changes, so it
 tracks the newest OBS, not a stable release. The job is independent and
 non-gating, so a master breakage blocks nothing — it just needs fixing.
+
+In CI the frontend build reuses a BuildKit GitHub Actions cache
+(`docker-compose.cache.yml`, loaded only when `TEMPORAL_CACHE` is
+set), so repeat runs skip the gem install when the OBS source has
+not changed. The cache is content-addressed, so drift detection is
+unaffected. Only the frontend is cached: db, cache and backend are
+published images pulled in seconds, and caching them would pin a
+`latest` image and hide drift.
 
 ## Run it locally
 

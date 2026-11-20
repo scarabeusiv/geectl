@@ -1,0 +1,31 @@
+# CI-only BuildKit cache for the temporal frontend image build.
+#
+# This is an override file, loaded only when provision.sh runs with
+# TEMPORAL_CACHE set (the `temporal` workflow sets it). It is NOT
+# loaded by default: local runs (docker or podman) build the frontend
+# uncached, exactly as before.
+#
+# The cache is the BuildKit GitHub Actions cache backend (`type=gha`):
+# layers are stored in the repository's Actions cache under the
+# `temporal-frontend` scope, so they do not collide with any other
+# build's cache. The cache is content-addressed: a layer is reused
+# only when its inputs are unchanged, so when OBS master moves and
+# the frontend sources change, the affected layers rebuild — drift
+# detection is preserved. `mode=max` exports every intermediate
+# layer, which is what makes the gem-install layer reusable.
+# `ignore-error=true` keeps a cache export failure (rate limit,
+# read-only cache) from failing the build: the run still succeeds,
+# it just builds uncached next time.
+#
+# Only the frontend is cached: db, cache and backend are published
+# images pulled from registry.opensuse.org in seconds, and caching
+# them would pin a `latest` image and hide the drift the temporal
+# job exists to catch.
+
+services:
+  frontend:
+    build:
+      cache_from:
+        - type=gha,scope=temporal-frontend
+      cache_to:
+        - type=gha,scope=temporal-frontend,mode=max,ignore-error=true

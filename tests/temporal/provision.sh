@@ -10,7 +10,8 @@
 #      is built from `src/api`. There is no published prebuilt frontend
 #      server image — the OBS project builds it from source, and so do we.
 #   2. Starts the database and cache, waits for the database.
-#   3. Builds the frontend image.
+#   3. Builds the frontend image (with the BuildKit GitHub Actions
+#      cache when TEMPORAL_CACHE is set — see docker-compose.cache.yml).
 #   4. Runs `rake dev:bootstrap` in a one-off frontend container. That
 #      creates the database and seeds it, including the Admin user
 #      (`Admin` / `opensuse` — the OBS development default, published in
@@ -31,6 +32,9 @@
 #   (defaults to <repo>/tests/temporal/obs; cloned if missing)
 #   COMPOSE="podman compose" bash tests/temporal/provision.sh
 #   (defaults to `docker compose`)
+#   TEMPORAL_CACHE=1 bash tests/temporal/provision.sh
+#   (loads docker-compose.cache.yml, the CI-only BuildKit cache for
+#   the frontend image build; local runs leave it unset)
 #
 # Exit code is non-zero if any step fails. The instance is left running
 # on failure for inspection; `tests/temporal/teardown.sh` removes it.
@@ -41,6 +45,17 @@ OBS_SOURCE_DIR="${OBS_SOURCE_DIR:-$SCRIPT_DIR/obs}"
 OBS_REPO="https://github.com/openSUSE/open-build-service.git"
 COMPOSE="${COMPOSE:-docker compose}"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+# CI-only frontend build cache (see docker-compose.cache.yml): when
+# TEMPORAL_CACHE is set, the cache override file is added to every
+# compose invocation. It only affects the frontend build
+# (cache_from/cache_to); all other commands behave identically.
+# Local runs leave TEMPORAL_CACHE unset and never load the file,
+# so podman and plain docker runs are unchanged.
+COMPOSE_FILES=(-f "$COMPOSE_FILE")
+if [ -n "${TEMPORAL_CACHE:-}" ]; then
+    COMPOSE_FILES+=(-f "$SCRIPT_DIR/docker-compose.cache.yml")
+    echo "Frontend build cache enabled (TEMPORAL_CACHE is set)."
+fi
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
 BASE_URL="http://127.0.0.1:${FRONTEND_PORT}"
 READINESS_TIMEOUT_SECONDS="${READINESS_TIMEOUT_SECONDS:-600}"
@@ -119,14 +134,14 @@ export FRONTEND_PORT
 # The database and cache first: the bootstrap and the backend both need
 # the database up, and the frontend will not boot without it.
 echo "Starting database and cache ..."
-$COMPOSE -f "$COMPOSE_FILE" up -d db cache
+$COMPOSE "${COMPOSE_FILES[@]}" up -d db cache
 
 echo "Waiting for the database ..."
 deadline=$((SECONDS + 300))
-until $COMPOSE -f "$COMPOSE_FILE" exec -T db mysqladmin ping --silent >/dev/null 2>&1; do
+until $COMPOSE "${COMPOSE_FILES[@]}" exec -T db mysqladmin ping --silent >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
         echo "database did not come up within 300s" >&2
-        $COMPOSE -f "$COMPOSE_FILE" logs db | tail -30 >&2
+        $COMPOSE "${COMPOSE_FILES[@]}" logs db | tail -30 >&2
         exit 1
     fi
     sleep 5
@@ -136,21 +151,21 @@ echo "Database is up."
 # The frontend image is built from the OBS source (there is no published
 # prebuilt frontend server image). This is the slow step.
 echo "Building the frontend image ..."
-$COMPOSE -f "$COMPOSE_FILE" build frontend
+$COMPOSE "${COMPOSE_FILES[@]}" build frontend
 
 # Bootstrap in a one-off frontend container (not the long-running one):
 # it creates the database and seeds it, including the Admin user. It
 # runs with the database and cache already up, and without the backend
 # (bootstrap touches only the database).
 echo "Bootstrapping the OBS database (creates it and seeds the Admin user) ..."
-$COMPOSE -f "$COMPOSE_FILE" run --rm --no-deps \
+$COMPOSE "${COMPOSE_FILES[@]}" run --rm --no-deps \
     -e RAILS_ENV=development frontend \
     bundle exec rake dev:bootstrap
 
 # Now the long-running services. The database exists, so the frontend
 # boots instead of exiting on a missing database.
 echo "Starting backend and frontend ..."
-$COMPOSE -f "$COMPOSE_FILE" up -d backend frontend
+$COMPOSE "${COMPOSE_FILES[@]}" up -d backend frontend
 
 # Readiness: the public /about endpoint answers 200 only once the
 # frontend can serve, which needs the database. It says nothing about
@@ -163,7 +178,7 @@ deadline=$((SECONDS + READINESS_TIMEOUT_SECONDS))
 until [ "$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "$BASE_URL/about" 2>/dev/null)" = "200" ]; do
     if [ "$SECONDS" -ge "$deadline" ]; then
         echo "API did not come up within ${READINESS_TIMEOUT_SECONDS}s" >&2
-        $COMPOSE -f "$COMPOSE_FILE" logs frontend | tail -50 >&2
+        $COMPOSE "${COMPOSE_FILES[@]}" logs frontend | tail -50 >&2
         exit 1
     fi
     sleep 10
@@ -177,10 +192,10 @@ done
 # do); only a refused connection means it is not up yet.
 echo "Waiting for the backend source server ..."
 deadline=$((SECONDS + READINESS_TIMEOUT_SECONDS))
-until $COMPOSE -f "$COMPOSE_FILE" exec -T frontend ruby -r net/http -e 'begin; Net::HTTP.get_response(URI("http://backend:5352/source")); rescue StandardError; exit(1); end' >/dev/null 2>&1; do
+until $COMPOSE "${COMPOSE_FILES[@]}" exec -T frontend ruby -r net/http -e 'begin; Net::HTTP.get_response(URI("http://backend:5352/source")); rescue StandardError; exit(1); end' >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
         echo "backend did not come up within ${READINESS_TIMEOUT_SECONDS}s" >&2
-        $COMPOSE -f "$COMPOSE_FILE" logs backend | tail -50 >&2
+        $COMPOSE "${COMPOSE_FILES[@]}" logs backend | tail -50 >&2
         exit 1
     fi
     sleep 10
