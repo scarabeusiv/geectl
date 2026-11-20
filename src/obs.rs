@@ -821,8 +821,23 @@ pub struct DeleteProjectOptions {
     pub comment: Option<String>,
 }
 
-/// Options for [`ObsClient::copy_package`]. All fields are optional:
-/// an unset revision means the latest, an unset flag means off.
+/// Options for [`ObsClient::aggregate_package`]. All fields are
+/// optional: an unset flag means off, an empty repository map means
+/// no repository mappings.
+#[derive(Debug, Clone, Default)]
+pub struct AggregateOptions {
+    /// Map source repositories to target repositories, as
+    /// (source, target) pairs: `<repository target="..." source="..."/>`
+    /// entries on the `_aggregate` file.
+    pub repository_map: Vec<(String, String)>,
+    /// Aggregate binaries only, not the sources. The server's
+    /// `<nosources/>`.
+    pub no_sources: bool,
+    /// Disable publishing of the aggregate package: a
+    /// `<publish><disable/></publish>` is added to the target meta.
+    pub disable_publish: bool,
+}
+
 /// Options for [`ObsClient::copy_package`]. All fields are optional:
 /// an unset revision means the latest, an unset flag means off.
 #[derive(Debug, Clone, Default)]
@@ -4467,6 +4482,213 @@ impl<'a> ObsClient<'a> {
                 format!("unexpected OBS undelete response for project {project}"),
             ))
         }
+    }
+
+    /// Aggregate a package's binaries into another package on OBS:
+    /// PUT an `_aggregate` file naming the source, and when the target
+    /// is new, copy the source package's meta to it first (without the
+    /// source's scmsync — an aggregate only cares about binaries, and
+    /// keeping the scmsync would block creating the `_aggregate`
+    /// file). Requires credentials; without them the call fails loudly
+    /// before any request. In dry-run the aggregate is recorded in the
+    /// plan and nothing is aggregated — the guard runs before the
+    /// credentials check, like `create_package`.
+    ///
+    /// An agent aggregates a package to ship another package's built
+    /// binaries under its own name (for example a -devel package
+    /// aggregating its base package's binaries): the target builds
+    /// nothing itself, it collects the source's binaries at build
+    /// time. The target meta is created from the source meta when the
+    /// target does not exist yet (or only exists through a project
+    /// link); an existing target keeps its own meta. An `_aggregate`
+    /// file that already exists is refused, before anything is
+    /// written — unlike the command-line client, which writes the
+    /// meta first and only then notices.
+    ///
+    /// The repository mapping is not validated here: the server marks
+    /// the aggregate broken at build time when a mapped repository
+    /// does not exist. A source and target that are the same package
+    /// are refused.
+    ///
+    /// Success is the revision document on the `_aggregate` PUT; any
+    /// other body is a server error, never success.
+    pub fn aggregate_package(
+        &self,
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+        options: &AggregateOptions,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [
+            ("project", source_project),
+            ("package", source_package),
+            ("project", target_project),
+            ("package", target_package),
+        ] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        for (source, target) in &options.repository_map {
+            for (label, value) in [("repository", source), ("repository", target)] {
+                if !valid_obs_name(value) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid OBS {label} name: {value:?}"),
+                    ));
+                }
+            }
+        }
+        if source_project == target_project && source_package == target_package {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "cannot aggregate a package into itself",
+            ));
+        }
+        // The dry-run guard: in dry-run the aggregate is recorded in
+        // the plan and nothing is aggregated — not even the
+        // credentials check runs.
+        if !dry_run.allow(&format!(
+            "aggregate package {source_project}/{source_package} into {target_project}/{target_package}{}",
+            aggregate_option_suffix(options),
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot aggregate a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let source_url = build_url(
+            &self.base,
+            &["source", source_project, source_package, "_meta"],
+            &[],
+        );
+        let source_meta = self.http.get_with(&source_url, &self.credentials)?;
+        let target_url = build_url(
+            &self.base,
+            &["source", target_project, target_package, "_meta"],
+            &[],
+        );
+        let target_meta = match self.http.get_with(&target_url, &self.credentials) {
+            Ok(meta) => Some(meta),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+        // The target meta is built from the source meta when the
+        // target does not exist yet, or when the target only exists
+        // through a project link (its meta names another project):
+        // the shadow must not supply the target's meta.
+        let (mut doc, put_meta) = match &target_meta {
+            Some(meta) => {
+                let doc = XmlDoc::parse(meta)?;
+                if doc.root_attr("project").as_deref() == Some(target_project) {
+                    (doc, false)
+                } else {
+                    (
+                        build_link_meta(&source_meta, target_project, target_package)?,
+                        true,
+                    )
+                }
+            }
+            None => (
+                build_link_meta(&source_meta, target_project, target_package)?,
+                true,
+            ),
+        };
+        if options.disable_publish {
+            doc.replace_or_insert_element("publish", "<publish><disable/></publish>")?;
+        }
+        // Refuse an existing `_aggregate` before writing anything:
+        // a refusal leaves nothing changed.
+        let aggregate_url = build_url(
+            &self.base,
+            &["source", target_project, target_package, "_aggregate"],
+            &[],
+        );
+        match self.http.get_with(&aggregate_url, &self.credentials) {
+            Ok(_) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "package {target_project}/{target_package} already has an _aggregate file"
+                    ),
+                ));
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        let rendered = doc.render();
+        if put_meta || target_meta.as_deref() != Some(rendered.as_str()) {
+            let body = self.http.put(&target_url, &rendered, &self.credentials)?;
+            if !parse_status_ok(&body) {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected OBS meta response for package {target_project}/{target_package}"
+                    ),
+                ));
+            }
+        }
+        let mut aggregate = format!(
+            "<aggregatelist><aggregate project=\"{source_project}\"><package>{source_package}</package>"
+        );
+        if options.no_sources {
+            aggregate.push_str("<nosources/>");
+        }
+        for (source, target) in &options.repository_map {
+            aggregate.push_str(&format!(
+                "<repository target=\"{target}\" source=\"{source}\"/>"
+            ));
+        }
+        aggregate.push_str("</aggregate></aggregatelist>");
+        let body = self
+            .http
+            .put_file(&aggregate_url, &aggregate, &self.credentials)?;
+        if parse_revision(&body).is_none() {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS aggregate response for package {target_project}/{target_package}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The option suffix for an aggregate plan line: the set options, in
+/// the order they appear in [`AggregateOptions`], so a dry-run plan
+/// reads what the aggregate would have done.
+fn aggregate_option_suffix(options: &AggregateOptions) -> String {
+    let mut flags: Vec<String> = Vec::new();
+    if options.no_sources {
+        flags.push("no sources".to_string());
+    }
+    if options.disable_publish {
+        flags.push("publish disabled".to_string());
+    }
+    if !options.repository_map.is_empty() {
+        flags.push(format!(
+            "{} repository mapping{}",
+            options.repository_map.len(),
+            if options.repository_map.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", flags.join(", "))
     }
 }
 
@@ -13375,6 +13597,369 @@ mod tests {
             .undelete_project("test:factory/pkg", &DryRun::new(false))
             .is_err());
         assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn aggregate_package_creates_from_source_meta() {
+        let source_meta = "<package name=\"srcpkg\" project=\"srcprj\"><title>Source</title><description>Source package</description><devel project=\"srcdevel\"/><person userid=\"alice\" role=\"maintainer\"/><lock><enable/></lock><scmsync>https://example.com#main</scmsync></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg/_meta",
+                source_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/dstprj/srcpkg/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/dstprj/srcpkg/_aggregate",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/dstprj/srcpkg/_meta",
+                "<status code=\"ok\"/>",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/dstprj/srcpkg/_aggregate",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .aggregate_package(
+                "srcprj",
+                "srcpkg",
+                "dstprj",
+                "srcpkg",
+                &AggregateOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 2);
+        // The target meta is built from the source meta: the devel,
+        // person, lock, and scmsync entries are stripped, the project
+        // and name are set.
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"srcpkg\" project=\"dstprj\"><title>Source</title><description>Source package</description></package>"
+        );
+        assert_eq!(
+            puts[1].1,
+            "<aggregatelist><aggregate project=\"srcprj\"><package>srcpkg</package></aggregate></aggregatelist>"
+        );
+    }
+
+    #[test]
+    fn aggregate_package_rename() {
+        let source_meta = "<package name=\"srcpkg\" project=\"srcprj\"><title>Source</title><description>Source package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg/_meta",
+                source_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_aggregate",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_meta",
+                "<status code=\"ok\"/>",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_aggregate",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .aggregate_package(
+                "srcprj",
+                "srcpkg",
+                "dstprj",
+                "dstpkg",
+                &AggregateOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 2);
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"dstpkg\" project=\"dstprj\"><title>Source</title><description>Source package</description></package>"
+        );
+        assert_eq!(
+            puts[1].1,
+            "<aggregatelist><aggregate project=\"srcprj\"><package>srcpkg</package></aggregate></aggregatelist>"
+        );
+    }
+
+    #[test]
+    fn aggregate_package_same_source_and_target_is_refused() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .aggregate_package(
+                "srcprj",
+                "srcpkg",
+                "srcprj",
+                "srcpkg",
+                &AggregateOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn aggregate_package_refuses_an_existing_aggregate() {
+        let source_meta = "<package name=\"srcpkg\" project=\"srcprj\"><title>Source</title><description>Source package</description></package>";
+        let target_meta = "<package name=\"dstpkg\" project=\"dstprj\"><title>Target</title><description>Target package</description></package>";
+        let aggregate = "<aggregatelist><aggregate project=\"srcprj\"><package>srcpkg</package></aggregate></aggregatelist>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg/_meta",
+                source_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_meta",
+                target_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_aggregate",
+                aggregate,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .aggregate_package(
+                "srcprj",
+                "srcpkg",
+                "dstprj",
+                "dstpkg",
+                &AggregateOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The refusal happens before anything is written.
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn aggregate_package_keeps_an_existing_target_meta() {
+        let source_meta = "<package name=\"srcpkg\" project=\"srcprj\"><title>Source</title><description>Source package</description></package>";
+        let target_meta = "<package name=\"dstpkg\" project=\"dstprj\"><title>Target</title><description>Target package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg/_meta",
+                source_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_meta",
+                target_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_aggregate",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_aggregate",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .aggregate_package(
+                "srcprj",
+                "srcpkg",
+                "dstprj",
+                "dstpkg",
+                &AggregateOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        // Only the _aggregate is PUT: the existing meta is kept.
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            "<aggregatelist><aggregate project=\"srcprj\"><package>srcpkg</package></aggregate></aggregatelist>"
+        );
+    }
+
+    #[test]
+    fn aggregate_package_disable_publish_adds_publish_disable() {
+        let source_meta = "<package name=\"srcpkg\" project=\"srcprj\"><title>Source</title><description>Source package</description></package>";
+        let target_meta = "<package name=\"dstpkg\" project=\"dstprj\"><title>Target</title><description>Target package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg/_meta",
+                source_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_meta",
+                target_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_aggregate",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_meta",
+                "<status code=\"ok\"/>",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/dstprj/dstpkg/_aggregate",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = AggregateOptions {
+            disable_publish: true,
+            ..AggregateOptions::default()
+        };
+        assert!(client
+            .aggregate_package(
+                "srcprj",
+                "srcpkg",
+                "dstprj",
+                "dstpkg",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 2);
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"dstpkg\" project=\"dstprj\"><title>Target</title><description>Target package</description><publish><disable/></publish></package>"
+        );
+    }
+
+    #[test]
+    fn aggregate_package_no_sources_and_repository_map_shape_the_document() {
+        let source_meta = "<package name=\"srcpkg\" project=\"srcprj\"><title>Source</title><description>Source package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg/_meta",
+                source_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/dstprj/srcpkg/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/dstprj/srcpkg/_aggregate",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/dstprj/srcpkg/_meta",
+                "<status code=\"ok\"/>",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/dstprj/srcpkg/_aggregate",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = AggregateOptions {
+            repository_map: vec![
+                ("standard".to_string(), "distro".to_string()),
+                ("images".to_string(), "images".to_string()),
+            ],
+            no_sources: true,
+            ..AggregateOptions::default()
+        };
+        assert!(client
+            .aggregate_package(
+                "srcprj",
+                "srcpkg",
+                "dstprj",
+                "srcpkg",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 2);
+        assert_eq!(
+            puts[1].1,
+            "<aggregatelist><aggregate project=\"srcprj\"><package>srcpkg</package><nosources/><repository target=\"distro\" source=\"standard\"/><repository target=\"images\" source=\"images\"/></aggregate></aggregatelist>"
+        );
+    }
+
+    #[test]
+    fn aggregate_package_dry_run_records_plan_and_aggregates_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = AggregateOptions {
+            repository_map: vec![("standard".to_string(), "distro".to_string())],
+            no_sources: true,
+            ..AggregateOptions::default()
+        };
+        assert!(client
+            .aggregate_package("srcprj", "srcpkg", "dstprj", "srcpkg", &options, &dry_run,)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: aggregate package srcprj/srcpkg into dstprj/srcpkg (no sources, 1 repository mapping)".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn aggregate_package_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/srcprj/srcpkg/_meta",
+            "<package name=\"srcpkg\" project=\"srcprj\"><title>Source</title><description>Source package</description></package>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .aggregate_package(
+                "srcprj",
+                "srcpkg",
+                "dstprj",
+                "srcpkg",
+                &AggregateOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn aggregate_package_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .aggregate_package(
+                "srcprj",
+                "srcpkg",
+                "dstprj",
+                "dst/pkg",
+                &AggregateOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        let options = AggregateOptions {
+            repository_map: vec![("bad/name".to_string(), "distro".to_string())],
+            ..AggregateOptions::default()
+        };
+        assert!(client
+            .aggregate_package(
+                "srcprj",
+                "srcpkg",
+                "dstprj",
+                "dstpkg",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]

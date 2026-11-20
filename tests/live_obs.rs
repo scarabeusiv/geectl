@@ -68,10 +68,10 @@ use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::{
-    BranchOptions, CopyOptions, CopyProjectOptions, DeleteProjectOptions, DryRun,
-    FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision, ObsClient, PackageDiffStatus,
-    Request, RequestAction, RequestSearch, RequestState, ReviewState, ReviewTarget,
-    RevisionRange, SourceUpdate, SrFiling, SrPayload,
+    AggregateOptions, BranchOptions, CopyOptions, CopyProjectOptions, DeleteProjectOptions,
+    DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision, ObsClient,
+    PackageDiffStatus, Request, RequestAction, RequestSearch, RequestState, ReviewState,
+    ReviewTarget, RevisionRange, SourceUpdate, SrFiling, SrPayload,
 };
 
 /// Whether `url` points at a loopback host.
@@ -2856,6 +2856,125 @@ fn live_undelete_project() {
         spec.contains("Name: live-test"),
         "the package sources are back after the restore; spec: {spec}"
     );
+}
+
+/// The `aggregate_package` operation aggregates a package into a
+/// fresh target package: the `_aggregate` file and the target meta
+/// are read back from the server.
+#[test]
+fn live_aggregate_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, _filename, _content) = setup_copy_source(&client);
+    let target_project = format!("geectl-tmp-agg-{}", unique_suffix());
+    client
+        .create_project(
+            &target_project,
+            "geectl live test aggregate target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create aggregate target project on the live instance");
+    client
+        .aggregate_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &AggregateOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("aggregate a package on the live instance");
+    let aggregate = read_file(&base, &target_project, &package, "_aggregate");
+    assert!(aggregate.contains(&format!("<aggregate project=\"{source_project}\">")));
+    assert!(aggregate.contains(&format!("<package>{package}</package>")));
+    let meta = read_meta(&base, &target_project, &package);
+    assert!(meta.contains(&format!("name=\"{package}\"")));
+    assert!(meta.contains(&format!("project=\"{target_project}\"")));
+    assert!(!meta.contains("scmsync"));
+}
+
+/// The `aggregate_package` operation aggregates into a renamed
+/// target package: the `_aggregate` still names the source package,
+/// the target meta carries the new name.
+#[test]
+fn live_aggregate_package_rename() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, _filename, _content) = setup_copy_source(&client);
+    let target_project = format!("geectl-tmp-agg-{}", unique_suffix());
+    client
+        .create_project(
+            &target_project,
+            "geectl live test aggregate target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create aggregate target project on the live instance");
+    let target_package = format!("{package}-agg");
+    client
+        .aggregate_package(
+            &source_project,
+            &package,
+            &target_project,
+            &target_package,
+            &AggregateOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("aggregate a package under a new name on the live instance");
+    let aggregate = read_file(&base, &target_project, &target_package, "_aggregate");
+    assert!(aggregate.contains(&format!("<aggregate project=\"{source_project}\">")));
+    assert!(aggregate.contains(&format!("<package>{package}</package>")));
+    let meta = read_meta(&base, &target_project, &target_package);
+    assert!(meta.contains(&format!("name=\"{target_package}\"")));
+}
+
+/// Aggregating a second time into a package that already has an
+/// `_aggregate` file is refused and leaves the file unchanged.
+#[test]
+fn live_aggregate_package_refuses_existing() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, _filename, _content) = setup_copy_source(&client);
+    let target_project = format!("geectl-tmp-agg-{}", unique_suffix());
+    client
+        .create_project(
+            &target_project,
+            "geectl live test aggregate target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create aggregate target project on the live instance");
+    client
+        .aggregate_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &AggregateOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("aggregate a package on the live instance");
+    let first = read_file(&base, &target_project, &package, "_aggregate");
+    let err = client
+        .aggregate_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &AggregateOptions::default(),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    let second = read_file(&base, &target_project, &package, "_aggregate");
+    assert_eq!(second, first);
 }
 
 #[cfg(test)]
