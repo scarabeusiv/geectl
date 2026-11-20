@@ -628,6 +628,55 @@ fn temporal_accept_deletes_source_branch_on_server() {
     wait_until_present(&base, &format!("{target_project}/{package}"));
 }
 
+/// The content of a file in a package, read back from the server. The
+/// library has no read-a-file operation (an agent uploads files; reading
+/// one back is test verification), so the harness reads it through
+/// geectl's own HTTP client with the admin credentials.
+fn file_content(base: &str, project: &str, package: &str, filename: &str) -> String {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    http.get_with(
+        &format!("{base}/source/{project}/{package}/{filename}"),
+        &temporal_credentials(),
+    )
+    .expect("GET the uploaded file back from the server")
+}
+
+/// Upload a file through geectl and read it back from the server,
+/// asserting the bytes the server holds are the ones uploaded. The
+/// upload returns the new revision number: the first upload to a fresh
+/// package is revision 1.
+#[test]
+fn temporal_upload_file_reads_back_on_server() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let package = temporal_package();
+    let source_project = create_source_branch(&client, &package);
+    let content = "Name: geectl-temporal-pkg\nVersion: 1.0\n";
+    let rev = client
+        .upload_file(
+            &source_project,
+            &package,
+            "geectl-temporal-pkg.spec",
+            content,
+            &DryRun::new(false),
+        )
+        .expect("upload a spec file to the temporal instance");
+    assert_eq!(
+        rev,
+        Some(1),
+        "first upload to a fresh package is revision 1"
+    );
+    let body = file_content(&base, &source_project, &package, "geectl-temporal-pkg.spec");
+    assert_eq!(
+        body, content,
+        "the file the server holds must be the uploaded content"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
