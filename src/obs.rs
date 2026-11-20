@@ -3298,6 +3298,167 @@ impl<'a> ObsClient<'a> {
         query
     }
 
+    /// Refuse a credentialed build read without OBS Basic
+    /// credentials, before any request: every `/build` endpoint
+    /// requires Basic authentication, so a call without credentials
+    /// would 401 — a failed lookup must fail closed, never read as
+    /// "no build state".
+    fn require_build_credentials(&self) -> Result<(), GeectlError> {
+        if self.has_basic() {
+            return Ok(());
+        }
+        Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            "reading build state requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+        ))
+    }
+
+    /// The build-results URL for `project` and `query`: `GET
+    /// /build/<project>/_result` with the query's filters, in a fixed
+    /// order (package, repositories, architectures, code, multibuild,
+    /// locallink, lastbuild, oldstate).
+    fn results_url(&self, project: &str, query: &ResultsQuery) -> String {
+        let mut pairs: Vec<(&str, &str)> = Vec::new();
+        if let Some(package) = &query.package {
+            pairs.push(("package", package));
+        }
+        for repository in &query.repositories {
+            pairs.push(("repository", repository));
+        }
+        for arch in &query.arches {
+            pairs.push(("arch", arch));
+        }
+        if let Some(code) = &query.code {
+            pairs.push(("code", code));
+        }
+        if query.multibuild {
+            pairs.push(("multibuild", "1"));
+        }
+        if query.locallink {
+            pairs.push(("locallink", "1"));
+        }
+        if query.lastbuild {
+            pairs.push(("lastbuild", "1"));
+        }
+        if let Some(oldstate) = &query.oldstate {
+            pairs.push(("oldstate", oldstate));
+        }
+        build_url(&self.base, &["build", project, "_result"], &pairs)
+    }
+
+    /// The build results for `project`: one entry per
+    /// repository/architecture cell, each with the per-package build
+    /// codes. The query filters by package, repository, architecture,
+    /// or package build code; `multibuild` + `locallink` expand
+    /// multibuild flavors into their own statuses, which is the
+    /// per-package form. A package-filtered query omits a filtered
+    /// package with no status instead of reporting it `unknown` (a
+    /// server-side typo in `getresult`), so a never-scheduled
+    /// package silently drops out of a filtered read. A filtered
+    /// [`ObsClient::wait_for_results`] does not treat that absence as
+    /// settled: it keeps polling until the package appears or the
+    /// deadline passes.
+    /// Requires OBS Basic credentials. That is a client policy, not
+    /// something the endpoint forces: the endpoint allows anonymous
+    /// reads when the instance permits them, so without credentials
+    /// the call fails closed instead of reading anonymously.
+    /// A failed lookup is an error, never an empty matrix.
+    pub fn results(
+        &self,
+        project: &str,
+        query: &ResultsQuery,
+    ) -> Result<BuildResults, GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        if let Some(package) = &query.package {
+            if !valid_obs_name(package) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name: {package:?}"),
+                ));
+            }
+        }
+        for (label, values) in [
+            ("repository", &query.repositories),
+            ("architecture", &query.arches),
+        ] {
+            for value in values {
+                if !valid_obs_name(value) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid OBS {label} name: {value:?}"),
+                    ));
+                }
+            }
+        }
+        if let Some(oldstate) = &query.oldstate {
+            if oldstate.is_empty() {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "invalid OBS results state hash: empty oldstate".to_string(),
+                ));
+            }
+        }
+        self.require_build_credentials()?;
+        let url = self.results_url(project, query);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_build_results(&body)
+    }
+
+    /// Poll the build results for `project` until they settle — no
+    /// cell dirty, no cell or package in a waiting state (`blocked`,
+    /// `scheduled`, `dispatching`, `building`, `signing`, `finished`)
+    /// — or `deadline` passes. With a package filter, the package
+    /// must also appear in the matrix: a never-scheduled package drops
+    /// out of a filtered read, and that absence is not settled, so the
+    /// poll keeps going until the package appears or the deadline
+    /// passes. The poll reads the matrix every two seconds (less when
+    /// the deadline is nearer, so a sleep never overshoots it); it
+    /// deliberately does not send `oldstate`, even though
+    /// the server holds an unchanged `oldstate` reply for up to five
+    /// minutes: past the transport's 30-second read timeout, so an
+    /// `oldstate` poll would time out instead of settling. Plain
+    /// polling keeps the deadline honest; use
+    /// `ResultsQuery.oldstate` with [`ObsClient::results`] directly
+    /// for a hand-rolled long poll. On a deadline the error is a
+    /// timeout: call [`ObsClient::results`] again for the current
+    /// state instead of assuming.
+    pub fn wait_for_results(
+        &self,
+        project: &str,
+        query: &ResultsQuery,
+        deadline: std::time::Duration,
+    ) -> Result<BuildResults, GeectlError> {
+        // Plain polling only: a caller-set `oldstate` would make the
+        // server hold an unchanged reply for up to five minutes, past
+        // the transport's read timeout.
+        let query = ResultsQuery {
+            oldstate: None,
+            ..query.clone()
+        };
+        let start = std::time::Instant::now();
+        loop {
+            let fetched = self.results(project, &query)?;
+            if results_settled(&fetched, query.package.as_deref()) {
+                return Ok(fetched);
+            }
+            if start.elapsed() >= deadline {
+                return Err(GeectlError::new(
+                    ErrorKind::Timeout,
+                    format!("build results for {project} did not settle within {deadline:?}"),
+                ));
+            }
+            // Sleep at most two seconds, and never past the deadline:
+            // a fixed sleep would overshoot a near deadline.
+            let remaining = deadline.saturating_sub(start.elapsed());
+            std::thread::sleep(std::cmp::min(std::time::Duration::from_secs(2), remaining));
+        }
+    }
+
     /// Build the OBS search URL for open submit requests targeting
     /// `package`. The match expression is XPath over the request XML;
     /// the submit restriction is applied client-side in
@@ -7522,6 +7683,229 @@ fn validate_request_id(id: &str) -> Result<u64, GeectlError> {
     Ok(number)
 }
 
+/// The build-results matrix for a project: one entry per
+/// repository/architecture cell, plus the state hash for polling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildResults {
+    /// The state hash: pass it back as [`ResultsQuery::oldstate`] to
+    /// poll for changes. None when the server sent no state.
+    pub state: Option<String>,
+    /// One entry per repository/architecture cell.
+    pub results: Vec<BuildResult>,
+}
+
+/// One repository/architecture cell of a build-results matrix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildResult {
+    /// The project the cell belongs to.
+    pub project: String,
+    /// The repository the cell belongs to.
+    pub repository: String,
+    /// The architecture the cell belongs to.
+    pub arch: String,
+    /// The cell's build state (`published`, `broken`, `blocked`,
+    /// `scheduling`, ...). This is the authoritative state; `state`
+    /// is its legacy name.
+    pub code: String,
+    /// The legacy name of `code`, still sent by the server; equal to
+    /// `code` when the server omits it.
+    pub state: String,
+    /// The cell is marked for re-scheduling: its state may already be
+    /// stale. A result is settled only once no cell is dirty.
+    pub dirty: bool,
+    /// The server's detail text for the cell (e.g. why a repository
+    /// is `broken`), if any.
+    pub details: Option<String>,
+    /// The per-package build codes in this cell.
+    pub statuses: Vec<PackageBuildStatus>,
+}
+
+/// One package's build code inside a [`BuildResult`] cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageBuildStatus {
+    /// The package.
+    pub package: String,
+    /// The package's build code (`succeeded`, `failed`,
+    /// `unresolvable`, `disabled`, ...).
+    pub code: String,
+    /// The server's detail text for the package (e.g. the missing
+    /// dependency for an `unresolvable` package), if any.
+    pub details: Option<String>,
+}
+
+/// Query options for [`ObsClient::results`]. Every field is an
+/// optional filter; an empty query returns the whole project's
+/// matrix. `multibuild` + `locallink` are the per-package form: they
+/// expand multibuild flavors into their own statuses, which is what
+/// an agent asking about one package wants.
+#[derive(Debug, Default, Clone)]
+pub struct ResultsQuery {
+    /// Only this package's statuses (the repository/architecture
+    /// cells still come back whole).
+    pub package: Option<String>,
+    /// Only these repositories (one `repository` pair per entry).
+    pub repositories: Vec<String>,
+    /// Only these architectures (one `arch` pair per entry).
+    pub arches: Vec<String>,
+    /// Only packages with this build code (e.g. `failed`). The
+    /// filter applies to each package's code, not to the
+    /// repository/architecture cell's state.
+    pub code: Option<String>,
+    /// Expand multibuild flavors into their own statuses. Older
+    /// servers without multibuild support reject the query; geectl
+    /// does not fall back to a plain query.
+    pub multibuild: bool,
+    /// Follow local links when expanding multibuild flavors.
+    pub locallink: bool,
+    /// The last build's results instead of the current state.
+    pub lastbuild: bool,
+    /// Poll for changes since this state hash (from a previous
+    /// [`BuildResults::state`]); set it only to poll by hand. A hand
+    /// poll with `oldstate` may time out at the transport level when
+    /// the state does not change within the read timeout: the server
+    /// holds the reply for up to five minutes.
+    pub oldstate: Option<String>,
+}
+
+/// Build states that are still in flight: a cell or a package in one
+/// of these states — or a cell marked dirty — means the build has not
+/// settled yet. The set is exactly the waiting set the reference
+/// client's `--watch` loop polls on.
+const WAITING_BUILD_CODES: [&str; 6] = [
+    "blocked",
+    "scheduled",
+    "dispatching",
+    "building",
+    "signing",
+    "finished",
+];
+
+/// True when no cell is dirty and no cell or package sits in a
+/// waiting state: the build has settled. With `package`, the package
+/// must also appear in the matrix: a package-filtered read drops a
+/// never-scheduled package instead of reporting it `unknown`, so
+/// absence is not settled — the wait keeps polling until the package
+/// appears or the deadline passes. Without a filter, an empty matrix
+/// (a project with no repositories) is settled.
+fn results_settled(results: &BuildResults, package: Option<&str>) -> bool {
+    if let Some(package) = package {
+        if !results
+            .results
+            .iter()
+            .flat_map(|result| result.statuses.iter())
+            .any(|status| status.package == package)
+        {
+            return false;
+        }
+    }
+    results.results.iter().all(|result| {
+        !result.dirty
+            && !WAITING_BUILD_CODES.contains(&result.code.as_str())
+            && result
+                .statuses
+                .iter()
+                .all(|status| !WAITING_BUILD_CODES.contains(&status.code.as_str()))
+    })
+}
+
+/// Parse a `<resultlist>` document into typed build results. A
+/// document that is not a resultlist — or a `<result>` / `<status>`
+/// missing a required attribute — is a server error, never an empty
+/// matrix: a failed lookup must not read as "nothing is building".
+pub(crate) fn parse_build_results(body: &str) -> Result<BuildResults, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS build results response: not a <resultlist> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<resultlist") else {
+        return Err(malformed());
+    };
+    // The tag name must end here: `<resultlistx>` is not a resultlist.
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_open) else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    let state = xml_attr(open_tag, "state");
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<resultlist .../>`: a project with no
+        // repositories, so no cells.
+        return Ok(BuildResults {
+            state,
+            results: Vec::new(),
+        });
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</resultlist>") else {
+        return Err(malformed());
+    };
+    // Nothing but whitespace may follow the closing tag.
+    if !inner[close + "</resultlist>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut results = Vec::new();
+    for element in xml_elements(inner, "result")? {
+        let (tag, content) = xml_split_element(element, "result");
+        let required = |name: &str| {
+            xml_attr(tag, name).ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("unexpected OBS build results response: <result> without {name}"),
+                )
+            })
+        };
+        let project = required("project")?;
+        let repository = required("repository")?;
+        let arch = required("arch")?;
+        let code = required("code")?;
+        let state = xml_attr(tag, "state").unwrap_or_else(|| code.clone());
+        let dirty = xml_attr(tag, "dirty").as_deref() == Some("true");
+        let details = xml_attr(tag, "details");
+        let mut statuses = Vec::new();
+        for status_element in xml_elements(content, "status")? {
+            let (status_tag, status_content) = xml_split_element(status_element, "status");
+            let package = xml_attr(status_tag, "package").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS build results response: <status> without package",
+                )
+            })?;
+            let code = xml_attr(status_tag, "code").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS build results response: <status> without code",
+                )
+            })?;
+            let details = xml_element_text(status_content, "details");
+            statuses.push(PackageBuildStatus {
+                package,
+                code,
+                details,
+            });
+        }
+        results.push(BuildResult {
+            project,
+            repository,
+            arch,
+            code,
+            state,
+            dirty,
+            details,
+            statuses,
+        });
+    }
+    Ok(BuildResults { state, results })
+}
+
 /// What OBS does with the source branch when a submit request is
 /// accepted. The values are exactly the server's
 /// `BsRequestAction::VALID_SOURCEUPDATE_OPTIONS`; anything else is
@@ -8575,6 +8959,183 @@ fn action_types(xml: &str) -> Result<Vec<String>, GeectlError> {
         rest = &after_tag[end..];
     }
     Ok(types)
+}
+
+/// Read the value of attribute `name` in an opening tag's text (the
+/// text between `<tag` and `>`). Either quote style works, and the
+/// attribute name must stand on its own — `valid="..."` must not match
+/// a lookup for `id` — so the character before the name has to be
+/// whitespace. None when the attribute is absent or unquoted. The
+/// value is XML-unescaped: an attribute the server sent as
+/// `details="a &amp; b"` reads as `a & b`.
+/// The index of the first `>` in `s` that is not inside a quoted
+/// attribute value, if any. A `>` inside a value (e.g. in a `details`
+/// attribute) does not end the tag; scanning for it naively would
+/// truncate the tag and drop the attributes after it.
+fn find_tag_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+        } else if b == b'>' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn xml_attr(element: &str, name: &str) -> Option<String> {
+    // Quote-aware: a `name=` inside an earlier attribute's value
+    // (e.g. `details="x dirty=y"`) must not match. The scan tracks
+    // whether it is inside a quoted value and only matches outside
+    // one. The match position is always an ASCII byte (the first byte
+    // of the ASCII needle), so the slicing below stays on UTF-8
+    // boundaries.
+    let needle = format!("{name}=");
+    let bytes = element.as_bytes();
+    let first = needle.as_bytes()[0];
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == first
+            && element[i..].starts_with(&needle)
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+        {
+            let after_eq = &element[i + needle.len()..];
+            let quote = after_eq.chars().next()?;
+            if quote != '"' && quote != '\'' {
+                return None;
+            }
+            let close = after_eq[1..].find(quote)?;
+            return Some(xml_unescape(&after_eq[1..1 + close]));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The text between `<name>` and `</name>` in `body` (first
+/// occurrence), trimmed and XML-unescaped. The opening tag may carry
+/// attributes (`<name lang="en">`); a `<namex>` prefix name is
+/// skipped, not read as `<name>`. None when the element is absent or
+/// unterminated. A self-closing `<name/>` carries no text, so it
+/// reads as None.
+fn xml_element_text(body: &str, name: &str) -> Option<String> {
+    let open_marker = format!("<{name}");
+    let close_marker = format!("</{name}>");
+    let mut offset = 0;
+    while offset < body.len() {
+        let rest = &body[offset..];
+        let pos = rest.find(&open_marker)?;
+        let after_tag = &rest[pos + open_marker.len()..];
+        let first = after_tag.chars().next()?;
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            offset += pos + open_marker.len();
+            continue;
+        }
+        let end = find_tag_end(after_tag)?;
+        let tag = &after_tag[..end];
+        if tag.trim_end().ends_with('/') {
+            // Self-closing: no text.
+            return None;
+        }
+        let start = offset + pos + open_marker.len() + end + 1;
+        let end = body[start..].find(&close_marker)?;
+        let end = end + start;
+        return Some(xml_unescape(body[start..end].trim()));
+    }
+    None
+}
+
+/// Each occurrence of element `name` in `body`, as its full text
+/// including the tags. The tag name must end at whitespace, `/`, or
+/// `>` (so `<resultlist>` never matches a search for `<result`).
+/// An unterminated element is a server error: the scan fails instead
+/// of returning the partial list, so a truncated document never reads
+/// as a smaller matrix.
+fn xml_elements<'a>(body: &'a str, name: &str) -> Result<Vec<&'a str>, GeectlError> {
+    let unterminated = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS response: unterminated <{name}> element"),
+        )
+    };
+    let mut out = Vec::new();
+    let mut offset = 0;
+    let open_marker = format!("<{name}");
+    let close_marker = format!("</{name}>");
+    while offset < body.len() {
+        let rest = &body[offset..];
+        let Some(pos) = rest.find(&open_marker) else {
+            break;
+        };
+        let after_tag = &rest[pos + open_marker.len()..];
+        let Some(first) = after_tag.chars().next() else {
+            return Err(unterminated());
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            offset += pos + open_marker.len();
+            continue;
+        }
+        let Some(end) = find_tag_end(after_tag) else {
+            return Err(unterminated());
+        };
+        let tag = &after_tag[..end];
+        let elem_start = offset + pos;
+        if tag.trim_end().ends_with('/') {
+            // Self-closing: the element is just the tag.
+            out.push(&body[elem_start..elem_start + open_marker.len() + end + 1]);
+            offset = elem_start + open_marker.len() + end + 1;
+            continue;
+        }
+        let Some(close) = after_tag[end + 1..].find(&close_marker) else {
+            return Err(unterminated());
+        };
+        let full_end = end + 1 + close + close_marker.len();
+        out.push(&body[elem_start..elem_start + open_marker.len() + full_end]);
+        offset = elem_start + open_marker.len() + full_end;
+    }
+    Ok(out)
+}
+
+/// Split a full element text (`<name ...>...</name>` or `<name .../>`,
+/// as returned by [`xml_elements`]) into its opening tag (without the
+/// brackets) and its inner content. The inner content is empty for a
+/// self-closing element.
+fn xml_split_element<'a>(element: &'a str, name: &str) -> (&'a str, &'a str) {
+    let after_lt = element.strip_prefix('<').unwrap_or(element);
+    let Some(end) = find_tag_end(after_lt) else {
+        return (after_lt, "");
+    };
+    let tag = &after_lt[..end];
+    if tag.trim_end().ends_with('/') {
+        return (tag, "");
+    }
+    let inner = &after_lt[end + 1..];
+    let close_marker = format!("</{name}>");
+    let inner = inner.strip_suffix(&close_marker).unwrap_or(inner);
+    (tag, inner)
 }
 
 /// Escape text for an XML element or attribute value.
@@ -11513,6 +12074,7 @@ mod tests {
     /// sent, and (for POST) the body.
     struct FakeHttp {
         gets: RefCell<HashMap<String, String>>,
+        get_sequences: RefCell<HashMap<String, VecDeque<String>>>,
         get_errors: RefCell<HashMap<String, ErrorKind>>,
         posts: RefCell<HashMap<String, String>>,
         post_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
@@ -11529,6 +12091,7 @@ mod tests {
         fn new() -> Self {
             FakeHttp {
                 gets: RefCell::new(HashMap::new()),
+                get_sequences: RefCell::new(HashMap::new()),
                 get_errors: RefCell::new(HashMap::new()),
                 posts: RefCell::new(HashMap::new()),
                 post_errors: RefCell::new(HashMap::new()),
@@ -11549,6 +12112,16 @@ mod tests {
             self
         }
 
+        /// Answer successive GETs of `url` with `bodies` in order;
+        /// once the queue is empty, the plain canned response (if
+        /// any) answers.
+        fn with_get_sequence(self, url: &str, bodies: &[&str]) -> Self {
+            self.get_sequences.borrow_mut().insert(
+                url.to_string(),
+                bodies.iter().map(|body| body.to_string()).collect(),
+            );
+            self
+        }
         fn with_get_error(self, url: &str, kind: ErrorKind) -> Self {
             self.get_errors.borrow_mut().insert(url.to_string(), kind);
             self
@@ -11634,6 +12207,14 @@ mod tests {
                     kind,
                     format!("canned GET error for {url}"),
                 ));
+            }
+            if let Some(body) = self
+                .get_sequences
+                .borrow_mut()
+                .get_mut(url)
+                .and_then(|queue| queue.pop_front())
+            {
+                return Ok(body);
             }
             self.gets.borrow().get(url).cloned().ok_or_else(|| {
                 GeectlError::new(
@@ -21671,6 +22252,271 @@ description</description>
         );
     }
 
+    // --- xml helpers ---
+
+    #[test]
+    fn xml_attr_reads_either_quote_style_and_requires_a_standalone_name() {
+        assert_eq!(
+            xml_attr("project=\"foo\" repository='bar'", "project"),
+            Some("foo".to_string())
+        );
+        assert_eq!(
+            xml_attr("project=\"foo\" repository='bar'", "repository"),
+            Some("bar".to_string())
+        );
+        // `valid="..."` must not match a lookup for `id`.
+        assert_eq!(
+            xml_attr("valid=\"1\" id=\"42\"", "id"),
+            Some("42".to_string())
+        );
+        assert_eq!(xml_attr("valid=\"1\"", "id"), None);
+        // Unquoted values are not read.
+        assert_eq!(xml_attr("code=failed", "code"), None);
+        // Missing attribute is None.
+        assert_eq!(xml_attr("code=\"failed\"", "state"), None);
+    }
+
+    #[test]
+    fn xml_unescape_decodes_entities_and_leaves_unknown_ones() {
+        assert_eq!(xml_unescape("a &amp; b"), "a & b");
+        assert_eq!(xml_unescape("&lt;tag&gt; &quot;x&quot;"), "<tag> \"x\"");
+        assert_eq!(xml_unescape("&#65;&#x42;"), "AB");
+        assert_eq!(xml_unescape("a &nosuch; b"), "a &nosuch; b");
+        assert_eq!(xml_unescape("a &amp;amp; b"), "a &amp; b");
+        assert_eq!(xml_unescape("plain"), "plain");
+        assert_eq!(xml_unescape("a & b"), "a & b");
+    }
+
+    #[test]
+    fn xml_attr_ignores_a_name_inside_an_earlier_quoted_value() {
+        // `dirty=` inside the details value must not match: the real
+        // `dirty` attribute follows it.
+        assert_eq!(
+            xml_attr("details=\"x dirty=y\" dirty=\"true\"", "dirty"),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            xml_attr("details=\"code=failed\" code=\"building\"", "code"),
+            Some("building".to_string())
+        );
+    }
+
+    #[test]
+    fn xml_elements_ignores_a_gt_inside_a_quoted_value() {
+        let body = "<resultlist><result project=\"a\" code=\"broken\" details=\"a > b\" dirty=\"true\"/><result project=\"b\" code=\"published\"/></resultlist>";
+        let found = xml_elements(body, "result").unwrap();
+        assert_eq!(found.len(), 2);
+        let (tag, _) = xml_split_element(found[0], "result");
+        assert_eq!(xml_attr(tag, "dirty").as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn xml_unescape_decodes_uppercase_hex_references() {
+        assert_eq!(xml_unescape("&#X41;&#x42;"), "AB");
+    }
+
+    #[test]
+    fn xml_elements_finds_full_elements_and_ignores_prefix_names() {
+        let body = "<resultlist><result project=\"a\"/><resultlistx/><result project=\"b\">x</result></resultlist>";
+        let found = xml_elements(body, "result").unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0], "<result project=\"a\"/>");
+        assert_eq!(found[1], "<result project=\"b\">x</result>");
+        assert!(xml_elements(body, "status").unwrap().is_empty());
+    }
+
+    #[test]
+    fn xml_elements_rejects_an_unterminated_element() {
+        // An element with no closing tag is a server error, not a
+        // shorter list: a truncated document must never read as a
+        // smaller matrix.
+        // A complete element followed by an unterminated one is an
+        // error, not a one-element list.
+        assert!(xml_elements("<result project=\"a\"/><result project=\"b\">x", "result").is_err());
+        assert!(xml_elements("<resultlist><result project=\"a\"", "result").is_err());
+        assert!(xml_elements("<resultlist><result project=\"a\">x", "result").is_err());
+    }
+
+    #[test]
+    fn xml_element_text_reads_an_attributed_open_tag() {
+        assert_eq!(
+            xml_element_text("<summary lang=\"en\">hello</summary>", "summary").as_deref(),
+            Some("hello")
+        );
+        assert_eq!(xml_element_text("<name attr=\"x\"/>", "name"), None);
+        assert_eq!(
+            xml_element_text("<namex>no</namex><name>yes</name>", "name").as_deref(),
+            Some("yes")
+        );
+    }
+
+    // --- parse_build_results ---
+
+    const RESULTS_FIXTURE: &str = "<resultlist state=\"f1cfebfd13354bcb8e792cb85f6218d8\">\n  <result project=\"testproject\" repository=\"openSUSE_Leap_42.3\" arch=\"x86_64\" code=\"published\" state=\"published\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n  <result project=\"testproject\" repository=\"openSUSE_Leap_15.0\" arch=\"x86_64\" code=\"published\" state=\"published\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n  <result project=\"testproject\" repository=\"SLE_12_SP4\" arch=\"x86_64\" code=\"published\" state=\"published\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n  <result project=\"testproject\" repository=\"SLE_12_SP3\" arch=\"x86_64\" code=\"published\" state=\"published\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n</resultlist>";
+
+    const RESULTS_DIRTY_FIXTURE: &str = "<resultlist state=\"c57e2ee592dbbf26ebf19cc4f1bc1e83\">\n  <result project=\"testproject\" repository=\"openSUSE_Leap_42.3\" arch=\"x86_64\" code=\"published\" state=\"published\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n  <result project=\"testproject\" repository=\"openSUSE_Leap_15.0\" arch=\"x86_64\" code=\"broken\" state=\"broken\" details=\"repository 'inheritedproject/openSUSE_Leap_15.0' is unavailable\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n  <result project=\"testproject\" repository=\"SLE_12_SP4\" arch=\"x86_64\" code=\"publishing\" state=\"publishing\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n  <result project=\"testproject\" repository=\"SLE_12_SP3\" arch=\"x86_64\" code=\"blocked\" state=\"blocked\" details=\"suspendproject\" dirty=\"true\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n</resultlist>";
+
+    #[test]
+    fn parse_build_results_reads_the_matrix() {
+        let parsed = parse_build_results(RESULTS_FIXTURE).unwrap();
+        assert_eq!(
+            parsed.state.as_deref(),
+            Some("f1cfebfd13354bcb8e792cb85f6218d8")
+        );
+        assert_eq!(parsed.results.len(), 4);
+        let first = &parsed.results[0];
+        assert_eq!(first.project, "testproject");
+        assert_eq!(first.repository, "openSUSE_Leap_42.3");
+        assert_eq!(first.arch, "x86_64");
+        assert_eq!(first.code, "published");
+        assert_eq!(first.state, "published");
+        assert!(!first.dirty);
+        assert_eq!(first.details, None);
+        assert_eq!(first.statuses.len(), 1);
+        assert_eq!(first.statuses[0].package, "python-MarkupSafe");
+        assert_eq!(first.statuses[0].code, "disabled");
+        assert_eq!(first.statuses[0].details, None);
+        assert!(results_settled(&parsed, None));
+    }
+
+    #[test]
+    fn parse_build_results_reads_dirty_and_broken_cells() {
+        let parsed = parse_build_results(RESULTS_DIRTY_FIXTURE).unwrap();
+        assert_eq!(parsed.results.len(), 4);
+        let broken = &parsed.results[1];
+        assert_eq!(broken.code, "broken");
+        assert_eq!(
+            broken.details.as_deref(),
+            Some("repository 'inheritedproject/openSUSE_Leap_15.0' is unavailable")
+        );
+        assert!(!broken.dirty);
+        let blocked = &parsed.results[3];
+        assert_eq!(blocked.code, "blocked");
+        assert_eq!(blocked.details.as_deref(), Some("suspendproject"));
+        assert!(blocked.dirty);
+        assert!(!results_settled(&parsed, None));
+    }
+
+    #[test]
+    fn parse_build_results_reads_an_empty_project() {
+        let parsed = parse_build_results("<resultlist state=\"abc\"/>").unwrap();
+        assert_eq!(parsed.state.as_deref(), Some("abc"));
+        assert!(parsed.results.is_empty());
+        assert!(results_settled(&parsed, None));
+    }
+
+    #[test]
+    fn parse_build_results_rejects_malformed_documents() {
+        assert!(parse_build_results("").is_err());
+        assert!(parse_build_results("<collection></collection>").is_err());
+        assert!(parse_build_results("<resultlist state=\"abc\">").is_err());
+        assert!(parse_build_results("<resultlist>junk</resultlist>junk").is_err());
+        // An unterminated <result> is malformed, not a shorter matrix.
+        assert!(parse_build_results(
+            "<resultlist><result project=\"p\" repository=\"r\" arch=\"x86_64\" code=\"succeeded\"></resultlist>"
+        )
+        .is_err());
+        // A result without a required attribute is malformed, not
+        // skipped: a partial matrix would read as a settled one.
+        assert!(parse_build_results(
+            "<resultlist><result project=\"p\" repository=\"r\" arch=\"x86_64\"/></resultlist>"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn results_settled_requires_no_dirty_and_no_waiting_code() {
+        let settled = BuildResults {
+            state: None,
+            results: vec![BuildResult {
+                project: "p".to_string(),
+                repository: "r".to_string(),
+                arch: "x86_64".to_string(),
+                code: "published".to_string(),
+                state: "published".to_string(),
+                dirty: false,
+                details: None,
+                statuses: vec![PackageBuildStatus {
+                    package: "pkg".to_string(),
+                    code: "succeeded".to_string(),
+                    details: None,
+                }],
+            }],
+        };
+        assert!(results_settled(&settled, None));
+        let mut dirty = settled.clone();
+        dirty.results[0].dirty = true;
+        assert!(!results_settled(&dirty, None));
+        let mut building = settled.clone();
+        building.results[0].statuses[0].code = "building".to_string();
+        assert!(!results_settled(&building, None));
+        let mut scheduled = settled.clone();
+        scheduled.results[0].code = "scheduled".to_string();
+        assert!(!results_settled(&scheduled, None));
+    }
+
+    #[test]
+    fn results_settled_requires_the_filtered_package_to_appear() {
+        let settled = BuildResults {
+            state: None,
+            results: vec![BuildResult {
+                project: "p".to_string(),
+                repository: "r".to_string(),
+                arch: "x86_64".to_string(),
+                code: "published".to_string(),
+                state: "published".to_string(),
+                dirty: false,
+                details: None,
+                statuses: vec![PackageBuildStatus {
+                    package: "pkg".to_string(),
+                    code: "succeeded".to_string(),
+                    details: None,
+                }],
+            }],
+        };
+        // The package is present and settled.
+        assert!(results_settled(&settled, Some("pkg")));
+        // A never-scheduled package drops out of a filtered read:
+        // absence is not settled, even when every present cell is.
+        assert!(!results_settled(&settled, Some("other")));
+        // Without a filter the same matrix is settled.
+        assert!(results_settled(&settled, None));
+        // An empty matrix is settled without a filter, not with one.
+        let empty = BuildResults {
+            state: None,
+            results: Vec::new(),
+        };
+        assert!(results_settled(&empty, None));
+        assert!(!results_settled(&empty, Some("pkg")));
+    }
+
+    // --- results ---
+
+    #[test]
+    fn results_builds_the_per_package_url() {
+        let query = ResultsQuery {
+            package: Some("python-MarkupSafe".to_string()),
+            multibuild: true,
+            locallink: true,
+            ..ResultsQuery::default()
+        };
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/_result?package=python-MarkupSafe&multibuild=1&locallink=1",
+            RESULTS_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let parsed = client.results("testproject", &query).unwrap();
+        assert_eq!(parsed.results.len(), 4);
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/build/testproject/_result?package=python-MarkupSafe&multibuild=1&locallink=1"
+                    .to_string(),
+                true
+            )]
+        );
+    }
+
     #[test]
     fn file_maintenance_incident_live_files_with_add_revision() {
         let search_url = action_match_url(
@@ -22352,5 +23198,231 @@ description</description>
         assert!(tag_attr("<package project=foo />", "project").is_none());
         assert!(tag_attr("<package project=\"\" />", "project").is_none());
         assert!(tag_attr("<package />", "project").is_none());
+    }
+
+    #[test]
+    fn results_builds_the_project_url_without_filters() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/_result",
+            RESULTS_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let parsed = client
+            .results("testproject", &ResultsQuery::default())
+            .unwrap();
+        assert_eq!(parsed.results.len(), 4);
+    }
+
+    #[test]
+    fn results_builds_repeated_repository_and_arch_pairs() {
+        let query = ResultsQuery {
+            repositories: vec!["standard".to_string(), "ports".to_string()],
+            arches: vec!["x86_64".to_string(), "aarch64".to_string()],
+            code: Some("failed".to_string()),
+            lastbuild: true,
+            ..ResultsQuery::default()
+        };
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/_result?repository=standard&repository=ports&arch=x86_64&arch=aarch64&code=failed&lastbuild=1",
+            "<resultlist state=\"abc\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let parsed = client.results("testproject", &query).unwrap();
+        assert!(parsed.results.is_empty());
+    }
+
+    #[test]
+    fn results_fails_closed_without_credentials() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/_result",
+            RESULTS_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        let err = client
+            .results("testproject", &ResultsQuery::default())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn results_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .results("bad/project", &ResultsQuery::default())
+            .is_err());
+        let query = ResultsQuery {
+            package: Some("bad/package".to_string()),
+            ..ResultsQuery::default()
+        };
+        assert!(client.results("testproject", &query).is_err());
+        let query = ResultsQuery {
+            repositories: vec!["bad repo".to_string()],
+            ..ResultsQuery::default()
+        };
+        assert!(client.results("testproject", &query).is_err());
+        let query = ResultsQuery {
+            oldstate: Some(String::new()),
+            ..ResultsQuery::default()
+        };
+        assert!(client.results("testproject", &query).is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn results_404_is_an_error_not_an_empty_matrix() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/build/nosuchproject/_result",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .results("nosuchproject", &ResultsQuery::default())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    // --- wait_for_results ---
+
+    #[test]
+    fn wait_for_results_polls_plain_until_settled() {
+        let http = FakeHttp::new().with_get_sequence(
+            "https://api.opensuse.org/build/testproject/_result",
+            &[RESULTS_DIRTY_FIXTURE, RESULTS_FIXTURE],
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let parsed = client
+            .wait_for_results(
+                "testproject",
+                &ResultsQuery::default(),
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(parsed.results.len(), 4);
+        assert!(results_settled(&parsed, None));
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                (
+                    "https://api.opensuse.org/build/testproject/_result".to_string(),
+                    true
+                ),
+                (
+                    "https://api.opensuse.org/build/testproject/_result".to_string(),
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_for_results_ignores_a_caller_set_oldstate() {
+        let query = ResultsQuery {
+            oldstate: Some("c57e2ee592dbbf26ebf19cc4f1bc1e83".to_string()),
+            ..ResultsQuery::default()
+        };
+        let http = FakeHttp::new().with_get_sequence(
+            "https://api.opensuse.org/build/testproject/_result",
+            &[RESULTS_DIRTY_FIXTURE, RESULTS_FIXTURE],
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let parsed = client
+            .wait_for_results("testproject", &query, std::time::Duration::from_secs(30))
+            .unwrap();
+        assert!(results_settled(&parsed, None));
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                (
+                    "https://api.opensuse.org/build/testproject/_result".to_string(),
+                    true
+                ),
+                (
+                    "https://api.opensuse.org/build/testproject/_result".to_string(),
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_for_results_returns_immediately_when_settled() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/_result",
+            RESULTS_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let parsed = client
+            .wait_for_results(
+                "testproject",
+                &ResultsQuery::default(),
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(results_settled(&parsed, None));
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn wait_for_results_times_out_on_a_never_settling_build() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/_result",
+            RESULTS_DIRTY_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .wait_for_results(
+                "testproject",
+                &ResultsQuery::default(),
+                std::time::Duration::ZERO,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Timeout);
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn wait_for_results_polls_a_package_filtered_wait_until_the_package_appears() {
+        // First poll: settled cells, but the filtered package is
+        // absent (never scheduled) — not settled. Second poll: the
+        // package appears, succeeded — settled.
+        let http = FakeHttp::new().with_get_sequence(
+            "https://api.opensuse.org/build/testproject/_result?package=foo",
+            &[
+                "<resultlist state=\"abc\"><result project=\"testproject\" repository=\"standard\" arch=\"x86_64\" code=\"published\" state=\"published\"></result></resultlist>",
+                "<resultlist state=\"abc\"><result project=\"testproject\" repository=\"standard\" arch=\"x86_64\" code=\"published\" state=\"published\"><status package=\"foo\" code=\"succeeded\"/></result></resultlist>",
+            ],
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let query = ResultsQuery {
+            package: Some("foo".to_string()),
+            ..ResultsQuery::default()
+        };
+        let parsed = client
+            .wait_for_results("testproject", &query, std::time::Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(parsed.results.len(), 1);
+        assert_eq!(parsed.results[0].statuses.len(), 1);
+        assert_eq!(parsed.results[0].statuses[0].package, "foo");
+        assert_eq!(http.get_calls().len(), 2);
+    }
+
+    #[test]
+    fn wait_for_results_times_out_on_a_never_scheduled_filtered_package() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/_result?package=foo",
+            "<resultlist state=\"abc\"><result project=\"testproject\" repository=\"standard\" arch=\"x86_64\" code=\"published\" state=\"published\"></result></resultlist>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let query = ResultsQuery {
+            package: Some("foo".to_string()),
+            ..ResultsQuery::default()
+        };
+        let err = client
+            .wait_for_results("testproject", &query, std::time::Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Timeout);
+        assert_eq!(http.get_calls().len(), 1);
     }
 }
