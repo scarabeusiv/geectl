@@ -155,6 +155,15 @@ impl UreqClient {
             .timeout_connect(Some(timeout.connect))
             .timeout_per_read(Some(timeout.read))
             .timeout_global(Some(timeout.total))
+            // Never follow a redirect automatically: a redirect
+            // would send the request (path, query) to a host geectl
+            // never validated. A 3xx is an error instead (see
+            // redirect_error); the caller retries or reports it.
+            // With max_redirects(0) ureq returns the 3xx as
+            // Ok(response), so get()/post_json() must refuse it
+            // explicitly — reading the body would return the
+            // redirect body as a success.
+            .max_redirects(0)
             // Never forward the Authorization header on a redirect.
             // The ureq default is already `Never`, but it is set
             // explicitly so a future ureq default change cannot
@@ -221,6 +230,21 @@ pub fn sanitize_url_for_error(url: &str) -> String {
     out.push_str(&url[..after_scheme]);
     out.push_str(&rest[at + 1..]);
     out
+}
+
+/// Refuse a redirect response: automatic redirects are disabled, so
+/// a 3xx is an error, not a body. The Location is named (sanitized —
+/// it can carry userinfo) so the caller can see where the server
+/// pointed. Plain arguments: ureq's Response type is private, so the
+/// call sites pass the status and header value.
+fn redirect_error(status: u16, location: Option<&str>) -> GeectlError {
+    let location = location
+        .map(sanitize_url_for_error)
+        .unwrap_or_else(|| "(no Location header)".to_string());
+    GeectlError::new(
+        ErrorKind::ServerError,
+        format!("server returned {status} and redirected to {location}; automatic redirects are disabled"),
+    )
 }
 
 /// Read a response body with a cap. Reads at most `MAX_BODY_BYTES + 1`
@@ -406,6 +430,10 @@ impl HttpClient for UreqClient {
             let request = self.apply_auth(self.agent.get(url), &credentials)?;
             match request.call() {
                 Ok(resp) => {
+                    if resp.status().is_redirection() {
+                        let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
+                        return Err(redirect_error(resp.status().as_u16(), location));
+                    }
                     return read_body_capped(resp.into_body().into_reader());
                 }
                 Err(ureq::Error::StatusCode(code)) => {
@@ -484,7 +512,13 @@ impl HttpClient for UreqClient {
         let request = self.apply_auth(self.agent.post(url), &credentials)?;
         let request = request.header("Content-Type", "application/json");
         match request.send(body) {
-            Ok(resp) => read_body_capped(resp.into_body().into_reader()),
+            Ok(resp) => {
+                if resp.status().is_redirection() {
+                    let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
+                    return Err(redirect_error(resp.status().as_u16(), location));
+                }
+                read_body_capped(resp.into_body().into_reader())
+            }
             Err(ureq::Error::StatusCode(code)) => {
                 let safe_url = sanitize_url_for_error(url);
                 // No retry for POST: return the mapped error
@@ -1059,10 +1093,10 @@ mod tests {
     }
 
     #[test]
-    fn authorization_header_is_not_forwarded_on_redirect() {
-        // The redirect target is a different loopback server: it must
-        // see no Authorization header even though the first request
-        // carried one.
+    fn redirect_is_not_followed() {
+        // Automatic redirects are disabled: a 302 is an error, and
+        // the redirect target sees no request at all — no metadata
+        // and no Authorization header reach it.
         let target = LoopbackServer::serve("target-body");
         let redirect = LoopbackServer::serve_redirect(&target.url());
         let client = UreqClient::with_auth(
@@ -1072,9 +1106,15 @@ mod tests {
             }))),
         )
         .unwrap();
-        assert_eq!(client.get(&redirect.url()).unwrap(), "target-body");
-        assert_eq!(redirect.authorization().as_deref(), Some("Bearer tok3n"));
-        assert_eq!(target.authorization(), None);
+        let err = client.get(&redirect.url()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("redirect"), "{err:?}");
+        // The redirector saw exactly one request (the initial GET);
+        // the target saw none (joining its handle waits out the
+        // 5s accept deadline, so this test is slow by design).
+        let first = redirect.request().expect("redirector recorded the request");
+        assert!(first.starts_with("GET /test HTTP/1.1\r\n"), "{first}");
+        assert_eq!(target.request(), None);
     }
 
     #[test]
