@@ -166,6 +166,53 @@ Three layers, by design:
    slow on purpose (source checkout + frontend build, minutes); that is
    why it is scheduled while the Gitea test gates.
 
+### The temporal layer in detail
+
+**Provisioning (`tests/temporal/`).** The instance is the OBS project's
+own development container setup, trimmed to what the live tests need:
+MariaDB, memcached, the backend, and the frontend (the API). The build
+worker is omitted — no test builds a package, and the worker needs a
+privileged container. The images are the published OBS master images at
+`registry.opensuse.org/obs/server/unstable/containers/containers/openbuildservice/<name>`;
+the frontend is built from the OBS source (`src/api`) because there is
+no published prebuilt frontend server image. `provision.sh` clones the
+OBS source (depth 1), builds the frontend, runs `rake dev:bootstrap`
+(which creates the database and seeds the Admin user), and polls the
+public `/about` endpoint until the API answers. `teardown.sh` removes
+the containers and volumes. The instance tracks OBS master on purpose:
+the job exists to catch drift, so it tracks the newest OBS, not a
+stable release.
+
+**Schedule.** The `temporal` workflow runs weekly (Mondays 06:00 UTC,
+the same slot as `freshness`) and on demand (`workflow_dispatch`), on a
+GitHub-hosted runner. It has no `pull_request` trigger and is not a
+required status check. It is slow on purpose (source checkout, frontend
+build, bootstrap); the timeout is 60 minutes.
+
+**Harness (`tests/temporal.rs`).** The tests are env-gated on
+`GEECTL_TEMPORAL_URL`: without it they skip, so `cargo test` stays
+green with no instance. With it, they assert on live server state
+through geectl's own HTTP client: `GET /about` returns a real OBS
+(title + non-empty revision), a missing project maps to geectl's
+`NotFound`, and the public project list returns the OBS collection
+envelope. The mutation assertions (create a project through geectl,
+read it back) are wired up but ignored until the auth provider and a
+project-create operation exist — see
+`temporal_create_project_shows_up_on_server`.
+
+**Plain HTTP on localhost is the single sanctioned exception to the
+https-only URL rule.** The OBS development frontend serves plain HTTP;
+there is no TLS to terminate against, and a self-signed certificate
+would fail geectl's always-on TLS verification anyway. The exception
+is safe because the instance is loopback-only (the harness rejects any
+non-loopback URL outright), ephemeral (created fresh per run,
+destroyed after), and the credentials are ephemeral (the OBS
+development default, never a real credential). This layer runs with no
+auth at all; when auth lands, the credentials it sends go to the same
+loopback-only ephemeral instance. The harness talks to the instance
+through `UreqClient` directly, not `UrlBuilder` (which rightly rejects
+`http://` bases) — the exception is confined to that one file.
+
 ## Distribution
 
 geectl is distributed as an OBS package with tagged releases, fetched via
