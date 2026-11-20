@@ -2,7 +2,9 @@
 # Provision a temporal OBS instance for geectl's scheduled live tests.
 #
 # What it does:
-#   1. Clones the OBS source (depth 1) if it is not already present.
+#   1. Clones the OBS source (depth 1) if it is not already present,
+#      and initialises its `src/backend/build` submodule (the Build
+#      Perl modules the backend daemons need).
 #      The source is needed twice: the backend runs its development
 #      start script from the mounted checkout, and the frontend image
 #      is built from `src/api`. There is no published prebuilt frontend
@@ -15,7 +17,10 @@
 #      the OBS repo's `src/api/db/seeds.rb`). The instance is ephemeral
 #      and loopback-only; those credentials are never real.
 #   5. Starts the backend and frontend, then polls `GET /about` until
-#      the API answers.
+#      the API answers, and probes the backend source server until it
+#      answers. /about needs only the frontend and the database, while
+#      project writes go to the backend — /about alone does not prove
+#      a write will work.
 #   6. Prints the base URL for the harness (`GEECTL_TEMPORAL_URL`).
 #
 # The worker is deliberately not started: no test builds a package, and
@@ -86,6 +91,16 @@ if [ ! -d "$OBS_SOURCE_DIR/src/api" ]; then
 else
     echo "Using existing OBS source at $OBS_SOURCE_DIR"
 fi
+# The backend runs its Perl daemons from the checkout, and they need
+# the Build modules, which live in the `src/backend/build` submodule
+# (openSUSE/obs-build): a plain clone leaves that directory empty
+# and every backend daemon dies at startup with "Can't locate
+# Build.pm". Initialise it whenever the source is a git checkout —
+# a fresh clone or a reused one from before this step existed.
+if git -C "$OBS_SOURCE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "Initialising OBS submodules ..."
+    git -C "$OBS_SOURCE_DIR" submodule update --init --depth 1
+fi
 # Log the exact OBS commit so a scheduled failure is actionable: the
 # instance tracks OBS master, and the HEAD SHA says which master. A
 # valid reuse need not be a git checkout (e.g. an extracted tarball),
@@ -138,7 +153,8 @@ echo "Starting backend and frontend ..."
 $COMPOSE -f "$COMPOSE_FILE" up -d backend frontend
 
 # Readiness: the public /about endpoint answers 200 only once the
-# frontend can serve, which needs the database and the backend.
+# frontend can serve, which needs the database. It says nothing about
+# the backend (probed separately below).
 echo "Waiting for the API at $BASE_URL/about ..."
 deadline=$((SECONDS + READINESS_TIMEOUT_SECONDS))
 # Explicit 200 check (curl -f without -L returns 0 on a 3xx) and
@@ -152,6 +168,24 @@ until [ "$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-tim
     fi
     sleep 10
 done
+
+# Readiness, backend: project writes go to the backend source
+# server (bs_srcserver), a separate process from the frontend, and
+# they fail until it answers. Its port is not published, so probe it
+# from inside the frontend container over the compose network: any
+# HTTP response means the source server is listening (a 404 would
+# do); only a refused connection means it is not up yet.
+echo "Waiting for the backend source server ..."
+deadline=$((SECONDS + READINESS_TIMEOUT_SECONDS))
+until $COMPOSE -f "$COMPOSE_FILE" exec -T frontend ruby -r net/http -e 'begin; Net::HTTP.get_response(URI("http://backend:5352/source")); rescue StandardError; exit(1); end' >/dev/null 2>&1; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "backend did not come up within ${READINESS_TIMEOUT_SECONDS}s" >&2
+        $COMPOSE -f "$COMPOSE_FILE" logs backend | tail -50 >&2
+        exit 1
+    fi
+    sleep 10
+done
+echo "Backend is up."
 
 echo "Temporal OBS instance is up."
 echo "Base URL: $BASE_URL"

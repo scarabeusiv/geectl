@@ -54,11 +54,12 @@ live server state through geectl's own HTTP client:
 
 - `GET /about` returns a real OBS (title + non-empty revision)
 - a missing project maps to geectl's `NotFound`
-- the public project list returns the OBS collection envelope
+- the project list at `GET /source` returns a `<directory>` of `<entry>` elements
 
 The instance serves plain HTTP on localhost. That is the single
 sanctioned exception to geectl's https-only rule (see `tests/temporal.rs`):
-loopback-only, ephemeral instance, ephemeral credentials, and no auth in
-this layer. The mutation assertions (create a project through geectl,
-read it back) are wired up but ignored until the auth provider and a
-project-create operation exist.
+loopback-only, ephemeral instance, ephemeral credentials, and the
+bootstrap admin credentials only for the mutation tests. The mutation
+assertion (create a project through geectl, read it back) runs live
+(`temporal_create_project_shows_up_on_server`); the submit-request
+tests live in `tests/temporal_obs.rs`.

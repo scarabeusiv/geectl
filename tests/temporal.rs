@@ -20,21 +20,26 @@
 //! - the instance is ephemeral (created fresh per run, destroyed after),
 //! - the credentials are ephemeral (the OBS development default, never a
 //!   real credential), and
-//! - this layer runs with no auth at all (`NoAuth`): nothing secret is
-//!   ever on the wire. When the auth layer lands, the credentials it
-//!   sends go to the same loopback-only ephemeral instance.
+//! - the public reads (`/about`, a missing project) run with no auth at
+//!   all (`NoAuth`): nothing secret is ever on the wire for them. The
+//!   project-list read and the mutation test send the bootstrap admin
+//!   credentials to the same loopback-only ephemeral instance — the
+//!   server requires auth for the project list (`GET /source` 401s
+//!   without it).
 //!
 //! The harness talks to the instance through geectl's own `UreqClient`
 //! (not `UrlBuilder`, which rightly rejects `http://` bases) — the HTTP
-//! exception is confined to this file.
+//! exception is confined to this file and `tests/temporal_obs.rs`.
 //!
-//! Phase B (auth-gated) is `temporal_create_project_shows_up_on_server`,
-//! ignored until the auth provider and a project-create operation exist.
-//! It is wired up here so the integration point is explicit, not
-//! discovered later.
+//! The mutation assertion is `temporal_create_project_shows_up_on_server`:
+//! it creates a project through geectl's own `ObsClient::create_project`
+//! with the bootstrap admin credentials and reads it back from the
+//! server.
 
+use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
+use geectl::obs::ObsClient;
 
 /// Whether `url` points at a loopback host.
 ///
@@ -185,6 +190,37 @@ fn temporal_client() -> UreqClient {
     UreqClient::new(Timeout::default()).expect("default timeout is valid")
 }
 
+/// A raw GET against the temporal instance with the bootstrap admin
+/// credentials. The project list (`GET /source`) requires auth, and
+/// the created project's meta is read back the same way — the typed
+/// `ObsClient` operations cover actions, not ad-hoc reads.
+fn temporal_authed_get(url: &str) -> Result<String, geectl::error::GeectlError> {
+    temporal_client().get_with(url, &temporal_credentials())
+}
+
+/// The temporal instance's bootstrap admin credentials (the OBS
+/// development defaults, ephemeral, never a real credential).
+/// Overridable via `GEECTL_TEMPORAL_OBS_USERNAME` /
+/// `GEECTL_TEMPORAL_OBS_PASSWORD` if the provisioning ever changes
+/// them.
+fn temporal_credentials() -> Credentials {
+    let username =
+        std::env::var("GEECTL_TEMPORAL_OBS_USERNAME").unwrap_or_else(|_| "Admin".to_string());
+    let password =
+        std::env::var("GEECTL_TEMPORAL_OBS_PASSWORD").unwrap_or_else(|_| "opensuse".to_string());
+    Credentials::Basic { username, password }
+}
+
+/// A client for the temporal instance, authenticated with the
+/// bootstrap admin credentials.
+fn temporal_client_authed(base: &str) -> ObsClient<'_> {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    ObsClient::with_base_and_credentials(http, base, temporal_credentials())
+        .expect("the temporal base is a loopback http URL")
+}
+
 /// Extract the text of `<tag>...</tag>` from a small XML body. This is a
 /// test-harness helper, not a parser: the full XML→JSON mapping is a
 /// later module. It is enough to assert the server returned the element
@@ -247,40 +283,62 @@ fn temporal_missing_project_is_not_found() {
 }
 
 #[test]
-fn temporal_project_list_is_a_collection() {
+fn temporal_project_list_is_a_directory() {
     let Some(base) = temporal_url() else {
         return;
     };
-    // The public project list must return the OBS collection envelope.
-    // A fresh bootstrapped instance may hold no projects yet; the
-    // assertion is on the shape, not the contents — the contents are
-    // whatever the server actually holds, which is the point.
-    let body = temporal_client()
-        .get(&format!("{base}/public/source"))
-        .expect("GET /public/source on the temporal instance");
+    // The project list lives at GET /source and returns a <directory>
+    // of <entry name="..."/> elements — there is no bare
+    // /public/source route (the public controller serves only
+    // /public/source/:project and below, so that path 404s), and the
+    // list is a directory, not a <collection> envelope. The list
+    // requires auth (401 without it), so this read uses the bootstrap
+    // admin credentials like the mutation test. A fresh bootstrapped
+    // instance may hold no projects yet; the assertion is on the
+    // shape, not the contents — the contents are whatever the server
+    // actually holds, which is the point.
+    let body = temporal_authed_get(&format!("{base}/source"))
+        .expect("GET /source on the temporal instance");
     assert!(
-        body.contains("<collection"),
-        "GET /public/source did not return a <collection>; body: {body}"
+        body.contains("<directory"),
+        "GET /source did not return a <directory>; body: {body}"
     );
 }
 
-/// Phase B (auth-gated): create a project through geectl and read it back
-/// from the server, asserting the server state shows the creation.
-///
-/// Ignored until the auth provider (OBS user/pass) and a project-create
-/// operation exist. When they do, this test is the integration point:
-/// replace the `todo!` with (1) create a uniquely-named project via
-/// geectl with the temporal instance's bootstrap admin credentials,
-/// (2) GET `/public/source/<name>` through geectl's client and assert
-/// it returns 200 with the project, (3) delete the project (or leave
-/// it — the instance is destroyed after the run). The `todo!` makes the
-/// gap explicit under `--ignored`: running this test must fail loudly,
-/// not pass empty and look like coverage. It is ignored, not deleted,
-/// so the integration point stays visible in the code.
+/// Create a project through geectl and read it back from the server,
+/// asserting the server state shows the creation. The project name is
+/// unique per run (process id plus a nanosecond timestamp): the
+/// temporal tests run in parallel, and the instance is shared with
+/// the `temporal_obs` target's tests. The project is left behind —
+/// the instance is destroyed after the run.
 #[test]
-#[ignore = "needs auth (OBS user/pass provider) and a project-create operation; see docs/architecture.md"]
 fn temporal_create_project_shows_up_on_server() {
-    todo!("needs auth (OBS user/pass provider) and a project-create operation; see docs/architecture.md");
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time is after the epoch")
+        .as_nanos();
+    let name = format!("geectl-tmp-create-{}-{nanos}", std::process::id());
+    client
+        .create_project(
+            &name,
+            "geectl temporal test project",
+            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+        )
+        .expect("create a project on the temporal instance");
+    // Read the project's stored meta back: a project directory
+    // listing shows its packages (none yet), not the project itself,
+    // so the name is asserted on the meta, which renders the stored
+    // `<project name="...">` with its title.
+    let body = temporal_authed_get(&format!("{base}/source/{name}/_meta"))
+        .expect("GET the created project's meta back from the server");
+    assert!(
+        body.contains(&format!("name=\"{name}\"")),
+        "the created project {name} must read back under its own name; body: {body}"
+    );
 }
 
 #[cfg(test)]

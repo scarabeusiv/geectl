@@ -2,8 +2,8 @@
 #
 # This is layer 2 of the testing design (see docs/architecture.md). It
 # spins up a real (temporary) OBS instance from the OBS project's own
-# development containers, runs the live tests in `tests/temporal.rs`
-# against it, and tears it down. The assertions are on server state —
+# development containers, runs the live tests in `tests/temporal.rs` and
+# `tests/temporal_obs.rs` against it, and tears it down. The assertions are on server state —
 # what geectl reads must reflect what the server actually holds — which
 # is what catches drift as OBS changes underneath us. Fixtures alone
 # cannot do that.
@@ -42,10 +42,14 @@ jobs:
           persist-credentials: false
       # Pinned to the v1 tag's commit so the action cannot move under us
       # and the SHA cannot be garbage-collected; Dependabot tracks SHA
-      # pins and proposes updates. No explicit toolchain: the action
-      # reads rust-toolchain.toml, so this job and local developers use
-      # the same compiler and the pin lives in exactly one place.
+      # pins and proposes updates. The toolchain is pinned to 1.99.1
+      # (matching rust-toolchain.toml): the action requires an
+      # explicit toolchain and does not read rust-toolchain.toml,
+      # so CI and local developers use the same compiler.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
       # Plain cache (no OS-release scoping): geectl is pure Rust with no
       # bindgen or system libraries, so the cache is not tied to a distro
       # release the way rpmcrab's is. Pinned to the v2 tag's commit;
@@ -64,6 +68,13 @@ jobs:
           # local runs) leave it unset and skip.
           GEECTL_TEMPORAL_REQUIRED: "true"
         run: cargo test --locked --test temporal
+      - name: Run OBS live tests against the temporal instance
+        env:
+          GEECTL_TEMPORAL_URL: http://127.0.0.1:3000
+          # Same marker as above: in this job the URL must be wired,
+          # so a silent skip would hide drift.
+          GEECTL_TEMPORAL_REQUIRED: "true"
+        run: cargo test --locked --test temporal_obs
       - name: Tear down temporal OBS instance
         if: always()
         run: bash tests/temporal/teardown.sh
