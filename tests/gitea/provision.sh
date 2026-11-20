@@ -133,11 +133,11 @@ if [ -n "${GITHUB_ENV:-}" ]; then
     # token first so it never appears in a log.
     echo "::add-mask::$TOKEN"
     {
-        echo "GEETCL_GITEA_URL=$BASE_URL"
+        echo "GEECTL_GITEA_URL=$BASE_URL"
         echo "GEECTL_GITEA_TOKEN=$TOKEN"
     } >> "$GITHUB_ENV"
     echo "URL and token exported to \$GITHUB_ENV (token masked, not printed)."
 else
     echo "Run the live tests with:"
-    echo "  GEETCL_GITEA_URL=$BASE_URL GEECTL_GITEA_TOKEN_FILE=$TOKEN_FILE cargo test --locked --test gitea"
+    echo "  GEECTL_GITEA_URL=$BASE_URL GEECTL_GITEA_TOKEN_FILE=$TOKEN_FILE cargo test --locked --test gitea"
 fi

@@ -13,7 +13,7 @@
 //!
 //! These tests run in the per-PR gate (the `test` job), against the
 //! instance the provisioning in `tests/gitea/` spins up. They are
-//! skipped unless `GEETCL_GITEA_URL` is set to the instance's base URL
+//! skipped unless `GEECTL_GITEA_URL` is set to the instance's base URL
 //! (e.g. `http://127.0.0.1:3001`), so `cargo test` stays green without
 //! an instance. They are fast enough for the gate (see
 //! `tests/gitea/README.md` for the measured timings): a single prebuilt
@@ -62,19 +62,19 @@ fn is_loopback_url(url: &str) -> bool {
 
 /// The Gitea instance's base URL, from the environment.
 ///
-/// Returns `None` (skip the test) when `GEETCL_GITEA_URL` is unset or
+/// Returns `None` (skip the test) when `GEECTL_GITEA_URL` is unset or
 /// empty. Rejects any URL that is not loopback-only: the instance is
 /// plain HTTP, so pointing the harness at a non-localhost server would
 /// send the token in cleartext over a real network. That must fail
 /// fast, not silently.
 fn gitea_url() -> Option<String> {
-    let url = std::env::var("GEETCL_GITEA_URL")
+    let url = std::env::var("GEECTL_GITEA_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())?;
     let url = url.trim_end_matches('/').to_string();
     assert!(
         is_loopback_url(&url),
-        "GEETCL_GITEA_URL must be a loopback URL (http://127.0.0.1, http://localhost, or http://[::1]); got {url}"
+        "GEECTL_GITEA_URL must be a loopback URL (http://127.0.0.1, http://localhost, or http://[::1]); got {url}"
     );
     Some(url)
 }
@@ -94,7 +94,7 @@ fn gitea_client() -> UreqClient {
         .expect("reading the Gitea token from the environment");
     match credentials {
         Credentials::None => panic!(
-            "GEETCL_GITEA_URL is set but no Gitea token is configured; \
+            "GEECTL_GITEA_URL is set but no Gitea token is configured; \
              set GEECTL_GITEA_TOKEN or GEECTL_GITEA_TOKEN_FILE \
              (provision.sh writes the token to tests/gitea/.gitea-token)"
         ),
@@ -123,7 +123,7 @@ fn unique_repo_name() -> String {
 #[test]
 fn gitea_user_is_the_provisioned_user() {
     let Some(base) = gitea_url() else {
-        eprintln!("skipping Gitea live test: GEETCL_GITEA_URL is not set");
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
         return;
     };
     let client = gitea_client();
@@ -150,7 +150,7 @@ fn gitea_user_is_the_provisioned_user() {
 #[test]
 fn gitea_create_repo_shows_up_on_server() {
     let Some(base) = gitea_url() else {
-        eprintln!("skipping Gitea live test: GEETCL_GITEA_URL is not set");
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
         return;
     };
     let client = gitea_client();
@@ -206,7 +206,7 @@ fn gitea_create_repo_shows_up_on_server() {
 #[test]
 fn gitea_missing_repo_is_not_found() {
     let Some(base) = gitea_url() else {
-        eprintln!("skipping Gitea live test: GEETCL_GITEA_URL is not set");
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
         return;
     };
     let client = gitea_client();

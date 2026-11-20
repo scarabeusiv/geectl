@@ -23,7 +23,7 @@ commands, so it cannot track the pin.)
 
 ```sh
 CONTAINER=podman bash tests/gitea/provision.sh   # starts Gitea, creates the user + token
-GEETCL_GITEA_URL=http://127.0.0.1:3001 GEECTL_GITEA_TOKEN_FILE=tests/gitea/.gitea-token cargo test --locked --test gitea
+GEECTL_GITEA_URL=http://127.0.0.1:3001 GEECTL_GITEA_TOKEN_FILE=tests/gitea/.gitea-token cargo test --locked --test gitea
 CONTAINER=podman bash tests/gitea/teardown.sh    # removes the container, volume, and token file
 ```
 
@@ -57,7 +57,7 @@ frontend build, minutes); Gitea is a single prebuilt image.
 
 ## The harness
 
-`tests/gitea.rs` is env-gated on `GEETCL_GITEA_URL` (and
+`tests/gitea.rs` is env-gated on `GEECTL_GITEA_URL` (and
 `GEECTL_GITEA_TOKEN` / `GEECTL_GITEA_TOKEN_FILE`): without them, the
 tests skip and `cargo test` stays green. With them, they assert on live
 server state through geectl's own HTTP client, with geectl's own

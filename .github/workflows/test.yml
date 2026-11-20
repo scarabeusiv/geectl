@@ -48,7 +48,7 @@ jobs:
       # (~20s end to end: a single prebuilt image), so they gate like
       # the rest of the suite — unlike the OBS temporal job, which is
       # scheduled because it takes minutes. The provision script exports
-      # GEETCL_GITEA_URL and GEECTL_GITEA_TOKEN for the test step (the
+      # GEECTL_GITEA_URL and GEECTL_GITEA_TOKEN for the test step (the
       # token is masked, never printed). The instance is loopback-only
       # and destroyed after the run.
       - name: Provision disposable Gitea instance
