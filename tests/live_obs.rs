@@ -68,10 +68,10 @@ use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::{
-    AggregateOptions, BranchOptions, CopyOptions, CopyProjectOptions, DeleteProjectOptions,
-    DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision, ObsClient,
-    PackageDiffStatus, ReleaseOptions, Request, RequestAction, RequestSearch, RequestState,
-    ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling, SrPayload,
+    AggregateOptions, BranchOptions, CopyOptions, CopyProjectOptions, CreatePackageOptions,
+    DeleteProjectOptions, DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision,
+    ObsClient, PackageDiffStatus, ReleaseOptions, Request, RequestAction, RequestSearch,
+    RequestState, ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling, SrPayload,
 };
 
 /// Whether `url` points at a loopback host.
@@ -3082,6 +3082,247 @@ fn live_release_project() {
     client
         .release_project(&source_project, &options, &DryRun::new(false))
         .expect("release a project on the live instance");
+}
+
+/// PUT a project `_meta` carrying a `<scmsync>`, so the project is
+/// git-managed. The harness writes the meta directly (test setup,
+/// like `set_project_link`); the library operation under test is
+/// `create_package_with_options`.
+fn set_project_scmsync(base: &str, project: &str, scmsync: &str) {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let meta = format!(
+        "<project name=\"{project}\"><title>geectl live test project</title><description>Created by the geectl live live test; the instance is destroyed after the run.</description><scmsync>{scmsync}</scmsync></project>"
+    );
+    http.put(
+        &format!("{base}/source/{project}/_meta"),
+        &meta,
+        &live_credentials(),
+    )
+    .expect("PUT the project meta with a scmsync");
+}
+
+/// The `create_package_with_options` operation creates a package
+/// wired to a git repository: the `<scmsync>` is read back from the
+/// server meta.
+#[test]
+fn live_create_package_with_scmsync() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let project = format!("geectl-tmp-mkpkg-{}", unique_suffix());
+    client
+        .create_project(
+            &project,
+            "geectl live test package target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create package target project on the live instance");
+    let package = live_package();
+    let options = CreatePackageOptions {
+        scmsync: Some("https://mygitea1.com#main".to_string()),
+        ..CreatePackageOptions::default()
+    };
+    client
+        .create_package_with_options(&project, &package, "", "", &options, &DryRun::new(false))
+        .expect("create a package with scmsync on the live instance");
+    let meta = read_meta(&base, &project, &package);
+    assert!(meta.contains("<scmsync>https://mygitea1.com#main</scmsync>"));
+}
+
+/// Creating the same package again with a different scmsync is
+/// refused without force, and the first scmsync stays in place.
+#[test]
+fn live_create_package_with_options_refuses_existing() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let project = format!("geectl-tmp-mkpkg-{}", unique_suffix());
+    client
+        .create_project(
+            &project,
+            "geectl live test package target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create package target project on the live instance");
+    let package = live_package();
+    let first = CreatePackageOptions {
+        scmsync: Some("https://mygitea1.com#main".to_string()),
+        ..CreatePackageOptions::default()
+    };
+    client
+        .create_package_with_options(&project, &package, "", "", &first, &DryRun::new(false))
+        .expect("create a package with scmsync on the live instance");
+    let second = CreatePackageOptions {
+        scmsync: Some("https://mygitea2.com#main".to_string()),
+        ..CreatePackageOptions::default()
+    };
+    let err = client
+        .create_package_with_options(&project, &package, "", "", &second, &DryRun::new(false))
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    let meta = read_meta(&base, &project, &package);
+    assert!(meta.contains("<scmsync>https://mygitea1.com#main</scmsync>"));
+    assert!(!meta.contains("mygitea2"));
+}
+
+/// Creating the same package again with force overwrites the
+/// scmsync.
+#[test]
+fn live_create_package_with_options_force_overwrites() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let project = format!("geectl-tmp-mkpkg-{}", unique_suffix());
+    client
+        .create_project(
+            &project,
+            "geectl live test package target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create package target project on the live instance");
+    let package = live_package();
+    let first = CreatePackageOptions {
+        scmsync: Some("https://mygitea1.com#main".to_string()),
+        ..CreatePackageOptions::default()
+    };
+    client
+        .create_package_with_options(&project, &package, "", "", &first, &DryRun::new(false))
+        .expect("create a package with scmsync on the live instance");
+    let second = CreatePackageOptions {
+        scmsync: Some("https://mygitea2.com#main".to_string()),
+        force: true,
+    };
+    client
+        .create_package_with_options(&project, &package, "", "", &second, &DryRun::new(false))
+        .expect("overwrite a package with force on the live instance");
+    let meta = read_meta(&base, &project, &package);
+    assert!(meta.contains("<scmsync>https://mygitea2.com#main</scmsync>"));
+    assert!(!meta.contains("mygitea1"));
+}
+
+/// The `create_package_with_options` operation creates a plain
+/// package without a scmsync, like `create_package`.
+#[test]
+fn live_create_package_with_options_plain() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let project = format!("geectl-tmp-mkpkg-{}", unique_suffix());
+    client
+        .create_project(
+            &project,
+            "geectl live test package target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create package target project on the live instance");
+    let package = live_package();
+    client
+        .create_package_with_options(
+            &project,
+            &package,
+            "",
+            "",
+            &CreatePackageOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("create a plain package on the live instance");
+    let meta = read_meta(&base, &project, &package);
+    assert!(!meta.contains("scmsync"));
+}
+
+/// An empty package name is refused without any request.
+#[test]
+fn live_create_package_with_options_empty_name() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let project = format!("geectl-tmp-mkpkg-{}", unique_suffix());
+    client
+        .create_project(
+            &project,
+            "geectl live test package target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create package target project on the live instance");
+    let err = client
+        .create_package_with_options(
+            &project,
+            "",
+            "",
+            "",
+            &CreatePackageOptions::default(),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+}
+
+/// Creating a package in a project that does not exist fails, even
+/// with force.
+#[test]
+fn live_create_package_with_options_missing_project() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let project = format!("geectl-tmp-mkpkg-nope-{}", unique_suffix());
+    let package = live_package();
+    for options in [
+        CreatePackageOptions::default(),
+        CreatePackageOptions {
+            force: true,
+            ..CreatePackageOptions::default()
+        },
+    ] {
+        let err = client
+            .create_package_with_options(&project, &package, "", "", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+}
+
+/// Creating a package by hand in a git-managed project is refused:
+/// the project's packages are created by the sync, not by hand.
+#[test]
+fn live_create_package_with_options_refuses_git_project() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let project = format!("geectl-tmp-mkpkg-{}", unique_suffix());
+    client
+        .create_project(
+            &project,
+            "geectl live test package target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create package target project on the live instance");
+    set_project_scmsync(&base, &project, "https://example.com#main");
+    let package = live_package();
+    let err = client
+        .create_package_with_options(
+            &project,
+            &package,
+            "",
+            "",
+            &CreatePackageOptions::default(),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
 }
 
 #[cfg(test)]

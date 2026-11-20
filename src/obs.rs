@@ -863,6 +863,21 @@ pub struct ReleaseOptions {
     pub no_delay: bool,
 }
 
+/// Options for [`ObsClient::create_package_with_options`]. All
+/// fields are optional: no scmsync means an OBS-native package, no
+/// force means an existing package is refused rather than
+/// overwritten.
+#[derive(Debug, Clone, Default)]
+pub struct CreatePackageOptions {
+    /// The git repository and branch the package syncs its sources
+    /// from, as `url#branch`. The server's `<scmsync>`. The fragment
+    /// (the branch name) is required.
+    pub scmsync: Option<String>,
+    /// Overwrite the package when it already exists. Without force
+    /// an existing package is refused.
+    pub force: bool,
+}
+
 /// Options for [`ObsClient::copy_package`]. All fields are optional:
 /// an unset revision means the latest, an unset flag means off.
 #[derive(Debug, Clone, Default)]
@@ -4816,6 +4831,110 @@ impl<'a> ObsClient<'a> {
             ))
         }
     }
+
+    /// Create package `package` in project `project` on OBS (`PUT
+    /// /source/<project>/<package>/_meta`) with the given title and
+    /// description, optionally wiring it to a git repository through
+    /// `<scmsync>`. Requires credentials; without them the call fails
+    /// loudly before any request. In dry-run the creation is recorded
+    /// in the plan and nothing is created — the guard runs before the
+    /// credentials check, like `create_package`.
+    ///
+    /// An agent creates the package it submits from — the branch
+    /// package — and a git-backed package is created the same way, by
+    /// naming its repository and branch in `scmsync`: the package
+    /// then syncs its sources from git instead of holding uploaded
+    /// files. That is the unified operation: one creation, OBS-native
+    /// or git-backed, distinguished only by the `scmsync` option.
+    ///
+    /// Creating in a project whose own meta carries `<scmsync>` is
+    /// refused: the project is git-managed, so its packages are
+    /// created by the sync, not by hand. An existing package is
+    /// refused unless `force` is set, so a re-run never silently
+    /// overwrites the first creation. A scmsync without a `#fragment`
+    /// is refused: the fragment names the branch to check out.
+    /// Success is the `<status code="ok"/>` body: any other body is
+    /// a server error, never success.
+    pub fn create_package_with_options(
+        &self,
+        project: &str,
+        package: &str,
+        title: &str,
+        description: &str,
+        options: &CreatePackageOptions,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if let Some(scmsync) = &options.scmsync {
+            validate_scmsync(scmsync)?;
+        }
+        if !dry_run.allow(&format!(
+            "create package {project}/{package}{}",
+            create_package_option_suffix(options),
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot create a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        // A project managed in git creates its own packages through
+        // the sync: refuse to create one by hand. The project must
+        // exist — a missing project dies here, even with force.
+        let project_url = build_url(&self.base, &["source", project, "_meta"], &[]);
+        let project_meta = self.http.get_with(&project_url, &self.credentials)?;
+        if XmlDoc::parse(&project_meta)?.child("scmsync").is_some() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot create a package in project {project}: the project is managed in git (its meta carries <scmsync>)"
+                ),
+            ));
+        }
+        let package_url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
+        if !options.force {
+            match self.http.get_with(&package_url, &self.credentials) {
+                Ok(_) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("package {project}/{package} already exists"),
+                    ));
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        let scmsync = match &options.scmsync {
+            Some(scmsync) => format!("<scmsync>{}</scmsync>", xml_escape(scmsync)),
+            None => String::new(),
+        };
+        let meta = format!(
+            "<package name=\"{}\" project=\"{}\"><title>{}</title><description>{}</description>{}</package>",
+            xml_escape(package),
+            xml_escape(project),
+            xml_escape(title),
+            xml_escape(description),
+            scmsync,
+        );
+        let body = self.http.put(&package_url, &meta, &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS create-package response for package {project}/{package}"),
+            ))
+        }
+    }
 }
 
 /// Releasing to an explicit target needs one source repository and
@@ -4892,6 +5011,40 @@ fn release_option_suffix(options: &ReleaseOptions) -> String {
     }
     if options.no_delay {
         parts.push("no delay".to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// A scmsync URL names the branch to sync in its fragment
+/// (`https://example.com/user/repo#main`): refuse a value without
+/// one — a scmsync with no branch names nothing to check out. The
+/// server stores the value as an opaque string and does not validate
+/// it, so this client-side check is the only guard.
+fn validate_scmsync(scmsync: &str) -> Result<(), GeectlError> {
+    let fragment = scmsync.split('#').nth(1);
+    match fragment {
+        Some(fragment) if !fragment.is_empty() => Ok(()),
+        _ => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "scmsync must include a fragment with the branch name (e.g. https://example.com/user/repo#main)",
+        )),
+    }
+}
+
+/// The option suffix for a package-creation plan line: the set
+/// options, so a dry-run plan reads what the creation would have
+/// done.
+fn create_package_option_suffix(options: &CreatePackageOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(scmsync) = &options.scmsync {
+        parts.push(format!("scmsync {scmsync}"));
+    }
+    if options.force {
+        parts.push("force".to_string());
     }
     if parts.is_empty() {
         String::new()
@@ -14414,6 +14567,323 @@ mod tests {
             )
             .is_err());
         assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_package_with_options_creates_with_scmsync() {
+        let project_meta = "<project name=\"home:Admin\"><title>Home</title><description>Home project</description></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:Admin/_meta",
+                project_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/home:Admin/test-GitPkgA/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:Admin/test-GitPkgA/_meta",
+                "<status code=\"ok\"/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CreatePackageOptions {
+            scmsync: Some("https://mygitea1.com#main".to_string()),
+            ..CreatePackageOptions::default()
+        };
+        assert!(client
+            .create_package_with_options(
+                "home:Admin",
+                "test-GitPkgA",
+                "",
+                "",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"test-GitPkgA\" project=\"home:Admin\"><title></title><description></description><scmsync>https://mygitea1.com#main</scmsync></package>"
+        );
+    }
+
+    #[test]
+    fn create_package_with_options_creates_without_scmsync() {
+        let project_meta = "<project name=\"home:Admin\"><title>Home</title><description>Home project</description></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:Admin/_meta",
+                project_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/home:Admin/test-pkgEmpty/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:Admin/test-pkgEmpty/_meta",
+                "<status code=\"ok\"/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .create_package_with_options(
+                "home:Admin",
+                "test-pkgEmpty",
+                "",
+                "",
+                &CreatePackageOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"test-pkgEmpty\" project=\"home:Admin\"><title></title><description></description></package>"
+        );
+    }
+
+    #[test]
+    fn create_package_with_options_refuses_an_existing_package() {
+        let project_meta = "<project name=\"home:Admin\"><title>Home</title><description>Home project</description></project>";
+        let package_meta = "<package name=\"test-GitPkgA\" project=\"home:Admin\"><title></title><description></description><scmsync>https://mygitea1.com#main</scmsync></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:Admin/_meta",
+                project_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/home:Admin/test-GitPkgA/_meta",
+                package_meta,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CreatePackageOptions {
+            scmsync: Some("https://mygitea2.com#main".to_string()),
+            ..CreatePackageOptions::default()
+        };
+        let err = client
+            .create_package_with_options(
+                "home:Admin",
+                "test-GitPkgA",
+                "",
+                "",
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The refusal happens before anything is written.
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn create_package_with_options_force_overwrites_an_existing_package() {
+        let project_meta = "<project name=\"home:Admin\"><title>Home</title><description>Home project</description></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:Admin/_meta",
+                project_meta,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:Admin/test-GitPkgA/_meta",
+                "<status code=\"ok\"/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CreatePackageOptions {
+            scmsync: Some("https://mygitea2.com#main".to_string()),
+            force: true,
+        };
+        assert!(client
+            .create_package_with_options(
+                "home:Admin",
+                "test-GitPkgA",
+                "",
+                "",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        // Force skips the existence check: the only GET is the
+        // project meta.
+        assert_eq!(http.get_calls().len(), 1);
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"test-GitPkgA\" project=\"home:Admin\"><title></title><description></description><scmsync>https://mygitea2.com#main</scmsync></package>"
+        );
+    }
+
+    #[test]
+    fn create_package_with_options_refuses_a_git_managed_project() {
+        let project_meta = "<project name=\"home:Admin\"><title>Home</title><description>Home project</description><scmsync>https://example.com#main</scmsync></project>";
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:Admin/_meta",
+            project_meta,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CreatePackageOptions {
+            scmsync: Some("https://mygitea1.com#main".to_string()),
+            force: true,
+        };
+        let err = client
+            .create_package_with_options(
+                "home:Admin",
+                "test-GitPkgA",
+                "",
+                "",
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The refusal happens before the package is even looked up.
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn create_package_with_options_missing_project_propagates_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/source/home:Admin1/_meta",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        for options in [
+            CreatePackageOptions::default(),
+            CreatePackageOptions {
+                force: true,
+                ..CreatePackageOptions::default()
+            },
+        ] {
+            let err = client
+                .create_package_with_options(
+                    "home:Admin1",
+                    "test-pkgEmpty",
+                    "",
+                    "",
+                    &options,
+                    &DryRun::new(false),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotFound);
+        }
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn create_package_with_options_scmsync_without_fragment_is_refused() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        for scmsync in ["https://mygitea1.com", "https://mygitea1.com#"] {
+            let options = CreatePackageOptions {
+                scmsync: Some(scmsync.to_string()),
+                ..CreatePackageOptions::default()
+            };
+            let err = client
+                .create_package_with_options(
+                    "home:Admin",
+                    "test-GitPkgB",
+                    "",
+                    "",
+                    &options,
+                    &DryRun::new(false),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn create_package_with_options_dry_run_records_plan_and_creates_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = CreatePackageOptions {
+            scmsync: Some("https://mygitea1.com#main".to_string()),
+            force: true,
+        };
+        assert!(client
+            .create_package_with_options("home:Admin", "test-GitPkgA", "", "", &options, &dry_run,)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: create package home:Admin/test-GitPkgA (scmsync https://mygitea1.com#main, force)".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn create_package_with_options_dry_run_defaults_record_plain_plan() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .create_package_with_options(
+                "home:Admin",
+                "test-pkgEmpty",
+                "",
+                "",
+                &CreatePackageOptions::default(),
+                &dry_run,
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: create package home:Admin/test-pkgEmpty".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn create_package_with_options_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:Admin/_meta",
+            "<project name=\"home:Admin\"><title>Home</title><description>Home project</description></project>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .create_package_with_options(
+                "home:Admin",
+                "test-pkgEmpty",
+                "",
+                "",
+                &CreatePackageOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn create_package_with_options_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .create_package_with_options(
+                "home:Admin",
+                "",
+                "",
+                "",
+                &CreatePackageOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(client
+            .create_package_with_options(
+                "home:Admin/pkg",
+                "test-pkgEmpty",
+                "",
+                "",
+                &CreatePackageOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]
