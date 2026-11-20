@@ -3459,6 +3459,136 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// Validate the coordinates of a build read (project, package,
+    /// repository, architecture): each must be a valid OBS name, so a
+    /// `/`, `?`, or quote can never rewrite the URL. The package is
+    /// optional: the repository-wide reads take None.
+    fn validate_build_coordinates(
+        project: &str,
+        package: Option<&str>,
+        repository: &str,
+        arch: &str,
+    ) -> Result<(), GeectlError> {
+        let mut names: Vec<(&str, &str)> = vec![
+            ("project", project),
+            ("repository", repository),
+            ("architecture", arch),
+        ];
+        if let Some(package) = package {
+            names.push(("package", package));
+        }
+        for (label, value) in names {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The build log for `package` in `repository`/`arch`: the raw
+    /// log text. `nostream=1` reads the whole log at once (no
+    /// streaming); the query selects the slice. None when there is no
+    /// log (404): the package was never built, or the package/project
+    /// does not exist — the server answers 404 for both, so the caller
+    /// checks the package exists when the distinction matters.
+    /// Requires OBS Basic credentials. The log is capped by the
+    /// transport's body limit, like every read.
+    pub fn build_log(
+        &self,
+        project: &str,
+        package: &str,
+        repository: &str,
+        arch: &str,
+        query: &BuildLogQuery,
+    ) -> Result<Option<String>, GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        self.require_build_credentials()?;
+        let start = query.start.map(|offset| offset.to_string());
+        let mut pairs: Vec<(&str, &str)> = vec![("nostream", "1")];
+        if let Some(start) = &start {
+            pairs.push(("start", start));
+        }
+        if query.last {
+            pairs.push(("last", "1"));
+        }
+        if query.lastsucceeded {
+            pairs.push(("lastsucceeded", "1"));
+        }
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, package, "_log"],
+            &pairs,
+        );
+        match self.http.get_with(&url, &self.credentials) {
+            Ok(body) => Ok(Some(body)),
+            // A 404 means no log: never built, or the package/project
+            // does not exist. Any other failure stays an error.
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The build status code for `package` in `repository`/`arch`
+    /// (`succeeded`, `failed`, `unresolvable`, ...), or None when the
+    /// package has no status: the server answers `code="unknown"`
+    /// with 200 when nothing is known, and 404 when the
+    /// package/project does not exist. Requires OBS Basic credentials.
+    pub fn build_status(
+        &self,
+        project: &str,
+        package: &str,
+        repository: &str,
+        arch: &str,
+    ) -> Result<Option<String>, GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        self.require_build_credentials()?;
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, package, "_status"],
+            &[],
+        );
+        let body = match self.http.get_with(&url, &self.credentials) {
+            Ok(body) => body,
+            // A 404 means the package/project does not exist. Any
+            // other failure stays an error.
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let code = parse_build_status(&body)?;
+        // The server's "no status known" is `code="unknown"` with a
+        // 200, not a 404: it reads as None, like the 404 above.
+        if code == "unknown" {
+            return Ok(None);
+        }
+        Ok(Some(code))
+    }
+
+    /// The running build job for `package` in `repository`/`arch`,
+    /// or None when no job is running. Requires OBS Basic credentials.
+    /// A 404 is an error (unknown project/package): unlike the log and
+    /// the status, a missing job reads as an empty jobstatus element,
+    /// not a 404, so a 404 here names something that does not exist.
+    pub fn job_status(
+        &self,
+        project: &str,
+        package: &str,
+        repository: &str,
+        arch: &str,
+    ) -> Result<Option<JobStatus>, GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        self.require_build_credentials()?;
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, package, "_jobstatus"],
+            &[],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_job_status(&body)
+    }
+
     /// Build the OBS search URL for open submit requests targeting
     /// `package`. The match expression is XPath over the request XML;
     /// the submit restriction is applied client-side in
@@ -7904,6 +8034,189 @@ pub(crate) fn parse_build_results(body: &str) -> Result<BuildResults, GeectlErro
         });
     }
     Ok(BuildResults { state, results })
+}
+
+/// Options for [`ObsClient::build_log`]: which slice of the log to
+/// read. The default reads the current log from the start.
+#[derive(Debug, Default, Clone)]
+pub struct BuildLogQuery {
+    /// Start reading at this byte offset; a negative offset reads
+    /// from the end of the log.
+    pub start: Option<i64>,
+    /// The last build's log instead of the current one. This skips
+    /// the live-worker handoff and reads the local logfile, so on a
+    /// currently-building package with no prior local log it reads
+    /// as no log (None) rather than the live log.
+    pub last: bool,
+    /// The last succeeded build's log.
+    pub lastsucceeded: bool,
+}
+
+/// A running build job, from `GET .../_jobstatus`. `code` is the
+/// only field guaranteed present: a jobstatus element with no `code`
+/// means no job is running (see [`ObsClient::job_status`]). Only
+/// `code`, `result`, and `details` are attributes; the rest are
+/// child elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobStatus {
+    /// The job's state (`building`, `scheduled`, ...).
+    pub code: String,
+    /// The job's result (`succeeded`, `failed`, `unchanged`), if the
+    /// server reported one.
+    pub result: Option<String>,
+    /// The server's detail text for the job, if any.
+    pub details: Option<String>,
+    /// When the job started (unix time).
+    pub starttime: Option<u64>,
+    /// When the job ended (unix time), if it ended.
+    pub endtime: Option<u64>,
+    /// How long the previous build took (seconds).
+    pub lastduration: Option<u64>,
+    /// The worker id running the job.
+    pub workerid: Option<String>,
+    /// The architecture of the machine running the job.
+    pub hostarch: Option<String>,
+    /// The worker URI the job runs on.
+    pub uri: Option<String>,
+    /// The architecture the job builds for.
+    pub arch: Option<String>,
+    /// The job name.
+    pub job: Option<String>,
+    /// The job id (md5 of the job info file).
+    pub jobid: Option<String>,
+    /// The number of attempts to build the job.
+    pub attempt: Option<u64>,
+}
+
+/// Parse a `<jobstatus ...>...</jobstatus>` document. An element
+/// with no `code` means no job is running (None); a document with no
+/// jobstatus element at all — or a non-numeric numeric child — is a
+/// server error, never "no job". Only `code`, `result`, and `details`
+/// are attributes; the rest (`starttime`, `endtime`, `lastduration`,
+/// `workerid`, `hostarch`, `uri`, `arch`, `job`, `jobid`, `attempt`)
+/// are child elements.
+pub(crate) fn parse_job_status(body: &str) -> Result<Option<JobStatus>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS job status response: not a <jobstatus> document",
+        )
+    };
+    let body = body.trim();
+    // The document must start with the root element: a `<jobstatus>`
+    // found later in the body is not a jobstatus document.
+    let Some(after_tag) = body.strip_prefix("<jobstatus") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_tag.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_tag) else {
+        return Err(malformed());
+    };
+    let tag = &after_tag[..end];
+    // The child elements, if the element is not self-closing.
+    // Nothing but whitespace may follow the root element either way.
+    let inner = if tag.trim_end().ends_with('/') {
+        if !after_tag[end + 1..].trim().is_empty() {
+            return Err(malformed());
+        }
+        ""
+    } else {
+        let after = &after_tag[end + 1..];
+        let Some(close) = after.find("</jobstatus>") else {
+            return Err(malformed());
+        };
+        if !after[close + "</jobstatus>".len()..].trim().is_empty() {
+            return Err(malformed());
+        }
+        &after[..close]
+    };
+    let Some(code) = xml_attr(tag, "code") else {
+        // An empty `<jobstatus/>`: no job is running.
+        return Ok(None);
+    };
+    if code.is_empty() {
+        return Ok(None);
+    }
+    let number = |name: &str| -> Result<Option<u64>, GeectlError> {
+        match xml_element_text(inner, name) {
+            None => Ok(None),
+            Some(value) => value.parse::<u64>().map(Some).map_err(|_| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected OBS job status response: <jobstatus> <{name}> is not a number"
+                    ),
+                )
+            }),
+        }
+    };
+    Ok(Some(JobStatus {
+        code,
+        result: xml_attr(tag, "result"),
+        details: xml_attr(tag, "details"),
+        starttime: number("starttime")?,
+        endtime: number("endtime")?,
+        lastduration: number("lastduration")?,
+        workerid: xml_element_text(inner, "workerid"),
+        hostarch: xml_element_text(inner, "hostarch"),
+        uri: xml_element_text(inner, "uri"),
+        arch: xml_element_text(inner, "arch"),
+        job: xml_element_text(inner, "job"),
+        jobid: xml_element_text(inner, "jobid"),
+        attempt: number("attempt")?,
+    }))
+}
+
+/// Parse a `<status package code/>` document (the `.../_status`
+/// response) into the status code. A document without a `code`
+/// attribute is a server error, never "no status": no status reads
+/// as `code="unknown"` on the call, not as an empty document.
+pub(crate) fn parse_build_status(body: &str) -> Result<String, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS build status response: not a <status> document",
+        )
+    };
+    let body = body.trim();
+    // The document must start with the root element: a `<status>`
+    // found later in the body is not a status document, and nothing
+    // but whitespace may follow the root element.
+    let Some(after_tag) = body.strip_prefix("<status") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_tag.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_tag) else {
+        return Err(malformed());
+    };
+    let tag = &after_tag[..end];
+    if tag.trim_end().ends_with('/') {
+        if !after_tag[end + 1..].trim().is_empty() {
+            return Err(malformed());
+        }
+    } else {
+        let after = &after_tag[end + 1..];
+        let Some(close) = after.find("</status>") else {
+            return Err(malformed());
+        };
+        if !after[close + "</status>".len()..].trim().is_empty() {
+            return Err(malformed());
+        }
+    }
+    match xml_attr(tag, "code") {
+        Some(code) if !code.is_empty() => Ok(code),
+        _ => Err(malformed()),
+    }
 }
 
 /// What OBS does with the source branch when a submit request is
@@ -23424,5 +23737,244 @@ description</description>
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Timeout);
         assert_eq!(http.get_calls().len(), 1);
+    }
+
+    // --- parse_job_status / parse_build_status ---
+
+    #[test]
+    fn parse_job_status_reads_a_running_job() {
+        let parsed = parse_job_status(
+            "<jobstatus code=\"building\" details=\"building on sheep87:16\"><starttime>1618222900</starttime><lastduration>43</lastduration><workerid>sheep87:16</workerid><hostarch>x86_64</hostarch><uri>http://172.18.0.5:38963</uri><arch>x86_64</arch><job>home:alice::foo::1</job><jobid>17c8d25b92da67f6ec428ea51a9b5342</jobid><attempt>1</attempt></jobstatus>",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Some(JobStatus {
+                code: "building".to_string(),
+                result: None,
+                details: Some("building on sheep87:16".to_string()),
+                starttime: Some(1_618_222_900),
+                endtime: None,
+                lastduration: Some(43),
+                workerid: Some("sheep87:16".to_string()),
+                hostarch: Some("x86_64".to_string()),
+                uri: Some("http://172.18.0.5:38963".to_string()),
+                arch: Some("x86_64".to_string()),
+                job: Some("home:alice::foo::1".to_string()),
+                jobid: Some("17c8d25b92da67f6ec428ea51a9b5342".to_string()),
+                attempt: Some(1),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_job_status_empty_means_no_job_running() {
+        assert_eq!(parse_job_status("<jobstatus/>").unwrap(), None);
+        assert_eq!(parse_job_status("<jobstatus></jobstatus>").unwrap(), None);
+        assert_eq!(parse_job_status("<jobstatus code=\"\"/>").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_job_status_rejects_malformed_documents() {
+        assert!(parse_job_status("").is_err());
+        assert!(parse_job_status("<collection></collection>").is_err());
+        assert!(parse_job_status("<jobstatus code=\"building\"").is_err());
+        assert!(parse_job_status(
+            "<jobstatus code=\"building\"><starttime>soon</starttime></jobstatus>"
+        )
+        .is_err());
+        assert!(parse_job_status("<jobstatus code=\"building\"><starttime>1</starttime>").is_err());
+        assert!(parse_job_status("junk<jobstatus/>").is_err());
+        assert!(parse_job_status("<jobstatus/>junk").is_err());
+        assert!(parse_job_status("<jobstatus code=\"building\"></jobstatus>junk").is_err());
+        assert!(parse_job_status("<jobstatusx/>").is_err());
+    }
+
+    #[test]
+    fn parse_build_status_reads_the_code() {
+        assert_eq!(
+            parse_build_status("<status package=\"foo\" code=\"failed\"/>").unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            parse_build_status("<status code=\"succeeded\" package=\"foo\"></status>").unwrap(),
+            "succeeded"
+        );
+    }
+
+    #[test]
+    fn parse_build_status_rejects_a_code_less_document() {
+        assert!(parse_build_status("").is_err());
+        assert!(parse_build_status("<status package=\"foo\"/>").is_err());
+        assert!(parse_build_status("<status package=\"foo\" code=\"\"/>").is_err());
+        assert!(parse_build_status("<collection></collection>").is_err());
+        assert!(parse_build_status("junk<status code=\"failed\"/>").is_err());
+        assert!(parse_build_status("<status code=\"failed\"/>junk").is_err());
+        assert!(parse_build_status("<statusx code=\"failed\"/>").is_err());
+    }
+
+    // --- build_log ---
+
+    #[test]
+    fn build_log_builds_the_url_and_returns_the_text() {
+        let query = BuildLogQuery {
+            start: Some(100),
+            last: true,
+            ..BuildLogQuery::default()
+        };
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=100&last=1",
+            "build log text",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .build_log("testproject", "foo", "standard", "x86_64", &query)
+                .unwrap(),
+            Some("build log text".to_string())
+        );
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1&start=100&last=1"
+                    .to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn build_log_keeps_the_multibuild_flavor_in_the_path() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo:flavor1/_log?nostream=1&lastsucceeded=1",
+            "flavor log",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let query = BuildLogQuery {
+            lastsucceeded: true,
+            ..BuildLogQuery::default()
+        };
+        assert_eq!(
+            client
+                .build_log("testproject", "foo:flavor1", "standard", "x86_64", &query)
+                .unwrap(),
+            Some("flavor log".to_string())
+        );
+    }
+
+    #[test]
+    fn build_log_404_is_none_not_an_error() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .build_log(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    "x86_64",
+                    &BuildLogQuery::default()
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn build_log_fails_closed_without_credentials() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .build_log(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                &BuildLogQuery::default(),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    // --- build_status ---
+
+    #[test]
+    fn build_status_returns_the_code_and_none_on_404() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_status",
+                "<status package=\"foo\" code=\"failed\"/>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/bar/_status",
+                ErrorKind::NotFound,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .build_status("testproject", "foo", "standard", "x86_64")
+                .unwrap(),
+            Some("failed".to_string())
+        );
+        assert_eq!(
+            client
+                .build_status("testproject", "bar", "standard", "x86_64")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn build_status_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .build_status("testproject", "bad/package", "standard", "x86_64")
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    // --- job_status ---
+
+    #[test]
+    fn job_status_returns_the_job_and_none_when_idle() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_jobstatus",
+                "<jobstatus code=\"building\"><starttime>1618222900</starttime></jobstatus>",
+            )
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/bar/_jobstatus",
+                "<jobstatus/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let job = client
+            .job_status("testproject", "foo", "standard", "x86_64")
+            .unwrap();
+        assert_eq!(job.as_ref().unwrap().code, "building");
+        assert_eq!(job.as_ref().unwrap().starttime, Some(1_618_222_900));
+        assert_eq!(
+            client
+                .job_status("testproject", "bar", "standard", "x86_64")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn job_status_404_is_an_error_not_none() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/nosuch/_jobstatus",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .job_status("testproject", "nosuch", "standard", "x86_64")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 }
