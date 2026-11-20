@@ -476,6 +476,31 @@ impl RevisionRange {
     }
 }
 
+/// A file in an OBS source directory listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFile {
+    /// File name.
+    pub name: String,
+    /// File size in bytes, when the listing carries it.
+    pub size: Option<u64>,
+    /// Modification time (seconds since the epoch), when the listing
+    /// carries it.
+    pub mtime: Option<u64>,
+    /// Source md5, when the listing carries it.
+    pub md5: Option<String>,
+}
+
+/// A parsed OBS source directory listing: the files plus the link
+/// target, when the package links another package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectoryListing {
+    /// The files in the listing, in server order.
+    pub entries: Vec<SourceFile>,
+    /// `(project, package)` from `<linkinfo project package/>`, when
+    /// the listing carries one.
+    pub linkinfo: Option<(String, String)>,
+}
+
 /// The OBS client: the devel-project lookup, the devel version, the
 /// open-submit-request check, submit-request filing, branch setup,
 /// and the remote reads (file and directory reads, history, meta,
@@ -1131,6 +1156,99 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// GET a public directory listing (`/public/source/...`) and
+    /// parse it. A public read: no credentials. The path is the
+    /// segments after `/public/source` (a project, or a
+    /// project/package pair).
+    fn public_directory(&self, path: &[&str]) -> Result<DirectoryListing, GeectlError> {
+        let mut segments: Vec<&str> = vec!["public", "source"];
+        segments.extend_from_slice(path);
+        let url = build_url(&self.base, &segments, &[]);
+        let body = self.http.get_with(&url, &Credentials::None)?;
+        parse_directory(&body)
+    }
+
+    /// Read file `file` of package `package` in project `project`
+    /// (`GET /public/source/<project>/<package>/<file>`), optionally
+    /// at revision `rev` (`?rev=N`, which the backend forwards to the
+    /// file at that revision). A public read: no credentials. A
+    /// missing file is an error, never an empty string.
+    pub fn cat(
+        &self,
+        project: &str,
+        package: &str,
+        file: &str,
+        rev: Option<u64>,
+    ) -> Result<String, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !valid_obs_filename(file) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS filename: {file:?}"),
+            ));
+        }
+        if let Some(0) = rev {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "invalid revision: 0",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        let rev_text;
+        if let Some(rev) = rev {
+            rev_text = rev.to_string();
+            query.push(("rev", &rev_text));
+        }
+        let url = build_url(
+            &self.base,
+            &["public", "source", project, package, file],
+            &query,
+        );
+        self.http.get_with(&url, &Credentials::None)
+    }
+
+    /// List the files of package `package` in project `project`
+    /// (`GET /public/source/<project>/<package>`). A public read: no
+    /// credentials. The listing carries each file's name, size,
+    /// modification time, and md5, in server order.
+    pub fn list_files(&self, project: &str, package: &str) -> Result<Vec<SourceFile>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        Ok(self.public_directory(&[project, package])?.entries)
+    }
+
+    /// List the packages of project `project` (`GET
+    /// /public/source/<project>`). A public read: no credentials.
+    /// Multibuild flavors (`pkg:flavor1`, `pkg:flavor2`) are separate
+    /// entries, exactly as the listing carries them.
+    pub fn list_packages(&self, project: &str) -> Result<Vec<String>, GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        let listing = self.public_directory(&[project])?;
+        Ok(listing
+            .entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect())
+    }
+
     /// Build the OBS search URL for open submit requests targeting
     /// `package`. The match expression is XPath over the request XML,
     /// restricted to `submit` actions: a request of another type that
@@ -1566,6 +1684,148 @@ pub(crate) fn parse_revision(body: &str) -> Option<u64> {
     None
 }
 
+/// The value of attribute `name` in an opening tag's text (the text
+/// between `<tag` and `>`), read order-tolerantly in either quote
+/// style. None when the tag carries no such attribute. The attribute
+/// name must stand on its own — `myname="..."` must not match — so
+/// the character before `name=` has to be whitespace.
+pub(crate) fn tag_attr(element: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=");
+    let mut rest = element;
+    while let Some(pos) = rest.find(&needle) {
+        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
+            rest = &rest[pos + needle.len()..];
+            continue;
+        }
+        let after_eq = &rest[pos + needle.len()..];
+        let quote = after_eq.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let close = after_eq[1..].find(quote)?;
+        let value = &after_eq[1..1 + close];
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// Parse an OBS source directory listing (`<directory>...</directory>`
+/// with `<entry name md5 size mtime .../>` children and an optional
+/// `<linkinfo project package/>`). The body must be a `<directory>`
+/// document: a body that is not one (empty, truncated, or some other
+/// document) is an error, never an empty listing — a truncated 200
+/// body must not read as "no files". An `<entry>` without a `name`
+/// attribute, or with a `size`/`mtime` that is not a number, is a
+/// malformed listing, not a skippable entry. Other children (`<devel
+/// .../>` and the like) are ignored: this parser reads files and the
+/// link target only.
+pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS directory response: not a <directory> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<directory") else {
+        return Err(malformed());
+    };
+    // The tag name must end here: `<directorylisting>` is not a
+    // directory element. The next character is whitespace, `/`, or `>`.
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    // The opening tag ends at the first `>`.
+    let Some(end) = after_open.find('>') else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<directory .../>`: no children, so no files.
+        return Ok(DirectoryListing {
+            entries: Vec::new(),
+            linkinfo: None,
+        });
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</directory>") else {
+        return Err(malformed());
+    };
+    // Nothing but whitespace may follow the closing tag.
+    if !inner[close + "</directory>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut entries = Vec::new();
+    let mut rest = inner;
+    while let Some(pos) = rest.find("<entry") {
+        let after_tag = &rest[pos + "<entry".len()..];
+        // The tag name must end here: `<entryname>` is not an entry
+        // element. The next character is whitespace, `/`, or `>`.
+        let Some(first) = after_tag.chars().next() else {
+            return Err(malformed());
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        // The element ends at the first `>`: an unterminated entry is
+        // a malformed listing, not a skippable element.
+        let Some(end) = after_tag.find('>') else {
+            return Err(malformed());
+        };
+        let element = &after_tag[..end];
+        let name = tag_attr(element, "name").ok_or_else(malformed)?;
+        let size = match tag_attr(element, "size") {
+            Some(value) => Some(value.parse::<u64>().map_err(|_| malformed())?),
+            None => None,
+        };
+        let mtime = match tag_attr(element, "mtime") {
+            Some(value) => Some(value.parse::<u64>().map_err(|_| malformed())?),
+            None => None,
+        };
+        let md5 = tag_attr(element, "md5").map(|value| xml_unescape(&value));
+        entries.push(SourceFile {
+            name: xml_unescape(&name),
+            size,
+            mtime,
+            md5,
+        });
+        rest = &after_tag[end..];
+    }
+    let mut linkinfo = None;
+    let mut rest = inner;
+    while let Some(pos) = rest.find("<linkinfo") {
+        let after_tag = &rest[pos + "<linkinfo".len()..];
+        let Some(first) = after_tag.chars().next() else {
+            return Err(malformed());
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        let Some(end) = after_tag.find('>') else {
+            return Err(malformed());
+        };
+        let element = &after_tag[..end];
+        if let (Some(project), Some(package)) =
+            (tag_attr(element, "project"), tag_attr(element, "package"))
+        {
+            // The first linkinfo wins: a listing carries at most one.
+            linkinfo = Some((xml_unescape(&project), xml_unescape(&package)));
+            break;
+        }
+        rest = &after_tag[end..];
+    }
+    Ok(DirectoryListing { entries, linkinfo })
+}
+
 /// Validate an OBS request id: a non-empty run of ASCII digits that
 /// reads as a positive number. Returns the canonical number, so
 /// `old != new` is a numeric comparison (a leading-zero spelling of
@@ -1923,6 +2183,65 @@ fn xml_escape(s: &str) -> String {
             _ => out.push(c),
         }
     }
+    out
+}
+
+/// Unescape XML text or an attribute value: the five entities
+/// [`xml_escape`] produces, plus numeric character references
+/// (`&#65;`, `&#x41;`). Anything else is left verbatim: an unknown
+/// entity is a server response the library does not understand, and
+/// passing it through beats inventing a character.
+pub(crate) fn xml_unescape(s: &str) -> String {
+    // Fast path: nothing to unescape.
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        match after.find(';') {
+            Some(semi) => {
+                let entity = &after[..semi];
+                match entity {
+                    "amp" => out.push('&'),
+                    "lt" => out.push('<'),
+                    "gt" => out.push('>'),
+                    "quot" => out.push('"'),
+                    "apos" => out.push('\''),
+                    _ => {
+                        let numeric = entity
+                            .strip_prefix("#x")
+                            .or_else(|| entity.strip_prefix("#X"))
+                            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                            .or_else(|| {
+                                entity
+                                    .strip_prefix('#')
+                                    .and_then(|dec| dec.parse::<u32>().ok())
+                            })
+                            .and_then(char::from_u32);
+                        match numeric {
+                            Some(c) => out.push(c),
+                            // Unknown entity: keep it verbatim.
+                            None => {
+                                out.push('&');
+                                out.push_str(entity);
+                                out.push(';');
+                            }
+                        }
+                    }
+                }
+                rest = &after[semi + 1..];
+            }
+            None => {
+                // A bare `&` with no `;` after it: keep it verbatim.
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
     out
 }
 
@@ -4346,5 +4665,235 @@ mod tests {
                 to: Some(RevisionSpec::Md5(hash2.to_string()))
             }
         );
+    }
+
+    // --- xml_unescape ---
+
+    #[test]
+    fn xml_unescape_reverses_escape() {
+        assert_eq!(xml_unescape("plain"), "plain");
+        assert_eq!(xml_unescape("a &amp; b"), "a & b");
+        assert_eq!(xml_unescape("&lt;tag&gt;"), "<tag>");
+        assert_eq!(xml_unescape("&quot;q&quot;"), "\"q\"");
+        assert_eq!(xml_unescape("&apos;a&apos;"), "'a'");
+        assert_eq!(xml_unescape("&#65;"), "A");
+        assert_eq!(xml_unescape("&#x41;"), "A");
+        // Unknown entities and a bare `&` pass through verbatim.
+        assert_eq!(xml_unescape("&nbsp;"), "&nbsp;");
+        assert_eq!(xml_unescape("a & b"), "a & b");
+        assert_eq!(xml_unescape("a &"), "a &");
+    }
+
+    // --- tag_attr ---
+
+    #[test]
+    fn tag_attr_reads_either_quote_style_in_any_order() {
+        assert_eq!(
+            tag_attr("entry name=\"foo\" md5=\"abc\"", "name").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            tag_attr("entry md5='abc' name='foo'", "name").as_deref(),
+            Some("foo")
+        );
+        // The name must stand on its own: `myname` does not match.
+        assert_eq!(tag_attr("entry myname=\"foo\"", "name"), None);
+        assert_eq!(tag_attr("entry name=\"\"", "name"), None);
+        assert_eq!(tag_attr("entry", "name"), None);
+    }
+
+    // --- parse_directory ---
+
+    const DIRECTORY_FIXTURE: &str = "<directory name=\"foo\" rev=\"3\" vrev=\"1\" srcmd5=\"0123456789abcdef0123456789abcdef\">\
+        <entry name=\"foo.spec\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" size=\"1234\" mtime=\"1700000000\"/>\
+        <entry name=\"foo.changes\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"567\" mtime=\"1700000001\"/>\
+        <entry name=\"_link\"/>\
+        <linkinfo project=\"home:Admin\" package=\"foo\"/>\
+        <devel project=\"devel:languages:python\" package=\"foo\"/>\
+        </directory>";
+
+    #[test]
+    fn directory_listing_parses_entries_and_linkinfo() {
+        let listing = parse_directory(DIRECTORY_FIXTURE).unwrap();
+        assert_eq!(
+            listing.entries,
+            vec![
+                SourceFile {
+                    name: "foo.spec".to_string(),
+                    size: Some(1234),
+                    mtime: Some(1_700_000_000),
+                    md5: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                },
+                SourceFile {
+                    name: "foo.changes".to_string(),
+                    size: Some(567),
+                    mtime: Some(1_700_000_001),
+                    md5: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+                },
+                SourceFile {
+                    name: "_link".to_string(),
+                    size: None,
+                    mtime: None,
+                    md5: None,
+                },
+            ]
+        );
+        assert_eq!(
+            listing.linkinfo,
+            Some(("home:Admin".to_string(), "foo".to_string()))
+        );
+    }
+
+    #[test]
+    fn directory_listing_rejects_malformed_bodies() {
+        // Not a directory document at all.
+        assert!(parse_directory("").is_err());
+        assert!(parse_directory("<collection matches=\"0\"></collection>").is_err());
+        assert!(parse_directory("<directorylisting></directorylisting>").is_err());
+        // Unterminated, or a missing close tag.
+        assert!(parse_directory("<directory name=\"foo\">").is_err());
+        assert!(parse_directory("<directory name=\"foo\"><entry name=\"x\"/>").is_err());
+        // Trailing garbage after the closing tag.
+        assert!(parse_directory("<directory></directory> junk").is_err());
+        // An entry without a name, or with a non-numeric size/mtime.
+        assert!(parse_directory("<directory><entry md5=\"abc\"/></directory>").is_err());
+        assert!(
+            parse_directory("<directory><entry name=\"x\" size=\"big\"/></directory>").is_err()
+        );
+        assert!(
+            parse_directory("<directory><entry name=\"x\" mtime=\"soon\"/></directory>").is_err()
+        );
+        // An unterminated entry tag.
+        assert!(parse_directory("<directory><entry name=\"x\"</directory>").is_err());
+    }
+
+    #[test]
+    fn directory_listing_self_closing_is_empty() {
+        let listing = parse_directory("<directory name=\"foo\"/>").unwrap();
+        assert!(listing.entries.is_empty());
+        assert_eq!(listing.linkinfo, None);
+    }
+
+    #[test]
+    fn directory_listing_without_linkinfo_is_none() {
+        let listing = parse_directory("<directory><entry name=\"foo.spec\"/></directory>").unwrap();
+        assert_eq!(listing.linkinfo, None);
+    }
+
+    // --- cat ---
+
+    #[test]
+    fn cat_reads_the_file_without_credentials() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
+            "Name: foo\nVersion: 1.0\n",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .cat("openSUSE:Factory", "foo", "foo.spec", None)
+                .unwrap(),
+            "Name: foo\nVersion: 1.0\n"
+        );
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec".to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn cat_at_revision_passes_rev() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec?rev=2",
+            "Name: foo\nVersion: 1.0\n",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .cat("openSUSE:Factory", "foo", "foo.spec", Some(2))
+                .unwrap(),
+            "Name: foo\nVersion: 1.0\n"
+        );
+    }
+
+    #[test]
+    fn cat_rejects_bad_inputs() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client
+            .cat("openSUSE:Factory", "foo/bar", "foo.spec", None)
+            .is_err());
+        assert!(client
+            .cat("openSUSE:Factory", "foo", ".hidden", None)
+            .is_err());
+        assert!(client.cat("openSUSE:Factory", "foo", "a/b", None).is_err());
+        assert!(client
+            .cat("openSUSE:Factory", "foo", "foo.spec", Some(0))
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn cat_missing_file_is_an_error() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/nope.spec",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::new(&http);
+        let err = client
+            .cat("openSUSE:Factory", "foo", "nope.spec", None)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    // --- list_files / list_packages ---
+
+    #[test]
+    fn list_files_reads_the_listing_without_credentials() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
+            DIRECTORY_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        let files = client.list_files("openSUSE:Factory", "foo").unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].name, "foo.spec");
+        assert_eq!(files[2].name, "_link");
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo".to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn list_packages_reads_entry_names() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory",
+            "<directory><entry name=\"foo\"/><entry name=\"multibuild-pkg:flavor1\"/><entry name=\"multibuild-pkg:flavor2\"/></directory>",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client.list_packages("openSUSE:Factory").unwrap(),
+            vec![
+                "foo".to_string(),
+                "multibuild-pkg:flavor1".to_string(),
+                "multibuild-pkg:flavor2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_calls_reject_bad_names() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.list_files("openSUSE:Factory", "foo/bar").is_err());
+        assert!(client.list_packages("openSUSE:Factory/x").is_err());
+        assert!(http.get_calls().is_empty());
     }
 }
