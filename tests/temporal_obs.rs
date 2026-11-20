@@ -51,24 +51,25 @@
 //! and the linkinfo are written by the backend, so they must not
 //! assert the instant the upload returns.
 //!
-//! The SR tests (`temporal_filed_request_shows_up_on_server`,
-//! `temporal_refile_supersedes_and_deletes_on_server`, and
-//! `temporal_accept_deletes_source_branch_on_server`) file real
-//! submit requests against the instance: they create a source branch
-//! and a target project first, through geectl's own
-//! `ObsClient::create_project` / `create_package` with the bootstrap
-//! admin credentials, then assert on the server state the filing
-//! leaves behind. The request XML is read back through geectl's own
-//! HTTP client (there is no library read-a-request operation), and
-//! the accept is a maintainer-side `changestate` POST, likewise
-//! through the harness — an agent files requests; accepting one is a
-//! maintainer action, so neither belongs in the library.
-
+//! The SR tests file real submit requests against the instance: they
+//! create a source branch and a target project first, through geectl's
+//! own `ObsClient::create_project` / `create_package` with the
+//! bootstrap admin credentials, then assert on the server state the
+//! filing leaves behind — read back through the library's own
+//! `ObsClient::show_request`, and changed through its
+//! `accept_request` / `decline_request` / `revoke_request`,
+//! `add_review`, comment, and search operations. Accepting is a
+//! maintainer action, and the library exposes it for automation all
+//! the same: the own-requests boundary (an agent accepts its own
+//! requests unless explicitly authorised) is documented on
+//! `ObsClient::change_state` in `src/obs.rs`, and the server stays
+//! the authority on who may move a request.
 use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::{
-    DryRun, FilePatchStatus, HistoryEntry, ObsClient, PackageDiffStatus, RevisionRange, SrFiling,
+    DryRun, FilePatchStatus, HistoryEntry, ObsClient, PackageDiffStatus, Request, RequestAction,
+    RequestSearch, RequestState, ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling,
     SrPayload,
 };
 
@@ -334,6 +335,77 @@ fn temporal_payload(
     .expect("temporal SR payload")
 }
 
+/// The submit action of a filed request: its source project and
+/// package, its target project and package (when the action names
+/// them), and what the request does with the source branch on
+/// accept. Panics naming the request when it carries no submit
+/// action — the live tests file submits, so a missing one means the
+/// filing did not do what the test asked.
+fn submit_action(
+    request: &Request,
+) -> (&str, &str, Option<&str>, Option<&str>, Option<SourceUpdate>) {
+    let Some(RequestAction::Submit {
+        source_project,
+        source_package,
+        target_project,
+        target_package,
+        sourceupdate,
+        ..
+    }) = request.actions.first()
+    else {
+        panic!("request {} must carry a submit action", request.id);
+    };
+    (
+        source_project,
+        source_package,
+        target_project.as_deref(),
+        target_package.as_deref(),
+        *sourceupdate,
+    )
+}
+
+/// File a submit request on the temporal instance and return its id
+/// and package. Each call files from a fresh, uniquely-named branch
+/// (see `setup_branch`), so parallel tests never share a target
+/// package name — the open-SR search is scoped by target package
+/// name only.
+fn file_temporal_request(client: &ObsClient<'_>, version: &str) -> (String, String) {
+    let (source_project, target_project, package) = setup_branch(client);
+    let dry = DryRun::new(false);
+    let filing = SrFiling::new(client, &dry);
+    let payload = temporal_payload(&source_project, &package, &target_project, version);
+    let id = filing
+        .file(&payload)
+        .expect("file a submit request on the temporal instance")
+        .expect("live filing returns a request id");
+    (id, package)
+}
+
+/// File a submit request from a branch holding one file: the diff of
+/// an empty submit fails on the server (the backend diff has nothing
+/// to compute from, and the unrescued diff error renders as 404), so
+/// the diff test files from a branch with content. The other tests
+/// keep the empty branch — they never ask the server for a diff.
+fn file_temporal_request_with_file(
+    client: &ObsClient<'_>,
+    version: &str,
+    filename: &str,
+    content: &str,
+) -> (String, String) {
+    let (source_project, target_project, package) = setup_branch(client);
+    let dry = DryRun::new(false);
+    client
+        .upload_file(&source_project, &package, filename, content, &dry)
+        .expect("upload a file into the source branch on the temporal instance");
+    let filing = SrFiling::new(client, &dry);
+    let payload = temporal_payload(&source_project, &package, &target_project, version);
+    let id = filing
+        .file(&payload)
+        .expect("file a submit request on the temporal instance")
+        .expect("live filing returns a request id");
+    (id, package)
+}
+
 /// The value of attribute `attr` in the first element starting at
 /// `marker` (e.g. `<state name="new">` via marker `<state `, attr
 /// `name`). None when the marker or the attribute is absent.
@@ -347,34 +419,11 @@ fn xml_attr_after(body: &str, marker: &str, attr: &str) -> Option<String> {
     Some(value.split('"').next()?.to_string())
 }
 
-/// The value of attribute `attr` anywhere in `body` (first
-/// occurrence). Used for `superseded_by`, which is not tied to one
-/// element the tests can name.
-fn xml_attr(body: &str, attr: &str) -> Option<String> {
-    let needle = format!("{attr}=\"");
-    let value = body.split_once(&needle)?.1;
-    Some(value.split('"').next()?.to_string())
-}
-
 /// The request's state name (`new`, `superseded`, `accepted`, ...):
 /// the first `<state name="...">` in the document, which is the
 /// request's current state.
 fn request_state(body: &str) -> Option<String> {
     xml_attr_after(body, "<state ", "name")
-}
-
-/// The request id this request was superseded by, if any: the
-/// `superseded_by` attribute when the server renders it on the
-/// request element, or the `<superseded_by>` element otherwise.
-fn superseded_by(body: &str) -> Option<String> {
-    if let Some(id) = xml_attr(body, "superseded_by") {
-        return Some(id);
-    }
-    let open = "<superseded_by>";
-    let close = "</superseded_by>";
-    let start = body.find(open)? + open.len();
-    let end = body[start..].find(close)? + start;
-    Some(body[start..end].trim().to_string())
 }
 
 /// The raw request XML for `id`, read back from the server. The
@@ -435,13 +484,31 @@ fn response_is_status_ok(body: &str) -> bool {
     })
 }
 
-/// Accept submit request `id` as the admin: the maintainer-side
-/// state change the accept-cleanup test exercises. There is no
-/// library accept operation (an agent files requests; accepting one
-/// is a maintainer action), so the harness POSTs the changestate
-/// directly, the same `cmd=changestate` form `supersede_request`
+/// Change the state of one review on a request, as the admin, by
+/// driving the raw `changereviewstate` command: the library has no
+/// review-state operation in this batch, so this is harness-only
+/// setup for the readback test, not a library operation. The comment
+/// travels as the POST body, the same form the change-state command
 /// uses.
-///
+fn change_review_state(base: &str, id: &str, newstate: &str, by_user: &str) {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let body = http
+        .post_text(
+            &format!(
+                "{base}/request/{id}?cmd=changereviewstate&newstate={newstate}&by_user={by_user}"
+            ),
+            "accepted by the geectl temporal test",
+            &temporal_credentials(),
+        )
+        .expect("change the review state on the temporal instance");
+    assert!(
+        response_is_status_ok(&body),
+        "changing the review state of request {id} did not return <status code=\"ok\"/>; body: {body}"
+    );
+}
+
 /// The accept retries on a failed POST for a bounded time: accepting
 /// runs the server's backend copy and cleanup, and on a fresh
 /// instance those can fail while the backend is still registering
@@ -591,39 +658,26 @@ fn temporal_filed_request_shows_up_on_server() {
         .file(&payload)
         .expect("file a submit request on the temporal instance")
         .expect("live filing returns a request id");
-    let body = request_xml(&base, &id);
+    let request = client
+        .show_request(&id)
+        .expect("read the filed request back from the server");
     // The filed request is open, from the branch, to the target, and
     // carries the default cleanup: whatever the server holds must be
     // what was filed.
+    assert_eq!(request.id.to_string(), id);
+    assert_eq!(request.creator, "Admin");
+    assert_eq!(request.state.name, RequestState::New);
     assert_eq!(
-        request_state(&body).as_deref(),
-        Some("new"),
-        "filed request {id} must be new; body: {body}"
+        request.description,
+        format!("Update {package} to 2.0: temporal test submission")
     );
-    assert_eq!(
-        xml_attr_after(&body, "<source ", "project").as_deref(),
-        Some(source_project.as_str()),
-        "filed request {id} must come from the branch; body: {body}"
-    );
-    assert_eq!(
-        xml_attr_after(&body, "<source ", "package").as_deref(),
-        Some(package.as_str()),
-        "filed request {id} must submit the branch package; body: {body}"
-    );
-    assert_eq!(
-        xml_attr_after(&body, "<target ", "project").as_deref(),
-        Some(target_project.as_str()),
-        "filed request {id} must target the target project; body: {body}"
-    );
-    assert_eq!(
-        xml_attr_after(&body, "<target ", "package").as_deref(),
-        Some(package.as_str()),
-        "filed request {id} must target the package; body: {body}"
-    );
-    assert!(
-        body.contains("<sourceupdate>cleanup</sourceupdate>"),
-        "filed request {id} must carry the default cleanup; body: {body}"
-    );
+    let (src_project, src_package, tgt_project, tgt_package, sourceupdate) =
+        submit_action(&request);
+    assert_eq!(src_project, source_project);
+    assert_eq!(src_package, package);
+    assert_eq!(tgt_project, Some(target_project.as_str()));
+    assert_eq!(tgt_package, Some(package.as_str()));
+    assert_eq!(sourceupdate, Some(SourceUpdate::Cleanup));
 }
 
 #[test]
@@ -680,22 +734,26 @@ fn temporal_refile_supersedes_and_deletes_on_server() {
         .expect("refile on the temporal instance")
         .expect("live refile returns a request id");
     assert_ne!(id1, id2, "refile must return a new request id");
-    let old = request_xml(&base, &id1);
+    let old = client
+        .show_request(&id1)
+        .expect("read the old request back from the server");
     assert_eq!(
-        request_state(&old).as_deref(),
-        Some("superseded"),
-        "the old request {id1} must be superseded; body: {old}"
+        old.state.name,
+        RequestState::Superseded,
+        "the old request {id1} must be superseded"
     );
     assert_eq!(
-        superseded_by(&old).as_deref(),
-        Some(id2.as_str()),
-        "the old request {id1} must point at the new one; body: {old}"
+        old.state.superseded_by,
+        Some(id2.parse().expect("the new request id is a number")),
+        "the old request {id1} must point at the new one"
     );
-    let new = request_xml(&base, &id2);
+    let new = client
+        .show_request(&id2)
+        .expect("read the new request back from the server");
     assert_eq!(
-        request_state(&new).as_deref(),
-        Some("new"),
-        "the new request {id2} must be new; body: {new}"
+        new.state.name,
+        RequestState::New,
+        "the new request {id2} must be new"
     );
     // The old branch deletes now that its request is closed...
     client
@@ -1304,6 +1362,364 @@ fn temporal_project_diff_classifies() {
         changed_diff.files[0].diff.contains("+Version: 1.1"),
         "the diff must add the new version; got {}",
         changed_diff.files[0].diff
+    );
+}
+
+/// Reading a filed request back through the library: the id,
+/// creator, state, description, action, and creation history must be
+/// what was filed.
+#[test]
+fn temporal_show_request_reads_back_the_filed_request() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, package) = file_temporal_request(&client, "2.0");
+    let request = client
+        .show_request(&id)
+        .expect("read the filed request back from the server");
+    assert_eq!(request.id.to_string(), id);
+    assert_eq!(request.creator, "Admin");
+    assert_eq!(request.state.name, RequestState::New);
+    assert_eq!(
+        request.description,
+        format!("Update {package} to 2.0: temporal test submission")
+    );
+    let (_, src_package, _, tgt_package, sourceupdate) = submit_action(&request);
+    assert_eq!(src_package, package);
+    assert_eq!(tgt_package, Some(package.as_str()));
+    assert_eq!(sourceupdate, Some(SourceUpdate::Cleanup));
+    // The creation history entry is the filing itself.
+    assert_eq!(request.history.len(), 1);
+    assert_eq!(request.history[0].description, "Request created");
+    assert_eq!(request.history[0].comment, request.description);
+}
+
+/// The log of a fresh request is its creation entry alone.
+#[test]
+fn temporal_request_log_lists_the_creation_entry() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, package) = file_temporal_request(&client, "2.0");
+    let log = client
+        .request_log(&id)
+        .expect("read the filed request's log from the server");
+    assert_eq!(
+        log.len(),
+        1,
+        "a fresh request has one log entry: its creation"
+    );
+    assert_eq!(log[0].description, "Request created");
+    assert_eq!(
+        log[0].comment,
+        format!("Update {package} to 2.0: temporal test submission")
+    );
+}
+
+/// Accepting a request through the library moves it to `accepted` on
+/// the server.
+#[test]
+fn temporal_accept_request_changes_state_on_server() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, _) = file_temporal_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    client
+        .accept_request(&id, "accepted by the geectl temporal test", false, &dry)
+        .expect("accept the request on the temporal instance");
+    let request = client
+        .show_request(&id)
+        .expect("read the accepted request back from the server");
+    assert_eq!(request.state.name, RequestState::Accepted);
+}
+
+/// Declining a request through the library moves it to `declined` on
+/// the server.
+#[test]
+fn temporal_decline_request_changes_state_on_server() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, _) = file_temporal_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    client
+        .decline_request(&id, "declined by the geectl temporal test", &dry)
+        .expect("decline the request on the temporal instance");
+    let request = client
+        .show_request(&id)
+        .expect("read the declined request back from the server");
+    assert_eq!(request.state.name, RequestState::Declined);
+}
+
+/// Revoking a request through the library moves it to `revoked` on
+/// the server.
+#[test]
+fn temporal_revoke_request_changes_state_on_server() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, _) = file_temporal_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    client
+        .revoke_request(&id, "revoked by the geectl temporal test", &dry)
+        .expect("revoke the request on the temporal instance");
+    let request = client
+        .show_request(&id)
+        .expect("read the revoked request back from the server");
+    assert_eq!(request.state.name, RequestState::Revoked);
+}
+
+/// Asking for a review through the library moves the request to
+/// `review` on the server, with the review carrying who it was asked
+/// of and why.
+#[test]
+fn temporal_add_review_marks_the_request_for_review() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, _) = file_temporal_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let target = ReviewTarget::new(Some("Admin"), None, None, None)
+        .expect("a review asked of a user is a valid target");
+    client
+        .add_review(&id, &target, "please review", &dry)
+        .expect("ask Admin to review the request on the temporal instance");
+    let request = client
+        .show_request(&id)
+        .expect("read the reviewed request back from the server");
+    assert_eq!(request.state.name, RequestState::Review);
+    assert_eq!(request.reviews.len(), 1);
+    assert_eq!(request.reviews[0].by_user.as_deref(), Some("Admin"));
+    assert_eq!(request.reviews[0].who.as_deref(), Some("Admin"));
+    assert_eq!(request.reviews[0].comment, "please review");
+    assert_eq!(request.reviews[0].state, ReviewState::New);
+}
+
+/// A review that was acted on reads back with its history: the
+/// parser must read the review's `<history>` children, not refuse
+/// the whole request. The library has no review-state operation in
+/// this batch, so the harness drives the raw `changereviewstate`
+/// command to put the review into the accepted state the parser
+/// must then read back — the test's subject is the readback, and the
+/// state change is only its setup.
+#[test]
+fn temporal_review_with_history_reads_back() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, _) = file_temporal_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let target = ReviewTarget::new(Some("Admin"), None, None, None)
+        .expect("a review asked of a user is a valid target");
+    client
+        .add_review(&id, &target, "please review", &dry)
+        .expect("ask Admin to review the request on the temporal instance");
+    change_review_state(&base, &id, "accepted", "Admin");
+    let request = client
+        .show_request(&id)
+        .expect("read the reviewed request back from the server");
+    assert_eq!(request.reviews.len(), 1);
+    assert_eq!(request.reviews[0].state, ReviewState::Accepted);
+    assert_eq!(
+        request.reviews[0].history.len(),
+        1,
+        "an accepted review must carry its history entry"
+    );
+    assert_eq!(
+        request.reviews[0].history[0].description,
+        "Review got accepted"
+    );
+}
+
+/// Commenting on a request through the library, then listing its
+/// comments back: the comment and its threaded reply must be what
+/// was posted.
+#[test]
+fn temporal_comment_create_and_list_round_trips() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, _) = file_temporal_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    client
+        .add_comment(&id, "first comment", None, &dry)
+        .expect("comment on the request on the temporal instance");
+    let comments = client
+        .list_comments(&id)
+        .expect("list the request's comments from the server");
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].body, "first comment");
+    assert_eq!(comments[0].who, "Admin");
+    assert_eq!(comments[0].parent_id, None);
+    let first_id = comments[0].id;
+    let first_id_str = first_id.to_string();
+    client
+        .add_comment(&id, "reply to the first", Some(&first_id_str), &dry)
+        .expect("reply to the comment on the temporal instance");
+    let comments = client
+        .list_comments(&id)
+        .expect("list the request's comments from the server");
+    assert_eq!(comments.len(), 2);
+    assert_eq!(comments[1].body, "reply to the first");
+    assert_eq!(comments[1].parent_id, Some(first_id));
+}
+
+/// The diff of a filed request, plain and wrapped in the request
+/// XML. The branch holds one file, so the plain diff shows it added;
+/// the XML form must wrap a request element.
+#[test]
+fn temporal_request_diff_returns_the_submit_diff() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, _) = file_temporal_request_with_file(
+        &client,
+        "2.0",
+        "geectl-temporal.txt",
+        "geectl temporal diff fixture\n",
+    );
+    let plain = client
+        .request_diff(&id, false)
+        .expect("read the plain diff of the filed request");
+    assert!(
+        plain.contains("geectl-temporal.txt"),
+        "the plain diff must show the added file; got {plain}"
+    );
+    let xml = client
+        .request_diff(&id, true)
+        .expect("read the XML diff of the filed request");
+    assert!(
+        xml.contains("<request"),
+        "the XML diff must wrap a request element; got {xml}"
+    );
+}
+
+/// Searching by id and action type finds the filed submit, and
+/// searching by creator contains it among the parallel tests'
+/// requests. The types filter is the live proof for the
+/// `action/@type` question: the server accepts it in the match
+/// expression.
+#[test]
+fn temporal_search_requests_finds_the_filed_request() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, package) = file_temporal_request(&client, "2.0");
+    let search = RequestSearch::new()
+        .request_ids(vec![id.parse().expect("the filed request id is a number")])
+        .types(vec!["submit".to_string()]);
+    let found = client
+        .search_requests(&search)
+        .expect("search by id and type on the temporal instance");
+    assert_eq!(
+        found.len(),
+        1,
+        "the search must find exactly the filed request"
+    );
+    assert_eq!(found[0].id.to_string(), id);
+    assert_eq!(found[0].state.name, RequestState::New);
+    // The source/target package filters use the singular attribute
+    // the search engine whitelists; the plural is refused with 400.
+    // The exclude filter is `not(target[@project='X'])`: excluding
+    // the request's own target project hides it, excluding another
+    // project does not.
+    let target_project = {
+        let request = client
+            .show_request(&id)
+            .expect("read the filed request back for its target project");
+        let (_, _, tgt_project, _, _) = submit_action(&request);
+        tgt_project
+            .expect("the filed submit names a target project")
+            .to_string()
+    };
+    let by_source_package = client
+        .search_requests(
+            &RequestSearch::new()
+                .request_ids(vec![id.parse().expect("the filed request id is a number")])
+                .source_packages(vec![package.clone()]),
+        )
+        .expect("search by id and source package on the temporal instance");
+    assert_eq!(
+        by_source_package.len(),
+        1,
+        "the source-package search must find exactly the filed request"
+    );
+    let by_target_package = client
+        .search_requests(
+            &RequestSearch::new()
+                .request_ids(vec![id.parse().expect("the filed request id is a number")])
+                .target_packages(vec![package.clone()]),
+        )
+        .expect("search by id and target package on the temporal instance");
+    assert_eq!(
+        by_target_package.len(),
+        1,
+        "the target-package search must find exactly the filed request"
+    );
+    let excluded = client
+        .search_requests(
+            &RequestSearch::new()
+                .request_ids(vec![id.parse().expect("the filed request id is a number")])
+                .exclude_target_projects(vec![target_project.to_string()]),
+        )
+        .expect("search excluding the filed request's target on the temporal instance");
+    assert!(
+        excluded.is_empty(),
+        "excluding the filed request's target project must hide it"
+    );
+    let not_excluded = client
+        .search_requests(
+            &RequestSearch::new()
+                .request_ids(vec![id.parse().expect("the filed request id is a number")])
+                .exclude_target_projects(vec!["home:Admin".to_string()]),
+        )
+        .expect("search excluding another project on the temporal instance");
+    assert_eq!(
+        not_excluded.len(),
+        1,
+        "excluding another project must not hide the filed request"
+    );
+    let by_creator = client
+        .search_requests(&RequestSearch::new().creators(vec!["Admin".to_string()]))
+        .expect("search by creator on the temporal instance");
+    assert!(
+        by_creator
+            .iter()
+            .any(|request| request.id.to_string() == id),
+        "the creator search must contain the filed request {id}"
+    );
+}
+
+/// The lenient state change on a request the server refuses to move:
+/// accepting an accepted request reports `false` instead of failing,
+/// so a batch triaging many requests does not stop here.
+#[test]
+fn temporal_try_change_state_false_on_an_accepted_request() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (id, _) = file_temporal_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    client
+        .accept_request(&id, "accepted by the geectl temporal test", false, &dry)
+        .expect("accept the request on the temporal instance");
+    assert!(
+        !client
+            .try_change_state(&id, RequestState::Accepted, "accept again", false, &dry)
+            .expect("the lenient change reports false, not an error"),
+        "accepting an accepted request must report false"
     );
 }
 #[cfg(test)]
