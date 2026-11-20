@@ -13,8 +13,8 @@
 //! Retry policy (a single documented constant, not per-call-site
 //! improvisation): only idempotent methods are retried (GET, HEAD, PUT,
 //! DELETE). POST is never retried without an explicit idempotency key.
-//! The scaffold applies the policy to GET only — mutations do not exist
-//! yet, so there is nothing to retry — but the rule is already the law.
+//! The policy applies to GET; `post_json` never retries — a retried
+//! mutation can create a duplicate.
 //! Within a retryable method, only transient failures are retried
 //! (timeouts, transport errors, 429, 5xx). Client errors (other 4xx),
 //! auth failures, and TLS failures are returned immediately.
@@ -120,6 +120,14 @@ pub fn is_retryable_method(method: &str) -> bool {
 /// the response body as a string on a 2xx status, or a [`GeectlError`].
 pub trait HttpClient {
     fn get(&self, url: &str) -> Result<String, GeectlError>;
+
+    /// POST a JSON body. The body is sent as-is with
+    /// `Content-Type: application/json`; the caller builds the JSON.
+    /// Unlike GET, POST is never retried: a retried mutation can create
+    /// a duplicate, so every non-2xx status (and every transport
+    /// failure) is returned immediately. Auth and the transport guard
+    /// work exactly as for GET.
+    fn post_json(&self, url: &str, body: &str) -> Result<String, GeectlError>;
 }
 
 /// A [`HttpClient`] backed by ureq, with bounded timeouts and the retry
@@ -447,6 +455,54 @@ impl HttpClient for UreqClient {
             GeectlError::new(ErrorKind::InternalError, "GET failed without an error")
         }))
     }
+
+    fn post_json(&self, url: &str, body: &str) -> Result<String, GeectlError> {
+        // Resolve credentials once: re-resolving per attempt would
+        // re-read the secret source for no reason — and there is only
+        // one attempt, because POST never retries.
+        let credentials = match &self.auth {
+            Some(auth) => auth.credentials()?,
+            None => Credentials::None,
+        };
+        // Credentials never travel over cleartext http, except to a
+        // loopback host (see require_credentials_transport).
+        require_credentials_transport(url, &credentials)?;
+        let request = self.apply_auth(self.agent.post(url), &credentials)?;
+        let request = request.header("Content-Type", "application/json");
+        match request.send(body) {
+            Ok(resp) => read_body_capped(resp.into_body().into_reader()),
+            Err(ureq::Error::StatusCode(code)) => {
+                let safe_url = sanitize_url_for_error(url);
+                // No retry for POST: return the mapped error
+                // immediately, even for a transient status — a retried
+                // mutation can create a duplicate.
+                let err = match status_action(code, &safe_url) {
+                    StatusAction::Return(err) | StatusAction::Retry(err) => err,
+                };
+                Err(err)
+            }
+            Err(ureq::Error::Tls(msg)) => Err(GeectlError::new(
+                ErrorKind::TlsError,
+                format!("TLS error: {msg}"),
+            )),
+            Err(ureq::Error::Rustls(e)) => Err(GeectlError::new(
+                ErrorKind::TlsError,
+                format!("TLS error: {e}"),
+            )),
+            Err(ureq::Error::Pem(e)) => Err(GeectlError::new(
+                ErrorKind::TlsError,
+                format!("TLS error: {e}"),
+            )),
+            Err(ureq::Error::Timeout(_)) => Err(GeectlError::new(
+                ErrorKind::Timeout,
+                format!("request to {} timed out", sanitize_url_for_error(url)),
+            )),
+            Err(ureq::Error::Io(e)) => {
+                Err(GeectlError::new(ErrorKind::NetworkError, e.to_string()))
+            }
+            Err(e) => Err(GeectlError::new(ErrorKind::ServerError, e.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -674,8 +730,8 @@ mod tests {
     }
 
     /// A one-shot loopback HTTP server for auth tests: accepts a single
-    /// request, records its Authorization header, and answers 200 with
-    /// the given body. The client talks to it over plain http:// —
+    /// request, records it (method line, headers, body), and answers
+    /// with the given body. The client talks to it over plain http:// —
     /// loopback only, fixture credentials only, never a real endpoint
     /// and never a real credential. The accept/read are bounded (5s)
     /// so a test that never connects fails instead of hanging the suite.
@@ -685,9 +741,11 @@ mod tests {
     }
 
     impl LoopbackServer {
-        /// Accept one request, record its Authorization header, answer
-        /// with `response`, and return the port plus the handle that
-        /// yields the recorded header.
+        /// Accept one request, record it (method line, headers, body),
+        /// answer with `response`, and return the port plus the handle
+        /// that yields the recorded request. The read is
+        /// Content-Length-aware: reading headers only would leave a
+        /// POST body unread and the recorded request incomplete.
         fn serve_once(response: String) -> (u16, std::thread::JoinHandle<Option<String>>) {
             let listener =
                 std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
@@ -709,6 +767,10 @@ mod tests {
                 }?;
                 use std::io::{Read, Write};
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                // Read the headers, then the body: the body length comes
+                // from Content-Length (a request without one has no
+                // body). Reading headers only would leave a POST body
+                // unread and the recorded request incomplete.
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
                 loop {
@@ -716,27 +778,43 @@ mod tests {
                         Ok(0) => break,
                         Ok(n) => {
                             buf.extend_from_slice(&chunk[..n]);
-                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                                break;
+                            let text = String::from_utf8_lossy(&buf);
+                            if let Some(end) = text.find("\r\n\r\n") {
+                                let header_end = end + 4;
+                                let content_length: usize = text[..end]
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        if k.trim().eq_ignore_ascii_case("content-length") {
+                                            v.trim().parse().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                if buf.len() >= header_end + content_length {
+                                    break;
+                                }
                             }
                         }
                         Err(_) => break,
                     }
                 }
-                let request = String::from_utf8_lossy(&buf);
-                let auth = request
-                    .lines()
-                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-                    .map(|l| l["authorization:".len()..].trim().to_string());
+                let request = String::from_utf8_lossy(&buf).into_owned();
                 let _ = stream.write_all(response.as_bytes());
-                auth
+                Some(request)
             });
             (port, handle)
         }
 
         fn serve(body: &'static str) -> Self {
+            Self::serve_status(body, 200)
+        }
+
+        fn serve_status(body: &'static str, status: u16) -> Self {
+            let reason = if status == 200 { "OK" } else { "Error" };
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -758,8 +836,19 @@ mod tests {
             format!("http://127.0.0.1:{}/test", self.port)
         }
 
-        fn authorization(self) -> Option<String> {
+        /// The recorded request (method line, headers, body), if the
+        /// client connected.
+        fn request(self) -> Option<String> {
             self.handle.join().ok().flatten()
+        }
+
+        fn authorization(self) -> Option<String> {
+            self.request().and_then(|request| {
+                request
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(|l| l["authorization:".len()..].trim().to_string())
+            })
         }
     }
 
@@ -795,6 +884,87 @@ mod tests {
         .unwrap();
         assert_eq!(client.get(&server.url()).unwrap(), "hello");
         assert_eq!(server.authorization().as_deref(), Some("Bearer tok3n"));
+    }
+
+    #[test]
+    fn post_json_sends_json_body_with_auth() {
+        let server = LoopbackServer::serve("created");
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Bearer {
+                token: "tok-123".to_string(),
+            }))),
+        )
+        .unwrap();
+        let body = "{\"name\":\"geectl-live\"}";
+        assert_eq!(client.post_json(&server.url(), body).unwrap(), "created");
+        let request = server.request().expect("server recorded the request");
+        // Method, content type, body, and auth — all four must be
+        // exactly what a Gitea create-repo call needs.
+        assert!(
+            request.starts_with("POST /test HTTP/1.1\r\n"),
+            "POST method line wrong; request: {request}"
+        );
+        assert!(
+            request
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("content-type: application/json")),
+            "POST must carry Content-Type: application/json; request: {request}"
+        );
+        let sent_body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("request has a body");
+        assert_eq!(sent_body, body);
+        assert!(
+            request
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("authorization: Bearer tok-123")),
+            "POST must carry the Bearer <redacted> request: {request}"
+        );
+    }
+
+    #[test]
+    fn post_json_maps_404_to_not_found() {
+        let server = LoopbackServer::serve_status("no such repo", 404);
+        let client = UreqClient::with_auth(Timeout::default(), None).unwrap();
+        let err = client
+            .post_json(&server.url(), "{}")
+            .expect_err("a 404 POST must fail");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn post_json_maps_401_to_auth_failed() {
+        let server = LoopbackServer::serve_status("bad token", 401);
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Bearer {
+                token: "bad-token".to_string(),
+            }))),
+        )
+        .unwrap();
+        let err = client
+            .post_json(&server.url(), "{}")
+            .expect_err("a 401 POST must fail");
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+    }
+
+    #[test]
+    fn post_json_over_non_loopback_http_is_refused() {
+        // Cleartext http to a real host must never carry a credential —
+        // the same transport guard as GET, for the mutation path.
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Bearer {
+                token: "tok-123".to_string(),
+            }))),
+        )
+        .unwrap();
+        let err = client
+            .post_json("http://example.com/api/v1/user/repos", "{}")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]
