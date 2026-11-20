@@ -120,7 +120,8 @@ Rules that hold:
 The library surface a tool uses to move a package update through the
 distribution: `ObsClient` (devel-project lookup, devel version, open
 submit-request check, filing, superseding, branch cleanup, branch-project
-and branch-package creation, file upload), `SrPayload`
+and branch-package creation, file upload, and the remote reads listed
+below), `SrPayload`
 (the validated submit-request payload), `SrFiling` (the only filing
 path, dry-run by default; `refile` is the file-then-supersede flow),
 `DryRun` (the would-do guard), and `CveId` (CVE id parsing plus the
@@ -222,9 +223,41 @@ All three are DryRun-guarded like the delete: in dry-run the
 creation or upload is recorded in the plan and nothing is created or
 uploaded, and no credentials are needed.
 
-Credentials: the public reads (devel project, devel version) need
-none; the open-SR search, the filing POST, superseding, deleting,
-creating, and uploading need OBS Basic and fail loudly without them.
+Remote reads: the read surface for inspecting what the distribution
+holds, all typed — no method takes or returns raw XML. The public
+reads (`ObsClient::cat`, `list_files`, `list_packages`,
+`project_meta`, `package_meta`, `link_target`, `project_diff`) need
+no credentials. `cat` reads one file at a revision (`rev`); the
+directory listings (`list_files`, `list_packages`) are the server's
+own `<directory>` documents. `package_log` reads the package history
+(newest first — the server lists oldest first, so the log is
+reversed) through `/source`, which has no public route, so it
+reads with the client's credentials. `revision_patch` diffs one
+revision against the previous one (revision 1 has nothing to diff
+against) with per-file unified diffs. `search_packages` and
+`search_projects` match a substring against name, title, and
+description — the search is a substring match, not the exact match
+osc defaults to — and the term must be non-empty and carry no `'`.
+`owners` and `owners_for_binary` read the owner search, `maintainers`
+filters it to role `maintainer`, and `whois` reads a person. The
+credentialed reads fail loudly without credentials, and an unexpected
+response is an error, never an empty list. A 403 surfaces as
+`AuthFailed` even for the public reads — a search-cap 403 on a public
+read reads as an auth failure, not a missing package. `project_diff`
+classifies every package in either project — identical, differs,
+only-in-old, only-in-new — with a per-file unified diff for the
+packages that differ, optionally annotated with the open submit
+requests involving each differing package in the new project (which
+needs credentials).
+
+Credentials: the public reads (devel project, devel version, file
+and directory reads, meta, link target, project diff) need none; the
+package log, the open-SR search, the package and project search, the
+owner search, and reading a person, plus the filing POST, superseding,
+deleting, creating, and uploading, need OBS Basic and fail loudly
+without them — except the package log, which reads with whatever
+credentials the client carries and fails on the server's 403 instead
+of refusing up front.
 OBS accepts Basic only —
 a Bearer token or SSH key is refused at client construction. No
 credential is stored here, and no request carries one over cleartext
@@ -340,7 +373,11 @@ through geectl's own HTTP client: `GET /about` returns a real OBS
 `<entry>` elements. The mutation assertions create a project through geectl and read it
 back (`temporal_create_project_shows_up_on_server`), upload a file
 and read it back (`temporal_upload_file_reads_back_on_server`, in
-`tests/temporal_obs.rs`: the bytes and the revision number), and file
+`tests/temporal_obs.rs`: the bytes and the revision number), read the
+remote state back through the new read operations
+(`tests/temporal_obs.rs`: cat at a revision, directory and project
+listings, log newest-first with a range, revision patch, meta, search,
+owners, whois, link target, project diff), and file
 real submit requests and assert on the server state they leave behind
 (`tests/temporal_obs.rs`: filing, refile, and accept-time cleanup).
 
