@@ -145,6 +145,32 @@ pub fn valid_obs_filename(name: &str) -> bool {
         && name != "_attribute"
 }
 
+/// Split a `project/package` path on `/`, dropping empty segments:
+/// a leading, trailing, or doubled slash contributes no segment, so
+/// `"//"` and `"/////////"` split to nothing and `"a//b"` to
+/// `["a", "b"]`. The segments are returned verbatim (no trimming);
+/// callers validate them as OBS names.
+pub fn split_slash_segments(s: &str) -> Vec<String> {
+    s.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_string())
+        .collect()
+}
+
+/// Split a `project/package` path into its two parts. Exactly two
+/// non-empty segments, or an error: a bare project, a bare package,
+/// or more than one slash is not a project/package pair.
+pub fn parse_project_package(s: &str) -> Result<(String, String), GeectlError> {
+    let segments = split_slash_segments(s);
+    if segments.len() != 2 {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("expected a project/package path, got {s:?}"),
+        ));
+    }
+    Ok((segments[0].clone(), segments[1].clone()))
+}
+
 /// Build a request URL from a base, path segments, and query pairs,
 /// using the encoders from `url.rs`. Segments are encoded as exactly
 /// one element each; query pairs as `name=value`.
@@ -369,13 +395,97 @@ impl Default for DryRun {
     }
 }
 
+/// A single revision specifier: a revision number, or a source md5.
+/// The `rev` parameter the API takes on source reads (`?rev=N`) is a
+/// number; an md5 names the same revision by content hash. Parsed by
+/// [`RevisionSpec::parse`]; a string that is neither a positive number
+/// nor a 32-hex md5 is invalid, never silently a revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionSpec {
+    /// Revision number (`rev` attribute).
+    Rev(u64),
+    /// Source md5 (32 hex digits, normalized to lowercase).
+    Md5(String),
+}
+
+impl RevisionSpec {
+    /// Parse a single revision specifier: `"1"` → `Rev(1)`; a 32-hex
+    /// md5 → `Md5`. Anything else (empty, `0`, a short hash, a
+    /// non-hex string) is an error.
+    pub fn parse(s: &str) -> Result<Self, GeectlError> {
+        if s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(RevisionSpec::Md5(s.to_ascii_lowercase()));
+        }
+        match s.parse::<u64>() {
+            Ok(0) | Err(_) => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid revision specifier: {s:?}"),
+            )),
+            Ok(n) => Ok(RevisionSpec::Rev(n)),
+        }
+    }
+}
+
+/// A revision range: an optional lower and upper bound, each a
+/// [`RevisionSpec`]. Parsed by [`RevisionRange::parse`] from the
+/// `rev` option form: `""` or `":"` → no bounds; `"1"` → only rev 1;
+/// `"1:2"` → revs 1 through 2; a 32-hex md5 → only that md5;
+/// `"hash1:hash2"` → the revisions between the two hashes, endpoints
+/// included. More than one `:` or a part that is neither a revision
+/// number nor a 32-hex md5 is an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionRange {
+    /// Lower bound (inclusive), or `None` for the oldest revision.
+    pub from: Option<RevisionSpec>,
+    /// Upper bound (inclusive), or `None` for the newest revision.
+    pub to: Option<RevisionSpec>,
+}
+
+impl RevisionRange {
+    /// Parse a revision range: `""`/`":"` → `(None, None)`; `"1"` →
+    /// `(Rev(1), None)`; `"1:2"` → `(Rev(1), Rev(2))`; a 32-hex md5
+    /// → `(Md5, None)`; `"hash1:hash2"` → `(Md5, Md5)`. `":::::"`,
+    /// `"1:2:3:4:5"`, and three hashes are errors (more than one
+    /// `:`); a part that is neither a revision number nor a 32-hex
+    /// md5 is an error.
+    pub fn parse(s: &str) -> Result<Self, GeectlError> {
+        let invalid = || {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid revision range: {s:?}"),
+            )
+        };
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() > 2 {
+            return Err(invalid());
+        }
+        let parse_part = |part: &str| -> Result<Option<RevisionSpec>, GeectlError> {
+            if part.is_empty() {
+                Ok(None)
+            } else {
+                RevisionSpec::parse(part).map(Some).map_err(|_| invalid())
+            }
+        };
+        let from = parse_part(parts[0])?;
+        let to = if parts.len() == 2 {
+            parse_part(parts[1])?
+        } else {
+            None
+        };
+        Ok(RevisionRange { from, to })
+    }
+}
+
 /// The OBS client: the devel-project lookup, the devel version, the
-/// open-submit-request check, and submit-request filing.
+/// open-submit-request check, submit-request filing, branch setup,
+/// and the remote reads (file and directory reads, history, meta,
+/// search, owners, person, link target, project diff).
 ///
 /// The client holds the HTTP client and the OBS Basic credentials
 /// (resolved by the caller through geectl's auth surface, e.g.
-/// `EnvObsAuth`). The public reads need no credentials; the search
-/// and the filing POST need them and fail loudly without them.
+/// `EnvObsAuth`). The public reads need no credentials; the
+/// credentialed reads and the filing POST need them and fail loudly
+/// without them.
 pub struct ObsClient<'a> {
     http: &'a dyn HttpClient,
     base: String,
@@ -4130,5 +4240,111 @@ mod tests {
         assert!(filing.refile(&payload(), "not-an-id").is_err());
         assert!(http.get_calls().is_empty());
         assert!(http.post_calls().is_empty());
+    }
+
+    // --- split_slash_segments / parse_project_package ---
+
+    #[test]
+    fn slash_split_drops_empty_segments() {
+        // No slash, leading/trailing slash, middle slash, `//` and
+        // `/////////` collapse (empty segments dropped).
+        assert_eq!(split_slash_segments("foo"), vec!["foo"]);
+        assert_eq!(split_slash_segments("a/b"), vec!["a", "b"]);
+        assert_eq!(split_slash_segments("/a/b"), vec!["a", "b"]);
+        assert_eq!(split_slash_segments("a/b/"), vec!["a", "b"]);
+        assert_eq!(split_slash_segments("a//b"), vec!["a", "b"]);
+        assert!(split_slash_segments("//").is_empty());
+        assert!(split_slash_segments("/////////").is_empty());
+        assert!(split_slash_segments("").is_empty());
+    }
+
+    #[test]
+    fn project_package_split_needs_exactly_two_segments() {
+        assert_eq!(
+            parse_project_package("devel:languages:python/foo").unwrap(),
+            ("devel:languages:python".to_string(), "foo".to_string())
+        );
+        assert_eq!(
+            parse_project_package("/a/b/").unwrap(),
+            ("a".to_string(), "b".to_string())
+        );
+        assert!(parse_project_package("foo").is_err());
+        assert!(parse_project_package("").is_err());
+        assert!(parse_project_package("a/b/c").is_err());
+        assert!(parse_project_package("a//b/c").is_err());
+    }
+
+    // --- RevisionSpec / RevisionRange ---
+
+    #[test]
+    fn revision_spec_parses_numbers_and_md5s() {
+        assert_eq!(RevisionSpec::parse("1").unwrap(), RevisionSpec::Rev(1));
+        assert_eq!(RevisionSpec::parse("123").unwrap(), RevisionSpec::Rev(123));
+        let md5 = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            RevisionSpec::parse(md5).unwrap(),
+            RevisionSpec::Md5(md5.to_string())
+        );
+        // An uppercase hex md5 normalizes to lowercase.
+        assert_eq!(
+            RevisionSpec::parse("0123456789ABCDEF0123456789ABCDEF").unwrap(),
+            RevisionSpec::Md5(md5.to_string())
+        );
+        assert!(RevisionSpec::parse("").is_err());
+        assert!(RevisionSpec::parse("0").is_err());
+        assert!(RevisionSpec::parse("abc").is_err());
+        assert!(RevisionSpec::parse("0123456789abcdef").is_err());
+        assert!(RevisionSpec::parse("1:2").is_err());
+    }
+
+    #[test]
+    fn revision_range_parses_the_option_form() {
+        // `""` / `":"` → (None, None).
+        assert_eq!(
+            RevisionRange::parse("").unwrap(),
+            RevisionRange {
+                from: None,
+                to: None
+            }
+        );
+        assert_eq!(
+            RevisionRange::parse(":").unwrap(),
+            RevisionRange {
+                from: None,
+                to: None
+            }
+        );
+        // `"1"` → ("1", None); `"1:2"` → ("1", "2").
+        assert_eq!(
+            RevisionRange::parse("1").unwrap(),
+            RevisionRange {
+                from: Some(RevisionSpec::Rev(1)),
+                to: None
+            }
+        );
+        assert_eq!(
+            RevisionRange::parse("1:2").unwrap(),
+            RevisionRange {
+                from: Some(RevisionSpec::Rev(1)),
+                to: Some(RevisionSpec::Rev(2))
+            }
+        );
+        // 32-hex md5 → (hash, None); hash1:hash2.
+        let hash1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert_eq!(
+            RevisionRange::parse(hash1).unwrap(),
+            RevisionRange {
+                from: Some(RevisionSpec::Md5(hash1.to_string())),
+                to: None
+            }
+        );
+        assert_eq!(
+            RevisionRange::parse(&format!("{hash1}:{hash2}")).unwrap(),
+            RevisionRange {
+                from: Some(RevisionSpec::Md5(hash1.to_string())),
+                to: Some(RevisionSpec::Md5(hash2.to_string()))
+            }
+        );
     }
 }

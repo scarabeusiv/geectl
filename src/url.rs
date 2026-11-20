@@ -195,4 +195,53 @@ mod tests {
         assert!(UrlBuilder::new("https://?q=1").is_err());
         assert!(UrlBuilder::new("https://api.opensuse.org").is_ok());
     }
+
+    #[test]
+    fn repeated_query_keys_are_kept_in_order() {
+        // Repeated keys are kept, in order — the array form
+        // (`k2[]=v2&k2[]=v3`): the builder never deduplicates.
+        let url = UrlBuilder::new("https://example.com")
+            .unwrap()
+            .segment("search")
+            .query("k2[]", "v2")
+            .query("k2[]", "v3")
+            .build();
+        assert_eq!(url, "https://example.com/search?k2%5B%5D=v2&k2%5B%5D=v3");
+    }
+
+    #[test]
+    fn query_encoding_table() {
+        // Query values: space encodes as `%20` (never `+` — the
+        // builder's intentional difference from the reference, whose
+        // `+` would decode as a space only in a form body, not in a
+        // raw query string the server reads as XPath), `/` as `%2F`,
+        // `:` as `%3A`.
+        assert_eq!(encode_query_value("a b"), "a%20b");
+        assert_eq!(encode_query_value("a/b"), "a%2Fb");
+        assert_eq!(encode_query_value("a:b"), "a%3Ab");
+    }
+
+    #[test]
+    fn path_encoding_table() {
+        // Path segments: `/` is always encoded (never a second
+        // element), a space is `%20`, `:` is preserved (the OBS
+        // `project:package` separator).
+        assert_eq!(encode_path_segment("a b"), "a%20b");
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(encode_path_segment("a:b"), "a:b");
+    }
+
+    #[test]
+    fn query_values_are_strings_the_caller_formats() {
+        // Ints and bools have no builder conversion: the caller
+        // formats them (`?int=1`, `true` → `1`, `false` → `0`) and
+        // passes the string. The builder only encodes.
+        let url = UrlBuilder::new("https://example.com")
+            .unwrap()
+            .segment("search")
+            .query("int", "1")
+            .query("flag", "0")
+            .build();
+        assert_eq!(url, "https://example.com/search?int=1&flag=0");
+    }
 }
