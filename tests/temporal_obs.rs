@@ -36,6 +36,21 @@
 //! uploads a spec file into a fresh branch package and reads it back,
 //! asserting the bytes and the revision number.
 //!
+//! The remote-read tests (`temporal_cat_reads_back_uploaded_file`,
+//! `temporal_list_files_and_packages_read_back`,
+//! `temporal_package_log_newest_first_and_range`,
+//! `temporal_revision_patch_diffs_revisions`,
+//! `temporal_meta_reads_back`,
+//! `temporal_search_finds_package_and_project`,
+//! `temporal_owners_call_succeeds`, `temporal_whois_reads_admin`,
+//! `temporal_link_target_reads_linkinfo`, and
+//! `temporal_project_diff_classifies`) exercise the read operations
+//! the same way: create through geectl's own write operations, then
+//! read back through the new operations and assert on server state.
+//! The log and link-target tests poll for up to a minute: the history
+//! and the linkinfo are written by the backend, so they must not
+//! assert the instant the upload returns.
+//!
 //! The SR tests (`temporal_filed_request_shows_up_on_server`,
 //! `temporal_refile_supersedes_and_deletes_on_server`, and
 //! `temporal_accept_deletes_source_branch_on_server`) file real
@@ -52,7 +67,10 @@
 use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{DryRun, ObsClient, SrFiling, SrPayload};
+use geectl::obs::{
+    DryRun, FilePatchStatus, HistoryEntry, ObsClient, PackageDiffStatus, RevisionRange, SrFiling,
+    SrPayload,
+};
 
 /// Whether `url` points at a loopback host.
 ///
@@ -709,6 +727,509 @@ fn temporal_upload_file_reads_back_on_server() {
     );
 }
 
+/// Create package `package` in existing project `project` and upload
+/// a spec file with `content` into it. Returns the revision the
+/// upload returns.
+fn add_package(client: &ObsClient<'_>, project: &str, package: &str, content: &str) -> Option<u64> {
+    client
+        .create_package(
+            project,
+            package,
+            "geectl temporal test package",
+            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create package on the temporal instance");
+    client
+        .upload_file(
+            project,
+            package,
+            &format!("{package}.spec"),
+            content,
+            &DryRun::new(false),
+        )
+        .expect("upload a spec file to the temporal instance")
+}
+
+/// Poll until `package_log` holds at least `count` entries, for up
+/// to a minute: the history is written by the backend, so the test
+/// must not assert the instant the upload returns. Returns the log.
+fn wait_until_log(
+    client: &ObsClient<'_>,
+    project: &str,
+    package: &str,
+    count: usize,
+) -> Vec<HistoryEntry> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let log = client
+            .package_log(project, package, None)
+            .expect("read the package log on the temporal instance");
+        if log.len() >= count {
+            return log;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("package log for {project}/{package} still holds fewer than {count} entries after 60s");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Poll until `link_target` finds a link, for up to a minute: the
+/// backend computes the linkinfo from the `_link` file, so the test
+/// must not assert the instant the upload returns.
+fn wait_until_link_target(
+    client: &ObsClient<'_>,
+    project: &str,
+    package: &str,
+) -> (String, String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(target) = client
+            .link_target(project, package)
+            .expect("read the link target on the temporal instance")
+        {
+            return target;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("{project}/{package} still links nothing after 60s");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// A file uploaded through geectl reads back through `cat`, at the
+/// current revision and at an earlier one. The reads are public: no
+/// credentials.
+#[test]
+fn temporal_cat_reads_back_uploaded_file() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let authed = temporal_client_authed(&base);
+    let package = temporal_package();
+    let source_project = create_source_branch(&authed, &package);
+    let v1 = "Name: geectl-temporal-pkg\nVersion: 1.0\n";
+    let v2 = "Name: geectl-temporal-pkg\nVersion: 1.1\n";
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "geectl-temporal-pkg.spec",
+            v1,
+            &DryRun::new(false),
+        )
+        .expect("upload the first spec on the temporal instance");
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "geectl-temporal-pkg.spec",
+            v2,
+            &DryRun::new(false),
+        )
+        .expect("upload the second spec on the temporal instance");
+    let public = temporal_client(&base);
+    assert_eq!(
+        public
+            .cat(&source_project, &package, "geectl-temporal-pkg.spec", None)
+            .expect("cat the current revision on the temporal instance"),
+        v2
+    );
+    assert_eq!(
+        public
+            .cat(
+                &source_project,
+                &package,
+                "geectl-temporal-pkg.spec",
+                Some(1)
+            )
+            .expect("cat revision 1 on the temporal instance"),
+        v1
+    );
+    assert_eq!(
+        public
+            .cat(
+                &source_project,
+                &package,
+                "geectl-temporal-pkg.spec",
+                Some(2)
+            )
+            .expect("cat revision 2 on the temporal instance"),
+        v2
+    );
+}
+
+/// The directory listing and the project listing read back what was
+/// uploaded and created, through the public reads.
+#[test]
+fn temporal_list_files_and_packages_read_back() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let authed = temporal_client_authed(&base);
+    let package = temporal_package();
+    let source_project = create_source_branch(&authed, &package);
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "a.spec",
+            "Name: a\nVersion: 1.0\n",
+            &DryRun::new(false),
+        )
+        .expect("upload a.spec on the temporal instance");
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "b.spec",
+            "Name: b\nVersion: 1.0\n",
+            &DryRun::new(false),
+        )
+        .expect("upload b.spec on the temporal instance");
+    let public = temporal_client(&base);
+    let files = public
+        .list_files(&source_project, &package)
+        .expect("list the package files on the temporal instance");
+    let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
+    assert!(
+        names.contains(&"a.spec") && names.contains(&"b.spec"),
+        "the listing must hold both uploaded files; got {names:?}"
+    );
+    let packages = public
+        .list_packages(&source_project)
+        .expect("list the project packages on the temporal instance");
+    assert!(
+        packages.contains(&package),
+        "the project listing must hold the created package {package}; got {packages:?}"
+    );
+}
+
+/// The package log comes back newest-first, and a revision range
+/// narrows it to the revisions in the range.
+#[test]
+fn temporal_package_log_newest_first_and_range() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let authed = temporal_client_authed(&base);
+    let package = temporal_package();
+    let source_project = create_source_branch(&authed, &package);
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "geectl-temporal-pkg.spec",
+            "Name: geectl-temporal-pkg\nVersion: 1.0\n",
+            &DryRun::new(false),
+        )
+        .expect("upload the first spec on the temporal instance");
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "geectl-temporal-pkg.spec",
+            "Name: geectl-temporal-pkg\nVersion: 1.1\n",
+            &DryRun::new(false),
+        )
+        .expect("upload the second spec on the temporal instance");
+    let log = wait_until_log(&authed, &source_project, &package, 2);
+    assert_eq!(log.len(), 2, "two uploads must leave two revisions");
+    assert_eq!(log[0].rev, 2, "the log must be newest-first");
+    assert_eq!(log[1].rev, 1);
+    let first_only = authed
+        .package_log(
+            &source_project,
+            &package,
+            Some(&RevisionRange::parse("1").unwrap()),
+        )
+        .expect("read the ranged log on the temporal instance");
+    assert_eq!(
+        first_only.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+        vec![1],
+        "the range must narrow the log to revision 1"
+    );
+}
+
+/// The revision patch diffs one revision against the previous one,
+/// and revision 1 has nothing to diff against.
+#[test]
+fn temporal_revision_patch_diffs_revisions() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let authed = temporal_client_authed(&base);
+    let package = temporal_package();
+    let source_project = create_source_branch(&authed, &package);
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "geectl-temporal-pkg.spec",
+            "Name: geectl-temporal-pkg\nVersion: 1.0\n",
+            &DryRun::new(false),
+        )
+        .expect("upload the first spec on the temporal instance");
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "geectl-temporal-pkg.spec",
+            "Name: geectl-temporal-pkg\nVersion: 1.1\n",
+            &DryRun::new(false),
+        )
+        .expect("upload the second spec on the temporal instance");
+    let public = temporal_client(&base);
+    let patch = public
+        .revision_patch(&source_project, &package, 2)
+        .expect("diff revision 2 on the temporal instance");
+    assert_eq!(patch.rev, 2);
+    assert_eq!(patch.files.len(), 1, "one file changed between revisions");
+    assert_eq!(
+        patch.files[0].status,
+        FilePatchStatus::Modified,
+        "the spec was modified, not added or deleted"
+    );
+    assert!(
+        patch.files[0].diff.contains("-Version: 1.0"),
+        "the diff must drop the old version; got {}",
+        patch.files[0].diff
+    );
+    assert!(
+        patch.files[0].diff.contains("+Version: 1.1"),
+        "the diff must add the new version; got {}",
+        patch.files[0].diff
+    );
+    let first = public
+        .revision_patch(&source_project, &package, 1)
+        .expect("diff revision 1 on the temporal instance");
+    assert!(
+        first.files.is_empty(),
+        "revision 1 has nothing to diff against"
+    );
+}
+
+/// The project and package meta read back what creation put there.
+#[test]
+fn temporal_meta_reads_back() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let authed = temporal_client_authed(&base);
+    let package = temporal_package();
+    let source_project = create_source_branch(&authed, &package);
+    let public = temporal_client(&base);
+    let project_meta = public
+        .project_meta(&source_project)
+        .expect("read the project meta on the temporal instance");
+    assert_eq!(project_meta.name, source_project);
+    assert_eq!(
+        project_meta.title.as_deref(),
+        Some("geectl temporal test branch")
+    );
+    let package_meta = public
+        .package_meta(&source_project, &package)
+        .expect("read the package meta on the temporal instance");
+    assert_eq!(package_meta.name, package);
+    assert_eq!(package_meta.project, source_project);
+    assert_eq!(
+        package_meta.title.as_deref(),
+        Some("geectl temporal test package")
+    );
+}
+
+/// The package and project search find what was just created.
+#[test]
+fn temporal_search_finds_package_and_project() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let authed = temporal_client_authed(&base);
+    let package = temporal_package();
+    let source_project = create_source_branch(&authed, &package);
+    let matches = authed
+        .search_packages(&package)
+        .expect("search packages on the temporal instance");
+    assert!(
+        matches
+            .iter()
+            .any(|found| found.name == package && found.project == source_project),
+        "the search must find the created package {package}; got {matches:?}"
+    );
+    let projects = authed
+        .search_projects(&source_project)
+        .expect("search projects on the temporal instance");
+    assert!(
+        projects.iter().any(|found| found.name == source_project),
+        "the search must find the created project {source_project}; got {projects:?}"
+    );
+}
+
+/// The owner search runs against the real server: a fresh package
+/// has no explicit owners, so the call succeeding (not 401, not
+/// 404) is the assertion, plus the shape of whatever it returns.
+#[test]
+fn temporal_owners_call_succeeds() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let authed = temporal_client_authed(&base);
+    let package = temporal_package();
+    let source_project = create_source_branch(&authed, &package);
+    let owners = authed
+        .owners(&source_project, &package)
+        .expect("owner search on the temporal instance");
+    assert!(
+        owners.iter().all(|owner| !owner.project.is_empty()),
+        "every returned owner must name a project; got {owners:?}"
+    );
+}
+
+/// `whois` reads the bootstrap admin back from the server.
+#[test]
+fn temporal_whois_reads_admin() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let authed = temporal_client_authed(&base);
+    let person = authed
+        .whois("Admin")
+        .expect("whois on the temporal instance");
+    assert_eq!(person.login, "Admin");
+    assert_eq!(person.state, "confirmed");
+}
+
+/// A `_link` file uploaded into a package reads back as its link
+/// target. The target is a second package in the same project, so
+/// the link resolves.
+#[test]
+fn temporal_link_target_reads_linkinfo() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let authed = temporal_client_authed(&base);
+    let package = temporal_package();
+    let source_project = create_source_branch(&authed, &package);
+    let target_package = format!("geectl-temporal-link-tgt-{}", unique_suffix());
+    add_package(
+        &authed,
+        &source_project,
+        &target_package,
+        "Name: target\nVersion: 1.0\n",
+    );
+    let link_package = format!("geectl-temporal-link-{}", unique_suffix());
+    authed
+        .create_package(
+            &source_project,
+            &link_package,
+            "geectl temporal test package",
+            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create the link package on the temporal instance");
+    authed
+        .upload_file(
+            &source_project,
+            &link_package,
+            "_link",
+            &format!("<link project=\"{source_project}\" package=\"{target_package}\"/>"),
+            &DryRun::new(false),
+        )
+        .expect("upload the _link file on the temporal instance");
+    let public = temporal_client(&base);
+    assert_eq!(
+        wait_until_link_target(&public, &source_project, &link_package),
+        (source_project, target_package)
+    );
+}
+
+/// Two projects diffed package by package: identical, differs,
+/// only-in-old, and only-in-new all classify.
+#[test]
+fn temporal_project_diff_classifies() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let authed = temporal_client_authed(&base);
+    let suffix = unique_suffix();
+    let old_project = format!("geectl-tmp-diff-old-{suffix}");
+    let new_project = format!("geectl-tmp-diff-new-{suffix}");
+    for project in [&old_project, &new_project] {
+        authed
+            .create_project(
+                project,
+                "geectl temporal test project",
+                "Created by the geectl temporal live test; the instance is destroyed after the run.",
+                &DryRun::new(false),
+            )
+            .expect("create a diff project on the temporal instance");
+    }
+    let shared = format!("pkg-shared-{suffix}");
+    let changed = format!("pkg-changed-{suffix}");
+    let old_only = format!("pkg-old-only-{suffix}");
+    let new_only = format!("pkg-new-only-{suffix}");
+    add_package(
+        &authed,
+        &old_project,
+        &shared,
+        "Name: shared\nVersion: 1.0\n",
+    );
+    add_package(
+        &authed,
+        &new_project,
+        &shared,
+        "Name: shared\nVersion: 1.0\n",
+    );
+    add_package(
+        &authed,
+        &old_project,
+        &changed,
+        "Name: changed\nVersion: 1.0\n",
+    );
+    add_package(
+        &authed,
+        &new_project,
+        &changed,
+        "Name: changed\nVersion: 1.1\n",
+    );
+    add_package(
+        &authed,
+        &old_project,
+        &old_only,
+        "Name: old-only\nVersion: 1.0\n",
+    );
+    add_package(
+        &authed,
+        &new_project,
+        &new_only,
+        "Name: new-only\nVersion: 1.0\n",
+    );
+    let public = temporal_client(&base);
+    let diffs = public
+        .project_diff(&old_project, &new_project, &[], &[], false)
+        .expect("diff the two projects on the temporal instance");
+    let status = |name: &str| {
+        diffs
+            .iter()
+            .find(|diff| diff.name == name)
+            .map(|diff| diff.status)
+    };
+    assert_eq!(status(&shared), Some(PackageDiffStatus::Identical));
+    assert_eq!(status(&changed), Some(PackageDiffStatus::Differs));
+    assert_eq!(status(&old_only), Some(PackageDiffStatus::OnlyInOld));
+    assert_eq!(status(&new_only), Some(PackageDiffStatus::OnlyInNew));
+    let changed_diff = diffs
+        .iter()
+        .find(|diff| diff.name == changed)
+        .expect("the changed package must be in the diff");
+    assert_eq!(changed_diff.files.len(), 1, "one file changed");
+    assert!(
+        changed_diff.files[0].diff.contains("+Version: 1.1"),
+        "the diff must add the new version; got {}",
+        changed_diff.files[0].diff
+    );
+}
 #[cfg(test)]
 mod tests {
     use super::*;
