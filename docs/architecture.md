@@ -119,8 +119,12 @@ Rules that hold:
 
 The library surface a tool uses to move a package update through the
 distribution: `ObsClient` (devel-project lookup, devel version, open
-submit-request check, filing, superseding, branch cleanup, branch-project
-and branch-package creation, file upload, the remote reads listed below, and reading and acting on
+submit-request check, filing, superseding, branch cleanup, branching,
+copying, linking, repairing links, link revisions, converting links to
+branches and detaching them, deleting and restoring packages and
+projects, aggregating binaries, releasing, branch-project and
+branch-package creation, package creation plain or git-backed, file
+upload, the remote reads listed below, and reading and acting on
 requests), `SrPayload`
 (the validated submit-request payload), `SrFiling` (the only filing
 path, dry-run by default; `refile` is the file-then-supersede flow),
@@ -227,6 +231,52 @@ mirrors the server (`PackageService::FileVerifier`: no `/`, no leading
 All three are DryRun-guarded like the delete: in dry-run the
 creation or upload is recorded in the plan and nothing is created or
 uploaded, and no credentials are needed.
+
+Branching, copying, and linking are the agent's package-duplication
+operations, and they are one operation each whether the package is
+OBS-native or git-backed: a link points at the package whatever its
+backend, and a git-backed package is created the same way as a plain
+one, by naming its repository and branch in `scmsync`
+(`ObsClient::create_package_with_options`). There is no separate git
+workflow in the library. `ObsClient::branch_package` branches a
+package (`POST /source/<project>/<package>?cmd=branch`, with the
+nodevelproject and new-package behaviours); `ObsClient::copy_package`
+and `ObsClient::copy_project` copy a package or a whole project
+(`?cmd=copy`); `ObsClient::link_package` links a package by composing
+its meta from the source meta and PUTting a `_link`;
+`ObsClient::repair_link` repairs a broken link the same way, by
+editing the `_link` itself — the server repairs links only in its
+commit path, which a library without a working copy never takes;
+`ObsClient::set_link_rev` pins or unpins a link revision, for one
+package or a whole project; `ObsClient::link_to_branch` converts a
+link into a branch and `ObsClient::detach_branch` detaches one;
+`ObsClient::delete_project`, `ObsClient::undelete_package`, and
+`ObsClient::undelete_project` delete and restore;
+`ObsClient::aggregate_package` collects another package's binaries
+under a new name; and `ObsClient::release_package` /
+`ObsClient::release_project` release sources and binaries to a
+release target without rebuilding them. Every one of these is
+DryRun-guarded and credentialed like the create and upload calls
+above.
+
+The server is ground truth for these operations, and the library is
+written against its behaviour. Two principles run through the
+implementations: a mistaken assumption is refused instead of
+succeeding silently (a non-link package handed to detach, a package
+that already exists handed to create without force, a pinned
+revision for a whole project), and a refusal leaves nothing changed
+— the checks that can refuse run before the first write (an
+existing `_aggregate`, an existing link). The repository mapping of
+an aggregate is not validated client-side: the server marks a bad
+map broken at build time, so the check would be a convenience, not
+a guard. When server behaviour looks like a bug rather than a
+design, the library does not silently work around it: the behaviour
+is documented as a candidate fix for the server itself.
+
+Consumers never see XML: the operations take and return typed values
+only. The XML document editor (`src/xml.rs`) and the response
+parsers added here are `pub(crate)` — the boundary the typed surface is built
+on, not part of it.
 
 Remote reads: the read surface for inspecting what the distribution
 holds, all typed — no method takes or returns raw XML. The public
@@ -416,6 +466,20 @@ real submit requests and assert on the server state they leave behind
 plus the request read/act tests — show, log, state changes, reviews,
 comments, diff, and search — which read and change live requests
 through the library and assert on the server state they find).
+
+The branch, copy, link, and release operations are covered the same
+way: live tests that create the server state through geectl and read
+it back (`tests/live_obs.rs`) — a branch that shows up as a
+linked package, a copy whose file reads back, a link whose `_link`
+and meta read back, a repair that unbreaks the link, a revision
+that lands on the link, a conversion and a detach that leave the
+expected sources, a delete and a restore verified by re-read, an
+aggregate whose `_aggregate` reads back, a release the server
+accepts, a git-backed package whose `<scmsync>` reads back. Every
+test uses names unique to itself (a process id plus a nanosecond
+timestamp): the tests run in parallel against one shared instance,
+and a shared name would file one test's request against another's
+branch.
 
 **Plain HTTP on localhost is the single sanctioned exception to the
 https-only URL rule.** The OBS development frontend serves plain HTTP;
