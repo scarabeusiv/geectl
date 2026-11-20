@@ -1,0 +1,63 @@
+# Temporal OBS instance for geectl's scheduled live tests.
+#
+# This is the OBS project's own development container setup, trimmed to
+# what the live tests need: the database, the cache, the backend, and
+# the frontend (the API the tests talk to). The build worker is omitted
+# on purpose — no test builds a package, and the worker needs a
+# privileged container, which the API assertions do not.
+#
+# Image sources (verified against the OBS repository — its root
+# `docker-compose.yml` and `.circleci/conditional_config.yml`):
+# - db, cache, backend: published images at
+#   registry.opensuse.org/obs/server/unstable/containers/containers/openbuildservice/<name>
+#   (OBS master; the temporal job exists to catch drift as OBS changes,
+#   so it tracks master, not a stable release).
+# - frontend: BUILT from the OBS source (`src/api` Dockerfile) on top of
+#   the published `frontend-features` image. There is no published
+#   prebuilt frontend server image — the OBS project builds it from
+#   source, and so do we.
+#
+# `OBS_SOURCE_DIR` is the OBS source checkout (cloned by `provision.sh`).
+# It defaults to `./obs` next to this file, so a manual
+# `docker compose up` works after cloning the OBS repo there.
+# The backend runs the development start script from the mounted source,
+# and the frontend is built from it — the checkout must be present.
+#
+# The frontend serves plain HTTP on localhost:3000. That is the OBS
+# development setup (no TLS). geectl's harness talks to it over
+# loopback only (see `tests/temporal.rs`); the instance is ephemeral
+# and never exposed beyond the host.
+
+services:
+  db:
+    image: registry.opensuse.org/obs/server/unstable/containers/containers/openbuildservice/mariadb:latest
+    command: /usr/libexec/mysql/mysql-systemd-helper start
+  cache:
+    image: registry.opensuse.org/obs/server/unstable/containers/containers/openbuildservice/memcached:latest
+    command: /usr/bin/memcached -u memcached
+  backend:
+    image: registry.opensuse.org/obs/server/unstable/containers/containers/openbuildservice/backend:latest
+    volumes:
+      - ${OBS_SOURCE_DIR:-./obs}:/obs:z
+    command: /obs/contrib/start_development_backend -d /obs
+    depends_on:
+      - db
+      - cache
+  frontend:
+    image: geectl-temporal-frontend
+    build:
+      dockerfile: docker-files/Dockerfile
+      context: ${OBS_SOURCE_DIR:-./obs}/src/api
+      args:
+        CONTAINER_USERID: ${CONTAINER_USERID:-1000}
+    command: foreman start -p 3000
+    environment:
+      RAILS_ENV: development
+    volumes:
+      - ${OBS_SOURCE_DIR:-./obs}:/obs:z
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - db
+      - cache
+      - backend

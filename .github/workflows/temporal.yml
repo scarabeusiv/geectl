@@ -1,0 +1,69 @@
+# Temporal live tests: scheduled live tests against a temporal OBS instance.
+#
+# This is layer 2 of the testing design (see docs/architecture.md). It
+# spins up a real (temporary) OBS instance from the OBS project's own
+# development containers, runs the live tests in `tests/temporal.rs`
+# against it, and tears it down. The assertions are on server state —
+# what geectl reads must reflect what the server actually holds — which
+# is what catches drift as OBS changes underneath us. Fixtures alone
+# cannot do that.
+#
+# This job is INDEPENDENT and does NOT gate PRs: it has no
+# `pull_request` trigger and is not a required status check. When it
+# regresses, it is fixed independently. It runs weekly (Mondays 06:00
+# UTC, the same slot as the freshness workflow) and on demand.
+#
+# It is slow on purpose: the OBS source checkout plus the frontend
+# image build take several minutes, and the bootstrap plus readiness
+# wait add more. The timeout is 60 minutes. If it proves too slow or
+# flaky on GitHub-hosted runners, the alternative is a dedicated host —
+# that is a decision for the maintainer, not something to guess here.
+
+name: temporal
+
+on:
+  schedule:
+    # Weekly, Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  temporal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # Pinned to the v4 tag's commit so the action cannot move under us;
+      # Dependabot tracks SHA pins and proposes updates.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned to the v1 tag's commit so the action cannot move under us
+      # and the SHA cannot be garbage-collected; Dependabot tracks SHA
+      # pins and proposes updates. No explicit toolchain: the action
+      # reads rust-toolchain.toml, so this job and local developers use
+      # the same compiler and the pin lives in exactly one place.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      # Plain cache (no OS-release scoping): geectl is pure Rust with no
+      # bindgen or system libraries, so the cache is not tied to a distro
+      # release the way rpmcrab's is. Pinned to the v2 tag's commit;
+      # Dependabot tracks SHA pins and proposes updates.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: . -> target
+      - name: Provision temporal OBS instance
+        run: bash tests/temporal/provision.sh
+      - name: Run live tests against the temporal instance
+        env:
+          GEECTL_TEMPORAL_URL: http://127.0.0.1:3000
+          # The harness panics (instead of skipping) when this marker
+          # is set and the URL is missing: in this job the URL must be
+          # wired, so a silent skip would hide drift. Other jobs (and
+          # local runs) leave it unset and skip.
+          GEECTL_TEMPORAL_REQUIRED: "true"
+        run: cargo test --locked --test temporal
+      - name: Tear down temporal OBS instance
+        if: always()
+        run: bash tests/temporal/teardown.sh
