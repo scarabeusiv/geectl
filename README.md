@@ -1,4 +1,5 @@
-![geectl logo](docs/assets/logo.svg)
+<img src="https://raw.githubusercontent.com/scarabeusiv/geectl/main/docs/assets/logo.svg"
+     align="right" width="130" alt="geectl logo">
 
 # geectl
 
