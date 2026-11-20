@@ -29,6 +29,7 @@ use crate::auth::{
     OBS_PASSWORD_VAR, OBS_USERNAME_VAR,
 };
 use crate::error::{ErrorKind, GeectlError};
+use crate::http::is_loopback_url;
 use crate::url::UrlBuilder;
 
 /// Environment variable overriding the OBS endpoint URL.
@@ -93,12 +94,44 @@ fn env_url(var: &str) -> Result<Option<String>, GeectlError> {
 /// (a config key or an env var) — never the value itself.
 fn validate_endpoint_url(text: &str, source: &str) -> Result<String, GeectlError> {
     let text = text.trim();
-    UrlBuilder::new(text).map_err(|e| {
-        GeectlError::new(ErrorKind::ConfigError, format!("{source}: {}", e.context))
-    })?;
+    // Leading/trailing whitespace is trimmed above by design, but
+    // whitespace or a control character inside the URL is never
+    // legitimate — reject it explicitly rather than relying on the
+    // URL parser to catch every shape.
+    if text.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{source}: endpoint URL must not contain whitespace or control characters"),
+        ));
+    }
+    // An http endpoint is allowed only to a loopback host — the same
+    // rule the transport guard enforces before any credential is sent
+    // (see require_credentials_transport): cleartext is safe only on
+    // loopback, never to a remote host. Anything else must be https.
+    // is_loopback_url is reused verbatim, so its bracketed-host
+    // hardening applies here too: `http://[::1]evil.com` is not
+    // loopback and stays rejected.
+    let http_loopback = text.starts_with("http://") && is_loopback_url(text);
+    if http_loopback {
+        // Same host check as UrlBuilder, minus the scheme rule.
+        let after_scheme = &text["http://".len()..];
+        let host_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        if after_scheme[..host_end].is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("{source}: URL base must have a host"),
+            ));
+        }
+    } else {
+        UrlBuilder::new(text).map_err(|e| {
+            GeectlError::new(ErrorKind::ConfigError, format!("{source}: {}", e.context))
+        })?;
+    }
     // The authority ends at the first `/`, `?`, or `#`. A `@` inside
     // it is userinfo (a credential in the endpoint).
-    let after_scheme = &text["https://".len()..];
+    let after_scheme = text.split("://").nth(1).unwrap_or("");
     let authority_end = after_scheme
         .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
@@ -129,7 +162,11 @@ pub fn effective_config(config: &Config) -> Result<EffectiveConfig, GeectlError>
             return Ok((value, "environment"));
         }
         if let Some(value) = from_file {
-            return Ok((value.clone(), "config"));
+            // Validated like the env value: parse_config validates
+            // too, but effective_config takes any Config, and a value
+            // built without the parse path must not slip through.
+            let value = validate_endpoint_url(value, "config file")?;
+            return Ok((value, "config"));
         }
         Ok((default.to_string(), "default"))
     };
@@ -890,6 +927,25 @@ mod tests {
         // http and hostless are rejected by the UrlBuilder check.
         assert!(validate_endpoint_url("http://api.opensuse.org", "obs_url").is_err());
         assert!(validate_endpoint_url("https://", "obs_url").is_err());
+        // http to a loopback host is allowed — the same rule the
+        // transport guard enforces (see require_credentials_transport):
+        // the local Gitea instance lives at http://127.0.0.1:3001.
+        for ok in [
+            "http://127.0.0.1:3001",
+            "http://localhost:3001",
+            "http://[::1]:3001",
+            "http://127.0.0.1:3001/base",
+        ] {
+            assert_eq!(
+                validate_endpoint_url(ok, "obs_url").unwrap(),
+                ok,
+                "url {ok}"
+            );
+        }
+        // ...but loopback does not excuse userinfo, and a bracketed
+        // host that is not really loopback stays rejected.
+        assert!(validate_endpoint_url("http://user:secret@127.0.0.1:3001", "obs_url").is_err());
+        assert!(validate_endpoint_url("http://[::1]evil.com", "obs_url").is_err());
         // A bare https host (with an optional path) is fine.
         assert_eq!(
             validate_endpoint_url("https://api.opensuse.org", "obs_url").unwrap(),
@@ -915,6 +971,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.obs_url.as_deref(), Some("https://api.opensuse.org"));
+    }
+
+    #[test]
+    fn effective_config_revalidates_file_values() {
+        // A Config built without going through parse_config must
+        // not smuggle an unvalidated URL past effective_config:
+        // the endpoint is validated at the point of use, not only
+        // at parse time.
+        let config = Config {
+            obs_url: Some("https://user:secret@api.opensuse.org".to_string()),
+            gitea_url: None,
+        };
+        let err = effective_config(&config).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(!err.context.contains("secret"));
+        // A valid file value still flows through.
+        let config = Config {
+            obs_url: Some("https://api.opensuse.org".to_string()),
+            gitea_url: None,
+        };
+        let effective = effective_config(&config).unwrap();
+        assert_eq!(
+            effective.config.obs_url.as_deref(),
+            Some("https://api.opensuse.org")
+        );
+        assert_eq!(effective.obs_url_source, "config");
     }
 
     #[test]
