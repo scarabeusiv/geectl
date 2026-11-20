@@ -556,6 +556,8 @@ impl HttpClient for UreqClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn retryable_methods_are_idempotent_only() {
@@ -785,6 +787,50 @@ mod tests {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
+    /// Read one request (headers + body) from a loopback connection:
+    /// the body length comes from Content-Length (a request without
+    /// one has no body). Reading headers only would leave a POST body
+    /// unread and the recorded request incomplete. Shared by the
+    /// one-shot and counting servers.
+    fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    // Search the raw bytes for the header/body
+                    // boundary: decoding first would let a multi-byte
+                    // body sequence mimic (or hide) the boundary in
+                    // the lossy text. Only the header slice is
+                    // decoded, for the Content-Length parse.
+                    if let Some(end) = find_subslice(&buf, b"\r\n\r\n") {
+                        let header_end = end + 4;
+                        let header_text = String::from_utf8_lossy(&buf[..end]);
+                        let content_length: usize = header_text
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= header_end + content_length {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        buf
+    }
+
     /// A one-shot loopback HTTP server for auth tests: accepts a single
     /// request, records it (method line, headers, body), and answers
     /// with the given body. The client talks to it over plain http:// —
@@ -821,47 +867,9 @@ mod tests {
                         Err(_) => break None,
                     }
                 }?;
-                use std::io::{Read, Write};
+                use std::io::Write;
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-                // Read the headers, then the body: the body length comes
-                // from Content-Length (a request without one has no
-                // body). Reading headers only would leave a POST body
-                // unread and the recorded request incomplete.
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
-                loop {
-                    match stream.read(&mut chunk) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            buf.extend_from_slice(&chunk[..n]);
-                            // Search the raw bytes for the header/body
-                            // boundary: decoding first would let a
-                            // multi-byte body sequence mimic (or hide)
-                            // the boundary in the lossy text. Only the
-                            // header slice is decoded, for the
-                            // Content-Length parse.
-                            if let Some(end) = find_subslice(&buf, b"\r\n\r\n") {
-                                let header_end = end + 4;
-                                let header_text = String::from_utf8_lossy(&buf[..end]);
-                                let content_length: usize = header_text
-                                    .lines()
-                                    .find_map(|l| {
-                                        let (k, v) = l.split_once(':')?;
-                                        if k.trim().eq_ignore_ascii_case("content-length") {
-                                            v.trim().parse().ok()
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(0);
-                                if buf.len() >= header_end + content_length {
-                                    break;
-                                }
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
+                let buf = read_request(&mut stream);
                 let request = String::from_utf8_lossy(&buf).into_owned();
                 let _ = stream.write_all(response.as_bytes());
                 Some(request)
@@ -917,6 +925,100 @@ mod tests {
                     .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
                     .map(|l| l["authorization:".len()..].trim().to_string())
             })
+        }
+    }
+
+    /// A loopback server that counts requests instead of serving once:
+    /// for the retry tests, which must prove the client made exactly
+    /// one attempt against a 429 or a 500. The accept loop runs until
+    /// the server is dropped; dropping connects once to unblock the
+    /// accept, then joins the thread.
+    struct CountingServer {
+        port: u16,
+        hits: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl CountingServer {
+        fn serve_status(body: &'static str, status: u16) -> Self {
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind counting server");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("local addr").port();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let hits_thread = Arc::clone(&hits);
+            let stop_thread = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                loop {
+                    if stop_thread.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            use std::io::Write;
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                            // The content is discarded; only the count
+                            // matters. Reading it fully keeps the client
+                            // from blocking on a half-read write.
+                            let _ = read_request(&mut stream);
+                            hits_thread.fetch_add(1, Ordering::Relaxed);
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            CountingServer {
+                port,
+                hits,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}/test", self.port)
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for CountingServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            // Unblock the accept loop, then join.
+            let _ = std::net::TcpStream::connect(format!("127.0.0.1:{}", self.port));
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[test]
+    fn post_json_does_not_retry_transient_failures() {
+        // A 429 or a 500 must surface as ServerError after exactly
+        // one attempt: post_json is documented single-attempt, and a
+        // retried POST could create the resource twice.
+        let client = UreqClient::with_auth(Timeout::default(), None).unwrap();
+        for status in [429, 500] {
+            let server = CountingServer::serve_status("error", status);
+            let err = client.post_json(&server.url(), "{}").unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError, "status {status}");
+            assert_eq!(server.hits(), 1, "status {status}: exactly one attempt");
         }
     }
 
