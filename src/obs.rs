@@ -128,6 +128,23 @@ pub fn valid_obs_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | ':'))
 }
 
+/// True when `name` is a valid OBS source filename for upload.
+/// Mirrors the server's rule (`PackageService::FileVerifier#file_name_invalid?`:
+/// `^[^./][^/]+$` — first character not `.` or `/`, no `/` anywhere;
+/// the `+` needs at least one more character, so a one-character name
+/// is invalid and the minimum length is two), plus the two names the
+/// routes reserve: `_meta` (the package-meta route, not a file) and
+/// `_attribute` (rejected by `Package.verify_file!`). Anything else is
+/// rejected rather than quoted into a URL, where a `/` would rewrite
+/// the request.
+pub fn valid_obs_filename(name: &str) -> bool {
+    name.chars().count() >= 2
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && name != "_meta"
+        && name != "_attribute"
+}
+
 /// Build a request URL from a base, path segments, and query pairs,
 /// using the encoders from `url.rs`. Segments are encoded as exactly
 /// one element each; query pairs as `name=value`.
@@ -937,6 +954,74 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// Upload file `filename` with `content` into package `package`
+    /// in project `project` on OBS (`PUT
+    /// /source/<project>/<package>/<filename>`). Requires credentials;
+    /// without them the call fails loudly before any request. In
+    /// dry-run the upload is recorded in the plan and nothing is
+    /// uploaded — the guard runs before the credentials check, like
+    /// `delete_package` — and the result is `None`, like
+    /// `SrFiling::file` in dry-run.
+    ///
+    /// An agent uploads the files it submits — the spec, the
+    /// `.changes` entry — into the branch package before filing, so
+    /// file upload belongs in the library next to
+    /// [`ObsClient::create_project`]: freshcrab needs exactly this
+    /// operation when it migrates its branch creation onto geectl.
+    /// The content is text (a spec, a `.changes` entry, a service
+    /// file); binary content is out of scope for this operation.
+    /// Returns the new revision number. Success is the backend's
+    /// `<revision rev="N" .../>` document, not a `<status code="ok"/>`:
+    /// the API streams the backend's answer back
+    /// (`SourcePackageController#update_file` passes the request
+    /// through to `bs_srcserver::putfile`, which returns the new
+    /// revision), so any other body is a server error, never success.
+    pub fn upload_file(
+        &self,
+        project: &str,
+        package: &str,
+        filename: &str,
+        content: &str,
+        dry_run: &DryRun,
+    ) -> Result<Option<u64>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !valid_obs_filename(filename) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS filename: {filename:?}"),
+            ));
+        }
+        // The dry-run guard: in dry-run the upload is recorded in the
+        // plan and nothing is uploaded — not even the credentials
+        // check runs. Without this, a dry-run caller invoking upload
+        // directly would mutate the server.
+        if !dry_run.allow(&format!("upload file {project}/{package}/{filename}")) {
+            return Ok(None);
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot upload a file without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(&self.base, &["source", project, package, filename], &[]);
+        let body = self.http.put_file(&url, content, &self.credentials)?;
+        match parse_revision(&body) {
+            Some(rev) => Ok(Some(rev)),
+            None => Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS upload response for file {project}/{package}/{filename}"),
+            )),
+        }
+    }
+
     /// Build the OBS search URL for open submit requests targeting
     /// `package`. The match expression is XPath over the request XML,
     /// restricted to `submit` actions: a request of another type that
@@ -1326,6 +1411,50 @@ pub fn parse_status_ok(body: &str) -> bool {
         return &after_eq[1..1 + close] == "ok";
     }
     false
+}
+
+/// Parse the revision number out of a backend `<revision>` document
+/// (the response to a file upload). Returns the revision number, or
+/// None when the body is not a revision document. The backend returns
+/// the new revision after storing a file (`bs_srcserver::putfile`
+/// returns `($rev, $BSXML::revision)`); the API streams it back
+/// through `pass_to_backend`, so the upload response is a revision
+/// document, not a `<status code="ok"/>` — `parse_status_ok` would
+/// read every successful upload as a failure.
+pub fn parse_revision(body: &str) -> Option<u64> {
+    let pos = body.find("<revision")?;
+    let after_tag = &body[pos + "<revision".len()..];
+    // The tag name must end here: `<revisions>` is not a revision
+    // element. The next character is whitespace, `/`, or `>`.
+    let first = after_tag.chars().next()?;
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return None;
+    }
+    // The revision number is the `rev` attribute of this element, not
+    // text after it — and it must be the `rev` attribute, not a longer
+    // name that ends in it (`vrev="3"` is not `rev`).
+    let end = after_tag.find('>')?;
+    let element = &after_tag[..end];
+    let mut rest = element;
+    while let Some(pos) = rest.find("rev=") {
+        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
+            rest = &rest[pos + "rev=".len()..];
+            continue;
+        }
+        let after_eq = &rest[pos + "rev=".len()..];
+        let quote = after_eq.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let close = after_eq[1..].find(quote)?;
+        let value = &after_eq[1..1 + close];
+        let number: u64 = value.parse().ok()?;
+        if number == 0 {
+            return None;
+        }
+        return Some(number);
+    }
+    None
 }
 
 /// Validate an OBS request id: a non-empty run of ASCII digits that
@@ -3469,6 +3598,149 @@ mod tests {
             dry.plan(),
             vec!["[dry-run] would: create package home:alice/foo"]
         );
+    }
+
+    // --- upload_file ---
+
+    #[test]
+    fn upload_file_puts_file_and_returns_revision() {
+        let http = FakeHttp::new().with_put(
+            "https://api.opensuse.org/source/home:alice/foo/foo.spec",
+            "<revision rev=\"1\" vrev=\"1\" srcmd5=\"abc\" version=\"1\" time=\"123\" user=\"Admin\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .upload_file(
+                    "home:alice",
+                    "foo",
+                    "foo.spec",
+                    "Name: foo\n",
+                    &DryRun::new(false)
+                )
+                .unwrap(),
+            Some(1)
+        );
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].0,
+            "https://api.opensuse.org/source/home:alice/foo/foo.spec"
+        );
+        assert_eq!(puts[0].1, "Name: foo\n");
+        // The upload PUT carried the credentials.
+        assert!(puts[0].2);
+    }
+
+    #[test]
+    fn upload_file_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_put(
+            "https://api.opensuse.org/source/home:alice/foo/foo.spec",
+            "<revision rev=\"1\" />",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .upload_file(
+                "home:alice",
+                "foo",
+                "foo.spec",
+                "Name: foo\n",
+                &DryRun::new(false)
+            )
+            .is_err());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn upload_file_rejects_invalid_names_and_filenames_without_http() {
+        // An invalid name or filename is rejected before any request:
+        // no canned responses exist, so reaching the HTTP client would
+        // error differently (FakeHttp: "no canned response").
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let live = DryRun::new(false);
+        assert!(client
+            .upload_file("home/alice", "foo", "foo.spec", "x", &live)
+            .is_err());
+        assert!(client
+            .upload_file("home:alice", "foo/bar", "foo.spec", "x", &live)
+            .is_err());
+        // The server's filename rule (^[^./][^/]+$): a slash anywhere,
+        // a leading dot, and a one-character name are all invalid.
+        for bad in ["foo/bar.spec", ".hidden", "x", "", "_meta", "_attribute"] {
+            assert!(
+                client
+                    .upload_file("home:alice", "foo", bad, "x", &live)
+                    .is_err(),
+                "filename {bad:?} must be rejected"
+            );
+        }
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn upload_file_non_revision_body_is_error_not_success() {
+        // The upload response is a revision document, not a status:
+        // a `<status code="ok"/>` body (the meta-PUT success shape)
+        // must never read as a successful upload.
+        let http = FakeHttp::new().with_put(
+            "https://api.opensuse.org/source/home:alice/foo/foo.spec",
+            "<status code=\"ok\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .upload_file(
+                "home:alice",
+                "foo",
+                "foo.spec",
+                "Name: foo\n",
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn upload_file_dry_run_records_plan_and_uploads_nothing() {
+        // As create_project: the upload is recorded in the plan, no
+        // PUT runs, and no credentials are needed.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dry = DryRun::default();
+        assert_eq!(
+            client
+                .upload_file("home:alice", "foo", "foo.spec", "Name: foo\n", &dry)
+                .unwrap(),
+            None
+        );
+        assert!(http.put_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: upload file home:alice/foo/foo.spec"]
+        );
+    }
+
+    #[test]
+    fn parse_revision_reads_the_rev_attribute() {
+        // The backend's revision document, full shape.
+        assert_eq!(
+            parse_revision("<revision rev=\"3\" vrev=\"3\" srcmd5=\"abc\" version=\"1\" time=\"123\" user=\"Admin\" />"),
+            Some(3)
+        );
+        // `vrev` comes first: the `rev=` inside `vrev=` is not the
+        // revision (it is preceded by `v`, not whitespace).
+        assert_eq!(parse_revision("<revision vrev=\"3\" rev=\"7\" />"), Some(7));
+        // Not a revision document: a status-ok body (the meta-PUT
+        // success shape), a revision list, a zero revision, and a
+        // `<revisions>` tag all read as none.
+        assert_eq!(parse_revision("<status code=\"ok\" />"), None);
+        assert_eq!(
+            parse_revision("<revisionlist><revision rev=\"1\" /></revisionlist>"),
+            None
+        );
+        assert_eq!(parse_revision("<revision rev=\"0\" />"), None);
+        assert_eq!(parse_revision("<revisions rev=\"1\" />"), None);
+        assert_eq!(parse_revision(""), None);
     }
 
     // --- open_requests_for_package / package_requests_search_url ---
