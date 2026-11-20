@@ -353,7 +353,10 @@ fn require_credentials_transport(url: &str, credentials: &Credentials) -> Result
 /// query does not count, and a DNS name that merely starts with
 /// "127." (e.g. `127.0.0.1.evil.com`) is not loopback — the host must
 /// parse as an IP in the loopback range, or be localhost.
-fn is_loopback_url(url: &str) -> bool {
+///
+/// Public so the live-test harness (`tests/gitea.rs`) shares the one
+/// check the transport guard uses, instead of a copy that can drift.
+pub fn is_loopback_url(url: &str) -> bool {
     let Some(after_scheme) = url.split("://").nth(1) else {
         return false;
     };
@@ -364,8 +367,16 @@ fn is_loopback_url(url: &str) -> bool {
     // Strip any userinfo first: an `@` in it must not be mistaken for
     // the host separator.
     let without_userinfo = authority.rsplit('@').next().unwrap_or(authority);
+    // A bracketed host is only a bracketed host if the closing bracket
+    // is followed by the end of the authority or a `:port`: without
+    // that, `http://[::1]evil.com` would read as `::1` and be classified
+    // loopback while the real host is `[::1]evil.com`. An unterminated
+    // bracket is not a host at all.
     let host = if let Some(bracketed) = without_userinfo.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or("")
+        match bracketed.split_once(']') {
+            Some((inside, rest)) if rest.is_empty() || rest.starts_with(':') => inside,
+            _ => "",
+        }
     } else {
         without_userinfo.split(':').next().unwrap_or("")
     };
@@ -1076,6 +1087,12 @@ mod tests {
         // A loopback string in the path or query does not count.
         assert!(!is_loopback_url("http://example.com/127.0.0.1"));
         assert!(!is_loopback_url("http://example.com/?x=127.0.0.1"));
+        // A bracketed host needs its closing bracket followed by the
+        // end of the authority or a port: `[::1]evil.com` is a
+        // different host, not loopback; an unterminated bracket is
+        // not a host at all.
+        assert!(!is_loopback_url("http://[::1]evil.com/"));
+        assert!(!is_loopback_url("http://[::1/x"));
         // No scheme names no host.
         assert!(!is_loopback_url("127.0.0.1/x"));
     }
