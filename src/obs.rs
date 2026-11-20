@@ -501,6 +501,63 @@ pub(crate) struct DirectoryListing {
     pub linkinfo: Option<(String, String)>,
 }
 
+/// One entry in a package's history (`<revision>` in
+/// `<revisionlist>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    /// Revision number (`rev` attribute).
+    pub rev: u64,
+    /// Versioned revision (`vrev` attribute).
+    pub vrev: u64,
+    /// Source md5 of this revision, when the history carries it.
+    pub srcmd5: Option<String>,
+    /// Package version at this revision, when the history carries it.
+    pub version: Option<String>,
+    /// Commit time (seconds since the epoch), when the history
+    /// carries it.
+    pub time: Option<u64>,
+    /// Who committed this revision, when the history carries it.
+    pub user: Option<String>,
+    /// Commit comment, when the history carries it.
+    pub comment: Option<String>,
+    /// The submit request that filed this revision, when the history
+    /// carries it.
+    pub request_id: Option<String>,
+}
+
+/// Whether a file was added, modified, or deleted between two
+/// revisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePatchStatus {
+    /// Present in the new revision only.
+    Added,
+    /// Present in both, with different contents.
+    Modified,
+    /// Present in the old revision only.
+    Deleted,
+}
+
+/// One file's diff between two revisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePatch {
+    /// File name.
+    pub filename: String,
+    /// Whether the file was added, modified, or deleted.
+    pub status: FilePatchStatus,
+    /// Unified diff of the file's contents (`---`/`+++`/`@@`
+    /// form); empty for an unchanged file, which never appears here.
+    pub diff: String,
+}
+
+/// The per-file diff of one revision against the previous one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionPatch {
+    /// The revision the patch describes.
+    pub rev: u64,
+    /// The changed files, sorted by name.
+    pub files: Vec<FilePatch>,
+}
+
 /// The OBS client: the devel-project lookup, the devel version, the
 /// open-submit-request check, submit-request filing, branch setup,
 /// and the remote reads (file and directory reads, history, meta,
@@ -1249,6 +1306,149 @@ impl<'a> ObsClient<'a> {
             .collect())
     }
 
+    /// List the files of a package at a revision (`GET
+    /// /public/source/<project>/<package>?rev=N`): the `rev`-carrying
+    /// form of [`ObsClient::list_files`], for diffing two revisions.
+    fn list_files_rev(
+        &self,
+        project: &str,
+        package: &str,
+        rev: Option<u64>,
+    ) -> Result<Vec<SourceFile>, GeectlError> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        let rev_text;
+        if let Some(rev) = rev {
+            rev_text = rev.to_string();
+            query.push(("rev", &rev_text));
+        }
+        let url = build_url(&self.base, &["public", "source", project, package], &query);
+        let body = self.http.get_with(&url, &Credentials::None)?;
+        Ok(parse_directory(&body)?.entries)
+    }
+
+    /// Read the history of package `package` in project `project`
+    /// (`GET /source/<project>/<package>/_history`), optionally
+    /// restricted to `range`. The history has no public route, so the
+    /// read uses the client's credentials (whatever they are — no
+    /// fail-closed pre-check: a client without credentials gets the
+    /// server's 401 as an error, like any other authenticated read).
+    /// Entries come back newest first: the server lists them oldest
+    /// first, so the log is reversed before it is returned; a range
+    /// filter preserves the newest-first order.
+    pub fn package_log(
+        &self,
+        project: &str,
+        package: &str,
+        range: Option<&RevisionRange>,
+    ) -> Result<Vec<HistoryEntry>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let url = build_url(&self.base, &["source", project, package, "_history"], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        let entries = parse_history(&body)?;
+        let mut entries = match range {
+            None => entries,
+            Some(range) => filter_history(entries, range)?,
+        };
+        // The server lists oldest first; a log reads newest first.
+        entries.reverse();
+        Ok(entries)
+    }
+
+    /// The per-file diff of revision `rev` of package `package` in
+    /// project `project` against the previous revision: the files
+    /// added, modified, or deleted, each with a unified diff.
+    /// Revision 1 has no previous revision, so its patch is empty.
+    /// File contents are read as text; a binary file that differs
+    /// fails the call (its contents cannot be rendered as a text
+    /// diff). Added and deleted files always appear; a modified file
+    /// appears only when its contents actually differ.
+    pub fn revision_patch(
+        &self,
+        project: &str,
+        package: &str,
+        rev: u64,
+    ) -> Result<RevisionPatch, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if rev == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "invalid revision: 0",
+            ));
+        }
+        if rev == 1 {
+            return Ok(RevisionPatch {
+                rev,
+                files: Vec::new(),
+            });
+        }
+        let new_files = self.list_files_rev(project, package, Some(rev))?;
+        let old_files = self.list_files_rev(project, package, Some(rev - 1))?;
+        let mut patches = Vec::new();
+        for new in &new_files {
+            match old_files.iter().find(|old| old.name == new.name) {
+                None => {
+                    // Added: the whole file is new.
+                    let content = self.cat(project, package, &new.name, Some(rev))?;
+                    patches.push(FilePatch {
+                        filename: new.name.clone(),
+                        status: FilePatchStatus::Added,
+                        diff: unified_diff("/dev/null", "", &format!("b/{}", new.name), &content),
+                    });
+                }
+                Some(old) if old.md5 != new.md5 => {
+                    let old_content = self.cat(project, package, &new.name, Some(rev - 1))?;
+                    let new_content = self.cat(project, package, &new.name, Some(rev))?;
+                    let diff = unified_diff(
+                        &format!("a/{}", new.name),
+                        &old_content,
+                        &format!("b/{}", new.name),
+                        &new_content,
+                    );
+                    // The md5s differ but the contents may not (a
+                    // missing md5 reads as a difference): only a
+                    // non-empty diff is a modification.
+                    if !diff.is_empty() {
+                        patches.push(FilePatch {
+                            filename: new.name.clone(),
+                            status: FilePatchStatus::Modified,
+                            diff,
+                        });
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        for old in &old_files {
+            if !new_files.iter().any(|new| new.name == old.name) {
+                let content = self.cat(project, package, &old.name, Some(rev - 1))?;
+                patches.push(FilePatch {
+                    filename: old.name.clone(),
+                    status: FilePatchStatus::Deleted,
+                    diff: unified_diff(&format!("a/{}", old.name), &content, "/dev/null", ""),
+                });
+            }
+        }
+        patches.sort_by(|a, b| a.filename.cmp(&b.filename));
+        Ok(RevisionPatch {
+            rev,
+            files: patches,
+        })
+    }
+
     /// Build the OBS search URL for open submit requests targeting
     /// `package`. The match expression is XPath over the request XML,
     /// restricted to `submit` actions: a request of another type that
@@ -1824,6 +2024,330 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
         rest = &after_tag[end..];
     }
     Ok(DirectoryListing { entries, linkinfo })
+}
+
+/// Restrict `entries` (server order, oldest first) to `range`.
+/// A numeric bound compares revision numbers; an md5 bound resolves
+/// to the revision carrying that md5 (an unknown md5 is an error,
+/// never an empty list). A one-sided range from a single specifier
+/// matches exactly that revision; `"a:b"` matches `a..=b`, and a
+/// reversed range is an error.
+fn filter_history(
+    entries: Vec<HistoryEntry>,
+    range: &RevisionRange,
+) -> Result<Vec<HistoryEntry>, GeectlError> {
+    let resolve = |spec: &RevisionSpec| -> Result<u64, GeectlError> {
+        match spec {
+            RevisionSpec::Rev(number) => Ok(*number),
+            RevisionSpec::Md5(md5) => entries
+                .iter()
+                .find(|entry| entry.srcmd5.as_deref() == Some(md5.as_str()))
+                .map(|entry| entry.rev)
+                .ok_or_else(|| {
+                    GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("revision md5 {md5:?} not found in the package history"),
+                    )
+                }),
+        }
+    };
+    let (low, high) = match (&range.from, &range.to) {
+        (None, None) => return Ok(entries),
+        (Some(from), None) => {
+            let rev = resolve(from)?;
+            (rev, rev)
+        }
+        (None, Some(to)) => {
+            let rev = resolve(to)?;
+            (0, rev)
+        }
+        (Some(from), Some(to)) => {
+            let from = resolve(from)?;
+            let to = resolve(to)?;
+            if from > to {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("reversed revision range: {from}..{to}"),
+                ));
+            }
+            (from, to)
+        }
+    };
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.rev >= low && entry.rev <= high)
+        .collect())
+}
+
+/// The text of the first `<tag>...</tag>` element in `block`, or
+/// None when there is none. The text is XML-unescaped. A
+/// self-closing `<tag/>` carries no text and reads as None.
+fn element_text(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let mut rest = block;
+    while let Some(pos) = rest.find(&open) {
+        let after_tag = &rest[pos + open.len()..];
+        let first = after_tag.chars().next()?;
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        let end = after_tag.find('>')?;
+        let open_text = &after_tag[..end];
+        if open_text.trim_end().ends_with('/') {
+            return None;
+        }
+        let inner = &after_tag[end + 1..];
+        let close = format!("</{tag}>");
+        let close_pos = inner.find(&close)?;
+        return Some(xml_unescape(&inner[..close_pos]));
+    }
+    None
+}
+
+/// Parse an OBS package history (`<revisionlist>` with `<revision
+/// rev vrev>` children carrying `<srcmd5>`, `<version>`, `<time>`,
+/// `<user>`, `<comment>`, and `<requestid>` elements). The body must
+/// be a `<revisionlist>` document: a body that is not one is an
+/// error, never an empty history. A `<revision>` without numeric
+/// `rev`/`vrev` attributes, or with a non-numeric `<time>`, is a
+/// malformed history. The entries come back in server order (oldest
+/// first); the parser preserves it.
+pub(crate) fn parse_history(body: &str) -> Result<Vec<HistoryEntry>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS history response: not a <revisionlist> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<revisionlist") else {
+        return Err(malformed());
+    };
+    // The tag name must end here: `<revisionlists>` is not a
+    // revision list. The next character is whitespace, `/`, or `>`.
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = after_open.find('>') else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<revisionlist/>`: no revisions.
+        return Ok(Vec::new());
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</revisionlist>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</revisionlist>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut entries = Vec::new();
+    let mut rest = inner;
+    while let Some(pos) = rest.find("<revision") {
+        let after_tag = &rest[pos + "<revision".len()..];
+        // The tag name must end here: `<revisions>` is not a
+        // revision element. The next character is whitespace, `/`,
+        // or `>`.
+        let Some(first) = after_tag.chars().next() else {
+            return Err(malformed());
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        let Some(end) = after_tag.find('>') else {
+            return Err(malformed());
+        };
+        let element = &after_tag[..end];
+        let rev = match tag_attr(element, "rev") {
+            Some(value) => value.parse::<u64>().map_err(|_| malformed())?,
+            None => return Err(malformed()),
+        };
+        let vrev = match tag_attr(element, "vrev") {
+            Some(value) => value.parse::<u64>().map_err(|_| malformed())?,
+            None => return Err(malformed()),
+        };
+        let inner = &after_tag[end + 1..];
+        let Some(close) = inner.find("</revision>") else {
+            return Err(malformed());
+        };
+        let block = &inner[..close];
+        let time = match element_text(block, "time") {
+            Some(value) => Some(value.trim().parse::<u64>().map_err(|_| malformed())?),
+            None => None,
+        };
+        entries.push(HistoryEntry {
+            rev,
+            vrev,
+            srcmd5: element_text(block, "srcmd5"),
+            version: element_text(block, "version"),
+            time,
+            user: element_text(block, "user"),
+            comment: element_text(block, "comment"),
+            request_id: element_text(block, "requestid"),
+        });
+        rest = &inner[close + "</revision>".len()..];
+    }
+    Ok(entries)
+}
+
+/// A unified diff of `old` against `new`, in the standard form:
+/// `--- <old_path>` / `+++ <new_path>` headers, `@@ -a,b +c,d @@`
+/// hunks with three lines of context, `-`/`+`/context lines. The
+/// diff is computed on lines (LCS-based); a file that exists on one
+/// side only is rendered with `/dev/null` on the missing side. The
+/// LCS table is quadratic in the file sizes, so very large files are
+/// expensive to diff — the callers diff package text files, which are
+/// small. An empty diff (identical contents) is an empty string:
+/// there is nothing to show.
+pub(crate) fn unified_diff(old_path: &str, old: &str, new_path: &str, new: &str) -> String {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let n = old_lines.len();
+    let m = new_lines.len();
+    // LCS table: `table[i][j]` is the LCS length of the suffixes from
+    // `i` and `j`.
+    let mut table = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            table[i][j] = if old_lines[i] == new_lines[j] {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i + 1][j].max(table[i][j + 1])
+            };
+        }
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Op {
+        Equal,
+        Delete,
+        Add,
+    }
+    let mut ops: Vec<(Op, &str)> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if old_lines[i] == new_lines[j] {
+            ops.push((Op::Equal, old_lines[i]));
+            i += 1;
+            j += 1;
+        } else if table[i + 1][j] >= table[i][j + 1] {
+            ops.push((Op::Delete, old_lines[i]));
+            i += 1;
+        } else {
+            ops.push((Op::Add, new_lines[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push((Op::Delete, old_lines[i]));
+        i += 1;
+    }
+    while j < m {
+        ops.push((Op::Add, new_lines[j]));
+        j += 1;
+    }
+    if ops.iter().all(|(op, _)| *op == Op::Equal) {
+        return String::new();
+    }
+    // Group into hunks with three lines of context: hunks merge when
+    // the equal run between two changes is at most twice the context.
+    const CONTEXT: usize = 3;
+    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    let mut k = 0;
+    while k < ops.len() {
+        while k < ops.len() && ops[k].0 == Op::Equal {
+            k += 1;
+        }
+        if k >= ops.len() {
+            break;
+        }
+        let hunk_start = k.saturating_sub(CONTEXT);
+        let mut end = k;
+        while end < ops.len() {
+            if ops[end].0 == Op::Equal {
+                let run_start = end;
+                while end < ops.len() && ops[end].0 == Op::Equal {
+                    end += 1;
+                }
+                if end >= ops.len() {
+                    // Trailing equals: only CONTEXT of them belong.
+                    end = run_start + CONTEXT.min(end - run_start);
+                    break;
+                }
+                if end - run_start > 2 * CONTEXT {
+                    // Gap too wide: the hunk ends CONTEXT after the
+                    // last change.
+                    end = run_start + CONTEXT;
+                    break;
+                }
+                // Short gap: absorbed, keep going.
+            } else {
+                end += 1;
+            }
+        }
+        hunks.push((hunk_start, end));
+        k = end;
+    }
+    let mut out = String::new();
+    out.push_str(&format!("--- {old_path}\n+++ {new_path}\n"));
+    for (start, end) in hunks {
+        // Line numbers before the hunk, then the counts within it.
+        let (mut old_line, mut new_line) = (0, 0);
+        for (op, _) in &ops[..start] {
+            match op {
+                Op::Equal => {
+                    old_line += 1;
+                    new_line += 1;
+                }
+                Op::Delete => old_line += 1,
+                Op::Add => new_line += 1,
+            }
+        }
+        let (mut old_count, mut new_count) = (0, 0);
+        for (op, _) in &ops[start..end] {
+            match op {
+                Op::Equal => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                Op::Delete => old_count += 1,
+                Op::Add => new_count += 1,
+            }
+        }
+        let fmt_range = |start: usize, count: usize| -> String {
+            if count == 0 {
+                // An empty range starts at the line before it.
+                format!("{start},0")
+            } else if count == 1 {
+                format!("{}", start + 1)
+            } else {
+                format!("{},{}", start + 1, count)
+            }
+        };
+        out.push_str(&format!(
+            "@@ -{} +{} @@\n",
+            fmt_range(old_line, old_count),
+            fmt_range(new_line, new_count)
+        ));
+        for (op, line) in &ops[start..end] {
+            let marker = match op {
+                Op::Equal => ' ',
+                Op::Delete => '-',
+                Op::Add => '+',
+            };
+            out.push(marker);
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Validate an OBS request id: a non-empty run of ASCII digits that
@@ -4894,6 +5418,306 @@ mod tests {
         let client = ObsClient::new(&http);
         assert!(client.list_files("openSUSE:Factory", "foo/bar").is_err());
         assert!(client.list_packages("openSUSE:Factory/x").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    // --- unified_diff ---
+
+    #[test]
+    fn unified_diff_of_identical_contents_is_empty() {
+        assert_eq!(unified_diff("a/x", "one\ntwo\n", "b/x", "one\ntwo\n"), "");
+        assert_eq!(unified_diff("a/x", "", "b/x", ""), "");
+    }
+
+    #[test]
+    fn unified_diff_shows_a_single_change_with_context() {
+        let diff = unified_diff(
+            "a/x",
+            "one\ntwo\nthree\nfour\nfive\n",
+            "b/x",
+            "one\nTWO\nthree\nfour\nfive\n",
+        );
+        assert_eq!(
+            diff,
+            "--- a/x\n+++ b/x\n@@ -1,5 +1,5 @@\n one\n-two\n+TWO\n three\n four\n five\n"
+        );
+    }
+
+    #[test]
+    fn unified_diff_of_a_new_file_is_all_additions() {
+        let diff = unified_diff("/dev/null", "", "b/new.txt", "hello\nworld\n");
+        assert_eq!(
+            diff,
+            "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+hello\n+world\n"
+        );
+    }
+
+    #[test]
+    fn unified_diff_of_a_deleted_file_is_all_deletions() {
+        let diff = unified_diff("a/old.txt", "hello\nworld\n", "/dev/null", "");
+        assert_eq!(
+            diff,
+            "--- a/old.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-hello\n-world\n"
+        );
+    }
+
+    #[test]
+    fn unified_diff_splits_distant_changes_into_hunks() {
+        // Two changes ten lines apart: two hunks, three context lines
+        // each, and no line from the middle in either hunk.
+        let old: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let mut new = old.clone();
+        new = new.replacen("line 2\n", "LINE 2\n", 1);
+        new = new.replacen("line 18\n", "LINE 18\n", 1);
+        let diff = unified_diff("a/x", &old, "b/x", &new);
+        assert!(diff.contains("@@ -1,5 +1,5 @@\n"));
+        assert!(diff.contains("@@ -15,6 +15,6 @@\n"));
+        assert!(!diff.contains("line 10\n"));
+        assert_eq!(diff.matches("@@").count(), 4);
+    }
+
+    // --- parse_history ---
+
+    const HISTORY_FIXTURE: &str = "<revisionlist>\
+        <revision rev=\"1\" vrev=\"1\">\
+        <srcmd5>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</srcmd5>\
+        <version>1.0</version><time>1700000000</time><user>Admin</user>\
+        <comment>Initial import</comment>\
+        </revision>\
+        <revision rev=\"2\" vrev=\"1\">\
+        <srcmd5>bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</srcmd5>\
+        <version>1.1</version><time>1700000001</time><user>Admin</user>\
+        <comment>Update to 1.1</comment>\
+        </revision>\
+        <revision rev=\"3\" vrev=\"1\">\
+        <srcmd5>cccccccccccccccccccccccccccccccc</srcmd5>\
+        <version>1.2</version><time>1700000002</time><user>Admin</user>\
+        <comment>Update to 1.2</comment><requestid>123</requestid>\
+        </revision>\
+        </revisionlist>";
+
+    #[test]
+    fn history_parses_in_server_order() {
+        let entries = parse_history(HISTORY_FIXTURE).unwrap();
+        assert_eq!(entries.len(), 3);
+        // Server order is oldest first: the parser preserves it.
+        assert_eq!(entries[0].rev, 1);
+        assert_eq!(entries[2].rev, 3);
+        assert_eq!(entries[2].vrev, 1);
+        assert_eq!(
+            entries[2].srcmd5.as_deref(),
+            Some("cccccccccccccccccccccccccccccccc")
+        );
+        assert_eq!(entries[2].version.as_deref(), Some("1.2"));
+        assert_eq!(entries[2].time, Some(1_700_000_002));
+        assert_eq!(entries[2].user.as_deref(), Some("Admin"));
+        assert_eq!(entries[2].comment.as_deref(), Some("Update to 1.2"));
+        assert_eq!(entries[2].request_id.as_deref(), Some("123"));
+        // The second entry carries no request id.
+        assert_eq!(entries[1].rev, 2);
+        assert_eq!(entries[1].request_id, None);
+    }
+
+    #[test]
+    fn history_rejects_malformed_bodies() {
+        assert!(parse_history("").is_err());
+        assert!(parse_history("<collection matches=\"0\"></collection>").is_err());
+        assert!(parse_history("<revisionlists></revisionlists>").is_err());
+        assert!(parse_history("<revisionlist>").is_err());
+        assert!(
+            parse_history("<revisionlist><revision vrev=\"1\"></revision></revisionlist>").is_err()
+        );
+        assert!(parse_history(
+            "<revisionlist><revision rev=\"x\" vrev=\"1\"></revision></revisionlist>"
+        )
+        .is_err());
+        assert!(
+            parse_history("<revisionlist><revision rev=\"1\" vrev=\"1\"><time>soon</time></revision></revisionlist>").is_err()
+        );
+        assert!(
+            parse_history("<revisionlist><revision rev=\"1\" vrev=\"1\"></revisionlist>").is_err()
+        );
+        assert!(parse_history("<revisionlist/>").unwrap().is_empty());
+    }
+
+    // --- package_log ---
+
+    #[test]
+    fn package_log_returns_newest_first() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_history",
+            HISTORY_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        let entries = client.package_log("openSUSE:Factory", "foo", None).unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        // No credentials on this client: the read is unauthenticated.
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_history".to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn package_log_range_filters_preserving_order() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_history",
+            HISTORY_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        // `--revision=2` returns only r2.
+        let entries = client
+            .package_log(
+                "openSUSE:Factory",
+                "foo",
+                Some(&RevisionRange::parse("2").unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+            vec![2]
+        );
+        // `--revision=1:2` returns r2 then r1.
+        let entries = client
+            .package_log(
+                "openSUSE:Factory",
+                "foo",
+                Some(&RevisionRange::parse("1:2").unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        // An md5 range resolves through the history.
+        let entries = client
+            .package_log(
+                "openSUSE:Factory",
+                "foo",
+                Some(
+                    &RevisionRange::parse(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+    }
+
+    #[test]
+    fn package_log_range_errors_are_fail_closed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_history",
+            HISTORY_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        // An unknown md5 is an error, never an empty list.
+        assert!(client
+            .package_log(
+                "openSUSE:Factory",
+                "foo",
+                Some(&RevisionRange::parse("dddddddddddddddddddddddddddddddd").unwrap()),
+            )
+            .is_err());
+        // A reversed range is an error.
+        assert!(client
+            .package_log(
+                "openSUSE:Factory",
+                "foo",
+                Some(&RevisionRange::parse("2:1").unwrap()),
+            )
+            .is_err());
+    }
+
+    // --- revision_patch ---
+
+    fn patch_client() -> FakeHttp {
+        let rev1 = "<directory><entry name=\"foo.spec\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/><entry name=\"old.txt\" md5=\"oooooooooooooooooooooooooooooooo\"/></directory>";
+        let rev2 = "<directory><entry name=\"foo.spec\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/><entry name=\"new.txt\" md5=\"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn\"/></directory>";
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo?rev=1",
+                rev1,
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo?rev=2",
+                rev2,
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec?rev=1",
+                "Name: foo\nVersion: 1.0\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec?rev=2",
+                "Name: foo\nVersion: 1.1\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/new.txt?rev=2",
+                "fresh\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/old.txt?rev=1",
+                "stale\n",
+            )
+    }
+
+    #[test]
+    fn revision_patch_rev1_is_empty() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let patch = client.revision_patch("openSUSE:Factory", "foo", 1).unwrap();
+        assert_eq!(patch.rev, 1);
+        assert!(patch.files.is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn revision_patch_classifies_added_modified_deleted() {
+        let http = patch_client();
+        let client = ObsClient::new(&http);
+        let patch = client.revision_patch("openSUSE:Factory", "foo", 2).unwrap();
+        assert_eq!(patch.rev, 2);
+        assert_eq!(
+            patch
+                .files
+                .iter()
+                .map(|file| (file.filename.as_str(), file.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("foo.spec", FilePatchStatus::Modified),
+                ("new.txt", FilePatchStatus::Added),
+                ("old.txt", FilePatchStatus::Deleted),
+            ]
+        );
+        let modified = &patch.files[0];
+        assert!(modified.diff.contains("--- a/foo.spec\n+++ b/foo.spec\n"));
+        assert!(modified.diff.contains("-Version: 1.0\n+Version: 1.1\n"));
+        // A new file renders with `/dev/null` on the old side.
+        assert!(patch.files[1]
+            .diff
+            .contains("--- /dev/null\n+++ b/new.txt\n"));
+        assert!(patch.files[1].diff.contains("+fresh\n"));
+        assert!(patch.files[2]
+            .diff
+            .contains("--- a/old.txt\n+++ /dev/null\n"));
+        assert!(patch.files[2].diff.contains("-stale\n"));
+    }
+
+    #[test]
+    fn revision_patch_rejects_rev_zero() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.revision_patch("openSUSE:Factory", "foo", 0).is_err());
         assert!(http.get_calls().is_empty());
     }
 }
