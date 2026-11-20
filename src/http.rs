@@ -196,7 +196,10 @@ impl UreqClient {
 /// error context. A URL with embedded credentials must never leak into
 /// an error message, a log, or stdout — the context names the resource,
 /// not the credential.
-fn sanitize_url_for_error(url: &str) -> String {
+///
+/// Public so the live-test harness strips userinfo the same way before
+/// printing a URL.
+pub fn sanitize_url_for_error(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
     };

@@ -65,7 +65,8 @@ fn gitea_url() -> Option<String> {
     let url = url.trim_end_matches('/').to_string();
     assert!(
         is_loopback_url(&url),
-        "GEECTL_GITEA_URL must be a loopback URL (http://127.0.0.1, http://localhost, or http://[::1]); got {url}"
+        "GEECTL_GITEA_URL must be a loopback URL (http://127.0.0.1, http://localhost, or http://[::1]); got {}",
+        geectl::http::sanitize_url_for_error(&url)
     );
     Some(url)
 }
@@ -237,6 +238,12 @@ mod tests {
         // plain-HTTP disposable instance only.
         assert!(!is_loopback_url("https://127.0.0.1:3001"));
         assert!(!is_loopback_url(""));
+        // Userinfo must not change the host: the host after the last
+        // `@` is what counts.
+        assert!(is_loopback_url("http://user:pass@127.0.0.1:3001"));
+        assert!(!is_loopback_url("http://user:pass@127.0.0.1.evil.com"));
+        assert!(!is_loopback_url("http://user@evil.com"));
+        assert!(!is_loopback_url("http://[::1]evil.com"));
     }
 
     #[test]
