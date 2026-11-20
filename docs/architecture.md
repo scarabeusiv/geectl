@@ -119,7 +119,8 @@ Rules that hold:
 
 The library surface a tool uses to move a package update through the
 distribution: `ObsClient` (devel-project lookup, devel version, open
-submit-request check, filing, superseding, branch cleanup), `SrPayload`
+submit-request check, filing, superseding, branch cleanup, branch-project
+and branch-package creation, file upload), `SrPayload`
 (the validated submit-request payload), `SrFiling` (the only filing
 path, dry-run by default; `refile` is the file-then-supersede flow),
 `DryRun` (the would-do guard), and `CveId` (CVE id parsing plus the
@@ -206,9 +207,25 @@ would delete the devel package — so that case opts out with
 branches the server-side cleanup never reaches: a superseded
 request's branch and a declined request's branch.
 
+Branch setup is creation plus upload: a fresh branch project
+(`ObsClient::create_project`, `PUT /source/<project>/_meta`) and the
+branch package in it (`ObsClient::create_package`, `PUT
+/source/<project>/<package>/_meta`), then the files the update
+carries (`ObsClient::upload_file`, `PUT
+/source/<project>/<package>/<filename>` as `application/octet-stream`).
+The meta PUTs return `<status code="ok"/>`; the file PUT returns the
+backend's `<revision rev="N" .../>` document, and `upload_file`
+returns that revision number (or `None` in dry-run). The filename rule
+mirrors the server (`PackageService::FileVerifier`: no `/`, no leading
+`.`, at least two characters; `_meta` and `_attribute` are reserved).
+All three are DryRun-guarded like the delete: in dry-run the
+creation or upload is recorded in the plan and nothing is created or
+uploaded, and no credentials are needed.
+
 Credentials: the public reads (devel project, devel version) need
-none; the open-SR search, the filing POST, superseding, and deleting
-need OBS Basic and fail loudly without them. OBS accepts Basic only —
+none; the open-SR search, the filing POST, superseding, deleting,
+creating, and uploading need OBS Basic and fail loudly without them.
+OBS accepts Basic only —
 a Bearer token or SSH key is refused at client construction. No
 credential is stored here, and no request carries one over cleartext
 http except to a loopback host (the transport guard in `http.rs`).
@@ -321,8 +338,10 @@ through geectl's own HTTP client: `GET /about` returns a real OBS
 (title + non-empty revision), a missing project maps to geectl's
 `NotFound`, and the project list at `GET /source` returns a `<directory>` of
 `<entry>` elements. The mutation assertions create a project through geectl and read it
-back (`temporal_create_project_shows_up_on_server`), and file real
-submit requests and assert on the server state they leave behind
+back (`temporal_create_project_shows_up_on_server`), upload a file
+and read it back (`temporal_upload_file_reads_back_on_server`, in
+`tests/temporal_obs.rs`: the bytes and the revision number), and file
+real submit requests and assert on the server state they leave behind
 (`tests/temporal_obs.rs`: filing, refile, and accept-time cleanup).
 
 **Plain HTTP on localhost is the single sanctioned exception to the

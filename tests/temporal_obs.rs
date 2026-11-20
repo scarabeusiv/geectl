@@ -32,6 +32,10 @@
 //! their URLs with the encoders from `url.rs`, as `docs/architecture.md`
 //! records).
 //!
+//! The upload test (`temporal_upload_file_reads_back_on_server`)
+//! uploads a spec file into a fresh branch package and reads it back,
+//! asserting the bytes and the revision number.
+//!
 //! The SR tests (`temporal_filed_request_shows_up_on_server`,
 //! `temporal_refile_supersedes_and_deletes_on_server`, and
 //! `temporal_accept_deletes_source_branch_on_server`) file real
