@@ -140,8 +140,12 @@ if [ -z "$TOKEN" ]; then
     exit 1
 fi
 # The token file is 0600 from the first byte (umask), and holds only
-# the token (no trailing newline).
+# the token (no trailing newline). Remove it first: a pre-existing
+# file keeps its mode on truncate, so a stale 0644 file would stay
+# readable. The chmod after the write is belt-and-braces.
+rm -f "$TOKEN_FILE"
 (umask 077 && printf '%s' "$TOKEN" > "$TOKEN_FILE")
+chmod 600 "$TOKEN_FILE"
 
 echo "Disposable Gitea instance is up."
 echo "Base URL: $BASE_URL"
