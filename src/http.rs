@@ -145,6 +145,10 @@ pub fn is_retryable_method(method: &str) -> bool {
 /// `put`: re-PUTting the same file stores the same bytes.
 /// `post_json` sends the body as `application/json` and resolves
 /// credentials from the client's auth seam instead.
+/// The mutation methods (`post`, `post_text`, `post_json`, `put`,
+/// `put_file`, `delete`) all ask for `application/xml` (`Accept`
+/// header): a path that exists in both the API and WebUI route sets
+/// serves the WebUI HTML page unless the request asks for XML.
 pub trait HttpClient {
     fn get(&self, url: &str) -> Result<String, GeectlError>;
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
@@ -273,7 +277,15 @@ impl UreqClient {
             !is_retryable_method("POST"),
             "POST must stay non-retryable; a retried mutation can duplicate"
         );
-        let request = self.agent.post(url).header("Content-Type", content_type);
+        // Ask for XML, the same defence as GET: the owner search proved
+        // a dual-routed path serves the WebUI HTML page unless the request
+        // asks for XML. No mutation path has been seen doing it yet, so
+        // for mutations this is preventive.
+        let request = self
+            .agent
+            .post(url)
+            .header("Content-Type", content_type)
+            .header("Accept", "application/xml");
         let request = self.apply_auth(request, credentials)?;
         match request.send(body) {
             Ok(resp) => {
@@ -333,7 +345,15 @@ impl UreqClient {
         require_credentials_transport(url, credentials)?;
         let mut last_error: Option<GeectlError> = None;
         for attempt in 0..=RETRY_POLICY.max_retries {
-            let request = self.agent.put(url).header("Content-Type", content_type);
+            // Ask for XML, the same defence as GET: the owner search proved
+            // a dual-routed path serves the WebUI HTML page unless the request
+            // asks for XML. No mutation path has been seen doing it yet, so
+            // for mutations this is preventive.
+            let request = self
+                .agent
+                .put(url)
+                .header("Content-Type", content_type)
+                .header("Accept", "application/xml");
             let request = self.apply_auth(request, credentials)?;
             match request.send(body) {
                 Ok(resp) => {
@@ -772,7 +792,11 @@ impl HttpClient for UreqClient {
         // state", never a false failure. The caller re-issues the
         // delete itself once it has checked.
         require_credentials_transport(url, credentials)?;
-        let request = self.agent.delete(url);
+        // Ask for XML, the same defence as GET: the owner search proved
+        // a dual-routed path serves the WebUI HTML page unless the request
+        // asks for XML. No mutation path has been seen doing it yet, so
+        // for mutations this is preventive.
+        let request = self.agent.delete(url).header("Accept", "application/xml");
         let request = self.apply_auth(request, credentials)?;
         match request.call() {
             Ok(resp) => {
@@ -2036,6 +2060,94 @@ mod tests {
         );
         assert_eq!(auth.as_deref(), Some(expected.as_str()));
         assert_eq!(received_body, "");
+    }
+
+    #[test]
+    fn mutations_request_xml_from_the_api() {
+        // Every mutation asks for XML, the same defence as GET: the owner
+        // search proved a dual-routed path serves the WebUI HTML page
+        // unless the request asks for XML. No mutation path has been seen
+        // doing it yet, so for mutations this is preventive.
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let accept_of = |request: &str| {
+            let headers = match request.split_once("\r\n\r\n") {
+                Some((headers, _)) => headers,
+                None => request,
+            };
+            headers
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("accept:"))
+                .map(|l| l["accept:".len()..].trim().to_string())
+        };
+
+        let server = LoopbackServer::serve("created");
+        assert_eq!(
+            client
+                .post(&server.url(), "<request/>", &Credentials::None)
+                .unwrap(),
+            "created"
+        );
+        assert_eq!(
+            accept_of(&server.request().expect("a request arrived")).as_deref(),
+            Some("application/xml")
+        );
+
+        let server = LoopbackServer::serve("<status code=\"ok\" />");
+        assert_eq!(
+            client
+                .put(&server.url(), "<project/>", &Credentials::None)
+                .unwrap(),
+            "<status code=\"ok\" />"
+        );
+        assert_eq!(
+            accept_of(&server.request().expect("a request arrived")).as_deref(),
+            Some("application/xml")
+        );
+
+        let server = LoopbackServer::serve("<status code=\"ok\" />");
+        assert_eq!(
+            client.delete(&server.url(), &Credentials::None).unwrap(),
+            "<status code=\"ok\" />"
+        );
+        assert_eq!(
+            accept_of(&server.request().expect("a request arrived")).as_deref(),
+            Some("application/xml")
+        );
+
+        let server = LoopbackServer::serve("created");
+        assert_eq!(
+            client
+                .post_text(&server.url(), "superseded by 42", &Credentials::None)
+                .unwrap(),
+            "created"
+        );
+        assert_eq!(
+            accept_of(&server.request().expect("a request arrived")).as_deref(),
+            Some("application/xml")
+        );
+
+        let server = LoopbackServer::serve("<status code=\"ok\" />");
+        assert_eq!(
+            client
+                .put_file(
+                    &server.url(),
+                    "Name: foo\nVersion: 1.0\n",
+                    &Credentials::None
+                )
+                .unwrap(),
+            "<status code=\"ok\" />"
+        );
+        assert_eq!(
+            accept_of(&server.request().expect("a request arrived")).as_deref(),
+            Some("application/xml")
+        );
+
+        let server = LoopbackServer::serve("created");
+        assert_eq!(client.post_json(&server.url(), "{}").unwrap(), "created");
+        assert_eq!(
+            accept_of(&server.request().expect("a request arrived")).as_deref(),
+            Some("application/xml")
+        );
     }
 
     #[test]
