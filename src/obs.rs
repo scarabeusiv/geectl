@@ -111,6 +111,7 @@ use crate::error::{ErrorKind, GeectlError};
 use crate::http::{is_loopback_url, HttpClient};
 use crate::url::{encode_path_segment, encode_query_value, UrlBuilder};
 use std::cell::RefCell;
+use std::fmt;
 
 /// The OBS API base (production).
 pub const OBS_API_BASE: &str = "https://api.opensuse.org";
@@ -878,8 +879,10 @@ impl<'a> ObsClient<'a> {
     ///
     /// Uses the OBS search API, matching on actions targeting the
     /// package in the `new`/`review` states, then keeping only the
-    /// requests that carry a submit action: the search engine cannot
-    /// filter by action type itself. The
+    /// requests that carry a submit action: the type filter lives
+    /// client-side in `parse_submit_request_ids` as defence-in-depth
+    /// — the engine does whitelist `action/@type`, so filtering
+    /// server-side is a follow-up, not this change. The
     /// search has no public equivalent: without credentials it is
     /// refused here, before any request, instead of made and 401'd —
     /// a failed check is fail-closed (an error), never "no open SR".
@@ -1987,8 +1990,9 @@ impl<'a> ObsClient<'a> {
     }
 
     /// Build the OBS search URL for open submit requests targeting
-    /// `package`. The match expression is XPath over the request XML,
-    /// restricted to `submit` actions: a request of another type that
+    /// `package`. The match expression is XPath over the request XML;
+    /// the submit restriction is applied client-side in
+    /// `parse_submit_request_ids`, so a request of another type that
     /// targets the package does not block filing.
     /// The package name goes into a single-quoted XPath string
     /// literal, so it must be a valid OBS package name
@@ -2003,11 +2007,12 @@ impl<'a> ObsClient<'a> {
             ));
         }
         // The match narrows to actions targeting the package in the
-        // open states. It does NOT filter by action type: the OBS
-        // search engine has no `action/@type` in its whitelist and
-        // refuses a match that uses it with 400. The submit filter
-        // lives client-side in `parse_submit_request_ids`, on the
-        // response the server actually returns.
+        // open states. It does NOT filter by action type: the submit
+        // filter lives client-side in `parse_submit_request_ids`, on
+        // the response the server actually returns. The search
+        // engine does whitelist `action/@type`, so the match could
+        // filter server-side — that is a follow-up, not this change;
+        // the client-side filter stays as defence-in-depth.
         let match_expr = format!(
             "action/target/@package='{package}' and (state/@name='new' or state/@name='review')"
         );
@@ -2218,10 +2223,10 @@ pub(crate) fn parse_request_ids(body: &str) -> Option<Vec<String>> {
 /// The ids of the open SUBMIT requests in an OBS search response
 /// (`<collection matches="N">` of full `<request>` elements): a
 /// request counts only when one of its `<action>` elements has
-/// `type="submit"`. The OBS search engine cannot filter by action
-/// type — `action/@type` is not in its whitelist, and a match that
-/// uses it is refused with 400 — so the type filter lives here, on
-/// the response the server actually returns. The search match still
+/// `type="submit"`. The search engine does whitelist `action/@type`,
+/// so the type filter could live in the match — it lives here
+/// instead, on the response the server actually returns, as
+/// defence-in-depth. The search match still
 /// narrows to the package and the open states; this only drops the
 /// non-submit requests it also returns. A request element is kept
 /// only when its own block contains a submit action; a self-closing
@@ -5811,6 +5816,465 @@ impl ReviewTarget {
     }
 }
 
+/// One XPath predicate over the request XML, for the `match=`
+/// parameter of the request search. The tree carries the precedence:
+/// `and` binds tighter than `or`, and rendering parenthesises a child
+/// whose operator differs from its parent's, so the string reads back
+/// with the same grouping the tree has. A leaf is a single comparison
+/// (`@name='foo'`, `contains(@name, 'foo')`); `Pred` is an element
+/// predicate (`state[@name='new']`) — the brackets scope the inner
+/// query, so it never needs parens of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XpathQuery {
+    /// No predicate; renders as the empty string.
+    Empty,
+    /// `path='value'`.
+    Eq(String, String),
+    /// `not(inner)`.
+    Not(Box<XpathQuery>),
+    /// `contains(path, 'value')`.
+    Contains(String, String),
+    /// `left and right`.
+    And(Box<XpathQuery>, Box<XpathQuery>),
+    /// `left or right`.
+    Or(Box<XpathQuery>, Box<XpathQuery>),
+    /// `element[inner]`.
+    Pred(String, Box<XpathQuery>),
+}
+
+impl XpathQuery {
+    /// The `and` of several queries, left-associated, skipping empty
+    /// ones. No queries reads as the empty query.
+    pub fn and_all(queries: Vec<XpathQuery>) -> XpathQuery {
+        queries
+            .into_iter()
+            .filter(|query| *query != XpathQuery::Empty)
+            .reduce(|left, right| XpathQuery::And(Box::new(left), Box::new(right)))
+            .unwrap_or(XpathQuery::Empty)
+    }
+
+    /// The `or` of several queries, left-associated, skipping empty
+    /// ones. No queries reads as the empty query.
+    pub fn or_all(queries: Vec<XpathQuery>) -> XpathQuery {
+        queries
+            .into_iter()
+            .filter(|query| *query != XpathQuery::Empty)
+            .reduce(|left, right| XpathQuery::Or(Box::new(left), Box::new(right)))
+            .unwrap_or(XpathQuery::Empty)
+    }
+
+    /// `path='value1' or path='value2' …` for a list of values. An
+    /// empty list reads as the empty query.
+    pub fn eq_list(path: &str, values: &[String]) -> XpathQuery {
+        XpathQuery::or_all(
+            values
+                .iter()
+                .map(|value| XpathQuery::Eq(path.to_string(), value.clone()))
+                .collect(),
+        )
+    }
+}
+
+impl fmt::Display for XpathQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            XpathQuery::Empty => Ok(()),
+            XpathQuery::Eq(path, value) => write!(f, "{path}='{value}'"),
+            XpathQuery::Not(inner) => write!(f, "not({inner})"),
+            XpathQuery::Contains(path, value) => write!(f, "contains({path}, '{value}')"),
+            XpathQuery::And(left, right) => {
+                let rendered_left = render_xpath_child(left, true);
+                let rendered_right = render_xpath_child(right, true);
+                write!(f, "{rendered_left} and {rendered_right}")
+            }
+            XpathQuery::Or(left, right) => {
+                let rendered_left = render_xpath_child(left, false);
+                let rendered_right = render_xpath_child(right, false);
+                write!(f, "{rendered_left} or {rendered_right}")
+            }
+            XpathQuery::Pred(element, inner) => write!(f, "{element}[{inner}]"),
+        }
+    }
+}
+
+/// Render a child of an `and` (`is_and`) or `or` node: a child whose
+/// operator differs from its parent's is parenthesised, so the
+/// precedence the tree carries survives the flat string; a child with
+/// the same operator, or a leaf, renders bare. An `and` of two `and`s
+/// reads flat (`a and b and c`); an `or` under an `and` reads
+/// parenthesised (`(a or b) and c`).
+fn render_xpath_child(child: &XpathQuery, is_and: bool) -> String {
+    let differs = match child {
+        XpathQuery::And(..) => !is_and,
+        XpathQuery::Or(..) => is_and,
+        _ => false,
+    };
+    if differs {
+        format!("({child})")
+    } else {
+        format!("{child}")
+    }
+}
+
+/// The action types the request search can filter by: exactly the
+/// types [`RequestAction`] parses. An unknown type in a search would
+/// match nothing on the server, so the builder refuses it instead.
+const KNOWN_ACTION_TYPES: &[&str] = &[
+    "submit",
+    "delete",
+    "add_role",
+    "set_bugowner",
+    "change_devel",
+    "maintenance_incident",
+    "maintenance_release",
+    "release",
+];
+
+/// A typed request search: the filters for `GET /search/request`,
+/// built into the `match=` expression the server evaluates. Every
+/// filter is a list, and a list matches when any of its values
+/// matches; the filters themselves are `and`-joined. The clause order
+/// is fixed (ids, projects, packages, source, target, creators, who,
+/// states, types, exclusions), so the same search always builds the
+/// same expression.
+///
+/// The states default to the open states — `new`, `review`,
+/// `declined` — the set a tool triaging open work wants. Pass an
+/// explicit (possibly empty) state list to override: an empty list
+/// means no state filter at all.
+///
+/// The `source_packages` / `target_packages` filters use the
+/// singular attribute (`source[@package='…']`): the search engine's
+/// whitelist has `source/@package` and `target/@package` and no
+/// plural form, so the plural is refused by the server with 400.
+///
+/// History: `with_history` adds the creation entry and the request
+/// history to each result; `with_full_history` adds all history
+/// elements. When both are set the server prefers the full history.
+#[derive(Debug, Clone, Default)]
+pub struct RequestSearch {
+    /// Match requests with one of these numbers.
+    request_ids: Vec<u64>,
+    /// Match requests whose source or target project is one of these.
+    projects: Vec<String>,
+    /// Match requests whose source or target package is one of these.
+    packages: Vec<String>,
+    /// Match requests whose source project is one of these.
+    source_projects: Vec<String>,
+    /// Match requests whose source package is one of these.
+    source_packages: Vec<String>,
+    /// Match requests whose target project is one of these.
+    target_projects: Vec<String>,
+    /// Match requests whose target package is one of these.
+    target_packages: Vec<String>,
+    /// Match requests created by one of these users.
+    creators: Vec<String>,
+    /// Match requests one of these users interacted with (as the last
+    /// actor on the state, or in the history).
+    who: Vec<String>,
+    /// Match requests in one of these states. `None` is the default
+    /// open states; `Some(vec![])` is no state filter.
+    states: Option<Vec<RequestState>>,
+    /// Match requests with an action of one of these types.
+    types: Vec<String>,
+    /// Exclude requests targeting one of these projects.
+    exclude_target_projects: Vec<String>,
+    /// Include the creation entry and the request history in each
+    /// result.
+    with_history: bool,
+    /// Include all history elements in each result.
+    with_full_history: bool,
+}
+
+impl RequestSearch {
+    /// An empty search: the default open states, no other filter, no
+    /// history.
+    pub fn new() -> Self {
+        RequestSearch::default()
+    }
+
+    /// Match requests with one of these numbers.
+    pub fn request_ids(mut self, request_ids: Vec<u64>) -> Self {
+        self.request_ids = request_ids;
+        self
+    }
+
+    /// Match requests whose source or target project is one of these.
+    pub fn projects(mut self, projects: Vec<String>) -> Self {
+        self.projects = projects;
+        self
+    }
+
+    /// Match requests whose source or target package is one of these.
+    pub fn packages(mut self, packages: Vec<String>) -> Self {
+        self.packages = packages;
+        self
+    }
+
+    /// Match requests whose source project is one of these.
+    pub fn source_projects(mut self, source_projects: Vec<String>) -> Self {
+        self.source_projects = source_projects;
+        self
+    }
+
+    /// Match requests whose source package is one of these.
+    pub fn source_packages(mut self, source_packages: Vec<String>) -> Self {
+        self.source_packages = source_packages;
+        self
+    }
+
+    /// Match requests whose target project is one of these.
+    pub fn target_projects(mut self, target_projects: Vec<String>) -> Self {
+        self.target_projects = target_projects;
+        self
+    }
+
+    /// Match requests whose target package is one of these.
+    pub fn target_packages(mut self, target_packages: Vec<String>) -> Self {
+        self.target_packages = target_packages;
+        self
+    }
+
+    /// Match requests created by one of these users.
+    pub fn creators(mut self, creators: Vec<String>) -> Self {
+        self.creators = creators;
+        self
+    }
+
+    /// Match requests one of these users interacted with.
+    pub fn who(mut self, who: Vec<String>) -> Self {
+        self.who = who;
+        self
+    }
+
+    /// Match requests in one of these states. An empty list means no
+    /// state filter at all.
+    pub fn states(mut self, states: Vec<RequestState>) -> Self {
+        self.states = Some(states);
+        self
+    }
+
+    /// Match requests with an action of one of these types.
+    pub fn types(mut self, types: Vec<String>) -> Self {
+        self.types = types;
+        self
+    }
+
+    /// Exclude requests targeting one of these projects.
+    pub fn exclude_target_projects(mut self, exclude_target_projects: Vec<String>) -> Self {
+        self.exclude_target_projects = exclude_target_projects;
+        self
+    }
+
+    /// Include the creation entry and the request history in each
+    /// result.
+    pub fn with_history(mut self, with_history: bool) -> Self {
+        self.with_history = with_history;
+        self
+    }
+
+    /// Include all history elements in each result.
+    pub fn with_full_history(mut self, with_full_history: bool) -> Self {
+        self.with_full_history = with_full_history;
+        self
+    }
+
+    /// Whether the search asks for the request history.
+    pub fn wants_history(&self) -> bool {
+        self.with_history
+    }
+
+    /// Whether the search asks for the full history.
+    pub fn wants_full_history(&self) -> bool {
+        self.with_full_history
+    }
+
+    /// Build the `match=` expression for this search. Every value is
+    /// validated first: project and package names must be valid OBS
+    /// names, user names must be non-empty and quote-free, and action
+    /// types must be ones the server renders. A value that would
+    /// break out of its XPath string literal is refused, because
+    /// XPath has no string escape and a quote in a value would
+    /// rewrite the query. A search with no filter at all — no
+    /// clause, not even a state — is refused too: the server answers
+    /// an empty `match=` with 400 (`empty_match`), so there is no
+    /// unfiltered search.
+    pub fn match_expr(&self) -> Result<String, GeectlError> {
+        for (label, values) in [
+            ("project", &self.projects),
+            ("package", &self.packages),
+            ("source project", &self.source_projects),
+            ("source package", &self.source_packages),
+            ("target project", &self.target_projects),
+            ("target package", &self.target_packages),
+            ("excluded target project", &self.exclude_target_projects),
+        ] {
+            for value in values {
+                if !valid_obs_name(value) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid OBS {label} name: {value:?}"),
+                    ));
+                }
+            }
+        }
+        for (label, values) in [("creator", &self.creators), ("user", &self.who)] {
+            for value in values {
+                validate_xpath_value(label, value)?;
+            }
+        }
+        for action_type in &self.types {
+            if !KNOWN_ACTION_TYPES.contains(&action_type.as_str()) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "unknown request action type: {action_type:?} (known: {})",
+                        KNOWN_ACTION_TYPES.join(", ")
+                    ),
+                ));
+            }
+        }
+        let mut clauses: Vec<XpathQuery> = Vec::new();
+        if !self.request_ids.is_empty() {
+            let ids: Vec<String> = self.request_ids.iter().map(|id| id.to_string()).collect();
+            clauses.push(XpathQuery::eq_list("@id", &ids));
+        }
+        if !self.projects.is_empty() {
+            clauses.push(XpathQuery::Or(
+                Box::new(XpathQuery::Pred(
+                    "source".to_string(),
+                    Box::new(XpathQuery::eq_list("@project", &self.projects)),
+                )),
+                Box::new(XpathQuery::Pred(
+                    "target".to_string(),
+                    Box::new(XpathQuery::eq_list("@project", &self.projects)),
+                )),
+            ));
+        }
+        if !self.packages.is_empty() {
+            clauses.push(XpathQuery::Or(
+                Box::new(XpathQuery::Pred(
+                    "source".to_string(),
+                    Box::new(XpathQuery::eq_list("@package", &self.packages)),
+                )),
+                Box::new(XpathQuery::Pred(
+                    "target".to_string(),
+                    Box::new(XpathQuery::eq_list("@package", &self.packages)),
+                )),
+            ));
+        }
+        if !self.source_projects.is_empty() {
+            clauses.push(XpathQuery::Pred(
+                "source".to_string(),
+                Box::new(XpathQuery::eq_list("@project", &self.source_projects)),
+            ));
+        }
+        if !self.source_packages.is_empty() {
+            clauses.push(XpathQuery::Pred(
+                "source".to_string(),
+                Box::new(XpathQuery::eq_list("@package", &self.source_packages)),
+            ));
+        }
+        if !self.target_projects.is_empty() {
+            clauses.push(XpathQuery::Pred(
+                "target".to_string(),
+                Box::new(XpathQuery::eq_list("@project", &self.target_projects)),
+            ));
+        }
+        if !self.target_packages.is_empty() {
+            clauses.push(XpathQuery::Pred(
+                "target".to_string(),
+                Box::new(XpathQuery::eq_list("@package", &self.target_packages)),
+            ));
+        }
+        if !self.creators.is_empty() {
+            clauses.push(XpathQuery::eq_list("@creator", &self.creators));
+        }
+        if !self.who.is_empty() {
+            clauses.push(XpathQuery::Or(
+                Box::new(XpathQuery::Pred(
+                    "state".to_string(),
+                    Box::new(XpathQuery::eq_list("@who", &self.who)),
+                )),
+                Box::new(XpathQuery::Pred(
+                    "history".to_string(),
+                    Box::new(XpathQuery::eq_list("@who", &self.who)),
+                )),
+            ));
+        }
+        let states = match &self.states {
+            Some(states) => states.clone(),
+            None => vec![
+                RequestState::New,
+                RequestState::Review,
+                RequestState::Declined,
+            ],
+        };
+        if !states.is_empty() {
+            let values: Vec<String> = states
+                .iter()
+                .map(|state| state.as_str().to_string())
+                .collect();
+            clauses.push(XpathQuery::Pred(
+                "state".to_string(),
+                Box::new(XpathQuery::eq_list("@name", &values)),
+            ));
+        }
+        if !self.types.is_empty() {
+            clauses.push(XpathQuery::Pred(
+                "action".to_string(),
+                Box::new(XpathQuery::eq_list("@type", &self.types)),
+            ));
+        }
+        for project in &self.exclude_target_projects {
+            // `target[not(@project='X')]`: no target of the request
+            // is project X. The outer form `not(target[@project='X'])`
+            // is refused by the server with 400 — verified live
+            // against the production API — so this predicate form is
+            // the only one the dialect accepts. One caveat: the
+            // server evaluates the match per joined action row, so a
+            // multi-action request targeting both X and another
+            // project still matches via the other row, and a request
+            // with no target at all is not excluded. The form is
+            // exact for the overwhelmingly common single-action case.
+            clauses.push(XpathQuery::Pred(
+                "target".to_string(),
+                Box::new(XpathQuery::Not(Box::new(XpathQuery::Eq(
+                    "@project".to_string(),
+                    project.clone(),
+                )))),
+            ));
+        }
+        if clauses.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a request search needs at least one filter; the server refuses an empty match",
+            ));
+        }
+        Ok(XpathQuery::and_all(clauses).to_string())
+    }
+}
+
+/// Validate a value that goes into a single-quoted XPath string
+/// literal: it must be non-empty, and it must not contain a single
+/// quote, which would break out of the literal (XPath has no string
+/// escape).
+fn validate_xpath_value(label: &str, value: &str) -> Result<(), GeectlError> {
+    if value.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("an XPath {label} value must not be empty"),
+        ));
+    }
+    if value.contains('\'') {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("an XPath {label} value must not contain a single quote: {value:?}"),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6222,9 +6686,9 @@ mod tests {
 
     #[test]
     fn has_open_sr_ignores_non_submit_requests() {
-        // The search match cannot filter by action type (the engine
-        // 400s on it), so a delete request targeting the package
-        // must not read as an open submit request.
+        // The search match does not filter by action type (the
+        // filter lives client-side), so a delete request targeting
+        // the package must not read as an open submit request.
         let http_for_url = FakeHttp::new();
         let client = ObsClient::with_credentials(&http_for_url, basic_credentials()).unwrap();
         let url = client.search_url("foo").unwrap();
@@ -9937,5 +10401,384 @@ description</description>
             target.describe(),
             "user Admin, group reviewers, project openSUSE:Factory"
         );
+    }
+
+    // -- XPath query construction (adopted from the `match=` string
+    // forms: noop, not, eq, not-eq, contains, and/or with the
+    // parenthesisation rules, eq lists, and element predicates).
+
+    #[test]
+    fn xpath_noop_renders_a_bare_comparison() {
+        let query = XpathQuery::Eq("@name".to_string(), "foo".to_string());
+        assert_eq!(query.to_string(), "@name='foo'");
+    }
+
+    #[test]
+    fn xpath_not_wraps_a_comparison() {
+        let query = XpathQuery::Not(Box::new(XpathQuery::Eq(
+            "@name".to_string(),
+            "foo".to_string(),
+        )));
+        assert_eq!(query.to_string(), "not(@name='foo')");
+    }
+
+    #[test]
+    fn xpath_contains_renders_a_contains_call() {
+        let query = XpathQuery::Contains("@name".to_string(), "foo".to_string());
+        assert_eq!(query.to_string(), "contains(@name, 'foo')");
+    }
+
+    #[test]
+    fn xpath_and_chains_flat() {
+        let query = XpathQuery::and_all(vec![
+            XpathQuery::Eq("@name".to_string(), "foo".to_string()),
+            XpathQuery::Eq("@name".to_string(), "bar".to_string()),
+        ]);
+        assert_eq!(query.to_string(), "@name='foo' and @name='bar'");
+        let query = XpathQuery::and_all(vec![
+            XpathQuery::Eq("@name".to_string(), "foo".to_string()),
+            XpathQuery::Eq("@name".to_string(), "bar".to_string()),
+            XpathQuery::Eq("@name".to_string(), "baz".to_string()),
+        ]);
+        assert_eq!(
+            query.to_string(),
+            "@name='foo' and @name='bar' and @name='baz'"
+        );
+    }
+
+    #[test]
+    fn xpath_or_chains_flat() {
+        let query = XpathQuery::or_all(vec![
+            XpathQuery::Eq("@name".to_string(), "foo".to_string()),
+            XpathQuery::Eq("@name".to_string(), "bar".to_string()),
+        ]);
+        assert_eq!(query.to_string(), "@name='foo' or @name='bar'");
+        let query = XpathQuery::or_all(vec![
+            XpathQuery::Eq("@name".to_string(), "foo".to_string()),
+            XpathQuery::Eq("@name".to_string(), "bar".to_string()),
+            XpathQuery::Eq("@name".to_string(), "baz".to_string()),
+        ]);
+        assert_eq!(
+            query.to_string(),
+            "@name='foo' or @name='bar' or @name='baz'"
+        );
+    }
+
+    #[test]
+    fn xpath_and_or_parenthesises_the_and_side() {
+        let and = XpathQuery::and_all(vec![
+            XpathQuery::Eq("@name".to_string(), "foo".to_string()),
+            XpathQuery::Eq("@name".to_string(), "bar".to_string()),
+        ]);
+        let query = XpathQuery::or_all(vec![
+            and,
+            XpathQuery::Eq("@name".to_string(), "baz".to_string()),
+        ]);
+        assert_eq!(
+            query.to_string(),
+            "(@name='foo' and @name='bar') or @name='baz'"
+        );
+        let query = XpathQuery::or_all(vec![
+            query,
+            XpathQuery::Eq("@name".to_string(), "xyz".to_string()),
+        ]);
+        assert_eq!(
+            query.to_string(),
+            "(@name='foo' and @name='bar') or @name='baz' or @name='xyz'"
+        );
+    }
+
+    #[test]
+    fn xpath_or_and_parenthesises_the_or_side() {
+        let or = XpathQuery::or_all(vec![
+            XpathQuery::Eq("@name".to_string(), "foo".to_string()),
+            XpathQuery::Eq("@name".to_string(), "bar".to_string()),
+        ]);
+        let query = XpathQuery::and_all(vec![
+            or,
+            XpathQuery::Eq("@name".to_string(), "baz".to_string()),
+        ]);
+        assert_eq!(
+            query.to_string(),
+            "(@name='foo' or @name='bar') and @name='baz'"
+        );
+        let query = XpathQuery::and_all(vec![
+            query,
+            XpathQuery::Eq("@name".to_string(), "xyz".to_string()),
+        ]);
+        assert_eq!(
+            query.to_string(),
+            "(@name='foo' or @name='bar') and @name='baz' and @name='xyz'"
+        );
+    }
+
+    #[test]
+    fn xpath_and_or_and_parenthesises_both_and_sides() {
+        let left = XpathQuery::and_all(vec![
+            XpathQuery::Eq("@name".to_string(), "foo".to_string()),
+            XpathQuery::Eq("@name".to_string(), "bar".to_string()),
+        ]);
+        let right = XpathQuery::and_all(vec![
+            XpathQuery::Eq("@name".to_string(), "baz".to_string()),
+            XpathQuery::Eq("@name".to_string(), "xyz".to_string()),
+        ]);
+        let query = XpathQuery::Or(Box::new(left), Box::new(right));
+        assert_eq!(
+            query.to_string(),
+            "(@name='foo' and @name='bar') or (@name='baz' and @name='xyz')"
+        );
+    }
+
+    #[test]
+    fn xpath_or_and_or_parenthesises_both_or_sides() {
+        let left = XpathQuery::or_all(vec![
+            XpathQuery::Eq("@name".to_string(), "foo".to_string()),
+            XpathQuery::Eq("@name".to_string(), "bar".to_string()),
+        ]);
+        let right = XpathQuery::or_all(vec![
+            XpathQuery::Eq("@name".to_string(), "baz".to_string()),
+            XpathQuery::Eq("@name".to_string(), "xyz".to_string()),
+        ]);
+        let query = XpathQuery::And(Box::new(left), Box::new(right));
+        assert_eq!(
+            query.to_string(),
+            "(@name='foo' or @name='bar') and (@name='baz' or @name='xyz')"
+        );
+    }
+
+    #[test]
+    fn xpath_multiple_terms_and_join() {
+        let query = XpathQuery::and_all(vec![
+            XpathQuery::Eq("@name1".to_string(), "foo".to_string()),
+            XpathQuery::Eq("@name2".to_string(), "bar".to_string()),
+        ]);
+        assert_eq!(query.to_string(), "@name1='foo' and @name2='bar'");
+    }
+
+    #[test]
+    fn xpath_eq_list_or_joins_values() {
+        let query = XpathQuery::eq_list(
+            "@name",
+            &["foo".to_string(), "bar".to_string(), "baz".to_string()],
+        );
+        assert_eq!(
+            query.to_string(),
+            "@name='foo' or @name='bar' or @name='baz'"
+        );
+    }
+
+    #[test]
+    fn xpath_not_eq_list_and_joins_nots() {
+        let query = XpathQuery::and_all(
+            ["foo", "bar", "baz"]
+                .iter()
+                .map(|value| {
+                    XpathQuery::Not(Box::new(XpathQuery::Eq(
+                        "@name".to_string(),
+                        (*value).to_string(),
+                    )))
+                })
+                .collect(),
+        );
+        assert_eq!(
+            query.to_string(),
+            "not(@name='foo') and not(@name='bar') and not(@name='baz')"
+        );
+    }
+
+    #[test]
+    fn xpath_element_predicate_scopes_its_inner_query() {
+        let query = XpathQuery::Pred(
+            "state".to_string(),
+            Box::new(XpathQuery::Eq("@name".to_string(), "new".to_string())),
+        );
+        assert_eq!(query.to_string(), "state[@name='new']");
+    }
+
+    #[test]
+    fn xpath_empty_renders_empty_and_is_skipped_by_and_all() {
+        assert_eq!(XpathQuery::Empty.to_string(), "");
+        let query = XpathQuery::and_all(vec![
+            XpathQuery::Empty,
+            XpathQuery::Eq("@name".to_string(), "foo".to_string()),
+        ]);
+        assert_eq!(query.to_string(), "@name='foo'");
+        assert_eq!(XpathQuery::and_all(vec![]), XpathQuery::Empty);
+    }
+
+    // -- Request search `match=` construction (adopted from the
+    // search rules: default states, ids, projects, packages, source
+    // / target, creators, who, states, types, exclusions, history).
+
+    fn search_without_states() -> RequestSearch {
+        RequestSearch::new().states(Vec::new())
+    }
+
+    #[test]
+    fn search_default_matches_the_open_states() {
+        assert_eq!(
+            RequestSearch::new().match_expr().unwrap(),
+            "state[@name='new' or @name='review' or @name='declined']"
+        );
+    }
+
+    #[test]
+    fn search_request_ids_or_join() {
+        let search = search_without_states().request_ids(vec![1, 2]);
+        assert_eq!(search.match_expr().unwrap(), "@id='1' or @id='2'");
+    }
+
+    #[test]
+    fn search_projects_match_source_or_target() {
+        let search = search_without_states().projects(vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "source[@project='foo' or @project='bar'] or target[@project='foo' or @project='bar']"
+        );
+    }
+
+    #[test]
+    fn search_packages_match_source_or_target() {
+        let search = search_without_states().packages(vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "source[@package='foo' or @package='bar'] or target[@package='foo' or @package='bar']"
+        );
+    }
+
+    #[test]
+    fn search_source_projects_match_source_only() {
+        let search =
+            search_without_states().source_projects(vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "source[@project='foo' or @project='bar']"
+        );
+    }
+
+    #[test]
+    fn search_source_packages_use_the_singular_attribute() {
+        // The search engine's whitelist has `source/@package` and
+        // no plural form; the plural is refused by the server.
+        let search =
+            search_without_states().source_packages(vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "source[@package='foo' or @package='bar']"
+        );
+    }
+
+    #[test]
+    fn search_target_projects_match_target_only() {
+        let search =
+            search_without_states().target_projects(vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "target[@project='foo' or @project='bar']"
+        );
+    }
+
+    #[test]
+    fn search_target_packages_use_the_singular_attribute() {
+        // As for source packages: the whitelist has
+        // `target/@package`, singular; the plural is refused.
+        let search =
+            search_without_states().target_packages(vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "target[@package='foo' or @package='bar']"
+        );
+    }
+
+    #[test]
+    fn search_creators_or_join() {
+        let search = search_without_states().creators(vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "@creator='foo' or @creator='bar'"
+        );
+    }
+
+    #[test]
+    fn search_who_matches_state_or_history() {
+        let search = search_without_states().who(vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "state[@who='foo' or @who='bar'] or history[@who='foo' or @who='bar']"
+        );
+    }
+
+    #[test]
+    fn search_states_match_the_given_states() {
+        let search = RequestSearch::new().states(vec![RequestState::New, RequestState::Review]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "state[@name='new' or @name='review']"
+        );
+    }
+
+    #[test]
+    fn search_types_match_action_types() {
+        let search =
+            search_without_states().types(vec!["submit".to_string(), "delete".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "action[@type='submit' or @type='delete']"
+        );
+    }
+
+    #[test]
+    fn search_exclude_target_projects_and_joins_nots() {
+        // `target[not(@project='X')]`: no target of the request is
+        // project X. The outer form `not(target[@project='X'])` is
+        // refused by the server with 400 (verified live against the
+        // production API), so this predicate form is the one emitted.
+        let search = search_without_states()
+            .exclude_target_projects(vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "target[not(@project='foo')] and target[not(@project='bar')]"
+        );
+    }
+
+    #[test]
+    fn search_with_no_filter_is_refused() {
+        // No clause at all — not even a state — is refused: the
+        // server answers an empty `match=` with 400 (`empty_match`).
+        let err = search_without_states().match_expr().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn search_combined_filters_parenthesise_the_or_clause() {
+        // An or-clause and-joined onto the states needs parens, or
+        // the `and` would bind tighter than the `or` and change the
+        // query's meaning.
+        let search = RequestSearch::new().projects(vec!["foo".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "(source[@project='foo'] or target[@project='foo']) and state[@name='new' or @name='review' or @name='declined']"
+        );
+    }
+
+    #[test]
+    fn search_rejects_an_invalid_project_name() {
+        let search = search_without_states().projects(vec!["foo' or '1'='1".to_string()]);
+        let err = search.match_expr().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn search_rejects_a_quoted_creator() {
+        let search = search_without_states().creators(vec!["o'brien".to_string()]);
+        let err = search.match_expr().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn search_rejects_an_unknown_action_type() {
+        let search = search_without_states().types(vec!["explode".to_string()]);
+        let err = search.match_expr().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 }
