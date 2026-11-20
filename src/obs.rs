@@ -1407,6 +1407,95 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// List the comments on submit request `id` (`GET
+    /// /comments/request/:id`): who said what, when, and which
+    /// comment each reply answers. The list covers the comments on
+    /// the request and the comments on its actions, in id order.
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. A request with no comments reads as an
+    /// empty list, not an error; a document the parser does not
+    /// recognise in full is a server error.
+    pub fn list_comments(&self, id: &str) -> Result<Vec<RequestComment>, GeectlError> {
+        let id = validate_request_id(id)?;
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot list a submit request's comments without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(&self.base, &["comments", "request", &id.to_string()], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_comments(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS comments response for submit request {id}"),
+            )
+        })
+    }
+
+    /// Comment on submit request `id` (`POST
+    /// /comments/request/:id`), with `parent_id` naming the comment
+    /// being replied to, when this is a reply. An agent comments to
+    /// discuss a request — asking a question, leaving a note for the
+    /// reviewer — without changing its state. The comment text
+    /// travels as the request body, as plain text; an empty comment
+    /// is refused, since a comment that says nothing is not a
+    /// comment. Requires credentials; without them the call fails
+    /// loudly before any request. Takes the caller's [`DryRun`]: in
+    /// dry-run the comment is recorded in the plan and nothing is
+    /// posted. Success is the `<status code="ok"/>` body: any other
+    /// body is a server error, never success.
+    pub fn add_comment(
+        &self,
+        id: &str,
+        body: &str,
+        parent_id: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        let id = validate_request_id(id)?;
+        // The parent is a comment id: the same positive-number shape
+        // as a request id, so the same check applies.
+        let parent = match parent_id {
+            Some(parent) => Some(validate_request_id(parent)?),
+            None => None,
+        };
+        if body.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a comment with no text says nothing; refusing an empty comment",
+            ));
+        }
+        if !dry_run.allow(&format!("comment on submit request {id}")) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot comment on a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let parent_string;
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(parent) = parent {
+            parent_string = parent.to_string();
+            query.push(("parent_id", &parent_string));
+        }
+        let url = build_url(
+            &self.base,
+            &["comments", "request", &id.to_string()],
+            &query,
+        );
+        let response = self.http.post_text(&url, body, &self.credentials)?;
+        if parse_status_ok(&response) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS comment response for submit request {id}"),
+            ))
+        }
+    }
+
     /// Delete `project`/`package` from OBS (`DELETE
     /// /source/<project>/<package>`): the manual branch cleanup.
     /// Requests filed through this library clean up on accept by
@@ -11491,6 +11580,172 @@ description</description>
         let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
         let err = obs
             .add_review("42", &target, "please review", &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    const COMMENTS_XML: &str = r#"<comments request="42">
+  <comment who="user1" when="2010-12-29T10:00:00" id="1">first comment</comment>
+  <comment who="user2" when="2010-12-29T11:00:00" id="2" parent="1">a reply</comment>
+</comments>"#;
+
+    // -- Comments: list and create.
+
+    #[test]
+    fn parse_comments_reads_comments_and_replies_in_order() {
+        let comments = parse_comments(COMMENTS_XML).expect("comments parse");
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, 1);
+        assert_eq!(comments[0].who, "user1");
+        assert_eq!(comments[0].when, "2010-12-29T10:00:00");
+        assert_eq!(comments[0].parent_id, None);
+        assert_eq!(comments[0].body, "first comment");
+        assert_eq!(comments[1].id, 2);
+        assert_eq!(comments[1].who, "user2");
+        assert_eq!(comments[1].parent_id, Some(1));
+        assert_eq!(comments[1].body, "a reply");
+    }
+
+    #[test]
+    fn parse_comments_empty_is_empty() {
+        assert_eq!(
+            parse_comments("<comments request=\"42\"></comments>"),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_comments("<comments request=\"42\" />"),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn parse_comments_rejects_a_malformed_document() {
+        assert_eq!(parse_comments("not xml at all"), None);
+        assert_eq!(
+            parse_comments("<comments request=\"42\"><note>hi</note></comments>"),
+            None
+        );
+        assert_eq!(
+            parse_comments(
+                "<comments request=\"42\"><comment who=\"user1\">no id</comment></comments>"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn list_comments_returns_the_parsed_comments() {
+        let http =
+            FakeHttp::new().with_get("https://api.opensuse.org/comments/request/42", COMMENTS_XML);
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let comments = obs.list_comments("42").expect("comments list");
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[1].parent_id, Some(1));
+        let calls = http.get_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "https://api.opensuse.org/comments/request/42");
+        assert!(calls[0].1, "the list is credentialed");
+    }
+
+    #[test]
+    fn list_comments_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let err = obs.list_comments("42").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn list_comments_unexpected_response_is_error() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/comments/request/42",
+            "not comments at all",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = obs.list_comments("42").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn add_comment_posts_the_comment_as_plain_text() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/comments/request/42",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        obs.add_comment("42", "looks good to me", None, &dry)
+            .expect("comment posts");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "https://api.opensuse.org/comments/request/42");
+        assert_eq!(calls[0].1, "looks good to me");
+        assert!(calls[0].2, "the comment is credentialed");
+    }
+
+    #[test]
+    fn add_comment_reply_names_its_parent() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/comments/request/42?parent_id=1",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        obs.add_comment("42", "agreed", Some("1"), &dry)
+            .expect("reply posts");
+        assert_eq!(
+            http.post_calls()[0].0,
+            "https://api.opensuse.org/comments/request/42?parent_id=1"
+        );
+    }
+
+    #[test]
+    fn add_comment_refuses_an_empty_body() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let err = obs.add_comment("42", "", None, &dry).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_comment_dry_run_records_the_plan_and_posts_nothing() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        obs.add_comment("42", "looks good to me", None, &dry)
+            .expect("dry-run comment records");
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: comment on submit request 42".to_string()]
+        );
+    }
+
+    #[test]
+    fn add_comment_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let dry = DryRun::new(false);
+        let err = obs
+            .add_comment("42", "looks good to me", None, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_comment_unexpected_response_is_error() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/comments/request/42",
+            "<status code=\"not_found\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let err = obs
+            .add_comment("42", "looks good to me", None, &dry)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
