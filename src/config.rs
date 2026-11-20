@@ -259,15 +259,51 @@ pub fn load_config() -> Result<Config, GeectlError> {
 }
 
 /// Load the config file at `path` (a missing file is an empty config).
+/// The largest config file accepted (64 KiB, the same cap as secret
+/// files). A config is two URL lines; anything larger is a
+/// misconfiguration, not a config.
+pub const MAX_CONFIG_FILE_BYTES: usize = 64 * 1024;
+
 pub fn load_config_at(path: &Path) -> Result<Config, GeectlError> {
-    match fs::read_to_string(path) {
-        Ok(text) => parse_config(&text, path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(e) => Err(GeectlError::new(
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("{}: cannot read config: {e}", path.display()),
+            ));
+        }
+    };
+    // Read at most MAX + 1 bytes, so a file that grows while being
+    // read is still capped.
+    let mut bytes = Vec::new();
+    if let Err(e) = file
+        .take((MAX_CONFIG_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+    {
+        return Err(GeectlError::new(
             ErrorKind::ConfigError,
             format!("{}: cannot read config: {e}", path.display()),
-        )),
+        ));
     }
+    if bytes.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "{}: config exceeds {MAX_CONFIG_FILE_BYTES} bytes",
+                path.display()
+            ),
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{}: config is not valid UTF-8", path.display()),
+        )
+    })?;
+    parse_config(&text, path)
 }
 
 /// The (1-based) line and column of a byte offset in `text`, for
@@ -909,6 +945,16 @@ mod tests {
             Some("https://src.opensuse.org")
         );
         assert_eq!(config.obs_url, None);
+    }
+
+    #[test]
+    fn load_config_at_rejects_an_oversize_file() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        secure_write(&path, &vec![b'x'; MAX_CONFIG_FILE_BYTES + 1]).unwrap();
+        let err = load_config_at(&path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("exceeds"), "{}", err.context);
     }
 
     #[test]
