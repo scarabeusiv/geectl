@@ -110,6 +110,43 @@ fn element_name(entry: &str) -> Option<&str> {
     Some(&after_open[..end])
 }
 
+/// Find attribute `name` in a tag's text (an open tag without its
+/// closing `>`, or a whole element's open tag): the attribute value
+/// with its quotes stripped, unescaped. The name must match exactly
+/// and be preceded by whitespace, so `project=` does not match
+/// `target_project=`. None when the attribute is absent or malformed.
+fn find_attr(tag: &str, name: &str) -> Option<String> {
+    let mut rest = tag;
+    let needle = format!("{name}=");
+    while let Some(pos) = rest.find(&needle) {
+        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
+            rest = &rest[pos + needle.len()..];
+            continue;
+        }
+        let after_eq = &rest[pos + needle.len()..];
+        let quote = after_eq.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let close = after_eq[1..].find(quote)?;
+        return Some(xml_unescape(&after_eq[1..1 + close]));
+    }
+    None
+}
+
+/// Unescape the five standard XML entities in an attribute value.
+/// Anything else (including numeric references) is left as-is: the
+/// values geectl reads are OBS names and revisions, which never
+/// carry them. `&amp;` is unescaped last, so `&amp;lt;` reads as
+/// `&lt;`, not `<`.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 /// Escape text for an XML attribute value.
 fn xml_escape_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -304,6 +341,12 @@ impl XmlDoc {
             pos += char_len_at(xml, pos);
         }
         Err(malformed())
+    }
+
+    /// The value of attribute `name` on the root element, or None
+    /// when it is absent.
+    pub(crate) fn root_attr(&self, name: &str) -> Option<String> {
+        find_attr(&self.root_open, name)
     }
 
     /// Set attribute `name` on the root element to `value`, replacing
@@ -529,6 +572,15 @@ mod tests {
     fn parse_skips_a_prolog() {
         let doc = XmlDoc::parse("<?xml version=\"1.0\"?><package name=\"p\"/>").unwrap();
         assert_eq!(doc.render(), "<package name=\"p\"/>");
+    }
+
+    #[test]
+    fn xml_unescape_replaces_ampersand_last() {
+        // `&amp;lt;` is an escaped `&lt;`, not a `<`: unescaping
+        // `&amp;` first would read it as a literal `<`.
+        assert_eq!(xml_unescape("&amp;lt;"), "&lt;");
+        assert_eq!(xml_unescape("&lt;"), "<");
+        assert_eq!(xml_unescape("&amp;"), "&");
     }
 
     #[test]

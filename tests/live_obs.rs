@@ -68,10 +68,9 @@ use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::{
-    BranchOptions, CopyOptions, CopyProjectOptions, DryRun, FilePatchStatus,
-    HistoryEntry, ObsClient, PackageDiffStatus, Request, RequestAction, RequestSearch,
-    RequestState, ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling,
-    SrPayload,
+    BranchOptions, CopyOptions, CopyProjectOptions, DryRun, FilePatchStatus, HistoryEntry,
+    LinkOptions, ObsClient, PackageDiffStatus, Request, RequestAction, RequestSearch,
+    RequestState, ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling, SrPayload,
 };
 
 /// Whether `url` points at a loopback host.
@@ -406,6 +405,15 @@ fn xml_attr_after(body: &str, marker: &str, attr: &str) -> Option<String> {
     let after = body.split_once(marker)?.1;
     let needle = format!("{attr}=\"");
     let value = after.split_once(&needle)?.1;
+    Some(value.split('"').next()?.to_string())
+}
+
+/// The value of attribute `attr` anywhere in `body` (first
+/// occurrence). Used for link attributes, which are not tied to one
+/// element the tests can name.
+fn xml_attr(body: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let value = body.split_once(&needle)?.1;
     Some(value.split('"').next()?.to_string())
 }
 
@@ -1963,22 +1971,22 @@ fn live_copy_project_with_no_delay() {
 }
 
 #[test]
-fn temporal_set_devel_project_sets_devel() {
-    let Some(base) = temporal_url() else {
+fn live_set_devel_project_sets_devel() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let package = temporal_package();
+    let client = live_client_authed(&base);
+    let package = live_package();
     let factory = create_source_branch(&client, &package);
     let devel = format!("geectl-tmp-devel-{}", unique_suffix());
     client
         .create_project(
             &devel,
-            "geectl temporal test devel",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test devel",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create devel project on the temporal instance");
+        .expect("create devel project on the live instance");
     // The server refuses a devel whose package does not exist in
     // the devel project, so the devel package is created there
     // first.
@@ -1986,14 +1994,14 @@ fn temporal_set_devel_project_sets_devel() {
         .create_package(
             &devel,
             &package,
-            "geectl temporal test devel package",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test devel package",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create devel package on the temporal instance");
+        .expect("create devel package on the live instance");
     client
         .set_devel_project(&factory, &package, Some(&devel), None, &DryRun::new(false))
-        .expect("set the devel project on the temporal instance");
+        .expect("set the devel project on the live instance");
     let meta = read_meta(&base, &factory, &package);
     // The server records the devel with the package attribute too
     // (defaulting to the same package name), so match the project
@@ -2006,22 +2014,22 @@ fn temporal_set_devel_project_sets_devel() {
 }
 
 #[test]
-fn temporal_set_devel_project_cross_package() {
-    let Some(base) = temporal_url() else {
+fn live_set_devel_project_cross_package() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let package = temporal_package();
+    let client = live_client_authed(&base);
+    let package = live_package();
     let factory = create_source_branch(&client, &package);
     let devel = format!("geectl-tmp-devel-{}", unique_suffix());
     client
         .create_project(
             &devel,
-            "geectl temporal test devel",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test devel",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create devel project on the temporal instance");
+        .expect("create devel project on the live instance");
     // A cross-package mapping: this package's devel is another
     // package in the devel project.
     let devel_package = format!("{package}-devel");
@@ -2032,11 +2040,11 @@ fn temporal_set_devel_project_cross_package() {
         .create_package(
             &devel,
             &devel_package,
-            "geectl temporal test devel package",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test devel package",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create devel package on the temporal instance");
+        .expect("create devel package on the live instance");
     client
         .set_devel_project(
             &factory,
@@ -2045,7 +2053,7 @@ fn temporal_set_devel_project_cross_package() {
             Some(&devel_package),
             &DryRun::new(false),
         )
-        .expect("set the cross-package devel on the temporal instance");
+        .expect("set the cross-package devel on the live instance");
     let meta = read_meta(&base, &factory, &package);
     assert!(
         meta.contains(&format!(
@@ -2056,22 +2064,22 @@ fn temporal_set_devel_project_cross_package() {
 }
 
 #[test]
-fn temporal_set_devel_project_unset() {
-    let Some(base) = temporal_url() else {
+fn live_set_devel_project_unset() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let package = temporal_package();
+    let client = live_client_authed(&base);
+    let package = live_package();
     let factory = create_source_branch(&client, &package);
     let devel = format!("geectl-tmp-devel-{}", unique_suffix());
     client
         .create_project(
             &devel,
-            "geectl temporal test devel",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test devel",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create devel project on the temporal instance");
+        .expect("create devel project on the live instance");
     // The server refuses a devel whose package does not exist in
     // the devel project, so the devel package is created there
     // first.
@@ -2079,21 +2087,207 @@ fn temporal_set_devel_project_unset() {
         .create_package(
             &devel,
             &package,
-            "geectl temporal test devel package",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test devel package",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create devel package on the temporal instance");
+        .expect("create devel package on the live instance");
     client
         .set_devel_project(&factory, &package, Some(&devel), None, &DryRun::new(false))
-        .expect("set the devel project on the temporal instance");
+        .expect("set the devel project on the live instance");
     client
         .set_devel_project(&factory, &package, None, None, &DryRun::new(false))
-        .expect("unset the devel project on the temporal instance");
+        .expect("unset the devel project on the live instance");
     let meta = read_meta(&base, &factory, &package);
     assert!(
         !meta.contains("<devel"),
         "the meta must carry no devel element after unsetting; meta: {meta}"
+    );
+}
+
+/// PUT a package `_meta` carrying a `<lock><enable/></lock>`, so the
+/// package is locked. The harness writes the meta directly (test
+/// setup, like `set_package_devel`); the library operation under test
+/// is `link_package`, which must not carry the lock into the target.
+fn set_package_lock(base: &str, project: &str, package: &str) {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let meta = format!(
+        "<package name=\"{package}\" project=\"{project}\"><title>geectl live test package</title><description>Created by the geectl live live test; the instance is destroyed after the run.</description><lock><enable/></lock></package>"
+    );
+    http.put(
+        &format!("{base}/source/{project}/{package}/_meta"),
+        &meta,
+        &live_credentials(),
+    )
+    .expect("PUT the package meta with a lock");
+}
+
+#[test]
+fn live_link_package_creates_link() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, target_project, package) = setup_branch(&client);
+    client
+        .link_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &LinkOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("link a package on the live instance");
+    let link = read_link(&base, &target_project, &package);
+    assert_eq!(
+        xml_attr(&link, "project").as_deref(),
+        Some(source_project.as_str()),
+        "the link must point at the source project; link: {link}"
+    );
+    assert_eq!(
+        xml_attr(&link, "package").as_deref(),
+        Some(package.as_str()),
+        "the link must point at the source package; link: {link}"
+    );
+    // The target meta exists and carries the source's title: the
+    // link was built from the source meta.
+    let meta = read_meta(&base, &target_project, &package);
+    assert!(
+        meta.contains("<title>geectl live test package</title>"),
+        "the target meta must carry the source title; meta: {meta}"
+    );
+}
+
+#[test]
+fn live_link_package_disable_build() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, target_project, package) = setup_branch(&client);
+    let options = LinkOptions {
+        disable_build: true,
+        ..LinkOptions::default()
+    };
+    client
+        .link_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &options,
+            &DryRun::new(false),
+        )
+        .expect("link a package with build disabled on the live instance");
+    let meta = read_meta(&base, &target_project, &package);
+    // The server pretty-prints the meta, so the elements are
+    // whitespace-separated; compare with the whitespace removed.
+    let flat: String = meta.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("<build><disable/></build>"),
+        "the target meta must disable building; meta: {meta}"
+    );
+}
+
+#[test]
+fn live_link_package_disable_publish() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, target_project, package) = setup_branch(&client);
+    let options = LinkOptions {
+        disable_publish: true,
+        ..LinkOptions::default()
+    };
+    client
+        .link_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &options,
+            &DryRun::new(false),
+        )
+        .expect("link a package with publishing disabled on the live instance");
+    let meta = read_meta(&base, &target_project, &package);
+    // The server pretty-prints the meta, so the elements are
+    // whitespace-separated; compare with the whitespace removed.
+    let flat: String = meta.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("<publish><disable/></publish>"),
+        "the target meta must disable publishing; meta: {meta}"
+    );
+}
+
+#[test]
+fn live_link_package_locked_source_not_inherited() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, target_project, package) = setup_branch(&client);
+    set_package_lock(&base, &source_project, &package);
+    client
+        .link_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &LinkOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("link a locked package on the live instance");
+    let meta = read_meta(&base, &target_project, &package);
+    assert!(
+        !meta.contains("<lock"),
+        "the target meta must not inherit the source lock; meta: {meta}"
+    );
+}
+
+#[test]
+fn live_link_package_project_link_target_takes_explicit_link() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let target_project = format!("geectl-tmp-link-{}", unique_suffix());
+    client
+        .create_project(
+            &target_project,
+            "geectl live test link target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create link target project on the live instance");
+    // The target project links at the source project, so the package
+    // is inherited there — the link must still be created explicitly.
+    set_project_link(&base, &target_project, &source_project);
+    client
+        .link_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &LinkOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("link a package into a project-linked target on the live instance");
+    let link = read_link(&base, &target_project, &package);
+    assert_eq!(
+        xml_attr(&link, "project").as_deref(),
+        Some(source_project.as_str()),
+        "the target must carry the explicit link; link: {link}"
+    );
+    assert_eq!(
+        xml_attr(&link, "package").as_deref(),
+        Some(package.as_str()),
+        "the link must point at the source package; link: {link}"
     );
 }
 

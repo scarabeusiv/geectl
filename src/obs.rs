@@ -859,6 +859,31 @@ pub struct CopyProjectOptions {
     pub no_delay: bool,
 }
 
+/// Options for [`ObsClient::link_package`]. All fields are optional:
+/// an unset revision means no pin, an unset flag means off.
+#[derive(Debug, Clone, Default)]
+pub struct LinkOptions {
+    /// Replace an existing link in the target package. Without it,
+    /// linking onto a package that already has a link is refused.
+    pub force: bool,
+    /// Pin the link at this source revision (a number or an md5).
+    /// The server's `rev` attribute on the link.
+    pub revision: Option<String>,
+    /// The link's vrev attribute.
+    pub vrev: Option<String>,
+    /// The link's cicount attribute.
+    pub cicount: Option<String>,
+    /// Allow the link to point at a package that does not exist yet.
+    /// The server's `missingok` attribute on the link.
+    pub missing_target: bool,
+    /// Disable building the target package. The server's
+    /// `<build><disable/></build>` in the target meta.
+    pub disable_build: bool,
+    /// Disable publishing the target package. The server's
+    /// `<publish><disable/></publish>` in the target meta.
+    pub disable_publish: bool,
+}
+
 impl<'a> ObsClient<'a> {
     /// A client for the production OBS API, with no credentials
     /// (public reads only).
@@ -3273,6 +3298,202 @@ impl<'a> ObsClient<'a> {
             ))
         }
     }
+
+    /// Link package `source_package` in project `source_project`
+    /// into `target_package` in project `target_project` on OBS: the
+    /// target package becomes a link at the source (a `PUT` of its
+    /// `_meta` and its `_link`). Requires credentials; without them
+    /// the call fails loudly before any request. In dry-run the link
+    /// is recorded in the plan and nothing is linked — the guard runs
+    /// before the credentials check, like `create_package`.
+    ///
+    /// An agent links a package when it wants the target to track the
+    /// source (the link expands to the source's files on read) without
+    /// copying the content: a devel package linked into a test
+    /// project, a package linked under another name. The target meta
+    /// is built from the source meta when the target does not exist
+    /// yet (with the devel, person, group, lock, release name,
+    /// and scmsync entries stripped — a link never inherits those),
+    /// and edited in place when it does — the target keeps its own
+    /// scmsync there, so linking onto a git-backed package does not
+    /// drop its sync config. The `_link` always names
+    /// the source package explicitly, with the project attribute
+    /// omitted when the link stays in the same project.
+    ///
+    /// The meta is PUT back only when the edit changes it, and the
+    /// link is refused when the target already has one unless `force`
+    /// is set — the refusal happens before anything is written, so a
+    /// refused link leaves no half-done meta behind. A target package
+    /// that only exists through a project link does not count as
+    /// having a link: the shadowed meta's project differs from the
+    /// target project, so the link is created explicitly (and the
+    /// meta is built from the source, not from the shadow).
+    ///
+    /// Success is the `<status code="ok"/>` body on the meta PUT and
+    /// the backend's `<revision>` document on the `_link` PUT; any
+    /// other body is a server error, never success. A missing source
+    /// package reads as `NotFound` from the source meta GET, before
+    /// anything is written.
+    pub fn link_package(
+        &self,
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+        options: &LinkOptions,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [
+            ("project", source_project),
+            ("package", source_package),
+            ("project", target_project),
+            ("package", target_package),
+        ] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        // The dry-run guard: in dry-run the link is recorded in the
+        // plan and nothing is linked — not even the credentials check
+        // runs.
+        if !dry_run.allow(&format!(
+            "link package {source_project}/{source_package} to {target_project}/{target_package}{}",
+            link_option_suffix(options),
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot link a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let source_url = build_url(
+            &self.base,
+            &["source", source_project, source_package, "_meta"],
+            &[],
+        );
+        let source_meta = self.http.get_with(&source_url, &self.credentials)?;
+        let target_url = build_url(
+            &self.base,
+            &["source", target_project, target_package, "_meta"],
+            &[],
+        );
+        let target_meta = match self.http.get_with(&target_url, &self.credentials) {
+            Ok(meta) => Some(meta),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+        // The target meta is built from the source meta when the
+        // target does not exist yet, or when the target only exists
+        // through a project link (its meta names another project):
+        // the shadow must not supply the target's meta.
+        let (mut doc, put_meta, target_exists_here) = match &target_meta {
+            Some(meta) => {
+                let doc = XmlDoc::parse(meta)?;
+                if doc.root_attr("project").as_deref() == Some(target_project) {
+                    (doc, false, true)
+                } else {
+                    (
+                        build_link_meta(&source_meta, target_project, target_package)?,
+                        true,
+                        false,
+                    )
+                }
+            }
+            None => (
+                build_link_meta(&source_meta, target_project, target_package)?,
+                true,
+                false,
+            ),
+        };
+        // A link never inherits the source's scmsync — but only the
+        // meta built from the source is stripped (build_link_meta
+        // already does that). On the edit-in-place path the target
+        // keeps its own sync config: dropping it would silently
+        // un-sync a git-backed package. The disable flags are applied
+        // to the target meta either way.
+        if put_meta {
+            doc.remove_elements("scmsync");
+        }
+        if options.disable_build {
+            doc.replace_or_insert_element("build", "<build><disable/></build>")?;
+        }
+        if options.disable_publish {
+            doc.replace_or_insert_element("publish", "<publish><disable/></publish>")?;
+        }
+        // Refuse an existing link before writing anything, unless
+        // forced — but only when the target package really lives in
+        // the target project (see above): a shadowed package has no
+        // explicit link to refuse.
+        if target_exists_here && !options.force {
+            let link_url = build_url(
+                &self.base,
+                &["source", target_project, target_package, "_link"],
+                &[],
+            );
+            match self.http.get_with(&link_url, &self.credentials) {
+                Ok(_) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "package {target_project}/{target_package} already has a link; pass force to replace it"
+                        ),
+                    ));
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        let rendered = doc.render();
+        if put_meta || target_meta.as_deref() != Some(rendered.as_str()) {
+            let body = self.http.put(&target_url, &rendered, &self.credentials)?;
+            if !parse_status_ok(&body) {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected OBS link meta response for package {target_project}/{target_package}"
+                    ),
+                ));
+            }
+        }
+        let mut link = String::from("<link");
+        if source_project != target_project {
+            link.push_str(&format!(" project=\"{}\"", xml_escape(source_project)));
+        }
+        link.push_str(&format!(" package=\"{}\"", xml_escape(source_package)));
+        if let Some(rev) = &options.revision {
+            link.push_str(&format!(" rev=\"{}\"", xml_escape(rev)));
+        }
+        if let Some(vrev) = &options.vrev {
+            link.push_str(&format!(" vrev=\"{}\"", xml_escape(vrev)));
+        }
+        if let Some(cicount) = &options.cicount {
+            link.push_str(&format!(" cicount=\"{}\"", xml_escape(cicount)));
+        }
+        if options.missing_target {
+            link.push_str(" missingok=\"1\"");
+        }
+        link.push_str("/>");
+        let link_url = build_url(
+            &self.base,
+            &["source", target_project, target_package, "_link"],
+            &[],
+        );
+        let body = self.http.put_file(&link_url, &link, &self.credentials)?;
+        match parse_revision(&body) {
+            Some(_) => Ok(()),
+            None => Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS link response for package {target_project}/{target_package}"
+                ),
+            )),
+        }
+    }
 }
 
 /// Extract the devel project from an OBS directory listing
@@ -3844,6 +4065,58 @@ fn copy_project_option_suffix(options: &CopyProjectOptions) -> String {
     }
     if options.no_delay {
         parts.push("no delay".to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// Build the target meta for a fresh link from the source meta: the
+/// source meta with the project and name set to the target, and the
+/// entries a link never inherits stripped (devel, person, group,
+/// lock, release name, scmsync). The title and description carry
+/// over; anything else in the source meta survives untouched.
+fn build_link_meta(
+    source_meta: &str,
+    target_project: &str,
+    target_package: &str,
+) -> Result<XmlDoc, GeectlError> {
+    let mut doc = XmlDoc::parse(source_meta)?;
+    doc.set_root_attr("project", target_project);
+    doc.set_root_attr("name", target_package);
+    for name in ["devel", "person", "group", "lock", "releasename", "scmsync"] {
+        doc.remove_elements(name);
+    }
+    Ok(doc)
+}
+
+/// The option suffix for a link plan line: the set options, in the
+/// order they appear in [`LinkOptions`], so a dry-run plan reads what
+/// the link would have done.
+fn link_option_suffix(options: &LinkOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if options.force {
+        parts.push("force".to_string());
+    }
+    if let Some(revision) = &options.revision {
+        parts.push(format!("revision {revision}"));
+    }
+    if let Some(vrev) = &options.vrev {
+        parts.push(format!("vrev {vrev}"));
+    }
+    if let Some(cicount) = &options.cicount {
+        parts.push(format!("cicount {cicount}"));
+    }
+    if options.missing_target {
+        parts.push("missing target".to_string());
+    }
+    if options.disable_build {
+        parts.push("disable build".to_string());
+    }
+    if options.disable_publish {
+        parts.push("disable publish".to_string());
     }
     if parts.is_empty() {
         String::new()
@@ -9774,6 +10047,501 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn link_package_creates_link_from_source_meta() {
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/><person userid=\"alice\" role=\"maintainer\"/><lock><enable/></lock><scmsync url=\"https://example.com#main\"/></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                "<status code=\"ok\" />",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                "<revision rev=\"1\" vrev=\"1\" srcmd5=\"abc\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &LinkOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        // The meta PUT comes first (built from the source meta, with
+        // the devel, person, lock, and scmsync entries stripped),
+        // then the _link PUT.
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 2);
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"test-pkgA\" project=\"test:target\"><title>Test</title><description>A test package</description></package>"
+        );
+        assert_eq!(
+            puts[1].1,
+            "<link project=\"test:factory\" package=\"test-pkgA\"/>"
+        );
+        assert!(puts[0].2 && puts[1].2);
+        assert_eq!(http.get_calls().len(), 2);
+    }
+
+    #[test]
+    fn link_package_existing_target_meta_is_edited() {
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let target_meta = "<package name=\"test-pkgA\" project=\"test:target\"><title>Target</title><description>Old</description><scmsync url=\"https://example.com#main\"/></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                target_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                "<status code=\"ok\" />",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                "<revision rev=\"1\" vrev=\"1\" srcmd5=\"abc\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = LinkOptions {
+            disable_build: true,
+            ..LinkOptions::default()
+        };
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 2);
+        // The target keeps its own scmsync and the build disable is
+        // added; the target's own title and description survive.
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"test-pkgA\" project=\"test:target\"><title>Target</title><description>Old</description><scmsync url=\"https://example.com#main\"/><build><disable/></build></package>"
+        );
+    }
+
+    #[test]
+    fn link_package_disable_publish_adds_publish_disable() {
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                "<status code=\"ok\" />",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                "<revision rev=\"1\" vrev=\"1\" srcmd5=\"abc\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = LinkOptions {
+            disable_publish: true,
+            ..LinkOptions::default()
+        };
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert!(http.put_calls()[0]
+            .1
+            .contains("<publish><disable/></publish>"));
+    }
+
+    #[test]
+    fn link_package_refuses_existing_link_without_force() {
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let target_meta = "<package name=\"test-pkgA\" project=\"test:target\"><title>Target</title><description>Old</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                target_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                "<link project=\"test:factory\" package=\"test-pkgA\"/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &LinkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The refusal happens before anything is written: no PUT at
+        // all, not even the meta.
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn link_package_force_overwrites_existing_link() {
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let target_meta = "<package name=\"test-pkgA\" project=\"test:target\"><title>Target</title><description>Old</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                target_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                "<link project=\"test:factory\" package=\"test-pkgA\"/>",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"def\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = LinkOptions {
+            force: true,
+            ..LinkOptions::default()
+        };
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        // No meta PUT (nothing changed there); the _link PUT happened.
+        assert_eq!(http.put_calls().len(), 1);
+        assert_eq!(
+            http.put_calls()[0].0,
+            "https://api.opensuse.org/source/test:target/test-pkgA/_link"
+        );
+    }
+
+    #[test]
+    fn link_package_same_project_omits_project_attr() {
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/test:factory/test-pkgB/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgB/_meta",
+                "<status code=\"ok\" />",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgB/_link",
+                "<revision rev=\"1\" vrev=\"1\" srcmd5=\"abc\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:factory",
+                "test-pkgB",
+                &LinkOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(http.put_calls()[1].1, "<link package=\"test-pkgA\"/>");
+    }
+
+    #[test]
+    fn link_package_project_link_shadowing_builds_from_source() {
+        // The target meta names another project: the package only
+        // exists through a project link, so the meta is built from
+        // the source (not from the shadow) and no _link check runs.
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let shadow_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Shadow</title><description>Shadowed</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                shadow_meta,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                "<status code=\"ok\" />",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                "<revision rev=\"1\" vrev=\"1\" srcmd5=\"abc\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &LinkOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        // Only the two meta GETs: no _link existence check for a
+        // shadowed package.
+        assert_eq!(http.get_calls().len(), 2);
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<package name=\"test-pkgA\" project=\"test:target\"><title>Test</title><description>A test package</description></package>"
+        );
+    }
+
+    #[test]
+    fn link_package_no_change_to_existing_meta_skips_put() {
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let target_meta = "<package name=\"test-pkgA\" project=\"test:target\"><title>Test</title><description>A test package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                target_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                "<revision rev=\"1\" vrev=\"1\" srcmd5=\"abc\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &LinkOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        // Only the _link PUT: the meta needed no change.
+        assert_eq!(http.put_calls().len(), 1);
+        assert_eq!(
+            http.put_calls()[0].0,
+            "https://api.opensuse.org/source/test:target/test-pkgA/_link"
+        );
+    }
+
+    #[test]
+    fn link_package_missing_source_is_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &LinkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn link_package_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+            "<package name=\"test-pkgA\" project=\"test:factory\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &LinkOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn link_package_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .link_package(
+                "test/factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &LinkOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn link_package_dry_run_records_plan_and_links_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &LinkOptions::default(),
+                &dry_run,
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: link package test:factory/test-pkgA to test:target/test-pkgA"
+                    .to_string()
+            ]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn link_package_dry_run_names_revision_vrev_and_cicount() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = LinkOptions {
+            revision: Some("abc123".to_string()),
+            vrev: Some("2".to_string()),
+            cicount: Some("3".to_string()),
+            ..LinkOptions::default()
+        };
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &options,
+                &dry_run,
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: link package test:factory/test-pkgA to test:target/test-pkgA (revision abc123, vrev 2, cicount 3)"
+                    .to_string()
+            ]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn link_package_with_revision_and_vrev_and_cicount() {
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                "<status code=\"ok\" />",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                "<revision rev=\"1\" vrev=\"1\" srcmd5=\"abc\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = LinkOptions {
+            revision: Some("abc123".to_string()),
+            vrev: Some("2".to_string()),
+            cicount: Some("3".to_string()),
+            missing_target: true,
+            ..LinkOptions::default()
+        };
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(
+            http.put_calls()[1].1,
+            "<link project=\"test:factory\" package=\"test-pkgA\" rev=\"abc123\" vrev=\"2\" cicount=\"3\" missingok=\"1\"/>"
+        );
     }
 
     #[test]
