@@ -67,7 +67,12 @@ if [ "${#GITEA_PORT}" -gt 5 ] || [ "$GITEA_PORT" -lt 1 ] || [ "$GITEA_PORT" -gt 
 fi
 BASE_URL="http://127.0.0.1:${GITEA_PORT}"
 GITEA_USER="${GITEA_USER:-geectl}"
-GITEA_PASSWORD="${GITEA_PASSWORD:-geectl-live-test}"
+# A random password when none is supplied: the default must not be
+# a fixed, guessable value. The password is only used once, by the
+# provision step, to create the user and the token.
+if [ -z "${GITEA_PASSWORD:-}" ]; then
+    GITEA_PASSWORD="$(head -c 48 /dev/urandom | base64 | tr -d '=+/\n' | head -c 32)"
+fi
 GITEA_EMAIL="${GITEA_EMAIL:-geectl@test.invalid}"
 TOKEN_FILE="$SCRIPT_DIR/.gitea-token"
 # A stale token from a previous instance must not survive a failed
