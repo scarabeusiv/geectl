@@ -4061,6 +4061,1756 @@ impl<'a> SrFiling<'a> {
     }
 }
 
+/// A single XML element found by scanning: its tag name, the raw
+/// attribute text between the tag name and the closing `>` (without a
+/// trailing `/` for a self-closing tag), and its inner XML (empty for
+/// a self-closing tag). Borrowed from the document being parsed.
+struct Element<'a> {
+    name: &'a str,
+    attrs: &'a str,
+    inner: &'a str,
+}
+
+/// Split `xml` — the inner XML of one parent element — into its
+/// top-level child elements, in document order. Text between elements
+/// must be whitespace only: a request document never carries bare text
+/// under a parent, so anything else is a shape change and the split
+/// fails. A child is found by its opening tag and its matching close
+/// tag (plain search, the same discipline as
+/// [`parse_submit_request_ids`]): these documents never nest an
+/// element inside another of the same name, so no depth counting is
+/// needed, and a missing close tag fails the whole document rather
+/// than yielding a partial element list.
+fn child_elements(xml: &str) -> Option<Vec<Element<'_>>> {
+    let mut elements = Vec::new();
+    let mut rest = xml;
+    loop {
+        let text_end = rest.find('<').unwrap_or(rest.len());
+        if !rest[..text_end].trim().is_empty() {
+            return None;
+        }
+        rest = &rest[text_end..];
+        if rest.is_empty() {
+            return Some(elements);
+        }
+        let after_lt = &rest[1..];
+        if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
+            return None;
+        }
+        let name_end = after_lt
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(after_lt.len());
+        let name = &after_lt[..name_end];
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+        {
+            return None;
+        }
+        let after_name = &after_lt[name_end..];
+        let tag_end = after_name.find('>')?;
+        let tag = &after_name[..tag_end];
+        if let Some(attrs) = tag.trim_end().strip_suffix('/') {
+            elements.push(Element {
+                name,
+                attrs: attrs.trim_end(),
+                inner: "",
+            });
+            rest = &after_name[tag_end + 1..];
+            continue;
+        }
+        let inner_start = &after_name[tag_end + 1..];
+        let close_tag = format!("</{name}>");
+        let close = inner_start.find(&close_tag)?;
+        elements.push(Element {
+            name,
+            attrs: tag,
+            inner: &inner_start[..close],
+        });
+        rest = &inner_start[close + close_tag.len()..];
+    }
+}
+
+/// The value of the `name` attribute in an opening tag's attribute
+/// text, in either quote style, order-tolerant. The attribute name
+/// must stand on its own — `subtype="..."` must not match a lookup
+/// for `type` — so the character before `name=` has to be whitespace
+/// or the start of the text. The value is returned raw: the attribute
+/// values this parser reads (ids, logins, project and package names,
+/// timestamps, state and role names) cannot carry XML entities, so
+/// there is nothing to unescape in them. None when the attribute is
+/// absent or unterminated.
+fn attr_value<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=");
+    let mut rest = attrs;
+    while let Some(pos) = rest.find(&needle) {
+        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
+            rest = &rest[pos + needle.len()..];
+            continue;
+        }
+        let after_eq = &rest[pos + needle.len()..];
+        let quote = after_eq.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let close = after_eq[1..].find(quote)?;
+        return Some(&after_eq[1..1 + close]);
+    }
+    None
+}
+
+/// The text of a leaf element's inner XML, unescaped. The inner XML
+/// must be pure text: any `<` in it means the element carries markup
+/// the model does not expect, and the leaf fails. An empty element
+/// reads as the empty string.
+fn leaf_text(inner: &str) -> Option<String> {
+    if inner.contains('<') {
+        return None;
+    }
+    Some(xml_unescape(inner))
+}
+
+/// The state a submit request is in. The values are exactly the
+/// server's `VALID_REQUEST_STATES` (`BsRequest`): a request the
+/// library reads can be in any of them, including `deleted`, which
+/// only an admin can produce — the library never sends it (see
+/// `ObsClient::change_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestState {
+    /// Freshly filed; nobody has acted on it yet.
+    New,
+    /// Under review; reviewers have been asked.
+    Review,
+    /// Accepted; the change landed.
+    Accepted,
+    /// Declined; the change was refused.
+    Declined,
+    /// Revoked by its creator; withdrawn.
+    Revoked,
+    /// Superseded by a newer request.
+    Superseded,
+    /// Deleted by an admin.
+    Deleted,
+}
+
+impl RequestState {
+    /// The server's spelling of this state, as it appears in
+    /// `<state name="…">` and in `newstate=` query values.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RequestState::New => "new",
+            RequestState::Review => "review",
+            RequestState::Accepted => "accepted",
+            RequestState::Declined => "declined",
+            RequestState::Revoked => "revoked",
+            RequestState::Superseded => "superseded",
+            RequestState::Deleted => "deleted",
+        }
+    }
+
+    /// Parse a state name the server sent. None for anything else:
+    /// an unknown state is a server shape change, not a state the
+    /// library can act on.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "new" => Some(RequestState::New),
+            "review" => Some(RequestState::Review),
+            "accepted" => Some(RequestState::Accepted),
+            "declined" => Some(RequestState::Declined),
+            "revoked" => Some(RequestState::Revoked),
+            "superseded" => Some(RequestState::Superseded),
+            "deleted" => Some(RequestState::Deleted),
+            _ => None,
+        }
+    }
+}
+
+/// The state of one review on a request. The values are exactly the
+/// server's `VALID_REVIEW_STATES` (`Review`) — a review's own states,
+/// not the request's: `obsoleted` is set when the reviewer is removed
+/// and never appears on a request, and a request's `review` and
+/// `revoked` never appear on a review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewState {
+    /// Asked for; nobody has acted on it yet.
+    New,
+    /// Accepted by the reviewer.
+    Accepted,
+    /// Declined by the reviewer.
+    Declined,
+    /// Superseded by a newer review of the same target.
+    Superseded,
+    /// The reviewer was removed, so the review no longer applies.
+    Obsoleted,
+}
+
+impl ReviewState {
+    /// The server's spelling of this state, as it appears in
+    /// `<review state="…">`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewState::New => "new",
+            ReviewState::Accepted => "accepted",
+            ReviewState::Declined => "declined",
+            ReviewState::Superseded => "superseded",
+            ReviewState::Obsoleted => "obsoleted",
+        }
+    }
+
+    /// Parse a review state name the server sent. None for anything
+    /// else: an unknown state is a server shape change, not a state
+    /// the library can act on.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "new" => Some(ReviewState::New),
+            "accepted" => Some(ReviewState::Accepted),
+            "declined" => Some(ReviewState::Declined),
+            "superseded" => Some(ReviewState::Superseded),
+            "obsoleted" => Some(ReviewState::Obsoleted),
+            _ => None,
+        }
+    }
+}
+
+/// A request's priority. The values are exactly the server's
+/// `VALID_REQUEST_PRIORITIES` (`BsRequest`): anything else is refused
+/// by the server at creation, so a priority the parser does not
+/// recognise is a shape change, not a priority. The server omits the
+/// `<priority>` element for the default `moderate` on its own output;
+/// the serializer renders the model as given, so a `Moderate` it was
+/// told about is written out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestPriority {
+    /// Below the default; handled when there is time.
+    Low,
+    /// The default; the server omits this value from its output.
+    Moderate,
+    /// Above the default; handled soon.
+    Important,
+    /// The highest; handled first.
+    Critical,
+}
+
+impl RequestPriority {
+    /// The server's spelling of this priority.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RequestPriority::Low => "low",
+            RequestPriority::Moderate => "moderate",
+            RequestPriority::Important => "important",
+            RequestPriority::Critical => "critical",
+        }
+    }
+
+    /// Parse a priority the server sent. None for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(RequestPriority::Low),
+            "moderate" => Some(RequestPriority::Moderate),
+            "important" => Some(RequestPriority::Important),
+            "critical" => Some(RequestPriority::Critical),
+            _ => None,
+        }
+    }
+}
+
+/// The `<acceptinfo>` of a submit action: the revision the request
+/// was accepted at, when it was accepted. Only present on a request
+/// that has been accepted; a request that is still open carries none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptInfo {
+    /// The accepted source revision number.
+    pub rev: String,
+    /// The accepted source md5.
+    pub srcmd5: String,
+    /// The origin project, when the accepted revision came from
+    /// elsewhere (a forwarded request).
+    pub oproject: Option<String>,
+    /// The origin package, when the accepted revision came from
+    /// elsewhere.
+    pub opackage: Option<String>,
+    /// The origin source md5, when the accepted revision came from
+    /// elsewhere.
+    pub osrcmd5: Option<String>,
+    /// The expanded source md5 at accept time.
+    pub xsrcmd5: Option<String>,
+    /// The origin expanded source md5, when the accepted revision
+    /// came from elsewhere.
+    pub oxsrcmd5: Option<String>,
+}
+
+/// One action of a submit request: what the request does. The
+/// variants are the action types the server renders
+/// (`BsRequestAction`): a document carrying an action type the
+/// library does not know is refused at parse time, so a new server
+/// action type surfaces as an error instead of silently dropping the
+/// action that carries the change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestAction {
+    /// Submit a package's changes from a source to a target. The
+    /// target is optional: a submit action the server returns can
+    /// carry no `<target>` element at all.
+    Submit {
+        /// The project the change comes from.
+        source_project: String,
+        /// The package in the source project.
+        source_package: String,
+        /// The source revision, when the request pins one.
+        source_rev: Option<String>,
+        /// The project the change goes to, when the action names one.
+        target_project: Option<String>,
+        /// The package in the target project, when the action names
+        /// one.
+        target_package: Option<String>,
+        /// What happens to the source branch on accept, when the
+        /// request sets it.
+        sourceupdate: Option<SourceUpdate>,
+        /// Whether the request updates the devel-project link on
+        /// accept.
+        updatelink: bool,
+        /// Whether the request makes the origin older on accept.
+        makeoriginolder: bool,
+        /// The accept revision, when the request was accepted.
+        acceptinfo: Option<AcceptInfo>,
+    },
+    /// Delete a project or a package.
+    Delete {
+        /// The project to delete.
+        target_project: String,
+        /// The package to delete; absent when the whole project goes.
+        target_package: Option<String>,
+        /// The repository to delete, when the request names one.
+        target_repository: Option<String>,
+    },
+    /// Grant a person or a group a role on a project or a package.
+    AddRole {
+        /// The project the role is granted on.
+        target_project: String,
+        /// The package the role is granted on; absent for a
+        /// project-level grant.
+        target_package: Option<String>,
+        /// The person and the role granted, when the action names one.
+        person: Option<(String, String)>,
+        /// The group and the role granted, when the action names one.
+        group: Option<(String, String)>,
+    },
+    /// Set the bugowner of a project or a package.
+    SetBugowner {
+        /// The project the bugowner is set on.
+        target_project: String,
+        /// The package the bugowner is set on; absent for a
+        /// project-level setting.
+        target_package: Option<String>,
+        /// The person set as bugowner, when the action names one.
+        person_name: Option<String>,
+        /// The group set as bugowner, when the action names one.
+        group_name: Option<String>,
+    },
+    /// Change the devel project of a package.
+    ChangeDevel {
+        /// The project the package lives in.
+        source_project: String,
+        /// The package whose devel project changes.
+        source_package: String,
+        /// The project that becomes the devel project.
+        target_project: String,
+        /// The package in the devel project.
+        target_package: String,
+    },
+    /// Create a maintenance incident from a source package.
+    MaintenanceIncident {
+        /// The project the incident comes from.
+        source_project: String,
+        /// The package the incident is built from.
+        source_package: String,
+        /// The maintenance project the incident goes to.
+        target_project: String,
+        /// The package in the target project, when the action names
+        /// one.
+        target_package: Option<String>,
+    },
+    /// Release a maintenance incident to the maintenance project.
+    MaintenanceRelease {
+        /// The project the release comes from.
+        source_project: String,
+        /// The package the release is built from.
+        source_package: String,
+        /// The project the release goes to.
+        target_project: String,
+        /// The package in the target project, when the action names
+        /// one.
+        target_package: Option<String>,
+    },
+    /// Release a package to another project.
+    Release {
+        /// The project the release comes from.
+        source_project: String,
+        /// The package being released.
+        source_package: String,
+        /// The project the release goes to.
+        target_project: String,
+        /// The package in the target project, when the action names
+        /// one.
+        target_package: Option<String>,
+    },
+}
+
+impl RequestAction {
+    /// The server's spelling of this action's type, as it appears in
+    /// `<action type="…">`.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            RequestAction::Submit { .. } => "submit",
+            RequestAction::Delete { .. } => "delete",
+            RequestAction::AddRole { .. } => "add_role",
+            RequestAction::SetBugowner { .. } => "set_bugowner",
+            RequestAction::ChangeDevel { .. } => "change_devel",
+            RequestAction::MaintenanceIncident { .. } => "maintenance_incident",
+            RequestAction::MaintenanceRelease { .. } => "maintenance_release",
+            RequestAction::Release { .. } => "release",
+        }
+    }
+}
+
+/// The `<state>` element of a request: the state it is in now, who
+/// put it there, and when. The `comment` is the message left with the
+/// last state change; it is empty when the change carried none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestStateInfo {
+    /// The state the request is in.
+    pub name: RequestState,
+    /// Who made the last state change.
+    pub who: String,
+    /// When the last state change happened.
+    pub when: String,
+    /// When the request was created. The server always sends this;
+    /// older documents may not carry it.
+    pub created: Option<String>,
+    /// The request this one was superseded by, when it was superseded.
+    pub superseded_by: Option<u64>,
+    /// Who approved the request, when it carries an approval.
+    pub approver: Option<String>,
+    /// The message left with the last state change; empty when none.
+    pub comment: String,
+}
+
+/// One `<review>` on a request: a review asked of a user, a group, a
+/// project, or a package. The `comment` is the reason the review was
+/// asked for, or the message left with it. The `history` is what
+/// happened to the review since it was asked — accepted, declined,
+/// assigned, reopened, obsoleted — one entry per change, in order;
+/// a review nobody has acted on yet has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestReview {
+    /// The review's state.
+    pub state: ReviewState,
+    /// When the review was asked for or last changed.
+    pub when: Option<String>,
+    /// Who asked for or last changed the review.
+    pub who: Option<String>,
+    /// The user the review is asked of, when it names one.
+    pub by_user: Option<String>,
+    /// The group the review is asked of, when it names one.
+    pub by_group: Option<String>,
+    /// The project the review is asked of, when it names one.
+    pub by_project: Option<String>,
+    /// The package the review is asked of, when it names one.
+    pub by_package: Option<String>,
+    /// The reason for the review; empty when none was given.
+    pub comment: String,
+    /// What happened to the review since it was asked, in order.
+    pub history: Vec<RequestHistory>,
+}
+
+/// One `<history>` entry of a request: a state change, who made it
+/// and when, and what it was. The first entry is always the creation
+/// (`description` "Request created", `comment` the request's
+/// description); the rest are the state changes in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestHistory {
+    /// Who made the change.
+    pub who: String,
+    /// When the change happened.
+    pub when: String,
+    /// What the change was; empty when the entry carries none.
+    pub description: String,
+    /// The message left with the change; empty when none.
+    pub comment: String,
+}
+
+/// A submit request as the server renders it: its id and creator,
+/// what it does, the state it is in, its reviews and history, and its
+/// message. Read with `ObsClient::show_request`; a document the
+/// parser does not recognise in full is refused rather than read
+/// partially, so a caller never acts on a half-parsed request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    /// The request number.
+    pub id: u64,
+    /// Who filed the request.
+    pub creator: String,
+    /// The request's title, when the document carries one. The server
+    /// does not render a title on its own output; older documents may
+    /// carry one.
+    pub title: Option<String>,
+    /// The request's description (its message); empty when none.
+    pub description: String,
+    /// What the request does, in order.
+    pub actions: Vec<RequestAction>,
+    /// The request's priority, when the document carries one. The
+    /// server omits the default `moderate` from its output.
+    pub priority: Option<RequestPriority>,
+    /// The state the request is in now.
+    pub state: RequestStateInfo,
+    /// The reviews asked on the request, in order.
+    pub reviews: Vec<RequestReview>,
+    /// The request's history, in order, starting with its creation.
+    /// Only present when the document was fetched with history (see
+    /// `ObsClient::show_request`); empty otherwise.
+    pub history: Vec<RequestHistory>,
+    /// When the request is scheduled to be accepted, when one is set.
+    pub accept_at: Option<String>,
+}
+
+impl Request {
+    /// The actions of the given types, in order. An empty type list
+    /// returns every action. A type name that matches no action
+    /// simply returns nothing for it — filtering is the caller's
+    /// choice, not a parse error.
+    pub fn actions_of(&self, types: &[&str]) -> Vec<&RequestAction> {
+        if types.is_empty() {
+            return self.actions.iter().collect();
+        }
+        self.actions
+            .iter()
+            .filter(|action| types.contains(&action.type_name()))
+            .collect()
+    }
+
+    /// Render this request as the XML the server renders: the same
+    /// elements, in the server's order, with the same attribute
+    /// order. Empty comments and descriptions are dropped (an empty
+    /// `<comment></comment>` reads back as the empty string, so
+    /// writing it out would add nothing). The round-trip is
+    /// structural — `parse_request(&request.to_xml())` reads back the
+    /// same request — not byte-identical to a server document, which
+    /// may spell attributes in another order.
+    pub fn to_xml(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "<request creator=\"{}\" id=\"{}\">\n",
+            xml_escape(&self.creator),
+            self.id
+        ));
+        for action in &self.actions {
+            out.push_str(&action_to_xml(action));
+        }
+        if let Some(priority) = self.priority {
+            out.push_str(&format!("  <priority>{}</priority>\n", priority.as_str()));
+        }
+        out.push_str(&state_to_xml(&self.state));
+        for review in &self.reviews {
+            out.push_str(&review_to_xml(review));
+        }
+        for entry in &self.history {
+            out.push_str(&history_to_xml(entry, 2));
+        }
+        if let Some(accept_at) = &self.accept_at {
+            out.push_str(&format!(
+                "  <accept_at>{}</accept_at>\n",
+                xml_escape(accept_at)
+            ));
+        }
+        if let Some(title) = &self.title {
+            out.push_str(&format!("  <title>{}</title>\n", xml_escape(title)));
+        }
+        if !self.description.is_empty() {
+            out.push_str(&format!(
+                "  <description>{}</description>\n",
+                xml_escape(&self.description)
+            ));
+        }
+        out.push_str("</request>");
+        out
+    }
+}
+
+/// Parse a `<request>` document into a [`Request`]. The document
+/// must be a whole request: an `id` and a `creator` on the root, at
+/// least one action, exactly one `<state>`. Anything the parser does
+/// not recognise — an unknown action type, an unknown child element,
+/// a missing required attribute, a duplicated singleton — fails the
+/// whole document (None), never a partial request. An old-style
+/// `<request type="submit"><submit>…` document parses to the modern
+/// action form, and re-serialises as `<action>`; the `type`
+/// attribute on the root is dropped on the way out.
+pub fn parse_request(xml: &str) -> Option<Request> {
+    let xml = xml.trim();
+    let root = parse_root(xml, "request")?;
+    let id = attr_value(root.attrs, "id")?;
+    let id = id.parse::<u64>().ok().filter(|id| *id > 0)?;
+    let creator = attr_value(root.attrs, "creator")?;
+    if creator.is_empty() {
+        return None;
+    }
+    let mut actions = Vec::new();
+    let mut has_action_element = false;
+    let mut has_submit_element = false;
+    let mut state: Option<RequestStateInfo> = None;
+    let mut reviews = Vec::new();
+    let mut history = Vec::new();
+    let mut title: Option<String> = None;
+    let mut description = String::new();
+    let mut seen_description = false;
+    let mut priority: Option<RequestPriority> = None;
+    let mut accept_at: Option<String> = None;
+    for child in child_elements(root.inner)? {
+        match child.name {
+            "action" => {
+                has_action_element = true;
+                actions.push(parse_action(&child)?);
+            }
+            "submit" => {
+                has_submit_element = true;
+                actions.push(parse_legacy_submit(&child)?);
+            }
+            "state" => {
+                if state.is_some() {
+                    return None;
+                }
+                state = Some(parse_state(&child)?);
+            }
+            "review" => reviews.push(parse_review(&child)?),
+            "history" => history.push(parse_request_history(&child)?),
+            "title" => {
+                if title.is_some() {
+                    return None;
+                }
+                title = Some(leaf_text(child.inner)?);
+            }
+            "description" => {
+                if seen_description {
+                    return None;
+                }
+                seen_description = true;
+                description = leaf_text(child.inner)?;
+            }
+            "priority" => {
+                if priority.is_some() {
+                    return None;
+                }
+                priority = Some(RequestPriority::parse(&leaf_text(child.inner)?)?);
+            }
+            "accept_at" => {
+                if accept_at.is_some() {
+                    return None;
+                }
+                accept_at = Some(leaf_text(child.inner)?);
+            }
+            _ => return None,
+        }
+    }
+    // The legacy form carries its submit action as `<submit>` and no
+    // `<action>` at all; a document mixing the two shapes is neither,
+    // so it fails rather than guessing which half to keep.
+    if has_action_element && has_submit_element {
+        return None;
+    }
+    if actions.is_empty() {
+        return None;
+    }
+    Some(Request {
+        id,
+        creator: creator.to_string(),
+        title,
+        description,
+        actions,
+        priority,
+        state: state?,
+        reviews,
+        history,
+        accept_at,
+    })
+}
+
+/// The root element of a document: its attribute text and inner XML.
+/// The document must start with `<name` and end with `</name>` (after
+/// trimming). A self-closing root reads as an empty document of this
+/// shape. A leading XML declaration (`<?xml …?>`) is skipped: the
+/// server does not send one on these responses, but a document that
+/// carries one is the same document.
+fn parse_root<'a>(xml: &'a str, name: &'a str) -> Option<Element<'a>> {
+    let xml = xml.trim();
+    let xml = match xml.strip_prefix("<?xml") {
+        Some(rest) => {
+            let end = rest.find("?>")?;
+            rest[end + 2..].trim_start()
+        }
+        None => xml,
+    };
+    let after_lt = xml.strip_prefix('<')?;
+    if after_lt.starts_with('/') || after_lt.starts_with('!') || after_lt.starts_with('?') {
+        return None;
+    }
+    if !after_lt.starts_with(name) {
+        return None;
+    }
+    let after_name = &after_lt[name.len()..];
+    match after_name.chars().next() {
+        Some(c) if c.is_whitespace() || c == '>' => {}
+        _ => return None,
+    }
+    let tag_end = after_name.find('>')?;
+    let tag = &after_name[..tag_end];
+    if let Some(attrs) = tag.trim_end().strip_suffix('/') {
+        // A self-closing root has no children: it is an empty
+        // document of this shape (an empty `<comments />` reads as an
+        // empty list; an empty `<request />` fails later, on its
+        // missing actions and state).
+        return Some(Element {
+            name,
+            attrs: attrs.trim_end(),
+            inner: "",
+        });
+    }
+    let inner_start = &after_name[tag_end + 1..];
+    let close_tag = format!("</{name}>");
+    let close = inner_start.rfind(&close_tag)?;
+    let inner = &inner_start[..close];
+    let after_close = &inner_start[close + close_tag.len()..];
+    if !after_close.trim().is_empty() {
+        return None;
+    }
+    Some(Element {
+        name,
+        attrs: tag,
+        inner,
+    })
+}
+
+/// Parse one `<action>` element. The `type` attribute names the
+/// variant; anything else fails. Each variant takes exactly the
+/// children the server renders for it — a missing required child, a
+/// duplicated singleton, or an unknown child fails the action.
+fn parse_action(element: &Element<'_>) -> Option<RequestAction> {
+    let action_type = attr_value(element.attrs, "type")?;
+    match action_type {
+        "submit" => parse_submit_action(element),
+        "delete" => parse_delete_action(element),
+        "add_role" => parse_add_role_action(element),
+        "set_bugowner" => parse_set_bugowner_action(element),
+        "change_devel" => parse_change_devel_action(element),
+        "maintenance_incident" | "maintenance_release" | "release" => {
+            parse_source_target_action(element, action_type)
+        }
+        _ => None,
+    }
+}
+
+/// Parse the `<source>` child of an action element: the project and
+/// package are required, the revision optional. Exactly one source;
+/// a missing or duplicated one fails.
+fn action_source(element: &Element<'_>) -> Option<(String, String, Option<String>)> {
+    let mut source: Option<(String, String, Option<String>)> = None;
+    for child in child_elements(element.inner)? {
+        if child.name != "source" {
+            continue;
+        }
+        if source.is_some() {
+            return None;
+        }
+        let project = attr_value(child.attrs, "project")?;
+        let package = attr_value(child.attrs, "package")?;
+        if project.is_empty() || package.is_empty() {
+            return None;
+        }
+        source = Some((
+            project.to_string(),
+            package.to_string(),
+            attr_value(child.attrs, "rev").map(str::to_string),
+        ));
+    }
+    source
+}
+
+/// A target reference: the project, the package (when the action
+/// names one), and the repository (when it pins one).
+type TargetRef = (String, Option<String>, Option<String>);
+
+/// Parse the `<target>` child of an action element: the project is
+/// required, the package and repository optional. At most one target;
+/// a duplicated one fails. None when the action carries no target.
+fn action_target(element: &Element<'_>) -> Option<Option<TargetRef>> {
+    let mut target: Option<TargetRef> = None;
+    for child in child_elements(element.inner)? {
+        if child.name != "target" {
+            continue;
+        }
+        if target.is_some() {
+            return None;
+        }
+        let project = attr_value(child.attrs, "project")?;
+        if project.is_empty() {
+            return None;
+        }
+        target = Some((
+            project.to_string(),
+            attr_value(child.attrs, "package").map(str::to_string),
+            attr_value(child.attrs, "repository").map(str::to_string),
+        ));
+    }
+    Some(target)
+}
+
+/// Parse a `<submit>` action: a source, an optional target, optional
+/// options, and an optional acceptinfo. Any other child fails.
+fn parse_submit_action(element: &Element<'_>) -> Option<RequestAction> {
+    let mut sourceupdate: Option<SourceUpdate> = None;
+    let mut updatelink = false;
+    let mut seen_updatelink = false;
+    let mut makeoriginolder = false;
+    let mut seen_makeoriginolder = false;
+    let mut acceptinfo: Option<AcceptInfo> = None;
+    let mut seen_options = false;
+    let mut seen_acceptinfo = false;
+    for child in child_elements(element.inner)? {
+        match child.name {
+            "source" | "target" => {}
+            "options" => {
+                if seen_options {
+                    return None;
+                }
+                seen_options = true;
+                for option in child_elements(child.inner)? {
+                    match option.name {
+                        "sourceupdate" => {
+                            if sourceupdate.is_some() {
+                                return None;
+                            }
+                            sourceupdate = Some(parse_sourceupdate(&leaf_text(option.inner)?)?);
+                        }
+                        "updatelink" => {
+                            if seen_updatelink {
+                                return None;
+                            }
+                            seen_updatelink = true;
+                            updatelink = parse_option_bool(&leaf_text(option.inner)?)?;
+                        }
+                        "makeoriginolder" => {
+                            if seen_makeoriginolder {
+                                return None;
+                            }
+                            seen_makeoriginolder = true;
+                            makeoriginolder = parse_option_bool(&leaf_text(option.inner)?)?;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            "acceptinfo" => {
+                if seen_acceptinfo {
+                    return None;
+                }
+                seen_acceptinfo = true;
+                if !child.inner.trim().is_empty() {
+                    return None;
+                }
+                let rev = attr_value(child.attrs, "rev")?;
+                let srcmd5 = attr_value(child.attrs, "srcmd5")?;
+                if rev.is_empty() || srcmd5.is_empty() {
+                    return None;
+                }
+                acceptinfo = Some(AcceptInfo {
+                    rev: rev.to_string(),
+                    srcmd5: srcmd5.to_string(),
+                    oproject: attr_value(child.attrs, "oproject").map(str::to_string),
+                    opackage: attr_value(child.attrs, "opackage").map(str::to_string),
+                    osrcmd5: attr_value(child.attrs, "osrcmd5").map(str::to_string),
+                    xsrcmd5: attr_value(child.attrs, "xsrcmd5").map(str::to_string),
+                    oxsrcmd5: attr_value(child.attrs, "oxsrcmd5").map(str::to_string),
+                });
+            }
+            _ => return None,
+        }
+    }
+    let (source_project, source_package, source_rev) = action_source(element)?;
+    let (target_project, target_package) = match action_target(element)? {
+        Some((project, package, _)) => (Some(project), package),
+        None => (None, None),
+    };
+    Some(RequestAction::Submit {
+        source_project,
+        source_package,
+        source_rev,
+        target_project,
+        target_package,
+        sourceupdate,
+        updatelink,
+        makeoriginolder,
+        acceptinfo,
+    })
+}
+
+/// Parse a `<sourceupdate>` value: exactly the three values the
+/// server accepts, as [`SourceUpdate`]. Anything else fails.
+fn parse_sourceupdate(value: &str) -> Option<SourceUpdate> {
+    match value {
+        "cleanup" => Some(SourceUpdate::Cleanup),
+        "update" => Some(SourceUpdate::Update),
+        "noupdate" => Some(SourceUpdate::NoUpdate),
+        _ => None,
+    }
+}
+
+/// Parse an `<updatelink>` / `<makeoriginolder>` value. The server
+/// writes `true`; documents produced elsewhere may write `1`. Both
+/// spellings read as true, `false` and `0` as false; anything else
+/// fails.
+fn parse_option_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a `<delete>` action: a target naming the project, and the
+/// package when a package (rather than the whole project) goes.
+fn parse_delete_action(element: &Element<'_>) -> Option<RequestAction> {
+    for child in child_elements(element.inner)? {
+        if child.name != "target" {
+            return None;
+        }
+    }
+    let (target_project, target_package, target_repository) = action_target(element)??;
+    Some(RequestAction::Delete {
+        target_project,
+        target_package,
+        target_repository,
+    })
+}
+
+/// Parse an `<add_role>` action: a target, and a person and/or a
+/// group with the role each is granted. At least one of person and
+/// group is required.
+fn parse_add_role_action(element: &Element<'_>) -> Option<RequestAction> {
+    let mut person: Option<(String, String)> = None;
+    let mut group: Option<(String, String)> = None;
+    for child in child_elements(element.inner)? {
+        match child.name {
+            "target" => {}
+            "person" => {
+                if person.is_some() {
+                    return None;
+                }
+                let name = attr_value(child.attrs, "name")?;
+                let role = attr_value(child.attrs, "role")?;
+                if name.is_empty() || role.is_empty() {
+                    return None;
+                }
+                person = Some((name.to_string(), role.to_string()));
+            }
+            "group" => {
+                if group.is_some() {
+                    return None;
+                }
+                let name = attr_value(child.attrs, "name")?;
+                let role = attr_value(child.attrs, "role")?;
+                if name.is_empty() || role.is_empty() {
+                    return None;
+                }
+                group = Some((name.to_string(), role.to_string()));
+            }
+            _ => return None,
+        }
+    }
+    if person.is_none() && group.is_none() {
+        return None;
+    }
+    let (target_project, target_package, _) = action_target(element)??;
+    Some(RequestAction::AddRole {
+        target_project,
+        target_package,
+        person,
+        group,
+    })
+}
+
+/// Parse a `<set_bugowner>` action: a target, and a person and/or a
+/// group set as bugowner. The person and group carry a name only, no
+/// role. At least one of person and group is required.
+fn parse_set_bugowner_action(element: &Element<'_>) -> Option<RequestAction> {
+    let mut person_name: Option<String> = None;
+    let mut group_name: Option<String> = None;
+    for child in child_elements(element.inner)? {
+        match child.name {
+            "target" => {}
+            "person" => {
+                if person_name.is_some() {
+                    return None;
+                }
+                let name = attr_value(child.attrs, "name")?;
+                if name.is_empty() {
+                    return None;
+                }
+                person_name = Some(name.to_string());
+            }
+            "group" => {
+                if group_name.is_some() {
+                    return None;
+                }
+                let name = attr_value(child.attrs, "name")?;
+                if name.is_empty() {
+                    return None;
+                }
+                group_name = Some(name.to_string());
+            }
+            _ => return None,
+        }
+    }
+    if person_name.is_none() && group_name.is_none() {
+        return None;
+    }
+    let (target_project, target_package, _) = action_target(element)??;
+    Some(RequestAction::SetBugowner {
+        target_project,
+        target_package,
+        person_name,
+        group_name,
+    })
+}
+
+/// Parse a `<change_devel>` action: a source and a target, both
+/// naming a project and a package.
+fn parse_change_devel_action(element: &Element<'_>) -> Option<RequestAction> {
+    for child in child_elements(element.inner)? {
+        if child.name != "source" && child.name != "target" {
+            return None;
+        }
+    }
+    let (source_project, source_package, _) = action_source(element)?;
+    let (target_project, target_package, _) = action_target(element)??;
+    let target_package = target_package?;
+    Some(RequestAction::ChangeDevel {
+        source_project,
+        source_package,
+        target_project,
+        target_package,
+    })
+}
+
+/// Parse a maintenance or release action: a source and a target,
+/// both naming a project; the target package is optional.
+fn parse_source_target_action(element: &Element<'_>, action_type: &str) -> Option<RequestAction> {
+    for child in child_elements(element.inner)? {
+        if child.name != "source" && child.name != "target" {
+            return None;
+        }
+    }
+    let (source_project, source_package, _) = action_source(element)?;
+    let (target_project, target_package, _) = action_target(element)??;
+    match action_type {
+        "maintenance_incident" => Some(RequestAction::MaintenanceIncident {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        }),
+        "maintenance_release" => Some(RequestAction::MaintenanceRelease {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        }),
+        "release" => Some(RequestAction::Release {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        }),
+        _ => None,
+    }
+}
+
+/// Parse an old-style `<submit>` element (the legacy request form):
+/// a source and a target, no options. The caller lifts it into a
+/// modern submit action.
+fn parse_legacy_submit(element: &Element<'_>) -> Option<RequestAction> {
+    for child in child_elements(element.inner)? {
+        if child.name != "source" && child.name != "target" {
+            return None;
+        }
+    }
+    let (source_project, source_package, source_rev) = action_source(element)?;
+    let (target_project, target_package) = match action_target(element)? {
+        Some((project, package, _)) => (Some(project), package),
+        None => (None, None),
+    };
+    Some(RequestAction::Submit {
+        source_project,
+        source_package,
+        source_rev,
+        target_project,
+        target_package,
+        sourceupdate: None,
+        updatelink: false,
+        makeoriginolder: false,
+        acceptinfo: None,
+    })
+}
+
+/// Parse a `<state>` element: the name, who, and when are required;
+/// `created`, `superseded_by`, and `approver` are optional. The
+/// comment child is optional and reads as empty when absent.
+fn parse_state(element: &Element<'_>) -> Option<RequestStateInfo> {
+    let name = RequestState::parse(attr_value(element.attrs, "name")?)?;
+    let who = attr_value(element.attrs, "who")?;
+    let when = attr_value(element.attrs, "when")?;
+    if who.is_empty() || when.is_empty() {
+        return None;
+    }
+    let created = attr_value(element.attrs, "created").map(str::to_string);
+    let superseded_by = match attr_value(element.attrs, "superseded_by") {
+        Some(value) => Some(value.parse::<u64>().ok().filter(|id| *id > 0)?),
+        None => None,
+    };
+    let approver = attr_value(element.attrs, "approver").map(str::to_string);
+    let mut comment = String::new();
+    let mut seen_comment = false;
+    for child in child_elements(element.inner)? {
+        if child.name != "comment" {
+            return None;
+        }
+        if seen_comment {
+            return None;
+        }
+        seen_comment = true;
+        comment = leaf_text(child.inner)?;
+    }
+    Some(RequestStateInfo {
+        name,
+        who: who.to_string(),
+        when: when.to_string(),
+        created,
+        superseded_by,
+        approver,
+        comment,
+    })
+}
+
+/// Parse a `<review>` element: the state is required; when, who, and
+/// the `by_*` fields are optional. The comment child is optional and
+/// reads as empty when absent. A review that was acted on carries
+/// one `<history>` child per change, each with a description of what
+/// happened; they read like request history entries.
+fn parse_review(element: &Element<'_>) -> Option<RequestReview> {
+    let state = ReviewState::parse(attr_value(element.attrs, "state")?)?;
+    let when = attr_value(element.attrs, "when").map(str::to_string);
+    let who = attr_value(element.attrs, "who").map(str::to_string);
+    let by_user = attr_value(element.attrs, "by_user").map(str::to_string);
+    let by_group = attr_value(element.attrs, "by_group").map(str::to_string);
+    let by_project = attr_value(element.attrs, "by_project").map(str::to_string);
+    let by_package = attr_value(element.attrs, "by_package").map(str::to_string);
+    let mut comment = String::new();
+    let mut seen_comment = false;
+    let mut history = Vec::new();
+    for child in child_elements(element.inner)? {
+        match child.name {
+            "comment" => {
+                if seen_comment {
+                    return None;
+                }
+                seen_comment = true;
+                comment = leaf_text(child.inner)?;
+            }
+            // A review that was acted on carries one `<history>`
+            // child per change (accepted, declined, assigned,
+            // reopened, obsoleted), each with a description of what
+            // happened — never empty, and never a placeholder. The
+            // entries read like request history entries.
+            "history" => history.push(parse_request_history(&child)?),
+            _ => return None,
+        }
+    }
+    Some(RequestReview {
+        state,
+        when,
+        who,
+        by_user,
+        by_group,
+        by_project,
+        by_package,
+        comment,
+        history,
+    })
+}
+
+/// Parse a `<history>` element: who and when are required; the
+/// description and comment children are optional and read as empty
+/// when absent.
+fn parse_request_history(element: &Element<'_>) -> Option<RequestHistory> {
+    let who = attr_value(element.attrs, "who")?;
+    let when = attr_value(element.attrs, "when")?;
+    if who.is_empty() || when.is_empty() {
+        return None;
+    }
+    let mut description = String::new();
+    let mut comment = String::new();
+    let mut seen_description = false;
+    let mut seen_comment = false;
+    for child in child_elements(element.inner)? {
+        match child.name {
+            "description" => {
+                if seen_description {
+                    return None;
+                }
+                seen_description = true;
+                description = leaf_text(child.inner)?;
+            }
+            "comment" => {
+                if seen_comment {
+                    return None;
+                }
+                seen_comment = true;
+                comment = leaf_text(child.inner)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(RequestHistory {
+        who: who.to_string(),
+        when: when.to_string(),
+        description,
+        comment,
+    })
+}
+
+/// Render one action as XML, in the server's shape: the same
+/// elements, in the server's order, with the same attribute order
+/// (`project` before `package`, `rev` last on a source).
+fn action_to_xml(action: &RequestAction) -> String {
+    let mut out = String::new();
+    match action {
+        RequestAction::Submit {
+            source_project,
+            source_package,
+            source_rev,
+            target_project,
+            target_package,
+            sourceupdate,
+            updatelink,
+            makeoriginolder,
+            acceptinfo,
+        } => {
+            out.push_str("  <action type=\"submit\">\n");
+            out.push_str(&source_to_xml(
+                source_project,
+                source_package,
+                source_rev.as_deref(),
+            ));
+            if let Some(target_project) = target_project {
+                out.push_str(&target_to_xml(
+                    target_project,
+                    target_package.as_deref(),
+                    None,
+                ));
+            }
+            if sourceupdate.is_some() || *updatelink || *makeoriginolder {
+                out.push_str("    <options>\n");
+                if let Some(update) = sourceupdate {
+                    out.push_str(&format!(
+                        "      <sourceupdate>{}</sourceupdate>\n",
+                        update.as_str()
+                    ));
+                }
+                if *updatelink {
+                    out.push_str("      <updatelink>true</updatelink>\n");
+                }
+                if *makeoriginolder {
+                    out.push_str("      <makeoriginolder>true</makeoriginolder>\n");
+                }
+                out.push_str("    </options>\n");
+            }
+            if let Some(info) = acceptinfo {
+                out.push_str(&format!(
+                    "    <acceptinfo rev=\"{}\" srcmd5=\"{}\"",
+                    xml_escape(&info.rev),
+                    xml_escape(&info.srcmd5)
+                ));
+                for (name, value) in [
+                    ("oproject", &info.oproject),
+                    ("opackage", &info.opackage),
+                    ("osrcmd5", &info.osrcmd5),
+                    ("xsrcmd5", &info.xsrcmd5),
+                    ("oxsrcmd5", &info.oxsrcmd5),
+                ] {
+                    if let Some(value) = value {
+                        out.push_str(&format!(" {name}=\"{}\"", xml_escape(value)));
+                    }
+                }
+                out.push_str(" />\n");
+            }
+            out.push_str("  </action>\n");
+        }
+        RequestAction::Delete {
+            target_project,
+            target_package,
+            target_repository,
+        } => {
+            out.push_str("  <action type=\"delete\">\n");
+            out.push_str(&target_to_xml(
+                target_project,
+                target_package.as_deref(),
+                target_repository.as_deref(),
+            ));
+            out.push_str("  </action>\n");
+        }
+        RequestAction::AddRole {
+            target_project,
+            target_package,
+            person,
+            group,
+        } => {
+            out.push_str("  <action type=\"add_role\">\n");
+            out.push_str(&target_to_xml(
+                target_project,
+                target_package.as_deref(),
+                None,
+            ));
+            if let Some((name, role)) = person {
+                out.push_str(&format!(
+                    "    <person name=\"{}\" role=\"{}\" />\n",
+                    xml_escape(name),
+                    xml_escape(role)
+                ));
+            }
+            if let Some((name, role)) = group {
+                out.push_str(&format!(
+                    "    <group name=\"{}\" role=\"{}\" />\n",
+                    xml_escape(name),
+                    xml_escape(role)
+                ));
+            }
+            out.push_str("  </action>\n");
+        }
+        RequestAction::SetBugowner {
+            target_project,
+            target_package,
+            person_name,
+            group_name,
+        } => {
+            out.push_str("  <action type=\"set_bugowner\">\n");
+            out.push_str(&target_to_xml(
+                target_project,
+                target_package.as_deref(),
+                None,
+            ));
+            if let Some(name) = person_name {
+                out.push_str(&format!("    <person name=\"{}\" />\n", xml_escape(name)));
+            }
+            if let Some(name) = group_name {
+                out.push_str(&format!("    <group name=\"{}\" />\n", xml_escape(name)));
+            }
+            out.push_str("  </action>\n");
+        }
+        RequestAction::ChangeDevel {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        } => {
+            out.push_str("  <action type=\"change_devel\">\n");
+            out.push_str(&source_to_xml(source_project, source_package, None));
+            out.push_str(&target_to_xml(target_project, Some(target_package), None));
+            out.push_str("  </action>\n");
+        }
+        RequestAction::MaintenanceIncident {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        }
+        | RequestAction::MaintenanceRelease {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        }
+        | RequestAction::Release {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        } => {
+            out.push_str(&format!("  <action type=\"{}\">\n", action.type_name()));
+            out.push_str(&source_to_xml(source_project, source_package, None));
+            out.push_str(&target_to_xml(
+                target_project,
+                target_package.as_deref(),
+                None,
+            ));
+            out.push_str("  </action>\n");
+        }
+    }
+    out
+}
+
+/// Render a `<source>` element: `project`, then `package`, then
+/// `rev` when one is pinned.
+fn source_to_xml(project: &str, package: &str, rev: Option<&str>) -> String {
+    let mut out = format!(
+        "    <source project=\"{}\" package=\"{}\"",
+        xml_escape(project),
+        xml_escape(package)
+    );
+    if let Some(rev) = rev {
+        out.push_str(&format!(" rev=\"{}\"", xml_escape(rev)));
+    }
+    out.push_str(" />\n");
+    out
+}
+
+/// Render a `<target>` element: `project`, then `package`, then
+/// `repository`, each only when present.
+fn target_to_xml(project: &str, package: Option<&str>, repository: Option<&str>) -> String {
+    let mut out = format!("    <target project=\"{}\"", xml_escape(project));
+    if let Some(package) = package {
+        out.push_str(&format!(" package=\"{}\"", xml_escape(package)));
+    }
+    if let Some(repository) = repository {
+        out.push_str(&format!(" repository=\"{}\"", xml_escape(repository)));
+    }
+    out.push_str(" />\n");
+    out
+}
+
+/// Render a `<state>` element: `name`, `who`, `when`, then `created`,
+/// `superseded_by`, and `approver` when present. The comment child is
+/// written only when non-empty; an empty comment reads back as the
+/// empty string, so writing it out would add nothing.
+fn state_to_xml(state: &RequestStateInfo) -> String {
+    let mut out = format!(
+        "  <state name=\"{}\" who=\"{}\" when=\"{}\"",
+        state.name.as_str(),
+        xml_escape(&state.who),
+        xml_escape(&state.when)
+    );
+    if let Some(created) = &state.created {
+        out.push_str(&format!(" created=\"{}\"", xml_escape(created)));
+    }
+    if let Some(superseded_by) = state.superseded_by {
+        out.push_str(&format!(" superseded_by=\"{superseded_by}\""));
+    }
+    if let Some(approver) = &state.approver {
+        out.push_str(&format!(" approver=\"{}\"", xml_escape(approver)));
+    }
+    if state.comment.is_empty() {
+        out.push_str(" />\n");
+    } else {
+        out.push_str(&format!(
+            ">\n    <comment>{}</comment>\n  </state>\n",
+            xml_escape(&state.comment)
+        ));
+    }
+    out
+}
+
+/// Render a `<review>` element: `state`, `when`, `who`, then the
+/// `by_*` fields when present. The comment child is written only when
+/// non-empty; the review's history entries follow it, in order.
+fn review_to_xml(review: &RequestReview) -> String {
+    let mut out = format!("  <review state=\"{}\"", review.state.as_str());
+    if let Some(when) = &review.when {
+        out.push_str(&format!(" when=\"{}\"", xml_escape(when)));
+    }
+    if let Some(who) = &review.who {
+        out.push_str(&format!(" who=\"{}\"", xml_escape(who)));
+    }
+    if let Some(by_group) = &review.by_group {
+        out.push_str(&format!(" by_group=\"{}\"", xml_escape(by_group)));
+    }
+    if let Some(by_user) = &review.by_user {
+        out.push_str(&format!(" by_user=\"{}\"", xml_escape(by_user)));
+    }
+    if let Some(by_package) = &review.by_package {
+        out.push_str(&format!(" by_package=\"{}\"", xml_escape(by_package)));
+    }
+    if let Some(by_project) = &review.by_project {
+        out.push_str(&format!(" by_project=\"{}\"", xml_escape(by_project)));
+    }
+    out.push_str(">\n");
+    if !review.comment.is_empty() {
+        out.push_str(&format!(
+            "    <comment>{}</comment>\n",
+            xml_escape(&review.comment)
+        ));
+    }
+    for entry in &review.history {
+        out.push_str(&history_to_xml(entry, 4));
+    }
+    out.push_str("  </review>\n");
+    out
+}
+
+/// Render a `<history>` element at `indent` spaces: `who`, then
+/// `when`. The description and comment children are written only
+/// when non-empty, indented two further spaces.
+fn history_to_xml(entry: &RequestHistory, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let child_pad = " ".repeat(indent + 2);
+    if entry.description.is_empty() && entry.comment.is_empty() {
+        return format!(
+            "{pad}<history who=\"{}\" when=\"{}\" />\n",
+            xml_escape(&entry.who),
+            xml_escape(&entry.when)
+        );
+    }
+    let mut out = format!(
+        "{pad}<history who=\"{}\" when=\"{}\">\n",
+        xml_escape(&entry.who),
+        xml_escape(&entry.when)
+    );
+    if !entry.description.is_empty() {
+        out.push_str(&format!(
+            "{child_pad}<description>{}</description>\n",
+            xml_escape(&entry.description)
+        ));
+    }
+    if !entry.comment.is_empty() {
+        out.push_str(&format!(
+            "{child_pad}<comment>{}</comment>\n",
+            xml_escape(&entry.comment)
+        ));
+    }
+    out.push_str(&format!("{pad}</history>\n"));
+    out
+}
+
+/// Parse a `<collection>` of whole `<request>` elements — the shape
+/// the request search returns — into the requests it carries. Each
+/// element is parsed with [`parse_request`]; any element that fails
+/// fails the whole collection, since a search result the library
+/// cannot read in full is not a result it can act on. The number of
+/// elements parsed must equal the `matches` count: the server returns
+/// every match in one response (over the limit it refuses with 403
+/// rather than truncating), so a short collection is a server shape
+/// change, not a partial result.
+pub fn parse_request_collection(body: &str) -> Option<Vec<Request>> {
+    if !body.contains("<collection") {
+        return None;
+    }
+    let matches = parse_search_matches(body)?;
+    let mut requests = Vec::new();
+    let mut parsed = 0usize;
+    let mut rest = body;
+    while let Some(pos) = rest.find("<request") {
+        let after_tag = &rest[pos + "<request".len()..];
+        let first = after_tag.chars().next()?;
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        let end = after_tag.find('>')?;
+        let tag = &after_tag[..end];
+        parsed += 1;
+        if tag.trim_end().ends_with('/') {
+            // Self-closing: no children, so not a whole request.
+            return None;
+        }
+        let inner = &after_tag[end + 1..];
+        let close = inner.find("</request>")?;
+        let block = &inner[..close];
+        let element = format!("<request{tag}>{block}</request>");
+        requests.push(parse_request(&element)?);
+        rest = &inner[close + "</request>".len()..];
+    }
+    if parsed != matches as usize {
+        return None;
+    }
+    Some(requests)
+}
+
+/// One comment on a request: who left it, when, what it says, and
+/// which comment it replies to, when it is a reply. Comments on a
+/// request and comments on its actions are listed together, in id
+/// order — the server sorts them, and a threaded reply carries its
+/// parent's id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestComment {
+    /// The comment's id, for threading replies under it.
+    pub id: u64,
+    /// Who left the comment.
+    pub who: String,
+    /// When the comment was left.
+    pub when: String,
+    /// The comment this one replies to, when it is a reply.
+    pub parent_id: Option<u64>,
+    /// The comment's text.
+    pub body: String,
+}
+
+/// Parse a `<comments>` document — the shape the comment list returns
+/// — into the comments it carries, in document order. An empty
+/// document reads as an empty list: a request with no comments is a
+/// normal request. Anything the parser does not recognise — an
+/// unknown child element, a missing required attribute — fails the
+/// whole document.
+pub fn parse_comments(body: &str) -> Option<Vec<RequestComment>> {
+    if !body.contains("<comments") {
+        return None;
+    }
+    let root = parse_root(body.trim(), "comments")?;
+    let mut comments = Vec::new();
+    for child in child_elements(root.inner)? {
+        if child.name != "comment" {
+            return None;
+        }
+        let id = attr_value(child.attrs, "id")?;
+        let id = id.parse::<u64>().ok().filter(|id| *id > 0)?;
+        let who = attr_value(child.attrs, "who")?;
+        let when = attr_value(child.attrs, "when")?;
+        if who.is_empty() || when.is_empty() {
+            return None;
+        }
+        let parent_id = match attr_value(child.attrs, "parent") {
+            Some(value) => Some(value.parse::<u64>().ok().filter(|id| *id > 0)?),
+            None => None,
+        };
+        let body = leaf_text(child.inner)?;
+        comments.push(RequestComment {
+            id,
+            who: who.to_string(),
+            when: when.to_string(),
+            parent_id,
+            body,
+        });
+    }
+    Some(comments)
+}
+
+/// Who a review is asked of: a user, a group, a project, or a
+/// project/package pair. At least one of user, group, and project is
+/// required — the server refuses a review asked of nobody — and a
+/// package review needs its project, since a package name alone
+/// names nothing. Built through [`ReviewTarget::new`], so an invalid
+/// target fails before any request is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewTarget {
+    /// The user the review is asked of, when it names one.
+    pub by_user: Option<String>,
+    /// The group the review is asked of, when it names one.
+    pub by_group: Option<String>,
+    /// The project the review is asked of, when it names one.
+    pub by_project: Option<String>,
+    /// The package the review is asked of, when it names one.
+    pub by_package: Option<String>,
+}
+
+impl ReviewTarget {
+    /// Build a review target from its parts. Each part is optional;
+    /// an empty string for a part is refused rather than silently
+    /// dropped, and a project or package name must be a valid OBS
+    /// name.
+    pub fn new(
+        by_user: Option<&str>,
+        by_group: Option<&str>,
+        by_project: Option<&str>,
+        by_package: Option<&str>,
+    ) -> Result<Self, GeectlError> {
+        let by_user = validate_review_party("user", by_user)?;
+        let by_group = validate_review_party("group", by_group)?;
+        let by_project = match by_project {
+            Some("") => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "a review project name must not be empty",
+                ));
+            }
+            Some(value) if !valid_obs_name(value) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS project name: {value:?}"),
+                ));
+            }
+            Some(value) => Some(value.to_string()),
+            None => None,
+        };
+        let by_package = match by_package {
+            Some("") => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "a review package name must not be empty",
+                ));
+            }
+            Some(value) if !valid_obs_name(value) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name: {value:?}"),
+                ));
+            }
+            Some(value) => Some(value.to_string()),
+            None => None,
+        };
+        if by_user.is_none() && by_group.is_none() && by_project.is_none() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a review must be asked of a user, a group, or a project",
+            ));
+        }
+        if by_package.is_some() && by_project.is_none() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a review asked of a package needs its project",
+            ));
+        }
+        Ok(ReviewTarget {
+            by_user,
+            by_group,
+            by_project,
+            by_package,
+        })
+    }
+}
+
+/// Validate one review party (a user or a group login): absent is
+/// fine, present must be non-empty.
+fn validate_review_party(label: &str, value: Option<&str>) -> Result<Option<String>, GeectlError> {
+    match value {
+        Some("") => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("a review {label} name must not be empty"),
+        )),
+        Some(value) => Ok(Some(value.to_string())),
+        None => Ok(None),
+    }
+}
+
+impl ReviewTarget {
+    /// The target as a short phrase for logs and dry-run plans, e.g.
+    /// `user Admin`, `group reviewers`, `project openSUSE:Factory`,
+    /// `project openSUSE:Factory/package foo`. The parts present are
+    /// joined with `, `.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(by_user) = &self.by_user {
+            parts.push(format!("user {by_user}"));
+        }
+        if let Some(by_group) = &self.by_group {
+            parts.push(format!("group {by_group}"));
+        }
+        if let Some(by_project) = &self.by_project {
+            match &self.by_package {
+                Some(by_package) => {
+                    parts.push(format!("project {by_project}/package {by_package}"));
+                }
+                None => parts.push(format!("project {by_project}")),
+            }
+        }
+        parts.join(", ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7485,5 +9235,707 @@ mod tests {
             .is_err());
         assert!(client.project_diff("o/l", "new", &[], &[], false).is_err());
         assert!(http.get_calls().is_empty());
+    }
+
+    // -- Request XML build/parse/round-trip (adopted from the
+    // request XML tests: submit/add_role/set_bugowner/delete/
+    // change_devel construction, action parsing, full-request reads,
+    // empty comment/description, legacy form, action filtering).
+
+    const REQUEST1_XML: &str = r#"<request creator="creator" id="42">
+  <action type="submit">
+    <source package="bar" project="foo" rev="1" />
+    <target package="bar" project="foobar" />
+  </action>
+  <action type="delete">
+    <target project="deleteme" />
+  </action>
+  <state name="accepted" when="2010-12-27T01:36:29" who="user1" />
+  <history when="2010-12-13T13:02:03" who="creator">
+    <description>Create Request</description>
+    <comment>foobar</comment>
+  </history>
+  <title>title of the request</title>
+  <description>this is a
+very long
+description</description>
+</request>"#;
+
+    const REQUEST2_XML: &str = r#"<request creator="creator" id="123">
+  <action type="submit">
+    <source package="abc" project="xyz" />
+    <options>
+      <sourceupdate>cleanup</sourceupdate>
+      <updatelink>1</updatelink>
+    </options>
+  </action>
+  <action type="add_role">
+    <target project="home:foo" />
+    <person name="bar" role="maintainer" />
+    <group name="groupxyz" role="reader" />
+  </action>
+  <state approver="someone" name="review" when="2010-12-27T01:36:29" who="abc" />
+  <review by_group="group1" state="new" when="2010-12-28T00:11:22" who="abc">
+    <comment>review start</comment>
+  </review>
+  <history when="2010-12-11T00:00:00" who="creator">
+    <description>Created request</description>
+  </history>
+</request>"#;
+
+    const LIST_VIEW1_XML: &str = r#"<request creator="Admin" id="62">
+  <action type="set_bugowner">
+    <target project="foo" />
+    <person name="buguser" />
+  </action>
+  <action type="add_role">
+    <target project="foobar" />
+    <person name="xyz" role="maintainer" />
+    <group name="group1" role="reader" />
+  </action>
+  <action type="add_role">
+    <target project="foo" package="bar" />
+    <person name="abc" role="reviewer" />
+  </action>
+  <action type="change_devel">
+    <source project="devprj" package="devpkg" />
+    <target project="foo" package="bar" />
+  </action>
+  <action type="submit">
+    <source project="srcprj" package="srcpackage" />
+    <target project="tgtprj" package="tgtpackage" />
+  </action>
+  <action type="submit">
+    <source project="foo" package="bar" />
+    <target project="baz" />
+  </action>
+  <action type="delete">
+    <target project="deleteme" />
+  </action>
+  <action type="delete">
+    <target project="foo" package="bar" />
+  </action>
+  <state name="new" when="2010-12-29T14:57:25" who="Admin">
+    <comment></comment>
+  </state>
+</request>"#;
+
+    /// A minimal request carrying one action, for the construction
+    /// tests: id 42, creator `creator`, state `new`.
+    fn request_with_action(action: RequestAction) -> Request {
+        Request {
+            id: 42,
+            creator: "creator".to_string(),
+            title: None,
+            description: String::new(),
+            actions: vec![action],
+            priority: None,
+            state: RequestStateInfo {
+                name: RequestState::New,
+                who: "creator".to_string(),
+                when: "2010-12-13T13:02:03".to_string(),
+                created: None,
+                superseded_by: None,
+                approver: None,
+                comment: String::new(),
+            },
+            reviews: Vec::new(),
+            history: Vec::new(),
+            accept_at: None,
+        }
+    }
+
+    /// A request document carrying one action fragment, for the
+    /// action-parsing tests.
+    fn request_document_with_action(action_xml: &str) -> String {
+        format!(
+            "<request creator=\"creator\" id=\"42\">\n  {action_xml}\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n</request>"
+        )
+    }
+
+    #[test]
+    fn request_state_names_round_trip() {
+        for (name, state) in [
+            ("new", RequestState::New),
+            ("review", RequestState::Review),
+            ("accepted", RequestState::Accepted),
+            ("declined", RequestState::Declined),
+            ("revoked", RequestState::Revoked),
+            ("superseded", RequestState::Superseded),
+            ("deleted", RequestState::Deleted),
+        ] {
+            assert_eq!(state.as_str(), name);
+            assert_eq!(RequestState::parse(name), Some(state));
+        }
+        assert_eq!(RequestState::parse("exploded"), None);
+    }
+
+    #[test]
+    fn request_priority_names_round_trip() {
+        for (name, priority) in [
+            ("low", RequestPriority::Low),
+            ("moderate", RequestPriority::Moderate),
+            ("important", RequestPriority::Important),
+            ("critical", RequestPriority::Critical),
+        ] {
+            assert_eq!(priority.as_str(), name);
+            assert_eq!(RequestPriority::parse(name), Some(priority));
+        }
+        assert_eq!(RequestPriority::parse("urgent"), None);
+    }
+
+    #[test]
+    fn request_createsr_serialises_a_submit_action() {
+        let action = RequestAction::Submit {
+            source_project: "foo".to_string(),
+            source_package: "bar".to_string(),
+            source_rev: Some("42".to_string()),
+            target_project: Some("foobar".to_string()),
+            target_package: Some("bar".to_string()),
+            sourceupdate: None,
+            updatelink: false,
+            makeoriginolder: false,
+            acceptinfo: None,
+        };
+        assert_eq!(action.type_name(), "submit");
+        let request = request_with_action(action);
+        assert_eq!(
+            request.to_xml(),
+            "<request creator=\"creator\" id=\"42\">\n  <action type=\"submit\">\n    <source project=\"foo\" package=\"bar\" rev=\"42\" />\n    <target project=\"foobar\" package=\"bar\" />\n  </action>\n  <state name=\"new\" who=\"creator\" when=\"2010-12-13T13:02:03\" />\n</request>"
+        );
+        // The serialised form parses back to the same request.
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_createsr_with_option_serialises_options() {
+        let action = RequestAction::Submit {
+            source_project: "foo".to_string(),
+            source_package: "bar".to_string(),
+            source_rev: None,
+            target_project: Some("foobar".to_string()),
+            target_package: Some("bar".to_string()),
+            sourceupdate: Some(SourceUpdate::Cleanup),
+            updatelink: true,
+            makeoriginolder: false,
+            acceptinfo: None,
+        };
+        let request = request_with_action(action);
+        assert_eq!(
+            request.to_xml(),
+            "<request creator=\"creator\" id=\"42\">\n  <action type=\"submit\">\n    <source project=\"foo\" package=\"bar\" />\n    <target project=\"foobar\" package=\"bar\" />\n    <options>\n      <sourceupdate>cleanup</sourceupdate>\n      <updatelink>true</updatelink>\n    </options>\n  </action>\n  <state name=\"new\" who=\"creator\" when=\"2010-12-13T13:02:03\" />\n</request>"
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_createsr_missing_tgt_package_serialises_project_only() {
+        let action = RequestAction::Submit {
+            source_project: "foo".to_string(),
+            source_package: "bar".to_string(),
+            source_rev: None,
+            target_project: Some("foobar".to_string()),
+            target_package: None,
+            sourceupdate: None,
+            updatelink: false,
+            makeoriginolder: false,
+            acceptinfo: None,
+        };
+        let request = request_with_action(action);
+        assert!(request.to_xml().contains("<target project=\"foobar\" />"));
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_create_add_role_person_serialises() {
+        let action = RequestAction::AddRole {
+            target_project: "foo".to_string(),
+            target_package: Some("bar".to_string()),
+            person: Some(("user".to_string(), "reader".to_string())),
+            group: None,
+        };
+        let request = request_with_action(action);
+        assert_eq!(
+            request.to_xml(),
+            "<request creator=\"creator\" id=\"42\">\n  <action type=\"add_role\">\n    <target project=\"foo\" package=\"bar\" />\n    <person name=\"user\" role=\"reader\" />\n  </action>\n  <state name=\"new\" who=\"creator\" when=\"2010-12-13T13:02:03\" />\n</request>"
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_create_add_role_group_serialises() {
+        let action = RequestAction::AddRole {
+            target_project: "foo".to_string(),
+            target_package: Some("bar".to_string()),
+            person: None,
+            group: Some(("group".to_string(), "reviewer".to_string())),
+        };
+        let request = request_with_action(action);
+        assert!(request
+            .to_xml()
+            .contains("<group name=\"group\" role=\"reviewer\" />"));
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_create_add_role_person_group_serialises_both() {
+        let action = RequestAction::AddRole {
+            target_project: "foo".to_string(),
+            target_package: Some("bar".to_string()),
+            person: Some(("user".to_string(), "reader".to_string())),
+            group: Some(("group".to_string(), "reviewer".to_string())),
+        };
+        let request = request_with_action(action);
+        let xml = request.to_xml();
+        assert!(xml.contains("<person name=\"user\" role=\"reader\" />"));
+        assert!(xml.contains("<group name=\"group\" role=\"reviewer\" />"));
+        assert_eq!(parse_request(&xml), Some(request));
+    }
+
+    #[test]
+    fn request_create_set_bugowner_project_serialises() {
+        let action = RequestAction::SetBugowner {
+            target_project: "foobar".to_string(),
+            target_package: None,
+            person_name: Some("buguser".to_string()),
+            group_name: None,
+        };
+        let request = request_with_action(action);
+        assert_eq!(
+            request.to_xml(),
+            "<request creator=\"creator\" id=\"42\">\n  <action type=\"set_bugowner\">\n    <target project=\"foobar\" />\n    <person name=\"buguser\" />\n  </action>\n  <state name=\"new\" who=\"creator\" when=\"2010-12-13T13:02:03\" />\n</request>"
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_create_set_bugowner_package_serialises() {
+        let action = RequestAction::SetBugowner {
+            target_project: "foobar".to_string(),
+            target_package: Some("baz".to_string()),
+            person_name: Some("buguser".to_string()),
+            group_name: None,
+        };
+        let request = request_with_action(action);
+        assert!(request
+            .to_xml()
+            .contains("<target project=\"foobar\" package=\"baz\" />"));
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_create_delete_project_serialises() {
+        let action = RequestAction::Delete {
+            target_project: "foo".to_string(),
+            target_package: None,
+            target_repository: None,
+        };
+        let request = request_with_action(action);
+        assert!(request.to_xml().contains("<target project=\"foo\" />"));
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_create_delete_package_serialises() {
+        let action = RequestAction::Delete {
+            target_project: "foo".to_string(),
+            target_package: Some("deleteme".to_string()),
+            target_repository: None,
+        };
+        let request = request_with_action(action);
+        assert!(request
+            .to_xml()
+            .contains("<target project=\"foo\" package=\"deleteme\" />"));
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_create_change_devel_serialises() {
+        let action = RequestAction::ChangeDevel {
+            source_project: "foo".to_string(),
+            source_package: "bar".to_string(),
+            target_project: "devprj".to_string(),
+            target_package: "devpkg".to_string(),
+        };
+        let request = request_with_action(action);
+        assert_eq!(
+            request.to_xml(),
+            "<request creator=\"creator\" id=\"42\">\n  <action type=\"change_devel\">\n    <source project=\"foo\" package=\"bar\" />\n    <target project=\"devprj\" package=\"devpkg\" />\n  </action>\n  <state name=\"new\" who=\"creator\" when=\"2010-12-13T13:02:03\" />\n</request>"
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_action_from_xml_add_role_parses_and_round_trips() {
+        let xml = request_document_with_action(
+            "<action type=\"add_role\">\n  <target package=\"bar\" project=\"foo\" />\n  <person name=\"user\" role=\"reader\" />\n  <group name=\"group\" role=\"reviewer\" />\n</action>",
+        );
+        let request = parse_request(&xml).expect("add_role parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::AddRole {
+                target_project: "foo".to_string(),
+                target_package: Some("bar".to_string()),
+                person: Some(("user".to_string(), "reader".to_string())),
+                group: Some(("group".to_string(), "reviewer".to_string())),
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_action_from_xml_submit_with_options_parses_and_round_trips() {
+        let xml = request_document_with_action(
+            "<action type=\"submit\">\n  <source package=\"bar\" project=\"foo\" />\n  <target package=\"bar\" project=\"foobar\" />\n  <options>\n    <sourceupdate>cleanup</sourceupdate>\n    <updatelink>1</updatelink>\n  </options>\n</action>",
+        );
+        let request = parse_request(&xml).expect("submit with options parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::Submit {
+                source_project: "foo".to_string(),
+                source_package: "bar".to_string(),
+                source_rev: None,
+                target_project: Some("foobar".to_string()),
+                target_package: Some("bar".to_string()),
+                sourceupdate: Some(SourceUpdate::Cleanup),
+                updatelink: true,
+                makeoriginolder: false,
+                acceptinfo: None,
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_action_from_xml_submit_with_acceptinfo_parses_and_round_trips() {
+        let xml = request_document_with_action(
+            "<action type=\"submit\">\n  <source package=\"bar\" project=\"testprj\" />\n  <target package=\"baz\" project=\"foobar\" />\n  <acceptinfo rev=\"5\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" xsrcmd5=\"ffffffffffffffffffffffffffffffff\" />\n</action>",
+        );
+        let request = parse_request(&xml).expect("submit with acceptinfo parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::Submit {
+                source_project: "testprj".to_string(),
+                source_package: "bar".to_string(),
+                source_rev: None,
+                target_project: Some("foobar".to_string()),
+                target_package: Some("baz".to_string()),
+                sourceupdate: None,
+                updatelink: false,
+                makeoriginolder: false,
+                acceptinfo: Some(AcceptInfo {
+                    rev: "5".to_string(),
+                    srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    oproject: None,
+                    opackage: None,
+                    osrcmd5: None,
+                    xsrcmd5: Some("ffffffffffffffffffffffffffffffff".to_string()),
+                    oxsrcmd5: None,
+                }),
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_parse_rejects_unknown_action_type() {
+        // An unknown action type at construction is unrepresentable in
+        // the typed model, and an unknown action kwarg cannot be
+        // passed to a typed constructor at all — so the parse refusal
+        // is the adoption of both invalid-argument cases: a document
+        // carrying an action the library does not know fails whole.
+        let xml = request_document_with_action(
+            "<action type=\"foo\"><source package=\"bar\" project=\"foo\" /></action>",
+        );
+        assert_eq!(parse_request(&xml), None);
+    }
+
+    #[test]
+    fn request_read_request1_parses_and_round_trips() {
+        let request = parse_request(REQUEST1_XML).expect("request 1 parses");
+        assert_eq!(request.id, 42);
+        assert_eq!(request.creator, "creator");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::Submit {
+                source_project: "foo".to_string(),
+                source_package: "bar".to_string(),
+                source_rev: Some("1".to_string()),
+                target_project: Some("foobar".to_string()),
+                target_package: Some("bar".to_string()),
+                sourceupdate: None,
+                updatelink: false,
+                makeoriginolder: false,
+                acceptinfo: None,
+            }
+        );
+        assert_eq!(
+            request.actions[1],
+            RequestAction::Delete {
+                target_project: "deleteme".to_string(),
+                target_package: None,
+                target_repository: None,
+            }
+        );
+        assert_eq!(request.state.name, RequestState::Accepted);
+        assert_eq!(request.state.when, "2010-12-27T01:36:29");
+        assert_eq!(request.state.who, "user1");
+        assert_eq!(request.state.approver, None);
+        assert_eq!(request.state.comment, "");
+        assert_eq!(request.history.len(), 1);
+        assert_eq!(request.history[0].when, "2010-12-13T13:02:03");
+        assert_eq!(request.history[0].who, "creator");
+        assert_eq!(request.history[0].description, "Create Request");
+        assert_eq!(request.history[0].comment, "foobar");
+        assert_eq!(request.title.as_deref(), Some("title of the request"));
+        assert_eq!(request.description, "this is a\nvery long\ndescription");
+        assert!(request.reviews.is_empty());
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_read_request2_parses_and_round_trips() {
+        let request = parse_request(REQUEST2_XML).expect("request 2 parses");
+        assert_eq!(request.id, 123);
+        assert_eq!(request.creator, "creator");
+        // The submit action carries no target element at all.
+        assert_eq!(
+            request.actions[0],
+            RequestAction::Submit {
+                source_project: "xyz".to_string(),
+                source_package: "abc".to_string(),
+                source_rev: None,
+                target_project: None,
+                target_package: None,
+                sourceupdate: Some(SourceUpdate::Cleanup),
+                updatelink: true,
+                makeoriginolder: false,
+                acceptinfo: None,
+            }
+        );
+        assert_eq!(
+            request.actions[1],
+            RequestAction::AddRole {
+                target_project: "home:foo".to_string(),
+                target_package: None,
+                person: Some(("bar".to_string(), "maintainer".to_string())),
+                group: Some(("groupxyz".to_string(), "reader".to_string())),
+            }
+        );
+        assert_eq!(request.state.name, RequestState::Review);
+        assert_eq!(request.state.when, "2010-12-27T01:36:29");
+        assert_eq!(request.state.approver.as_deref(), Some("someone"));
+        assert_eq!(request.state.who, "abc");
+        assert_eq!(request.state.comment, "");
+        assert_eq!(request.reviews.len(), 1);
+        assert_eq!(request.reviews[0].state, ReviewState::New);
+        assert_eq!(request.reviews[0].by_group.as_deref(), Some("group1"));
+        assert_eq!(
+            request.reviews[0].when.as_deref(),
+            Some("2010-12-28T00:11:22")
+        );
+        assert_eq!(request.reviews[0].who.as_deref(), Some("abc"));
+        assert_eq!(request.reviews[0].comment, "review start");
+        assert_eq!(request.reviews[0].by_user, None);
+        assert_eq!(request.history.len(), 1);
+        assert_eq!(request.history[0].when, "2010-12-11T00:00:00");
+        assert_eq!(request.history[0].who, "creator");
+        assert_eq!(request.history[0].comment, "");
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_review_with_history_parses_and_round_trips() {
+        // A review that was acted on carries one `<history>` child
+        // per change, each with a description of what happened —
+        // never empty, never a placeholder. The parser must read it,
+        // not refuse the whole request.
+        let xml = "<request creator=\"creator\" id=\"7\">\n  <action type=\"submit\">\n    <source package=\"bar\" project=\"foo\" />\n    <target package=\"bar\" project=\"foobar\" />\n  </action>\n  <state name=\"review\" when=\"2010-12-27T01:36:29\" who=\"abc\" />\n  <review by_user=\"Admin\" state=\"accepted\" when=\"2010-12-28T00:11:22\" who=\"abc\">\n    <comment>looks good</comment>\n    <history when=\"2010-12-28T00:12:00\" who=\"Admin\">\n      <description>Review got accepted</description>\n    </history>\n  </review>\n</request>";
+        let request = parse_request(xml).expect("review with history parses");
+        assert_eq!(request.reviews.len(), 1);
+        assert_eq!(request.reviews[0].state, ReviewState::Accepted);
+        assert_eq!(request.reviews[0].history.len(), 1);
+        assert_eq!(request.reviews[0].history[0].who, "Admin");
+        assert_eq!(
+            request.reviews[0].history[0].description,
+            "Review got accepted"
+        );
+        assert_eq!(request.reviews[0].history[0].comment, "");
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_review_obsoleted_parses() {
+        // `obsoleted` is a review-only state, set when the reviewer
+        // is removed; it never appears on a request itself.
+        let xml = "<request creator=\"creator\" id=\"8\">\n  <action type=\"submit\">\n    <source package=\"bar\" project=\"foo\" />\n    <target package=\"bar\" project=\"foobar\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"abc\" />\n  <review by_user=\"gone\" state=\"obsoleted\" when=\"2010-12-28T00:11:22\" who=\"abc\">\n    <history when=\"2010-12-28T00:12:00\" who=\"abc\">\n      <description>Review was updated</description>\n    </history>\n  </review>\n</request>";
+        let request = parse_request(xml).expect("obsoleted review parses");
+        assert_eq!(request.reviews.len(), 1);
+        assert_eq!(request.reviews[0].state, ReviewState::Obsoleted);
+        assert_eq!(request.reviews[0].history.len(), 1);
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_read_request3_empty_comment_and_description_drop_on_serialise() {
+        let xml = "<request creator=\"xyz\" id=\"2\">\n  <action type=\"set_bugowner\">\n    <target project=\"foo\" />\n    <person name=\"buguser\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-28T12:36:29\" who=\"xyz\">\n    <comment></comment>\n  </state>\n  <description></description>\n</request>";
+        let request = parse_request(xml).expect("request 3 parses");
+        assert_eq!(request.id, 2);
+        assert_eq!(request.creator, "xyz");
+        assert_eq!(request.state.name, RequestState::New);
+        assert_eq!(request.state.comment, "");
+        assert_eq!(request.description, "");
+        assert!(request.history.is_empty());
+        assert!(request.reviews.is_empty());
+        let serialised = request.to_xml();
+        assert!(
+            !serialised.contains("<comment>"),
+            "empty comment drops: {serialised}"
+        );
+        assert!(
+            !serialised.contains("<description>"),
+            "empty description drops: {serialised}"
+        );
+        assert_eq!(parse_request(&serialised), Some(request));
+    }
+
+    #[test]
+    fn request_legacy_form_parses_and_reserialises_modern() {
+        let xml = "<request creator=\"olduser\" id=\"1234\" type=\"submit\">\n  <submit>\n    <source package=\"baz\" project=\"foobar\" />\n    <target package=\"baz\" project=\"foo\" />\n  </submit>\n  <state name=\"new\" when=\"2010-12-30T02:11:22\" who=\"olduser\" />\n</request>";
+        let request = parse_request(xml).expect("legacy request parses");
+        assert_eq!(request.id, 1234);
+        assert_eq!(request.creator, "olduser");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::Submit {
+                source_project: "foobar".to_string(),
+                source_package: "baz".to_string(),
+                source_rev: None,
+                target_project: Some("foo".to_string()),
+                target_package: Some("baz".to_string()),
+                sourceupdate: None,
+                updatelink: false,
+                makeoriginolder: false,
+                acceptinfo: None,
+            }
+        );
+        assert_eq!(request.state.name, RequestState::New);
+        assert_eq!(request.state.when, "2010-12-30T02:11:22");
+        assert_eq!(request.state.who, "olduser");
+        // The modern form: an `<action>` element, and no `type` on
+        // the root.
+        let serialised = request.to_xml();
+        assert!(serialised.contains("<action type=\"submit\">"));
+        assert!(serialised.contains("<request creator=\"olduser\" id=\"1234\">"));
+        assert!(!serialised.contains("<submit>"));
+        assert_eq!(parse_request(&serialised), Some(request));
+    }
+
+    #[test]
+    fn request_get_actions_filters_by_type() {
+        let request = parse_request(LIST_VIEW1_XML).expect("list view parses");
+        assert_eq!(request.actions.len(), 8);
+        assert_eq!(request.actions_of(&["submit"]).len(), 2);
+        for action in request.actions_of(&["submit"]) {
+            assert_eq!(action.type_name(), "submit");
+        }
+        assert_eq!(
+            request
+                .actions_of(&["submit", "delete", "change_devel"])
+                .len(),
+            5
+        );
+        assert_eq!(request.actions_of(&[]).len(), 8);
+        assert_eq!(request.actions_of(&["delete"]).len(), 2);
+    }
+
+    #[test]
+    fn request_parse_rejects_unknown_child_element() {
+        let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n  <surprise>hello</surprise>\n</request>";
+        assert_eq!(parse_request(xml), None);
+    }
+
+    #[test]
+    fn request_parse_requires_a_state() {
+        let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n</request>";
+        assert_eq!(parse_request(xml), None);
+    }
+
+    #[test]
+    fn request_parse_rejects_missing_or_zero_id() {
+        let no_id = "<request creator=\"creator\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n</request>";
+        assert_eq!(parse_request(no_id), None);
+        let zero_id = no_id.replace("creator=\"creator\"", "creator=\"creator\" id=\"0\"");
+        assert_eq!(parse_request(&zero_id), None);
+    }
+
+    #[test]
+    fn request_parse_rejects_duplicate_state() {
+        let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n  <state name=\"review\" when=\"2010-12-28T01:36:29\" who=\"creator\" />\n</request>";
+        assert_eq!(parse_request(xml), None);
+    }
+
+    #[test]
+    fn request_parse_accepts_priority_and_rejects_an_unknown_one() {
+        let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n  <priority>important</priority>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n</request>";
+        let request = parse_request(xml).expect("priority parses");
+        assert_eq!(request.priority, Some(RequestPriority::Important));
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+        let bad = xml.replace("important", "urgent");
+        assert_eq!(parse_request(&bad), None);
+    }
+
+    #[test]
+    fn request_parse_accepts_accept_at() {
+        let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n  <accept_at>2010-12-30T00:00:00</accept_at>\n</request>";
+        let request = parse_request(xml).expect("accept_at parses");
+        assert_eq!(request.accept_at.as_deref(), Some("2010-12-30T00:00:00"));
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_parse_unescapes_entities_in_text() {
+        let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n  <title>fish &amp; chips</title>\n  <description>5 &lt; 6 &amp;&amp; 7 &gt; 6</description>\n</request>";
+        let request = parse_request(xml).expect("entities parse");
+        assert_eq!(request.title.as_deref(), Some("fish & chips"));
+        assert_eq!(request.description, "5 < 6 && 7 > 6");
+        // Re-serialising escapes them again, and re-parsing reads
+        // the same request back.
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn xml_unescape_decodes_named_and_numeric_entities() {
+        assert_eq!(
+            xml_unescape("a &amp; b &lt; c &gt; d &quot;e&quot; &apos;f&apos;"),
+            "a & b < c > d \"e\" 'f'"
+        );
+        assert_eq!(xml_unescape("&#65;&#x42;"), "AB");
+        assert_eq!(xml_unescape("&amp;lt;"), "&lt;");
+        assert_eq!(xml_unescape("plain text"), "plain text");
+        assert_eq!(xml_unescape("&bogus; stays"), "&bogus; stays");
+    }
+
+    #[test]
+    fn review_target_describe_names_each_part() {
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        assert_eq!(target.describe(), "user Admin");
+        let target = ReviewTarget::new(None, Some("reviewers"), None, None).unwrap();
+        assert_eq!(target.describe(), "group reviewers");
+        let target = ReviewTarget::new(None, None, Some("openSUSE:Factory"), None).unwrap();
+        assert_eq!(target.describe(), "project openSUSE:Factory");
+        let target = ReviewTarget::new(None, None, Some("openSUSE:Factory"), Some("foo")).unwrap();
+        assert_eq!(target.describe(), "project openSUSE:Factory/package foo");
+        let target = ReviewTarget::new(
+            Some("Admin"),
+            Some("reviewers"),
+            Some("openSUSE:Factory"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            target.describe(),
+            "user Admin, group reviewers, project openSUSE:Factory"
+        );
     }
 }
