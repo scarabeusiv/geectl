@@ -1496,6 +1496,36 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// Read the diff of submit request `id` (`POST
+    /// /request/:id?cmd=diff`): what the request changes, as a
+    /// unified diff — or, with `view_xml`, as the request XML with
+    /// the diff injected into it. An agent reads the diff to review
+    /// a request before acting on it: accepting or declining without
+    /// seeing the change is not a review. Requires credentials;
+    /// without them the call fails loudly before any request. The
+    /// diff is returned as the raw response body, unparsed: it is
+    /// caller-consumed text, not a structure the library acts on.
+    ///
+    /// The diff is fetched with a POST because that is the only way
+    /// the API offers it — but it changes nothing on the server, so
+    /// it takes no [`DryRun`]: a dry-run caller reading a diff is
+    /// still only reading.
+    pub fn request_diff(&self, id: &str, view_xml: bool) -> Result<String, GeectlError> {
+        let id = validate_request_id(id)?;
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot read a submit request's diff without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("cmd", "diff")];
+        if view_xml {
+            query.push(("view", "xml"));
+        }
+        let url = build_url(&self.base, &["request", &id.to_string()], &query);
+        self.http.post_text(&url, "", &self.credentials)
+    }
+
     /// Delete `project`/`package` from OBS (`DELETE
     /// /source/<project>/<package>`): the manual branch cleanup.
     /// Requests filed through this library clean up on accept by
@@ -11748,5 +11778,47 @@ description</description>
             .add_comment("42", "looks good to me", None, &dry)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    // -- Request diff.
+
+    #[test]
+    fn request_diff_plain_posts_diff_and_returns_the_body() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=diff",
+            "diff --git a/foo b/foo\n",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let diff = obs.request_diff("42", false).expect("diff reads");
+        assert_eq!(diff, "diff --git a/foo b/foo\n");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "https://api.opensuse.org/request/42?cmd=diff");
+        assert_eq!(calls[0].1, "");
+        assert!(calls[0].2, "the diff read is credentialed");
+    }
+
+    #[test]
+    fn request_diff_xml_adds_the_view_param() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=diff&view=xml",
+            "<request id=\"42\"></request>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let diff = obs.request_diff("42", true).expect("xml diff reads");
+        assert_eq!(diff, "<request id=\"42\"></request>");
+        assert_eq!(
+            http.post_calls()[0].0,
+            "https://api.opensuse.org/request/42?cmd=diff&view=xml"
+        );
+    }
+
+    #[test]
+    fn request_diff_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let err = obs.request_diff("42", false).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
     }
 }
