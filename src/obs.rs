@@ -568,18 +568,17 @@ impl<'a> ObsClient<'a> {
         })
     }
 
-    /// File a submit request: POST the request XML to the OBS API
-    /// (`POST /request?cmd=create`) and return the new request id.
-    /// Requires credentials; without them the filing fails loudly
-    /// before any request. The dry-run guard lives in [`SrFiling`],
-    /// not here — do not call this in dry-run.
+    /// File `payload` as a submit request: render it and POST it to
+    /// the OBS API (`POST /request?cmd=create`) and return the new
+    /// request id. Requires credentials; without them the filing
+    /// fails loudly before any request.
     ///
-    /// Convention, not compiler-enforced: [`SrFiling`] is the single
-    /// permitted caller in this crate. A direct call bypasses the
-    /// dry-run guard and the dedup check, so do not add another one;
-    /// enforcing it would need a capability design, which is a
-    /// follow-up.
-    pub fn create_request(&self, xml: &str) -> Result<String, GeectlError> {
+    /// Private: [`SrFiling`] is the only caller. Filing goes through
+    /// the guarded workflow there (payload validation, dry-run, and
+    /// the dedup check) — a direct call would bypass all three, so
+    /// there is no direct call to bypass them with. The request XML
+    /// is rendered here from the typed payload; no caller passes XML.
+    fn create_request(&self, payload: &SrPayload) -> Result<String, GeectlError> {
         if !self.has_basic() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
@@ -587,7 +586,7 @@ impl<'a> ObsClient<'a> {
             ));
         }
         let url = build_url(&self.base, &["request"], &[("cmd", "create")]);
-        let body = self.http.post(&url, xml, &self.credentials)?;
+        let body = self.http.post(&url, &payload.to_xml(), &self.credentials)?;
         parse_request_id(&body).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
@@ -2074,8 +2073,7 @@ impl<'a> SrFiling<'a> {
                 ),
             ));
         }
-        let xml = payload.to_xml();
-        let id = self.obs.create_request(&xml)?;
+        let id = self.obs.create_request(payload)?;
         Ok(Some(id))
     }
 
@@ -2631,20 +2629,21 @@ mod tests {
     // --- create_request ---
 
     #[test]
-    fn create_request_posts_xml_and_returns_id() {
+    fn create_request_posts_payload_and_returns_id() {
+        let payload = payload();
         let http = FakeHttp::new().with_post(
             "https://api.opensuse.org/request?cmd=create",
             "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
-        let id = client
-            .create_request("<request><action type=\"submit\"/></request>")
-            .unwrap();
+        let id = client.create_request(&payload).unwrap();
         assert_eq!(id, "1400001");
         let posted = http.post_calls();
         assert_eq!(posted.len(), 1);
         assert_eq!(posted[0].0, "https://api.opensuse.org/request?cmd=create");
-        assert_eq!(posted[0].1, "<request><action type=\"submit\"/></request>");
+        // The posted body is the payload's own rendering: the typed
+        // path is the only path, and no XML is ever handed in.
+        assert_eq!(posted[0].1, payload.to_xml());
         // The filing POST carried the credentials.
         assert!(posted[0].2);
     }
@@ -2656,9 +2655,7 @@ mod tests {
             "<request id=\"1400001\"></request>",
         );
         let client = ObsClient::new(&http);
-        assert!(client
-            .create_request("<request><action type=\"submit\"/></request>")
-            .is_err());
+        assert!(client.create_request(&payload()).is_err());
         assert!(http.post_calls().is_empty());
     }
 
@@ -2668,9 +2665,7 @@ mod tests {
         // instead of silently reporting success.
         let http = FakeHttp::new();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
-        assert!(client
-            .create_request("<request><action type=\"submit\"/></request>")
-            .is_err());
+        assert!(client.create_request(&payload()).is_err());
     }
 
     #[test]
