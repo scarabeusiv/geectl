@@ -1526,6 +1526,40 @@ impl<'a> ObsClient<'a> {
         self.http.post_text(&url, "", &self.credentials)
     }
 
+    /// List the submit requests matching `search` (`GET
+    /// /search/request`): the typed list-my-requests operation. An
+    /// agent lists requests to triage — its own open requests, the
+    /// open requests targeting a package, the requests waiting on a
+    /// reviewer — and each result is a whole [`Request`], parsed in
+    /// full, so the caller can filter further without another round
+    /// trip. Requires credentials; without them the call fails loudly
+    /// before any request. An unexpected response is an error, never
+    /// an empty list.
+    pub fn search_requests(&self, search: &RequestSearch) -> Result<Vec<Request>, GeectlError> {
+        let match_expr = search.match_expr()?;
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot search submit requests without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("match", &match_expr)];
+        if search.wants_history() {
+            query.push(("withhistory", "1"));
+        }
+        if search.wants_full_history() {
+            query.push(("withfullhistory", "1"));
+        }
+        let url = build_url(&self.base, &["search", "request"], &query);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_request_collection(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS request search response",
+            )
+        })
+    }
+
     /// Delete `project`/`package` from OBS (`DELETE
     /// /source/<project>/<package>`): the manual branch cleanup.
     /// Requests filed through this library clean up on accept by
@@ -11820,5 +11854,122 @@ description</description>
         let err = obs.request_diff("42", false).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn search_requests_returns_parsed_requests() {
+        let collection =
+            format!("<collection matches=\"2\">\n{REQUEST1_XML}\n{REQUEST2_XML}\n</collection>");
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/request?match=%28%40id%3D%2742%27%20or%20%40id%3D%27123%27%29%20and%20state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
+            &collection,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search = RequestSearch::new().request_ids(vec![42, 123]);
+        let requests = obs.search_requests(&search).expect("search parses");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].id, 42);
+        assert_eq!(requests[1].id, 123);
+        let calls = http.get_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1, "the search is credentialed");
+    }
+
+    #[test]
+    fn search_requests_empty_collection_is_empty() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
+            "<collection matches=\"0\"></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let requests = obs
+            .search_requests(&RequestSearch::new())
+            .expect("empty search parses");
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn search_requests_unexpected_response_is_error() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
+            "not a collection at all",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = obs.search_requests(&RequestSearch::new()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn search_requests_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let err = obs.search_requests(&RequestSearch::new()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn search_requests_with_history_adds_the_history_param() {
+        // The search is the default open-states search with the
+        // history flag: an all-empty search is refused (the server
+        // answers an empty match with 400), so the flag rides on a
+        // real filter.
+        let search = RequestSearch::new().with_history(true);
+        let url = build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[
+                ("match", &search.match_expr().unwrap()),
+                ("withhistory", "1"),
+            ],
+        );
+        let http = FakeHttp::new().with_get(&url, "<collection matches=\"0\"></collection>");
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let requests = obs.search_requests(&search).expect("history search parses");
+        assert!(requests.is_empty());
+        assert_eq!(http.get_calls()[0].0, url);
+    }
+
+    #[test]
+    fn search_requests_with_full_history_adds_the_full_history_param() {
+        // As above, with the full-history flag instead.
+        let search = RequestSearch::new().with_full_history(true);
+        let url = build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[
+                ("match", &search.match_expr().unwrap()),
+                ("withfullhistory", "1"),
+            ],
+        );
+        let http = FakeHttp::new().with_get(&url, "<collection matches=\"0\"></collection>");
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let requests = obs.search_requests(&search).expect("full history parses");
+        assert!(requests.is_empty());
+        assert_eq!(http.get_calls()[0].0, url);
+    }
+
+    #[test]
+    fn parse_request_collection_rejects_a_malformed_request() {
+        let collection = "<collection matches=\"1\">\n<request creator=\"creator\" id=\"42\">\n  <action type=\"explode\">\n    <target project=\"foo\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n</request>\n</collection>";
+        assert_eq!(parse_request_collection(collection), None);
+    }
+
+    #[test]
+    fn parse_request_collection_rejects_a_count_with_no_requests() {
+        assert_eq!(
+            parse_request_collection("<collection matches=\"2\"></collection>"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_request_collection_rejects_a_short_collection() {
+        // The server returns every match in one response (over the
+        // limit it refuses with 403 rather than truncating), so a
+        // collection carrying fewer requests than its `matches`
+        // count is a shape change, not a partial result.
+        let collection = format!("<collection matches=\"2\">\n{REQUEST1_XML}\n</collection>");
+        assert_eq!(parse_request_collection(&collection), None);
     }
 }
