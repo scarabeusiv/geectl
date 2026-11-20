@@ -127,13 +127,17 @@ pub fn is_retryable_method(method: &str) -> bool {
 /// The HTTP client interface. Implementations are synchronous and return
 /// the response body as a string on a 2xx status, or a [`GeectlError`].
 /// `get` uses the client's configured credentials (from its
-/// [`AuthProvider`], or none); `get_with`, `post`, `post_text`, and
-/// `delete` take explicit credentials, for callers that resolve them
+/// [`AuthProvider`], or none); `get_with`, `get_bytes`, `post`,
+/// `post_text`, and `delete` take explicit credentials, for callers
+/// that resolve them
 /// per request (e.g. the OBS operations, which read public endpoints
 /// without credentials and authenticated endpoints with OBS Basic).
 /// `get` and `get_with` ask for `application/xml`: the API answers
 /// XML, and a path the WebUI also serves (the owner search proved it)
-/// would otherwise come back as an HTML page.
+/// would otherwise come back as an HTML page. `get_bytes` sends no
+/// `Accept` header: a binary download is not an XML document, and
+/// asking for XML could invite an XML error document in place of the
+/// file.
 /// `post` sends the body as `application/xml`, `post_text` as
 /// `text/plain` (the request `changestate` comment, which the server
 /// reads as the raw body); both, and `delete`, are never retried.
@@ -152,6 +156,21 @@ pub fn is_retryable_method(method: &str) -> bool {
 pub trait HttpClient {
     fn get(&self, url: &str) -> Result<String, GeectlError>;
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
+    /// GET a URL and return the raw response bytes. The byte
+    /// counterpart of [`HttpClient::get_with`]: same transport guard,
+    /// same retry policy, same body cap — but no UTF-8 check, so it
+    /// can download a binary (an RPM), and no `Accept` header: the
+    /// bytes are a file, not an XML document. The default implementation
+    /// refuses: a client that only reads text cannot download
+    /// binaries, and a caller that needs bytes gets an honest error
+    /// instead of a mojibake string. [`UreqClient`] overrides it.
+    fn get_bytes(&self, url: &str, credentials: &Credentials) -> Result<Vec<u8>, GeectlError> {
+        let _ = (url, credentials);
+        Err(GeectlError::new(
+            ErrorKind::InternalError,
+            "this HTTP client cannot download binary bodies",
+        ))
+    }
     fn post(&self, url: &str, body: &str, credentials: &Credentials)
         -> Result<String, GeectlError>;
 
@@ -257,6 +276,108 @@ impl UreqClient {
                 "an SSH key cannot authenticate an HTTP request",
             )),
         }
+    }
+
+    /// One GET, retried: the retry loop shared by `get_with` (text)
+    /// and `get_bytes` (raw bytes). Only the body reader differs:
+    /// text goes through the UTF-8 check, bytes do not. `accept` is
+    /// the `Accept` header to send, if any: text reads ask for
+    /// `application/xml` (a dual-routed path would otherwise serve the
+    /// WebUI HTML page), a binary download sends none — the bytes are
+    /// a file, not an XML document. `read_body` is `FnOnce`: the body
+    /// is read at most once, on the first successful response, so a
+    /// closure that consumes its captures is fine. A redirect is
+    /// refused, like POST: automatic redirects are disabled, so a 3xx
+    /// is an error, not a body.
+    fn get_with_body<T>(
+        &self,
+        url: &str,
+        credentials: &Credentials,
+        accept: Option<&str>,
+        read_body: impl FnOnce(ureq::Body) -> Result<T, GeectlError>,
+    ) -> Result<T, GeectlError> {
+        // Credentials never travel over cleartext http, except to a
+        // loopback host (see require_credentials_transport).
+        require_credentials_transport(url, credentials)?;
+        let mut last_error: Option<GeectlError> = None;
+        for attempt in 0..=RETRY_POLICY.max_retries {
+            // Ask for XML when the caller wants it: the deployment
+            // serves the WebUI HTML page for a path that exists in
+            // both the API and WebUI route sets (the owner search
+            // proved it) unless the request asks for XML. A binary
+            // download sends no `Accept` header (see `get_bytes`).
+            let mut request = self.apply_auth(self.agent.get(url), credentials)?;
+            if let Some(accept) = accept {
+                request = request.header("Accept", accept);
+            }
+            match request.call() {
+                Ok(resp) => {
+                    if resp.status().is_redirection() {
+                        let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
+                        return Err(redirect_error(resp.status().as_u16(), location));
+                    }
+                    return read_body(resp.into_body());
+                }
+                Err(ureq::Error::StatusCode(code)) => {
+                    let safe_url = sanitize_url_for_error(url);
+                    match status_action(code, &safe_url) {
+                        StatusAction::Return(err) => return Err(err),
+                        StatusAction::Retry(err) => {
+                            last_error = Some(err);
+                        }
+                    }
+                }
+                Err(ureq::Error::Tls(msg)) => {
+                    // TLS failures are never retried: retrying a failed
+                    // handshake or an untrusted certificate cannot
+                    // succeed, and it would hammer a server that
+                    // already refused us.
+                    return Err(GeectlError::new(
+                        ErrorKind::TlsError,
+                        format!("TLS error: {msg}"),
+                    ));
+                }
+                Err(ureq::Error::Rustls(e)) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::TlsError,
+                        format!("TLS error: {e}"),
+                    ));
+                }
+                Err(ureq::Error::Pem(e)) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::TlsError,
+                        format!("TLS error: {e}"),
+                    ));
+                }
+                Err(ureq::Error::Timeout(_)) => {
+                    last_error = Some(GeectlError::new(
+                        ErrorKind::Timeout,
+                        format!("request to {} timed out", sanitize_url_for_error(url)),
+                    ));
+                }
+                Err(ureq::Error::Io(e)) => {
+                    last_error = Some(GeectlError::new(ErrorKind::NetworkError, e.to_string()));
+                }
+                Err(e) => {
+                    last_error = Some(GeectlError::new(ErrorKind::ServerError, e.to_string()));
+                }
+            }
+            // Only idempotent methods retry. This function only ever
+            // issues GET (which is retryable), so the gate is a
+            // debug_assert: it documents the policy and fails a debug
+            // build if the method ever changes, without dead code in
+            // release. A future method must gate on its real method.
+            debug_assert!(
+                is_retryable_method("GET"),
+                "GET must stay retryable; a new method needs its own gate"
+            );
+            if attempt < RETRY_POLICY.max_retries {
+                std::thread::sleep(RETRY_POLICY.backoff_base * 2u32.pow(attempt));
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            GeectlError::new(ErrorKind::InternalError, "GET failed without an error")
+        }))
     }
 
     /// One POST attempt with the given content type. POST is never
@@ -475,12 +596,8 @@ fn redirect_error(status: u16, location: Option<&str>) -> GeectlError {
 /// Read a response body with a cap. Reads at most `MAX_BODY_BYTES + 1`
 /// bytes; a body longer than the cap fails with `ServerError` instead
 /// of growing the process without bound. The `+ 1` distinguishes "at
-/// the cap" (accepted) from "over the cap" (rejected). Bytes are read
-/// first and converted to UTF-8 after the cap check: converting while
-/// reading would split a multi-byte character at the cap (and report
-/// the over-cap body as a network error), and an in-cap body that is
-/// not valid UTF-8 is a server error, not a transport failure.
-fn read_body_capped(reader: impl Read) -> Result<String, GeectlError> {
+/// the cap" (accepted) from "over the cap" (rejected).
+fn read_bytes_capped(reader: impl Read) -> Result<Vec<u8>, GeectlError> {
     let mut bytes = Vec::new();
     reader
         .take(MAX_BODY_BYTES as u64 + 1)
@@ -492,6 +609,16 @@ fn read_body_capped(reader: impl Read) -> Result<String, GeectlError> {
             format!("response body exceeds the {MAX_BODY_BYTES}-byte limit"),
         ));
     }
+    Ok(bytes)
+}
+
+/// Read a response body as text: the capped bytes, converted to
+/// UTF-8 after the cap check. Converting while reading would split a
+/// multi-byte character at the cap (and report the over-cap body as a
+/// network error), and an in-cap body that is not valid UTF-8 is a
+/// server error, not a transport failure.
+fn read_body_capped(reader: impl Read) -> Result<String, GeectlError> {
+    let bytes = read_bytes_capped(reader)?;
     String::from_utf8(bytes).map_err(|e| {
         GeectlError::new(
             ErrorKind::ServerError,
@@ -651,87 +778,15 @@ impl HttpClient for UreqClient {
     }
 
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
-        // Credentials never travel over cleartext http, except to a
-        // loopback host (see require_credentials_transport).
-        require_credentials_transport(url, credentials)?;
-        let mut last_error: Option<GeectlError> = None;
-        for attempt in 0..=RETRY_POLICY.max_retries {
-            // Ask for XML: the deployment serves the WebUI HTML page
-            // for a path that exists in both the API and WebUI route
-            // sets (the owner search proved it) unless the request
-            // asks for XML. `get` funnels through here, so every GET
-            // carries it.
-            let request = self
-                .apply_auth(self.agent.get(url), credentials)?
-                .header("Accept", "application/xml");
-            match request.call() {
-                Ok(resp) => {
-                    if resp.status().is_redirection() {
-                        let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
-                        return Err(redirect_error(resp.status().as_u16(), location));
-                    }
-                    return read_body_capped(resp.into_body().into_reader());
-                }
-                Err(ureq::Error::StatusCode(code)) => {
-                    let safe_url = sanitize_url_for_error(url);
-                    match status_action(code, &safe_url) {
-                        StatusAction::Return(err) => return Err(err),
-                        StatusAction::Retry(err) => {
-                            last_error = Some(err);
-                        }
-                    }
-                }
-                Err(ureq::Error::Tls(msg)) => {
-                    // TLS failures are never retried: retrying a failed
-                    // handshake or an untrusted certificate cannot
-                    // succeed, and it would hammer a server that
-                    // already refused us.
-                    return Err(GeectlError::new(
-                        ErrorKind::TlsError,
-                        format!("TLS error: {msg}"),
-                    ));
-                }
-                Err(ureq::Error::Rustls(e)) => {
-                    return Err(GeectlError::new(
-                        ErrorKind::TlsError,
-                        format!("TLS error: {e}"),
-                    ));
-                }
-                Err(ureq::Error::Pem(e)) => {
-                    return Err(GeectlError::new(
-                        ErrorKind::TlsError,
-                        format!("TLS error: {e}"),
-                    ));
-                }
-                Err(ureq::Error::Timeout(_)) => {
-                    last_error = Some(GeectlError::new(
-                        ErrorKind::Timeout,
-                        format!("request to {} timed out", sanitize_url_for_error(url)),
-                    ));
-                }
-                Err(ureq::Error::Io(e)) => {
-                    last_error = Some(GeectlError::new(ErrorKind::NetworkError, e.to_string()));
-                }
-                Err(e) => {
-                    last_error = Some(GeectlError::new(ErrorKind::ServerError, e.to_string()));
-                }
-            }
-            // Only idempotent methods retry. This function only ever
-            // issues GET (which is retryable), so the gate is a
-            // debug_assert: it documents the policy and fails a debug
-            // build if the method ever changes, without dead code in
-            // release. A future method must gate on its real method.
-            debug_assert!(
-                is_retryable_method("GET"),
-                "GET must stay retryable; a new method needs its own gate"
-            );
-            if attempt < RETRY_POLICY.max_retries {
-                std::thread::sleep(RETRY_POLICY.backoff_base * 2u32.pow(attempt));
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            GeectlError::new(ErrorKind::InternalError, "GET failed without an error")
-        }))
+        self.get_with_body(url, credentials, Some("application/xml"), |body| {
+            read_body_capped(body.into_reader())
+        })
+    }
+
+    fn get_bytes(&self, url: &str, credentials: &Credentials) -> Result<Vec<u8>, GeectlError> {
+        self.get_with_body(url, credentials, None, |body| {
+            read_bytes_capped(body.into_reader())
+        })
     }
 
     fn post_json(&self, url: &str, body: &str) -> Result<String, GeectlError> {
@@ -1759,6 +1814,149 @@ mod tests {
         );
         assert_eq!(auth.as_deref(), Some(expected.as_str()));
         assert_eq!(received_body, body);
+    }
+
+    /// A loopback server that answers one request with `body` as raw
+    /// bytes, then exits. Returns the port and the server thread. The
+    /// accept loop is nonblocking with a 5s deadline, so a test that
+    /// never connects does not hang the suite.
+    fn serve_bytes_once(body: Vec<u8>) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf);
+                        let mut response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        response.extend_from_slice(&body);
+                        let _ = stream.write_all(&response);
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn get_bytes_returns_raw_bytes_that_get_with_refuses() {
+        // RPM magic plus non-UTF-8 bytes: a binary body.
+        let bytes: Vec<u8> = vec![0xED, 0xAB, 0xEE, 0xDB, 0x03, 0x00, 0x00, 0x00, 0xFF, 0xFE];
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let (port, server) = serve_bytes_once(bytes.clone());
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let got = client.get_bytes(&url, &Credentials::None).unwrap();
+        assert_eq!(got, bytes);
+        server.join().expect("server thread");
+        // The same bytes through get_with are a server error, not a
+        // mojibake string: a text read must not silently corrupt a
+        // binary body.
+        let (port, server) = serve_bytes_once(bytes.clone());
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let err = client.get_with(&url, &Credentials::None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        server.join().expect("server thread");
+    }
+
+    /// A loopback server that answers 200 with `body` once and
+    /// captures the request head (method line + headers) it received.
+    /// Returns the port, the server thread, and the captured head.
+    fn serve_bytes_once_capture_request(
+        body: Vec<u8>,
+    ) -> (
+        u16,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("local addr").port();
+        let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = std::sync::Arc::clone(&captured);
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        *captured_clone.lock().expect("capture lock") = Some(head);
+                        let mut response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        response.extend_from_slice(&body);
+                        let _ = stream.write_all(&response);
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (port, handle, captured)
+    }
+
+    #[test]
+    fn get_bytes_sends_no_accept_xml_header() {
+        // A binary download must not ask for XML: the bytes are a
+        // file, not a document. The text path still asks for it.
+        let bytes: Vec<u8> = vec![0xED, 0xAB, 0xEE, 0xDB];
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let (port, server, request) = serve_bytes_once_capture_request(bytes.clone());
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let got = client.get_bytes(&url, &Credentials::None).unwrap();
+        assert_eq!(got, bytes);
+        server.join().expect("server thread");
+        let head = request
+            .lock()
+            .expect("request lock")
+            .clone()
+            .expect("request seen");
+        assert!(
+            !head.contains("accept: application/xml"),
+            "binary download asked for XML: {head}"
+        );
+        let (port, server, request) = serve_bytes_once_capture_request(b"<collection/>".to_vec());
+        let url = format!("http://127.0.0.1:{port}/collection");
+        let _ = client.get_with(&url, &Credentials::None).unwrap();
+        server.join().expect("server thread");
+        let head = request
+            .lock()
+            .expect("request lock")
+            .clone()
+            .expect("request seen");
+        assert!(
+            head.contains("accept: application/xml"),
+            "text read did not ask for XML: {head}"
+        );
     }
 
     /// A loopback server that counts requests and answers 500 to each.

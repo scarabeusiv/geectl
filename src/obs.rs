@@ -150,17 +150,28 @@ pub fn valid_attribute_name(name: &str) -> bool {
 /// Mirrors the server's rule (`PackageService::FileVerifier#file_name_invalid?`:
 /// `^[^./][^/]+$` — first character not `.` or `/`, no `/` anywhere;
 /// the `+` needs at least one more character, so a one-character name
-/// is invalid and the minimum length is two), plus the two names the
+/// is invalid and the minimum length is two), plus the names the
 /// routes reserve: `_meta` (the package-meta route, not a file) and
-/// `_attribute` (rejected by `Package.verify_file!`). Anything else is
-/// rejected rather than quoted into a URL, where a `/` would rewrite
-/// the request.
+/// `_attribute` (rejected by `Package.verify_file!`), and the build
+/// routes' leaves (`_log`, `_status`, `_buildinfo`, `_history`,
+/// `_jobstatus`, `_jobhistory`) — under `/build/.../<package>/` those
+/// address the log, status, buildinfo, history, job-status, and
+/// job-history routes, not a
+/// file, so a download by one of those names would return route
+/// output as if it were a file. Anything else is rejected rather
+/// than quoted into a URL, where a `/` would rewrite the request.
 pub fn valid_obs_filename(name: &str) -> bool {
     name.chars().count() >= 2
         && !name.starts_with('.')
         && !name.contains('/')
         && name != "_meta"
         && name != "_attribute"
+        && name != "_log"
+        && name != "_status"
+        && name != "_buildinfo"
+        && name != "_history"
+        && name != "_jobstatus"
+        && name != "_jobhistory"
 }
 
 /// Split a `project/package` path on `/`, dropping empty segments:
@@ -3695,6 +3706,100 @@ impl<'a> ObsClient<'a> {
         );
         let body = self.http.get_with(&url, &self.credentials)?;
         parse_job_history(&body)
+    }
+
+    /// The built files for `package` in `repository`/`arch`: the
+    /// binary RPMs plus the build artifacts (`_buildenv`,
+    /// `_statistics`, `rpmlint.log`, the `.src.rpm`, `-debuginfo` and
+    /// `-debugsource` when built). With `package` None, the whole
+    /// repository's files (`_repository`). An empty list means no
+    /// binaries: a never-built existing package answers 200 with an
+    /// empty list. A 404 is an error (the package or project does not
+    /// exist), never an empty list: a misspelled package must not read
+    /// as "nothing built".
+    /// Requires OBS Basic credentials. A multibuild flavor travels as
+    /// `pkg:flavor`.
+    pub fn list_binaries(
+        &self,
+        project: &str,
+        package: Option<&str>,
+        repository: &str,
+        arch: &str,
+    ) -> Result<Vec<BinaryFile>, GeectlError> {
+        Self::validate_build_coordinates(project, package, repository, arch)?;
+        self.require_build_credentials()?;
+        let package = package.unwrap_or("_repository");
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, package],
+            &[],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_binary_list(&body)
+    }
+
+    /// Download one built file (`filename`) for `package` in
+    /// `repository`/`arch`: the raw bytes. Use it for a binary RPM or
+    /// a build artifact by name (`rpmlint.log`). The download is
+    /// capped at 10 MiB by the transport's body limit, like every
+    /// read: a file larger than 10 MiB is an error, not a truncated
+    /// download. Requires OBS Basic credentials. A 404 is an error
+    /// (the file does not exist).
+    pub fn download_binary(
+        &self,
+        project: &str,
+        package: &str,
+        repository: &str,
+        arch: &str,
+        filename: &str,
+    ) -> Result<Vec<u8>, GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        if !valid_obs_filename(filename) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS binary filename: {filename:?}"),
+            ));
+        }
+        self.require_build_credentials()?;
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, package, filename],
+            &[],
+        );
+        self.http.get_bytes(&url, &self.credentials)
+    }
+
+    /// The metadata of a built file (`filename`) for `package` in
+    /// `repository`/`arch`: the RPM header fields plus the dependency
+    /// lists. With `ext`, the `fileinfo_ext` view: each required
+    /// dependency names the packages providing it, and each provided
+    /// dependency names the packages requiring it. Requires OBS Basic
+    /// credentials. A 404 is an error (the file does not exist).
+    pub fn fileinfo(
+        &self,
+        project: &str,
+        package: &str,
+        repository: &str,
+        arch: &str,
+        filename: &str,
+        ext: bool,
+    ) -> Result<FileInfo, GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        if !valid_obs_filename(filename) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS binary filename: {filename:?}"),
+            ));
+        }
+        self.require_build_credentials()?;
+        let view = if ext { "fileinfo_ext" } else { "fileinfo" };
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, package, filename],
+            &[("view", view)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_fileinfo(&body)
     }
 
     /// Build the OBS search URL for open submit requests targeting
@@ -8592,6 +8697,362 @@ pub(crate) fn parse_job_history(body: &str) -> Result<Vec<JobHistoryEntry>, Geec
     Ok(entries)
 }
 
+/// One built file in a build result directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryFile {
+    /// The file name (e.g. `foo-1.0-1.x86_64.rpm`, `_buildenv`).
+    pub name: String,
+    /// The file size in bytes, if the server reported it.
+    pub size: Option<u64>,
+    /// The file mtime (unix time), if the server reported it.
+    pub mtime: Option<u64>,
+}
+
+/// The metadata of a built file: the RPM header fields (name,
+/// epoch, version, release, arch, source, summary, description,
+/// disturl, size, mtime) plus the dependency lists (plain view) and
+/// the resolved dependencies (`fileinfo_ext` view).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfo {
+    /// The file name.
+    pub filename: String,
+    /// The RPM name.
+    pub name: Option<String>,
+    /// The RPM epoch.
+    pub epoch: Option<u64>,
+    /// The RPM version.
+    pub version: Option<String>,
+    /// The RPM release.
+    pub release: Option<String>,
+    /// The RPM architecture.
+    pub arch: Option<String>,
+    /// The source package, for a source RPM.
+    pub source: Option<String>,
+    /// The RPM summary.
+    pub summary: Option<String>,
+    /// The RPM description.
+    pub description: Option<String>,
+    /// The dist URL identifying where the file was built.
+    pub disturl: Option<String>,
+    /// The file size in bytes.
+    pub size: Option<u64>,
+    /// The file mtime (unix time).
+    pub mtime: Option<u64>,
+    /// The dependencies the file provides (plain view).
+    pub provides: Vec<String>,
+    /// The dependencies the file requires (plain view).
+    pub requires: Vec<String>,
+    /// The pre-requires (plain view).
+    pub prerequires: Vec<String>,
+    /// The conflicts (plain view).
+    pub conflicts: Vec<String>,
+    /// The obsoletes (plain view).
+    pub obsoletes: Vec<String>,
+    /// The recommends (plain view).
+    pub recommends: Vec<String>,
+    /// The supplements (plain view).
+    pub supplements: Vec<String>,
+    /// The suggests (plain view).
+    pub suggests: Vec<String>,
+    /// The enhances (plain view).
+    pub enhances: Vec<String>,
+    /// The dependencies the file provides, with the packages that
+    /// require each one (`fileinfo_ext` view only).
+    pub provides_ext: Vec<ExtDependency>,
+    /// The dependencies the file requires, with the package providing
+    /// each one (`fileinfo_ext` view only).
+    pub requires_ext: Vec<ExtDependency>,
+    /// The dependencies the file recommends, with the package
+    /// providing each one (`fileinfo_ext` view only).
+    pub recommends_ext: Vec<ExtDependency>,
+    /// The dependencies the file supplements, with the package
+    /// providing each one (`fileinfo_ext` view only).
+    pub supplements_ext: Vec<ExtDependency>,
+}
+
+/// One dependency in a `fileinfo_ext` view, with its resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtDependency {
+    /// The dependency (e.g. `libc.so.6()(64bit)`).
+    pub dep: String,
+    /// For a required dependency: the packages providing it, if
+    /// any were found in the repository.
+    pub provided_by: Vec<ProvidedBy>,
+    /// For a provided dependency: the packages requiring it.
+    pub required_by: Vec<ProvidedBy>,
+}
+
+/// A package named by a `fileinfo_ext` resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvidedBy {
+    /// The package name.
+    pub name: String,
+    /// The package epoch.
+    pub epoch: Option<u64>,
+    /// The package version.
+    pub version: Option<String>,
+    /// The package release.
+    pub release: Option<String>,
+    /// The package architecture.
+    pub arch: Option<String>,
+    /// The project the package comes from.
+    pub project: Option<String>,
+    /// The repository the package comes from.
+    pub repository: Option<String>,
+}
+
+/// Parse a `<binarylist>...</binarylist>` document into the built
+/// files. A document that is not a binarylist — or a `<binary>`
+/// without a filename, or with a non-numeric size/mtime — is a server
+/// error, never an empty list.
+pub(crate) fn parse_binary_list(body: &str) -> Result<Vec<BinaryFile>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS binary list response: not a <binarylist> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<binarylist") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_open) else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<binarylist/>`: no binaries built.
+        return Ok(Vec::new());
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</binarylist>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</binarylist>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut files = Vec::new();
+    for element in xml_elements(inner, "binary")? {
+        let (tag, _) = xml_split_element(element, "binary");
+        let name = xml_attr(tag, "filename").ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS binary list response: <binary> without filename",
+            )
+        })?;
+        files.push(BinaryFile {
+            name,
+            size: xml_attr_number(tag, "size")?,
+            mtime: xml_attr_number(tag, "mtime")?,
+        });
+    }
+    Ok(files)
+}
+
+/// Parse one `<provided_by>` / `<requiredby>` resolution element
+/// (both carry the same attributes) into the package it names.
+fn parse_provided_by(tag: &str) -> Result<ProvidedBy, GeectlError> {
+    let name = xml_attr(tag, "name").ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS fileinfo response: a dependency resolution without name",
+        )
+    })?;
+    Ok(ProvidedBy {
+        name,
+        epoch: xml_attr_number(tag, "epoch")?,
+        version: xml_attr(tag, "version"),
+        release: xml_attr(tag, "release"),
+        arch: xml_attr(tag, "arch"),
+        project: xml_attr(tag, "project"),
+        repository: xml_attr(tag, "repository"),
+    })
+}
+
+/// Parse one `<*_ext>` dependency element into its dependency
+/// and its resolution: the packages requiring a provided dependency
+/// (`<requiredby>` children) and the packages providing a required,
+/// recommended, or supplemented dependency (`<provided_by>` under
+/// both spellings). An element without a `dep` is a server error.
+fn parse_ext_dependency(element: &str, name: &str) -> Result<ExtDependency, GeectlError> {
+    let (tag, content) = xml_split_element(element, name);
+    let dep = xml_attr(tag, "dep").ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS fileinfo response: <{name}> without dep"),
+        )
+    })?;
+    let mut required_by = Vec::new();
+    for child in xml_elements(content, "requiredby")? {
+        let (child_tag, _) = xml_split_element(child, "requiredby");
+        required_by.push(parse_provided_by(child_tag)?);
+    }
+    let mut provided_by = Vec::new();
+    for spelling in ["provided_by", "providedby"] {
+        for child in xml_elements(content, spelling)? {
+            let (child_tag, _) = xml_split_element(child, spelling);
+            provided_by.push(parse_provided_by(child_tag)?);
+        }
+    }
+    Ok(ExtDependency {
+        dep,
+        provided_by,
+        required_by,
+    })
+}
+
+/// Parse a `<fileinfo ...>...</fileinfo>` document into the file's
+/// metadata. The plain view carries the dependency lists
+/// (`provides`, `requires`, `prerequires`, `conflicts`,
+/// `obsoletes`, `recommends`, `supplements`, `suggests`,
+/// `enhances`) as repeated text elements; the `fileinfo_ext` view
+/// carries `provides_ext` / `requires_ext` / `recommends_ext` /
+/// `supplements_ext` with one element per dependency. A document
+/// that is not a fileinfo — or a fileinfo without a filename, an ext
+/// dependency without a `dep`, or a non-numeric size/mtime — is a
+/// server error, never an empty fileinfo. The `provided_by` element
+/// is read under both spellings: the backend writes `<providedby>`,
+/// the API docs name it `<provided_by>`. `filelist` is only present
+/// with `withfilelist`, which geectl never requests, so it is not
+/// read.
+pub(crate) fn parse_fileinfo(body: &str) -> Result<FileInfo, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS fileinfo response: not a <fileinfo> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<fileinfo") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_open) else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    let filename = xml_attr(open_tag, "filename").ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS fileinfo response: <fileinfo> without filename",
+        )
+    })?;
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<fileinfo .../>`: a file with no metadata.
+        return Ok(FileInfo {
+            filename,
+            name: None,
+            epoch: None,
+            version: None,
+            release: None,
+            arch: None,
+            source: None,
+            summary: None,
+            description: None,
+            disturl: None,
+            size: None,
+            mtime: None,
+            provides: Vec::new(),
+            requires: Vec::new(),
+            prerequires: Vec::new(),
+            conflicts: Vec::new(),
+            obsoletes: Vec::new(),
+            recommends: Vec::new(),
+            supplements: Vec::new(),
+            suggests: Vec::new(),
+            enhances: Vec::new(),
+            provides_ext: Vec::new(),
+            requires_ext: Vec::new(),
+            recommends_ext: Vec::new(),
+            supplements_ext: Vec::new(),
+        });
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</fileinfo>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</fileinfo>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let number_text = |name: &str| -> Result<Option<u64>, GeectlError> {
+        match xml_element_text(inner, name) {
+            None => Ok(None),
+            Some(value) => value.parse::<u64>().map(Some).map_err(|_| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("unexpected OBS fileinfo response: <{name}> is not a number"),
+                )
+            }),
+        }
+    };
+    let list = |name: &str| -> Result<Vec<String>, GeectlError> {
+        Ok(xml_elements(inner, name)?
+            .iter()
+            .map(|element| {
+                let (_, text) = xml_split_element(element, name);
+                xml_unescape(text.trim())
+            })
+            .filter(|text| !text.is_empty())
+            .collect())
+    };
+    let mut provides_ext = Vec::new();
+    for element in xml_elements(inner, "provides_ext")? {
+        provides_ext.push(parse_ext_dependency(element, "provides_ext")?);
+    }
+    let mut requires_ext = Vec::new();
+    for element in xml_elements(inner, "requires_ext")? {
+        requires_ext.push(parse_ext_dependency(element, "requires_ext")?);
+    }
+    let mut recommends_ext = Vec::new();
+    for element in xml_elements(inner, "recommends_ext")? {
+        recommends_ext.push(parse_ext_dependency(element, "recommends_ext")?);
+    }
+    let mut supplements_ext = Vec::new();
+    for element in xml_elements(inner, "supplements_ext")? {
+        supplements_ext.push(parse_ext_dependency(element, "supplements_ext")?);
+    }
+    Ok(FileInfo {
+        filename,
+        name: xml_element_text(inner, "name"),
+        epoch: number_text("epoch")?,
+        version: xml_element_text(inner, "version"),
+        release: xml_element_text(inner, "release"),
+        arch: xml_element_text(inner, "arch"),
+        source: xml_element_text(inner, "source"),
+        summary: xml_element_text(inner, "summary"),
+        description: xml_element_text(inner, "description"),
+        disturl: xml_element_text(inner, "disturl"),
+        size: number_text("size")?,
+        mtime: number_text("mtime")?,
+        provides: list("provides")?,
+        requires: list("requires")?,
+        prerequires: list("prerequires")?,
+        conflicts: list("conflicts")?,
+        obsoletes: list("obsoletes")?,
+        recommends: list("recommends")?,
+        supplements: list("supplements")?,
+        suggests: list("suggests")?,
+        enhances: list("enhances")?,
+        provides_ext,
+        requires_ext,
+        recommends_ext,
+        supplements_ext,
+    })
+}
+
 /// What OBS does with the source branch when a submit request is
 /// accepted. The values are exactly the server's
 /// `BsRequestAction::VALID_SOURCEUPDATE_OPTIONS`; anything else is
@@ -12801,6 +13262,8 @@ mod tests {
         puts: RefCell<HashMap<String, String>>,
         put_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
         get_calls: RefCell<Vec<(String, bool)>>,
+        get_bytes: RefCell<HashMap<String, Vec<u8>>>,
+        get_bytes_calls: RefCell<Vec<(String, bool)>>,
         post_calls: RefCell<Vec<(String, String, bool)>>,
         delete_calls: RefCell<Vec<(String, bool)>>,
         put_calls: RefCell<Vec<(String, String, bool)>>,
@@ -12818,6 +13281,8 @@ mod tests {
                 puts: RefCell::new(HashMap::new()),
                 put_errors: RefCell::new(HashMap::new()),
                 get_calls: RefCell::new(Vec::new()),
+                get_bytes: RefCell::new(HashMap::new()),
+                get_bytes_calls: RefCell::new(Vec::new()),
                 post_calls: RefCell::new(Vec::new()),
                 delete_calls: RefCell::new(Vec::new()),
                 put_calls: RefCell::new(Vec::new()),
@@ -12841,6 +13306,14 @@ mod tests {
             );
             self
         }
+
+        fn with_get_bytes(self, url: &str, body: &[u8]) -> Self {
+            self.get_bytes
+                .borrow_mut()
+                .insert(url.to_string(), body.to_vec());
+            self
+        }
+
         fn with_get_error(self, url: &str, kind: ErrorKind) -> Self {
             self.get_errors.borrow_mut().insert(url.to_string(), kind);
             self
@@ -12900,6 +13373,10 @@ mod tests {
             self.get_calls.borrow().clone()
         }
 
+        fn get_bytes_calls(&self) -> Vec<(String, bool)> {
+            self.get_bytes_calls.borrow().clone()
+        }
+
         fn post_calls(&self) -> Vec<(String, String, bool)> {
             self.post_calls.borrow().clone()
         }
@@ -12939,6 +13416,25 @@ mod tests {
                 GeectlError::new(
                     ErrorKind::NetworkError,
                     format!("no canned GET response for {url}"),
+                )
+            })
+        }
+
+        fn get_bytes(&self, url: &str, credentials: &Credentials) -> Result<Vec<u8>, GeectlError> {
+            let authed = !matches!(credentials, Credentials::None);
+            self.get_bytes_calls
+                .borrow_mut()
+                .push((url.to_string(), authed));
+            if let Some(kind) = self.get_errors.borrow().get(url).cloned() {
+                return Err(GeectlError::new(
+                    kind,
+                    format!("canned GET error for {url}"),
+                ));
+            }
+            self.get_bytes.borrow().get(url).cloned().ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::NetworkError,
+                    format!("no canned GET bytes response for {url}"),
                 )
             })
         }
@@ -24670,5 +25166,313 @@ description</description>
             )
             .is_err());
         assert!(http.get_calls().is_empty());
+    }
+
+    // --- parse_binary_list ---
+
+    #[test]
+    fn parse_binary_list_reads_the_whole_build_output() {
+        let parsed = parse_binary_list(
+            "<binarylist><binary filename=\"foo-1.0-1.x86_64.rpm\" size=\"58352\" mtime=\"1617270174\"/><binary filename=\"foo-1.0-1.src.rpm\" size=\"1234\" mtime=\"1617270174\"/><binary filename=\"foo-debuginfo-1.0-1.x86_64.rpm\" size=\"999\" mtime=\"1617270174\"/><binary filename=\"_buildenv\" size=\"10\" mtime=\"1617270174\"/><binary filename=\"_statistics\" size=\"20\" mtime=\"1617270174\"/><binary filename=\"rpmlint.log\" size=\"30\" mtime=\"1617270174\"/></binarylist>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 6);
+        assert_eq!(parsed[0].name, "foo-1.0-1.x86_64.rpm");
+        assert_eq!(parsed[0].size, Some(58_352));
+        assert_eq!(parsed[0].mtime, Some(1_617_270_174));
+        assert_eq!(parsed[1].name, "foo-1.0-1.src.rpm");
+        assert_eq!(parsed[3].name, "_buildenv");
+        assert_eq!(parsed[5].name, "rpmlint.log");
+    }
+
+    #[test]
+    fn parse_binary_list_empty_is_an_empty_list() {
+        assert_eq!(
+            parse_binary_list("<binarylist/>").unwrap(),
+            Vec::<BinaryFile>::new()
+        );
+        assert_eq!(
+            parse_binary_list("<binarylist></binarylist>").unwrap(),
+            Vec::<BinaryFile>::new()
+        );
+    }
+
+    #[test]
+    fn parse_binary_list_rejects_malformed_documents() {
+        assert!(parse_binary_list("").is_err());
+        assert!(parse_binary_list("<directory></directory>").is_err());
+        assert!(parse_binary_list("<binarylist><binary size=\"1\"/></binarylist>").is_err());
+        assert!(parse_binary_list(
+            "<binarylist><binary filename=\"x\" size=\"big\"/></binarylist>"
+        )
+        .is_err());
+    }
+
+    // --- parse_fileinfo ---
+
+    #[test]
+    fn parse_fileinfo_reads_the_plain_view() {
+        let parsed = parse_fileinfo(
+            "<fileinfo filename=\"foo-1.0-1.x86_64.rpm\"><name>foo</name><epoch>1</epoch><version>1.0</version><release>1</release><arch>x86_64</arch><summary>Foo tool</summary><description>Does foo.</description><disturl>obs://build.opensuse.org/openSUSE:Factory/standard/abc-foo-1.0-1.x86_64.rpm</disturl><size>58352</size><mtime>1617270174</mtime><provides>foo = 1.0-1</provides><provides>libc.so.6()(64bit)</provides><requires>libc.so.6()(64bit)</requires><prerequires>/bin/sh</prerequires><conflicts>oldfoo</conflicts><obsoletes>oldfoo</obsoletes><recommends>foo-doc</recommends><supplements>foo</supplements><suggests>foo-extra</suggests><enhances>foo-base</enhances></fileinfo>",
+        )
+        .unwrap();
+        assert_eq!(parsed.filename, "foo-1.0-1.x86_64.rpm");
+        assert_eq!(parsed.name.as_deref(), Some("foo"));
+        assert_eq!(parsed.version.as_deref(), Some("1.0"));
+        assert_eq!(parsed.release.as_deref(), Some("1"));
+        assert_eq!(parsed.arch.as_deref(), Some("x86_64"));
+        assert_eq!(parsed.summary.as_deref(), Some("Foo tool"));
+        assert_eq!(parsed.size, Some(58_352));
+        assert_eq!(parsed.mtime, Some(1_617_270_174));
+        assert_eq!(
+            parsed.provides,
+            vec!["foo = 1.0-1".to_string(), "libc.so.6()(64bit)".to_string()]
+        );
+        assert_eq!(parsed.requires, vec!["libc.so.6()(64bit)".to_string()]);
+        assert_eq!(parsed.epoch, Some(1));
+        assert_eq!(
+            parsed.disturl.as_deref(),
+            Some("obs://build.opensuse.org/openSUSE:Factory/standard/abc-foo-1.0-1.x86_64.rpm")
+        );
+        assert_eq!(parsed.prerequires, vec!["/bin/sh".to_string()]);
+        assert_eq!(parsed.conflicts, vec!["oldfoo".to_string()]);
+        assert_eq!(parsed.obsoletes, vec!["oldfoo".to_string()]);
+        assert_eq!(parsed.recommends, vec!["foo-doc".to_string()]);
+        assert_eq!(parsed.supplements, vec!["foo".to_string()]);
+        assert_eq!(parsed.suggests, vec!["foo-extra".to_string()]);
+        assert_eq!(parsed.enhances, vec!["foo-base".to_string()]);
+        assert!(parsed.provides_ext.is_empty());
+        assert!(parsed.requires_ext.is_empty());
+        assert!(parsed.recommends_ext.is_empty());
+        assert!(parsed.supplements_ext.is_empty());
+    }
+
+    #[test]
+    fn parse_fileinfo_reads_the_ext_view_under_both_spellings() {
+        let parsed = parse_fileinfo(
+            "<fileinfo filename=\"foo-1.0-1.x86_64.rpm\"><name>foo</name><provides_ext dep=\"libc.so.6()(64bit)\"><requiredby name=\"bar\" version=\"2.0\" release=\"1\" arch=\"x86_64\" project=\"p\" repository=\"r\"/></provides_ext><requires_ext dep=\"libc.so.6()(64bit)\"><provided_by name=\"glibc\" epoch=\"2\" version=\"2.38\" release=\"1\" arch=\"x86_64\" project=\"p\" repository=\"r\"/></requires_ext><requires_ext dep=\"libz.so.1()(64bit)\"><providedby name=\"zlib\" version=\"1.3\" release=\"1\" arch=\"x86_64\" project=\"p\" repository=\"r\"/><providedby name=\"zlib-32bit\" version=\"1.3\" release=\"1\" arch=\"i586\" project=\"p\" repository=\"r\"/></requires_ext><recommends_ext dep=\"foo-doc\"><provided_by name=\"foo-doc\" epoch=\"1\" version=\"1.0\" release=\"1\" arch=\"x86_64\" project=\"p\" repository=\"r\"/></recommends_ext><supplements_ext dep=\"foo-base\"><requiredby name=\"bar\" version=\"2.0\" release=\"1\" arch=\"x86_64\" project=\"p\" repository=\"r\"/></supplements_ext></fileinfo>",
+        )
+        .unwrap();
+        assert_eq!(parsed.provides_ext.len(), 1);
+        assert_eq!(parsed.provides_ext[0].dep, "libc.so.6()(64bit)");
+        assert_eq!(parsed.provides_ext[0].required_by.len(), 1);
+        assert_eq!(parsed.provides_ext[0].required_by[0].name, "bar");
+        assert_eq!(parsed.requires_ext.len(), 2);
+        assert_eq!(parsed.requires_ext[0].dep, "libc.so.6()(64bit)");
+        assert_eq!(parsed.requires_ext[0].provided_by[0].name, "glibc");
+        assert_eq!(parsed.requires_ext[1].provided_by[0].name, "zlib");
+        assert_eq!(parsed.requires_ext[1].provided_by.len(), 2);
+        assert_eq!(parsed.requires_ext[1].provided_by[1].name, "zlib-32bit");
+        assert_eq!(parsed.requires_ext[0].provided_by[0].epoch, Some(2));
+        assert_eq!(parsed.recommends_ext.len(), 1);
+        assert_eq!(parsed.recommends_ext[0].dep, "foo-doc");
+        assert_eq!(parsed.recommends_ext[0].provided_by[0].name, "foo-doc");
+        assert_eq!(parsed.recommends_ext[0].provided_by[0].epoch, Some(1));
+        assert_eq!(parsed.supplements_ext.len(), 1);
+        assert_eq!(parsed.supplements_ext[0].dep, "foo-base");
+        assert_eq!(parsed.supplements_ext[0].required_by.len(), 1);
+        assert_eq!(parsed.supplements_ext[0].required_by[0].name, "bar");
+    }
+
+    #[test]
+    fn parse_fileinfo_rejects_malformed_documents() {
+        assert!(parse_fileinfo("").is_err());
+        assert!(parse_fileinfo("<collection></collection>").is_err());
+        assert!(parse_fileinfo("<fileinfo><name>foo</name></fileinfo>").is_err());
+        assert!(
+            parse_fileinfo("<fileinfo filename=\"x\"><provides_ext><requiredby name=\"a\"/></provides_ext></fileinfo>")
+                .is_err()
+        );
+        assert!(parse_fileinfo("<fileinfo filename=\"x\"><size>big</size></fileinfo>").is_err());
+    }
+
+    // --- list_binaries ---
+
+    #[test]
+    fn list_binaries_lists_the_package_and_the_whole_repository() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo",
+                "<binarylist><binary filename=\"foo-1.0-1.x86_64.rpm\" size=\"58352\" mtime=\"1617270174\"/><binary filename=\"_buildenv\" size=\"10\" mtime=\"1617270174\"/></binarylist>",
+            )
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/_repository",
+                "<binarylist><binary filename=\"foo-1.0-1.x86_64.rpm\" size=\"58352\" mtime=\"1617270174\"/></binarylist>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let files = client
+            .list_binaries("testproject", Some("foo"), "standard", "x86_64")
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[1].name, "_buildenv");
+        let files = client
+            .list_binaries("testproject", None, "standard", "x86_64")
+            .unwrap();
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn list_binaries_404_is_an_error() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .list_binaries("testproject", Some("foo"), "standard", "x86_64")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn valid_obs_filename_rejects_build_route_leaves() {
+        // Under `/build/.../<package>/` these address routes, not
+        // files: a download by one of them would return route output
+        // as if it were a file.
+        for name in [
+            "_log",
+            "_status",
+            "_buildinfo",
+            "_history",
+            "_jobstatus",
+            "_jobhistory",
+        ] {
+            assert!(!valid_obs_filename(name), "{name} must be rejected");
+        }
+        assert!(valid_obs_filename("foo-1.0-1.x86_64.rpm"));
+        assert!(valid_obs_filename("rpmlint.log"));
+    }
+
+    #[test]
+    fn list_binaries_keeps_the_multibuild_flavor_in_the_path() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo:flavor1",
+            "<binarylist/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .list_binaries("testproject", Some("foo:flavor1"), "standard", "x86_64")
+                .unwrap(),
+            Vec::<BinaryFile>::new()
+        );
+    }
+
+    // --- download_binary ---
+
+    #[test]
+    fn download_binary_returns_raw_bytes_not_text() {
+        // Non-UTF-8 bytes: the download must not go through the
+        // string path, which would refuse them.
+        let bytes: &[u8] = &[0xED, 0xAB, 0xEE, 0xDB, 0xFF, 0xFE];
+        let http = FakeHttp::new().with_get_bytes(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/foo-1.0-1.x86_64.rpm",
+            bytes,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .download_binary(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    "x86_64",
+                    "foo-1.0-1.x86_64.rpm"
+                )
+                .unwrap(),
+            bytes.to_vec()
+        );
+        assert_eq!(
+            http.get_bytes_calls(),
+            vec![(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo/foo-1.0-1.x86_64.rpm"
+                    .to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn download_binary_404_is_an_error_not_empty_bytes() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/nosuch.rpm",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .download_binary("testproject", "foo", "standard", "x86_64", "nosuch.rpm")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn download_binary_rejects_an_unsafe_filename_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .download_binary("testproject", "foo", "standard", "x86_64", "../evil")
+            .is_err());
+        assert!(http.get_bytes_calls().is_empty());
+    }
+
+    // --- fileinfo ---
+
+    #[test]
+    fn fileinfo_reads_both_views() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo/foo-1.0-1.x86_64.rpm?view=fileinfo",
+                "<fileinfo filename=\"foo-1.0-1.x86_64.rpm\"><name>foo</name><version>1.0</version></fileinfo>",
+            )
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo/foo-1.0-1.x86_64.rpm?view=fileinfo_ext",
+                "<fileinfo filename=\"foo-1.0-1.x86_64.rpm\"><name>foo</name><requires_ext dep=\"libc.so.6()(64bit)\"><provided_by name=\"glibc\"/></requires_ext></fileinfo>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let info = client
+            .fileinfo(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                "foo-1.0-1.x86_64.rpm",
+                false,
+            )
+            .unwrap();
+        assert_eq!(info.name.as_deref(), Some("foo"));
+        assert!(info.requires_ext.is_empty());
+        let info = client
+            .fileinfo(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                "foo-1.0-1.x86_64.rpm",
+                true,
+            )
+            .unwrap();
+        assert_eq!(info.requires_ext.len(), 1);
+        assert_eq!(info.requires_ext[0].provided_by.len(), 1);
+        assert_eq!(info.requires_ext[0].provided_by[0].name, "glibc");
+    }
+
+    #[test]
+    fn fileinfo_404_is_an_error_not_an_empty_fileinfo() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/nosuch.rpm?view=fileinfo",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .fileinfo(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                "nosuch.rpm",
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 }
