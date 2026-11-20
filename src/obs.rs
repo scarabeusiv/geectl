@@ -1783,6 +1783,28 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// The link target of package `package` in project `project`
+    /// (`GET /public/source/<project>/<package>`, reading the
+    /// listing's `<linkinfo project package/>`), or None when the
+    /// package links nothing. A public read: no credentials. A
+    /// missing package is an error, never None — only a listing
+    /// without linkinfo reads as "no link".
+    pub fn link_target(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<Option<(String, String)>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        Ok(self.public_directory(&[project, package])?.linkinfo)
+    }
+
     /// Build the OBS search URL for open submit requests targeting
     /// `package`. The match expression is XPath over the request XML,
     /// restricted to `submit` actions: a request of another type that
@@ -7056,6 +7078,57 @@ mod tests {
         assert!(client.owners_for_binary("python3.11/x").is_err());
         assert!(client.whois("a").is_err());
         assert!(client.whois("a/b").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    // --- link_target ---
+
+    #[test]
+    fn link_target_reads_linkinfo_without_credentials() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
+            DIRECTORY_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client.link_target("openSUSE:Factory", "foo").unwrap(),
+            Some(("home:Admin".to_string(), "foo".to_string()))
+        );
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo".to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn link_target_without_linkinfo_is_none() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
+            "<directory><entry name=\"foo.spec\"/></directory>",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(client.link_target("openSUSE:Factory", "foo").unwrap(), None);
+    }
+
+    #[test]
+    fn link_target_missing_package_is_an_error() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::new(&http);
+        let err = client.link_target("openSUSE:Factory", "foo").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn link_target_rejects_bad_names() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.link_target("openSUSE:Factory", "foo/bar").is_err());
         assert!(http.get_calls().is_empty());
     }
 }
