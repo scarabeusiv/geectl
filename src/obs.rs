@@ -3802,6 +3802,124 @@ impl<'a> ObsClient<'a> {
         parse_fileinfo(&body)
     }
 
+    /// The build dependencies of the packages in `repository`/`arch`:
+    /// which packages each package depends on for its build
+    /// (whole-package dependencies, not individual binaries). With
+    /// `package`, only that package's dependencies. Requires OBS Basic
+    /// credentials. A 404 is an error (unknown
+    /// project/repository/architecture). An empty list means the
+    /// repository has no packages with recorded dependencies.
+    pub fn dependson(
+        &self,
+        project: &str,
+        repository: &str,
+        arch: &str,
+        package: Option<&str>,
+    ) -> Result<Vec<PackageDeps>, GeectlError> {
+        Self::validate_build_coordinates(project, package, repository, arch)?;
+        self.require_build_credentials()?;
+        let mut pairs: Vec<(&str, &str)> = vec![("view", "pkgnames")];
+        if let Some(package) = package {
+            pairs.push(("package", package));
+        }
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, "_builddepinfo"],
+            &pairs,
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_builddepinfo(&body)
+    }
+
+    /// The packages in `repository`/`arch` that depend on `package`
+    /// for their build: a rebuild of `package` triggers a rebuild of
+    /// each of them. The reverse of [`ObsClient::dependson`]: each
+    /// entry's `dependencies` are the packages depending on the
+    /// queried package, not the queried package's own dependencies.
+    /// Requires OBS Basic credentials. A 404 is an error (unknown
+    /// project/repository/architecture).
+    pub fn whatdependson(
+        &self,
+        project: &str,
+        repository: &str,
+        arch: &str,
+        package: &str,
+    ) -> Result<Vec<PackageDeps>, GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        self.require_build_credentials()?;
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, "_builddepinfo"],
+            &[("view", "revpkgnames"), ("package", package)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_builddepinfo(&body)
+    }
+
+    /// The worker ids that satisfy `constraints` for `package` in
+    /// `repository`/`arch`: a query, not a build — it creates or
+    /// modifies nothing, so it takes no dry-run guard. `constraints`
+    /// is the package's constraints XML (`_constraints`), passed
+    /// through as authored: there is no typed constraints model yet,
+    /// so this is the one place a raw XML document crosses the
+    /// public API. None posts an empty body, which the server
+    /// accepts. An empty list means no worker satisfies the
+    /// constraints (or no worker is registered). Requires OBS Basic
+    /// credentials.
+    pub fn check_constraints(
+        &self,
+        project: &str,
+        package: &str,
+        repository: &str,
+        arch: &str,
+        constraints: Option<&str>,
+    ) -> Result<Vec<String>, GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        if let Some(constraints) = constraints {
+            if constraints.is_empty() {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "invalid OBS constraints: empty".to_string(),
+                ));
+            }
+        }
+        self.require_build_credentials()?;
+        let url = build_url(
+            &self.base,
+            &["worker"],
+            &[
+                ("cmd", "checkconstraints"),
+                ("project", project),
+                ("package", package),
+                ("repository", repository),
+                ("arch", arch),
+            ],
+        );
+        let body = self
+            .http
+            .post(&url, constraints.unwrap_or(""), &self.credentials)?;
+        // The response is a `<directory>` of the matching workers,
+        // one `<entry name="workerid"/>` each.
+        parse_directory_entry_names(&body)
+    }
+
+    /// The repositories of `project`: their names, architectures, and
+    /// the repositories they build against. A public read: project
+    /// meta is public, so no credentials are needed. A 404 is an
+    /// error (unknown project). An empty list means the project has no
+    /// repositories.
+    pub fn list_repositories(&self, project: &str) -> Result<Vec<Repository>, GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        let url = build_url(&self.base, &["public", "source", project, "_meta"], &[]);
+        let body = self.http.get_with(&url, &Credentials::None)?;
+        parse_repositories(&body)
+    }
+
     /// Build the OBS search URL for open submit requests targeting
     /// `package`. The match expression is XPath over the request XML;
     /// the submit restriction is applied client-side in
@@ -9053,6 +9171,220 @@ pub(crate) fn parse_fileinfo(body: &str) -> Result<FileInfo, GeectlError> {
     })
 }
 
+/// One package's build dependencies, from `_builddepinfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageDeps {
+    /// The package.
+    pub name: String,
+    /// The source package, if the server reported one.
+    pub source: Option<String>,
+    /// The packages it depends on for the build (whole-package
+    /// dependencies, not individual binaries). In the reverse
+    /// (`revpkgnames`) view returned by [`ObsClient::whatdependson`],
+    /// these are instead the packages depending on the queried
+    /// package.
+    pub dependencies: Vec<String>,
+    /// The subpackages it produces.
+    pub subpackages: Vec<String>,
+}
+
+/// Parse a `<builddepinfo>...</builddepinfo>` document into the
+/// per-package build dependencies. Only the direct `<package>`
+/// children count: the document also carries `<cycle>` and `<scc>`
+/// elements whose `<package>` children are cycle members, not
+/// dependencies. A document that is not a builddepinfo — or a
+/// `<package>` without a name — is a server error, never an empty
+/// list.
+pub(crate) fn parse_builddepinfo(body: &str) -> Result<Vec<PackageDeps>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS builddepinfo response: not a <builddepinfo> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<builddepinfo") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_open) else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<builddepinfo/>`: no packages, no deps.
+        return Ok(Vec::new());
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</builddepinfo>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</builddepinfo>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut packages = Vec::new();
+    for element in xml_child_elements(inner, "package")? {
+        let (tag, content) = xml_split_element(element, "package");
+        let name = xml_attr(tag, "name").ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS builddepinfo response: <package> without name",
+            )
+        })?;
+        let dependencies = xml_elements(content, "pkgdep")?
+            .iter()
+            .map(|dep| {
+                let (_, text) = xml_split_element(dep, "pkgdep");
+                xml_unescape(text.trim())
+            })
+            .filter(|text| !text.is_empty())
+            .collect();
+        let subpackages = xml_elements(content, "subpkg")?
+            .iter()
+            .map(|sub| {
+                let (_, text) = xml_split_element(sub, "subpkg");
+                xml_unescape(text.trim())
+            })
+            .filter(|text| !text.is_empty())
+            .collect();
+        packages.push(PackageDeps {
+            name,
+            source: xml_element_text(content, "source"),
+            dependencies,
+            subpackages,
+        });
+    }
+    Ok(packages)
+}
+
+/// Parse a `<project ...>...</project>` document (`_meta`) into the
+/// project's repositories. A document that is not a project — or a
+/// `<repository>` without a name, or a `<path>` without a project —
+/// is a server error, never an empty list.
+pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS project meta response: not a <project> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<project") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_open) else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<project .../>`: no repositories.
+        return Ok(Vec::new());
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</project>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</project>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut repositories = Vec::new();
+    for element in xml_child_elements(inner, "repository")? {
+        let (tag, content) = xml_split_element(element, "repository");
+        let name = xml_attr(tag, "name").ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS project meta response: <repository> without name",
+            )
+        })?;
+        let arch = xml_elements(content, "arch")?
+            .iter()
+            .map(|arch| {
+                let (_, text) = xml_split_element(arch, "arch");
+                xml_unescape(text.trim())
+            })
+            .filter(|text| !text.is_empty())
+            .collect();
+        let mut paths = Vec::new();
+        for path in xml_elements(content, "path")? {
+            let (path_tag, _) = xml_split_element(path, "path");
+            let project = xml_attr(path_tag, "project").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <path> without project",
+                )
+            })?;
+            // A path without a repository attribute names no
+            // (project, repository) pair, so it is dropped - the
+            // same rule project_meta applies to its paths.
+            if let Some(repository) = xml_attr(path_tag, "repository") {
+                paths.push((project, repository));
+            }
+        }
+        repositories.push(Repository { name, arch, paths });
+    }
+    Ok(repositories)
+}
+
+/// Parse a `<directory>...</directory>` document into the `name`
+/// attributes of its `<entry>` children. A document that is not a
+/// directory is a server error, never an empty list: an empty
+/// directory is the "nothing matches" answer.
+pub(crate) fn parse_directory_entry_names(body: &str) -> Result<Vec<String>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS response: not a <directory> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<directory") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_open) else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<directory/>`: no entries.
+        return Ok(Vec::new());
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</directory>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</directory>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut names = Vec::new();
+    for element in xml_elements(inner, "entry")? {
+        let (tag, _) = xml_split_element(element, "entry");
+        if let Some(name) = xml_attr(tag, "name") {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
 /// What OBS does with the source branch when a submit request is
 /// accepted. The values are exactly the server's
 /// `BsRequestAction::VALID_SOURCEUPDATE_OPTIONS`; anything else is
@@ -10316,6 +10648,165 @@ where
             format!("unexpected OBS response: missing attribute {name}"),
         )
     })
+}
+
+/// The index just past the element starting at `start` (the `<` of
+/// its opening tag), honouring nesting of the same element name.
+/// None when the element is unterminated. The opening tag must not be
+/// self-closing: the caller checks that first.
+fn xml_element_end(inner: &str, start: usize, name: &str) -> Option<usize> {
+    let after_lt = &inner[start + 1..];
+    let gt = find_tag_end(after_lt)?;
+    let mut depth = 1;
+    let mut scan = start + 1 + gt + 1;
+    while scan < inner.len() {
+        let lt = inner[scan..].find('<')?;
+        let pos = scan + lt;
+        let after = &inner[pos + 1..];
+        if let Some(after_slash) = after.strip_prefix('/') {
+            // Closing tag: which element does it close?
+            let cname_end = after_slash
+                .find(|c: char| c.is_whitespace() || c == '>')
+                .unwrap_or(after_slash.len());
+            if &after_slash[..cname_end] == name {
+                depth -= 1;
+                if depth == 0 {
+                    let cgt = after.find('>')?;
+                    return Some(pos + 1 + cgt + 1);
+                }
+            }
+            scan = pos + 1;
+            continue;
+        }
+        if after.starts_with("<!--") {
+            // Comment: skip to `-->`, not to the first `>`: a `>`
+            // inside a comment does not end it.
+            let end = after.find("-->")?;
+            scan = pos + 1 + end + 3;
+            continue;
+        }
+        if after.starts_with('?') {
+            // Processing instruction: skip to `?>`.
+            let end = after.find("?>")?;
+            scan = pos + 1 + end + 2;
+            continue;
+        }
+        if after.starts_with('!') {
+            // Other markup (e.g. a doctype): skip to `>`.
+            let end = after.find('>')?;
+            scan = pos + 1 + end + 1;
+            continue;
+        }
+        // Opening tag: the same name, not self-closing, nests.
+        let oname_end = after
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(after.len());
+        if &after[..oname_end] == name {
+            let ogt = find_tag_end(after)?;
+            if !after[..ogt].trim_end().ends_with('/') {
+                depth += 1;
+            }
+            scan = pos + 1 + ogt + 1;
+        } else {
+            scan = pos + 1;
+        }
+    }
+    None
+}
+
+/// The direct child elements named `name` in `inner` (the content
+/// between an element's open and close tags), as their full text
+/// including the tags. Unlike [`xml_elements`], this does not descend:
+/// a `<package>` inside a `<cycle>` is a grandchild, not a child, and
+/// is skipped. A malformed remainder — an unterminated child,
+/// comment, processing instruction, or markup, a missing tag end, an
+/// empty tag name, a missing element end, or a stray closing tag at
+/// this level — is a server error, never a partial list: like
+/// [`xml_elements`], the caller treats the missing content as malformed.
+fn xml_child_elements<'a>(inner: &'a str, name: &str) -> Result<Vec<&'a str>, GeectlError> {
+    let unterminated = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS response: unterminated <{name}> element"),
+        )
+    };
+    let stray_close = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS response: stray closing tag in element content",
+        )
+    };
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset < inner.len() {
+        let rest = &inner[offset..];
+        let Some(lt) = rest.find('<') else {
+            break;
+        };
+        let tag_start = offset + lt;
+        let after_lt = &rest[lt + 1..];
+        if after_lt.starts_with('/') {
+            // A closing tag at this level is stray: the parent's close
+            // was stripped by the caller, so nothing may close here.
+            return Err(stray_close());
+        }
+        if after_lt.starts_with("<!--") {
+            // Comment: skip to `-->`, not to the first `>`.
+            let Some(end) = after_lt.find("-->") else {
+                return Err(unterminated());
+            };
+            offset = tag_start + 1 + end + 3;
+            continue;
+        }
+        if after_lt.starts_with('?') {
+            // Processing instruction: skip to `?>`.
+            let Some(end) = after_lt.find("?>") else {
+                return Err(unterminated());
+            };
+            offset = tag_start + 1 + end + 2;
+            continue;
+        }
+        if after_lt.starts_with('!') {
+            // Other markup (e.g. a doctype): skip to `>`.
+            let Some(end) = after_lt.find('>') else {
+                return Err(unterminated());
+            };
+            offset = tag_start + 1 + end + 1;
+            continue;
+        }
+        let name_end = after_lt
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(after_lt.len());
+        let tag_name = &after_lt[..name_end];
+        let Some(gt) = find_tag_end(after_lt) else {
+            return Err(unterminated());
+        };
+        if tag_name.is_empty() {
+            // An empty tag (`<></>`) has no name to match or to close
+            // against: it is malformed content, not a child to skip.
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS response: empty tag name in element content",
+            ));
+        }
+        let tag_end = tag_start + 1 + gt + 1;
+        if after_lt[..gt].trim_end().ends_with('/') {
+            // Self-closing: a direct child when the name matches.
+            if tag_name == name {
+                out.push(&inner[tag_start..tag_end]);
+            }
+            offset = tag_end;
+            continue;
+        }
+        let Some(elem_end) = xml_element_end(inner, tag_start, tag_name) else {
+            return Err(unterminated());
+        };
+        if tag_name == name {
+            out.push(&inner[tag_start..elem_end]);
+        }
+        offset = elem_end;
+    }
+    Ok(out)
 }
 
 /// Escape text for an XML element or attribute value.
@@ -25474,5 +25965,325 @@ description</description>
             )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    // --- xml_child_elements ---
+
+    #[test]
+    fn xml_child_elements_reads_direct_children_only() {
+        let inner = "<package name=\"a\"><pkgdep>x</pkgdep></package><cycle><package name=\"b\"/></cycle><package name=\"c\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found[0].contains("name=\"a\""));
+        assert!(found[1].contains("name=\"c\""));
+    }
+
+    #[test]
+    fn xml_child_elements_skips_nested_same_name_elements() {
+        let inner = "<package name=\"a\"><package name=\"inner\"/></package><package name=\"b\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found[0].contains("name=\"a\""));
+        assert!(found[0].contains("name=\"inner\""));
+    }
+
+    #[test]
+    fn xml_child_elements_rejects_malformed_remainders() {
+        // Every former fail-open break site is an error now: an
+        // unterminated child, comment, processing instruction, or
+        // markup, a missing tag end, an empty tag name, and a stray
+        // closing tag at this level.
+        assert!(xml_child_elements("<package name=\"a\"><pkgdep>x</pkgdep>", "package").is_err());
+        assert!(xml_child_elements("<!-- never closed", "package").is_err());
+        assert!(xml_child_elements("<?pi never closed", "package").is_err());
+        assert!(xml_child_elements("<!DOCTYPE never closed", "package").is_err());
+        assert!(xml_child_elements("<package name=\"a\"", "package").is_err());
+        assert!(xml_child_elements("</package>", "package").is_err());
+        assert!(xml_child_elements("<></>", "package").is_err());
+        assert!(xml_child_elements("<package name=\"a\"/><></>", "package").is_err());
+    }
+
+    // --- parse_builddepinfo ---
+
+    #[test]
+    fn parse_builddepinfo_reads_packages_and_ignores_cycles() {
+        let parsed = parse_builddepinfo(
+            "<builddepinfo><package name=\"memcached\"><source>memcached</source><pkgdep>gzip</pkgdep><pkgdep>obs-server</pkgdep><subpkg>memcached-devel</subpkg><subpkg>memcached-debugsource</subpkg></package><package name=\"gzip\"><source>gzip</source><pkgdep>zlib</pkgdep><subpkg>gzip</subpkg></package><cycle><package>memcached</package><package>gzip</package></cycle><scc><package>memcached</package></scc></builddepinfo>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "memcached");
+        assert_eq!(parsed[0].source.as_deref(), Some("memcached"));
+        assert_eq!(
+            parsed[0].dependencies,
+            vec!["gzip".to_string(), "obs-server".to_string()]
+        );
+        assert_eq!(
+            parsed[0].subpackages,
+            vec![
+                "memcached-devel".to_string(),
+                "memcached-debugsource".to_string()
+            ]
+        );
+        assert_eq!(parsed[1].name, "gzip");
+        assert_eq!(parsed[1].source.as_deref(), Some("gzip"));
+        assert_eq!(parsed[1].dependencies, vec!["zlib".to_string()]);
+    }
+
+    #[test]
+    fn parse_builddepinfo_empty_is_an_empty_list() {
+        assert_eq!(
+            parse_builddepinfo("<builddepinfo/>").unwrap(),
+            Vec::<PackageDeps>::new()
+        );
+        assert_eq!(
+            parse_builddepinfo("<builddepinfo></builddepinfo>").unwrap(),
+            Vec::<PackageDeps>::new()
+        );
+    }
+
+    #[test]
+    fn parse_builddepinfo_rejects_malformed_documents() {
+        assert!(parse_builddepinfo("").is_err());
+        assert!(parse_builddepinfo("<collection></collection>").is_err());
+        assert!(parse_builddepinfo(
+            "<builddepinfo><package><pkgdep>x</pkgdep></package></builddepinfo>"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_builddepinfo_rejects_an_inner_unclosed_package() {
+        // The package close is missing but the outer close is present:
+        // this used to read as an empty list instead of an error.
+        assert!(parse_builddepinfo(
+            "<builddepinfo><package name=\"a\"><pkgdep>x</pkgdep></builddepinfo>"
+        )
+        .is_err());
+    }
+
+    // --- parse_repositories ---
+
+    #[test]
+    fn parse_repositories_reads_repos_arches_and_paths() {
+        let parsed = parse_repositories(
+            "<project name=\"testproject\"><title>t</title><repository name=\"standard\"><arch>x86_64</arch><arch>i586</arch><path project=\"openSUSE.org:openSUSE:Tumbleweed\" repository=\"standard\"/></repository><repository name=\"ports\"><arch>aarch64</arch><path project=\"openSUSE.org:openSUSE:Tumbleweed\" repository=\"ports\"/></repository></project>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "standard");
+        assert_eq!(
+            parsed[0].arch,
+            vec!["x86_64".to_string(), "i586".to_string()]
+        );
+        assert_eq!(parsed[0].paths.len(), 1);
+        assert_eq!(parsed[0].paths[0].0, "openSUSE.org:openSUSE:Tumbleweed");
+        assert_eq!(parsed[0].paths[0].1, "standard");
+        assert_eq!(parsed[1].name, "ports");
+        assert_eq!(parsed[1].arch, vec!["aarch64".to_string()]);
+    }
+
+    #[test]
+    fn parse_repositories_empty_is_an_empty_list() {
+        assert_eq!(
+            parse_repositories("<project name=\"p\"/>").unwrap(),
+            Vec::<Repository>::new()
+        );
+        assert_eq!(
+            parse_repositories("<project name=\"p\"><title>t</title></project>").unwrap(),
+            Vec::<Repository>::new()
+        );
+    }
+
+    #[test]
+    fn parse_repositories_rejects_malformed_documents() {
+        assert!(parse_repositories("").is_err());
+        assert!(parse_repositories("<collection></collection>").is_err());
+        assert!(parse_repositories(
+            "<project><repository><arch>x86_64</arch></repository></project>"
+        )
+        .is_err());
+        assert!(
+            parse_repositories(
+                "<project><repository name=\"r\"><path repository=\"standard\"/></repository></project>"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_repositories_rejects_an_inner_unclosed_repository() {
+        // The repository close is missing but the outer close is
+        // present: this used to read as an empty list instead of an
+        // error.
+        assert!(parse_repositories(
+            "<project name=\"p\"><repository name=\"r\"><path project=\"q\" repository=\"s\"/></project>"
+        )
+        .is_err());
+    }
+
+    // --- dependson / whatdependson ---
+
+    #[test]
+    fn dependson_builds_the_url_with_and_without_a_package() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/_builddepinfo?view=pkgnames&package=foo",
+                "<builddepinfo><package name=\"foo\"><pkgdep>bar</pkgdep><subpkg>foo</subpkg></package></builddepinfo>",
+            )
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/_builddepinfo?view=pkgnames",
+                "<builddepinfo/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let deps = client
+            .dependson("testproject", "standard", "x86_64", Some("foo"))
+            .unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].dependencies, vec!["bar".to_string()]);
+        let deps = client
+            .dependson("testproject", "standard", "x86_64", None)
+            .unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn whatdependson_builds_the_reverse_url() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/_builddepinfo?view=revpkgnames&package=bar",
+            "<builddepinfo><package name=\"foo\"><pkgdep>bar</pkgdep></package></builddepinfo>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let deps = client
+            .whatdependson("testproject", "standard", "x86_64", "bar")
+            .unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "foo");
+    }
+
+    #[test]
+    fn dependson_404_is_an_error_not_an_empty_list() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/_builddepinfo?view=pkgnames",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .dependson("testproject", "standard", "x86_64", None)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    // --- check_constraints ---
+
+    #[test]
+    fn check_constraints_posts_the_constraints_and_reads_worker_ids() {
+        let constraints = "<constraints><hardware><disk><size unit=\"G\">10</size></disk></hardware></constraints>";
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/worker?cmd=checkconstraints&project=testproject&package=foo&repository=standard&arch=x86_64",
+            "<directory><entry name=\"worker1\"/><entry name=\"worker2\"/></directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let workers = client
+            .check_constraints(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                Some(constraints),
+            )
+            .unwrap();
+        assert_eq!(workers, vec!["worker1".to_string(), "worker2".to_string()]);
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://api.opensuse.org/worker?cmd=checkconstraints&project=testproject&package=foo&repository=standard&arch=x86_64"
+                    .to_string(),
+                constraints.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn check_constraints_non_directory_body_is_an_error() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/worker?cmd=checkconstraints&project=testproject&package=foo&repository=standard&arch=x86_64",
+            "<collection></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .check_constraints("testproject", "foo", "standard", "x86_64", None)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn check_constraints_without_constraints_posts_an_empty_body() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/worker?cmd=checkconstraints&project=testproject&package=foo&repository=standard&arch=x86_64",
+            "<directory/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let workers = client
+            .check_constraints("testproject", "foo", "standard", "x86_64", None)
+            .unwrap();
+        assert!(workers.is_empty());
+        assert_eq!(http.post_calls()[0].1, String::new());
+    }
+
+    #[test]
+    fn check_constraints_rejects_empty_constraints_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .check_constraints("testproject", "foo", "standard", "x86_64", Some(""))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    // --- list_repositories ---
+
+    #[test]
+    fn list_repositories_reads_the_public_meta() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/testproject/_meta",
+            "<project name=\"testproject\"><repository name=\"standard\"><arch>x86_64</arch><arch>i586</arch><path project=\"openSUSE.org:openSUSE:Tumbleweed\" repository=\"standard\"/></repository></project>",
+        );
+        let client = ObsClient::new(&http);
+        let repos = client.list_repositories("testproject").unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, "standard");
+        assert_eq!(
+            repos[0].arch,
+            vec!["x86_64".to_string(), "i586".to_string()]
+        );
+        // The public read carries no credentials.
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/testproject/_meta".to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn list_repositories_404_is_an_error_not_an_empty_list() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/public/source/nosuchproject/_meta",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::new(&http);
+        let err = client.list_repositories("nosuchproject").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn list_repositories_rejects_an_invalid_name_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.list_repositories("bad/project").is_err());
+        assert!(http.get_calls().is_empty());
     }
 }
