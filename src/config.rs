@@ -958,6 +958,23 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_url_rejects_embedded_whitespace_and_control() {
+        // Leading/trailing whitespace is trimmed by design (see
+        // endpoint_url_is_trimmed); whitespace or control characters
+        // inside the URL are rejected.
+        for bad in [
+            "https://api.open suse.org",
+            "https://api.opensuse.org/pa th",
+            "https://api.opensuse.org\u{7f}",
+            "https://api.opensuse.org\u{0}",
+        ] {
+            let err = validate_endpoint_url(bad, "obs_url").unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError, "url {bad:?}");
+            assert!(err.context.contains("whitespace"), "{}", err.context);
+        }
+    }
+
+    #[test]
     fn endpoint_url_is_trimmed() {
         // Leading/trailing whitespace is stored trimmed, not passed
         // on to fail confusingly at request time.
