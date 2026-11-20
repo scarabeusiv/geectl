@@ -11,11 +11,15 @@
 //!   vs query values).
 //! - [`http`]: the HTTP client trait with a bounded timeout, plus a ureq
 //!   implementation.
-//! - [`auth`]: the auth seam — a trait only. The credential design (OBS
-//!   user/pass, Gitea token, SSH keys) is done after scaffolding; this trait
-//!   is the seam it plugs into. No credentials are stored anywhere here.
+//! - [`auth`]: the credential types and resolution — OBS user/pass
+//!   (Basic), Gitea token (Bearer), and the Gitea SSH key — resolved
+//!   from environment variables or mounted secret files. No
+//!   credentials are stored anywhere here.
+//! - [`config`]: the XDG config file (endpoint URLs only, never
+//!   credentials) and the secure-write primitive.
 
 pub mod auth;
+pub mod config;
 pub mod error;
 pub mod http;
 pub mod url;
