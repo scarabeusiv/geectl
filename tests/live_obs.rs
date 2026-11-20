@@ -69,8 +69,9 @@ use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::{
     BranchOptions, CopyOptions, CopyProjectOptions, DryRun, FilePatchStatus, HistoryEntry,
-    LinkOptions, ObsClient, PackageDiffStatus, Request, RequestAction, RequestSearch,
-    RequestState, ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling, SrPayload,
+    LinkOptions, LinkRevision, ObsClient, PackageDiffStatus, Request, RequestAction,
+    RequestSearch, RequestState, ReviewState, ReviewTarget, RevisionRange, SourceUpdate,
+    SrFiling, SrPayload,
 };
 
 /// Whether `url` points at a loopback host.
@@ -1760,7 +1761,7 @@ fn read_expanded_file(base: &str, project: &str, package: &str, filename: &str) 
     ));
     http.get_with(
         &format!("{base}/source/{project}/{package}/{filename}?expand=1"),
-        &temporal_credentials(),
+        &live_credentials(),
     )
     .expect("GET the expanded file back from the server")
 }
@@ -2315,9 +2316,9 @@ fn put_link(base: &str, project: &str, package: &str, link: &str) {
     http.put_file(
         &format!("{base}/source/{project}/{package}/_link"),
         link,
-        &temporal_credentials(),
+        &live_credentials(),
     )
-    .expect("PUT the _link on the temporal instance");
+    .expect("PUT the _link on the live instance");
 }
 
 /// Read a package's directory listing back from the server,
@@ -2328,27 +2329,27 @@ fn read_directory(base: &str, project: &str, package: &str) -> String {
     ));
     http.get_with(
         &format!("{base}/source/{project}/{package}?rev=latest"),
-        &temporal_credentials(),
+        &live_credentials(),
     )
     .expect("GET the directory back from the server")
 }
 
 #[test]
-fn temporal_repair_link_repairs_broken_link() {
-    let Some(base) = temporal_url() else {
+fn live_repair_link_repairs_broken_link() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (source_project, package, filename, content) = setup_copy_source(&client);
     let target_project = format!("geectl-tmp-repair-{}", unique_suffix());
     client
         .create_project(
             &target_project,
-            "geectl temporal test repair target",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test repair target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create repair target project on the temporal instance");
+        .expect("create repair target project on the live instance");
     client
         .link_package(
             &source_project,
@@ -2358,7 +2359,7 @@ fn temporal_repair_link_repairs_broken_link() {
             &LinkOptions::default(),
             &DryRun::new(false),
         )
-        .expect("link a package on the temporal instance");
+        .expect("link a package on the live instance");
     // Break the link: a patch file that is not a patch at all, plus
     // an apply entry for it. The link stops expanding.
     client
@@ -2385,7 +2386,7 @@ fn temporal_repair_link_repairs_broken_link() {
     );
     client
         .repair_link(&target_project, &package, &DryRun::new(false))
-        .expect("repair a broken link on the temporal instance");
+        .expect("repair a broken link on the live instance");
     // The repaired link expands again, carries no apply entry, and
     // is pinned at a baserev.
     let directory = read_directory(&base, &target_project, &package);
@@ -2408,6 +2409,208 @@ fn temporal_repair_link_repairs_broken_link() {
         read_expanded_file(&base, &target_project, &package, &filename),
         content,
         "the source file must read back through the repaired link"
+    );
+}
+
+/// Create a source project with a package holding one spec file
+/// and link it into a fresh target project. Returns
+/// `(source_project, target_project, package)`.
+fn setup_link(client: &ObsClient<'_>) -> (String, String, String) {
+    let (source_project, package, _, _) = setup_copy_source(client);
+    let target_project = format!("geectl-tmp-setlinkrev-{}", unique_suffix());
+    client
+        .create_project(
+            &target_project,
+            "geectl live test link-revision target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create link-revision target project on the live instance");
+    client
+        .link_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &LinkOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("link a package on the live instance");
+    (source_project, target_project, package)
+}
+
+#[test]
+fn live_set_link_rev_latest() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, target_project, package) = setup_link(&client);
+    let source_dir = read_directory(&base, &source_project, &package);
+    let expected = xml_attr(&source_dir, "rev").expect("the source directory carries a rev");
+    let rev = client
+        .set_link_rev(
+            &target_project,
+            &package,
+            &LinkRevision::Latest,
+            &DryRun::new(false),
+        )
+        .expect("set the link revision on the live instance");
+    assert_eq!(
+        rev.as_deref(),
+        Some(expected.as_str()),
+        "the resolved revision must be the target's revision"
+    );
+    let link = read_link(&base, &target_project, &package);
+    assert_eq!(
+        xml_attr(&link, "rev").as_deref(),
+        Some(expected.as_str()),
+        "the link must carry the target's revision; link: {link}"
+    );
+}
+
+#[test]
+fn live_set_link_rev_pinned() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, target_project, package) = setup_link(&client);
+    // Pin to the source's actual current revision: the source is
+    // created with a single revision, so a hardcoded "2" names a
+    // revision that does not exist.
+    let source_dir = read_directory(&base, &source_project, &package);
+    let pinned = xml_attr(&source_dir, "rev").expect("the source directory carries a rev");
+    let rev = client
+        .set_link_rev(
+            &target_project,
+            &package,
+            &LinkRevision::Pinned(pinned.clone()),
+            &DryRun::new(false),
+        )
+        .expect("pin the link revision on the live instance");
+    assert_eq!(rev.as_deref(), Some(pinned.as_str()));
+    let link = read_link(&base, &target_project, &package);
+    assert_eq!(
+        xml_attr(&link, "rev").as_deref(),
+        Some(pinned.as_str()),
+        "the link must carry the pinned revision; link: {link}"
+    );
+    // The pinned revision is the target's current revision, so the
+    // link still expands.
+    let directory = read_directory(&base, &target_project, &package);
+    assert!(
+        !directory.contains("error=\""),
+        "the pinned link must expand; directory: {directory}"
+    );
+}
+
+#[test]
+fn live_set_link_rev_unset() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (_, target_project, package) = setup_link(&client);
+    client
+        .set_link_rev(
+            &target_project,
+            &package,
+            &LinkRevision::Latest,
+            &DryRun::new(false),
+        )
+        .expect("set the link revision on the live instance");
+    let rev = client
+        .set_link_rev(
+            &target_project,
+            &package,
+            &LinkRevision::Unset,
+            &DryRun::new(false),
+        )
+        .expect("unset the link revision on the live instance");
+    assert_eq!(rev, None);
+    let link = read_link(&base, &target_project, &package);
+    assert!(
+        !link.contains(" rev=\""),
+        "the link must carry no revision after unsetting; link: {link}"
+    );
+}
+
+#[test]
+fn live_set_link_rev_expanded() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (_, target_project, package) = setup_link(&client);
+    let rev = client
+        .set_link_rev(
+            &target_project,
+            &package,
+            &LinkRevision::Expanded,
+            &DryRun::new(false),
+        )
+        .expect("set the expanded link revision on the live instance")
+        .expect("expanding sets a revision");
+    assert_eq!(rev.len(), 32, "the expanded revision is an md5; rev: {rev}");
+    let link = read_link(&base, &target_project, &package);
+    assert_eq!(
+        xml_attr(&link, "rev").as_deref(),
+        Some(rev.as_str()),
+        "the link must carry the expanded revision; link: {link}"
+    );
+    assert_eq!(
+        xml_attr(&link, "vrev").as_deref(),
+        Some("1"),
+        "the expanded revision carries a vrev; link: {link}"
+    );
+}
+
+#[test]
+fn live_set_link_rev_project() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (_, target_project, package) = setup_link(&client);
+    let set = client
+        .set_link_rev_project(&target_project, &LinkRevision::Latest, &DryRun::new(false))
+        .expect("set the project link revisions on the live instance");
+    assert_eq!(set.len(), 1, "the project holds one linked package");
+    assert_eq!(set[0].0, package);
+    assert!(set[0].1.is_some());
+    let link = read_link(&base, &target_project, &package);
+    assert_eq!(
+        xml_attr(&link, "rev").as_deref(),
+        set[0].1.as_deref(),
+        "the link must carry the resolved revision; link: {link}"
+    );
+}
+
+#[test]
+fn live_set_link_rev_project_unset() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (_, target_project, package) = setup_link(&client);
+    client
+        .set_link_rev(
+            &target_project,
+            &package,
+            &LinkRevision::Latest,
+            &DryRun::new(false),
+        )
+        .expect("set the link revision on the live instance");
+    let set = client
+        .set_link_rev_project(&target_project, &LinkRevision::Unset, &DryRun::new(false))
+        .expect("unset the project link revisions on the live instance");
+    assert_eq!(set.len(), 1, "the project holds one linked package");
+    assert_eq!(set[0], (package.clone(), None));
+    let link = read_link(&base, &target_project, &package);
+    assert!(
+        !link.contains(" rev=\""),
+        "the link must carry no revision after unsetting; link: {link}"
     );
 }
 

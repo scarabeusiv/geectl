@@ -198,10 +198,14 @@ impl XmlDoc {
         let (tag_end, self_closing) =
             scan_tag(text, 0).ok_or_else(|| malformed("unterminated root tag"))?;
         // The root open tag without its closing `>` (and without a
-        // trailing `/` for a self-closing root).
+        // trailing `/` for a self-closing root). A self-closing root
+        // written `<tag ... />` also leaves a trailing space in the
+        // open tag; drop it so attribute edits render cleanly
+        // (`<tag ... rev="42"/>`, not `<tag ...  rev="42"/>`).
         let mut root_open = text[..tag_end - 1].to_string();
         if self_closing {
             root_open.pop();
+            root_open.truncate(root_open.trim_end().len());
         }
         if self_closing {
             if !text[tag_end..].trim().is_empty() {
@@ -420,6 +424,38 @@ impl XmlDoc {
             .any(|child| element_name(child).is_some())
     }
 
+    /// Remove attribute `name` from the root element, when it is
+    /// there. The whitespace before the attribute goes with it, so
+    /// the tag stays well-formed.
+    pub(crate) fn remove_root_attr(&mut self, name: &str) {
+        let needle = format!("{name}=");
+        let mut search_from = 0;
+        while let Some(found) = self.root_open[search_from..].find(&needle) {
+            let pos = search_from + found;
+            if pos > 0 && !self.root_open.as_bytes()[pos - 1].is_ascii_whitespace() {
+                search_from = pos + needle.len();
+                continue;
+            }
+            let after_eq = &self.root_open[pos + needle.len()..];
+            let Some(quote) = after_eq.chars().next() else {
+                return;
+            };
+            if quote != '"' && quote != '\'' {
+                return;
+            }
+            let Some(close) = after_eq[1..].find(quote) else {
+                return;
+            };
+            let value_end = pos + needle.len() + 1 + close + 1;
+            let mut start = pos;
+            while start > 0 && self.root_open.as_bytes()[start - 1].is_ascii_whitespace() {
+                start -= 1;
+            }
+            self.root_open.replace_range(start..value_end, "");
+            return;
+        }
+    }
+
     /// Remove every child element named `name`. Opaque entries
     /// (comments, text) are never elements, so they survive.
     pub(crate) fn remove_elements(&mut self, name: &str) {
@@ -554,6 +590,23 @@ mod tests {
         assert!(doc.child("title").is_none());
         let doc = XmlDoc::parse("<package><title>Test</title></package>").unwrap();
         assert!(doc.has_elements());
+    }
+
+    #[test]
+    fn remove_root_attr_drops_the_attribute_and_its_space() {
+        let mut doc = XmlDoc::parse(META).unwrap();
+        doc.remove_root_attr("project");
+        assert_eq!(
+            doc.render(),
+            "<package name=\"test-pkgA\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/><person userid=\"alice\" role=\"maintainer\"/><lock><enable/></lock></package>"
+        );
+        // Removing an absent attribute changes nothing.
+        doc.remove_root_attr("project");
+        assert_eq!(doc.root_attr("project"), None);
+        // Removing the first attribute leaves a well-formed tag.
+        let mut doc = XmlDoc::parse("<link rev=\"42\" package=\"srcpkg\"/>").unwrap();
+        doc.remove_root_attr("rev");
+        assert_eq!(doc.render(), "<link package=\"srcpkg\"/>");
     }
 
     #[test]

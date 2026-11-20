@@ -884,6 +884,28 @@ pub struct LinkOptions {
     pub disable_publish: bool,
 }
 
+/// Which revision a link is set to by [`ObsClient::set_link_rev`].
+/// The revision is the link target's revision the link expands at:
+/// a number, an md5, or nothing (the link follows the target).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkRevision {
+    /// The link target's latest revision (its directory `rev`).
+    Latest,
+    /// Exactly this revision: a number or an md5. Set without
+    /// fetching anything — the revision is taken as given.
+    Pinned(String),
+    /// The link target's latest revision, expanded: the directory
+    /// `rev` at `expand=1` (the expanded srcmd5) with its `vrev`.
+    Expanded,
+    /// This revision, expanded: the directory `rev` at the pinned
+    /// revision with `expand=1` (the expanded srcmd5) with its
+    /// `vrev`.
+    PinnedExpanded(String),
+    /// No revision: the link follows its target. The `rev` and the
+    /// `vrev` are both stripped from the link.
+    Unset,
+}
+
 impl<'a> ObsClient<'a> {
     /// A client for the production OBS API, with no credentials
     /// (public reads only).
@@ -3730,6 +3752,291 @@ impl<'a> ObsClient<'a> {
         }
         Ok(())
     }
+
+    /// Set the revision of the source link in `project`/`package`
+    /// on OBS: write the `rev` (and, for an md5 revision, the
+    /// `vrev`) onto its `_link` and PUT it back. Requires
+    /// credentials; without them the call fails loudly before any
+    /// request. In dry-run the revision is recorded in the plan
+    /// and nothing is set — the guard runs before the credentials
+    /// check, like `create_package`.
+    ///
+    /// An agent sets a link revision when a linked package must
+    /// stop following its target: pinning it at the revision that
+    /// was reviewed, or unsetting it so it follows again. `Latest`
+    /// resolves the target's current revision, `Expanded` the
+    /// target's current expanded revision (the expanded srcmd5,
+    /// with its `vrev`), `Pinned` sets exactly the revision
+    /// given without fetching anything, and `Unset` strips the
+    /// revision (and the `vrev`) so the link follows its target.
+    /// The revision is always PUT back, even when it is unchanged:
+    /// the link revision is re-asserted, not deduplicated.
+    ///
+    /// The `vrev` counts versions within an md5 revision, so it
+    /// is only ever set from a directory fetch, and only when the
+    /// new revision is an md5; a `vrev` left from another revision
+    /// is stale and is dropped. The PUT carries a comment
+    /// ("Set link revision to {rev}" / "Unset link revision") so
+    /// the package history says what changed.
+    ///
+    /// Returns the revision now on the link, or None when it was
+    /// unset — and None in dry-run, where nothing is set. Success is
+    /// the backend's `<revision>` document on
+    /// the `_link` PUT; any other body is a server error, never
+    /// success. A missing link reads as `NotFound` from the
+    /// `_link` GET, before anything is written; expanding a
+    /// broken link reads as the server's 400, propagated.
+    pub fn set_link_rev(
+        &self,
+        project: &str,
+        package: &str,
+        revision: &LinkRevision,
+        dry_run: &DryRun,
+    ) -> Result<Option<String>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let plan = match revision {
+            LinkRevision::Unset => format!("unset link revision of {project}/{package}"),
+            LinkRevision::Latest => {
+                format!("set link revision of {project}/{package} to latest")
+            }
+            LinkRevision::Pinned(rev) => {
+                format!("set link revision of {project}/{package} to {rev}")
+            }
+            LinkRevision::Expanded => {
+                format!("set link revision of {project}/{package} to expanded")
+            }
+            LinkRevision::PinnedExpanded(rev) => {
+                format!("set link revision of {project}/{package} to expanded {rev}")
+            }
+        };
+        // The dry-run guard: in dry-run the revision is recorded
+        // in the plan and nothing is set — not even the
+        // credentials check runs.
+        if !dry_run.allow(&plan) {
+            return Ok(None);
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot set a link revision without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let link_url = build_url(&self.base, &["source", project, package, "_link"], &[]);
+        let link_body = self.http.get_with(&link_url, &self.credentials)?;
+        self.set_link_rev_with_link(project, package, revision, &link_body)
+    }
+
+    /// Set the link revision of every linked package in `project`
+    /// on OBS, with the same modes as [`ObsClient::set_link_rev`]
+    /// except a pinned revision: pinning every link in a project
+    /// to one revision is almost certainly a mistake, so a pinned
+    /// revision needs a package (use `set_link_rev` for one
+    /// package at a time). Packages without a link are skipped.
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. In dry-run the revision is recorded
+    /// in the plan and nothing is set.
+    ///
+    /// An agent sets a project's link revisions when a whole
+    /// project of links must stop following its targets — a test
+    /// project frozen at the revisions that were reviewed. The
+    /// operation applies per package and may partially apply: a
+    /// failure leaves the earlier packages set and is reported
+    /// with the package it stopped at.
+    ///
+    /// Returns the packages whose links were set, in project
+    /// order, with the revision now on each link (or None when
+    /// unset). In dry-run the returned list is empty: nothing is
+    /// set. Success is the backend's `<revision>` document
+    /// on each `_link` PUT.
+    pub fn set_link_rev_project(
+        &self,
+        project: &str,
+        revision: &LinkRevision,
+        dry_run: &DryRun,
+    ) -> Result<Vec<(String, Option<String>)>, GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        if matches!(
+            revision,
+            LinkRevision::Pinned(_) | LinkRevision::PinnedExpanded(_)
+        ) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "setting a pinned link revision needs a package: use set_link_rev for one package at a time",
+            ));
+        }
+        let plan = match revision {
+            LinkRevision::Unset => {
+                format!("unset link revision of every linked package in project {project}")
+            }
+            LinkRevision::Latest => {
+                format!("set link revision of every linked package in project {project} to latest")
+            }
+            LinkRevision::Expanded => format!(
+                "set link revision of every linked package in project {project} to expanded"
+            ),
+            LinkRevision::Pinned(_) | LinkRevision::PinnedExpanded(_) => {
+                unreachable!("pinned revisions are refused above")
+            }
+        };
+        if !dry_run.allow(&plan) {
+            return Ok(Vec::new());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot set a link revision without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(&self.base, &["source", project], &[]);
+        let directory = self.http.get_with(&url, &self.credentials)?;
+        let packages = parse_package_names(&directory)?;
+        let mut set = Vec::new();
+        for package in packages {
+            let link_url = build_url(
+                &self.base,
+                &["source", project, package.as_str(), "_link"],
+                &[],
+            );
+            let link_body = match self.http.get_with(&link_url, &self.credentials) {
+                Ok(body) => body,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            let rev = self.set_link_rev_with_link(project, &package, revision, &link_body)?;
+            set.push((package, rev));
+        }
+        Ok(set)
+    }
+
+    /// Set the link revision on an already-fetched `_link`
+    /// document: resolve the revision when the mode needs it,
+    /// apply the `rev`/`vrev` attributes, and PUT the link back.
+    /// The credentials check and the `_link` fetch live in the
+    /// callers, so the project form can skip packages without a
+    /// link instead of failing on them.
+    fn set_link_rev_with_link(
+        &self,
+        project: &str,
+        package: &str,
+        revision: &LinkRevision,
+        link_body: &str,
+    ) -> Result<Option<String>, GeectlError> {
+        let mut doc = XmlDoc::parse(link_body)?;
+        // The link target: the link's own project/package
+        // attributes, defaulting to the package the link lives in.
+        let target_project = doc
+            .root_attr("project")
+            .unwrap_or_else(|| project.to_string());
+        let target_package = doc
+            .root_attr("package")
+            .unwrap_or_else(|| package.to_string());
+        let (new_rev, new_vrev): (Option<String>, Option<String>) = match revision {
+            LinkRevision::Unset => (None, None),
+            LinkRevision::Pinned(rev) => (Some(rev.clone()), None),
+            LinkRevision::Latest => {
+                let (rev, vrev) =
+                    self.resolve_link_rev(&target_project, &target_package, None, false)?;
+                (Some(rev), vrev)
+            }
+            LinkRevision::Expanded => {
+                let (rev, vrev) =
+                    self.resolve_link_rev(&target_project, &target_package, None, true)?;
+                (Some(rev), vrev)
+            }
+            LinkRevision::PinnedExpanded(rev) => {
+                let (resolved, vrev) =
+                    self.resolve_link_rev(&target_project, &target_package, Some(rev), true)?;
+                (Some(resolved), vrev)
+            }
+        };
+        match &new_rev {
+            Some(rev) => doc.set_root_attr("rev", rev),
+            None => doc.remove_root_attr("rev"),
+        }
+        // A vrev counts versions within an md5 revision: it is
+        // only ever set from a directory fetch, and only when the
+        // new revision is an md5. Any vrev left from another
+        // revision is stale and is dropped.
+        match &new_vrev {
+            Some(vrev) => doc.set_root_attr("vrev", vrev),
+            None => doc.remove_root_attr("vrev"),
+        }
+        let comment = match &new_rev {
+            Some(rev) => format!("Set link revision to {rev}"),
+            None => "Unset link revision".to_string(),
+        };
+        let link_url = build_url(
+            &self.base,
+            &["source", project, package, "_link"],
+            &[("comment", comment.as_str())],
+        );
+        let body = self
+            .http
+            .put_file(&link_url, &doc.render(), &self.credentials)?;
+        if parse_revision(&body).is_none() {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS link response for package {project}/{package}"),
+            ));
+        }
+        Ok(new_rev)
+    }
+
+    /// Resolve the revision a link is set to from the link
+    /// target's directory: the directory's `rev` attribute, with
+    /// its `vrev` when the revision is an md5 (32 characters or
+    /// more — a vrev counts versions within an md5 revision, so
+    /// a numeric revision has none). `at` pins the directory
+    /// revision; `expand` asks for the expanded source. A failed
+    /// directory read (expanding a broken link reads as a 400)
+    /// propagates: there is no revision to set.
+    fn resolve_link_rev(
+        &self,
+        target_project: &str,
+        target_package: &str,
+        at: Option<&str>,
+        expand: bool,
+    ) -> Result<(String, Option<String>), GeectlError> {
+        let mut query: Vec<(&str, &str)> = vec![("rev", at.unwrap_or("latest"))];
+        if expand {
+            query.push(("expand", "1"));
+        }
+        let url = build_url(
+            &self.base,
+            &["source", target_project, target_package],
+            &query,
+        );
+        let directory = self.http.get_with(&url, &self.credentials)?;
+        let (rev, vrev, srcmd5) = parse_directory_rev(&directory)?;
+        // An expanded directory reports the revision number in
+        // `rev` and the expanded content's md5 in `srcmd5`; the
+        // link revision is the md5. (The server rewrites `rev` to
+        // the srcmd5 only when the listed package itself is a link
+        // being expanded, which the target here is not.)
+        let rev = if expand { srcmd5 } else { rev };
+        let Some(rev) = rev else {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS directory response for package {target_project}/{target_package}"
+                ),
+            ));
+        };
+        let vrev = if rev.len() >= 32 { vrev } else { None };
+        Ok((rev, vrev))
+    }
 }
 
 /// Extract the devel project from an OBS directory listing
@@ -4492,6 +4799,115 @@ fn repair_link_doc(doc: &mut XmlDoc, new_baserev: Option<&str>) -> Result<bool, 
         doc.set_root_attr("baserev", baserev);
     }
     Ok(true)
+}
+
+/// The `rev`, `vrev`, and `srcmd5` attributes of an OBS directory
+/// listing's root element, each None when the attribute is absent.
+pub(crate) type DirectoryRev = (Option<String>, Option<String>, Option<String>);
+
+/// The `rev`, `vrev`, and `srcmd5` attributes of an OBS directory
+/// listing's root element. An error when the body is not a
+/// `<directory>` document at all; None values when the attributes
+/// are absent. A truncated body (no closing tag) is an error, not
+/// an empty revision. The `srcmd5` is the expanded content's md5:
+/// for an expanded fetch it is the revision to pin, where `rev`
+/// is only the revision number.
+pub(crate) fn parse_directory_rev(body: &str) -> Result<DirectoryRev, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS directory response: not a <directory> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<directory") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = after_open.find('>') else {
+        return Err(malformed());
+    };
+    let tag = &after_open[..end];
+    let self_closing = tag.ends_with('/');
+    let rev = find_attr(tag, "rev");
+    let vrev = find_attr(tag, "vrev");
+    let srcmd5 = find_attr(tag, "srcmd5");
+    let rest = &after_open[end + 1..];
+    if self_closing {
+        if !rest.trim().is_empty() {
+            return Err(malformed());
+        }
+        return Ok((rev, vrev, srcmd5));
+    }
+    let Some(close) = rest.find("</directory>") else {
+        return Err(malformed());
+    };
+    if !rest[close + "</directory>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    Ok((rev, vrev, srcmd5))
+}
+
+/// The package names in an OBS project directory listing: the
+/// `name` of every `<entry>`. An error when the body is not a
+/// `<directory>` document, or when an entry carries no name.
+pub(crate) fn parse_package_names(body: &str) -> Result<Vec<String>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS directory response: not a <directory> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<directory") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = after_open.find('>') else {
+        return Err(malformed());
+    };
+    if after_open[..end].trim_end().ends_with('/') {
+        return Ok(Vec::new());
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</directory>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</directory>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let mut names = Vec::new();
+    let mut rest = &inner[..close];
+    while let Some(pos) = rest.find("<entry") {
+        let after_tag = &rest[pos + "<entry".len()..];
+        let Some(first) = after_tag.chars().next() else {
+            return Err(malformed());
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        let Some(end) = after_tag.find('>') else {
+            return Err(malformed());
+        };
+        let tag = &after_tag[..end];
+        let Some(name) = find_attr(tag, "name") else {
+            return Err(malformed());
+        };
+        names.push(name);
+        rest = &after_tag[end..];
+    }
+    Ok(names)
 }
 
 pub(crate) fn parse_revision(body: &str) -> Option<u64> {
@@ -11379,6 +11795,602 @@ mod tests {
         let mut doc =
             XmlDoc::parse("<link project=\"test:factory\" package=\"test-pkgA\"/>").unwrap();
         assert!(!repair_link_doc(&mut doc, None).unwrap());
+    }
+
+    #[test]
+    fn set_link_rev_latest_resolves_target_revision() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" />";
+        let directory = "<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"ffffffffffffffffffffffffffffffff\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=latest",
+                directory,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Set%20link%20revision%20to%2042",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .set_link_rev(
+                    "osctest",
+                    "simple",
+                    &LinkRevision::Latest,
+                    &DryRun::new(false),
+                )
+                .unwrap(),
+            Some("42".to_string())
+        );
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            "<link package=\"srcpkg\" project=\"srcprj\" rev=\"42\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_pinned_puts_without_fetching() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" />";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Set%20link%20revision%20to%2042",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .set_link_rev(
+                    "osctest",
+                    "simple",
+                    &LinkRevision::Pinned("42".to_string()),
+                    &DryRun::new(false),
+                )
+                .unwrap(),
+            Some("42".to_string())
+        );
+        // Only the _link GET: no directory fetch for a pinned rev.
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.put_calls().len(), 1);
+    }
+
+    #[test]
+    fn set_link_rev_expanded_resolves_expanded_revision() {
+        let link = "<link package=\"srcpkg\" />";
+        let directory = "<directory name=\"srcpkg\" rev=\"1\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\"><linkinfo project=\"srcsrcprj\" package=\"srcsrcpkg\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" baserev=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" xsrcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" lsrcmd5=\"cccccccccccccccccccccccccccccccc\" /><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"_link\" size=\"23\" /></directory>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/osctest/srcpkg?rev=latest&expand=1",
+                directory,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Set%20link%20revision%20to%20eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .set_link_rev(
+                    "osctest",
+                    "simple",
+                    &LinkRevision::Expanded,
+                    &DryRun::new(false),
+                )
+                .unwrap(),
+            Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string())
+        );
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link package=\"srcpkg\" rev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_latest_updates_existing_revision() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" rev=\"7\" />";
+        let directory = "<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"ffffffffffffffffffffffffffffffff\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=latest",
+                directory,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Set%20link%20revision%20to%2042",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Latest,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link package=\"srcpkg\" project=\"srcprj\" rev=\"42\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_expanded_updates_existing_revision() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" rev=\"7\" />";
+        let directory = "<directory name=\"srcpkg\" rev=\"1\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\"><linkinfo project=\"srcsrcprj\" package=\"srcsrcpkg\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" baserev=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" xsrcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" lsrcmd5=\"cccccccccccccccccccccccccccccccc\" /><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"_link\" size=\"23\" /></directory>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=latest&expand=1",
+                directory,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Set%20link%20revision%20to%20eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Expanded,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link package=\"srcpkg\" project=\"srcprj\" rev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_expanding_broken_link_propagates_the_error() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" />";
+        let http = FakeHttp::new()
+            .with_get("https://api.opensuse.org/source/osctest/simple/_link", link)
+            .with_get_error(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=latest&expand=1",
+                ErrorKind::ServerError,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Expanded,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_link_rev_unset_strips_the_revision() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" rev=\"42\" />";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Unset%20link%20revision",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .set_link_rev(
+                    "osctest",
+                    "simple",
+                    &LinkRevision::Unset,
+                    &DryRun::new(false),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link package=\"srcpkg\" project=\"srcprj\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_unset_strips_revision_and_vrev() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" rev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\" />";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Unset%20link%20revision",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Unset,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link package=\"srcpkg\" project=\"srcprj\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_unset_puts_even_without_a_revision() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" />";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Unset%20link%20revision",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Unset,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        // Unsetting a missing revision still PUTs the unchanged link.
+        assert_eq!(http.put_calls().len(), 1);
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link package=\"srcpkg\" project=\"srcprj\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_pinned_expanded_resolves_the_pinned_revision() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" />";
+        let directory = "<directory name=\"srcpkg\" rev=\"2\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=2&expand=1",
+                directory,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Set%20link%20revision%20to%20eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .set_link_rev(
+                    "osctest",
+                    "simple",
+                    &LinkRevision::PinnedExpanded("2".to_string()),
+                    &DryRun::new(false),
+                )
+                .unwrap(),
+            Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string())
+        );
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link package=\"srcpkg\" project=\"srcprj\" rev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_latest_short_revision_drops_stale_vrev() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" rev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\" />";
+        let directory = "<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"ffffffffffffffffffffffffffffffff\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=latest",
+                directory,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Set%20link%20revision%20to%2042",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Latest,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        // The numeric revision has no versions within it: the vrev
+        // from the old md5 revision is stale and is dropped.
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link package=\"srcpkg\" project=\"srcprj\" rev=\"42\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_pinned_md5_drops_stale_vrev() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" rev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\" />";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=Set%20link%20revision%20to%20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Pinned("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        // Pinning resolves nothing, so there is no vrev to set — and
+        // the vrev from the old revision is stale.
+        assert_eq!(
+            http.put_calls()[0].1,
+            "<link package=\"srcpkg\" project=\"srcprj\" rev=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_latest_without_directory_revision_is_error() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" />";
+        let directory = "<directory name=\"srcpkg\" srcmd5=\"ffffffffffffffffffffffffffffffff\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>";
+        let http = FakeHttp::new()
+            .with_get("https://api.opensuse.org/source/osctest/simple/_link", link)
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=latest",
+                directory,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Latest,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_link_rev_missing_link_is_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/source/osctest/simple/_link",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Latest,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_link_rev_dry_run_records_plan_and_sets_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert_eq!(
+            client
+                .set_link_rev("osctest", "simple", &LinkRevision::Latest, &dry_run,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: set link revision of osctest/simple to latest".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_link_rev_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/osctest/simple/_link",
+            "<link package=\"srcpkg\" project=\"srcprj\" />",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Latest,
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_link_rev_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_link_rev(
+                "osctest",
+                "simple/pkg",
+                &LinkRevision::Latest,
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn set_link_rev_project_sets_every_linked_package() {
+        let project = "<directory name=\"test:factory\"><entry name=\"pkgA\"/><entry name=\"pkgB\"/><entry name=\"pkgC\"/></directory>";
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" />";
+        let directory = "<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"ffffffffffffffffffffffffffffffff\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory",
+                project,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/pkgA/_link",
+                link,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/test:factory/pkgB/_link",
+                ErrorKind::NotFound,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/pkgC/_link",
+                link,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=latest",
+                directory,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/pkgA/_link?comment=Set%20link%20revision%20to%2042",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/pkgC/_link?comment=Set%20link%20revision%20to%2042",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .set_link_rev_project("test:factory", &LinkRevision::Latest, &DryRun::new(false),)
+                .unwrap(),
+            vec![
+                ("pkgA".to_string(), Some("42".to_string())),
+                ("pkgC".to_string(), Some("42".to_string())),
+            ]
+        );
+        // pkgB has no link and is skipped; pkgA and pkgC are set.
+        assert_eq!(http.put_calls().len(), 2);
+    }
+
+    #[test]
+    fn set_link_rev_project_pinned_is_refused() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .set_link_rev_project(
+                "test:factory",
+                &LinkRevision::Pinned("42".to_string()),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn set_link_rev_project_dry_run_records_plan_and_sets_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert_eq!(
+            client
+                .set_link_rev_project("test:factory", &LinkRevision::Latest, &dry_run)
+                .unwrap(),
+            Vec::<(String, Option<String>)>::new()
+        );
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: set link revision of every linked package in project test:factory to latest".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn parse_directory_rev_reads_rev_and_vrev() {
+        let body = "<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"ffffffffffffffffffffffffffffffff\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>";
+        assert_eq!(
+            parse_directory_rev(body).unwrap(),
+            (
+                Some("42".to_string()),
+                Some("1".to_string()),
+                Some("ffffffffffffffffffffffffffffffff".to_string()),
+            )
+        );
+        let body = "<directory name=\"srcpkg\" srcmd5=\"ffffffffffffffffffffffffffffffff\"/>";
+        assert_eq!(
+            parse_directory_rev(body).unwrap(),
+            (
+                None,
+                None,
+                Some("ffffffffffffffffffffffffffffffff".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_directory_rev_malformed_body_is_error() {
+        assert!(parse_directory_rev("garbage").is_err());
+        assert!(parse_directory_rev("<directory name=\"x\">").is_err());
+        assert!(parse_directory_rev("<collection/>").is_err());
+    }
+
+    #[test]
+    fn parse_package_names_reads_entry_names() {
+        let body = "<directory name=\"test:factory\"><entry name=\"pkgA\"/><entry name=\"pkgB\"/><entry name=\"pkgC\"/></directory>";
+        assert_eq!(
+            parse_package_names(body).unwrap(),
+            vec!["pkgA".to_string(), "pkgB".to_string(), "pkgC".to_string()]
+        );
+        let body = "<directory name=\"test:factory\"/>";
+        assert_eq!(parse_package_names(body).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_package_names_malformed_body_is_error() {
+        assert!(parse_package_names("garbage").is_err());
+        assert!(parse_package_names("<directory name=\"x\">").is_err());
+        let body = "<directory name=\"test:factory\"><entry size=\"10\"/></directory>";
+        assert!(parse_package_names(body).is_err());
     }
 
     #[test]
