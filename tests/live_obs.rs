@@ -68,10 +68,10 @@ use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::{
-    BranchOptions, CopyOptions, CopyProjectOptions, DryRun, FilePatchStatus, HistoryEntry,
-    LinkOptions, LinkRevision, ObsClient, PackageDiffStatus, Request, RequestAction,
-    RequestSearch, RequestState, ReviewState, ReviewTarget, RevisionRange, SourceUpdate,
-    SrFiling, SrPayload,
+    BranchOptions, CopyOptions, CopyProjectOptions, DeleteProjectOptions, DryRun,
+    FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision, ObsClient, PackageDiffStatus,
+    Request, RequestAction, RequestSearch, RequestState, ReviewState, ReviewTarget,
+    RevisionRange, SourceUpdate, SrFiling, SrPayload,
 };
 
 /// Whether `url` points at a loopback host.
@@ -2615,15 +2615,15 @@ fn live_set_link_rev_project_unset() {
 }
 
 #[test]
-fn temporal_link_to_branch() {
-    let Some(base) = temporal_url() else {
+fn live_link_to_branch() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (source_project, target_project, package) = setup_link(&client);
     client
         .link_to_branch(&target_project, &package, &DryRun::new(false))
-        .expect("convert the link to a branch on the temporal instance");
+        .expect("convert the link to a branch on the live instance");
     let link = read_link(&base, &target_project, &package);
     // The link still points at its target, now as a branch: the
     // server sets baserev and replaces the patches with a single
@@ -2655,15 +2655,15 @@ fn temporal_link_to_branch() {
 }
 
 #[test]
-fn temporal_detach_branch() {
-    let Some(base) = temporal_url() else {
+fn live_detach_branch() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (_, target_project, package) = setup_link(&client);
     let rev = client
         .detach_branch(&target_project, &package, &DryRun::new(false))
-        .expect("detach the branch on the temporal instance");
+        .expect("detach the branch on the live instance");
     assert!(rev.is_some(), "detaching commits a new revision");
     let directory = read_directory(&base, &target_project, &package);
     assert!(
@@ -2677,24 +2677,184 @@ fn temporal_detach_branch() {
 }
 
 #[test]
-fn temporal_detach_branch_drops_link_when_target_removed() {
-    let Some(base) = temporal_url() else {
+fn live_detach_branch_drops_link_when_target_removed() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (source_project, target_project, package) = setup_link(&client);
     client
         .delete_package(&source_project, &package, true, &DryRun::new(false))
-        .expect("remove the link target on the temporal instance");
+        .expect("remove the link target on the live instance");
     // Dropping the link reports no revision: the API's file delete
     // answers status-ok, not a revision document.
     client
         .detach_branch(&target_project, &package, &DryRun::new(false))
-        .expect("detach the branch with a removed target on the temporal instance");
+        .expect("detach the branch with a removed target on the live instance");
     let directory = read_directory(&base, &target_project, &package);
     assert!(
         !directory.contains("name=\"_link\""),
         "the link is dropped when its target is gone; directory: {directory}"
+    );
+}
+
+/// Whether the project still exists on the server, authenticated:
+/// a GET of the project directory succeeds exactly when the project
+/// is there.
+fn project_exists(base: &str, project: &str) -> bool {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    match http.get_with(&format!("{base}/source/{project}"), &live_credentials()) {
+        Ok(_) => true,
+        Err(err) if err.kind() == ErrorKind::NotFound => false,
+        Err(err) => panic!("GET /source/{project} failed unexpectedly: {err}"),
+    }
+}
+
+/// Poll until the project is gone, for up to a minute: the project
+/// itself is unlinked before the delete replies, but the poll covers
+/// any lag. Panics naming the project when the deadline passes.
+fn wait_until_project_gone(base: &str, project: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if !project_exists(base, project) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    panic!("{project} still exists on the server 60s after the delete");
+}
+
+#[test]
+fn live_delete_project_empty() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let project = format!("geectl-tmp-delproj-{}", unique_suffix());
+    client
+        .create_project(
+            &project,
+            "geectl live test delete target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create the project on the live instance");
+    client
+        .delete_project(
+            &project,
+            &DeleteProjectOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("delete the empty project on the live instance");
+    wait_until_project_gone(&base, &project);
+}
+
+#[test]
+fn live_delete_project_refuses_non_empty() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, _, _) = setup_copy_source(&client);
+    let err = client
+        .delete_project(
+            &source_project,
+            &DeleteProjectOptions::default(),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // The refusal deletes nothing: the package is still there.
+    let meta = read_meta(&base, &source_project, &package);
+    assert!(
+        meta.contains(&format!("name=\"{package}\"")),
+        "the package meta is still there after the refused delete; meta: {meta}"
+    );
+}
+
+#[test]
+fn live_delete_project_recursive() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, _, _, _) = setup_copy_source(&client);
+    let options = DeleteProjectOptions {
+        recursive: true,
+        force: true,
+        comment: Some("cleanup".to_string()),
+    };
+    client
+        .delete_project(&source_project, &options, &DryRun::new(false))
+        .expect("delete the project recursively on the live instance");
+    wait_until_project_gone(&base, &source_project);
+}
+
+#[test]
+fn live_undelete_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, filename, _) = setup_copy_source(&client);
+    client
+        .delete_package(&source_project, &package, true, &DryRun::new(false))
+        .expect("delete the package on the live instance");
+    client
+        .undelete_package(&source_project, &package, &DryRun::new(false))
+        .expect("restore the deleted package on the live instance");
+    let meta = read_meta(&base, &source_project, &package);
+    assert!(
+        meta.contains(&format!("name=\"{package}\"")),
+        "the package meta is back after the restore; meta: {meta}"
+    );
+    let spec = read_file(&base, &source_project, &package, &filename);
+    assert!(
+        spec.contains("Name: live-test"),
+        "the package sources are back after the restore; spec: {spec}"
+    );
+}
+
+#[test]
+fn live_undelete_project() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, filename, _) = setup_copy_source(&client);
+    let options = DeleteProjectOptions {
+        recursive: true,
+        ..DeleteProjectOptions::default()
+    };
+    client
+        .delete_project(&source_project, &options, &DryRun::new(false))
+        .expect("delete the project recursively on the live instance");
+    // The server moves the packages to the deleted area after
+    // replying to the delete, so the restore can race it: retry
+    // until the project is restorable.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match client.undelete_project(&source_project, &DryRun::new(false)) {
+            Ok(()) => break,
+            Err(err)
+                if err.kind() == ErrorKind::NotFound && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            Err(err) => panic!("restore the deleted project on the live instance: {err}"),
+        }
+    }
+    let meta = read_meta(&base, &source_project, &package);
+    assert!(
+        meta.contains(&format!("name=\"{package}\"")),
+        "the package meta is back after the restore; meta: {meta}"
+    );
+    let spec = read_file(&base, &source_project, &package, &filename);
+    assert!(
+        spec.contains("Name: live-test"),
+        "the package sources are back after the restore; spec: {spec}"
     );
 }
 

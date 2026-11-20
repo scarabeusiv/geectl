@@ -804,6 +804,25 @@ pub struct BranchResult {
     /// The branch package name.
     pub target_package: String,
 }
+/// Options for [`ObsClient::delete_project`]. All fields are
+/// optional: an unset flag means off, an unset comment means the
+/// server's default.
+#[derive(Debug, Clone, Default)]
+pub struct DeleteProjectOptions {
+    /// Delete the project with all its packages. Without this, a
+    /// project holding packages is refused — the server deletes a
+    /// non-empty project without complaint, so the guard is
+    /// client-side.
+    pub recursive: bool,
+    /// Ignore other projects depending on this one. The server's
+    /// `force`.
+    pub force: bool,
+    /// A comment recorded on the delete. The server's `comment`.
+    pub comment: Option<String>,
+}
+
+/// Options for [`ObsClient::copy_package`]. All fields are optional:
+/// an unset revision means the latest, an unset flag means off.
 /// Options for [`ObsClient::copy_package`]. All fields are optional:
 /// an unset revision means the latest, an unset flag means off.
 #[derive(Debug, Clone, Default)]
@@ -4256,6 +4275,196 @@ impl<'a> ObsClient<'a> {
             Err(GeectlError::new(
                 ErrorKind::ServerError,
                 format!("unexpected OBS delete response for file {project}/{package}/{filename}"),
+            ))
+        }
+    }
+
+    /// Delete project `project` on OBS (`DELETE /source/<project>`).
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. In dry-run the delete is recorded in the
+    /// plan and nothing is deleted — the guard runs before the
+    /// credentials check, like `create_package`.
+    ///
+    /// An agent deletes a project to remove a scratch or superseded
+    /// project and everything in it. The server deletes a non-empty
+    /// project without complaint (it removes the packages after
+    /// replying), so the must-be-empty guard is client-side: without
+    /// `recursive` the packages are listed first and a project
+    /// holding packages is refused. `force` ignores other projects
+    /// depending on this one; `comment` is recorded on the delete.
+    ///
+    /// Success is the `<status code="ok"/>` body; any other body is a
+    /// server error, never success. Deleting a project that does not
+    /// exist reads as `NotFound` from the package-list read (or from
+    /// the delete itself, when recursive).
+    pub fn delete_project(
+        &self,
+        project: &str,
+        options: &DeleteProjectOptions,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        let mut plan = format!("delete project {project}");
+        if options.recursive {
+            plan.push_str(" with all its packages");
+        }
+        if options.force {
+            plan.push_str(" (force)");
+        }
+        // The dry-run guard: in dry-run the delete is recorded in
+        // the plan and nothing is deleted — not even the credentials
+        // check runs, and the package list is not read.
+        if !dry_run.allow(&plan) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot delete a project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        // The server deletes a non-empty project without complaint,
+        // so the must-be-empty guard is client-side: list the
+        // packages first and refuse a non-empty project without
+        // `recursive`.
+        if !options.recursive {
+            let url = build_url(&self.base, &["source", project], &[]);
+            let directory = self.http.get_with(&url, &self.credentials)?;
+            let packages = parse_package_names(&directory)?;
+            if !packages.is_empty() {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "project {project} contains packages; it must be empty before deleting it (use recursive to delete it with all its packages)"
+                    ),
+                ));
+            }
+        }
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if options.force {
+            query.push(("force", "1"));
+        }
+        if let Some(comment) = &options.comment {
+            query.push(("comment", comment));
+        }
+        let url = build_url(&self.base, &["source", project], &query);
+        let body = self.http.delete(&url, &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS delete response for project {project}"),
+            ))
+        }
+    }
+
+    /// Restore a deleted package on OBS (`POST
+    /// /source/<project>/<package>?cmd=undelete`). Requires
+    /// credentials; without them the call fails loudly before any
+    /// request. In dry-run the restore is recorded in the plan and
+    /// nothing is restored — the guard runs before the credentials
+    /// check, like `create_package`.
+    ///
+    /// An agent restores a package it deleted by mistake (or that a
+    /// cleanup deleted too eagerly): the server restores the package
+    /// including its sources and meta — binaries are lost and
+    /// rebuild. The server records 'package was undeleted' when no
+    /// comment is given, so no comment is sent here. Restoring a
+    /// package that already exists, or one that was never deleted,
+    /// is refused by the server.
+    ///
+    /// Success is the `<status code="ok"/>` body; any other body is a
+    /// server error, never success.
+    pub fn undelete_package(
+        &self,
+        project: &str,
+        package: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        // The dry-run guard: in dry-run the restore is recorded in
+        // the plan and nothing is restored — not even the credentials
+        // check runs.
+        if !dry_run.allow(&format!("restore deleted package {project}/{package}")) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot restore a deleted package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["source", project, package],
+            &[("cmd", "undelete")],
+        );
+        let body = self.http.post(&url, "", &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS undelete response for package {project}/{package}"),
+            ))
+        }
+    }
+
+    /// Restore a deleted project on OBS (`POST
+    /// /source/<project>?cmd=undelete`). Requires credentials; without
+    /// them the call fails loudly before any request. In dry-run the
+    /// restore is recorded in the plan and nothing is restored — the
+    /// guard runs before the credentials check, like `create_package`.
+    ///
+    /// An agent restores a project it deleted by mistake: the server
+    /// restores the project including its packages' sources and meta
+    /// — binaries are lost and rebuild. The server records 'project
+    /// was undeleted' when no comment is given, so no comment is sent
+    /// here. Restoring a project that already exists, or one that was
+    /// never deleted, is refused by the server.
+    ///
+    /// Success is the `<status code="ok"/>` body; any other body is a
+    /// server error, never success.
+    pub fn undelete_project(&self, project: &str, dry_run: &DryRun) -> Result<(), GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        // The dry-run guard: in dry-run the restore is recorded in
+        // the plan and nothing is restored — not even the credentials
+        // check runs.
+        if !dry_run.allow(&format!("restore deleted project {project}")) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot restore a deleted project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(&self.base, &["source", project], &[("cmd", "undelete")]);
+        let body = self.http.post(&url, "", &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS undelete response for project {project}"),
             ))
         }
     }
@@ -12868,6 +13077,302 @@ mod tests {
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
             .detach_branch("osctest", "simple/pkg", &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_project_deletes_an_empty_project() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory",
+                "<directory name=\"test:factory\"/>",
+            )
+            .with_delete(
+                "https://api.opensuse.org/source/test:factory",
+                "<status code=\"ok\"/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(http.get_calls().len(), 1);
+        let deletes = http.delete_calls();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].0, "https://api.opensuse.org/source/test:factory");
+        assert!(deletes[0].1);
+    }
+
+    #[test]
+    fn delete_project_refuses_a_non_empty_project_without_recursive() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory",
+            "<directory name=\"test:factory\"><entry name=\"pkgA\"/></directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The refusal happens before the delete: nothing is deleted.
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_project_recursive_deletes_without_the_package_check() {
+        let http = FakeHttp::new().with_delete(
+            "https://api.opensuse.org/source/test:factory?force=1&comment=cleanup",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = DeleteProjectOptions {
+            recursive: true,
+            force: true,
+            comment: Some("cleanup".to_string()),
+        };
+        assert!(client
+            .delete_project("test:factory", &options, &DryRun::new(false))
+            .is_ok());
+        // Recursive skips the package list entirely: no GET.
+        assert!(http.get_calls().is_empty());
+        assert_eq!(http.delete_calls().len(), 1);
+    }
+
+    #[test]
+    fn delete_project_non_ok_body_is_error_not_success() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory",
+                "<directory name=\"test:factory\"/>",
+            )
+            .with_delete(
+                "https://api.opensuse.org/source/test:factory",
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn delete_project_dry_run_records_plan_and_deletes_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .delete_project("test:factory", &DeleteProjectOptions::default(), &dry_run,)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: delete project test:factory".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_project_dry_run_names_recursive_and_force() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = DeleteProjectOptions {
+            recursive: true,
+            force: true,
+            comment: None,
+        };
+        assert!(client
+            .delete_project("test:factory", &options, &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: delete project test:factory with all its packages (force)"
+                    .to_string()
+            ]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_project_without_credentials_fails_closed() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory",
+                "<directory name=\"test:factory\"/>",
+            )
+            .with_delete(
+                "https://api.opensuse.org/source/test:factory",
+                "<status code=\"ok\"/>",
+            );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_project_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .delete_project(
+                "test:factory/pkg",
+                &DeleteProjectOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn undelete_package_posts_the_command_and_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=undelete",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .undelete_package("test:factory", "test-pkgA", &DryRun::new(false))
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn undelete_package_non_ok_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=undelete",
+            "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .undelete_package("test:factory", "test-pkgA", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn undelete_package_dry_run_records_plan_and_restores_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .undelete_package("test:factory", "test-pkgA", &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: restore deleted package test:factory/test-pkgA".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn undelete_package_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=undelete",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .undelete_package("test:factory", "test-pkgA", &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn undelete_package_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .undelete_package("test:factory", "test-pkgA/pkg", &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn undelete_project_posts_the_command_and_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=undelete",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .undelete_project("test:factory", &DryRun::new(false))
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn undelete_project_non_ok_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=undelete",
+            "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .undelete_project("test:factory", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn undelete_project_dry_run_records_plan_and_restores_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client.undelete_project("test:factory", &dry_run).is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: restore deleted project test:factory".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn undelete_project_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=undelete",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .undelete_project("test:factory", &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn undelete_project_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .undelete_project("test:factory/pkg", &DryRun::new(false))
             .is_err());
         assert!(http.post_calls().is_empty());
     }
