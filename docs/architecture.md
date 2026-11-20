@@ -119,13 +119,12 @@ Rules that hold:
 
 The library surface a tool uses to move a package update through the
 distribution: `ObsClient` (devel-project lookup, devel version, open
-submit-request check, filing, superseding, branch cleanup, branching, copying,
-linking, repairing links, link revisions, converting links to branches and
-detaching them, deleting and restoring packages and projects, aggregating
-binaries, releasing, branch-project and branch-package creation, package
-creation plain or git-backed, file upload, maintenance incident / change-devel
-/ delete filing, maintained-instance listing, maintenance branching, the
-remote reads listed below, and reading and acting on
+submit-request check, filing, superseding, branch cleanup, branching, copying, linking, repairing
+links, link revisions, converting links to branches and detaching them, deleting and restoring
+packages and projects, aggregating binaries, releasing, branch-project and branch-package creation,
+package creation plain or git-backed, file upload, build status, maintenance incident / change-devel
+/ delete filing, maintained-instance listing, maintenance branching, the remote reads listed below,
+and reading and acting on
 requests), `SrPayload`
 (the validated submit-request payload), `SrFiling` (the only filing
 path, dry-run by default; `refile` is the file-then-supersede flow),
@@ -403,15 +402,100 @@ code (`BsRequestActionMaintenanceIncident`,
 `BsRequestActionChangeDevel`, `BsRequestActionDelete`,
 `BranchPackage` on open-build-service master).
 
+Build status is the read side of a package's build: what state it
+is in, why it is there, and what it produced. The methods are the
+same whether the package is OBS-native or git-backed — the build
+service serves both through the same `/build` API, so there is no
+split in the operation. An agent asks them when it needs to know
+whether a package built, what blocked it, and what came out:
+
+- `results` reads the build matrix for a project (one cell per
+  repository/architecture, with the per-package codes inside);
+  `wait_for_results` polls it until it settles — no cell dirty, no
+  cell or package in a waiting state — with plain two-second polls
+  and a timeout at the deadline (the caller then re-reads with
+  `results`). It deliberately does not pass `oldstate`: the server
+  long-polls on an unchanged state, up to five minutes, which
+  outruns the transport's per-read timeout and fails the wait even
+  when the caller's deadline is longer. A multibuild flavor travels
+  as `pkg:flavor` with `multibuild=1` and `locallink=1`; older
+  servers reject `multibuild`, and geectl does not fall back to a
+  plain read.
+- `build_log` reads the raw log text (`nostream=1`); `build_status`
+  reads the package's build code (`succeeded`, `failed`,
+  `unresolvable`, ...); `job_status` reads the running job, if any.
+- `buildinfo` reads the dependencies a build pulls in — and the
+  error blocking it, when it cannot start. An unresolvable build
+  surfaces its missing dependencies as the error, as a
+  comma-separated list (`unresolvable: dep, dep, ...`).
+- `build_history` lists the completed builds, newest first;
+  `job_history` lists the build jobs that ran in a repository.
+  Match a job-history entry's `srcmd5` against the package's
+  current revision to check a green build is from the current
+  source, not a stale rebuild.
+- `list_binaries` lists the built files (binary RPMs plus the build
+  artifacts: `_buildenv`, `_statistics`, `rpmlint.log`, the
+  `.src.rpm`, `-debuginfo` and `-debugsource` when built);
+  `download_binary` downloads one by name as raw bytes, capped at
+  10 MiB by the transport's body limit; `fileinfo` reads its RPM
+  header fields (name, epoch, version, release, arch, source,
+  summary, description, disturl, size, mtime) and dependency lists
+  (plain view: provides, requires, prerequires, conflicts,
+  obsoletes, recommends, supplements, suggests, enhances), with
+  the `fileinfo_ext` view naming the providing/requiring packages
+  per dependency.
+- `dependson` lists which packages each package depends on for its
+  build; `whatdependson` is the reverse (a rebuild of the package
+  triggers a rebuild of each of them): each entry's `dependencies`
+  are the packages depending on the queried package.
+- `check_constraints` lists the worker ids satisfying a
+  `_constraints` document. It is a query, not a build: it creates
+  or modifies nothing, so it takes no dry-run guard. None posts an
+  empty body, which the server accepts. The constraints document is
+  passed through as authored — there is no typed constraints model
+  yet, so this is the one place a raw XML document crosses the
+  public API.
+- `list_repositories` reads the project's repositories (names,
+  architectures, the repositories they build against) from the
+  project meta. Repository add and remove are mutations and out of
+  this batch's reads-only scope, so they are not here.
+
+All of the build reads are typed: no public method takes or returns
+raw XML — except `check_constraints`, whose constraints document is
+passed through as authored (no typed constraints model yet) — and
+the parsers are `pub(crate)`. The binary download needed a bytes
+path through the transport — `HttpClient` returned string bodies
+only, and a non-UTF-8 body failed the read — so the trait gains
+`get_bytes` with a refusing default implementation (existing
+implementors keep compiling) and `UreqClient` overrides it, sharing
+the GET retry loop with `get_with`. The download is capped at 10
+MiB by the transport's body limit like every read.
+
+The 404 conventions follow the devel-project precedent: a missing
+log reads as `None` (the package was never built, or does not
+exist — the server answers 404 for both, so the caller checks
+the package exists when the distinction matters); a missing status
+reads as `None` too, but through `code="unknown"` with a 200 — the
+server only 404s when the package/project does not exist. A
+missing binary list reads as an empty list (a never-built package
+answers 200 with an empty list; only a nonexistent package or
+project 404s). A missing job reads as an empty jobstatus element,
+not a 404, so `job_status` returns `None` for it — while a 404
+there is an error (unknown project/package), as it is for the
+histories, the buildinfo, the dependency info, a download, and a
+fileinfo. A malformed document is a server error, never an empty
+result.
+
 Credentials: the public reads (devel project, devel version, file
-and directory reads, meta, link target, project diff) need none; the
-package log, the open-SR search, the package and project search, the
-owner search, and reading a person, plus the filing POST, superseding,
-deleting, creating, and uploading, and every request read and act
-(show, log, search, state change, review, comment, diff) need OBS Basic
-and fail loudly without them — except the package log, which reads
-with whatever credentials the client carries and fails on the server's
-403 instead of refusing up front. OBS accepts Basic only —
+and directory reads, meta, link target, project diff, repository list)
+need none; the package log, the open-SR search, the package and project
+search, the owner search, and reading a person, plus the filing POST,
+superseding, deleting, creating, and uploading, and every `/build` read,
+and every request read and act (show, log, search, state change,
+review, comment, diff) need OBS Basic and fail loudly without them —
+except the package log, which reads with whatever credentials the client
+carries and fails on the server's 403 instead of refusing up front. OBS
+accepts Basic only —
 a Bearer token or SSH key is refused at client construction. No
 credential is stored here, and no request carries one over cleartext
 http except to a loopback host (the transport guard in `http.rs`).
