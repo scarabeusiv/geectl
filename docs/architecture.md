@@ -68,9 +68,11 @@ to encode.
   The timeout values are documented defaults, overridable by explicit
   config, never by accident.
 - Retry policy, as a single documented constant: only idempotent methods
-  are retried (GET, HEAD, PUT, DELETE), up to 3 times with doubling
-  backoff. POST is never retried without an explicit idempotency key.
-  `post_json` (JSON body, `Content-Type: application/json`) never
+  are retried (GET, HEAD, PUT), up to 3 times with doubling
+  backoff. POST is never retried without an explicit idempotency key,
+  and DELETE is never retried either (single-attempt by design: a
+  retried delete cannot tell a lost response from a delete that never
+  ran). `post_json` (JSON body, `Content-Type: application/json`) never
   retries at all: a retried mutation can create a duplicate, so every
   non-2xx status is returned immediately.
 - Non-2xx statuses are converted to a `GeectlError` at this layer, before

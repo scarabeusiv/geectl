@@ -11,9 +11,12 @@
 //! over the cap fails with `ServerError`.
 //!
 //! Retry policy (a single documented constant, not per-call-site
-//! improvisation): only idempotent methods are retried (GET, HEAD, PUT,
-//! DELETE). POST is never retried without an explicit idempotency key.
-//! The policy applies to GET; `post_json` never retries — a retried
+//! improvisation): only idempotent methods are retried (GET, HEAD, PUT).
+//! POST is never retried without an explicit idempotency key, and
+//! DELETE is never retried either: a retried delete cannot tell "the
+//! first attempt never ran" from "the first attempt deleted it and the
+//! response was lost", so the second attempt 404s and a successful
+//! delete reads as a failure. `post_json` never retries — a retried
 //! mutation can create a duplicate.
 //! Within a retryable method, only transient failures are retried
 //! (timeouts, transport errors, 429, 5xx). Client errors (other 4xx),
@@ -111,15 +114,37 @@ pub const RETRY_POLICY: RetryPolicy = RetryPolicy {
 };
 
 /// True when the method may be retried. POST (and PATCH) are never
-/// retried: a retried mutation can create a duplicate.
+/// retried: a retried mutation can create a duplicate. DELETE is not
+/// retried either, even though it is idempotent in the HTTP sense: a
+/// retried delete cannot tell "the first attempt never ran" from "the
+/// first attempt deleted it and the response was lost", so the second
+/// attempt 404s and a successful delete reads as a failure. DELETE is
+/// single-attempt by design (see `UreqClient::delete`).
 pub fn is_retryable_method(method: &str) -> bool {
-    matches!(method, "GET" | "HEAD" | "PUT" | "DELETE")
+    matches!(method, "GET" | "HEAD" | "PUT")
 }
 
 /// The HTTP client interface. Implementations are synchronous and return
 /// the response body as a string on a 2xx status, or a [`GeectlError`].
+/// `get` uses the client's configured credentials (from its
+/// [`AuthProvider`], or none); `get_with`, `post`, `post_text`, and
+/// `delete` take explicit credentials, for callers that resolve them
+/// per request (e.g. the OBS operations, which read public endpoints
+/// without credentials and authenticated endpoints with OBS Basic).
+/// `post` sends the body as `application/xml`, `post_text` as
+/// `text/plain` (the request `changestate` comment, which the server
+/// reads as the raw body); both, and `delete`, are never retried.
+/// `put` sends the body as `application/xml` (a project or package
+/// `_meta` document) and IS retried: PUT is idempotent — re-PUTting
+/// the same `_meta` returns the same 200 — so a transient failure
+/// retries like GET.
+/// `post_json` sends the body as `application/json` and resolves
+/// credentials from the client's auth seam instead.
 pub trait HttpClient {
     fn get(&self, url: &str) -> Result<String, GeectlError>;
+    fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
+    fn post(&self, url: &str, body: &str, credentials: &Credentials)
+        -> Result<String, GeectlError>;
 
     /// POST a JSON body. The body is sent as-is with
     /// `Content-Type: application/json`; the caller builds the JSON.
@@ -128,6 +153,18 @@ pub trait HttpClient {
     /// failure) is returned immediately. Auth and the transport guard
     /// work exactly as for GET.
     fn post_json(&self, url: &str, body: &str) -> Result<String, GeectlError>;
+    fn post_text(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError>;
+    /// PUT a body as `application/xml` (a project or package `_meta`
+    /// document). Unlike POST, PUT is retried: it is idempotent —
+    /// re-PUTting the same `_meta` returns the same 200 — so a
+    /// transient failure retries like GET.
+    fn put(&self, url: &str, body: &str, credentials: &Credentials) -> Result<String, GeectlError>;
+    fn delete(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
 }
 
 /// A [`HttpClient`] backed by ureq, with bounded timeouts and the retry
@@ -197,6 +234,65 @@ impl UreqClient {
                 ErrorKind::InvalidInput,
                 "an SSH key cannot authenticate an HTTP request",
             )),
+        }
+    }
+
+    /// One POST attempt with the given content type. POST is never
+    /// retried: a retried mutation can create a duplicate (e.g. a
+    /// second submit request). A transient failure (429, 5xx) is
+    /// returned as an error immediately, not retried. This is a
+    /// single attempt, end to end. A redirect is refused, like GET:
+    /// automatic redirects are disabled, so a 3xx is an error, not a body.
+    fn post_with_content_type(
+        &self,
+        url: &str,
+        body: &str,
+        content_type: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        require_credentials_transport(url, credentials)?;
+        debug_assert!(
+            !is_retryable_method("POST"),
+            "POST must stay non-retryable; a retried mutation can duplicate"
+        );
+        let request = self.agent.post(url).header("Content-Type", content_type);
+        let request = self.apply_auth(request, credentials)?;
+        match request.send(body) {
+            Ok(resp) => {
+                if resp.status().is_redirection() {
+                    let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
+                    return Err(redirect_error(resp.status().as_u16(), location));
+                }
+                read_body_capped(resp.into_body().into_reader())
+            }
+            Err(ureq::Error::StatusCode(code)) => {
+                let safe_url = sanitize_url_for_error(url);
+                match status_action(code, &safe_url) {
+                    // No retry for POST: a Retry action is returned
+                    // as the error, immediately.
+                    StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
+                }
+            }
+            Err(ureq::Error::Tls(msg)) => Err(GeectlError::new(
+                ErrorKind::TlsError,
+                format!("TLS error: {msg}"),
+            )),
+            Err(ureq::Error::Rustls(e)) => Err(GeectlError::new(
+                ErrorKind::TlsError,
+                format!("TLS error: {e}"),
+            )),
+            Err(ureq::Error::Pem(e)) => Err(GeectlError::new(
+                ErrorKind::TlsError,
+                format!("TLS error: {e}"),
+            )),
+            Err(ureq::Error::Timeout(_)) => Err(GeectlError::new(
+                ErrorKind::Timeout,
+                format!("request to {} timed out", sanitize_url_for_error(url)),
+            )),
+            Err(ureq::Error::Io(e)) => {
+                Err(GeectlError::new(ErrorKind::NetworkError, e.to_string()))
+            }
+            Err(e) => Err(GeectlError::new(ErrorKind::ServerError, e.to_string())),
         }
     }
 }
@@ -422,12 +518,16 @@ impl HttpClient for UreqClient {
             Some(auth) => auth.credentials()?,
             None => Credentials::None,
         };
+        self.get_with(url, &credentials)
+    }
+
+    fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
         // Credentials never travel over cleartext http, except to a
         // loopback host (see require_credentials_transport).
-        require_credentials_transport(url, &credentials)?;
+        require_credentials_transport(url, credentials)?;
         let mut last_error: Option<GeectlError> = None;
         for attempt in 0..=RETRY_POLICY.max_retries {
-            let request = self.apply_auth(self.agent.get(url), &credentials)?;
+            let request = self.apply_auth(self.agent.get(url), credentials)?;
             match request.call() {
                 Ok(resp) => {
                     if resp.status().is_redirection() {
@@ -506,12 +606,131 @@ impl HttpClient for UreqClient {
             Some(auth) => auth.credentials()?,
             None => Credentials::None,
         };
-        // Credentials never travel over cleartext http, except to a
-        // loopback host (see require_credentials_transport).
-        require_credentials_transport(url, &credentials)?;
-        let request = self.apply_auth(self.agent.post(url), &credentials)?;
-        let request = request.header("Content-Type", "application/json");
-        match request.send(body) {
+        // The JSON body goes through the shared single-attempt POST:
+        // same transport guard, same error mapping, Content-Type
+        // application/json.
+        self.post_with_content_type(url, body, "application/json", &credentials)
+    }
+
+    fn post(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // The filing POST carries request XML.
+        self.post_with_content_type(url, body, "application/xml", credentials)
+    }
+
+    fn post_text(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // The changestate POST carries a plain-text comment.
+        self.post_with_content_type(url, body, "text/plain", credentials)
+    }
+
+    fn put(&self, url: &str, body: &str, credentials: &Credentials) -> Result<String, GeectlError> {
+        // PUT is idempotent (re-PUTting the same `_meta` returns the
+        // same 200), so a transient failure retries like GET: the
+        // retry loop is the same shape as `get_with`, with the method
+        // changed. A lost response cannot leave a half-applied `_meta`
+        // behind — the document is applied atomically — so unlike
+        // DELETE there is no 404 ambiguity on retry.
+        require_credentials_transport(url, credentials)?;
+        let mut last_error: Option<GeectlError> = None;
+        for attempt in 0..=RETRY_POLICY.max_retries {
+            let request = self
+                .agent
+                .put(url)
+                .header("Content-Type", "application/xml");
+            let request = self.apply_auth(request, credentials)?;
+            match request.send(body) {
+                Ok(resp) => {
+                    if resp.status().is_redirection() {
+                        let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
+                        return Err(redirect_error(resp.status().as_u16(), location));
+                    }
+                    return read_body_capped(resp.into_body().into_reader());
+                }
+                Err(ureq::Error::StatusCode(code)) => {
+                    let safe_url = sanitize_url_for_error(url);
+                    match status_action(code, &safe_url) {
+                        StatusAction::Return(err) => return Err(err),
+                        StatusAction::Retry(err) => {
+                            last_error = Some(err);
+                        }
+                    }
+                }
+                Err(ureq::Error::Tls(msg)) => {
+                    // TLS failures are never retried: retrying a failed
+                    // handshake or an untrusted certificate cannot
+                    // succeed, and it would hammer a server that
+                    // already refused us.
+                    return Err(GeectlError::new(
+                        ErrorKind::TlsError,
+                        format!("TLS error: {msg}"),
+                    ));
+                }
+                Err(ureq::Error::Rustls(e)) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::TlsError,
+                        format!("TLS error: {e}"),
+                    ));
+                }
+                Err(ureq::Error::Pem(e)) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::TlsError,
+                        format!("TLS error: {e}"),
+                    ));
+                }
+                Err(ureq::Error::Timeout(_)) => {
+                    last_error = Some(GeectlError::new(
+                        ErrorKind::Timeout,
+                        format!("request to {} timed out", sanitize_url_for_error(url)),
+                    ));
+                }
+                Err(ureq::Error::Io(e)) => {
+                    last_error = Some(GeectlError::new(ErrorKind::NetworkError, e.to_string()));
+                }
+                Err(e) => {
+                    last_error = Some(GeectlError::new(ErrorKind::ServerError, e.to_string()));
+                }
+            }
+            // Only idempotent methods retry. This function only ever
+            // issues PUT (which is retryable), so the gate is a
+            // debug_assert: it documents the policy and fails a debug
+            // build if the method ever changes, without dead code in
+            // release. A future method must gate on its real method.
+            debug_assert!(
+                is_retryable_method("PUT"),
+                "PUT must stay retryable; a new method needs its own gate"
+            );
+            if attempt < RETRY_POLICY.max_retries {
+                std::thread::sleep(RETRY_POLICY.backoff_base * 2u32.pow(attempt));
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            GeectlError::new(ErrorKind::InternalError, "PUT failed without an error")
+        }))
+    }
+
+    fn delete(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
+        // DELETE is never retried, like POST — and `is_retryable_method`
+        // agrees: DELETE is not in the retryable set. A retried delete
+        // cannot tell "the first attempt never ran" from "the first
+        // attempt deleted it and the response was lost": the second
+        // attempt then 404s, and the retry loop would report a
+        // successful delete as NotFound. A single attempt keeps the
+        // outcome honest: a timeout means "unknown, check the server
+        // state", never a false failure. The caller re-issues the
+        // delete itself once it has checked.
+        require_credentials_transport(url, credentials)?;
+        let request = self.agent.delete(url);
+        let request = self.apply_auth(request, credentials)?;
+        match request.call() {
             Ok(resp) => {
                 if resp.status().is_redirection() {
                     let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
@@ -521,13 +740,11 @@ impl HttpClient for UreqClient {
             }
             Err(ureq::Error::StatusCode(code)) => {
                 let safe_url = sanitize_url_for_error(url);
-                // No retry for POST: return the mapped error
-                // immediately, even for a transient status — a retried
-                // mutation can create a duplicate.
-                let err = match status_action(code, &safe_url) {
-                    StatusAction::Return(err) | StatusAction::Retry(err) => err,
-                };
-                Err(err)
+                match status_action(code, &safe_url) {
+                    // No retry for DELETE: a Retry action is returned
+                    // as the error, immediately.
+                    StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
+                }
             }
             Err(ureq::Error::Tls(msg)) => Err(GeectlError::new(
                 ErrorKind::TlsError,
@@ -564,9 +781,12 @@ mod tests {
         assert!(is_retryable_method("GET"));
         assert!(is_retryable_method("HEAD"));
         assert!(is_retryable_method("PUT"));
-        assert!(is_retryable_method("DELETE"));
         assert!(!is_retryable_method("POST"));
         assert!(!is_retryable_method("PATCH"));
+        // DELETE is idempotent in the HTTP sense but single-attempt
+        // by design: a retried delete cannot tell a lost response
+        // from a delete that never ran.
+        assert!(!is_retryable_method("DELETE"));
     }
 
     #[test]
@@ -1270,6 +1490,14 @@ mod tests {
         assert!(!is_loopback_url("http://example.com/"));
         // A DNS name that merely starts with "127." is not loopback.
         assert!(!is_loopback_url("http://127.0.0.1.evil.com/"));
+        // A bracketed host counts only when the closing bracket is
+        // followed by end of authority or a `:port`: `http://[::1]evil.com`
+        // is not loopback, while genuine `[::1]` with or without a port is.
+        assert!(!is_loopback_url("http://[::1]evil.com"));
+        assert!(!is_loopback_url("http://[::1]evil.com:3000"));
+        assert!(!is_loopback_url("http://[::1"));
+        assert!(is_loopback_url("http://[::1]:8080/x"));
+        assert!(is_loopback_url("http://[::1]/x"));
         // A loopback string in the path or query does not count.
         assert!(!is_loopback_url("http://example.com/127.0.0.1"));
         assert!(!is_loopback_url("http://example.com/?x=127.0.0.1"));
@@ -1281,5 +1509,453 @@ mod tests {
         assert!(!is_loopback_url("http://[::1/x"));
         // No scheme names no host.
         assert!(!is_loopback_url("127.0.0.1/x"));
+    }
+
+    // --- POST tests (OBS submit-request filing) ---
+
+    /// A one-shot loopback server that records the request it receives:
+    /// method, Content-Type and Authorization headers, and the body.
+    /// Answers 200 with `response`. Loopback only, fixture
+    /// credentials only, never a real endpoint and never a real
+    /// credential.
+    ///
+    /// The captured request: (method, Content-Type, Authorization, body).
+    type CapturedRequest = (String, Option<String>, Option<String>, String);
+
+    struct RequestCapture {
+        port: u16,
+        handle: std::thread::JoinHandle<Option<CapturedRequest>>,
+    }
+
+    impl RequestCapture {
+        fn serve(response: &'static str) -> Self {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("local addr").port();
+            let handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break Some(stream),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() > deadline {
+                                break None;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break None,
+                    }
+                }?;
+                use std::io::{Read, Write};
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            // The body follows the header terminator;
+                            // stop once the declared Content-Length
+                            // bytes have arrived.
+                            if let Some(headers_end) = find_subsequence(&buf, b"\r\n\r\n") {
+                                let headers =
+                                    String::from_utf8_lossy(&buf[..headers_end]).to_string();
+                                let content_length = headers
+                                    .lines()
+                                    .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                                    .and_then(|l| {
+                                        l["content-length:".len()..].trim().parse::<usize>().ok()
+                                    })
+                                    .unwrap_or(0);
+                                if buf.len() >= headers_end + 4 + content_length {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let (head, body) = match text.split_once("\r\n\r\n") {
+                    Some((head, body)) => (head.to_string(), body.to_string()),
+                    None => (text.clone(), String::new()),
+                };
+                let method = head
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let header = |name: &str| {
+                    head.lines()
+                        .find(|l| {
+                            l.to_ascii_lowercase()
+                                .starts_with(&name.to_ascii_lowercase())
+                        })
+                        .map(|l| l[name.len() + 1..].trim().to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                let _ = stream.write_all(response.as_bytes());
+                Some((
+                    method,
+                    header("Content-Type:"),
+                    header("Authorization:"),
+                    body,
+                ))
+            });
+            RequestCapture { port, handle }
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}/request?cmd=create", self.port)
+        }
+
+        fn url_for(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}{}", self.port, path)
+        }
+
+        fn captured(self) -> CapturedRequest {
+            self.handle
+                .join()
+                .expect("server thread")
+                .expect("a request arrived")
+        }
+    }
+
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    #[test]
+    fn post_sends_body_content_type_and_auth() {
+        let server = RequestCapture::serve("created");
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Basic {
+                username: "alice".to_string(),
+                password: "s3cr3t".to_string(),
+            }))),
+        )
+        .unwrap();
+        let body = "<request><action type=\"submit\"/></request>";
+        assert_eq!(
+            client
+                .post(
+                    &server.url(),
+                    body,
+                    &Credentials::Basic {
+                        username: "alice".to_string(),
+                        password: "s3cr3t".to_string(),
+                    }
+                )
+                .unwrap(),
+            "created"
+        );
+        let (method, content_type, auth, received_body) = server.captured();
+        assert_eq!(method, "POST");
+        assert_eq!(content_type.as_deref(), Some("application/xml"));
+        use base64::Engine;
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("alice:s3cr3t")
+        );
+        assert_eq!(auth.as_deref(), Some(expected.as_str()));
+        assert_eq!(received_body, body);
+    }
+
+    /// A loopback server that counts requests and answers 500 to each.
+    /// It stays up 1.5s past the last request (longer than the 1s
+    /// first-retry backoff), so a retry would be observed as a second
+    /// request. Returns the port, the count, and the server thread.
+    fn serve_counting_500() -> (
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicU32>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("local addr").port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = count.clone();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut last_request: Option<std::time::Instant> = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        last_request = Some(std::time::Instant::now());
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if let Some(last) = last_request {
+                            if last.elapsed() > std::time::Duration::from_millis(1500) {
+                                break;
+                            }
+                        }
+                        if std::time::Instant::now() > deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, count, handle)
+    }
+
+    /// Answer 500 to the first request, then 200: the server a
+    /// retrying client must recover from. Like `serve_counting_500`
+    /// but with a success after the failure, so a test can assert the
+    /// client retried (it got the 200 body) instead of counting
+    /// attempts against a server that never succeeds.
+    fn serve_500_then_ok() -> (
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicU32>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("local addr").port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = count.clone();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut last_request: Option<std::time::Instant> = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let n = count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        last_request = Some(std::time::Instant::now());
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf);
+                        // First request fails; the retry succeeds.
+                        let response = if n == 0 {
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        } else {
+                            let body = "<status code=\"ok\" />";
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                        };
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if let Some(last) = last_request {
+                            // 3s, not the 1.5s `serve_counting_500`
+                            // uses: the client sleeps 1s before its
+                            // retry, and the server timestamps the
+                            // request before the client reads the 500,
+                            // so 1.5s leaves only ~0.5s of margin.
+                            if last.elapsed() > std::time::Duration::from_millis(3000) {
+                                break;
+                            }
+                        }
+                        if std::time::Instant::now() > deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, count, handle)
+    }
+
+    #[test]
+    fn post_is_never_retried() {
+        // A 500 must come back as a ServerError after exactly ONE
+        // attempt: a retried POST could file a duplicate submit
+        // request.
+        let (port, count, handle) = serve_counting_500();
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/request?cmd=create");
+        let err = client
+            .post(&url, "<request/>", &Credentials::None)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        handle.join().expect("server thread");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn put_sends_xml_body() {
+        let server = LoopbackServer::serve("<status code=\"ok\" />");
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let body =
+            "<project name=\"home:alice\"><title>t</title><description>d</description></project>";
+        assert_eq!(
+            client.put(&server.url(), body, &Credentials::None).unwrap(),
+            "<status code=\"ok\" />"
+        );
+        let request = server.request().expect("server recorded the request");
+        // Method, content type, and body — exactly what a `_meta` PUT needs.
+        assert!(
+            request.starts_with("PUT /test HTTP/1.1\r\n"),
+            "PUT method line wrong; request: {request}"
+        );
+        assert!(
+            request
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("content-type: application/xml")),
+            "PUT must carry Content-Type: application/xml; request: {request}"
+        );
+        let sent_body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("request has a body");
+        assert_eq!(sent_body, body);
+    }
+
+    #[test]
+    fn put_retries_after_500() {
+        // A 500 on the first attempt must be retried, and the retry
+        // must return the 200 body: PUT is idempotent (re-PUTting the
+        // same `_meta` returns the same 200), so unlike POST a retry
+        // cannot duplicate anything. The counting 500 server cannot
+        // serve this: its idle break (1.5s) is shorter than the
+        // backoff between the second and third attempts, so it exits
+        // mid-retry — hence the 500-then-200 server below.
+        let (port, count, handle) = serve_500_then_ok();
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/source/home:alice/_meta");
+        assert_eq!(
+            client.put(&url, "<project/>", &Credentials::None).unwrap(),
+            "<status code=\"ok\" />"
+        );
+        handle.join().expect("server thread");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn post_over_non_loopback_http_is_refused() {
+        // Cleartext http to a real host must never carry a credential
+        // — and a POST body must not reach it either. The refusal
+        // happens before connecting.
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let err = client
+            .post(
+                "http://example.com/request?cmd=create",
+                "<request/>",
+                &Credentials::Basic {
+                    username: "alice".to_string(),
+                    password: "s3cr3t".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn post_text_sends_plain_text_content_type() {
+        // The changestate comment is plain text, not XML: the server
+        // reads the raw body as the comment, so the header must say
+        // what the body is.
+        let server = RequestCapture::serve("<status code=\"ok\" />");
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = server
+            .url_for("/request/1397357?cmd=changestate&newstate=superseded&superseded_by=1397897");
+        assert_eq!(
+            client
+                .post_text(
+                    &url,
+                    "superseded by 1397897",
+                    &Credentials::Basic {
+                        username: "alice".to_string(),
+                        password: "s3cr3t".to_string(),
+                    }
+                )
+                .unwrap(),
+            "<status code=\"ok\" />"
+        );
+        let (method, content_type, auth, received_body) = server.captured();
+        assert_eq!(method, "POST");
+        assert_eq!(content_type.as_deref(), Some("text/plain"));
+        assert!(auth.is_some());
+        assert_eq!(received_body, "superseded by 1397897");
+    }
+
+    // --- DELETE tests (branch-cleanup mutation) ---
+
+    #[test]
+    fn delete_sends_auth_and_returns_body() {
+        let server = RequestCapture::serve("<status code=\"ok\" />");
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = server.url_for("/source/home:scarabeus_iv/foo");
+        assert_eq!(
+            client
+                .delete(
+                    &url,
+                    &Credentials::Basic {
+                        username: "alice".to_string(),
+                        password: "s3cr3t".to_string(),
+                    }
+                )
+                .unwrap(),
+            "<status code=\"ok\" />"
+        );
+        let (method, content_type, auth, received_body) = server.captured();
+        assert_eq!(method, "DELETE");
+        // A DELETE carries no body, so no Content-Type is sent.
+        assert_eq!(content_type, None);
+        use base64::Engine;
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("alice:s3cr3t")
+        );
+        assert_eq!(auth.as_deref(), Some(expected.as_str()));
+        assert_eq!(received_body, "");
+    }
+
+    #[test]
+    fn delete_is_never_retried() {
+        // A 500 must come back as a ServerError after exactly ONE
+        // attempt: a retried DELETE cannot tell "the first attempt
+        // never ran" from "the first attempt deleted it and the
+        // response was lost", so a second attempt would 404 and read
+        // a successful delete as a failure.
+        let (port, count, handle) = serve_counting_500();
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/source/home:scarabeus_iv/foo");
+        let err = client.delete(&url, &Credentials::None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        handle.join().expect("server thread");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn delete_over_non_loopback_http_is_refused() {
+        // Cleartext http to a real host must never carry a credential.
+        // The refusal happens before connecting.
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let err = client
+            .delete(
+                "http://example.com/source/home:scarabeus_iv/foo",
+                &Credentials::Basic {
+                    username: "alice".to_string(),
+                    password: "s3cr3t".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 }
