@@ -133,7 +133,10 @@ TOKEN_OUTPUT="$($CONTAINER exec -u git "$CONTAINER_NAME" \
     --scopes read:user,read:repository,write:repository,write:user)"
 TOKEN="$(printf '%s' "$TOKEN_OUTPUT" | sed -n 's/^Access token was successfully created: //p')"
 if [ -z "$TOKEN" ]; then
-    echo "could not extract the token from: $TOKEN_OUTPUT" >&2
+    # The raw output is withheld on purpose: it may contain the
+    # token (e.g. if the output format changed just enough for the
+    # extraction to miss it).
+    echo "could not extract the access token from the generate-access-token output" >&2
     exit 1
 fi
 # The token file is 0600 from the first byte (umask), and holds only
