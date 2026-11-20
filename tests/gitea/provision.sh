@@ -104,7 +104,7 @@ $CONTAINER run -d --name "$CONTAINER_NAME" --rm \
 
 echo "Waiting for Gitea at $BASE_URL/api/healthz ..."
 deadline=$((SECONDS + READINESS_TIMEOUT_SECONDS))
-until curl -fsS -o /dev/null "$BASE_URL/api/healthz" >/dev/null 2>&1; do
+until curl --max-time 5 -fsS -o /dev/null "$BASE_URL/api/healthz" >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
         echo "Gitea did not come up within ${READINESS_TIMEOUT_SECONDS}s" >&2
         $CONTAINER logs "$CONTAINER_NAME" | tail -50 >&2

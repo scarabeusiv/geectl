@@ -114,16 +114,29 @@ fn gitea_client() -> UreqClient {
     }
 }
 
+/// The Gitea user provision.sh created (`GITEA_USER`, default
+/// `geectl`): the same variable the provision script reads, so an
+/// overridden user does not make the harness assert against a user
+/// that does not exist.
+fn gitea_user() -> String {
+    std::env::var("GITEA_USER")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "geectl".to_string())
+}
+
 /// A repository name unique to this run, so the test can run twice
 /// against one instance (e.g. a local re-run without teardown) without
-/// colliding with its own previous creation. The process id is included
-/// so two test processes in the same second do not collide either.
+/// colliding with its own previous creation. The timestamp is
+/// nanoseconds: two calls in the same process within a second do not
+/// collide (whole seconds did). The process id is included so two
+/// test processes do not collide either.
 fn unique_repo_name() -> String {
-    let secs = std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time is after the epoch")
-        .as_secs();
-    format!("geectl-live-{}-{}", std::process::id(), secs)
+        .as_nanos();
+    format!("geectl-live-{}-{}", std::process::id(), nanos)
 }
 
 #[test]
@@ -143,7 +156,7 @@ fn gitea_user_is_the_provisioned_user() {
         serde_json::from_str(&body).expect("GET /api/v1/user returns valid JSON");
     assert_eq!(
         user["login"].as_str(),
-        Some("geectl"),
+        Some(gitea_user().as_str()),
         "GET /api/v1/user did not return the provisioned user; body: {body}"
     );
     assert_eq!(
@@ -161,7 +174,7 @@ fn gitea_create_repo_shows_up_on_server() {
     };
     let client = gitea_client();
     let repo = unique_repo_name();
-    let expected_full_name = format!("geectl/{repo}");
+    let expected_full_name = format!("{}/{repo}", gitea_user());
     // Create the repository through geectl (POST with the Bearer
     // token). A 201 means the server accepted the creation.
     let create_body = serde_json::json!({
@@ -221,7 +234,8 @@ fn gitea_missing_repo_is_not_found() {
     // exercised against a real server, not a fixture.
     let err = client
         .get(&format!(
-            "{base}/api/v1/repos/geectl/geectl-live-no-such-repo"
+            "{base}/api/v1/repos/{}/geectl-live-no-such-repo",
+            gitea_user()
         ))
         .expect_err("a missing repository must not return 200");
     assert_eq!(
@@ -261,16 +275,24 @@ mod tests {
     }
 
     #[test]
-    fn unique_repo_name_is_stable_within_a_second() {
+    fn unique_repo_name_has_pid_and_timestamp_suffix() {
         let first = unique_repo_name();
         assert!(first.starts_with("geectl-live-"));
-        // The suffix is "<process-id>-<seconds-since-epoch>": both
-        // numeric, so the name is deterministic within a process and a
-        // second, and two processes in the same second still differ.
+        // The suffix is "<process-id>-<nanoseconds-since-epoch>":
+        // both numeric, so the name is deterministic within a
+        // process, and two processes still differ.
         let suffix = &first["geectl-live-".len()..];
         let parts: Vec<&str> = suffix.split('-').collect();
         assert_eq!(parts.len(), 2);
         assert!(parts[0].parse::<u32>().is_ok());
-        assert!(parts[1].parse::<u64>().is_ok());
+        assert!(parts[1].parse::<u128>().is_ok());
+    }
+
+    #[test]
+    fn unique_repo_name_differs_between_calls() {
+        // Nanosecond timestamps: two calls in the same process do
+        // not collide, so a re-run against one instance cannot
+        // clash with its own previous creation.
+        assert_ne!(unique_repo_name(), unique_repo_name());
     }
 }
