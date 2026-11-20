@@ -43,8 +43,21 @@ jobs:
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           workspaces: . -> target
+      # Live Gitea tests (tests/gitea.rs) run in this job, against a
+      # disposable Gitea container provisioned here. They are fast
+      # (~20s end to end: a single prebuilt image), so they gate like
+      # the rest of the suite — unlike the OBS temporal job, which is
+      # scheduled because it takes minutes. The provision script exports
+      # GEETCL_GITEA_URL and GEECTL_GITEA_TOKEN for the test step (the
+      # token is masked, never printed). The instance is loopback-only
+      # and destroyed after the run.
+      - name: Provision disposable Gitea instance
+        run: bash tests/gitea/provision.sh
       - name: Run the test suite
         run: cargo test --locked
+      - name: Tear down disposable Gitea instance
+        if: always()
+        run: bash tests/gitea/teardown.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
