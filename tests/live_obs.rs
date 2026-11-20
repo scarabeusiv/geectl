@@ -2614,6 +2614,90 @@ fn live_set_link_rev_project_unset() {
     );
 }
 
+#[test]
+fn temporal_link_to_branch() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (source_project, target_project, package) = setup_link(&client);
+    client
+        .link_to_branch(&target_project, &package, &DryRun::new(false))
+        .expect("convert the link to a branch on the temporal instance");
+    let link = read_link(&base, &target_project, &package);
+    // The link still points at its target, now as a branch: the
+    // server sets baserev and replaces the patches with a single
+    // <branch/> entry.
+    assert_eq!(
+        xml_attr(&link, "project").as_deref(),
+        Some(source_project.as_str()),
+        "the branch link still points at the source project; link: {link}"
+    );
+    assert_eq!(
+        xml_attr(&link, "package").as_deref(),
+        Some(package.as_str()),
+        "the branch link still points at the source package; link: {link}"
+    );
+    assert!(
+        xml_attr(&link, "baserev").is_some(),
+        "the branch link carries the baserev it expanded at; link: {link}"
+    );
+    assert!(
+        link.contains("<branch"),
+        "the branch link carries a branch patch entry; link: {link}"
+    );
+    // The linked sources are now the package's own files.
+    let directory = read_directory(&base, &target_project, &package);
+    assert!(
+        directory.contains(&format!("name=\"{package}.spec\"")),
+        "the expanded sources are the package's own files; directory: {directory}"
+    );
+}
+
+#[test]
+fn temporal_detach_branch() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (_, target_project, package) = setup_link(&client);
+    let rev = client
+        .detach_branch(&target_project, &package, &DryRun::new(false))
+        .expect("detach the branch on the temporal instance");
+    assert!(rev.is_some(), "detaching commits a new revision");
+    let directory = read_directory(&base, &target_project, &package);
+    assert!(
+        directory.contains(&format!("name=\"{package}.spec\"")),
+        "the expanded sources stay as the package's own files; directory: {directory}"
+    );
+    assert!(
+        !directory.contains("name=\"_link\""),
+        "the link is gone after the detach; directory: {directory}"
+    );
+}
+
+#[test]
+fn temporal_detach_branch_drops_link_when_target_removed() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let (source_project, target_project, package) = setup_link(&client);
+    client
+        .delete_package(&source_project, &package, true, &DryRun::new(false))
+        .expect("remove the link target on the temporal instance");
+    // Dropping the link reports no revision: the API's file delete
+    // answers status-ok, not a revision document.
+    client
+        .detach_branch(&target_project, &package, &DryRun::new(false))
+        .expect("detach the branch with a removed target on the temporal instance");
+    let directory = read_directory(&base, &target_project, &package);
+    assert!(
+        !directory.contains("name=\"_link\""),
+        "the link is dropped when its target is gone; directory: {directory}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

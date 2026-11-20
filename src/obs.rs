@@ -4037,6 +4037,228 @@ impl<'a> ObsClient<'a> {
         let vrev = if rev.len() >= 32 { vrev } else { None };
         Ok((rev, vrev))
     }
+
+    /// Convert a package holding a classic source link into a branch
+    /// on OBS (`POST /source/<project>/<package>?cmd=linktobranch`).
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. In dry-run the conversion is recorded in
+    /// the plan and nothing is converted — the guard runs before the
+    /// credentials check, like `create_package`.
+    ///
+    /// An agent converts a link to a branch when it wants to work on
+    /// the linked sources as its own package while keeping the
+    /// connection to the link target: the server expands the link into
+    /// the package's own files, sets the link's baserev to the target
+    /// revision it expanded at, and replaces the link's patches with a
+    /// single `<branch/>` entry — the package keeps pointing at its
+    /// target, so a later submit diffs against it. The link target
+    /// itself is unchanged.
+    ///
+    /// The server refuses a package that is not a link ("package is
+    /// not a link") and a link that is already a branch ("package is
+    /// already a branch"); both surface as server errors, so no
+    /// client-side pre-check is needed. The route also takes `rev`,
+    /// `user`, `comment`, `linkrev`, and `noservice`, but they are not
+    /// exposed here: the conversion uses the current revision and the
+    /// server's defaults.
+    ///
+    /// Success is the `<status code="ok"/>` body; any other body is a
+    /// server error, never success.
+    pub fn link_to_branch(
+        &self,
+        project: &str,
+        package: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        // The dry-run guard: in dry-run the conversion is recorded
+        // in the plan and nothing is converted — not even the
+        // credentials check runs.
+        if !dry_run.allow(&format!("convert link {project}/{package} to a branch")) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot convert a link to a branch without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["source", project, package],
+            &[("cmd", "linktobranch")],
+        );
+        let body = self.http.post(&url, "", &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS linktobranch response for package {project}/{package}"),
+            ))
+        }
+    }
+
+    /// Replace a link with its expanded sources on OBS: copy the
+    /// package onto itself with the link expanded, so the link is
+    /// gone and the package holds the sources as its own files
+    /// (`POST /source/<project>/<package>?cmd=copy&...&expand=1`).
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. In dry-run the detach is recorded in the
+    /// plan and nothing is detached — the guard runs before the
+    /// credentials check, like `create_package`. Returns the new
+    /// revision, or None in dry-run — and None when the link is
+    /// dropped instead of copied, because the file delete reports
+    /// only status-ok and no revision.
+    ///
+    /// An agent detaches a branch when it no longer wants the package
+    /// tied to its link target: after the detach the package builds
+    /// from its own files and there is no target left to submit
+    /// against. The package meta is untouched.
+    ///
+    /// When the copy fails, the failure is triaged from the package's
+    /// link state, because the common cause is a broken link: when
+    /// the link is broken and its target is gone, the link is dropped
+    /// instead (the expanded sources are already lost with the
+    /// target, so there is nothing to keep) and the detach still
+    /// succeeds. A package that is not a link at all is refused —
+    /// there is nothing to detach — and any other copy failure
+    /// propagates unchanged.
+    pub fn detach_branch(
+        &self,
+        project: &str,
+        package: &str,
+        dry_run: &DryRun,
+    ) -> Result<Option<u64>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        // The dry-run guard: in dry-run the detach is recorded in
+        // the plan and nothing is detached — not even the credentials
+        // check runs.
+        if !dry_run.allow(&format!(
+            "detach branch {project}/{package} (replace the link with its expanded sources)"
+        )) {
+            return Ok(None);
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot detach a branch without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let options = CopyOptions {
+            expand: true,
+            ..CopyOptions::default()
+        };
+        match self.copy_package(project, package, project, package, &options, dry_run) {
+            Ok(rev) => Ok(rev),
+            Err(copy_err) => self.detach_branch_on_copy_failure(project, package, copy_err),
+        }
+    }
+
+    /// Triage a failed detach copy from the package's link state. A
+    /// broken link whose target is gone is dropped instead; a package
+    /// that is not a link is refused; anything else keeps the
+    /// original copy error.
+    fn detach_branch_on_copy_failure(
+        &self,
+        project: &str,
+        package: &str,
+        copy_err: GeectlError,
+    ) -> Result<Option<u64>, GeectlError> {
+        let directory_url = build_url(
+            &self.base,
+            &["source", project, package],
+            &[("rev", "latest")],
+        );
+        let Ok(directory) = self.http.get_with(&directory_url, &self.credentials) else {
+            return Err(copy_err);
+        };
+        let Ok(linkinfo) = parse_linkinfo(&directory) else {
+            return Err(copy_err);
+        };
+        let Some(linkinfo) = linkinfo else {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("package {project}/{package} is not a source link"),
+            ));
+        };
+        if linkinfo.error.is_none() {
+            return Err(copy_err);
+        }
+        // The link target: the linkinfo's own project/package
+        // attributes, defaulting to the package the link lives in.
+        let target_project = linkinfo.project.as_deref().unwrap_or(project);
+        let target_package = linkinfo.package.as_deref().unwrap_or(package);
+        let target_meta_url = build_url(
+            &self.base,
+            &["source", target_project, target_package, "_meta"],
+            &[],
+        );
+        match self.http.get_with(&target_meta_url, &self.credentials) {
+            Ok(_) => Err(copy_err),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                // The link target is gone: the expanded sources are
+                // already lost with it, so drop the link. The API's
+                // file delete reports only status-ok, not a revision,
+                // so the detach reports no revision here.
+                self.delete_file(project, package, "_link")?;
+                Ok(None)
+            }
+            Err(_) => Err(copy_err),
+        }
+    }
+
+    /// Delete one file from a package on OBS
+    /// (`DELETE /source/<project>/<package>/<filename>`). This is an
+    /// internal step — detaching a branch whose link target is gone
+    /// drops the `_link` — not a public operation, so the caller owns
+    /// the dry-run guard. Success is the `<status code="ok"/>` body:
+    /// the API discards the backend's revision and reports only
+    /// that the delete landed, so no revision is returned.
+    fn delete_file(&self, project: &str, package: &str, filename: &str) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !valid_obs_filename(filename) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS file name: {filename:?}"),
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["source", project, package, filename],
+            &[("comment", format!("removed {filename}").as_str())],
+        );
+        let body = self.http.delete(&url, &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS delete response for file {project}/{package}/{filename}"),
+            ))
+        }
+    }
 }
 
 /// Extract the devel project from an OBS directory listing
@@ -12391,6 +12613,263 @@ mod tests {
         assert!(parse_package_names("<directory name=\"x\">").is_err());
         let body = "<directory name=\"test:factory\"><entry size=\"10\"/></directory>";
         assert!(parse_package_names(body).is_err());
+    }
+
+    #[test]
+    fn link_to_branch_posts_the_command_and_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/osctest/simple?cmd=linktobranch",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .link_to_branch("osctest", "simple", &DryRun::new(false))
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        // The linktobranch POST carries no body (the command is the
+        // query) and the credentials.
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn link_to_branch_non_ok_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/osctest/simple?cmd=linktobranch",
+            "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .link_to_branch("osctest", "simple", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn link_to_branch_dry_run_records_plan_and_converts_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client.link_to_branch("osctest", "simple", &dry_run).is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: convert link osctest/simple to a branch".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn link_to_branch_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/osctest/simple?cmd=linktobranch",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .link_to_branch("osctest", "simple", &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn link_to_branch_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .link_to_branch("osctest", "simple/pkg", &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn detach_branch_self_copy_with_expand_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/osctest/simple?cmd=copy&oproject=osctest&opackage=simple&expand=1",
+            "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .detach_branch("osctest", "simple", &DryRun::new(false))
+                .unwrap(),
+            Some(2)
+        );
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+        // No triage reads: the copy succeeded.
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn detach_branch_copy_failure_on_plain_package_is_refused() {
+        let directory =
+            "<directory name=\"osctest/simple\" rev=\"2\"><entry name=\"foo.spec\"/></directory>";
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/source/osctest/simple?cmd=copy&oproject=osctest&opackage=simple&expand=1",
+                "<status code=\"ok\"/>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple?rev=latest",
+                directory,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .detach_branch("osctest", "simple", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn detach_branch_copy_failure_on_unbroken_link_propagates() {
+        let directory = "<directory name=\"osctest/simple\" rev=\"2\"><entry name=\"_link\"/><linkinfo project=\"srcprj\" package=\"srcpkg\" srcmd5=\"dddddddddddddddddddddddddddddddd\"/></directory>";
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/source/osctest/simple?cmd=copy&oproject=osctest&opackage=simple&expand=1",
+                "<status code=\"ok\"/>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple?rev=latest",
+                directory,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .detach_branch("osctest", "simple", &DryRun::new(false))
+            .unwrap_err();
+        // The link expands, so the copy failed for another reason:
+        // the original copy error propagates.
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn detach_branch_copy_failure_broken_link_target_exists_propagates() {
+        let directory = "<directory name=\"osctest/simple\" rev=\"2\"><entry name=\"_link\"/><linkinfo project=\"srcprj\" package=\"srcpkg\" srcmd5=\"dddddddddddddddddddddddddddddddd\" error=\"404 package 'srcprj/srcpkg' does not exist\"/></directory>";
+        let target_meta = "<package name=\"srcpkg\" project=\"srcprj\"><title>Source</title><description>Source package</description></package>";
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/source/osctest/simple?cmd=copy&oproject=osctest&opackage=simple&expand=1",
+                "<status code=\"ok\"/>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple?rev=latest",
+                directory,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg/_meta",
+                target_meta,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .detach_branch("osctest", "simple", &DryRun::new(false))
+            .unwrap_err();
+        // The target still exists, so the broken link is not the
+        // target-gone case: the original copy error propagates.
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn detach_branch_copy_failure_broken_link_target_gone_drops_the_link() {
+        let directory = "<directory name=\"osctest/simple\" rev=\"2\"><entry name=\"_link\"/><linkinfo project=\"srcprj\" package=\"srcpkg\" srcmd5=\"dddddddddddddddddddddddddddddddd\" error=\"404 package 'srcprj/srcpkg' does not exist\"/></directory>";
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/source/osctest/simple?cmd=copy&oproject=osctest&opackage=simple&expand=1",
+                "<status code=\"ok\"/>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple?rev=latest",
+                directory,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/srcprj/srcpkg/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_delete(
+                "https://api.opensuse.org/source/osctest/simple/_link?comment=removed%20_link",
+                "<status code=\"ok\"/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        // The file delete reports only status-ok, so the detach
+        // reports no revision for the dropped link.
+        assert_eq!(
+            client
+                .detach_branch("osctest", "simple", &DryRun::new(false))
+                .unwrap(),
+            None
+        );
+        let deletes = http.delete_calls();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(
+            deletes[0].0,
+            "https://api.opensuse.org/source/osctest/simple/_link?comment=removed%20_link"
+        );
+        assert!(deletes[0].1);
+    }
+
+    #[test]
+    fn detach_branch_copy_failure_directory_read_failure_propagates() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/source/osctest/simple?cmd=copy&oproject=osctest&opackage=simple&expand=1",
+                "<status code=\"ok\"/>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/osctest/simple?rev=latest",
+                ErrorKind::ServerError,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .detach_branch("osctest", "simple", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn detach_branch_dry_run_records_plan_and_detaches_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert_eq!(
+            client.detach_branch("osctest", "simple", &dry_run).unwrap(),
+            None
+        );
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: detach branch osctest/simple (replace the link with its expanded sources)".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn detach_branch_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/osctest/simple?cmd=copy&oproject=osctest&opackage=simple&expand=1",
+            "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .detach_branch("osctest", "simple", &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn detach_branch_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .detach_branch("osctest", "simple/pkg", &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]
