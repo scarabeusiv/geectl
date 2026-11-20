@@ -2173,6 +2173,17 @@ mod tests {
                 )
             })
         }
+
+        fn put_file(
+            &self,
+            url: &str,
+            body: &str,
+            credentials: &Credentials,
+        ) -> Result<String, GeectlError> {
+            // Fixtures do not distinguish content types: the transport
+            // tests in `http.rs` assert the header each method sends.
+            self.put(url, body, credentials)
+        }
     }
 
     fn basic_credentials() -> Credentials {

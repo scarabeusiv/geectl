@@ -137,7 +137,9 @@ pub fn is_retryable_method(method: &str) -> bool {
 /// `put` sends the body as `application/xml` (a project or package
 /// `_meta` document) and IS retried: PUT is idempotent — re-PUTting
 /// the same `_meta` returns the same 200 — so a transient failure
-/// retries like GET.
+/// retries like GET. `put_file` sends the body as
+/// `application/octet-stream` (a source file) and IS retried like
+/// `put`: re-PUTting the same file stores the same bytes.
 /// `post_json` sends the body as `application/json` and resolves
 /// credentials from the client's auth seam instead.
 pub trait HttpClient {
@@ -164,6 +166,19 @@ pub trait HttpClient {
     /// re-PUTting the same `_meta` returns the same 200 — so a
     /// transient failure retries like GET.
     fn put(&self, url: &str, body: &str, credentials: &Credentials) -> Result<String, GeectlError>;
+    /// PUT a file body as `application/octet-stream` (a source file in
+    /// a package). Retried like `put`: re-PUTting the same file stores
+    /// the same bytes, so a transient failure cannot corrupt anything
+    /// (a retry records a second revision with identical content).
+    /// The server reads the raw body as the file content (see
+    /// `SourcePackageController#update_file`); the content type
+    /// carries no meaning to it beyond being the file's bytes.
+    fn put_file(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError>;
     fn delete(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
 }
 
@@ -294,6 +309,97 @@ impl UreqClient {
             }
             Err(e) => Err(GeectlError::new(ErrorKind::ServerError, e.to_string())),
         }
+    }
+
+    fn put_with_content_type(
+        &self,
+        url: &str,
+        body: &str,
+        content_type: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // PUT is idempotent (re-PUTting the same `_meta` returns the
+        // same 200; re-PUTting the same file stores the same bytes),
+        // so a transient failure retries like GET: the retry loop is
+        // the same shape as `get_with`, with the method changed. A
+        // lost response cannot leave a half-applied document behind —
+        // the `_meta` document and the file content are both applied
+        // atomically — so unlike DELETE there is no 404 ambiguity on
+        // retry. A file retry records a second revision with identical
+        // content; the bytes on the server are the same either way.
+        require_credentials_transport(url, credentials)?;
+        let mut last_error: Option<GeectlError> = None;
+        for attempt in 0..=RETRY_POLICY.max_retries {
+            let request = self.agent.put(url).header("Content-Type", content_type);
+            let request = self.apply_auth(request, credentials)?;
+            match request.send(body) {
+                Ok(resp) => {
+                    if resp.status().is_redirection() {
+                        let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
+                        return Err(redirect_error(resp.status().as_u16(), location));
+                    }
+                    return read_body_capped(resp.into_body().into_reader());
+                }
+                Err(ureq::Error::StatusCode(code)) => {
+                    let safe_url = sanitize_url_for_error(url);
+                    match status_action(code, &safe_url) {
+                        StatusAction::Return(err) => return Err(err),
+                        StatusAction::Retry(err) => {
+                            last_error = Some(err);
+                        }
+                    }
+                }
+                Err(ureq::Error::Tls(msg)) => {
+                    // TLS failures are never retried: retrying a failed
+                    // handshake or an untrusted certificate cannot
+                    // succeed, and it would hammer a server that
+                    // already refused us.
+                    return Err(GeectlError::new(
+                        ErrorKind::TlsError,
+                        format!("TLS error: {msg}"),
+                    ));
+                }
+                Err(ureq::Error::Rustls(e)) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::TlsError,
+                        format!("TLS error: {e}"),
+                    ));
+                }
+                Err(ureq::Error::Pem(e)) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::TlsError,
+                        format!("TLS error: {e}"),
+                    ));
+                }
+                Err(ureq::Error::Timeout(_)) => {
+                    last_error = Some(GeectlError::new(
+                        ErrorKind::Timeout,
+                        format!("request to {} timed out", sanitize_url_for_error(url)),
+                    ));
+                }
+                Err(ureq::Error::Io(e)) => {
+                    last_error = Some(GeectlError::new(ErrorKind::NetworkError, e.to_string()));
+                }
+                Err(e) => {
+                    last_error = Some(GeectlError::new(ErrorKind::ServerError, e.to_string()));
+                }
+            }
+            // Only idempotent methods retry. This function only ever
+            // issues PUT (which is retryable), so the gate is a
+            // debug_assert: it documents the policy and fails a debug
+            // build if the method ever changes, without dead code in
+            // release. A future method must gate on its real method.
+            debug_assert!(
+                is_retryable_method("PUT"),
+                "PUT must stay retryable; a new method needs its own gate"
+            );
+            if attempt < RETRY_POLICY.max_retries {
+                std::thread::sleep(RETRY_POLICY.backoff_base * 2u32.pow(attempt));
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            GeectlError::new(ErrorKind::InternalError, "PUT failed without an error")
+        }))
     }
 }
 
@@ -633,88 +739,16 @@ impl HttpClient for UreqClient {
     }
 
     fn put(&self, url: &str, body: &str, credentials: &Credentials) -> Result<String, GeectlError> {
-        // PUT is idempotent (re-PUTting the same `_meta` returns the
-        // same 200), so a transient failure retries like GET: the
-        // retry loop is the same shape as `get_with`, with the method
-        // changed. A lost response cannot leave a half-applied `_meta`
-        // behind — the document is applied atomically — so unlike
-        // DELETE there is no 404 ambiguity on retry.
-        require_credentials_transport(url, credentials)?;
-        let mut last_error: Option<GeectlError> = None;
-        for attempt in 0..=RETRY_POLICY.max_retries {
-            let request = self
-                .agent
-                .put(url)
-                .header("Content-Type", "application/xml");
-            let request = self.apply_auth(request, credentials)?;
-            match request.send(body) {
-                Ok(resp) => {
-                    if resp.status().is_redirection() {
-                        let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
-                        return Err(redirect_error(resp.status().as_u16(), location));
-                    }
-                    return read_body_capped(resp.into_body().into_reader());
-                }
-                Err(ureq::Error::StatusCode(code)) => {
-                    let safe_url = sanitize_url_for_error(url);
-                    match status_action(code, &safe_url) {
-                        StatusAction::Return(err) => return Err(err),
-                        StatusAction::Retry(err) => {
-                            last_error = Some(err);
-                        }
-                    }
-                }
-                Err(ureq::Error::Tls(msg)) => {
-                    // TLS failures are never retried: retrying a failed
-                    // handshake or an untrusted certificate cannot
-                    // succeed, and it would hammer a server that
-                    // already refused us.
-                    return Err(GeectlError::new(
-                        ErrorKind::TlsError,
-                        format!("TLS error: {msg}"),
-                    ));
-                }
-                Err(ureq::Error::Rustls(e)) => {
-                    return Err(GeectlError::new(
-                        ErrorKind::TlsError,
-                        format!("TLS error: {e}"),
-                    ));
-                }
-                Err(ureq::Error::Pem(e)) => {
-                    return Err(GeectlError::new(
-                        ErrorKind::TlsError,
-                        format!("TLS error: {e}"),
-                    ));
-                }
-                Err(ureq::Error::Timeout(_)) => {
-                    last_error = Some(GeectlError::new(
-                        ErrorKind::Timeout,
-                        format!("request to {} timed out", sanitize_url_for_error(url)),
-                    ));
-                }
-                Err(ureq::Error::Io(e)) => {
-                    last_error = Some(GeectlError::new(ErrorKind::NetworkError, e.to_string()));
-                }
-                Err(e) => {
-                    last_error = Some(GeectlError::new(ErrorKind::ServerError, e.to_string()));
-                }
-            }
-            // Only idempotent methods retry. This function only ever
-            // issues PUT (which is retryable), so the gate is a
-            // debug_assert: it documents the policy and fails a debug
-            // build if the method ever changes, without dead code in
-            // release. A future method must gate on its real method.
-            debug_assert!(
-                is_retryable_method("PUT"),
-                "PUT must stay retryable; a new method needs its own gate"
-            );
-            if attempt < RETRY_POLICY.max_retries {
-                std::thread::sleep(RETRY_POLICY.backoff_base * 2u32.pow(attempt));
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            GeectlError::new(ErrorKind::InternalError, "PUT failed without an error")
-        }))
+        self.put_with_content_type(url, body, "application/xml", credentials)
+    }
+
+    fn put_file(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        self.put_with_content_type(url, body, "application/octet-stream", credentials)
     }
 
     fn delete(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
@@ -1827,6 +1861,36 @@ mod tests {
     }
 
     #[test]
+    fn put_file_sends_octet_stream_body() {
+        let server = LoopbackServer::serve("<status code=\"ok\" />");
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let body = "Name: foo\nVersion: 1.0\n";
+        assert_eq!(
+            client
+                .put_file(&server.url(), body, &Credentials::None)
+                .unwrap(),
+            "<status code=\"ok\" />"
+        );
+        let request = server.request().expect("server recorded the request");
+        // Method, content type, and body — exactly what a file PUT needs.
+        assert!(
+            request.starts_with("PUT /test HTTP/1.1\r\n"),
+            "PUT method line wrong; request: {request}"
+        );
+        assert!(
+            request
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("content-type: application/octet-stream")),
+            "PUT file must carry Content-Type: application/octet-stream; request: {request}"
+        );
+        let sent_body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("request has a body");
+        assert_eq!(sent_body, body);
+    }
+
+    #[test]
     fn put_retries_after_500() {
         // A 500 on the first attempt must be retried, and the retry
         // must return the 200 body: PUT is idempotent (re-PUTting the
@@ -1840,6 +1904,27 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/source/home:alice/_meta");
         assert_eq!(
             client.put(&url, "<project/>", &Credentials::None).unwrap(),
+            "<status code=\"ok\" />"
+        );
+        handle.join().expect("server thread");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn put_file_retries_after_500() {
+        // A 500 on the first attempt must be retried, and the retry
+        // must return the 200 body: PUT is idempotent (re-PUTting the
+        // same file stores the same bytes), so unlike POST a retry
+        // cannot duplicate anything. The retry records a second
+        // revision with identical content on a real server; the
+        // counting server here only proves the retry happens.
+        let (port, count, handle) = serve_500_then_ok();
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/source/home:alice/foo/foo.spec");
+        assert_eq!(
+            client
+                .put_file(&url, "Name: foo\n", &Credentials::None)
+                .unwrap(),
             "<status code=\"ok\" />"
         );
         handle.join().expect("server thread");
