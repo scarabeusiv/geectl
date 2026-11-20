@@ -3589,6 +3589,114 @@ impl<'a> ObsClient<'a> {
         parse_job_status(&body)
     }
 
+    /// The buildinfo for `package` in `repository`/`arch`: the error
+    /// blocking the build, if any, and the dependencies the build
+    /// pulls in. An unresolvable build surfaces its missing
+    /// dependencies as the error, as a comma-separated list. Requires
+    /// OBS Basic credentials. A 404 is an error (unknown
+    /// project/package): a buildinfo with no error and no dependencies
+    /// reads as an empty document, not a 404.
+    pub fn buildinfo(
+        &self,
+        project: &str,
+        package: &str,
+        repository: &str,
+        arch: &str,
+    ) -> Result<BuildInfo, GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        self.require_build_credentials()?;
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, package, "_buildinfo"],
+            &[],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_buildinfo(&body)
+    }
+
+    /// The build history for `package` in `repository`/`arch`: the
+    /// completed builds, newest first, up to `limit` entries. An empty
+    /// history (never built) reads as an empty list. Requires OBS
+    /// Basic credentials. A 404 is an error (unknown project/package).
+    pub fn build_history(
+        &self,
+        project: &str,
+        package: &str,
+        repository: &str,
+        arch: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<BuildHistoryEntry>, GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        self.require_build_credentials()?;
+        let limit = limit.map(|n| n.to_string());
+        let mut pairs: Vec<(&str, &str)> = Vec::new();
+        if let Some(limit) = &limit {
+            pairs.push(("limit", limit));
+        }
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, package, "_history"],
+            &pairs,
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_build_history(&body)
+    }
+
+    /// The job history for `repository`/`arch`: the build jobs that
+    /// ran there, newest first, optionally limited to `package`,
+    /// `limit` entries, and a result `code`. `lastfailures` is
+    /// rejected: it is a special server mode returning per-package
+    /// success-then-failure pairs, not a chronological history. Use
+    /// it to check a green build is from the
+    /// current source revision, not a stale rebuild: match the entry's
+    /// `srcmd5` against the package's current revision. An empty
+    /// history reads as an empty list. Requires OBS Basic credentials.
+    /// A 404 is an error (unknown project/repository/architecture).
+    pub fn job_history(
+        &self,
+        project: &str,
+        repository: &str,
+        arch: &str,
+        package: Option<&str>,
+        limit: Option<u32>,
+        code: Option<&str>,
+    ) -> Result<Vec<JobHistoryEntry>, GeectlError> {
+        Self::validate_build_coordinates(project, package, repository, arch)?;
+        self.require_build_credentials()?;
+        if let Some(code) = code {
+            if code.is_empty() {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "invalid OBS job history code: empty".to_string(),
+                ));
+            }
+            if code == "lastfailures" {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "invalid OBS job history code: lastfailures is a special server mode, not a result filter".to_string(),
+                ));
+            }
+        }
+        let limit = limit.map(|n| n.to_string());
+        let mut pairs: Vec<(&str, &str)> = Vec::new();
+        if let Some(package) = package {
+            pairs.push(("package", package));
+        }
+        if let Some(limit) = &limit {
+            pairs.push(("limit", limit));
+        }
+        if let Some(code) = code {
+            pairs.push(("code", code));
+        }
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, "_jobhistory"],
+            &pairs,
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_job_history(&body)
+    }
+
     /// Build the OBS search URL for open submit requests targeting
     /// `package`. The match expression is XPath over the request XML;
     /// the submit restriction is applied client-side in
@@ -8219,6 +8327,271 @@ pub(crate) fn parse_build_status(body: &str) -> Result<String, GeectlError> {
     }
 }
 
+/// The buildinfo for a package in a repository/architecture: the
+/// error that blocks the build, if any, and the dependencies the
+/// build pulls in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildInfo {
+    /// The error blocking the build (e.g. `unresolvable:
+    /// DOES-NOT-EXIST`), if the build cannot start.
+    pub error: Option<String>,
+    /// The names of the build dependencies, in build order.
+    pub bdeps: Vec<String>,
+}
+
+/// One entry of a package's build history: a completed build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildHistoryEntry {
+    /// The source revision the build ran on.
+    pub rev: String,
+    /// The source md5 the build ran on.
+    pub srcmd5: String,
+    /// The version-release the build produced.
+    pub versrel: String,
+    /// The build count for that version-release.
+    pub bcnt: u32,
+    /// When the build ran (unix time).
+    pub time: u64,
+    /// How long the build took (seconds), if recorded.
+    pub duration: Option<u64>,
+}
+
+/// One entry of a repository/architecture's job history: a build job
+/// that ran, succeeded or failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobHistoryEntry {
+    /// The repository the job ran in.
+    pub repository: Option<String>,
+    /// The architecture the job ran on.
+    pub arch: Option<String>,
+    /// The package the job built.
+    pub package: String,
+    /// The source revision the job ran on.
+    pub rev: Option<String>,
+    /// The source md5 the job ran on.
+    pub srcmd5: Option<String>,
+    /// The version-release the job produced.
+    pub versrel: Option<String>,
+    /// The build count for that version-release.
+    pub bcnt: Option<u32>,
+    /// When the job became ready (unix time).
+    pub readytime: Option<u64>,
+    /// When the job started (unix time).
+    pub starttime: Option<u64>,
+    /// When the job ended (unix time).
+    pub endtime: Option<u64>,
+    /// The job's result (`succeeded`, `failed`, ...).
+    pub code: String,
+    /// The worker URI the job ran on.
+    pub uri: Option<String>,
+    /// The worker id the job ran on.
+    pub workerid: Option<String>,
+    /// The architecture of the machine that ran the job.
+    pub hostarch: Option<String>,
+    /// The reason the job ran.
+    pub reason: Option<String>,
+    /// The md5 the job verified against.
+    pub verifymd5: Option<String>,
+}
+
+/// Parse a `<buildinfo ...>...</buildinfo>` document into the error
+/// blocking the build, if any, and the build dependency names. A
+/// document that is not a buildinfo — or a `<bdep>` without a name —
+/// is a server error, never an empty buildinfo.
+pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS buildinfo response: not a <buildinfo> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<buildinfo") else {
+        return Err(malformed());
+    };
+    // The tag name must end here: `<buildinfox>` is not a buildinfo.
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_open) else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<buildinfo .../>`: no error, no dependencies.
+        return Ok(BuildInfo {
+            error: None,
+            bdeps: Vec::new(),
+        });
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</buildinfo>") else {
+        return Err(malformed());
+    };
+    // Nothing but whitespace may follow the closing tag.
+    if !inner[close + "</buildinfo>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let error = xml_element_text(inner, "error");
+    let mut bdeps = Vec::new();
+    for element in xml_elements(inner, "bdep")? {
+        let (tag, _) = xml_split_element(element, "bdep");
+        let name = xml_attr(tag, "name").ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS buildinfo response: <bdep> without name",
+            )
+        })?;
+        bdeps.push(name);
+    }
+    Ok(BuildInfo { error, bdeps })
+}
+
+/// Parse a `<buildhistory>...</buildhistory>` document into the
+/// completed builds. A document that is not a buildhistory — or an
+/// `<entry>` missing a required attribute or carrying a non-numeric
+/// one — is a server error, never an empty history.
+pub(crate) fn parse_build_history(body: &str) -> Result<Vec<BuildHistoryEntry>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS build history response: not a <buildhistory> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<buildhistory") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_open) else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<buildhistory/>`: never built.
+        return Ok(Vec::new());
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</buildhistory>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</buildhistory>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut entries = Vec::new();
+    for element in xml_elements(inner, "entry")? {
+        let (tag, _) = xml_split_element(element, "entry");
+        let required = |name: &str| {
+            xml_attr(tag, name).ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("unexpected OBS build history response: <entry> without {name}"),
+                )
+            })
+        };
+        entries.push(BuildHistoryEntry {
+            rev: required("rev")?,
+            srcmd5: required("srcmd5")?,
+            versrel: required("versrel")?,
+            bcnt: xml_attr_number_required(tag, "bcnt")?,
+            time: xml_attr_number_required(tag, "time")?,
+            duration: xml_attr_number(tag, "duration")?,
+        });
+    }
+    // The wire order is oldest-first (the backend reads the
+    // append-only history file backwards, then reverses it), so the
+    // newest build is first.
+    entries.reverse();
+    Ok(entries)
+}
+
+/// Parse a `<jobhistlist>...</jobhistlist>` document into the build
+/// jobs that ran. A document that is not a jobhistlist — or a
+/// `<jobhist>` missing its package or code, or carrying a non-numeric
+/// number — is a server error, never an empty history.
+pub(crate) fn parse_job_history(body: &str) -> Result<Vec<JobHistoryEntry>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS job history response: not a <jobhistlist> document",
+        )
+    };
+    let body = body.trim();
+    let Some(after_open) = body.strip_prefix("<jobhistlist") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_open) else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<jobhistlist/>`: no jobs ran.
+        return Ok(Vec::new());
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</jobhistlist>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</jobhistlist>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut entries = Vec::new();
+    for element in xml_elements(inner, "jobhist")? {
+        let (tag, _) = xml_split_element(element, "jobhist");
+        let package = xml_attr(tag, "package").ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS job history response: <jobhist> without package",
+            )
+        })?;
+        let code = xml_attr(tag, "code").ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS job history response: <jobhist> without code",
+            )
+        })?;
+        entries.push(JobHistoryEntry {
+            repository: xml_attr(tag, "repository"),
+            arch: xml_attr(tag, "arch"),
+            package,
+            rev: xml_attr(tag, "rev"),
+            srcmd5: xml_attr(tag, "srcmd5"),
+            versrel: xml_attr(tag, "versrel"),
+            bcnt: xml_attr_number(tag, "bcnt")?,
+            readytime: xml_attr_number(tag, "readytime")?,
+            starttime: xml_attr_number(tag, "starttime")?,
+            endtime: xml_attr_number(tag, "endtime")?,
+            code,
+            uri: xml_attr(tag, "uri"),
+            workerid: xml_attr(tag, "workerid"),
+            hostarch: xml_attr(tag, "hostarch"),
+            reason: xml_attr(tag, "reason"),
+            verifymd5: xml_attr(tag, "verifymd5"),
+        });
+    }
+    // The wire order is oldest-first, like the build history, so the
+    // newest job is first.
+    entries.reverse();
+    Ok(entries)
+}
+
 /// What OBS does with the source branch when a submit request is
 /// accepted. The values are exactly the server's
 /// `BsRequestAction::VALID_SOURCEUPDATE_OPTIONS`; anything else is
@@ -9449,6 +9822,39 @@ fn xml_split_element<'a>(element: &'a str, name: &str) -> (&'a str, &'a str) {
     let close_marker = format!("</{name}>");
     let inner = inner.strip_suffix(&close_marker).unwrap_or(inner);
     (tag, inner)
+}
+
+/// Parse an unsigned attribute value: None when the attribute is
+/// absent, an error when it is present but not a number.
+fn xml_attr_number<T>(tag: &str, name: &str) -> Result<Option<T>, GeectlError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match xml_attr(tag, name) {
+        None => Ok(None),
+        Some(value) => value.parse::<T>().map(Some).map_err(|_| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS response: attribute {name} is not a number"),
+            )
+        }),
+    }
+}
+
+/// Parse a required unsigned attribute value: an error when it is
+/// absent or not a number.
+fn xml_attr_number_required<T>(tag: &str, name: &str) -> Result<T, GeectlError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    xml_attr_number(tag, name)?.ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS response: missing attribute {name}"),
+        )
+    })
 }
 
 /// Escape text for an XML element or attribute value.
@@ -23909,6 +24315,10 @@ description</description>
                 "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_status",
                 "<status package=\"foo\" code=\"failed\"/>",
             )
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/baz/_status",
+                "<status package=\"baz\" code=\"unknown\"/>",
+            )
             .with_get_error(
                 "https://api.opensuse.org/build/testproject/standard/x86_64/bar/_status",
                 ErrorKind::NotFound,
@@ -23923,6 +24333,12 @@ description</description>
         assert_eq!(
             client
                 .build_status("testproject", "bar", "standard", "x86_64")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            client
+                .build_status("testproject", "baz", "standard", "x86_64")
                 .unwrap(),
             None
         );
@@ -23976,5 +24392,283 @@ description</description>
             .job_status("testproject", "nosuch", "standard", "x86_64")
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    // --- parse_buildinfo ---
+
+    #[test]
+    fn parse_buildinfo_reads_the_error_and_the_dependencies() {
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\" repository=\"r\" package=\"foo\" arch=\"x86_64\"><error>unresolvable: DOES-NOT-EXIST</error><bdep name=\"gcc\"/><bdep name=\"make\"/></buildinfo>",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.error.as_deref(),
+            Some("unresolvable: DOES-NOT-EXIST")
+        );
+        assert_eq!(parsed.bdeps, vec!["gcc".to_string(), "make".to_string()]);
+    }
+
+    #[test]
+    fn parse_buildinfo_without_an_error_is_empty() {
+        let parsed = parse_buildinfo("<buildinfo project=\"p\"/>").unwrap();
+        assert_eq!(parsed.error, None);
+        assert!(parsed.bdeps.is_empty());
+        let parsed = parse_buildinfo("<buildinfo/>").unwrap();
+        assert_eq!(parsed.error, None);
+        assert!(parsed.bdeps.is_empty());
+    }
+
+    #[test]
+    fn parse_buildinfo_rejects_malformed_documents() {
+        assert!(parse_buildinfo("").is_err());
+        assert!(parse_buildinfo("<collection></collection>").is_err());
+        assert!(parse_buildinfo("<buildinfo>").is_err());
+        assert!(parse_buildinfo("<buildinfo><bdep version=\"1\"/></buildinfo>").is_err());
+    }
+
+    // --- parse_build_history ---
+
+    #[test]
+    fn parse_build_history_reads_entries() {
+        let parsed = parse_build_history(
+            "<buildhistory><entry rev=\"2\" srcmd5=\"def\" versrel=\"1.0-1\" bcnt=\"1\" time=\"1699900000\"/><entry rev=\"3\" srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\" duration=\"120\"/></buildhistory>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].rev, "3");
+        assert_eq!(parsed[0].srcmd5, "abc");
+        assert_eq!(parsed[0].versrel, "1.0-1");
+        assert_eq!(parsed[0].bcnt, 2);
+        assert_eq!(parsed[0].time, 1_700_000_000);
+        assert_eq!(parsed[0].duration, Some(120));
+        assert_eq!(parsed[1].duration, None);
+    }
+
+    #[test]
+    fn parse_build_history_empty_is_an_empty_list() {
+        assert_eq!(
+            parse_build_history("<buildhistory/>").unwrap(),
+            Vec::<BuildHistoryEntry>::new()
+        );
+        assert_eq!(
+            parse_build_history("<buildhistory></buildhistory>").unwrap(),
+            Vec::<BuildHistoryEntry>::new()
+        );
+    }
+
+    #[test]
+    fn parse_build_history_rejects_malformed_documents() {
+        assert!(parse_build_history("").is_err());
+        assert!(parse_build_history("<collection></collection>").is_err());
+        assert!(
+            parse_build_history(
+                "<buildhistory><entry rev=\"3\" srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"x\" time=\"1\"/></buildhistory>"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_build_history(
+                "<buildhistory><entry srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"1\" time=\"1\"/></buildhistory>"
+            )
+            .is_err()
+        );
+    }
+
+    // --- parse_job_history ---
+
+    #[test]
+    fn parse_job_history_reads_entries() {
+        let parsed = parse_job_history(
+            "<jobhistlist><jobhist repository=\"standard\" arch=\"x86_64\" package=\"foo\" rev=\"3\" srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"2\" readytime=\"1700000000\" starttime=\"1700000060\" endtime=\"1700000120\" code=\"succeeded\" uri=\"http://worker:3000\" workerid=\"w1\" hostarch=\"x86_64\" reason=\"source change\" verifymd5=\"abc\"/></jobhistlist>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        let entry = &parsed[0];
+        assert_eq!(entry.repository.as_deref(), Some("standard"));
+        assert_eq!(entry.package, "foo");
+        assert_eq!(entry.code, "succeeded");
+        assert_eq!(entry.bcnt, Some(2));
+        assert_eq!(entry.readytime, Some(1_700_000_000));
+        assert_eq!(entry.starttime, Some(1_700_000_060));
+        assert_eq!(entry.endtime, Some(1_700_000_120));
+        assert_eq!(entry.reason.as_deref(), Some("source change"));
+    }
+
+    #[test]
+    fn parse_job_history_reads_newest_first() {
+        let parsed = parse_job_history(
+            "<jobhistlist><jobhist package=\"foo\" code=\"failed\" endtime=\"1700000000\"/><jobhist package=\"foo\" code=\"succeeded\" endtime=\"1700000120\"/></jobhistlist>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].code, "succeeded");
+        assert_eq!(parsed[1].code, "failed");
+    }
+
+    #[test]
+    fn parse_job_history_minimal_entry_is_enough() {
+        let parsed = parse_job_history(
+            "<jobhistlist><jobhist package=\"foo\" code=\"failed\"/></jobhistlist>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].package, "foo");
+        assert_eq!(parsed[0].code, "failed");
+        assert_eq!(parsed[0].bcnt, None);
+    }
+
+    #[test]
+    fn parse_job_history_rejects_malformed_documents() {
+        assert!(parse_job_history("").is_err());
+        assert!(parse_job_history("<collection></collection>").is_err());
+        assert!(
+            parse_job_history("<jobhistlist><jobhist code=\"failed\"/></jobhistlist>").is_err()
+        );
+        assert!(
+            parse_job_history("<jobhistlist><jobhist package=\"foo\"/></jobhistlist>").is_err()
+        );
+        assert!(
+            parse_job_history(
+                "<jobhistlist><jobhist package=\"foo\" code=\"failed\" starttime=\"soon\"/></jobhistlist>"
+            )
+            .is_err()
+        );
+    }
+
+    // --- buildinfo ---
+
+    #[test]
+    fn buildinfo_returns_the_error_and_dependencies() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_buildinfo",
+            "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"x86_64\"><error>unresolvable: DOES-NOT-EXIST</error><bdep name=\"gcc\"/></buildinfo>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let info = client
+            .buildinfo("testproject", "foo", "standard", "x86_64")
+            .unwrap();
+        assert_eq!(info.error.as_deref(), Some("unresolvable: DOES-NOT-EXIST"));
+        assert_eq!(info.bdeps, vec!["gcc".to_string()]);
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_buildinfo"
+                    .to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn buildinfo_fails_closed_without_credentials() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .buildinfo("testproject", "foo", "standard", "x86_64")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    // --- build_history ---
+
+    #[test]
+    fn build_history_builds_the_url_with_and_without_a_limit() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_history?limit=1",
+                "<buildhistory><entry rev=\"3\" srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\"/></buildhistory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_history",
+                "<buildhistory/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let entries = client
+            .build_history("testproject", "foo", "standard", "x86_64", Some(1))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].rev, "3");
+        let entries = client
+            .build_history("testproject", "foo", "standard", "x86_64", None)
+            .unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn build_history_404_is_an_error_not_an_empty_list() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/nosuch/_history",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .build_history("testproject", "nosuch", "standard", "x86_64", None)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    // --- job_history ---
+
+    #[test]
+    fn job_history_builds_the_url_with_filters() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/_jobhistory?package=foo&limit=10&code=succeeded",
+            "<jobhistlist><jobhist package=\"foo\" code=\"succeeded\"/></jobhistlist>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let entries = client
+            .job_history(
+                "testproject",
+                "standard",
+                "x86_64",
+                Some("foo"),
+                Some(10),
+                Some("succeeded"),
+            )
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].code, "succeeded");
+    }
+
+    #[test]
+    fn job_history_builds_the_url_without_filters() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/_jobhistory",
+            "<jobhistlist/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let entries = client
+            .job_history("testproject", "standard", "x86_64", None, None, None)
+            .unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn job_history_rejects_an_empty_code_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .job_history("testproject", "standard", "x86_64", None, None, Some(""))
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn job_history_rejects_lastfailures_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .job_history(
+                "testproject",
+                "standard",
+                "x86_64",
+                None,
+                None,
+                Some("lastfailures")
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
     }
 }
