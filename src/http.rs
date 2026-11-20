@@ -131,6 +131,9 @@ pub fn is_retryable_method(method: &str) -> bool {
 /// `delete` take explicit credentials, for callers that resolve them
 /// per request (e.g. the OBS operations, which read public endpoints
 /// without credentials and authenticated endpoints with OBS Basic).
+/// `get` and `get_with` ask for `application/xml`: the API answers
+/// XML, and a path the WebUI also serves (the owner search proved it)
+/// would otherwise come back as an HTML page.
 /// `post` sends the body as `application/xml`, `post_text` as
 /// `text/plain` (the request `changestate` comment, which the server
 /// reads as the raw body); both, and `delete`, are never retried.
@@ -633,7 +636,14 @@ impl HttpClient for UreqClient {
         require_credentials_transport(url, credentials)?;
         let mut last_error: Option<GeectlError> = None;
         for attempt in 0..=RETRY_POLICY.max_retries {
-            let request = self.apply_auth(self.agent.get(url), credentials)?;
+            // Ask for XML: the deployment serves the WebUI HTML page
+            // for a path that exists in both the API and WebUI route
+            // sets (the owner search proved it) unless the request
+            // asks for XML. `get` funnels through here, so every GET
+            // carries it.
+            let request = self
+                .apply_auth(self.agent.get(url), credentials)?
+                .header("Accept", "application/xml");
             match request.call() {
                 Ok(resp) => {
                     if resp.status().is_redirection() {
@@ -1311,6 +1321,23 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode("alice:s3cr3t")
         );
         assert_eq!(server.authorization().as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn get_requests_xml_from_the_api() {
+        let server = LoopbackServer::serve("hello");
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        assert_eq!(client.get(&server.url()).unwrap(), "hello");
+        let request = server.request().expect("a request arrived");
+        let headers = match request.split_once("\r\n\r\n") {
+            Some((headers, _)) => headers,
+            None => &request,
+        };
+        let accept = headers
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("accept:"))
+            .map(|l| l["accept:".len()..].trim().to_string());
+        assert_eq!(accept.as_deref(), Some("application/xml"));
     }
 
     #[test]

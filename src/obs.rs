@@ -652,6 +652,35 @@ pub struct ProjectMatch {
     pub description: Option<String>,
 }
 
+/// An owner of a package or project: the project (and package, when
+/// the ownership is package-scoped) the person or group owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owner {
+    /// The root project the ownership resolves under.
+    pub root_project: String,
+    /// The project the ownership is in.
+    pub project: String,
+    /// The package, when the ownership is package-scoped.
+    pub package: Option<String>,
+    /// Persons with roles on it.
+    pub persons: Vec<NamedRole>,
+    /// Groups with roles on it.
+    pub groups: Vec<NamedRole>,
+}
+
+/// A person (`<person>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Person {
+    /// Login name.
+    pub login: String,
+    /// Email address.
+    pub email: String,
+    /// Real name, when the person carries one.
+    pub realname: Option<String>,
+    /// Account state (`confirmed`, `locked`, ...).
+    pub state: String,
+}
+
 /// The OBS client: the devel-project lookup, the devel version, the
 /// open-submit-request check, submit-request filing, branch setup,
 /// and the remote reads (file and directory reads, history, meta,
@@ -1646,6 +1675,110 @@ impl<'a> ObsClient<'a> {
             GeectlError::new(
                 ErrorKind::ServerError,
                 format!("unexpected OBS project search response for {term:?}"),
+            )
+        })
+    }
+
+    /// The owners of package `package` in project `project` (`GET
+    /// /search/owner?project=...&package=...`). Requires credentials;
+    /// without them the search fails loudly before any request. An
+    /// unexpected response (not a collection) is an error, never an
+    /// empty list.
+    pub fn owners(&self, project: &str, package: &str) -> Result<Vec<Owner>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching owners requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["search", "owner"],
+            &[("project", project), ("package", package)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_owners(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS owner search response for package {project}/{package}"),
+            )
+        })
+    }
+
+    /// The owners of binary `binary` (`GET
+    /// /search/owner?binary=...`). Requires credentials; an
+    /// unexpected response is an error, never an empty list.
+    pub fn owners_for_binary(&self, binary: &str) -> Result<Vec<Owner>, GeectlError> {
+        if !valid_obs_name(binary) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS binary name: {binary:?}"),
+            ));
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching owners requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(&self.base, &["search", "owner"], &[("binary", binary)]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_owners(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS owner search response for binary {binary:?}"),
+            )
+        })
+    }
+
+    /// The maintainers of package `package` in project `project`:
+    /// the owners filtered to role `maintainer`, as `(name, role)`
+    /// pairs (persons and groups flattened).
+    pub fn maintainers(&self, project: &str, package: &str) -> Result<Vec<NamedRole>, GeectlError> {
+        let owners = self.owners(project, package)?;
+        let mut maintainers = Vec::new();
+        for owner in owners {
+            maintainers.extend(
+                owner
+                    .persons
+                    .into_iter()
+                    .filter(|person| person.role == "maintainer"),
+            );
+            maintainers.extend(
+                owner
+                    .groups
+                    .into_iter()
+                    .filter(|group| group.role == "maintainer"),
+            );
+        }
+        Ok(maintainers)
+    }
+
+    /// Read the person `login` (`GET /person/<login>`). Requires
+    /// credentials; without them the read fails loudly before any
+    /// request. An unknown login is an error, never an empty person.
+    pub fn whois(&self, login: &str) -> Result<Person, GeectlError> {
+        validate_login(login)?;
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "reading a person requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(&self.base, &["person", login], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_person(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS person response for login {login:?}"),
             )
         })
     }
@@ -2864,6 +2997,116 @@ fn validate_search_term(term: &str) -> Result<&str, GeectlError> {
         ));
     }
     Ok(term)
+}
+
+/// Parse an owner search response (`<collection>` of `<owner
+/// rootproject project package?>` elements with `<person name
+/// role/>` and `<group name role/>` children — `name`, not
+/// `userid`). None when the response is not a collection at all, or
+/// when a `matches` count is present but does not parse: an
+/// unexpected response is an error, never an empty list. An owner
+/// element without its `rootproject` or `project` attribute is
+/// skipped, not an error: only the collection envelope itself is
+/// validated here. The `matches` count is not required: the owner
+/// search renders a collection either way, and refusing on a missing
+/// count would refuse a valid empty answer.
+pub(crate) fn parse_owners(body: &str) -> Option<Vec<Owner>> {
+    if !body.contains("<collection") {
+        return None;
+    }
+    if body.contains("matches=") && parse_search_matches(body).is_none() {
+        return None;
+    }
+    let mut owners = Vec::new();
+    for (element, inner) in elements(body, "owner").ok()? {
+        let (Some(root_project), Some(project)) = (
+            tag_attr(&element, "rootproject"),
+            tag_attr(&element, "project"),
+        ) else {
+            continue;
+        };
+        let package = tag_attr(&element, "package").map(|value| xml_unescape(&value));
+        let mut persons = Vec::new();
+        for (person_element, _) in elements(&inner, "person").ok()? {
+            if let (Some(name), Some(role)) = (
+                tag_attr(&person_element, "name"),
+                tag_attr(&person_element, "role"),
+            ) {
+                persons.push(NamedRole {
+                    name: xml_unescape(&name),
+                    role: xml_unescape(&role),
+                });
+            }
+        }
+        let mut groups = Vec::new();
+        for (group_element, _) in elements(&inner, "group").ok()? {
+            if let (Some(name), Some(role)) = (
+                tag_attr(&group_element, "name"),
+                tag_attr(&group_element, "role"),
+            ) {
+                groups.push(NamedRole {
+                    name: xml_unescape(&name),
+                    role: xml_unescape(&role),
+                });
+            }
+        }
+        owners.push(Owner {
+            root_project: xml_unescape(&root_project),
+            project: xml_unescape(&project),
+            package,
+            persons,
+            groups,
+        });
+    }
+    Some(owners)
+}
+
+/// Parse a person document (`<person>` with `<login>`, `<email>`,
+/// `<realname?>`, `<state>`, and `<globalrole>*` children). None
+/// when the body is not a `<person>` document, or when it carries no
+/// login, email, or state: a person without an identity is an
+/// unexpected response, never a person with empty fields.
+pub(crate) fn parse_person(body: &str) -> Option<Person> {
+    let (_, inner) = meta_envelope(body, "person").ok()?;
+    let token = |tag: &str| -> Option<String> {
+        element_text(inner, tag)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    Some(Person {
+        login: token("login")?,
+        email: token("email")?,
+        realname: token("realname"),
+        state: token("state")?,
+    })
+}
+
+/// Validate a login name against the server's format: 2–100
+/// characters, from `[\w $\^\-.#*+&'"]` (word characters plus space,
+/// `$`, `^`, `-`, `.`, `#`, `*`, `+`, `&`, `'`, `"`).
+fn validate_login(login: &str) -> Result<(), GeectlError> {
+    let invalid = || {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OBS login name: {login:?}"),
+        )
+    };
+    let len = login.chars().count();
+    if !(2..=100).contains(&len) {
+        return Err(invalid());
+    }
+    let allowed = |c: char| {
+        c.is_ascii_alphanumeric()
+            || c == '_'
+            || matches!(
+                c,
+                ' ' | '$' | '^' | '-' | '.' | '#' | '*' | '+' | '&' | '\'' | '"'
+            )
+    };
+    if !login.chars().all(allowed) {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// Validate an OBS request id: a non-empty run of ASCII digits that
@@ -6578,5 +6821,241 @@ mod tests {
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client.search_packages("foo").is_err());
+    }
+
+    // --- parse_owners / parse_person ---
+
+    const OWNER_SEARCH_FIXTURE: &str = "<collection matches=\"2\">\
+        <owner rootproject=\"openSUSE:Factory\" project=\"devel:languages:python\" package=\"foo\">\
+        <person name=\"Admin\" role=\"maintainer\"/>\
+        <person name=\"scarabeus_iv\" role=\"bugowner\"/>\
+        <group name=\"factory-maintainers\" role=\"maintainer\"/>\
+        </owner>\
+        <owner rootproject=\"openSUSE:Factory\" project=\"openSUSE:Factory\">\
+        <person name=\"Admin\" role=\"maintainer\"/>\
+        </owner>\
+        </collection>";
+
+    const PERSON_FIXTURE: &str = "<person>\
+        <login>Admin</login><email>admin@example.com</email>\
+        <realname>Admin User</realname><state>confirmed</state>\
+        <globalrole>Admin</globalrole>\
+        </person>";
+
+    #[test]
+    fn owner_search_parses_owners() {
+        let owners = parse_owners(OWNER_SEARCH_FIXTURE).unwrap();
+        assert_eq!(
+            owners,
+            vec![
+                Owner {
+                    root_project: "openSUSE:Factory".to_string(),
+                    project: "devel:languages:python".to_string(),
+                    package: Some("foo".to_string()),
+                    persons: vec![
+                        NamedRole {
+                            name: "Admin".to_string(),
+                            role: "maintainer".to_string(),
+                        },
+                        NamedRole {
+                            name: "scarabeus_iv".to_string(),
+                            role: "bugowner".to_string(),
+                        },
+                    ],
+                    groups: vec![NamedRole {
+                        name: "factory-maintainers".to_string(),
+                        role: "maintainer".to_string(),
+                    }],
+                },
+                Owner {
+                    root_project: "openSUSE:Factory".to_string(),
+                    project: "openSUSE:Factory".to_string(),
+                    package: None,
+                    persons: vec![NamedRole {
+                        name: "Admin".to_string(),
+                        role: "maintainer".to_string(),
+                    }],
+                    groups: vec![],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn owner_search_parsers_are_fail_closed() {
+        assert_eq!(parse_owners(""), None);
+        assert_eq!(parse_owners("<directory></directory>"), None);
+        // A `matches` count that does not parse is unexpected.
+        assert_eq!(
+            parse_owners("<collection matches=\"many\"></collection>"),
+            None
+        );
+        // An empty collection reads as an empty list.
+        assert_eq!(
+            parse_owners("<collection matches=\"0\"></collection>"),
+            Some(vec![])
+        );
+        // An owner without its project is skipped, not an error.
+        assert_eq!(
+            parse_owners("<collection><owner rootproject=\"p\"/></collection>"),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn person_parses_everything() {
+        let person = parse_person(PERSON_FIXTURE).unwrap();
+        assert_eq!(
+            person,
+            Person {
+                login: "Admin".to_string(),
+                email: "admin@example.com".to_string(),
+                realname: Some("Admin User".to_string()),
+                state: "confirmed".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn person_without_realname_is_none() {
+        let person = parse_person(
+            "<person><login>Admin</login><email>a@b.c</email><state>confirmed</state></person>",
+        )
+        .unwrap();
+        assert_eq!(person.realname, None);
+    }
+
+    #[test]
+    fn person_rejects_malformed_bodies() {
+        assert_eq!(parse_person(""), None);
+        assert_eq!(parse_person("<collection></collection>"), None);
+        assert_eq!(
+            parse_person("<person><email>a@b.c</email><state>confirmed</state></person>"),
+            None
+        );
+        assert_eq!(
+            parse_person("<person><login>Admin</login><state>confirmed</state></person>"),
+            None
+        );
+        assert_eq!(
+            parse_person("<person><login>Admin</login><email>a@b.c</email></person>"),
+            None
+        );
+        assert_eq!(
+            parse_person(
+                "<person><login>Admin</login><email>a@b.c</email><state>confirmed</state>"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn login_validation_matches_the_server_format() {
+        assert!(validate_login("Admin").is_ok());
+        assert!(validate_login("ab").is_ok());
+        assert!(validate_login("a b").is_ok());
+        assert!(validate_login("a$b^c-d.e#f*g+h&i'j\"k").is_ok());
+        assert!(validate_login("a").is_err());
+        assert!(validate_login("").is_err());
+        assert!(validate_login("a/b").is_err());
+        assert!(validate_login("a?b").is_err());
+        assert!(validate_login("a:b").is_err());
+        assert!(validate_login(&"a".repeat(101)).is_err());
+        assert!(validate_login(&"a".repeat(100)).is_ok());
+    }
+
+    // --- owners / owners_for_binary / maintainers / whois ---
+
+    #[test]
+    fn owners_searches_by_project_and_package_authed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/owner?project=openSUSE%3AFactory&package=foo",
+            OWNER_SEARCH_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let owners = client.owners("openSUSE:Factory", "foo").unwrap();
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owners[0].package.as_deref(), Some("foo"));
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/search/owner?project=openSUSE%3AFactory&package=foo"
+                    .to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn owners_for_binary_searches_by_binary() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/owner?binary=python3.11",
+            OWNER_SEARCH_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let owners = client.owners_for_binary("python3.11").unwrap();
+        assert_eq!(owners.len(), 2);
+    }
+
+    #[test]
+    fn maintainers_filters_to_the_maintainer_role() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/owner?project=openSUSE%3AFactory&package=foo",
+            OWNER_SEARCH_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client.maintainers("openSUSE:Factory", "foo").unwrap(),
+            vec![
+                NamedRole {
+                    name: "Admin".to_string(),
+                    role: "maintainer".to_string(),
+                },
+                NamedRole {
+                    name: "factory-maintainers".to_string(),
+                    role: "maintainer".to_string(),
+                },
+                NamedRole {
+                    name: "Admin".to_string(),
+                    role: "maintainer".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn whois_reads_the_person_authed() {
+        let http =
+            FakeHttp::new().with_get("https://api.opensuse.org/person/Admin", PERSON_FIXTURE);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let person = client.whois("Admin").unwrap();
+        assert_eq!(person.login, "Admin");
+        assert_eq!(person.state, "confirmed");
+        assert_eq!(
+            http.get_calls(),
+            vec![("https://api.opensuse.org/person/Admin".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn owner_and_whois_reads_require_credentials() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.owners("openSUSE:Factory", "foo").is_err());
+        assert!(client.owners_for_binary("python3.11").is_err());
+        assert!(client.maintainers("openSUSE:Factory", "foo").is_err());
+        assert!(client.whois("Admin").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn owner_and_whois_reads_reject_bad_inputs() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.owners("openSUSE:Factory", "foo/bar").is_err());
+        assert!(client.owners_for_binary("python3.11/x").is_err());
+        assert!(client.whois("a").is_err());
+        assert!(client.whois("a/b").is_err());
+        assert!(http.get_calls().is_empty());
     }
 }
