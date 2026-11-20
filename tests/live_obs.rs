@@ -68,9 +68,10 @@ use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::{
-    BranchOptions, DryRun, FilePatchStatus, HistoryEntry, ObsClient, PackageDiffStatus, Request,
-    RequestAction, RequestSearch, RequestState, ReviewState, ReviewTarget, RevisionRange,
-    SourceUpdate, SrFiling, SrPayload,
+    BranchOptions, CopyOptions, CopyProjectOptions, DryRun, FilePatchStatus,
+    HistoryEntry, ObsClient, PackageDiffStatus, Request, RequestAction, RequestSearch,
+    RequestState, ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling,
+    SrPayload,
 };
 
 /// Whether `url` points at a loopback host.
@@ -808,12 +809,12 @@ fn set_project_link(base: &str, project: &str, link_project: &str) {
         UreqClient::new(Timeout::default()).expect("default timeout is valid"),
     ));
     let meta = format!(
-        "<project name=\"{project}\"><title>geectl temporal test project</title><description>Created by the geectl temporal live test; the instance is destroyed after the run.</description><link project=\"{link_project}\"/></project>"
+        "<project name=\"{project}\"><title>geectl live test project</title><description>Created by the geectl live live test; the instance is destroyed after the run.</description><link project=\"{link_project}\"/></project>"
     );
     http.put(
         &format!("{base}/source/{project}/_meta"),
         &meta,
-        &temporal_credentials(),
+        &live_credentials(),
     )
     .expect("PUT the project meta with a project link");
 }
@@ -826,12 +827,12 @@ fn set_package_devel(base: &str, project: &str, package: &str, devel_project: &s
         UreqClient::new(Timeout::default()).expect("default timeout is valid"),
     ));
     let meta = format!(
-        "<package name=\"{package}\" project=\"{project}\"><title>geectl temporal test package</title><description>Created by the geectl temporal live test; the instance is destroyed after the run.</description><devel project=\"{devel_project}\"/></package>"
+        "<package name=\"{package}\" project=\"{project}\"><title>geectl live test package</title><description>Created by the geectl live live test; the instance is destroyed after the run.</description><devel project=\"{devel_project}\"/></package>"
     );
     http.put(
         &format!("{base}/source/{project}/{package}/_meta"),
         &meta,
-        &temporal_credentials(),
+        &live_credentials(),
     )
     .expect("PUT the package meta with a devel project");
 }
@@ -843,7 +844,7 @@ fn read_link(base: &str, project: &str, package: &str) -> String {
     ));
     http.get_with(
         &format!("{base}/source/{project}/{package}/_link"),
-        &temporal_credentials(),
+        &live_credentials(),
     )
     .expect("GET the _link back from the server")
 }
@@ -854,22 +855,22 @@ fn read_link(base: &str, project: &str, package: &str) -> String {
 /// the devel project too, so a branch that resolves through devel
 /// links at a package that exists.
 fn setup_branch_projects(client: &ObsClient<'_>, base: &str) -> (String, String, String, String) {
-    let package = temporal_package();
+    let package = live_package();
     let factory = format!("geectl-tmp-factory-{}", unique_suffix());
     client
         .create_project(
             &factory,
-            "geectl temporal test factory",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test factory",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create factory project on the temporal instance");
+        .expect("create factory project on the live instance");
     client
         .create_package(
             &factory,
             &package,
-            "geectl temporal test package",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test package",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
         .expect("create package in the factory project");
@@ -877,27 +878,27 @@ fn setup_branch_projects(client: &ObsClient<'_>, base: &str) -> (String, String,
     client
         .create_project(
             &update,
-            "geectl temporal test update",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test update",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create update project on the temporal instance");
+        .expect("create update project on the live instance");
     set_project_link(base, &update, &factory);
     let devel = format!("geectl-tmp-devel-{}", unique_suffix());
     client
         .create_project(
             &devel,
-            "geectl temporal test devel",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test devel",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create devel project on the temporal instance");
+        .expect("create devel project on the live instance");
     client
         .create_package(
             &devel,
             &package,
-            "geectl temporal test package",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test package",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
         .expect("create package in the devel project");
@@ -1729,6 +1730,238 @@ fn live_try_change_state_false_on_an_accepted_request() {
         "accepting an accepted request must report false"
     );
 }
+
+/// Read a source file back from the server, authenticated.
+fn read_file(base: &str, project: &str, package: &str, filename: &str) -> String {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    http.get_with(
+        &format!("{base}/source/{project}/{package}/{filename}"),
+        &live_credentials(),
+    )
+    .expect("GET the file back from the server")
+}
+
+/// Read a package's `_meta` back from the server, authenticated.
+fn read_meta(base: &str, project: &str, package: &str) -> String {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    http.get_with(
+        &format!("{base}/source/{project}/{package}/_meta"),
+        &live_credentials(),
+    )
+    .expect("GET the _meta back from the server")
+}
+
+/// Create a source project with a package holding one spec file.
+/// Returns `(source_project, package, spec_filename, spec_content)`.
+fn setup_copy_source(client: &ObsClient<'_>) -> (String, String, String, String) {
+    let package = live_package();
+    let source_project = create_source_branch(client, &package);
+    let filename = format!("{package}.spec");
+    let content =
+        "Name: live-test\nVersion: 1.0\nRelease: 1\nSummary: geectl live copy test\nLicense: MIT\n";
+    client
+        .upload_file(
+            &source_project,
+            &package,
+            &filename,
+            content,
+            &DryRun::new(false),
+        )
+        .expect("upload a spec file into the source package");
+    (source_project, package, filename, content.to_string())
+}
+
+#[test]
+fn live_copy_package_to_target_project() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, filename, content) = setup_copy_source(&client);
+    let target_project = format!("geectl-tmp-copy-{}", unique_suffix());
+    client
+        .create_project(
+            &target_project,
+            "geectl live test copy target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create copy target project on the live instance");
+    // Copy to the target project under the same package name: the
+    // file must read back, and the server must have built the target
+    // meta from the source meta.
+    let revision = client
+        .copy_package(
+            &source_project,
+            &package,
+            &target_project,
+            &package,
+            &CopyOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("copy a package on the live instance")
+        .expect("live copy returns a revision");
+    assert!(revision >= 1, "the copy must record a revision");
+    assert_eq!(
+        read_file(&base, &target_project, &package, &filename),
+        content,
+        "the copied file must read back with its content"
+    );
+    assert!(
+        read_meta(&base, &target_project, &package)
+            .contains("<title>geectl live test package</title>"),
+        "the target meta must carry the source title"
+    );
+}
+
+#[test]
+fn live_copy_package_with_rename() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, filename, content) = setup_copy_source(&client);
+    let target_project = format!("geectl-tmp-copy-{}", unique_suffix());
+    client
+        .create_project(
+            &target_project,
+            "geectl live test copy target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create copy target project on the live instance");
+    // Copy under another name: the renamed package holds the file.
+    let renamed = format!("{package}-renamed");
+    client
+        .copy_package(
+            &source_project,
+            &package,
+            &target_project,
+            &renamed,
+            &CopyOptions::default(),
+            &DryRun::new(false),
+        )
+        .expect("copy a package with a rename on the live instance");
+    assert_eq!(
+        read_file(&base, &target_project, &renamed, &filename),
+        content,
+        "the renamed copy must hold the file"
+    );
+}
+
+#[test]
+fn live_copy_self_with_keep_link_and_revision() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, _filename, _content) = setup_copy_source(&client);
+    // A link package pointing at the source package, made by writing
+    // the _link directly (test setup, like set_project_link): the
+    // library link operation lands in a later commit.
+    let link_package = format!("{package}-link");
+    client
+        .create_package(
+            &source_project,
+            &link_package,
+            "geectl live test link package",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create link package on the live instance");
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    http.put_file(
+        &format!("{base}/source/{source_project}/{link_package}/_link"),
+        &format!("<link project=\"{source_project}\" package=\"{package}\"/>"),
+        &live_credentials(),
+    )
+    .expect("PUT the _link into the link package");
+    // Self-copy with keep-link and a revision succeeds, and the link
+    // survives the copy.
+    let options = CopyOptions {
+        keep_link: true,
+        revision: Some("1".to_string()),
+        ..CopyOptions::default()
+    };
+    client
+        .copy_package(
+            &source_project,
+            &link_package,
+            &source_project,
+            &link_package,
+            &options,
+            &DryRun::new(false),
+        )
+        .expect("self-copy a link package with keep-link and a revision");
+    let link = read_link(&base, &source_project, &link_package);
+    assert_eq!(
+        xml_attr_after(&link, "<link ", "project").as_deref(),
+        Some(source_project.as_str()),
+        "the link must survive the self-copy; link: {link}"
+    );
+}
+
+#[test]
+fn live_copy_self_without_flags_is_refused() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, _filename, _content) = setup_copy_source(&client);
+    // A self-copy with nothing to copy from is refused client-side,
+    // before any request reaches the server.
+    let err = client
+        .copy_package(
+            &source_project,
+            &package,
+            &source_project,
+            &package,
+            &CopyOptions::default(),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+}
+
+#[test]
+fn live_copy_project_with_no_delay() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, filename, content) = setup_copy_source(&client);
+    let target_project = format!("geectl-tmp-copy-{}", unique_suffix());
+    // Copy the whole project synchronously: the target project, its
+    // package, and the file must all be there afterwards.
+    let options = CopyProjectOptions {
+        no_delay: true,
+        ..CopyProjectOptions::default()
+    };
+    client
+        .copy_project(
+            &source_project,
+            &target_project,
+            &options,
+            &DryRun::new(false),
+        )
+        .expect("copy a project on the live instance");
+    assert!(
+        public_path_exists(&base, &format!("{target_project}/{package}")),
+        "the copied project must hold the package"
+    );
+    assert_eq!(
+        read_file(&base, &target_project, &package, &filename),
+        content,
+        "the copied project must hold the file"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1854,11 +2087,11 @@ mod tests {
 }
 
 #[test]
-fn temporal_branch_inherited_package_links_at_origin() {
-    let Some(base) = temporal_url() else {
+fn live_branch_inherited_package_links_at_origin() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (factory, update, _devel, package) = setup_branch_projects(&client, &base);
     // Branch the package from the update project, where it is only
     // inherited through the project link: the branch must link at the
@@ -1870,7 +2103,7 @@ fn temporal_branch_inherited_package_links_at_origin() {
             &BranchOptions::default(),
             &DryRun::new(false),
         )
-        .expect("branch an inherited package on the temporal instance")
+        .expect("branch an inherited package on the live instance")
         .expect("live branching returns a target");
     // The server reports the resolved origin as the source
     // project, not the project the branch was requested from.
@@ -1892,11 +2125,11 @@ fn temporal_branch_inherited_package_links_at_origin() {
     );
 }
 #[test]
-fn temporal_branch_no_devel_project_flag() {
-    let Some(base) = temporal_url() else {
+fn live_branch_no_devel_project_flag() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (factory, update, _devel, package) = setup_branch_projects(&client, &base);
     // The same inherited case with the no-devel-project flag, sent
     // for real: the branch still links at the inherited source.
@@ -1906,7 +2139,7 @@ fn temporal_branch_no_devel_project_flag() {
     };
     let result = client
         .branch_package(&update, &package, &options, &DryRun::new(false))
-        .expect("branch with no-devel-project on the temporal instance")
+        .expect("branch with no-devel-project on the live instance")
         .expect("live branching returns a target");
     let link = read_link(&base, &result.target_project, &result.target_package);
     assert_eq!(
@@ -1916,11 +2149,11 @@ fn temporal_branch_no_devel_project_flag() {
     );
 }
 #[test]
-fn temporal_branch_new_package_keeps_update_project() {
-    let Some(base) = temporal_url() else {
+fn live_branch_new_package_keeps_update_project() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (factory, update, _devel, package) = setup_branch_projects(&client, &base);
     // Branch the inherited package as a new package: the link keeps
     // the update project as its source instead of resolving to the
@@ -1931,7 +2164,7 @@ fn temporal_branch_new_package_keeps_update_project() {
     };
     let result = client
         .branch_package(&update, &package, &options, &DryRun::new(false))
-        .expect("branch as a new package on the temporal instance")
+        .expect("branch as a new package on the live instance")
         .expect("live branching returns a target");
     let link = read_link(&base, &result.target_project, &result.target_package);
     assert_eq!(
@@ -1945,11 +2178,11 @@ fn temporal_branch_new_package_keeps_update_project() {
     );
 }
 #[test]
-fn temporal_branch_new_package_copies_devel_sources() {
-    let Some(base) = temporal_url() else {
+fn live_branch_new_package_copies_devel_sources() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (factory, _update, devel, package) = setup_branch_projects(&client, &base);
     // The devel package carries a file the source package does not
     // have; a new-package branch of a source with a devel project
@@ -1965,14 +2198,14 @@ fn temporal_branch_new_package_copies_devel_sources() {
         .expect("upload a marker file to the devel package");
     client
         .set_devel_project(&factory, &package, Some(&devel), None, &DryRun::new(false))
-        .expect("set the devel project on the temporal instance");
+        .expect("set the devel project on the live instance");
     let options = BranchOptions {
         new_package: true,
         ..BranchOptions::default()
     };
     let result = client
         .branch_package(&factory, &package, &options, &DryRun::new(false))
-        .expect("branch as a new package on the temporal instance")
+        .expect("branch as a new package on the live instance")
         .expect("live branching returns a target");
     let directory = read_directory(&base, &result.target_project, &result.target_package);
     assert!(
@@ -1981,11 +2214,11 @@ fn temporal_branch_new_package_copies_devel_sources() {
     );
 }
 #[test]
-fn temporal_branch_with_devel_project_links_at_devel() {
-    let Some(base) = temporal_url() else {
+fn live_branch_with_devel_project_links_at_devel() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (factory, _update, devel, package) = setup_branch_projects(&client, &base);
     set_package_devel(&base, &factory, &package, &devel);
     // Branch the package with a devel project registered: the link
@@ -1997,7 +2230,7 @@ fn temporal_branch_with_devel_project_links_at_devel() {
             &BranchOptions::default(),
             &DryRun::new(false),
         )
-        .expect("branch a package with a devel project on the temporal instance")
+        .expect("branch a package with a devel project on the live instance")
         .expect("live branching returns a target");
     let link = read_link(&base, &result.target_project, &result.target_package);
     assert_eq!(
@@ -2007,11 +2240,11 @@ fn temporal_branch_with_devel_project_links_at_devel() {
     );
 }
 #[test]
-fn temporal_branch_no_devel_project_overrides_devel() {
-    let Some(base) = temporal_url() else {
+fn live_branch_no_devel_project_overrides_devel() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (factory, _update, devel, package) = setup_branch_projects(&client, &base);
     set_package_devel(&base, &factory, &package, &devel);
     // The flag overrides the devel project: the branch links at the
@@ -2022,7 +2255,7 @@ fn temporal_branch_no_devel_project_overrides_devel() {
     };
     let result = client
         .branch_package(&factory, &package, &options, &DryRun::new(false))
-        .expect("branch with no-devel-project on the temporal instance")
+        .expect("branch with no-devel-project on the live instance")
         .expect("live branching returns a target");
     let link = read_link(&base, &result.target_project, &result.target_package);
     assert_eq!(
@@ -2032,11 +2265,11 @@ fn temporal_branch_no_devel_project_overrides_devel() {
     );
 }
 #[test]
-fn temporal_branch_inherited_with_devel_resolves_through_devel() {
-    let Some(base) = temporal_url() else {
+fn live_branch_inherited_with_devel_resolves_through_devel() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (factory, update, devel, package) = setup_branch_projects(&client, &base);
     set_package_devel(&base, &factory, &package, &devel);
     // An inherited package that HAS a devel project still resolves
@@ -2048,7 +2281,7 @@ fn temporal_branch_inherited_with_devel_resolves_through_devel() {
             &BranchOptions::default(),
             &DryRun::new(false),
         )
-        .expect("branch an inherited package with a devel project on the temporal instance")
+        .expect("branch an inherited package with a devel project on the live instance")
         .expect("live branching returns a target");
     let link = read_link(&base, &result.target_project, &result.target_package);
     assert_eq!(
@@ -2058,11 +2291,11 @@ fn temporal_branch_inherited_with_devel_resolves_through_devel() {
     );
 }
 #[test]
-fn temporal_branch_inherited_no_devel_project_links_at_factory() {
-    let Some(base) = temporal_url() else {
+fn live_branch_inherited_no_devel_project_links_at_factory() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (factory, update, devel, package) = setup_branch_projects(&client, &base);
     set_package_devel(&base, &factory, &package, &devel);
     // The flag on the inherited package: the branch links at the
@@ -2073,7 +2306,7 @@ fn temporal_branch_inherited_no_devel_project_links_at_factory() {
     };
     let result = client
         .branch_package(&update, &package, &options, &DryRun::new(false))
-        .expect("branch an inherited package with no-devel-project on the temporal instance")
+        .expect("branch an inherited package with no-devel-project on the live instance")
         .expect("live branching returns a target");
     let link = read_link(&base, &result.target_project, &result.target_package);
     assert_eq!(
@@ -2083,11 +2316,11 @@ fn temporal_branch_inherited_no_devel_project_links_at_factory() {
     );
 }
 #[test]
-fn temporal_branch_new_package_nonexistent_succeeds() {
-    let Some(base) = temporal_url() else {
+fn live_branch_new_package_nonexistent_succeeds() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (_factory, update, _devel, package) = setup_branch_projects(&client, &base);
     // Branch a package that does not exist anywhere as a new
     // package: it succeeds, and the link points at the project
@@ -2101,7 +2334,7 @@ fn temporal_branch_new_package_nonexistent_succeeds() {
     };
     let result = client
         .branch_package(&update, &missing, &options, &DryRun::new(false))
-        .expect("branch a not-yet-existing package on the temporal instance")
+        .expect("branch a not-yet-existing package on the live instance")
         .expect("live branching returns a target");
     let link = read_link(&base, &result.target_project, &result.target_package);
     assert_eq!(

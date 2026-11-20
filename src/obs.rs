@@ -803,6 +803,61 @@ pub struct BranchResult {
     /// The branch package name.
     pub target_package: String,
 }
+/// Options for [`ObsClient::copy_package`]. All fields are optional:
+/// an unset revision means the latest, an unset flag means off.
+#[derive(Debug, Clone, Default)]
+pub struct CopyOptions {
+    /// The source revision to copy (a number or an md5). None means
+    /// the latest. The server's `orev`.
+    pub revision: Option<String>,
+    /// Keep the source package's link when copying a link package.
+    /// The server's `keeplink`.
+    pub keep_link: bool,
+    /// Copy the expanded source (the link resolved) instead of the
+    /// link itself. The server's `expand`.
+    pub expand: bool,
+    /// A comment recorded on the copy. The server's `comment`.
+    pub comment: Option<String>,
+    /// Do not run source services on the copied files. The server's
+    /// `noservice`.
+    pub noservice: bool,
+    /// Do not update the source package when copying a link onto its
+    /// target. The server's `dontupdatesource`.
+    pub dont_update_source: bool,
+    /// Carry the source revision's vrev over to the copy. The
+    /// server's `withvrev`.
+    pub with_vrev: bool,
+}
+
+/// Options for [`ObsClient::copy_project`]. All fields are optional:
+/// an unset flag means off. The copy runs as a background job unless
+/// `no_delay` is set.
+#[derive(Debug, Clone, Default)]
+pub struct CopyProjectOptions {
+    /// Copy the built binaries as well. Admin-only on the server.
+    /// The server's `withbinaries`.
+    pub with_binaries: bool,
+    /// Copy the full history. The server's `withhistory`.
+    pub with_history: bool,
+    /// Make the copied project older than the source (for rebuild
+    /// ordering). The server's `makeolder`.
+    pub make_older: bool,
+    /// Make the origin older than the copy. The server's
+    /// `makeoriginolder`.
+    pub make_origin_older: bool,
+    /// Do not run source services on the copied files. The server's
+    /// `noservice`.
+    pub noservice: bool,
+    /// Re-sign the copied packages. The server's `resign`.
+    pub resign: bool,
+    /// A comment recorded on the copy. The server's `comment`.
+    pub comment: Option<String>,
+    /// Run the copy synchronously and wait for it, instead of the
+    /// server default of queueing it as a job (which answers
+    /// `invoked`). The server's `nodelay`.
+    pub no_delay: bool,
+}
+
 impl<'a> ObsClient<'a> {
     /// A client for the production OBS API, with no credentials
     /// (public reads only).
@@ -2890,6 +2945,223 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// Copy package `source_package` in project `source_project` to
+    /// `target_package` in project `target_project` on OBS
+    /// (`POST /source/<target>/<target package>?cmd=copy`) and return
+    /// the new revision number. Requires credentials; without them the
+    /// call fails loudly before any request. In dry-run the copy is
+    /// recorded in the plan and nothing is copied — the guard runs
+    /// before the credentials check, like `create_package` — and the
+    /// result is `None`, like `upload_file` in dry-run.
+    ///
+    /// An agent copies a package to fork its content into another
+    /// project (or under another name) without the link a branch
+    /// carries: the copy is a standalone package, and the server
+    /// builds the target meta from the source meta itself, so the
+    /// caller never writes one. Copying a package onto itself needs
+    /// `expand` or a revision — without either the server has nothing
+    /// to copy, and the call is refused client-side with that reason
+    /// instead of failing on the server.
+    ///
+    /// Success is the backend's `<revision>` document carrying the
+    /// new revision number, not a `<status code="ok"/>`: the
+    /// controller passes the backend's answer back, so a status check
+    /// would read every successful copy as a failure (the same shape
+    /// as `upload_file`).
+    pub fn copy_package(
+        &self,
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+        options: &CopyOptions,
+        dry_run: &DryRun,
+    ) -> Result<Option<u64>, GeectlError> {
+        for (label, value) in [
+            ("project", source_project),
+            ("package", source_package),
+            ("project", target_project),
+            ("package", target_package),
+        ] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        // A self-copy with nothing to copy from: the server dies
+        // with "need a revision to copy", so refuse it here with the
+        // reason instead of failing on the server.
+        if source_project == target_project
+            && source_package == target_package
+            && !options.expand
+            && options.revision.is_none()
+        {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "copying a package onto itself needs expand or a revision",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![
+            ("cmd", "copy"),
+            ("oproject", source_project),
+            ("opackage", source_package),
+        ];
+        if let Some(rev) = &options.revision {
+            query.push(("orev", rev));
+        }
+        if options.keep_link {
+            query.push(("keeplink", "1"));
+        }
+        if options.expand {
+            query.push(("expand", "1"));
+        }
+        if let Some(comment) = &options.comment {
+            query.push(("comment", comment));
+        }
+        if options.noservice {
+            query.push(("noservice", "1"));
+        }
+        if options.dont_update_source {
+            query.push(("dontupdatesource", "1"));
+        }
+        if options.with_vrev {
+            query.push(("withvrev", "1"));
+        }
+        self.copy_to(
+            target_project,
+            target_package,
+            &query,
+            &format!(
+                "copy package {source_project}/{source_package} to {target_project}/{target_package}{}",
+                copy_option_suffix(options),
+            ),
+            dry_run,
+        )
+    }
+
+    /// Copy project `source_project` to project `target_project` on
+    /// OBS (`POST /source/<target>?cmd=copy`). Requires credentials;
+    /// without them the call fails loudly before any request. In
+    /// dry-run the copy is recorded in the plan and nothing is
+    /// copied — the guard runs before the credentials check, like
+    /// `create_package`.
+    ///
+    /// An agent copies a project to fork a whole project (its
+    /// packages, flags, links, and repositories — the server copies
+    /// them from the source project itself) under another name. The
+    /// server runs the copy as a background job by default and
+    /// answers `invoked`; with `no_delay` it runs synchronously and
+    /// answers `ok`. Both are success here — the copy is accepted
+    /// either way, and a queued copy lands asynchronously, so the
+    /// caller polls for the target project when it needs it.
+    pub fn copy_project(
+        &self,
+        source_project: &str,
+        target_project: &str,
+        options: &CopyProjectOptions,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", source_project), ("project", target_project)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        // The dry-run guard: in dry-run the copy is recorded in the
+        // plan and nothing is copied — not even the credentials check
+        // runs.
+        if !dry_run.allow(&format!(
+            "copy project {source_project} to {target_project}{}",
+            copy_project_option_suffix(options),
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot copy a project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("cmd", "copy"), ("oproject", source_project)];
+        if options.with_binaries {
+            query.push(("withbinaries", "1"));
+        }
+        if options.with_history {
+            query.push(("withhistory", "1"));
+        }
+        if options.make_older {
+            query.push(("makeolder", "1"));
+        }
+        if options.make_origin_older {
+            query.push(("makeoriginolder", "1"));
+        }
+        if options.noservice {
+            query.push(("noservice", "1"));
+        }
+        if options.resign {
+            query.push(("resign", "1"));
+        }
+        if let Some(comment) = &options.comment {
+            query.push(("comment", comment));
+        }
+        if options.no_delay {
+            query.push(("nodelay", "1"));
+        }
+        let url = build_url(&self.base, &["source", target_project], &query);
+        let body = self.http.post(&url, "", &self.credentials)?;
+        if parse_status_ok(&body) || parse_status_invoked(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS copy-project response for project {target_project}"),
+            ))
+        }
+    }
+
+    /// POST a `cmd=copy` to the target package and return the new
+    /// revision number. Shared by [`ObsClient::copy_package`] and the
+    /// repair path, which copies with its own flags. The dry-run
+    /// guard and the credentials check live here, so both callers get
+    /// them: in dry-run the copy is recorded in the plan and nothing
+    /// is copied, and the result is `None`.
+    fn copy_to(
+        &self,
+        target_project: &str,
+        target_package: &str,
+        query: &[(&str, &str)],
+        plan_action: &str,
+        dry_run: &DryRun,
+    ) -> Result<Option<u64>, GeectlError> {
+        if !dry_run.allow(plan_action) {
+            return Ok(None);
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot copy a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["source", target_project, target_package],
+            query,
+        );
+        let body = self.http.post(&url, "", &self.credentials)?;
+        match parse_revision(&body) {
+            Some(rev) => Ok(Some(rev)),
+            None => Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS copy response for package {target_project}/{target_package}"
+                ),
+            )),
+        }
+    }
 }
 
 /// Extract the devel project from an OBS directory listing
@@ -3353,6 +3625,122 @@ pub(crate) fn parse_branch_result(body: &str) -> Option<BranchResult> {
         target_package,
     })
 }
+/// True when `body` is a `<status code="invoked"/>` document: the
+/// server queued the operation as a job instead of running it (a
+/// project copy or a project release without `nodelay`). The same
+/// tag-boundary discipline as [`parse_status_ok`]: the code must be
+/// the `code` attribute of the `<status>` element itself, not text
+/// after it and not a longer attribute name ending in it.
+pub(crate) fn parse_status_invoked(body: &str) -> bool {
+    let Some(pos) = body.find("<status") else {
+        return false;
+    };
+    let after_tag = &body[pos + "<status".len()..];
+    // The tag name must end here: `<statuscode>` is not a status
+    // element. The next character is whitespace, `/`, or `>`.
+    let first = match after_tag.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return false;
+    }
+    // The code must be an attribute of this element, not text after it
+    // — and it must be the `code` attribute, not a longer name that
+    // ends in it (`mycode="invoked"` is not `code="invoked"`).
+    let Some(end) = after_tag.find('>') else {
+        return false;
+    };
+    let element = &after_tag[..end];
+    let mut rest = element;
+    while let Some(pos) = rest.find("code=") {
+        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
+            rest = &rest[pos + "code=".len()..];
+            continue;
+        }
+        let after_eq = &rest[pos + "code=".len()..];
+        let Some(quote) = after_eq.chars().next() else {
+            return false;
+        };
+        if quote != '"' && quote != '\'' {
+            return false;
+        }
+        let Some(close) = after_eq[1..].find(quote) else {
+            return false;
+        };
+        return &after_eq[1..1 + close] == "invoked";
+    }
+    false
+}
+
+/// The option suffix for a copy plan line: the set options, in the
+/// order they appear in [`CopyOptions`], so a dry-run plan reads what
+/// the copy would have done.
+fn copy_option_suffix(options: &CopyOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(revision) = &options.revision {
+        parts.push(format!("revision {revision}"));
+    }
+    if options.keep_link {
+        parts.push("keep link".to_string());
+    }
+    if options.expand {
+        parts.push("expand".to_string());
+    }
+    if let Some(comment) = &options.comment {
+        parts.push(format!("comment {comment}"));
+    }
+    if options.noservice {
+        parts.push("no service".to_string());
+    }
+    if options.dont_update_source {
+        parts.push("do not update source".to_string());
+    }
+    if options.with_vrev {
+        parts.push("with vrev".to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// The option suffix for a project-copy plan line: the set options, in
+/// the order they appear in [`CopyProjectOptions`].
+fn copy_project_option_suffix(options: &CopyProjectOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if options.with_binaries {
+        parts.push("with binaries".to_string());
+    }
+    if options.with_history {
+        parts.push("with history".to_string());
+    }
+    if options.make_older {
+        parts.push("make older".to_string());
+    }
+    if options.make_origin_older {
+        parts.push("make origin older".to_string());
+    }
+    if options.noservice {
+        parts.push("no service".to_string());
+    }
+    if options.resign {
+        parts.push("resign".to_string());
+    }
+    if let Some(comment) = &options.comment {
+        parts.push(format!("comment {comment}"));
+    }
+    if options.no_delay {
+        parts.push("no delay".to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 pub(crate) fn parse_revision(body: &str) -> Option<u64> {
     let pos = body.find("<revision")?;
     let after_tag = &body[pos + "<revision".len()..];
@@ -8884,6 +9272,413 @@ mod tests {
         );
         assert_eq!(parse_branch_result(""), None);
     }
+    #[test]
+    fn copy_package_posts_copy_command_and_returns_revision() {
+        // The copy response is the backend's revision document, not
+        // a status: the revision number is the result.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:target/test-pkgA?cmd=copy&oproject=test%3Afactory&opackage=test-pkgA",
+            "<revision rev=\"3\" vrev=\"1\" srcmd5=\"abc\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let result = client
+            .copy_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(result, Some(3));
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn copy_package_with_rename_and_options() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:target/renamed?cmd=copy&oproject=test%3Afactory&opackage=test-pkgA&orev=42&keeplink=1&expand=1&comment=copy-for-test&noservice=1&dontupdatesource=1&withvrev=1",
+            "<revision rev=\"5\" vrev=\"2\" srcmd5=\"def\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CopyOptions {
+            revision: Some("42".to_string()),
+            keep_link: true,
+            expand: true,
+            comment: Some("copy-for-test".to_string()),
+            noservice: true,
+            dont_update_source: true,
+            with_vrev: true,
+        };
+        let result = client
+            .copy_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "renamed",
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(result, Some(5));
+    }
+
+    #[test]
+    fn copy_package_self_copy_without_flags_is_refused() {
+        // A self-copy with nothing to copy from is refused
+        // client-side, before any request: no canned response exists,
+        // so reaching the HTTP client would error differently.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .copy_package(
+                "test:factory",
+                "test-pkgA",
+                "test:factory",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_package_self_copy_with_expand_is_allowed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=copy&oproject=test%3Afactory&opackage=test-pkgA&expand=1",
+            "<revision rev=\"2\" vrev=\"1\" srcmd5=\"abc\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CopyOptions {
+            expand: true,
+            ..CopyOptions::default()
+        };
+        assert!(client
+            .copy_package(
+                "test:factory",
+                "test-pkgA",
+                "test:factory",
+                "test-pkgA",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn copy_package_self_copy_with_revision_is_allowed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=copy&oproject=test%3Afactory&opackage=test-pkgA&orev=1",
+            "<revision rev=\"2\" vrev=\"1\" srcmd5=\"abc\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CopyOptions {
+            revision: Some("1".to_string()),
+            ..CopyOptions::default()
+        };
+        assert!(client
+            .copy_package(
+                "test:factory",
+                "test-pkgA",
+                "test:factory",
+                "test-pkgA",
+                &options,
+                &DryRun::new(false),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn copy_package_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:target/test-pkgA?cmd=copy&oproject=test%3Afactory&opackage=test-pkgA",
+            "<revision rev=\"3\" vrev=\"1\" srcmd5=\"abc\" />",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .copy_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_package_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .copy_package(
+                "test/factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_package_dry_run_records_plan_and_copies_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let result = client
+            .copy_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: copy package test:factory/test-pkgA to test:target/test-pkgA"
+                    .to_string()
+            ]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_package_dry_run_names_revision_and_comment() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = CopyOptions {
+            revision: Some("1".to_string()),
+            comment: Some("pick".to_string()),
+            ..CopyOptions::default()
+        };
+        let result = client
+            .copy_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &options,
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: copy package test:factory/test-pkgA to test:target/test-pkgA (revision 1, comment pick)"
+                    .to_string()
+            ]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_package_non_revision_body_is_error_not_success() {
+        // A status-ok body is not a copy result: the copy response
+        // must be a revision document.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:target/test-pkgA?cmd=copy&oproject=test%3Afactory&opackage=test-pkgA",
+            "<status code=\"ok\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .copy_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn copy_project_posts_copy_command_and_returns_ok() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:target?cmd=copy&oproject=test%3Afactory",
+            "<status code=\"ok\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .copy_project(
+                "test:factory",
+                "test:target",
+                &CopyProjectOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn copy_project_invoked_is_success() {
+        // The default (queued) copy answers invoked, not ok: both
+        // are acceptance.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:target?cmd=copy&oproject=test%3Afactory",
+            "<status code=\"invoked\"><summary>Job invoked</summary></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .copy_project(
+                "test:factory",
+                "test:target",
+                &CopyProjectOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn copy_project_no_delay_and_options() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:target?cmd=copy&oproject=test%3Afactory&withbinaries=1&withhistory=1&makeolder=1&makeoriginolder=1&noservice=1&resign=1&comment=project-copy&nodelay=1",
+            "<status code=\"ok\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CopyProjectOptions {
+            with_binaries: true,
+            with_history: true,
+            make_older: true,
+            make_origin_older: true,
+            noservice: true,
+            resign: true,
+            comment: Some("project-copy".to_string()),
+            no_delay: true,
+        };
+        assert!(client
+            .copy_project("test:factory", "test:target", &options, &DryRun::new(false))
+            .is_ok());
+    }
+
+    #[test]
+    fn copy_project_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:target?cmd=copy&oproject=test%3Afactory",
+            "<status code=\"ok\" />",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .copy_project(
+                "test:factory",
+                "test:target",
+                &CopyProjectOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_project_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .copy_project(
+                "test/factory",
+                "test:target",
+                &CopyProjectOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_project_dry_run_records_plan_and_copies_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .copy_project(
+                "test:factory",
+                "test:target",
+                &CopyProjectOptions::default(),
+                &dry_run
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: copy project test:factory to test:target".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_project_dry_run_names_comment() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = CopyProjectOptions {
+            comment: Some("move".to_string()),
+            ..CopyProjectOptions::default()
+        };
+        assert!(client
+            .copy_project("test:factory", "test:target", &options, &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: copy project test:factory to test:target (comment move)"
+                    .to_string()
+            ]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_project_non_ok_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:target?cmd=copy&oproject=test%3Afactory",
+            "<status code=\"error\"><summary>nope</summary></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .copy_project(
+                "test:factory",
+                "test:target",
+                &CopyProjectOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn parse_status_invoked_reads_the_status_code() {
+        assert!(parse_status_invoked(
+            "<status code=\"invoked\"><summary>Job invoked</summary></status>"
+        ));
+        assert!(parse_status_invoked("<status code=\"invoked\" />"));
+        assert!(!parse_status_invoked("<status code=\"ok\" />"));
+        assert!(!parse_status_invoked("<status code=\"error\" />"));
+        assert!(!parse_status_invoked(""));
+        assert!(!parse_status_invoked("<other code=\"invoked\" />"));
+        assert!(!parse_status_invoked("<status mycode=\"invoked\" />"));
+        assert!(parse_status_invoked("<status code='invoked' />"));
+    }
+
     #[test]
     fn create_project_puts_meta_and_returns_ok() {
         let http = FakeHttp::new().with_put(
