@@ -70,6 +70,9 @@ GITEA_USER="${GITEA_USER:-geectl}"
 GITEA_PASSWORD="${GITEA_PASSWORD:-geectl-live-test}"
 GITEA_EMAIL="${GITEA_EMAIL:-geectl@test.invalid}"
 TOKEN_FILE="$SCRIPT_DIR/.gitea-token"
+# A stale token from a previous instance must not survive a failed
+# provision (which never reaches the fresh-token write below).
+rm -f "$TOKEN_FILE"
 READINESS_TIMEOUT_SECONDS="${READINESS_TIMEOUT_SECONDS:-120}"
 
 # A stale instance (previous run, no teardown) would make user/token

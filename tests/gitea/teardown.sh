@@ -15,6 +15,9 @@ CONTAINER="${CONTAINER:-docker}"
 CONTAINER_NAME="geectl-gitea-live"
 VOLUME_NAME="geectl-gitea-data"
 TOKEN_FILE="$SCRIPT_DIR/.gitea-token"
+# The token must not outlive the instance even if a step below fails
+# midway: remove it on any exit, not only on the happy path.
+trap 'rm -f "$TOKEN_FILE"' EXIT
 
 $CONTAINER stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
 $CONTAINER rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
