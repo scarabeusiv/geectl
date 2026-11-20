@@ -20,6 +20,7 @@
 //! credentials; it is not a credential store.
 
 use crate::error::{ErrorKind, GeectlError};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -488,25 +489,29 @@ pub fn resolve_gitea_ssh_key(
     Ok(Credentials::SshKey { path })
 }
 
-/// Fail when any of `names` is set but not valid UTF-8. A set
-/// variable that cannot be read as UTF-8 must not silently become
-/// "not set": the user configured a credential and would get a
-/// confusing "nothing configured" outcome instead of an error.
-/// This runs before the `std::env::var(name).ok()` lookups in the
-/// providers, so by the time those run every set variable is known
-/// to be readable UTF-8.
-fn require_env_unicode(names: &[&str]) -> Result<(), GeectlError> {
+/// Read the named environment variables once, into a map. A set
+/// variable that is not valid UTF-8 is a `ConfigError` naming the
+/// variable — it must not silently become "not set": the user
+/// configured a credential and would get a confusing "nothing
+/// configured" outcome instead of an error.
+///
+/// Reading each variable once (instead of a check pass plus a read
+/// pass) means resolution sees one consistent view of the
+/// environment: a variable cannot be checked, then changed, then
+/// read as a different value. Consumers read from the returned map
+/// (see the `VarLookup` closures in the providers, and
+/// `crate::config`).
+pub(crate) fn snapshot_env(names: &[&str]) -> Result<HashMap<String, String>, GeectlError> {
+    let mut map = HashMap::new();
     for name in names {
         if let Some(value) = std::env::var_os(name) {
-            if value.to_str().is_none() {
-                return Err(GeectlError::new(
-                    ErrorKind::ConfigError,
-                    format!("{name} is not valid UTF-8"),
-                ));
-            }
+            let value = value.into_string().map_err(|_| {
+                GeectlError::new(ErrorKind::ConfigError, format!("{name} is not valid UTF-8"))
+            })?;
+            map.insert(name.to_string(), value);
         }
     }
-    Ok(())
+    Ok(map)
 }
 
 /// OBS Basic auth from the process environment. See
@@ -515,11 +520,8 @@ pub struct EnvObsAuth;
 
 impl AuthProvider for EnvObsAuth {
     fn credentials(&self) -> Result<Credentials, GeectlError> {
-        require_env_unicode(&[OBS_USERNAME_VAR, OBS_PASSWORD_VAR, OBS_PASSWORD_FILE_VAR])?;
-        resolve_obs_basic(
-            &|name| std::env::var(name).ok(),
-            &read_secret_file_production,
-        )
+        let env = snapshot_env(&[OBS_USERNAME_VAR, OBS_PASSWORD_VAR, OBS_PASSWORD_FILE_VAR])?;
+        resolve_obs_basic(&|name| env.get(name).cloned(), &read_secret_file_production)
     }
 }
 
@@ -529,11 +531,8 @@ pub struct EnvGiteaAuth;
 
 impl AuthProvider for EnvGiteaAuth {
     fn credentials(&self) -> Result<Credentials, GeectlError> {
-        require_env_unicode(&[GITEA_TOKEN_VAR, GITEA_TOKEN_FILE_VAR])?;
-        resolve_gitea_bearer(
-            &|name| std::env::var(name).ok(),
-            &read_secret_file_production,
-        )
+        let env = snapshot_env(&[GITEA_TOKEN_VAR, GITEA_TOKEN_FILE_VAR])?;
+        resolve_gitea_bearer(&|name| env.get(name).cloned(), &read_secret_file_production)
     }
 }
 
@@ -543,8 +542,8 @@ pub struct GiteaSshKey;
 
 impl AuthProvider for GiteaSshKey {
     fn credentials(&self) -> Result<Credentials, GeectlError> {
-        require_env_unicode(&[GITEA_SSH_KEY_VAR])?;
-        resolve_gitea_ssh_key(&|name| std::env::var(name).ok(), &open_secret_file_production)
+        let env = snapshot_env(&[GITEA_SSH_KEY_VAR])?;
+        resolve_gitea_ssh_key(&|name| env.get(name).cloned(), &open_secret_file_production)
     }
 }
 

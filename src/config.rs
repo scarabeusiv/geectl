@@ -25,12 +25,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::auth::{
-    GITEA_SSH_KEY_VAR, GITEA_TOKEN_FILE_VAR, GITEA_TOKEN_VAR, OBS_PASSWORD_FILE_VAR,
+    snapshot_env, GITEA_SSH_KEY_VAR, GITEA_TOKEN_FILE_VAR, GITEA_TOKEN_VAR, OBS_PASSWORD_FILE_VAR,
     OBS_PASSWORD_VAR, OBS_USERNAME_VAR,
 };
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::is_loopback_url;
 use crate::url::UrlBuilder;
+use std::collections::HashMap;
 
 /// Environment variable overriding the OBS endpoint URL.
 pub const OBS_URL_VAR: &str = "GEECTL_OBS_URL";
@@ -63,26 +64,13 @@ pub struct EffectiveConfig {
     pub gitea_url_source: &'static str,
 }
 
-/// Read one environment variable as a string: `None` when unset, a
-/// `ConfigError` naming the variable when it is set but not valid
-/// UTF-8. A set-but-unreadable value must not silently become "not
-/// set".
-fn env_str(name: &str) -> Result<Option<String>, GeectlError> {
-    match std::env::var_os(name) {
-        None => Ok(None),
-        Some(value) => value.into_string().map(Some).map_err(|_| {
-            GeectlError::new(ErrorKind::ConfigError, format!("{name} is not valid UTF-8"))
-        }),
-    }
-}
-
-/// Read one endpoint URL from the environment: `None` when unset or
-/// empty (after trimming). A set-but-non-UTF-8 value is an error
-/// (see [`env_str`]).
-fn env_url(var: &str) -> Result<Option<String>, GeectlError> {
-    Ok(env_str(var)?
+/// Read one endpoint URL from a snapshot (see [`snapshot_env`]):
+/// `None` when unset or empty (after trimming). Non-UTF-8 values
+/// are already refused by the snapshot, so this cannot fail.
+fn env_url(env: &HashMap<String, String>, var: &str) -> Option<String> {
+    env.get(var)
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty()))
+        .filter(|v| !v.is_empty())
 }
 
 /// Validate an endpoint URL value (from the config file or the
@@ -156,8 +144,11 @@ fn validate_endpoint_url(text: &str, source: &str) -> Result<String, GeectlError
 /// validated like a file value (see [`validate_endpoint_url`]); a bad
 /// one is a `ConfigError` naming the variable.
 pub fn effective_config(config: &Config) -> Result<EffectiveConfig, GeectlError> {
+    // One snapshot for both URLs: the two resolutions see the same
+    // environment.
+    let env = snapshot_env(&[OBS_URL_VAR, GITEA_URL_VAR])?;
     let resolve = |var: &str, from_file: &Option<String>, default: &str| {
-        if let Some(value) = env_url(var)? {
+        if let Some(value) = env_url(&env, var) {
             let value = validate_endpoint_url(&value, var)?;
             return Ok((value, "environment"));
         }
@@ -210,12 +201,13 @@ fn candidate_paths(
 /// misconfiguration, and silently picking one would hide it. A
 /// missing file is not an error: `load_config` treats it as empty.
 pub fn config_path() -> Result<PathBuf, GeectlError> {
-    let xdg = env_str("XDG_CONFIG_HOME")?;
-    let home = env_str("HOME")?;
-    let (xdg_path, default_path) = candidate_paths(xdg.as_deref(), home.as_deref());
+    let env = snapshot_env(&["XDG_CONFIG_HOME", "HOME"])?;
+    let xdg = env.get("XDG_CONFIG_HOME").map(String::as_str);
+    let home = env.get("HOME").map(String::as_str);
+    let (xdg_path, default_path) = candidate_paths(xdg, home);
     let xdg_exists = xdg_path.as_ref().is_some_and(|p| p.exists());
     let default_exists = default_path.as_ref().is_some_and(|p| p.exists());
-    resolve_config_path(xdg.as_deref(), home.as_deref(), xdg_exists, default_exists)
+    resolve_config_path(xdg, home, xdg_exists, default_exists)
 }
 
 /// Pure path resolution, for tests: given the environment values and
