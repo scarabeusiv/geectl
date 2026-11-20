@@ -205,8 +205,10 @@ fn gitea_create_repo_shows_up_on_server() {
         "GET the created repository did not return it; body: {read_back}"
     );
     // And it must be in the authenticated user's repository list.
+    // The limit is explicit: relying on the server's default page
+    // size would let the assertion silently change meaning.
     let list = client
-        .get(&format!("{base}/api/v1/user/repos"))
+        .get(&format!("{base}/api/v1/user/repos?limit=50"))
         .expect("GET /api/v1/user/repos on the Gitea instance");
     let list: serde_json::Value =
         serde_json::from_str(&list).expect("GET /api/v1/user/repos returns valid JSON");
