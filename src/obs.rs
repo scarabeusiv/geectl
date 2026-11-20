@@ -558,6 +558,76 @@ pub struct RevisionPatch {
     pub files: Vec<FilePatch>,
 }
 
+/// A person or group with a role on a project or package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedRole {
+    /// User login (`person`) or group id (`group`).
+    pub name: String,
+    /// Role (`maintainer`, `bugowner`, `reviewer`, ...).
+    pub role: String,
+}
+
+/// A repository in a project meta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repository {
+    /// Repository name.
+    pub name: String,
+    /// Architectures the repository builds for.
+    pub arch: Vec<String>,
+    /// Rebuild sources: `(project, repository)` pairs.
+    pub paths: Vec<(String, String)>,
+}
+
+/// A project meta (`<project>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMeta {
+    /// Project name.
+    pub name: String,
+    /// Title, when the meta carries one.
+    pub title: Option<String>,
+    /// Description, when the meta carries one.
+    pub description: Option<String>,
+    /// URL, when the meta carries one.
+    pub url: Option<String>,
+    /// The git source the project syncs from, when it is a
+    /// git-backed (scmsync) project.
+    pub scmsync: Option<String>,
+    /// The devel project, when the meta names one.
+    pub devel: Option<String>,
+    /// Persons with roles on the project.
+    pub persons: Vec<NamedRole>,
+    /// Groups with roles on the project.
+    pub groups: Vec<NamedRole>,
+    /// Repositories.
+    pub repositories: Vec<Repository>,
+}
+
+/// A package meta (`<package>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageMeta {
+    /// Package name.
+    pub name: String,
+    /// The project the package lives in.
+    pub project: String,
+    /// Title, when the meta carries one.
+    pub title: Option<String>,
+    /// Description, when the meta carries one.
+    pub description: Option<String>,
+    /// URL, when the meta carries one.
+    pub url: Option<String>,
+    /// The git source the package syncs from, when it is a
+    /// git-backed (scmsync) package.
+    pub scmsync: Option<String>,
+    /// Release name, when the meta carries one.
+    pub releasename: Option<String>,
+    /// The devel project and package, when the meta names one.
+    pub devel: Option<(String, String)>,
+    /// Persons with roles on the package.
+    pub persons: Vec<NamedRole>,
+    /// Groups with roles on the package.
+    pub groups: Vec<NamedRole>,
+}
+
 /// The OBS client: the devel-project lookup, the devel version, the
 /// open-submit-request check, submit-request filing, branch setup,
 /// and the remote reads (file and directory reads, history, meta,
@@ -1447,6 +1517,50 @@ impl<'a> ObsClient<'a> {
             rev,
             files: patches,
         })
+    }
+
+    /// Read the meta of project `project` (`GET
+    /// /public/source/<project>/_meta`). A public read: no
+    /// credentials. The meta carries the title, description, url,
+    /// scmsync, devel project, persons, groups, and repositories —
+    /// the same operation regardless of whether the project is a
+    /// plain project or a git-backed one: a scmsync project returns
+    /// its typed `scmsync` element through this call.
+    pub fn project_meta(&self, project: &str) -> Result<ProjectMeta, GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        let url = build_url(&self.base, &["public", "source", project, "_meta"], &[]);
+        let body = self.http.get_with(&url, &Credentials::None)?;
+        parse_project_meta(&body)
+    }
+
+    /// Read the meta of package `package` in project `project` (`GET
+    /// /public/source/<project>/<package>/_meta`). A public read: no
+    /// credentials. The meta carries the title, description, url,
+    /// scmsync, releasename, devel project and package, persons, and
+    /// groups — the same operation regardless of whether the package
+    /// is a plain package or a git-backed one: a scmsync package
+    /// returns its typed `scmsync` element through this call.
+    pub fn package_meta(&self, project: &str, package: &str) -> Result<PackageMeta, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let url = build_url(
+            &self.base,
+            &["public", "source", project, package, "_meta"],
+            &[],
+        );
+        let body = self.http.get_with(&url, &Credentials::None)?;
+        parse_package_meta(&body)
     }
 
     /// Build the OBS search URL for open submit requests targeting
@@ -2348,6 +2462,231 @@ pub(crate) fn unified_diff(old_path: &str, old: &str, new_path: &str, new: &str)
         }
     }
     out
+}
+
+/// Each `<tag ...>...</tag>` (or self-closing `<tag .../>`) element
+/// in `block`, as `(opening-tag text, inner text)`. The tag name must
+/// stand on its own. An unterminated element is an error, never a
+/// skipped element.
+fn elements(block: &str, tag: &str) -> Result<Vec<(String, String)>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS response: malformed <{tag}> element"),
+        )
+    };
+    let open = format!("<{tag}");
+    let mut out = Vec::new();
+    let mut rest = block;
+    while let Some(pos) = rest.find(&open) {
+        let after_tag = &rest[pos + open.len()..];
+        let Some(first) = after_tag.chars().next() else {
+            return Err(malformed());
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        let Some(end) = after_tag.find('>') else {
+            return Err(malformed());
+        };
+        let element = &after_tag[..end];
+        if element.trim_end().ends_with('/') {
+            out.push((element.to_string(), String::new()));
+            rest = &after_tag[end + 1..];
+        } else {
+            let inner = &after_tag[end + 1..];
+            let close = format!("</{tag}>");
+            let Some(close_pos) = inner.find(&close) else {
+                return Err(malformed());
+            };
+            out.push((element.to_string(), inner[..close_pos].to_string()));
+            rest = &inner[close_pos + close.len()..];
+        }
+    }
+    Ok(out)
+}
+
+/// The `<person userid role/>` and `<group groupid role/>` children
+/// of a meta document. An element without its name or role attribute
+/// is skipped, not an error: only the meta envelope itself is
+/// validated here.
+fn meta_roles(block: &str) -> Result<(Vec<NamedRole>, Vec<NamedRole>), GeectlError> {
+    let mut persons = Vec::new();
+    for (element, _) in elements(block, "person")? {
+        if let (Some(name), Some(role)) = (tag_attr(&element, "userid"), tag_attr(&element, "role"))
+        {
+            persons.push(NamedRole {
+                name: xml_unescape(&name),
+                role: xml_unescape(&role),
+            });
+        }
+    }
+    let mut groups = Vec::new();
+    for (element, _) in elements(block, "group")? {
+        if let (Some(name), Some(role)) =
+            (tag_attr(&element, "groupid"), tag_attr(&element, "role"))
+        {
+            groups.push(NamedRole {
+                name: xml_unescape(&name),
+                role: xml_unescape(&role),
+            });
+        }
+    }
+    Ok((persons, groups))
+}
+
+/// Split a meta document into its root opening-tag text and inner
+/// text. The body must be a `<root>` document: a body that is not
+/// one (empty, truncated, or some other document) is an error, never
+/// a meta with no name. A self-closing root reads as an empty inner
+/// text.
+fn meta_envelope<'a>(body: &'a str, root: &str) -> Result<(String, &'a str), GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS meta response: not a <{root}> document"),
+        )
+    };
+    let body = body.trim();
+    let open = format!("<{root}");
+    let Some(after_open) = body.strip_prefix(&open) else {
+        return Err(malformed());
+    };
+    // The tag name must end here: `<packages>` is not a package
+    // element. The next character is whitespace, `/`, or `>`.
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = after_open.find('>') else {
+        return Err(malformed());
+    };
+    let open_tag = after_open[..end].to_string();
+    if open_tag.trim_end().ends_with('/') {
+        return Ok((open_tag, ""));
+    }
+    let inner = &after_open[end + 1..];
+    let close = format!("</{root}>");
+    let Some(close_pos) = inner.find(&close) else {
+        return Err(malformed());
+    };
+    // Nothing but whitespace may follow the closing tag.
+    if !inner[close_pos + close.len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    Ok((open_tag, &inner[..close_pos]))
+}
+
+/// Parse a project meta (`<project>` with `title`, `description`,
+/// `url?`, `scmsync?`, `devel?`, persons, groups, and
+/// `<repository name><arch>*<path project repository/>` children).
+/// The body must be a `<project>` document with a `name` attribute:
+/// either is missing and the parse is an error, never a meta with
+/// no name.
+pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS project meta response: not a <project> document",
+        )
+    };
+    let (open_tag, inner) = meta_envelope(body, "project")?;
+    let name = tag_attr(&open_tag, "name").ok_or_else(malformed)?;
+    let devel = {
+        let mut found = None;
+        for (element, _) in elements(inner, "devel")? {
+            if let Some(project) = tag_attr(&element, "project") {
+                found = Some(xml_unescape(&project));
+                break;
+            }
+        }
+        found
+    };
+    let mut repositories = Vec::new();
+    for (element, repo_inner) in elements(inner, "repository")? {
+        let Some(repo_name) = tag_attr(&element, "name") else {
+            continue;
+        };
+        let mut arch = Vec::new();
+        for (_, text) in elements(&repo_inner, "arch")? {
+            let arch_name = text.trim().to_string();
+            if !arch_name.is_empty() {
+                arch.push(xml_unescape(&arch_name));
+            }
+        }
+        let mut paths = Vec::new();
+        for (path_element, _) in elements(&repo_inner, "path")? {
+            if let (Some(project), Some(repository)) = (
+                tag_attr(&path_element, "project"),
+                tag_attr(&path_element, "repository"),
+            ) {
+                paths.push((xml_unescape(&project), xml_unescape(&repository)));
+            }
+        }
+        repositories.push(Repository {
+            name: xml_unescape(&repo_name),
+            arch,
+            paths,
+        });
+    }
+    let (persons, groups) = meta_roles(inner)?;
+    Ok(ProjectMeta {
+        name: xml_unescape(&name),
+        title: element_text(inner, "title"),
+        description: element_text(inner, "description"),
+        url: element_text(inner, "url"),
+        scmsync: element_text(inner, "scmsync"),
+        devel,
+        persons,
+        groups,
+        repositories,
+    })
+}
+
+/// Parse a package meta (`<package>` with `title`, `description`,
+/// `url?`, `scmsync?`, `releasename?`, `devel project package?`,
+/// `<person userid role/>`, and `<group groupid role/>` children).
+/// The body must be a `<package>` document with `name` and `project`
+/// attributes: either is missing and the parse is an error, never a
+/// meta with no name.
+pub(crate) fn parse_package_meta(body: &str) -> Result<PackageMeta, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS package meta response: not a <package> document",
+        )
+    };
+    let (open_tag, inner) = meta_envelope(body, "package")?;
+    let name = tag_attr(&open_tag, "name").ok_or_else(malformed)?;
+    let project = tag_attr(&open_tag, "project").ok_or_else(malformed)?;
+    let devel = {
+        let mut found = None;
+        for (element, _) in elements(inner, "devel")? {
+            if let (Some(devel_project), Some(devel_package)) =
+                (tag_attr(&element, "project"), tag_attr(&element, "package"))
+            {
+                found = Some((xml_unescape(&devel_project), xml_unescape(&devel_package)));
+                break;
+            }
+        }
+        found
+    };
+    let (persons, groups) = meta_roles(inner)?;
+    Ok(PackageMeta {
+        name: xml_unescape(&name),
+        project: xml_unescape(&project),
+        title: element_text(inner, "title"),
+        description: element_text(inner, "description"),
+        url: element_text(inner, "url"),
+        scmsync: element_text(inner, "scmsync"),
+        releasename: element_text(inner, "releasename"),
+        devel,
+        persons,
+        groups,
+    })
 }
 
 /// Validate an OBS request id: a non-empty run of ASCII digits that
@@ -5718,6 +6057,193 @@ mod tests {
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
         assert!(client.revision_patch("openSUSE:Factory", "foo", 0).is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    // --- parse_project_meta / parse_package_meta ---
+
+    const PROJECT_META_FIXTURE: &str = "<project name=\"openSUSE:Factory\">\
+        <title>Factory</title>\
+        <description>The Factory project</description>\
+        <url>https://example.com</url>\
+        <scmsync>https://src.opensuse.org/pool/factory</scmsync>\
+        <devel project=\"openSUSE:Factory:Devel\"/>\
+        <person userid=\"Admin\" role=\"maintainer\"/>\
+        <group groupid=\"factory-maintainers\" role=\"maintainer\"/>\
+        <repository name=\"standard\">\
+        <arch>x86_64</arch><arch>aarch64</arch>\
+        <path project=\"openSUSE:Factory:ARM\" repository=\"standard\"/>\
+        <path project=\"openSUSE:Factory\" repository=\"snapshot\"/>\
+        </repository>\
+        <repository name=\"images\"><arch>x86_64</arch></repository>\
+        </project>";
+
+    const PACKAGE_META_FIXTURE: &str = "<package name=\"foo\" project=\"openSUSE:Factory\">\
+        <title>Foo package</title>\
+        <description>A test package &amp; more</description>\
+        <url>https://example.com/foo</url>\
+        <scmsync>https://src.opensuse.org/pool/foo</scmsync>\
+        <releasename>foo</releasename>\
+        <devel project=\"devel:languages:python\" package=\"foo\"/>\
+        <person userid=\"Admin\" role=\"maintainer\"/>\
+        <person userid=\"scarabeus_iv\" role=\"bugowner\"/>\
+        <group groupid=\"factory-maintainers\" role=\"maintainer\"/>\
+        </package>";
+
+    #[test]
+    fn project_meta_parses_everything() {
+        let meta = parse_project_meta(PROJECT_META_FIXTURE).unwrap();
+        assert_eq!(meta.name, "openSUSE:Factory");
+        assert_eq!(meta.title.as_deref(), Some("Factory"));
+        assert_eq!(meta.description.as_deref(), Some("The Factory project"));
+        assert_eq!(meta.url.as_deref(), Some("https://example.com"));
+        assert_eq!(
+            meta.scmsync.as_deref(),
+            Some("https://src.opensuse.org/pool/factory")
+        );
+        assert_eq!(meta.devel.as_deref(), Some("openSUSE:Factory:Devel"));
+        assert_eq!(
+            meta.persons,
+            vec![NamedRole {
+                name: "Admin".to_string(),
+                role: "maintainer".to_string(),
+            }]
+        );
+        assert_eq!(
+            meta.groups,
+            vec![NamedRole {
+                name: "factory-maintainers".to_string(),
+                role: "maintainer".to_string(),
+            }]
+        );
+        assert_eq!(
+            meta.repositories,
+            vec![
+                Repository {
+                    name: "standard".to_string(),
+                    arch: vec!["x86_64".to_string(), "aarch64".to_string()],
+                    paths: vec![
+                        ("openSUSE:Factory:ARM".to_string(), "standard".to_string()),
+                        ("openSUSE:Factory".to_string(), "snapshot".to_string()),
+                    ],
+                },
+                Repository {
+                    name: "images".to_string(),
+                    arch: vec!["x86_64".to_string()],
+                    paths: vec![],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn package_meta_parses_everything() {
+        let meta = parse_package_meta(PACKAGE_META_FIXTURE).unwrap();
+        assert_eq!(meta.name, "foo");
+        assert_eq!(meta.project, "openSUSE:Factory");
+        assert_eq!(meta.title.as_deref(), Some("Foo package"));
+        assert_eq!(meta.description.as_deref(), Some("A test package & more"));
+        assert_eq!(meta.url.as_deref(), Some("https://example.com/foo"));
+        assert_eq!(
+            meta.scmsync.as_deref(),
+            Some("https://src.opensuse.org/pool/foo")
+        );
+        assert_eq!(meta.releasename.as_deref(), Some("foo"));
+        assert_eq!(
+            meta.devel,
+            Some(("devel:languages:python".to_string(), "foo".to_string()))
+        );
+        assert_eq!(
+            meta.persons,
+            vec![
+                NamedRole {
+                    name: "Admin".to_string(),
+                    role: "maintainer".to_string(),
+                },
+                NamedRole {
+                    name: "scarabeus_iv".to_string(),
+                    role: "bugowner".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            meta.groups,
+            vec![NamedRole {
+                name: "factory-maintainers".to_string(),
+                role: "maintainer".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn meta_parses_minimal_documents() {
+        let meta = parse_project_meta("<project name=\"home:Admin\"/>").unwrap();
+        assert_eq!(meta.name, "home:Admin");
+        assert_eq!(meta.title, None);
+        assert!(meta.repositories.is_empty());
+        let meta = parse_package_meta(
+            "<package name=\"foo\" project=\"home:Admin\"><title>Foo</title></package>",
+        )
+        .unwrap();
+        assert_eq!(meta.name, "foo");
+        assert_eq!(meta.project, "home:Admin");
+        assert_eq!(meta.title.as_deref(), Some("Foo"));
+        assert_eq!(meta.devel, None);
+    }
+
+    #[test]
+    fn meta_rejects_malformed_bodies() {
+        assert!(parse_project_meta("").is_err());
+        assert!(parse_project_meta("<package name=\"foo\" project=\"p\"/>").is_err());
+        assert!(parse_project_meta("<projects name=\"p\"></projects>").is_err());
+        assert!(parse_project_meta("<project></project>").is_err());
+        assert!(parse_project_meta("<project name=\"p\">").is_err());
+        assert!(parse_package_meta("").is_err());
+        assert!(parse_package_meta("<project name=\"p\"/>").is_err());
+        assert!(parse_package_meta("<package name=\"foo\"></package>").is_err());
+        assert!(parse_package_meta("<package name=\"foo\" project=\"p\">").is_err());
+    }
+
+    // --- project_meta / package_meta ---
+
+    #[test]
+    fn project_meta_reads_without_credentials() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/_meta",
+            PROJECT_META_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        let meta = client.project_meta("openSUSE:Factory").unwrap();
+        assert_eq!(meta.name, "openSUSE:Factory");
+        assert_eq!(meta.repositories.len(), 2);
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/_meta".to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn package_meta_reads_without_credentials() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            PACKAGE_META_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        let meta = client.package_meta("openSUSE:Factory", "foo").unwrap();
+        assert_eq!(meta.name, "foo");
+        assert_eq!(meta.project, "openSUSE:Factory");
+        assert_eq!(meta.persons.len(), 2);
+    }
+
+    #[test]
+    fn meta_reads_reject_bad_names() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.project_meta("openSUSE:Factory/x").is_err());
+        assert!(client.package_meta("openSUSE:Factory", "foo/bar").is_err());
         assert!(http.get_calls().is_empty());
     }
 }
