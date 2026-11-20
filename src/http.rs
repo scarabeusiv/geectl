@@ -147,6 +147,12 @@ impl UreqClient {
             .timeout_connect(Some(timeout.connect))
             .timeout_per_read(Some(timeout.read))
             .timeout_global(Some(timeout.total))
+            // Never forward the Authorization header on a redirect.
+            // The ureq default is already `Never`, but it is set
+            // explicitly so a future ureq default change cannot
+            // silently start leaking credentials to the redirect
+            // target (which may be a different host entirely).
+            .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
             .build();
         let agent: ureq::Agent = config.into();
         Ok(UreqClient { agent, auth })
@@ -288,6 +294,79 @@ fn status_action(code: u16, safe_url: &str) -> StatusAction {
     }
 }
 
+/// True when the URL's authority carries userinfo (`user` or
+/// `user:pass` before the last `@`). Only the authority is inspected:
+/// an `@` in the path or query is not userinfo. The last `@`
+/// separates userinfo from the host, so an `@` inside a password
+/// does not end the userinfo.
+fn url_has_userinfo(url: &str) -> bool {
+    let Some(after_scheme) = url.split("://").nth(1) else {
+        return false;
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    after_scheme[..authority_end].contains('@')
+}
+
+/// Refuse to send credentials over cleartext http, except to a loopback
+/// host (127.0.0.0/8, ::1, localhost) where the traffic never leaves
+/// the host. Real servers are addressed through `UrlBuilder`, which
+/// requires `https://`; this is the second guard, for callers that pass
+/// a raw URL. The loopback exception exists so tests can exercise auth
+/// against a local server with fixture credentials — never a real
+/// endpoint, never a real credential. A userinfo URL carries a
+/// credential in the URL itself, so the transport check applies to it
+/// even when no `Credentials` are configured.
+fn require_credentials_transport(url: &str, credentials: &Credentials) -> Result<(), GeectlError> {
+    if url_has_userinfo(url) && !url.starts_with("https://") && !is_loopback_url(url) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "a URL with userinfo requires an https:// URL (http:// is allowed only for loopback hosts)",
+        ));
+    }
+    if matches!(credentials, Credentials::None) {
+        return Ok(());
+    }
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if is_loopback_url(url) {
+        return Ok(());
+    }
+    Err(GeectlError::new(
+        ErrorKind::InvalidInput,
+        "credentials require an https:// URL (http:// is allowed only for loopback hosts)",
+    ))
+}
+
+/// True when the URL's host is loopback (localhost, 127.0.0.0/8, ::1).
+/// Only the authority is inspected; a loopback string in the path or
+/// query does not count, and a DNS name that merely starts with
+/// "127." (e.g. `127.0.0.1.evil.com`) is not loopback — the host must
+/// parse as an IP in the loopback range, or be localhost.
+fn is_loopback_url(url: &str) -> bool {
+    let Some(after_scheme) = url.split("://").nth(1) else {
+        return false;
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // Strip any userinfo first: an `@` in it must not be mistaken for
+    // the host separator.
+    let without_userinfo = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(bracketed) = without_userinfo.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        without_userinfo.split(':').next().unwrap_or("")
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    matches!(host.parse::<std::net::IpAddr>(), Ok(ip) if ip.is_loopback())
+}
+
 impl HttpClient for UreqClient {
     fn get(&self, url: &str) -> Result<String, GeectlError> {
         // Resolve credentials once per call, not once per retry
@@ -297,6 +376,9 @@ impl HttpClient for UreqClient {
             Some(auth) => auth.credentials()?,
             None => Credentials::None,
         };
+        // Credentials never travel over cleartext http, except to a
+        // loopback host (see require_credentials_transport).
+        require_credentials_transport(url, &credentials)?;
         let mut last_error: Option<GeectlError> = None;
         for attempt in 0..=RETRY_POLICY.max_retries {
             let request = self.apply_auth(self.agent.get(url), &credentials)?;
@@ -576,5 +658,255 @@ mod tests {
         assert!(
             matches!(status_action(503, "u"), StatusAction::Retry(e) if e.kind() == ErrorKind::ServerError)
         );
+    }
+
+    // --- Authenticated-request tests (loopback server, fixture creds) ---
+
+    /// An [`AuthProvider`] returning fixed credentials, for tests. The
+    /// real providers read the process environment; this one lets the
+    /// HTTP tests supply exact credentials without touching env vars.
+    struct FixedAuth(Credentials);
+
+    impl AuthProvider for FixedAuth {
+        fn credentials(&self) -> Result<Credentials, GeectlError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A one-shot loopback HTTP server for auth tests: accepts a single
+    /// request, records its Authorization header, and answers 200 with
+    /// the given body. The client talks to it over plain http:// —
+    /// loopback only, fixture credentials only, never a real endpoint
+    /// and never a real credential. The accept/read are bounded (5s)
+    /// so a test that never connects fails instead of hanging the suite.
+    struct LoopbackServer {
+        port: u16,
+        handle: std::thread::JoinHandle<Option<String>>,
+    }
+
+    impl LoopbackServer {
+        /// Accept one request, record its Authorization header, answer
+        /// with `response`, and return the port plus the handle that
+        /// yields the recorded header.
+        fn serve_once(response: String) -> (u16, std::thread::JoinHandle<Option<String>>) {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("local addr").port();
+            let handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break Some(stream),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() > deadline {
+                                break None;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break None,
+                    }
+                }?;
+                use std::io::{Read, Write};
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
+                let auth = request
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(|l| l["authorization:".len()..].trim().to_string());
+                let _ = stream.write_all(response.as_bytes());
+                auth
+            });
+            (port, handle)
+        }
+
+        fn serve(body: &'static str) -> Self {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let (port, handle) = Self::serve_once(response);
+            LoopbackServer { port, handle }
+        }
+
+        /// Answer 302 to `location`: the client must follow it, and
+        /// must not carry the Authorization header to the target.
+        fn serve_redirect(location: &str) -> Self {
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let (port, handle) = Self::serve_once(response);
+            LoopbackServer { port, handle }
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}/test", self.port)
+        }
+
+        fn authorization(self) -> Option<String> {
+            self.handle.join().ok().flatten()
+        }
+    }
+
+    #[test]
+    fn basic_auth_is_sent_as_authorization_header() {
+        let server = LoopbackServer::serve("hello");
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Basic {
+                username: "alice".to_string(),
+                password: "s3cr3t".to_string(),
+            }))),
+        )
+        .unwrap();
+        assert_eq!(client.get(&server.url()).unwrap(), "hello");
+        use base64::Engine;
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("alice:s3cr3t")
+        );
+        assert_eq!(server.authorization().as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn bearer_auth_is_sent_as_authorization_header() {
+        let server = LoopbackServer::serve("hello");
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Bearer {
+                token: "tok3n".to_string(),
+            }))),
+        )
+        .unwrap();
+        assert_eq!(client.get(&server.url()).unwrap(), "hello");
+        assert_eq!(server.authorization().as_deref(), Some("Bearer tok3n"));
+    }
+
+    #[test]
+    fn ssh_key_credentials_are_refused_for_http() {
+        // An SSH key cannot authenticate an HTTP request: the refusal
+        // happens before any network traffic.
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::SshKey {
+                path: std::path::PathBuf::from("/home/user/.ssh/id_ed25519"),
+            }))),
+        )
+        .unwrap();
+        let err = client.get("https://example.com/").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn credentials_over_non_loopback_http_are_refused() {
+        // Cleartext http to a real host must never carry a credential.
+        // The refusal happens before connecting.
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Basic {
+                username: "alice".to_string(),
+                password: "s3cr3t".to_string(),
+            }))),
+        )
+        .unwrap();
+        let err = client.get("http://example.com/").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn userinfo_detection_is_authority_only() {
+        assert!(url_has_userinfo("http://user:pass@example.com/"));
+        assert!(url_has_userinfo("http://user@example.com"));
+        assert!(!url_has_userinfo("http://example.com/@user"));
+        assert!(!url_has_userinfo("http://example.com/?x=user@host"));
+        assert!(!url_has_userinfo("http://example.com/"));
+        assert!(!url_has_userinfo("example.com"));
+    }
+
+    #[test]
+    fn userinfo_url_without_credentials_is_still_transport_checked() {
+        // A userinfo URL carries a credential in the URL itself, so
+        // the transport check applies even with Credentials::None:
+        // http://user:pass@example.com/ would otherwise send the
+        // password in cleartext.
+        assert!(
+            require_credentials_transport("http://user:pass@example.com/", &Credentials::None)
+                .is_err()
+        );
+        // Loopback and https userinfo URLs are not a cleartext leak.
+        assert!(
+            require_credentials_transport("http://user:pass@127.0.0.1/x", &Credentials::None)
+                .is_ok()
+        );
+        assert!(require_credentials_transport(
+            "https://user:pass@example.com/",
+            &Credentials::None
+        )
+        .is_ok());
+        // An `@` in the path is not userinfo.
+        assert!(
+            require_credentials_transport("http://example.com/@user", &Credentials::None).is_ok()
+        );
+        // And with credentials configured, a plain http URL is still
+        // refused (the pre-existing rule).
+        assert!(require_credentials_transport(
+            "http://example.com/",
+            &Credentials::Basic {
+                username: "alice".to_string(),
+                password: "s3cr3t".to_string(),
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn authorization_header_is_not_forwarded_on_redirect() {
+        // The redirect target is a different loopback server: it must
+        // see no Authorization header even though the first request
+        // carried one.
+        let target = LoopbackServer::serve("target-body");
+        let redirect = LoopbackServer::serve_redirect(&target.url());
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Bearer {
+                token: "tok3n".to_string(),
+            }))),
+        )
+        .unwrap();
+        assert_eq!(client.get(&redirect.url()).unwrap(), "target-body");
+        assert_eq!(redirect.authorization().as_deref(), Some("Bearer tok3n"));
+        assert_eq!(target.authorization(), None);
+    }
+
+    #[test]
+    fn loopback_detection_is_authority_only() {
+        assert!(is_loopback_url("http://127.0.0.1:8080/x"));
+        assert!(is_loopback_url("http://localhost/x"));
+        assert!(is_loopback_url("http://LOCALHOST:8080/x"));
+        assert!(is_loopback_url("http://[::1]:8080/x"));
+        assert!(is_loopback_url("http://user:pass@127.0.0.1/x"));
+        assert!(!is_loopback_url("http://example.com/"));
+        // A DNS name that merely starts with "127." is not loopback.
+        assert!(!is_loopback_url("http://127.0.0.1.evil.com/"));
+        // A loopback string in the path or query does not count.
+        assert!(!is_loopback_url("http://example.com/127.0.0.1"));
+        assert!(!is_loopback_url("http://example.com/?x=127.0.0.1"));
+        // No scheme names no host.
+        assert!(!is_loopback_url("127.0.0.1/x"));
     }
 }
