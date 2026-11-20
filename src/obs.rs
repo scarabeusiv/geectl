@@ -681,6 +681,37 @@ pub struct Person {
     pub state: String,
 }
 
+/// Whether a package is the same, different, or only on one side
+/// of a project diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageDiffStatus {
+    /// Same files, same contents.
+    Identical,
+    /// Files added, removed, or changed.
+    Differs,
+    /// Only in the old project.
+    OnlyInOld,
+    /// Only in the new project.
+    OnlyInNew,
+}
+
+/// One package's diff between two projects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageDiff {
+    /// Package name.
+    pub name: String,
+    /// Whether the package is identical, differs, or is only on one
+    /// side.
+    pub status: PackageDiffStatus,
+    /// The changed files, sorted by name (empty for identical
+    /// packages and for packages only on one side).
+    pub files: Vec<FilePatch>,
+    /// The ids of the open submit requests involving this package in
+    /// the new project, when the diff was annotated (empty
+    /// otherwise).
+    pub requests: Vec<String>,
+}
+
 /// The OBS client: the devel-project lookup, the devel version, the
 /// open-submit-request check, submit-request filing, branch setup,
 /// and the remote reads (file and directory reads, history, meta,
@@ -1803,6 +1834,156 @@ impl<'a> ObsClient<'a> {
             }
         }
         Ok(self.public_directory(&[project, package])?.linkinfo)
+    }
+
+    /// The per-file diff between two listings of the same package:
+    /// files added, modified (contents differ), or deleted, each
+    /// with a unified diff. Unchanged files do not appear.
+    fn diff_files(
+        &self,
+        old_project: &str,
+        package: &str,
+        old_files: &[SourceFile],
+        new_project: &str,
+        new_files: &[SourceFile],
+    ) -> Result<Vec<FilePatch>, GeectlError> {
+        let mut patches = Vec::new();
+        for new in new_files {
+            match old_files.iter().find(|old| old.name == new.name) {
+                None => {
+                    // Added: the whole file is new.
+                    let content = self.cat(new_project, package, &new.name, None)?;
+                    patches.push(FilePatch {
+                        filename: new.name.clone(),
+                        status: FilePatchStatus::Added,
+                        diff: unified_diff("/dev/null", "", &format!("b/{}", new.name), &content),
+                    });
+                }
+                Some(old) if old.md5 != new.md5 => {
+                    let old_content = self.cat(old_project, package, &new.name, None)?;
+                    let new_content = self.cat(new_project, package, &new.name, None)?;
+                    let diff = unified_diff(
+                        &format!("a/{}", new.name),
+                        &old_content,
+                        &format!("b/{}", new.name),
+                        &new_content,
+                    );
+                    // The md5s differ but the contents may not (a
+                    // missing md5 reads as a difference): only a
+                    // non-empty diff is a modification.
+                    if !diff.is_empty() {
+                        patches.push(FilePatch {
+                            filename: new.name.clone(),
+                            status: FilePatchStatus::Modified,
+                            diff,
+                        });
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        for old in old_files {
+            if !new_files.iter().any(|new| new.name == old.name) {
+                let content = self.cat(old_project, package, &old.name, None)?;
+                patches.push(FilePatch {
+                    filename: old.name.clone(),
+                    status: FilePatchStatus::Deleted,
+                    diff: unified_diff(&format!("a/{}", old.name), &content, "/dev/null", ""),
+                });
+            }
+        }
+        patches.sort_by(|a, b| a.filename.cmp(&b.filename));
+        Ok(patches)
+    }
+
+    /// Diff two projects package by package (`old` vs `new`): every
+    /// package in either project is classified — identical (same
+    /// files, same contents), differs (files added, removed, or
+    /// changed), only-in-old, or only-in-new — with a per-file
+    /// unified diff for the packages that differ. `include` narrows
+    /// the diff to the named packages (empty means all); `exclude`
+    /// drops the named packages. With `annotate_requests`, each
+    /// differing package is annotated with the ids of the open
+    /// submit requests involving it in the `new` project (which
+    /// requires credentials, like
+    /// [`ObsClient::open_requests_for_package`]).
+    ///
+    /// A package only in the new project is its own status
+    /// (`OnlyInNew`), not folded into identical: the caller decides
+    /// what a new package means. The file comparison is by md5, so a
+    /// file that only changed metadata does not count as changed.
+    pub fn project_diff(
+        &self,
+        old: &str,
+        new: &str,
+        include: &[&str],
+        exclude: &[&str],
+        annotate_requests: bool,
+    ) -> Result<Vec<PackageDiff>, GeectlError> {
+        for (label, value) in [("old project", old), ("new project", new)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        for name in include.iter().chain(exclude.iter()) {
+            if !valid_obs_name(name) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name: {name:?}"),
+                ));
+            }
+        }
+        let old_packages = self.list_packages(old)?;
+        let new_packages = self.list_packages(new)?;
+        let mut names: Vec<String> = old_packages
+            .iter()
+            .chain(new_packages.iter())
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+        let mut diffs = Vec::new();
+        for name in names {
+            if !include.is_empty() && !include.contains(&name.as_str()) {
+                continue;
+            }
+            if exclude.contains(&name.as_str()) {
+                continue;
+            }
+            let in_old = old_packages.contains(&name);
+            let in_new = new_packages.contains(&name);
+            let (status, files) = match (in_old, in_new) {
+                (true, false) => (PackageDiffStatus::OnlyInOld, Vec::new()),
+                (false, true) => (PackageDiffStatus::OnlyInNew, Vec::new()),
+                (true, true) => {
+                    let old_files = self.list_files(old, &name)?;
+                    let new_files = self.list_files(new, &name)?;
+                    let files = self.diff_files(old, &name, &old_files, new, &new_files)?;
+                    let status = if files.is_empty() {
+                        PackageDiffStatus::Identical
+                    } else {
+                        PackageDiffStatus::Differs
+                    };
+                    (status, files)
+                }
+                (false, false) => unreachable!("package in neither project"),
+            };
+            let requests = if annotate_requests && status == PackageDiffStatus::Differs {
+                self.open_requests_for_package(new, &name)?
+            } else {
+                Vec::new()
+            };
+            diffs.push(PackageDiff {
+                name,
+                status,
+                files,
+                requests,
+            });
+        }
+        Ok(diffs)
     }
 
     /// Build the OBS search URL for open submit requests targeting
@@ -7129,6 +7310,180 @@ mod tests {
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
         assert!(client.link_target("openSUSE:Factory", "foo/bar").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    // --- project_diff ---
+
+    /// The request-search URL `open_requests_for_package` builds,
+    /// for the FakeHttp fixture keys. The URL builder itself is
+    /// tested separately; here it only supplies the fixture key.
+    fn requests_url(project: &str, package: &str) -> String {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        client
+            .package_requests_search_url(project, package)
+            .unwrap()
+    }
+
+    const OLD_PACKAGES_FIXTURE: &str = "<directory>\
+        <entry name=\"common-one\"/><entry name=\"common-two\"/>\
+        <entry name=\"common-three\"/><entry name=\"old-only\"/>\
+        </directory>";
+    const NEW_PACKAGES_FIXTURE: &str = "<directory>\
+        <entry name=\"common-one\"/><entry name=\"common-two\"/>\
+        <entry name=\"common-three\"/><entry name=\"new-only\"/>\
+        </directory>";
+
+    /// A FakeHttp with the two project listings and the file
+    /// listings for the shared packages: `common-one` and
+    /// `common-three` identical on both sides, `common-two` with a
+    /// changed `foo.spec`.
+    fn diff_http() -> FakeHttp {
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/old",
+                OLD_PACKAGES_FIXTURE,
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/new",
+                NEW_PACKAGES_FIXTURE,
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/old/common-one",
+                "<directory><entry name=\"a.spec\" md5=\"111\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/new/common-one",
+                "<directory><entry name=\"a.spec\" md5=\"111\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/old/common-two",
+                "<directory><entry name=\"foo.spec\" md5=\"aaa\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/new/common-two",
+                "<directory><entry name=\"foo.spec\" md5=\"bbb\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/old/common-three",
+                "<directory><entry name=\"c.spec\" md5=\"222\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/new/common-three",
+                "<directory><entry name=\"c.spec\" md5=\"222\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/old/common-two/foo.spec",
+                "Version: 1.0\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/new/common-two/foo.spec",
+                "Version: 1.1\n",
+            )
+    }
+
+    #[test]
+    fn project_diff_classifies_packages() {
+        let http = diff_http();
+        let client = ObsClient::new(&http);
+        let diffs = client.project_diff("old", "new", &[], &[], false).unwrap();
+        assert_eq!(
+            diffs
+                .iter()
+                .map(|d| (d.name.as_str(), d.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("common-one", PackageDiffStatus::Identical),
+                ("common-three", PackageDiffStatus::Identical),
+                ("common-two", PackageDiffStatus::Differs),
+                ("new-only", PackageDiffStatus::OnlyInNew),
+                ("old-only", PackageDiffStatus::OnlyInOld),
+            ]
+        );
+        assert_eq!(diffs[0].files, Vec::<FilePatch>::new());
+        assert_eq!(diffs[0].requests, Vec::<String>::new());
+        let changed = &diffs[2];
+        assert_eq!(
+            changed.files,
+            vec![FilePatch {
+                filename: "foo.spec".to_string(),
+                status: FilePatchStatus::Modified,
+                diff: "--- a/foo.spec\n+++ b/foo.spec\n@@ -1 +1 @@\n-Version: 1.0\n+Version: 1.1\n"
+                    .to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn project_diff_include_and_exclude_narrow_the_diff() {
+        let http = diff_http();
+        let client = ObsClient::new(&http);
+        let diffs = client
+            .project_diff("old", "new", &["common-two"], &[], false)
+            .unwrap();
+        assert_eq!(
+            diffs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["common-two"]
+        );
+        let http = diff_http();
+        let client = ObsClient::new(&http);
+        let diffs = client
+            .project_diff("old", "new", &[], &["common-two"], false)
+            .unwrap();
+        assert_eq!(
+            diffs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["common-one", "common-three", "new-only", "old-only"]
+        );
+        let http = diff_http();
+        let client = ObsClient::new(&http);
+        let diffs = client
+            .project_diff("old", "new", &["common-one"], &["common-one"], false)
+            .unwrap();
+        assert_eq!(diffs, Vec::<PackageDiff>::new());
+    }
+
+    #[test]
+    fn project_diff_annotations_carry_open_request_ids() {
+        let http = diff_http().with_get(
+            &requests_url("new", "common-two"),
+            "<collection matches=\"1\"><request id=\"42\"/></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let diffs = client.project_diff("old", "new", &[], &[], true).unwrap();
+        let changed = diffs
+            .iter()
+            .find(|d| d.name == "common-two")
+            .expect("common-two differs");
+        assert_eq!(changed.requests, vec!["42".to_string()]);
+        let identical = diffs
+            .iter()
+            .find(|d| d.name == "common-one")
+            .expect("common-one identical");
+        assert_eq!(identical.requests, Vec::<String>::new());
+    }
+
+    #[test]
+    fn project_diff_annotation_requires_credentials() {
+        let http = diff_http();
+        let client = ObsClient::new(&http);
+        let err = client
+            .project_diff("old", "new", &[], &[], true)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+    }
+
+    #[test]
+    fn project_diff_rejects_bad_names_without_requesting() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client
+            .project_diff("old", "new", &["bad/name"], &[], false)
+            .is_err());
+        assert!(client
+            .project_diff("old", "new", &[], &["bad/name"], false)
+            .is_err());
+        assert!(client.project_diff("o/l", "new", &[], &[], false).is_err());
         assert!(http.get_calls().is_empty());
     }
 }
