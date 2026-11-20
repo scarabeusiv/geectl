@@ -24,6 +24,9 @@
 //!   file upload, and reading and acting on requests (show, log,
 //!   search, accept/decline/revoke, reviews, comments), with dry-run
 //!   as the default for mutations.
+//! - [`xml`]: the minimal XML document editor for the small documents
+//!   geectl rewrites in place (a package `_meta`, a `_link`) —
+//!   internal only, so XML never leaves the library.
 
 pub mod auth;
 pub mod config;
@@ -31,3 +34,5 @@ pub mod error;
 pub mod http;
 pub mod obs;
 pub mod url;
+
+pub(crate) mod xml;

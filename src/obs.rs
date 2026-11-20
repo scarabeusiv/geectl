@@ -110,6 +110,7 @@ use crate::auth::Credentials;
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{is_loopback_url, HttpClient};
 use crate::url::{encode_path_segment, encode_query_value, UrlBuilder};
+use crate::xml::XmlDoc;
 use std::cell::RefCell;
 use std::fmt;
 
@@ -3160,6 +3161,116 @@ impl<'a> ObsClient<'a> {
                     "unexpected OBS copy response for package {target_project}/{target_package}"
                 ),
             )),
+        }
+    }
+
+    /// Set the devel project of package `package` in project `project`
+    /// on OBS (`GET` then `PUT /source/<project>/<package>/_meta`),
+    /// or remove it when `devel_project` is None. `devel_package`
+    /// names a different package in the devel project (a cross-package
+    /// mapping); it is ignored when `devel_project` is None. Requires
+    /// credentials; without them the call fails loudly before any
+    /// request. In dry-run the change is recorded in the plan and
+    /// nothing is changed — the guard runs before the credentials
+    /// check, like `create_package`.
+    ///
+    /// An agent sets the devel project so the package resolves its
+    /// branch source (and its submit target) through the right
+    /// project: branching follows the devel project, so a package
+    /// whose devel is wrong branches from the wrong place. The meta is
+    /// PUT back only when the edit changes it — setting the devel that
+    /// is already there makes no request.
+    ///
+    /// Success is the `<status code="ok"/>` body on the PUT; any
+    /// other body is a server error, never success. A missing package
+    /// reads as `NotFound` from the GET, before anything is written.
+    /// The server refuses a devel whose package does not exist in
+    /// the devel project, so the devel package must be created
+    /// there first.
+    pub fn set_devel_project(
+        &self,
+        project: &str,
+        package: &str,
+        devel_project: Option<&str>,
+        devel_package: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if let Some(devel) = devel_project {
+            if !valid_obs_name(devel) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS project name: {devel:?}"),
+                ));
+            }
+        }
+        if let Some(devel) = devel_package {
+            if !valid_obs_name(devel) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name: {devel:?}"),
+                ));
+            }
+        }
+        // The dry-run guard: in dry-run the change is recorded in the
+        // plan and nothing is changed — not even the credentials check
+        // runs.
+        let action = match devel_project {
+            Some(devel) => match devel_package {
+                Some(pkg) => format!("set devel project of {project}/{package} to {devel}/{pkg}"),
+                None => format!("set devel project of {project}/{package} to {devel}"),
+            },
+            None => format!("unset devel project of {project}/{package}"),
+        };
+        if !dry_run.allow(&action) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot set a devel project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
+        let meta = self.http.get_with(&url, &self.credentials)?;
+        let mut doc = XmlDoc::parse(&meta)?;
+        match devel_project {
+            Some(devel) => {
+                let element = match devel_package {
+                    Some(pkg) => format!(
+                        "<devel project=\"{}\" package=\"{}\"/>",
+                        xml_escape(devel),
+                        xml_escape(pkg),
+                    ),
+                    None => format!("<devel project=\"{}\"/>", xml_escape(devel)),
+                };
+                doc.replace_or_insert_element("devel", &element)?;
+            }
+            None => doc.remove_elements("devel"),
+        }
+        let rendered = doc.render();
+        // No change, no PUT: setting the devel that is already there
+        // (or unsetting one that is not) writes nothing.
+        if rendered == meta.trim() {
+            return Ok(());
+        }
+        let body = self.http.put(&url, &rendered, &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS set-devel-project response for package {project}/{package}"
+                ),
+            ))
         }
     }
 }
@@ -9677,6 +9788,222 @@ mod tests {
         assert!(!parse_status_invoked("<other code=\"invoked\" />"));
         assert!(!parse_status_invoked("<status mycode=\"invoked\" />"));
         assert!(parse_status_invoked("<status code='invoked' />"));
+    }
+
+    #[test]
+    fn set_devel_project_sets_devel_in_meta() {
+        let meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                meta,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_devel_project(
+                "test:factory",
+                "test-pkgA",
+                Some("test:devel"),
+                None,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/></package>"
+        );
+        assert!(puts[0].2);
+    }
+
+    #[test]
+    fn set_devel_project_sets_cross_package_devel() {
+        let meta = "<package name=\"test-pkgB\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgB/_meta",
+                meta,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgB/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_devel_project(
+                "test:factory",
+                "test-pkgB",
+                Some("test:devel"),
+                Some("test-pkgA"),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(http.put_calls().len(), 1);
+        assert!(http.put_calls()[0]
+            .1
+            .contains("<devel project=\"test:devel\" package=\"test-pkgA\"/>"));
+    }
+
+    #[test]
+    fn set_devel_project_unsets_devel() {
+        let meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                meta,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_devel_project("test:factory", "test-pkgA", None, None, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.put_calls().len(), 1);
+        assert!(!http.put_calls()[0].1.contains("<devel"));
+    }
+
+    #[test]
+    fn set_devel_project_no_change_makes_no_put() {
+        // The devel is already what was asked: nothing is written.
+        let meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/></package>";
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+            meta,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_devel_project(
+                "test:factory",
+                "test-pkgA",
+                Some("test:devel"),
+                None,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_devel_project_missing_package_is_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .set_devel_project(
+                "test:factory",
+                "test-pkgA",
+                Some("test:devel"),
+                None,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_devel_project_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+            "<package name=\"test-pkgA\" project=\"test:factory\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .set_devel_project(
+                "test:factory",
+                "test-pkgA",
+                Some("test:devel"),
+                None,
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_devel_project_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_devel_project(
+                "test/factory",
+                "test-pkgA",
+                Some("test:devel"),
+                None,
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(client
+            .set_devel_project(
+                "test:factory",
+                "test-pkgA",
+                Some("test/devel"),
+                None,
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn set_devel_project_dry_run_records_plan_and_changes_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .set_devel_project(
+                "test:factory",
+                "test-pkgA",
+                Some("test:devel"),
+                None,
+                &dry_run,
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: set devel project of test:factory/test-pkgA to test:devel"
+                    .to_string()
+            ]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_devel_project_non_ok_body_is_error_not_success() {
+        let meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                meta,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                "<status code=\"error\"><summary>nope</summary></status>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .set_devel_project(
+                "test:factory",
+                "test-pkgA",
+                Some("test:devel"),
+                None,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]

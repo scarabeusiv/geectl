@@ -1962,6 +1962,141 @@ fn live_copy_project_with_no_delay() {
     );
 }
 
+#[test]
+fn temporal_set_devel_project_sets_devel() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let package = temporal_package();
+    let factory = create_source_branch(&client, &package);
+    let devel = format!("geectl-tmp-devel-{}", unique_suffix());
+    client
+        .create_project(
+            &devel,
+            "geectl temporal test devel",
+            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel project on the temporal instance");
+    // The server refuses a devel whose package does not exist in
+    // the devel project, so the devel package is created there
+    // first.
+    client
+        .create_package(
+            &devel,
+            &package,
+            "geectl temporal test devel package",
+            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel package on the temporal instance");
+    client
+        .set_devel_project(&factory, &package, Some(&devel), None, &DryRun::new(false))
+        .expect("set the devel project on the temporal instance");
+    let meta = read_meta(&base, &factory, &package);
+    // The server records the devel with the package attribute too
+    // (defaulting to the same package name), so match the project
+    // attribute rather than the whole element.
+    assert_eq!(
+        xml_attr_after(&meta, "<devel ", "project").as_deref(),
+        Some(devel.as_str()),
+        "the meta must carry the devel project; meta: {meta}"
+    );
+}
+
+#[test]
+fn temporal_set_devel_project_cross_package() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let package = temporal_package();
+    let factory = create_source_branch(&client, &package);
+    let devel = format!("geectl-tmp-devel-{}", unique_suffix());
+    client
+        .create_project(
+            &devel,
+            "geectl temporal test devel",
+            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel project on the temporal instance");
+    // A cross-package mapping: this package's devel is another
+    // package in the devel project.
+    let devel_package = format!("{package}-devel");
+    // The server refuses a devel whose package does not exist in
+    // the devel project, so the devel package is created there
+    // first.
+    client
+        .create_package(
+            &devel,
+            &devel_package,
+            "geectl temporal test devel package",
+            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel package on the temporal instance");
+    client
+        .set_devel_project(
+            &factory,
+            &package,
+            Some(&devel),
+            Some(&devel_package),
+            &DryRun::new(false),
+        )
+        .expect("set the cross-package devel on the temporal instance");
+    let meta = read_meta(&base, &factory, &package);
+    assert!(
+        meta.contains(&format!(
+            "<devel project=\"{devel}\" package=\"{devel_package}\"/>"
+        )),
+        "the meta must carry the cross-package devel; meta: {meta}"
+    );
+}
+
+#[test]
+fn temporal_set_devel_project_unset() {
+    let Some(base) = temporal_url() else {
+        return;
+    };
+    let client = temporal_client_authed(&base);
+    let package = temporal_package();
+    let factory = create_source_branch(&client, &package);
+    let devel = format!("geectl-tmp-devel-{}", unique_suffix());
+    client
+        .create_project(
+            &devel,
+            "geectl temporal test devel",
+            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel project on the temporal instance");
+    // The server refuses a devel whose package does not exist in
+    // the devel project, so the devel package is created there
+    // first.
+    client
+        .create_package(
+            &devel,
+            &package,
+            "geectl temporal test devel package",
+            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel package on the temporal instance");
+    client
+        .set_devel_project(&factory, &package, Some(&devel), None, &DryRun::new(false))
+        .expect("set the devel project on the temporal instance");
+    client
+        .set_devel_project(&factory, &package, None, None, &DryRun::new(false))
+        .expect("unset the devel project on the temporal instance");
+    let meta = read_meta(&base, &factory, &package);
+    assert!(
+        !meta.contains("<devel"),
+        "the meta must carry no devel element after unsetting; meta: {meta}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
