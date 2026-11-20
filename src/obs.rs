@@ -1334,6 +1334,79 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// Ask `target` to review submit request `id` (`POST
+    /// /request/:id?cmd=addreview`), with `comment` as the reason the
+    /// review is asked for. The review moves the request to `review`
+    /// state. An agent asks for a review when a request needs eyes it
+    /// does not have — a maintainer of the target, a group that owns
+    /// the area — and the reason is the ask, so an empty comment is
+    /// refused: a review that says nothing about what it wants is not
+    /// a review. Requires credentials; without them the call fails
+    /// loudly before any request. Takes the caller's [`DryRun`]: in
+    /// dry-run the review is recorded in the plan and nothing is
+    /// asked.
+    ///
+    /// The target is validated up front ([`ReviewTarget::new`]): at
+    /// least one of a user, a group, and a project must be named, and
+    /// a package review needs its project. Success is the `<status
+    /// code="ok"/>` body: any other body is a server error, never
+    /// success.
+    pub fn add_review(
+        &self,
+        id: &str,
+        target: &ReviewTarget,
+        comment: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        let id = validate_request_id(id)?;
+        if comment.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a review needs a reason; an empty comment asks for a review that says nothing",
+            ));
+        }
+        if !dry_run.allow(&format!(
+            "add a review by {} to submit request {id}",
+            target.describe()
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot add a review to a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("cmd", "addreview")];
+        if let Some(by_user) = &target.by_user {
+            query.push(("by_user", by_user));
+        }
+        if let Some(by_group) = &target.by_group {
+            query.push(("by_group", by_group));
+        }
+        if let Some(by_project) = &target.by_project {
+            query.push(("by_project", by_project));
+        }
+        if let Some(by_package) = &target.by_package {
+            query.push(("by_package", by_package));
+        }
+        let url = build_url(&self.base, &["request", &id.to_string()], &query);
+        // The reason travels as the request body, as plain text:
+        // the server's `RequestController#request_command` takes
+        // `request.raw_post` as the comment (see
+        // `supersede_request`), so the body is the reason verbatim
+        // and its content type is its actual type (`text/plain`).
+        let body = self.http.post_text(&url, comment, &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS addreview response for submit request {id}"),
+            ))
+        }
+    }
+
     /// Delete `project`/`package` from OBS (`DELETE
     /// /source/<project>/<package>`): the manual branch cleanup.
     /// Requests filed through this library clean up on accept by
@@ -11317,5 +11390,108 @@ description</description>
             .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
             .unwrap());
         assert!(http.post_calls().is_empty());
+    }
+
+    // -- Review add.
+
+    #[test]
+    fn add_review_posts_addreview_with_the_reason() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=addreview&by_user=Admin",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        obs.add_review("42", &target, "please review", &dry)
+            .expect("review posts");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0,
+            "https://api.opensuse.org/request/42?cmd=addreview&by_user=Admin"
+        );
+        assert_eq!(calls[0].1, "please review");
+        assert!(calls[0].2, "the review is credentialed");
+    }
+
+    #[test]
+    fn add_review_by_project_and_package_names_both() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=addreview&by_project=openSUSE%3AFactory&by_package=foo",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(None, None, Some("openSUSE:Factory"), Some("foo")).unwrap();
+        obs.add_review("42", &target, "package review", &dry)
+            .expect("project/package review posts");
+        assert_eq!(
+            http.post_calls()[0].0,
+            "https://api.opensuse.org/request/42?cmd=addreview&by_project=openSUSE%3AFactory&by_package=foo"
+        );
+    }
+
+    #[test]
+    fn add_review_refuses_an_empty_reason() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        let err = obs.add_review("42", &target, "", &dry).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn review_target_requires_someone_and_a_project_for_a_package() {
+        assert!(ReviewTarget::new(None, None, None, None).is_err());
+        assert!(ReviewTarget::new(None, None, None, Some("foo")).is_err());
+        assert!(ReviewTarget::new(Some(""), None, None, None).is_err());
+        assert!(ReviewTarget::new(None, None, Some("not a project!"), None).is_err());
+        assert!(ReviewTarget::new(None, None, Some("openSUSE:Factory"), Some("foo")).is_ok());
+    }
+
+    #[test]
+    fn add_review_dry_run_records_the_plan_and_posts_nothing() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        obs.add_review("42", &target, "please review", &dry)
+            .expect("dry-run review records");
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: add a review by user Admin to submit request 42".to_string()]
+        );
+    }
+
+    #[test]
+    fn add_review_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        let err = obs
+            .add_review("42", &target, "please review", &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_review_unexpected_response_is_error() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=addreview&by_user=Admin",
+            "<status code=\"not_found\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        let err = obs
+            .add_review("42", &target, "please review", &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 }
