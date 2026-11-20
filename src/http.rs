@@ -777,6 +777,14 @@ mod tests {
         }
     }
 
+    /// The offset of the first occurrence of `needle` in `haystack`,
+    /// if any. A byte search, not a text search: the header/body
+    /// boundary must be found in the raw request bytes (see
+    /// `serve_once`), not in a lossy decoding of them.
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
     /// A one-shot loopback HTTP server for auth tests: accepts a single
     /// request, records it (method line, headers, body), and answers
     /// with the given body. The client talks to it over plain http:// —
@@ -826,10 +834,16 @@ mod tests {
                         Ok(0) => break,
                         Ok(n) => {
                             buf.extend_from_slice(&chunk[..n]);
-                            let text = String::from_utf8_lossy(&buf);
-                            if let Some(end) = text.find("\r\n\r\n") {
+                            // Search the raw bytes for the header/body
+                            // boundary: decoding first would let a
+                            // multi-byte body sequence mimic (or hide)
+                            // the boundary in the lossy text. Only the
+                            // header slice is decoded, for the
+                            // Content-Length parse.
+                            if let Some(end) = find_subslice(&buf, b"\r\n\r\n") {
                                 let header_end = end + 4;
-                                let content_length: usize = text[..end]
+                                let header_text = String::from_utf8_lossy(&buf[..end]);
+                                let content_length: usize = header_text
                                     .lines()
                                     .find_map(|l| {
                                         let (k, v) = l.split_once(':')?;
