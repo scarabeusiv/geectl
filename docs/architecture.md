@@ -19,7 +19,7 @@ The library modules at scaffolding time:
 | `http` | The HTTP client trait with a bounded timeout, plus a ureq implementation. |
 | `auth` | The credential types and resolution (see below). |
 | `config` | The XDG config file (URLs only) and the secure-write primitive. |
-| `obs` | The OBS operations (devel lookup, open-SR check, SR filing, superseding, branch cleanup — see below). |
+| `obs` | The OBS operations (devel lookup, open-SR check, SR filing, superseding, branch cleanup, request read/act — see below). |
 
 Later modules (Gitea operations, XML→JSON mapping) plug into this
 shape; they do not change it.
@@ -120,12 +120,17 @@ Rules that hold:
 The library surface a tool uses to move a package update through the
 distribution: `ObsClient` (devel-project lookup, devel version, open
 submit-request check, filing, superseding, branch cleanup, branch-project
-and branch-package creation, file upload, and the remote reads listed
-below), `SrPayload`
+and branch-package creation, file upload, the remote reads listed below, and reading and acting on
+requests), `SrPayload`
 (the validated submit-request payload), `SrFiling` (the only filing
 path, dry-run by default; `refile` is the file-then-supersede flow),
 `DryRun` (the would-do guard), and `CveId` (CVE id parsing plus the
 changelog-names-CVE rule).
+Request reading and acting is the typed `Request` model
+(`RequestAction`, `RequestState`, `ReviewState`, `RequestReview`,
+`RequestHistory`, `RequestComment`) with its parser and serializer,
+`RequestSearch` (the search builder over the server's `match=`
+expression), and `ReviewTarget` (who a review is asked of).
 
 Behaviour rules (from the openSUSE packaging guide):
 
@@ -250,15 +255,43 @@ packages that differ, optionally annotated with the open submit
 requests involving each differing package in the new project (which
 needs credentials).
 
+Reading and acting on a request is the same shape as filing it: the
+server is the authority, and the library does not pre-check what the
+server decides. `show_request` reads one request with its history,
+`request_log` reads only the history, `search_requests` runs a
+`RequestSearch` against `/search/request` (ids, projects, packages,
+source/target, creators, who, states, action types, and the history
+flags — the match expression is built in the library's fixed clause order),
+and `request_diff` returns the submit diff, plain or wrapped in the
+request XML. `change_state` moves a request (`accepted`, `declined`,
+`revoked`, `review`, `new`); `accept_request`, `decline_request`,
+and `revoke_request` are the named wrappers, and
+`try_change_state` is the lenient form that reports `false` with one
+warning instead of failing when the server refuses the move, so a
+batch triaging many requests does not stop at the first one that
+cannot move. `add_review` asks a user, group, project, or
+project/package to review (`ReviewTarget` validates the target up
+front: at least one of user, group, project, and a package needs its
+project); `list_comments` and `add_comment` read and write the
+request's comments, with replies threaded under their parent. State
+changes, reviews, and comment creation take the `DryRun` guard, like
+deleting; the reads do not. Accepting is a maintainer action, and the
+boundary is the packaging guide's: an agent accepts its own requests
+unless explicitly authorised, and the server enforces who may move a
+request — the library surfaces its refusal as-is rather than
+pre-checking. The operations are backend-agnostic server calls: a
+request is a server object whether the package is OBS-native or
+git-backed, so there is no git-mode split anywhere in this surface.
+
 Credentials: the public reads (devel project, devel version, file
 and directory reads, meta, link target, project diff) need none; the
 package log, the open-SR search, the package and project search, the
 owner search, and reading a person, plus the filing POST, superseding,
-deleting, creating, and uploading, need OBS Basic and fail loudly
-without them — except the package log, which reads with whatever
-credentials the client carries and fails on the server's 403 instead
-of refusing up front.
-OBS accepts Basic only —
+deleting, creating, and uploading, and every request read and act
+(show, log, search, state change, review, comment, diff) need OBS Basic
+and fail loudly without them — except the package log, which reads
+with whatever credentials the client carries and fails on the server's
+403 instead of refusing up front. OBS accepts Basic only —
 a Bearer token or SSH key is refused at client construction. No
 credential is stored here, and no request carries one over cleartext
 http except to a loopback host (the transport guard in `http.rs`).
@@ -379,7 +412,10 @@ remote state back through the new read operations
 listings, log newest-first with a range, revision patch, meta, search,
 owners, whois, link target, project diff), and file
 real submit requests and assert on the server state they leave behind
-(`tests/temporal_obs.rs`: filing, refile, and accept-time cleanup).
+(`tests/temporal_obs.rs`: filing, refile, and accept-time cleanup,
+plus the request read/act tests — show, log, state changes, reviews,
+comments, diff, and search — which read and change live requests
+through the library and assert on the server state they find).
 
 **Plain HTTP on localhost is the single sanctioned exception to the
 https-only URL rule.** The OBS development frontend serves plain HTTP;

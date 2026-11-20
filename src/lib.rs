@@ -20,8 +20,10 @@
 //! - [`obs`]: the OBS operations a tool uses to move a package update
 //!   through the distribution — devel-project lookup, devel version,
 //!   open-submit-request check, submit-request filing, superseding,
-//!   branch cleanup, branch-project and branch-package creation, and
-//!   file upload, with dry-run as the default.
+//!   branch cleanup, branch-project and branch-package creation,
+//!   file upload, and reading and acting on requests (show, log,
+//!   search, accept/decline/revoke, reviews, comments), with dry-run
+//!   as the default for mutations.
 
 pub mod auth;
 pub mod config;
