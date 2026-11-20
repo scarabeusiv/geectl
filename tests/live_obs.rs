@@ -70,8 +70,8 @@ use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::{
     AggregateOptions, BranchOptions, CopyOptions, CopyProjectOptions, DeleteProjectOptions,
     DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision, ObsClient,
-    PackageDiffStatus, Request, RequestAction, RequestSearch, RequestState, ReviewState,
-    ReviewTarget, RevisionRange, SourceUpdate, SrFiling, SrPayload,
+    PackageDiffStatus, ReleaseOptions, Request, RequestAction, RequestSearch, RequestState,
+    ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling, SrPayload,
 };
 
 /// Whether `url` points at a loopback host.
@@ -2858,6 +2858,37 @@ fn live_undelete_project() {
     );
 }
 
+/// PUT a project `_meta` carrying a repository, so the project can
+/// release from it. The harness writes the meta directly (test
+/// setup, like `set_project_link`); the library operation under test
+/// is `release_*`. `target` is the optional release target
+/// (project, repository) the repository releases to.
+fn set_project_repository(
+    base: &str,
+    project: &str,
+    repository: &str,
+    target: Option<(&str, &str)>,
+) {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let releasetarget = match target {
+        Some((target_project, target_repository)) => format!(
+            "<releasetarget project=\"{target_project}\" repository=\"{target_repository}\" trigger=\"manual\"/>"
+        ),
+        None => String::new(),
+    };
+    let meta = format!(
+        "<project name=\"{project}\"><title>geectl live test project</title><description>Created by the geectl live live test; the instance is destroyed after the run.</description><repository name=\"{repository}\"><arch>x86_64</arch>{releasetarget}</repository></project>"
+    );
+    http.put(
+        &format!("{base}/source/{project}/_meta"),
+        &meta,
+        &live_credentials(),
+    )
+    .expect("PUT the project meta with a repository");
+}
+
 /// The `aggregate_package` operation aggregates a package into a
 /// fresh target package: the `_aggregate` file and the target meta
 /// are read back from the server.
@@ -2975,6 +3006,82 @@ fn live_aggregate_package_refuses_existing() {
     assert_eq!(err.kind(), ErrorKind::InvalidInput);
     let second = read_file(&base, &target_project, &package, "_aggregate");
     assert_eq!(second, first);
+}
+
+/// The `release_package` operation is accepted by the server for a
+/// package with a repository and a release target.
+#[test]
+fn live_release_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, package, _filename, _content) = setup_copy_source(&client);
+    let target_project = format!("geectl-tmp-rel-{}", unique_suffix());
+    client
+        .create_project(
+            &target_project,
+            "geectl live test release target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create release target project on the live instance");
+    // The target project's repository must exist before the
+    // source project's meta names it as a release target.
+    set_project_repository(&base, &target_project, "distro-1-ga", None);
+    set_project_repository(
+        &base,
+        &source_project,
+        "standard",
+        Some((&target_project, "distro-1-ga")),
+    );
+    let options = ReleaseOptions {
+        repository: Some("standard".to_string()),
+        target_project: Some(target_project),
+        target_repository: Some("distro-1-ga".to_string()),
+        ..ReleaseOptions::default()
+    };
+    client
+        .release_package(&source_project, &package, &options, &DryRun::new(false))
+        .expect("release a package on the live instance");
+}
+
+/// The `release_project` operation is accepted by the server for a
+/// project with a repository and a release target.
+#[test]
+fn live_release_project() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, _package, _filename, _content) = setup_copy_source(&client);
+    let target_project = format!("geectl-tmp-rel-{}", unique_suffix());
+    client
+        .create_project(
+            &target_project,
+            "geectl live test release target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create release target project on the live instance");
+    // The target project's repository must exist before the
+    // source project's meta names it as a release target.
+    set_project_repository(&base, &target_project, "distro-1-ga", None);
+    set_project_repository(
+        &base,
+        &source_project,
+        "standard",
+        Some((&target_project, "distro-1-ga")),
+    );
+    let options = ReleaseOptions {
+        repository: Some("standard".to_string()),
+        target_project: Some(target_project),
+        target_repository: Some("distro-1-ga".to_string()),
+        ..ReleaseOptions::default()
+    };
+    client
+        .release_project(&source_project, &options, &DryRun::new(false))
+        .expect("release a project on the live instance");
 }
 
 #[cfg(test)]

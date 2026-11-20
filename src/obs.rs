@@ -838,6 +838,31 @@ pub struct AggregateOptions {
     pub disable_publish: bool,
 }
 
+/// Options for [`ObsClient::release_package`] and
+/// [`ObsClient::release_project`]. All fields are optional: an unset
+/// value means the server's default.
+#[derive(Debug, Clone, Default)]
+pub struct ReleaseOptions {
+    /// Release only binaries from this repository. The server's
+    /// `repository`. Required when `target_project` is set.
+    pub repository: Option<String>,
+    /// Release only binaries for this architecture. The server's
+    /// `arch`.
+    pub architecture: Option<String>,
+    /// Release only to this project. The server's `target_project`.
+    /// Needs `repository` and `target_repository`.
+    pub target_project: Option<String>,
+    /// Release only to this repository in the target project. The
+    /// server's `target_repository`. Needs `target_project`.
+    pub target_repository: Option<String>,
+    /// Rename binaries during the release using this release tag.
+    /// The server's `setrelease`.
+    pub set_release: Option<String>,
+    /// Run the release immediately instead of queueing it as a job.
+    /// The server's `nodelay`.
+    pub no_delay: bool,
+}
+
 /// Options for [`ObsClient::copy_package`]. All fields are optional:
 /// an unset revision means the latest, an unset flag means off.
 #[derive(Debug, Clone, Default)]
@@ -4661,6 +4686,158 @@ impl<'a> ObsClient<'a> {
         }
         Ok(())
     }
+
+    /// Release a package's sources and binaries on OBS (`POST
+    /// /source/<project>/<package>?cmd=release`). Requires
+    /// credentials; without them the call fails loudly before any
+    /// request. In dry-run the release is recorded in the plan and
+    /// nothing is released — the guard runs before the credentials
+    /// check, like `create_package`.
+    ///
+    /// An agent releases a package to transfer its sources and
+    /// binaries to a release target without rebuilding them. The
+    /// release is accepted either way — the server answers `ok` when
+    /// it runs synchronously and `invoked` when it queues the release
+    /// as a job — so the caller polls for the released binaries when
+    /// it needs them, rather than assuming they landed.
+    pub fn release_package(
+        &self,
+        project: &str,
+        package: &str,
+        options: &ReleaseOptions,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        validate_release_options(options)?;
+        if !dry_run.allow(&format!(
+            "release package {project}/{package}{}",
+            release_option_suffix(options),
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot release a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        self.release(
+            &[project, package],
+            options,
+            &format!("release package {project}/{package}"),
+        )
+    }
+
+    /// Release a whole project's sources and binaries on OBS (`POST
+    /// /source/<project>?cmd=release`). Requires credentials; without
+    /// them the call fails loudly before any request. In dry-run the
+    /// release is recorded in the plan and nothing is released — the
+    /// guard runs before the credentials check, like `create_package`.
+    ///
+    /// An agent releases a project to transfer all its packages'
+    /// sources and binaries to a release target without rebuilding
+    /// them. A project release is queued as a job unless `no_delay`
+    /// is set, so the server answers `invoked` — the release lands
+    /// asynchronously, and the caller polls for the released binaries
+    /// when it needs them.
+    pub fn release_project(
+        &self,
+        project: &str,
+        options: &ReleaseOptions,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        validate_release_options(options)?;
+        if !dry_run.allow(&format!(
+            "release project {project}{}",
+            release_option_suffix(options),
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot release a project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        self.release(&[project], options, &format!("release project {project}"))
+    }
+
+    /// The shared release POST for the package and project forms.
+    /// `path` is the source path segments, `what` names the release
+    /// in errors.
+    fn release(
+        &self,
+        path: &[&str],
+        options: &ReleaseOptions,
+        what: &str,
+    ) -> Result<(), GeectlError> {
+        let mut query: Vec<(&str, &str)> = vec![("cmd", "release")];
+        if let Some(repository) = &options.repository {
+            query.push(("repository", repository));
+        }
+        if let Some(architecture) = &options.architecture {
+            query.push(("arch", architecture));
+        }
+        if let Some(target_project) = &options.target_project {
+            query.push(("target_project", target_project));
+        }
+        if let Some(target_repository) = &options.target_repository {
+            query.push(("target_repository", target_repository));
+        }
+        if let Some(set_release) = &options.set_release {
+            query.push(("setrelease", set_release));
+        }
+        if options.no_delay {
+            query.push(("nodelay", "1"));
+        }
+        let mut segments = vec!["source"];
+        segments.extend_from_slice(path);
+        let url = build_url(&self.base, &segments, &query);
+        let body = self.http.post(&url, "", &self.credentials)?;
+        if parse_status_ok(&body) || parse_status_invoked(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS release response for {what}"),
+            ))
+        }
+    }
+}
+
+/// Releasing to an explicit target needs one source repository and
+/// one target repository to be unambiguous, and a target repository
+/// needs its target project: refuse the ambiguous combination
+/// client-side instead of failing on the server.
+fn validate_release_options(options: &ReleaseOptions) -> Result<(), GeectlError> {
+    if options.target_repository.is_some() && options.target_project.is_none() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "releasing to a target repository needs a target project",
+        ));
+    }
+    if options.target_project.is_some()
+        && (options.repository.is_none() || options.target_repository.is_none())
+    {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "releasing to a target project needs a repository and a target repository",
+        ));
+    }
+    Ok(())
 }
 
 /// The option suffix for an aggregate plan line: the set options, in
@@ -4689,6 +4866,37 @@ fn aggregate_option_suffix(options: &AggregateOptions) -> String {
         String::new()
     } else {
         format!(" ({})", flags.join(", "))
+    }
+}
+
+/// The option suffix for a release plan line: the set options, so a
+/// dry-run plan reads what the release would have done.
+fn release_option_suffix(options: &ReleaseOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(repository) = &options.repository {
+        parts.push(format!("repository {repository}"));
+    }
+    if let Some(architecture) = &options.architecture {
+        parts.push(format!("architecture {architecture}"));
+    }
+    if let Some(target_project) = &options.target_project {
+        match &options.target_repository {
+            Some(target_repository) => {
+                parts.push(format!("to {target_project}/{target_repository}"));
+            }
+            None => parts.push(format!("to {target_project}")),
+        }
+    }
+    if let Some(set_release) = &options.set_release {
+        parts.push(format!("release tag {set_release}"));
+    }
+    if options.no_delay {
+        parts.push("no delay".to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
     }
 }
 
@@ -13960,6 +14168,252 @@ mod tests {
             )
             .is_err());
         assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn release_package_posts_with_all_options_and_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=release&repository=standard&arch=x86_64&target_project=test%3Arelease&target_repository=distro-1-ga&setrelease=1&nodelay=1",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = ReleaseOptions {
+            repository: Some("standard".to_string()),
+            architecture: Some("x86_64".to_string()),
+            target_project: Some("test:release".to_string()),
+            target_repository: Some("distro-1-ga".to_string()),
+            set_release: Some("1".to_string()),
+            no_delay: true,
+        };
+        assert!(client
+            .release_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn release_package_invoked_is_acceptance() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=release",
+            "<status code=\"invoked\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .release_package(
+                "test:factory",
+                "test-pkgA",
+                &ReleaseOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn release_package_other_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=release",
+            "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .release_package(
+                "test:factory",
+                "test-pkgA",
+                &ReleaseOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn release_package_target_project_needs_repository_and_target_repository() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let no_repository = ReleaseOptions {
+            target_project: Some("test:release".to_string()),
+            target_repository: Some("distro-1-ga".to_string()),
+            ..ReleaseOptions::default()
+        };
+        assert!(client
+            .release_package(
+                "test:factory",
+                "test-pkgA",
+                &no_repository,
+                &DryRun::new(false),
+            )
+            .is_err());
+        let no_target_repository = ReleaseOptions {
+            repository: Some("standard".to_string()),
+            target_project: Some("test:release".to_string()),
+            ..ReleaseOptions::default()
+        };
+        assert!(client
+            .release_package(
+                "test:factory",
+                "test-pkgA",
+                &no_target_repository,
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn release_package_target_repository_needs_a_target_project() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = ReleaseOptions {
+            repository: Some("standard".to_string()),
+            target_repository: Some("distro-1-ga".to_string()),
+            ..ReleaseOptions::default()
+        };
+        assert!(client
+            .release_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn release_package_dry_run_records_plan_and_releases_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = ReleaseOptions {
+            repository: Some("standard".to_string()),
+            target_project: Some("test:release".to_string()),
+            target_repository: Some("distro-1-ga".to_string()),
+            no_delay: true,
+            ..ReleaseOptions::default()
+        };
+        assert!(client
+            .release_package("test:factory", "test-pkgA", &options, &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: release package test:factory/test-pkgA (repository standard, to test:release/distro-1-ga, no delay)".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn release_package_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=release",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .release_package(
+                "test:factory",
+                "test-pkgA",
+                &ReleaseOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn release_package_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .release_package(
+                "test:factory",
+                "test-pkgA/pkg",
+                &ReleaseOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn release_project_posts_the_command_and_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=release&repository=standard&target_project=test%3Arelease&target_repository=distro-1-ga",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = ReleaseOptions {
+            repository: Some("standard".to_string()),
+            target_project: Some("test:release".to_string()),
+            target_repository: Some("distro-1-ga".to_string()),
+            ..ReleaseOptions::default()
+        };
+        assert!(client
+            .release_project("test:factory", &options, &DryRun::new(false))
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn release_project_invoked_is_acceptance() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=release",
+            "<status code=\"invoked\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .release_project(
+                "test:factory",
+                &ReleaseOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn release_project_dry_run_records_plan_and_releases_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .release_project("test:factory", &ReleaseOptions::default(), &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: release project test:factory".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn release_project_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=release",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .release_project(
+                "test:factory",
+                &ReleaseOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn release_project_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .release_project(
+                "test:factory/pkg",
+                &ReleaseOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]
