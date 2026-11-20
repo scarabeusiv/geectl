@@ -17,9 +17,14 @@
 //!   credentials are stored anywhere here.
 //! - [`config`]: the XDG config file (endpoint URLs only, never
 //!   credentials) and the secure-write primitive.
+//! - [`obs`]: the OBS operations a tool uses to move a package update
+//!   through the distribution — devel-project lookup, devel version,
+//!   open-submit-request check, submit-request filing, superseding,
+//!   and branch cleanup, with dry-run as the default.
 
 pub mod auth;
 pub mod config;
 pub mod error;
 pub mod http;
+pub mod obs;
 pub mod url;

@@ -19,9 +19,10 @@ The library modules at scaffolding time:
 | `http` | The HTTP client trait with a bounded timeout, plus a ureq implementation. |
 | `auth` | The credential types and resolution (see below). |
 | `config` | The XDG config file (URLs only) and the secure-write primitive. |
+| `obs` | The OBS operations (devel lookup, open-SR check, SR filing, superseding, branch cleanup — see below). |
 
-Later modules (OBS operations, Gitea operations, XML→JSON mapping) plug
-into this shape; they do not change it.
+Later modules (Gitea operations, XML→JSON mapping) plug into this
+shape; they do not change it.
 
 ## The error store (`src/error.rs`)
 
@@ -48,7 +49,6 @@ Rules:
 ## The URL builder (`src/url.rs`)
 
 There is exactly one place that builds URLs, and one encoder per context:
-
 - Path segments are encoded with an empty safe set except `:` (the OBS
   `project:package` separator). `/` is always encoded, never passed
   through, and segments are never stripped or trimmed — a segment
@@ -114,6 +114,119 @@ Rules that hold:
   created with mode 0600 from the first byte.
 - TLS verification is always on. There is no option to disable it, and
   no "continue anyways".
+
+## OBS operations (`src/obs.rs`)
+
+The library surface a tool uses to move a package update through the
+distribution: `ObsClient` (devel-project lookup, devel version, open
+submit-request check, filing, superseding, branch cleanup), `SrPayload`
+(the validated submit-request payload), `SrFiling` (the only filing
+path, dry-run by default; `refile` is the file-then-supersede flow),
+`DryRun` (the would-do guard), and `CveId` (CVE id parsing plus the
+changelog-names-CVE rule).
+
+Behaviour rules (from the openSUSE packaging guide):
+
+- A submit request targets the DEVEL project, never Factory directly.
+  A payload naming `openSUSE:Factory` as its target is refused at
+  build time.
+- An open submit request for the package must be checked before filing
+  (dedup). `SrFiling::file` performs that check itself in live mode
+  and refuses to file a duplicate; the check is also available on its
+  own as `ObsClient::has_open_sr`.
+- The SR description follows the guide's message format: one headline
+  of at most 160 characters of prose, then `- ` lines for staging,
+  needs, and rebuilds. The library validates the description is
+  non-empty; the headline shape is the caller's responsibility.
+- A security fix's `.changes` entry must name every CVE it fixes.
+  When the caller supplies CVE ids, `SrPayload::new` refuses a
+  `.changes` entry that does not name each of them.
+- A failed lookup must never read as good news: a lookup that errors
+  (transport, auth, unexpected response) returns an error, never a
+  silent "not found" or "no open SR". Only a successful response that
+  carries no result reads as "none" / "false".
+
+The full lifecycle is file -> supersede -> delete branch, and the
+branch dies by default: every payload carries
+`opt_sourceupdate="cleanup"`, so the new branch is deleted when its
+request is accepted. `SrFiling::refile` files the new request first
+and only then supersedes the old one with it, so `superseded_by`
+always names a request that exists. Branch deletion
+(`ObsClient::delete_package`) is a separate explicit call for the
+old branch — a superseded request never reaches accept, so the
+server-side cleanup never runs for it — and the delete refuses
+while requests in `new`, `review`, or `declined` state involve the
+package as a submit source or target.
+
+The supersede and delete semantics are validated against the OBS API
+server code, not copied from osc — osc's flow is a reference to check
+against, not ground truth. Where osc and the API disagree, the API
+wins:
+
+- `superseded_by` is required by the server (a supersede without it
+  is refused); the library always sends it.
+- Superseding is allowed from `new`, `review`, and `declined`, and
+  refused from any final state (`accepted`, `superseded`, `revoked`).
+  The library does not pre-check the old request's state; the server
+  stays the authority and its 403 is surfaced as-is.
+- The server does not verify that `superseded_by` names a real
+  request, so the file-first ordering in `refile` is what makes the
+  link real.
+- A package delete does not fail on open requests: the API revokes
+  them as source and declines them as target. The library refuses the
+  delete instead, naming the blocking requests, so a branch deletion
+  can never silently kill a live submit request. `force` bypasses the
+  guard and is forwarded as `force=1`, which also bypasses the
+  server's weak-dependency guard (refuse when other packages use this
+  one as their devel package) — osc's `force` semantics.
+- If superseding fails after the new request is filed, `refile`
+  returns an error naming the new id. That is a deliberate divergence
+  from osc, which supersedes with `can_fail=True` and only warns: a
+  half-done refile passing silently is a failed refile that reads as
+  a success.
+
+Branch cleanup is the default: every payload carries
+`opt_sourceupdate="cleanup"` (what `osc sr --cleanup` sets), so OBS
+deletes the source branch when the request is accepted — and the
+source project with it, when that was its last package and it is not
+a top-level `home:<user>` project. The packaging guide requires it
+for filings from a `home:` subproject; pr-guard refuses the SR
+without it. The values and the accept behaviour are validated
+against the OBS API server code (`BsRequestAction` accepts only
+`update`, `noupdate`, `cleanup`; `BsRequestActionSubmit` deletes
+the source package on accept when the value is `cleanup`). The
+server also defaults to cleanup itself when no value is given and
+the source is the filer's branch project for the target, but the
+library sends the value explicitly: the server default only covers
+branch projects, and the explicit value is what pr-guard checks.
+A forward from a devel project must NOT carry cleanup — accept
+would delete the devel package — so that case opts out with
+`SrPayload::without_cleanup`, which sends `update` instead.
+`ObsClient::delete_package` remains the manual cleanup for the
+branches the server-side cleanup never reaches: a superseded
+request's branch and a declined request's branch.
+
+Credentials: the public reads (devel project, devel version) need
+none; the open-SR search, the filing POST, superseding, and deleting
+need OBS Basic and fail loudly without them. OBS accepts Basic only —
+a Bearer token or SSH key is refused at client construction. No
+credential is stored here, and no request carries one over cleartext
+http except to a loopback host (the transport guard in `http.rs`).
+
+Dry-run is the default (`DryRun::default()` files nothing): every
+mutating operation goes through the single guard (`DryRun::allow`)
+before any write or API call. Reads are not gated. The live executor
+that actually branches, bumps, cleans, builds, and runs the package
+gates is NOT part of this module: the library builds and files the
+submit-request payload; the caller owns the package work.
+
+The OBS API base is `https://api.opensuse.org` by default. A custom
+base is accepted for a test instance (`ObsClient::with_base`): it must
+be `https://` with a host, or `http://` on a loopback host. URLs are
+built with the encoders from `url.rs` (one encoder per context); the
+base itself is carried as a string because the URL builder rightly
+rejects `http://` bases, and the test instance is plain http on
+loopback.
 
 ## Output contract
 
