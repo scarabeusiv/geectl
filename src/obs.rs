@@ -1083,6 +1083,71 @@ impl<'a> ObsClient<'a> {
         ))
     }
 
+    /// Read submit request `id` (`GET /request/:id`): what it does,
+    /// the state it is in, its reviews, and its history. An agent
+    /// reads a request before acting on it — to see what it changes,
+    /// who filed it, what state it is in, and what has already been
+    /// said about it — and after acting on it, to confirm the state
+    /// it landed in. Requires credentials; without them the call
+    /// fails loudly before any request. A request that does not exist
+    /// reads as `NotFound`, and a document the parser does not
+    /// recognise in full is a server error, never a partial request.
+    ///
+    /// The read asks for the history with the request
+    /// (`withhistory=1`): the creation entry and the state changes
+    /// are part of reading a request, not a separate operation — the
+    /// separate operation ([`ObsClient::request_log`]) is for when
+    /// the history alone is what the caller wants.
+    ///
+    /// The operation is the same whether the request's packages are
+    /// OBS-native or git-backed: a request is a server object, and
+    /// its actions name projects and packages without saying how
+    /// their sources are stored, so nothing here branches on the
+    /// backend.
+    pub fn show_request(&self, id: &str) -> Result<Request, GeectlError> {
+        self.fetch_request(id)
+    }
+
+    /// Read one request's history (`GET /request/:id` with
+    /// `withhistory=1`, returning only the history entries): the
+    /// creation entry first, then each state change in order, with
+    /// who made it, when, and what it was. An agent reads the log to
+    /// audit what happened to a request — who declined it and why,
+    /// when it was superseded — without pulling the whole request.
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. The history the server sends with
+    /// `withhistory` is the request history (creation plus state
+    /// changes); review history is not included, by the server's own
+    /// choice.
+    pub fn request_log(&self, id: &str) -> Result<Vec<RequestHistory>, GeectlError> {
+        Ok(self.fetch_request(id)?.history)
+    }
+
+    /// The shared read behind [`ObsClient::show_request`] and
+    /// [`ObsClient::request_log`]: fetch the request document with
+    /// its history and parse it in full.
+    fn fetch_request(&self, id: &str) -> Result<Request, GeectlError> {
+        let id = validate_request_id(id)?;
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot read a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["request", &id.to_string()],
+            &[("withhistory", "1")],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_request(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS request response for submit request {id}"),
+            )
+        })
+    }
+
     /// Delete `project`/`package` from OBS (`DELETE
     /// /source/<project>/<package>`): the manual branch cleanup.
     /// Requests filed through this library clean up on accept by
@@ -10780,5 +10845,83 @@ description</description>
         let search = search_without_states().types(vec!["explode".to_string()]);
         let err = search.match_expr().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    // -- Request read: show / log / search.
+
+    #[test]
+    fn show_request_reads_a_request_with_its_history() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/request/42?withhistory=1",
+            REQUEST1_XML,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let request = obs.show_request("42").expect("show reads the request");
+        assert_eq!(request.id, 42);
+        assert_eq!(request.state.name, RequestState::Accepted);
+        assert_eq!(request.actions.len(), 2);
+        assert_eq!(request.history.len(), 1);
+        assert_eq!(request.history[0].comment, "foobar");
+        let calls = http.get_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0,
+            "https://api.opensuse.org/request/42?withhistory=1"
+        );
+        assert!(calls[0].1, "the read is credentialed");
+    }
+
+    #[test]
+    fn show_request_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let err = obs.show_request("42").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn show_request_invalid_id_without_http() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(obs.show_request("0").is_err());
+        assert!(obs.show_request("not-an-id").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn show_request_malformed_response_is_error() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/request/42?withhistory=1",
+            "<request this is not xml",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = obs.show_request("42").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn show_request_not_found_maps_to_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/request/42?withhistory=1",
+            ErrorKind::NotFound,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = obs.show_request("42").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn request_log_returns_only_the_history() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/request/42?withhistory=1",
+            REQUEST1_XML,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let log = obs.request_log("42").expect("log reads the history");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].description, "Create Request");
+        assert_eq!(log[0].comment, "foobar");
+        assert_eq!(log[0].who, "creator");
     }
 }
