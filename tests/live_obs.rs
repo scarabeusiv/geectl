@@ -70,12 +70,12 @@ use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{sanitize_url_for_error, HttpClient, Timeout, UreqClient};
 use geectl::obs::{
-    AggregateOptions, BranchOptions, ChangeDevelPayload, CopyOptions, CopyProjectOptions,
-    CreatePackageOptions, DeletePayload, DeleteProjectOptions, DeleteTarget, DryRun,
-    FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision, MaintenanceBranchOptions,
+    AggregateOptions, BranchOptions, BuildLogQuery, ChangeDevelPayload, CopyOptions,
+    CopyProjectOptions, CreatePackageOptions, DeletePayload, DeleteProjectOptions, DeleteTarget,
+    DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision, MaintenanceBranchOptions,
     MaintenanceIncidentPayload, ObsClient, PackageDiffStatus, ReleaseOptions, Request,
-    RequestAction, RequestSearch, RequestState, ReviewState, ReviewTarget, RevisionRange,
-    SourceUpdate, SrFiling, SrPayload,
+    RequestAction, RequestSearch, RequestState, ResultsQuery, ReviewState, ReviewTarget,
+    RevisionRange, SourceUpdate, SrFiling, SrPayload,
 };
 
 /// Whether `url` points at a loopback host.
@@ -3910,6 +3910,104 @@ fn live_change_devel_accept_sets_devel_on_server() {
     );
 }
 
+/// Give `project` a single repository `repo` / `arch` whose path
+/// points at `path_project` / `path_repo` (see
+/// [`project_meta_with_repo`]).
+fn add_repository(
+    base: &str,
+    project: &str,
+    repo: &str,
+    arch: &str,
+    path_project: &str,
+    path_repo: &str,
+) {
+    set_project_meta(
+        base,
+        project,
+        &project_meta_with_repo(project, repo, arch, path_project, path_repo),
+    );
+}
+
+/// Create a uniquely-named empty project with a single `standard`
+/// repository and no path, for use as a repository path target (see
+/// [`project_meta_with_repo`]). The target's repository has no
+/// packages, so anything building against it finds nothing to
+/// resolve.
+fn create_path_target(client: &ObsClient<'_>, base: &str) -> String {
+    let target = format!("geectl-tmp-path-{}", unique_suffix());
+    client
+        .create_project(
+            &target,
+            "geectl live test path target",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create path target project on the live instance");
+    set_project_meta(
+        base,
+        &target,
+        &project_meta_with_bare_repo(&target, "standard", "x86_64"),
+    );
+    target
+}
+
+/// The binaries for a package that was never built: no files to
+/// list, and neither a download nor a fileinfo exists.
+#[test]
+fn live_binaries_empty_for_a_never_built_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let path_target = create_path_target(&client, &base);
+    add_repository(
+        &base,
+        &source_project,
+        "standard",
+        "x86_64",
+        &path_target,
+        "standard",
+    );
+    assert!(
+        client
+            .list_binaries(&source_project, Some(&package), "standard", "x86_64")
+            .expect("binary list on the live instance")
+            .is_empty(),
+        "a package that was never built has no binaries"
+    );
+    let err = client
+        .download_binary(
+            &source_project,
+            &package,
+            "standard",
+            "x86_64",
+            "nosuch-1.0-1.x86_64.rpm",
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "downloading a binary that was never built must 404"
+    );
+    let err = client
+        .fileinfo(
+            &source_project,
+            &package,
+            "standard",
+            "x86_64",
+            "nosuch-1.0-1.x86_64.rpm",
+            false,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "fileinfo for a binary that was never built must 404"
+    );
+}
+
 /// Accepting a delete request deletes the target package.
 #[test]
 fn live_delete_accept_deletes_package_on_server() {
@@ -4419,4 +4517,402 @@ fn upload_spec(client: &ObsClient<'_>, project: &str, package: &str) {
             &DryRun::new(false),
         )
         .expect("upload a spec file to the live instance");
+}
+
+/// The build and job histories for a package that was never built:
+/// both empty.
+#[test]
+fn live_build_history_empty_for_a_never_built_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let path_target = create_path_target(&client, &base);
+    add_repository(
+        &base,
+        &source_project,
+        "standard",
+        "x86_64",
+        &path_target,
+        "standard",
+    );
+    assert!(
+        client
+            .build_history(&source_project, &package, "standard", "x86_64", None)
+            .expect("build history on the live instance")
+            .is_empty(),
+        "a package that was never built has no build history"
+    );
+    assert!(
+        client
+            .job_history(
+                &source_project,
+                "standard",
+                "x86_64",
+                Some(&package),
+                None,
+                None
+            )
+            .expect("job history on the live instance")
+            .is_empty(),
+        "a repository that never built has no job history"
+    );
+}
+
+/// The log, the status, and the job status for a package that was
+/// never built: no log, no status, and no running job.
+#[test]
+fn live_build_log_and_status_none_for_a_never_built_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let path_target = create_path_target(&client, &base);
+    add_repository(
+        &base,
+        &source_project,
+        "standard",
+        "x86_64",
+        &path_target,
+        "standard",
+    );
+    assert_eq!(
+        client
+            .build_log(
+                &source_project,
+                &package,
+                "standard",
+                "x86_64",
+                &BuildLogQuery::default()
+            )
+            .expect("build log on the live instance"),
+        None,
+        "a package that was never built has no log"
+    );
+    assert_eq!(
+        client
+            .build_status(&source_project, &package, "standard", "x86_64")
+            .expect("build status on the live instance"),
+        None,
+        "a package that was never built has no status"
+    );
+    assert_eq!(
+        client
+            .job_status(&source_project, &package, "standard", "x86_64")
+            .expect("job status on the live instance"),
+        None,
+        "no job runs for a package that was never built"
+    );
+}
+
+/// Build results on the server: a fresh project has no repositories,
+/// so the matrix is empty and the wait settles at once; once a
+/// repository exists, the scheduler reports it.
+#[test]
+fn live_build_results_empty_then_scheduler_reports_the_repo() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    // A fresh project has no repositories: the matrix is empty.
+    let results = client
+        .results(&source_project, &ResultsQuery::default())
+        .expect("results for a fresh project");
+    assert!(
+        results.results.is_empty(),
+        "a project with no repositories must have an empty results matrix"
+    );
+    // The wait settles at once on an empty matrix: nothing is
+    // building, nothing is dirty.
+    let waited = client
+        .wait_for_results(
+            &source_project,
+            &ResultsQuery::default(),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("wait on a fresh project");
+    assert!(waited.results.is_empty());
+    // Give the project a repository whose path points at an
+    // empty repository: the scheduler reports the cell, but the
+    // report arrives through the backend, so poll for it.
+    let path_target = create_path_target(&client, &base);
+    add_repository(
+        &base,
+        &source_project,
+        "standard",
+        "x86_64",
+        &path_target,
+        "standard",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let results = loop {
+        let results = client
+            .results(&source_project, &ResultsQuery::default())
+            .expect("results while polling for the repository");
+        if !results.results.is_empty() {
+            break results;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("no build result for {source_project}/standard/x86_64 after 60s");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    };
+    assert_eq!(results.results.len(), 1);
+    let cell = &results.results[0];
+    assert_eq!(cell.project, source_project);
+    assert_eq!(cell.repository, "standard");
+    assert_eq!(cell.arch, "x86_64");
+    assert!(
+        !cell.code.is_empty(),
+        "the scheduler must report a state for the repository"
+    );
+}
+
+/// Buildinfo on the server: a spec whose BuildRequires names a
+/// package that does not exist surfaces as an unresolvable error.
+/// The buildinfo is computed on demand, so poll until the error
+/// appears (the backend reads the fresh meta and spec directly).
+/// The project config must define the build type (`Type: spec`):
+/// without it the backend errors before dependency expansion.
+#[test]
+fn live_buildinfo_reports_the_unresolvable_dependency() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let spec = format!(
+        "Name:           {package}\nVersion:        1.0\nRelease:        0\nSummary:        geectl live test package\nLicense:        MIT\nBuildRequires:  DOES-NOT-EXIST\n\n%description\ngeectl live test package.\n\n%prep\n%build\n%install\n"
+    );
+    client
+        .upload_file(
+            &source_project,
+            &package,
+            &format!("{package}.spec"),
+            &spec,
+            &DryRun::new(false),
+        )
+        .expect("upload a spec file to the live instance");
+    // The repository builds against an empty repository: its
+    // published state is empty, so nothing the spec requires can
+    // resolve.
+    let path_target = create_path_target(&client, &base);
+    add_repository(
+        &base,
+        &source_project,
+        "standard",
+        "x86_64",
+        &path_target,
+        "standard",
+    );
+    // The build type comes from the project config, not the spec:
+    // without it the backend reports "no build type defined or
+    // detected" instead of expanding the dependencies.
+    set_project_config(&base, &source_project, "Type: spec\n");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let info = loop {
+        match client.buildinfo(&source_project, &package, "standard", "x86_64") {
+            Ok(info) if info.error.is_some() => break info,
+            Ok(info) => {
+                if std::time::Instant::now() > deadline {
+                    panic!(
+                        "buildinfo for {package} never reported an error; last buildinfo: {info:?}"
+                    );
+                }
+            }
+            Err(err) => {
+                if std::time::Instant::now() > deadline {
+                    panic!("buildinfo for {package} kept failing: {err}");
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    };
+    let error = info.error.expect("the polled buildinfo carries an error");
+    assert!(
+        error.contains("unresolvable"),
+        "buildinfo must name the unresolvable dependency; got: {error}"
+    );
+}
+
+/// The constraint check on the server: the live instance
+/// ships no build worker by design (see
+/// tests/live/docker-compose.yml), so no worker satisfies the
+/// constraints. The empty result is an environment property, not a
+/// property of the check: on an instance with a worker this test
+/// would fail.
+#[test]
+fn live_check_constraints_reports_no_workers() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let path_target = create_path_target(&client, &base);
+    add_repository(
+        &base,
+        &source_project,
+        "standard",
+        "x86_64",
+        &path_target,
+        "standard",
+    );
+    let workers = client
+        .check_constraints(&source_project, &package, "standard", "x86_64", None)
+        .expect("constraint check on the live instance");
+    assert!(
+        workers.is_empty(),
+        "an instance with no workers must report no matching workers"
+    );
+}
+
+/// The dependency info for a fresh repository: no packages have
+/// recorded dependencies, in either direction.
+#[test]
+fn live_dependson_empty_for_a_fresh_repository() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let path_target = create_path_target(&client, &base);
+    add_repository(
+        &base,
+        &source_project,
+        "standard",
+        "x86_64",
+        &path_target,
+        "standard",
+    );
+    assert!(
+        client
+            .dependson(&source_project, "standard", "x86_64", None)
+            .expect("dependson on the live instance")
+            .is_empty(),
+        "a fresh repository has no recorded build dependencies"
+    );
+    assert!(
+        client
+            .whatdependson(&source_project, "standard", "x86_64", &package)
+            .expect("whatdependson on the live instance")
+            .is_empty(),
+        "nothing in a fresh repository depends on the package"
+    );
+}
+
+/// The repository list on the server, read as a public read: a fresh
+/// project has none, and the added repository reads back with its
+/// name, architectures, and path.
+#[test]
+fn live_list_repositories_reads_back_the_added_repo() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    // The repository list is a public read: no credentials.
+    let client = live_client(&base);
+    assert!(
+        client
+            .list_repositories(&source_project)
+            .expect("repository list on the live instance")
+            .is_empty(),
+        "a fresh project has no repositories"
+    );
+    let path_target = create_path_target(&authed, &base);
+    add_repository(
+        &base,
+        &source_project,
+        "standard",
+        "x86_64",
+        &path_target,
+        "standard",
+    );
+    let repos = client
+        .list_repositories(&source_project)
+        .expect("repository list after adding a repository");
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].name, "standard");
+    assert_eq!(repos[0].arch, vec!["x86_64".to_string()]);
+    assert_eq!(repos[0].paths.len(), 1);
+    assert_eq!(repos[0].paths[0].0, path_target);
+    assert_eq!(repos[0].paths[0].1, "standard");
+}
+
+/// A project meta document for `project` with a single repository
+/// `repo` / `arch` and no path: it builds against nothing.
+fn project_meta_with_bare_repo(project: &str, repo: &str, arch: &str) -> String {
+    format!(
+        "<project name=\"{project}\"><title>geectl live test project</title><description>Created by the geectl live live test; the instance is destroyed after the run.</description><repository name=\"{repo}\"><arch>{arch}</arch></repository></project>"
+    )
+}
+
+/// A project meta document for `project` with a single repository
+/// `repo` / `arch` whose path points at `path_project` /
+/// `path_repo`. The path's project and repository must exist on the
+/// instance — the API rejects an unknown path project with 404, and
+/// an unknown path repository (or a path to the repository itself)
+/// with 400 — so the target is a separate project created for the
+/// test (see [`create_path_target`]).
+fn project_meta_with_repo(
+    project: &str,
+    repo: &str,
+    arch: &str,
+    path_project: &str,
+    path_repo: &str,
+) -> String {
+    format!(
+        "<project name=\"{project}\"><title>geectl live test project</title><description>Created by the geectl live live test; the instance is destroyed after the run.</description><repository name=\"{repo}\"><arch>{arch}</arch><path project=\"{path_project}\" repository=\"{path_repo}\"/></repository></project>"
+    )
+}
+
+/// PUT a project config (`_config`, the prjconf) for `project` on
+/// the live instance.
+fn set_project_config(base: &str, project: &str, config: &str) {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let body = http
+        .put(
+            &format!("{base}/source/{project}/_config"),
+            config,
+            &live_credentials(),
+        )
+        .expect("PUT the project config on the live instance");
+    assert!(
+        response_is_status_ok(&body),
+        "PUT project config for {project} did not return <status code=\"ok\"/>; body: {body}"
+    );
+}
+
+/// Replace the project meta of `project` on the live instance
+/// (PUT /source/<project>/_meta with the admin credentials). The
+/// library has no repository-add operation (a mutation, outside this
+/// batch's reads-only scope), so the harness writes the meta
+/// directly, the same way it POSTs the accept `changestate`.
+fn set_project_meta(base: &str, project: &str, meta: &str) {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let body = http
+        .put(
+            &format!("{base}/source/{project}/_meta"),
+            meta,
+            &live_credentials(),
+        )
+        .expect("PUT the project meta on the live instance");
+    assert!(
+        response_is_status_ok(&body),
+        "PUT project meta for {project} did not return <status code=\"ok\"/>; body: {body}"
+    );
 }
