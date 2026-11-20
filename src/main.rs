@@ -7,6 +7,8 @@
 //! one exit path: the error kind's exit code.
 
 use clap::{Parser, Subcommand, ValueEnum};
+use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
+use geectl::config;
 use geectl::error::{ErrorKind, GeectlError};
 use serde_json::json;
 use std::io::Write;
@@ -40,24 +42,159 @@ struct Cli {
 enum Command {
     /// Print version information as the result payload.
     Version,
+    /// Inspect or initialise the config file.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+/// The `config` subcommands.
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Show the effective config: endpoint URLs with their source,
+    /// and credential status (never a secret value).
+    Show,
+    /// Write the config template (endpoints only). Refuses if the
+    /// file already exists.
+    Init,
 }
 
 fn run(cli: Cli) -> Result<String, GeectlError> {
-    let payload = match cli.command {
-        Some(Command::Version) | None => json!({
-            "name": "geectl",
-            "version": env!("CARGO_PKG_VERSION"),
-        }),
+    let (payload, text) = match cli.command {
+        Some(Command::Version) | None => {
+            let payload = json!({
+                "name": "geectl",
+                "version": env!("CARGO_PKG_VERSION"),
+            });
+            let text = format!("geectl {}", env!("CARGO_PKG_VERSION"));
+            (payload, text)
+        }
+        Some(Command::Config { command }) => match command {
+            ConfigCommand::Show => {
+                let payload = config_show_payload()?;
+                let text = render_config_show_text(&payload);
+                (payload, text)
+            }
+            ConfigCommand::Init => {
+                let payload = config_init_payload()?;
+                let text = render_config_init_text(&payload);
+                (payload, text)
+            }
+        },
     };
     Ok(match cli.format {
         Format::Json => payload.to_string(),
-        Format::Text => format!(
-            "geectl {}",
-            payload["version"]
-                .as_str()
-                .unwrap_or(env!("CARGO_PKG_VERSION"))
-        ),
+        Format::Text => text,
     })
+}
+
+/// The `config show` payload: the effective endpoint URLs with the
+/// source of each value (environment / config / default), and the
+/// credential status for each provider. A status is never a secret:
+/// Basic auth shows the username only, Bearer shows "configured"
+/// only, and an SSH key shows its path.
+fn config_show_payload() -> Result<serde_json::Value, GeectlError> {
+    // The config path is resolved once and passed to the load: a
+    // second `config_path()` call here could diverge from the one
+    // inside `load_config()` if the environment changed in between.
+    // The URL sources come from `effective_config` itself — they are
+    // computed with the values, not re-derived by re-reading the
+    // environment.
+    let path = config::config_path()?;
+    let file_config = config::load_config_at(&path)?;
+    let effective = config::effective_config(&file_config)?;
+    Ok(json!({
+        "config_file": path.to_string_lossy(),
+        "obs_url": effective.config.obs_url,
+        "obs_url_source": effective.obs_url_source,
+        "gitea_url": effective.config.gitea_url,
+        "gitea_url_source": effective.gitea_url_source,
+        "obs_auth": auth_status(&EnvObsAuth),
+        "gitea_auth": auth_status(&EnvGiteaAuth),
+        "gitea_ssh_key": auth_status(&GiteaSshKey),
+    }))
+}
+
+/// The credential status as JSON: `{"status": "configured"}` plus,
+/// for Basic auth, the username (never the password); for an SSH key,
+/// the path; for a misconfiguration, `{"status": "error", "message":
+/// ...}` naming the variable, never the value.
+fn auth_status(provider: &dyn AuthProvider) -> serde_json::Value {
+    match provider.credentials() {
+        Ok(Credentials::None) => json!({"status": "not_configured"}),
+        Ok(Credentials::Basic { username, .. }) => {
+            json!({"status": "configured", "username": username})
+        }
+        Ok(Credentials::Bearer { .. }) => json!({"status": "configured"}),
+        Ok(Credentials::SshKey { path }) => {
+            json!({"status": "configured", "path": path.to_string_lossy()})
+        }
+        Err(e) => json!({
+            "status": "error",
+            "code": e.kind().code(),
+            "message": e.context,
+            "remediation": e.kind().remediation(),
+        }),
+    }
+}
+
+/// The `config init` payload: the path created. The file itself is
+/// written by `write_config_template`, which refuses to overwrite.
+fn config_init_payload() -> Result<serde_json::Value, GeectlError> {
+    let path = config::config_path()?;
+    config::write_config_template(&path)?;
+    Ok(json!({
+        "config_file": path.to_string_lossy(),
+        "created": true,
+        "note": "Edit the endpoint URLs as needed. Credentials are never stored here — use the GEECTL_* environment variables.",
+    }))
+}
+
+fn render_config_show_text(payload: &serde_json::Value) -> String {
+    [
+        format!(
+            "config file: {}",
+            payload["config_file"].as_str().unwrap_or("")
+        ),
+        format!(
+            "obs_url: {} ({})",
+            payload["obs_url"].as_str().unwrap_or(""),
+            payload["obs_url_source"].as_str().unwrap_or("")
+        ),
+        format!(
+            "gitea_url: {} ({})",
+            payload["gitea_url"].as_str().unwrap_or(""),
+            payload["gitea_url_source"].as_str().unwrap_or("")
+        ),
+        format!("obs_auth: {}", render_auth_text(&payload["obs_auth"])),
+        format!("gitea_auth: {}", render_auth_text(&payload["gitea_auth"])),
+        format!(
+            "gitea_ssh_key: {}",
+            render_auth_text(&payload["gitea_ssh_key"])
+        ),
+    ]
+    .join("\n")
+}
+
+fn render_auth_text(auth: &serde_json::Value) -> String {
+    match auth["status"].as_str().unwrap_or("") {
+        "configured" => {
+            if let Some(user) = auth.get("username").and_then(|v| v.as_str()) {
+                format!("configured (username {user})")
+            } else if let Some(path) = auth.get("path").and_then(|v| v.as_str()) {
+                format!("configured ({path})")
+            } else {
+                "configured".to_string()
+            }
+        }
+        "error" => format!("error: {}", auth["message"].as_str().unwrap_or("")),
+        _ => "not_configured".to_string(),
+    }
+}
+
+fn render_config_init_text(payload: &serde_json::Value) -> String {
+    format!("created {}", payload["config_file"].as_str().unwrap_or(""))
 }
 
 /// Write a payload to stdout. A closed pipe (`BrokenPipe`, e.g. the
