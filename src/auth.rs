@@ -198,29 +198,17 @@ pub type VarLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 /// `std::fs::read_to_string`; tests pass a closure over a fixed map.
 pub type FileReader<'a> = &'a dyn Fn(&Path) -> std::io::Result<String>;
 
-/// The unix permission bits of one path, or `None` where the platform
-/// has no unix modes. Production passes [`unix_mode`]; tests pass a
-/// closure returning a fixed mode, so the permission check is exercised
-/// without touching the filesystem.
-pub type ModeLookup<'a> = &'a dyn Fn(&Path) -> std::io::Result<Option<u32>>;
-
-/// The unix permission bits of `path` (`PermissionsExt::mode`), or
-/// `None` on a platform without unix modes (where the permission check
-/// is skipped). `symlink_metadata`, not `metadata`: the mode is of
-/// the link itself, so a symlink is never mistaken for the key it
-/// points at (and its file-type bits say it is a link).
-fn unix_mode(path: &Path) -> std::io::Result<Option<u32>> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::symlink_metadata(path).map(|m| Some(m.permissions().mode()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(None)
-    }
-}
+/// Open a secret file once and return its unix mode (or `None`
+/// where the platform has no unix modes) together with its contents.
+/// Production passes [`open_secret_file_production`]; tests pass a
+/// closure returning a fixed mode and contents, so the permission
+/// check is exercised without touching the filesystem.
+///
+/// One opener, not a separate mode lookup plus a reader: the mode
+/// and the content come from the same open file, so the type and
+/// permission checks and the read cannot be separated by a path
+/// swap in between.
+pub type SecretFileOpener<'a> = &'a dyn Fn(&Path) -> std::io::Result<(Option<u32>, String)>;
 
 /// Re-attribute a credential validation failure to the configuration
 /// that supplied it. The value came from config (an env var or a
@@ -235,17 +223,39 @@ fn config_error(source: &str, err: GeectlError) -> GeectlError {
 /// whole keyring dumped into the file, say), not a secret.
 pub const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 
-/// Read a secret file in production: the file must be a regular file
-/// (not a device, pipe, or directory — reading those could block or
+/// Open a secret file in production and return its unix mode
+/// together with its contents. The file must be a regular file (not
+/// a device, pipe, or directory — reading those could block or
 /// return unbounded data) and at most [`MAX_SECRET_FILE_BYTES`]
 /// long. The size check is enforced while reading (`take(MAX + 1)`),
 /// so a file that grows between the open and the read is still
-/// capped. The open-then-fstat order means the type check and the
-/// read are on the same file, not on a path re-resolved in between.
-pub fn read_secret_file_production(path: &Path) -> std::io::Result<String> {
+/// capped.
+///
+/// The type and mode checks and the read are all on the one open
+/// file, not on a path re-resolved in between: the mode comes from
+/// fstat on the open descriptor, and on unix the path's lstat
+/// identity (dev, ino) must match the fstat identity — so a symlink
+/// (the open follows it; lstat is the link) and a path swapped
+/// after the open are both refused rather than silently read.
+pub fn open_secret_file_production(path: &Path) -> std::io::Result<(Option<u32>, String)> {
     use std::io::Read;
     let file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::MetadataExt;
+        let link = std::fs::symlink_metadata(path)?;
+        if (link.dev(), link.ino()) != (meta.dev(), meta.ino()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path does not name the file that was opened (symlink or swapped path)",
+            ));
+        }
+        Some(meta.mode())
+    };
+    #[cfg(not(unix))]
+    let mode = None;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
@@ -260,7 +270,16 @@ pub fn read_secret_file_production(path: &Path) -> std::io::Result<String> {
             format!("secret file exceeds {MAX_SECRET_FILE_BYTES} bytes"),
         ));
     }
-    String::from_utf8(contents).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let text = String::from_utf8(contents)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok((mode, text))
+}
+
+/// Read a secret file in production: the contents only (the mode is
+/// not needed for passwords and tokens). See
+/// [`open_secret_file_production`] for the guards.
+pub fn read_secret_file_production(path: &Path) -> std::io::Result<String> {
+    open_secret_file_production(path).map(|(_, content)| content)
 }
 
 /// Read a secret from a file: the whole file is the secret. The caller
@@ -404,21 +423,25 @@ pub fn resolve_gitea_bearer(
 /// refuses it.
 pub fn resolve_gitea_ssh_key(
     vars: VarLookup<'_>,
-    read_file: FileReader<'_>,
-    file_mode: ModeLookup<'_>,
+    open_file: SecretFileOpener<'_>,
 ) -> Result<Credentials, GeectlError> {
     let Some(path) = vars(GITEA_SSH_KEY_VAR) else {
         return Ok(Credentials::None);
     };
     let path = PathBuf::from(path);
-    // Check the permissions before reading the key: a key other users
-    // can read is a misconfiguration, and it should not even be read.
-    if let Some(mode) = file_mode(&path).map_err(|e| {
+    // One open for the mode and the content: the mode is of the file
+    // that was opened, so the type and permission checks and the read
+    // are on the same file — no second path resolution in between.
+    // A key other users can read is a misconfiguration, and it should
+    // not even be read — hence the permission check before the PEM
+    // validation below.
+    let (mode, content) = open_file(&path).map_err(|e| {
         GeectlError::new(
             ErrorKind::ConfigError,
-            format!("cannot stat SSH key {}: {e}", path.display()),
+            format!("cannot read SSH key {}: {e}", path.display()),
         )
-    })? {
+    })?;
+    if let Some(mode) = mode {
         // The mode's file-type bits say what the path is: a symlink
         // (0o120000) or anything but a regular file (0o100000) is a
         // misconfiguration — the key must be the file itself, not a
@@ -446,12 +469,6 @@ pub fn resolve_gitea_ssh_key(
             ));
         }
     }
-    let content = read_file(&path).map_err(|e| {
-        GeectlError::new(
-            ErrorKind::ConfigError,
-            format!("cannot read SSH key {}: {e}", path.display()),
-        )
-    })?;
     // A leading BOM or whitespace (editors and copy-paste add both)
     // must not make a real key look invalid, and a BEGIN without an
     // END is a truncated file, not a key.
@@ -527,11 +544,7 @@ pub struct GiteaSshKey;
 impl AuthProvider for GiteaSshKey {
     fn credentials(&self) -> Result<Credentials, GeectlError> {
         require_env_unicode(&[GITEA_SSH_KEY_VAR])?;
-        resolve_gitea_ssh_key(
-            &|name| std::env::var(name).ok(),
-            &read_secret_file_production,
-            &unix_mode,
-        )
+        resolve_gitea_ssh_key(&|name| std::env::var(name).ok(), &open_secret_file_production)
     }
 }
 
@@ -650,12 +663,16 @@ mod tests {
         }
     }
 
-    fn mode(mode: u32) -> impl Fn(&Path) -> std::io::Result<Option<u32>> {
-        move |_| Ok(Some(mode))
-    }
-
-    fn no_mode() -> impl Fn(&Path) -> std::io::Result<Option<u32>> {
-        |_| Ok(None)
+    fn opener(
+        map: &HashMap<PathBuf, String>,
+        mode: Option<u32>,
+    ) -> impl Fn(&Path) -> std::io::Result<(Option<u32>, String)> + '_ {
+        move |path| {
+            map.get(path)
+                .cloned()
+                .map(|content| (mode, content))
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))
+        }
     }
 
     fn empty_files() -> HashMap<PathBuf, String> {
@@ -841,7 +858,7 @@ mod tests {
     fn gitea_ssh_key_resolves_a_valid_key() {
         let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
         let files = files(&[(SSH_KEY_PATH, SSH_KEY_PEM)]);
-        let creds = resolve_gitea_ssh_key(&lookup(&map), &reader(&files), &mode(0o100600)).unwrap();
+        let creds = resolve_gitea_ssh_key(&lookup(&map), &opener(&files, Some(0o100600))).unwrap();
         assert!(
             matches!(creds, Credentials::SshKey { ref path } if path == Path::new(SSH_KEY_PATH))
         );
@@ -850,8 +867,7 @@ mod tests {
     #[test]
     fn gitea_ssh_key_unconfigured_is_none() {
         let map = vars(&[]);
-        let creds =
-            resolve_gitea_ssh_key(&lookup(&map), &reader(&empty_files()), &no_mode()).unwrap();
+        let creds = resolve_gitea_ssh_key(&lookup(&map), &opener(&empty_files(), None)).unwrap();
         assert!(matches!(creds, Credentials::None));
     }
 
@@ -860,7 +876,7 @@ mod tests {
         let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
         let files = files(&[(SSH_KEY_PATH, SSH_KEY_PEM)]);
         let err =
-            resolve_gitea_ssh_key(&lookup(&map), &reader(&files), &mode(0o100644)).unwrap_err();
+            resolve_gitea_ssh_key(&lookup(&map), &opener(&files, Some(0o100644))).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(err.context.contains(SSH_KEY_PATH));
         assert!(err.context.contains("chmod 600"));
@@ -870,7 +886,7 @@ mod tests {
     fn gitea_ssh_key_owner_read_only_is_accepted() {
         let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
         let files = files(&[(SSH_KEY_PATH, SSH_KEY_PEM)]);
-        let creds = resolve_gitea_ssh_key(&lookup(&map), &reader(&files), &mode(0o100400)).unwrap();
+        let creds = resolve_gitea_ssh_key(&lookup(&map), &opener(&files, Some(0o100400))).unwrap();
         assert!(matches!(creds, Credentials::SshKey { .. }));
     }
 
@@ -881,7 +897,7 @@ mod tests {
         let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
         let files = files(&[(SSH_KEY_PATH, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 user@host\n")]);
         let err =
-            resolve_gitea_ssh_key(&lookup(&map), &reader(&files), &mode(0o100600)).unwrap_err();
+            resolve_gitea_ssh_key(&lookup(&map), &opener(&files, Some(0o100600))).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(err.context.contains(SSH_KEY_PATH));
     }
@@ -889,8 +905,7 @@ mod tests {
     #[test]
     fn gitea_ssh_key_unreadable_file_is_config_error() {
         let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
-        let err =
-            resolve_gitea_ssh_key(&lookup(&map), &reader(&empty_files()), &no_mode()).unwrap_err();
+        let err = resolve_gitea_ssh_key(&lookup(&map), &opener(&empty_files(), None)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(err.context.contains(SSH_KEY_PATH));
     }
@@ -900,7 +915,7 @@ mod tests {
         // On a platform without unix modes there is nothing to check.
         let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
         let files = files(&[(SSH_KEY_PATH, SSH_KEY_PEM)]);
-        let creds = resolve_gitea_ssh_key(&lookup(&map), &reader(&files), &no_mode()).unwrap();
+        let creds = resolve_gitea_ssh_key(&lookup(&map), &opener(&files, None)).unwrap();
         assert!(matches!(creds, Credentials::SshKey { .. }));
     }
 
@@ -930,7 +945,7 @@ mod tests {
         let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
         let files = files(&[(SSH_KEY_PATH, SSH_KEY_PEM)]);
         let err =
-            resolve_gitea_ssh_key(&lookup(&map), &reader(&files), &mode(0o120777)).unwrap_err();
+            resolve_gitea_ssh_key(&lookup(&map), &opener(&files, Some(0o120777))).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(
             err.context.contains("not a regular file"),
@@ -946,7 +961,7 @@ mod tests {
         let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
         let files = files(&[(SSH_KEY_PATH, SSH_KEY_PEM)]);
         let err =
-            resolve_gitea_ssh_key(&lookup(&map), &reader(&files), &mode(0o100644)).unwrap_err();
+            resolve_gitea_ssh_key(&lookup(&map), &opener(&files, Some(0o100644))).unwrap_err();
         assert!(err.context.contains("mode 644"), "{}", err.context);
         assert!(!err.context.contains("100644"), "{}", err.context);
     }
@@ -955,7 +970,7 @@ mod tests {
     fn gitea_ssh_key_pem_with_bom_and_leading_space_is_accepted() {
         let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
         let files = files(&[(SSH_KEY_PATH, &format!("\u{feff}  \n{SSH_KEY_PEM}"))]);
-        let creds = resolve_gitea_ssh_key(&lookup(&map), &reader(&files), &mode(0o100600)).unwrap();
+        let creds = resolve_gitea_ssh_key(&lookup(&map), &opener(&files, Some(0o100600))).unwrap();
         assert!(matches!(creds, Credentials::SshKey { .. }));
     }
 
@@ -965,7 +980,7 @@ mod tests {
         let map = vars(&[(GITEA_SSH_KEY_VAR, SSH_KEY_PATH)]);
         let files = files(&[(SSH_KEY_PATH, "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n")]);
         let err =
-            resolve_gitea_ssh_key(&lookup(&map), &reader(&files), &mode(0o100600)).unwrap_err();
+            resolve_gitea_ssh_key(&lookup(&map), &opener(&files, Some(0o100600))).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
     }
 
@@ -1012,6 +1027,41 @@ mod tests {
     fn production_secret_reader_rejects_a_non_regular_file() {
         // /dev/null opens fine but is not a regular file.
         let err = read_secret_file_production(Path::new("/dev/null")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn production_secret_opener_returns_the_open_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let file = TempSecretFile::write(b"tok3n\n");
+        std::fs::set_permissions(&file.0, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (mode, content) = open_secret_file_production(&file.0).unwrap();
+        assert_eq!(content, "tok3n\n");
+        assert_eq!(mode, Some(0o100600));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn production_secret_opener_refuses_a_symlink() {
+        // The opener follows the link, but the lstat identity is the
+        // link, not the file it opened — refused, not silently read.
+        let file = TempSecretFile::write(b"tok3n\n");
+        let link = std::env::temp_dir().join(format!(
+            "geectl-secret-link-{}-{}",
+            std::process::id(),
+            SECRET_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::os::unix::fs::symlink(&file.0, &link).unwrap();
+        let err = open_secret_file_production(&link).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_file(&link);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn production_secret_opener_refuses_a_directory() {
+        let err = open_secret_file_production(&std::env::temp_dir()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
