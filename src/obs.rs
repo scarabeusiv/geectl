@@ -729,6 +729,80 @@ pub struct ObsClient<'a> {
     credentials: Credentials,
 }
 
+/// Options for [`ObsClient::branch_package`]. All fields are optional
+/// except through the method arguments: an unset target means the
+/// server default, an unset flag means off. The defaults branch the
+/// package into the caller's `home:<user>:branches:<project>` project
+/// (the server default), resolving the link source through the devel
+/// project when one is registered.
+///
+/// The flags are the server's `cmd=branch` parameters, named after the
+/// behaviour rather than the wire spelling: `no_devel_project` is the
+/// server's `ignoredevel`, `new_package` is `missingok` when the source
+/// does not exist yet and `newinstance` when it already does (the source
+/// is read first, see [`ObsClient::branch_package`]).
+#[derive(Debug, Clone, Default)]
+pub struct BranchOptions {
+    /// The branch project. None means the server default — usually
+    /// `home:<user>:branches:<source project>`, but the server may
+    /// pick another project (an incident project when branching as
+    /// maintenance), so the key is omitted and the client never
+    /// guesses it.
+    pub target_project: Option<String>,
+    /// The branch package name. None means the source package name
+    /// (the key is omitted and the server applies its default).
+    pub target_package: Option<String>,
+    /// Ignore the devel project when resolving the link source: the
+    /// branch links at the project branched from instead of the devel
+    /// project. The server's `ignoredevel`.
+    pub no_devel_project: bool,
+    /// Branch a package that does not exist yet (or that only exists
+    /// through a project link): the server's `missingok` when the
+    /// source does not exist yet, `newinstance` when it already
+    /// does. See [`ObsClient::branch_package`].
+    pub new_package: bool,
+    /// Overwrite an existing target package. The server's `force`.
+    pub force: bool,
+    /// Branch from this source revision instead of the latest. The
+    /// server's `rev`.
+    pub revision: Option<String>,
+    /// The link revision the branch records. The server's `linkrev`.
+    pub linkrev: Option<String>,
+    /// A comment recorded on the branch. The server's `comment`.
+    pub comment: Option<String>,
+    /// Do not give the branch read access to the source package's
+    /// project. The server's `noaccess`.
+    pub noaccess: bool,
+    /// Add the source project's repositories to the branch project.
+    /// The server's `add_repositories`.
+    pub add_repositories: bool,
+    /// Block the added repositories. Only sent with
+    /// `add_repositories`. The server's `add_repositories_block`.
+    pub add_repositories_block: Option<String>,
+    /// Rebuild the added repositories. Only sent with
+    /// `add_repositories`. The server's `add_repositories_rebuild`.
+    pub add_repositories_rebuild: Option<String>,
+    /// Extend the branch package names with the source project name.
+    /// The server's `extend_package_names`.
+    pub extend_package_names: bool,
+    /// Branch as a maintenance incident. The server's `maintenance`.
+    pub maintenance: bool,
+}
+
+/// Where a branch landed: the source package and the branch package
+/// the server created for it, as reported by the server's
+/// `cmd=branch` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchResult {
+    /// The project branched from.
+    pub source_project: String,
+    /// The package branched from.
+    pub source_package: String,
+    /// The project the branch lives in.
+    pub target_project: String,
+    /// The branch package name.
+    pub target_package: String,
+}
 impl<'a> ObsClient<'a> {
     /// A client for the production OBS API, with no credentials
     /// (public reads only).
@@ -2645,6 +2719,177 @@ impl<'a> ObsClient<'a> {
             &[("match", &match_expr)],
         ))
     }
+    /// Branch package `package` in project `project` on OBS
+    /// (`POST /source/<project>/<package>?cmd=branch`) and return
+    /// where the branch landed. Requires credentials; without them the
+    /// call fails loudly before any request. In dry-run the branch is
+    /// recorded in the plan and nothing is branched — the guard runs
+    /// before the credentials check, like `create_package` — and the
+    /// result is `None`, like `upload_file` in dry-run.
+    ///
+    /// An agent branches the package it is about to change, so that
+    /// the change is a package like any other: the branch is where the
+    /// spec and `.changes` edits land before a submit request is
+    /// filed from it. The link source resolves through the package's
+    /// devel project when one is registered, unless
+    /// `no_devel_project` is set; a package inherited through a
+    /// project link branches from the project it is inherited from.
+    ///
+    /// `new_package` is the server's two-step for a package that does
+    /// not exist yet (or only exists through a project link): when the
+    /// source does not exist yet the call sends `missingok`, when it
+    /// already exists it sends `newinstance`. A `newinstance` branch
+    /// also copies the source's devel package sources in when the
+    /// source has a devel project. The two cases are told
+    /// apart by reading the source first, because the transport
+    /// reports a failed call by status only and the server's
+    /// `not_missing` error code does not survive it. The read runs
+    /// only on the `new_package` path; a plain branch makes a single
+    /// POST.
+    ///
+    /// Success is the server's `<status code="ok"/>` carrying the
+    /// branch target as `<data>` elements; any other body is a server
+    /// error, never success.
+    pub fn branch_package(
+        &self,
+        project: &str,
+        package: &str,
+        options: &BranchOptions,
+        dry_run: &DryRun,
+    ) -> Result<Option<BranchResult>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if let Some(target) = &options.target_project {
+            if !valid_obs_name(target) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS project name: {target:?}"),
+                ));
+            }
+        }
+        if let Some(target) = &options.target_package {
+            if !valid_obs_name(target) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name: {target:?}"),
+                ));
+            }
+        }
+        for value in [
+            &options.add_repositories_block,
+            &options.add_repositories_rebuild,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS repository name: {value:?}"),
+                ));
+            }
+        }
+        // The dry-run guard: in dry-run the branch is recorded in the
+        // plan and nothing is branched — not even the credentials
+        // check runs. The target is named when it is known: the
+        // explicit target, or the server default when the username is
+        // available from the credentials.
+        // The dry-run plan names the target only when the caller
+        // gave one: otherwise it says the server default instead of
+        // guessing it, and the request omits the keys below so the
+        // server applies its own default.
+        let target_project = options
+            .target_project
+            .as_deref()
+            .unwrap_or("the server default branch project");
+        let target_package = options.target_package.as_deref().unwrap_or(package);
+        if !dry_run.allow(&format!(
+            "branch package {project}/{package} to {target_project}/{target_package}{}",
+            branch_option_suffix(options),
+        )) {
+            return Ok(None);
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot branch a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("cmd", "branch")];
+        if let Some(target_project) = &options.target_project {
+            query.push(("target_project", target_project));
+        }
+        if let Some(target_package) = &options.target_package {
+            query.push(("target_package", target_package));
+        }
+        if options.no_devel_project {
+            query.push(("ignoredevel", "1"));
+        }
+        if options.new_package {
+            // The source's existence decides the flag: `missingok`
+            // when the source does not exist yet, `newinstance`
+            // when it already does (the server answers
+            // `not_missing` to a `missingok` branch of an existing
+            // source, and the transport does not carry the error
+            // code back). A source inherited through a project link
+            // reads as existing — the branch creates a new instance
+            // of it.
+            let source_url = build_url(&self.base, &["source", project, package], &[]);
+            match self.http.get_with(&source_url, &self.credentials) {
+                Ok(_) => query.push(("newinstance", "1")),
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    query.push(("missingok", "1"));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if options.force {
+            query.push(("force", "1"));
+        }
+        if let Some(rev) = &options.revision {
+            query.push(("rev", rev));
+        }
+        if let Some(linkrev) = &options.linkrev {
+            query.push(("linkrev", linkrev));
+        }
+        if let Some(comment) = &options.comment {
+            query.push(("comment", comment));
+        }
+        if options.noaccess {
+            query.push(("noaccess", "1"));
+        }
+        if options.add_repositories {
+            query.push(("add_repositories", "1"));
+            if let Some(block) = &options.add_repositories_block {
+                query.push(("add_repositories_block", block));
+            }
+            if let Some(rebuild) = &options.add_repositories_rebuild {
+                query.push(("add_repositories_rebuild", rebuild));
+            }
+        }
+        if options.extend_package_names {
+            query.push(("extend_package_names", "1"));
+        }
+        if options.maintenance {
+            query.push(("maintenance", "1"));
+        }
+        let url = build_url(&self.base, &["source", project, package], &query);
+        let body = self.http.post(&url, "", &self.credentials)?;
+        match parse_branch_result(&body) {
+            Some(result) => Ok(Some(result)),
+            None => Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS branch response for package {project}/{package}"),
+            )),
+        }
+    }
+
 }
 
 /// Extract the devel project from an OBS directory listing
@@ -3013,6 +3258,101 @@ pub(crate) fn parse_status_ok(body: &str) -> bool {
 /// through `pass_to_backend`, so the upload response is a revision
 /// document, not a `<status code="ok"/>` — `parse_status_ok` would
 /// read every successful upload as a failure.
+/// The option suffix for a branch plan line: the set options, in the
+/// order they appear in [`BranchOptions`], so a dry-run plan reads
+/// what the branch would have done. The target project and package
+/// are not listed: the plan line already names the resolved target.
+fn branch_option_suffix(options: &BranchOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if options.no_devel_project {
+        parts.push("no devel project".to_string());
+    }
+    if options.new_package {
+        parts.push("new package".to_string());
+    }
+    if options.force {
+        parts.push("force".to_string());
+    }
+    if let Some(revision) = &options.revision {
+        parts.push(format!("revision {revision}"));
+    }
+    if let Some(linkrev) = &options.linkrev {
+        parts.push(format!("link revision {linkrev}"));
+    }
+    if let Some(comment) = &options.comment {
+        parts.push(format!("comment {comment}"));
+    }
+    if options.noaccess {
+        parts.push("no access".to_string());
+    }
+    if options.add_repositories {
+        parts.push("add repositories".to_string());
+    }
+    if let Some(block) = &options.add_repositories_block {
+        parts.push(format!("add repositories block {block}"));
+    }
+    if let Some(rebuild) = &options.add_repositories_rebuild {
+        parts.push(format!("add repositories rebuild {rebuild}"));
+    }
+    if options.extend_package_names {
+        parts.push("extend package names".to_string());
+    }
+    if options.maintenance {
+        parts.push("maintenance".to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// The text of the first `<data name="NAME">VALUE</data>` element in
+/// a `<status>` document. None when there is no such element, or it
+/// is self-closing (an empty value is not a result). The name is
+/// matched exactly, quoted: `<data name="target_project">` does not
+/// match a search for `project`.
+pub(crate) fn status_data(body: &str, name: &str) -> Option<String> {
+    let open = format!("<data name=\"{name}\">");
+    let pos = body.find(&open)?;
+    let after = &body[pos + open.len()..];
+    let end = after.find("</data>")?;
+    let value = &after[..end];
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// Parse the branch target out of the server's `cmd=branch`
+/// response: a `<status code="ok"/>` carrying the source and the
+/// target as `<data>` elements. Returns None when the body is not
+/// one (a non-ok status, a missing element, an empty value).
+///
+/// The server renders the names two ways: the current
+/// `target_project`, `target_package`, `project`, `package`, and the
+/// deprecated `targetproject`, `targetpackage`, `sourceproject`,
+/// `sourcepackage`. The current names win when both are present; the
+/// deprecated ones are the fallback for an older server.
+pub(crate) fn parse_branch_result(body: &str) -> Option<BranchResult> {
+    if !parse_status_ok(body) {
+        return None;
+    }
+    let target_project =
+        status_data(body, "target_project").or_else(|| status_data(body, "targetproject"))?;
+    let target_package =
+        status_data(body, "target_package").or_else(|| status_data(body, "targetpackage"))?;
+    let source_project =
+        status_data(body, "project").or_else(|| status_data(body, "sourceproject"))?;
+    let source_package =
+        status_data(body, "package").or_else(|| status_data(body, "sourcepackage"))?;
+    Some(BranchResult {
+        source_project,
+        source_package,
+        target_project,
+        target_package,
+    })
+}
 pub(crate) fn parse_revision(body: &str) -> Option<u64> {
     let pos = body.find("<revision")?;
     let after_tag = &body[pos + "<revision".len()..];
@@ -8177,6 +8517,373 @@ mod tests {
 
     // --- create_project / create_package ---
 
+    #[test]
+    fn branch_package_posts_branch_command_and_returns_target() {
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"target_project\">home:scarabeus_iv:branches:test:factory</data>\
+            <data name=\"target_package\">test-pkgA</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
+            body,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let result = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            Some(BranchResult {
+                source_project: "test:factory".to_string(),
+                source_package: "test-pkgA".to_string(),
+                target_project: "home:scarabeus_iv:branches:test:factory".to_string(),
+                target_package: "test-pkgA".to_string(),
+            })
+        );
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        // No target was given, so the request omits both keys and
+        // lets the server apply its default.
+        assert_eq!(
+            posts[0].0,
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch"
+        );
+        // The branch POST carries no body (the parameters are the
+        // query) and the credentials.
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+        // A plain branch makes a single POST: no target pre-check.
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_package_new_package_missing_source_sends_missingok() {
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"target_project\">home:scarabeus_iv:branches:test:factory</data>\
+            <data name=\"target_package\">test-pkgA</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new()
+            .with_get_error(
+                "https://api.opensuse.org/source/test:factory/test-pkgA",
+                ErrorKind::NotFound,
+            )
+            .with_post(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&missingok=1",
+                body,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = BranchOptions {
+            new_package: true,
+            ..BranchOptions::default()
+        };
+        let result = client
+            .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
+            .unwrap();
+        assert!(result.is_some());
+        // The source was read first, then branched with missingok.
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn branch_package_new_package_existing_source_sends_newinstance() {
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"target_project\">home:scarabeus_iv:branches:test:factory</data>\
+            <data name=\"target_package\">test-pkgA</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA",
+                "<directory name=\"test-pkgA\" />",
+            )
+            .with_post(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&newinstance=1",
+                body,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = BranchOptions {
+            new_package: true,
+            ..BranchOptions::default()
+        };
+        let result = client
+            .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn branch_package_no_devel_project_sends_ignoredevel() {
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"target_project\">home:scarabeus_iv:branches:test:factory</data>\
+            <data name=\"target_package\">test-pkgA</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&ignoredevel=1",
+            body,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = BranchOptions {
+            no_devel_project: true,
+            ..BranchOptions::default()
+        };
+        assert!(client
+            .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
+            .is_ok());
+    }
+
+    #[test]
+    fn branch_package_explicit_target_and_options() {
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"target_project\">home:alice:branches:test:factory</data>\
+            <data name=\"target_package\">renamed</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&target_project=home%3Aalice%3Abranches%3Atest%3Afactory&target_package=renamed&ignoredevel=1&force=1&rev=42&linkrev=abc123&comment=test-branch&noaccess=1&add_repositories=1&add_repositories_block=standard&add_repositories_rebuild=standard&extend_package_names=1&maintenance=1",
+            body,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = BranchOptions {
+            target_project: Some("home:alice:branches:test:factory".to_string()),
+            target_package: Some("renamed".to_string()),
+            no_devel_project: true,
+            force: true,
+            revision: Some("42".to_string()),
+            linkrev: Some("abc123".to_string()),
+            comment: Some("test-branch".to_string()),
+            noaccess: true,
+            add_repositories: true,
+            add_repositories_block: Some("standard".to_string()),
+            add_repositories_rebuild: Some("standard".to_string()),
+            extend_package_names: true,
+            maintenance: true,
+            ..BranchOptions::default()
+        };
+        let result = client
+            .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.unwrap().target_package, "renamed".to_string());
+    }
+
+    #[test]
+    fn branch_package_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
+            "<status code=\"ok\" />",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false)
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_package_rejects_invalid_names_without_http() {
+        // An invalid name is rejected before any request: no canned
+        // response exists, so reaching the HTTP client would error
+        // differently (FakeHttp: "no canned response").
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .branch_package(
+                "test/factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false)
+            )
+            .is_err());
+        let options = BranchOptions {
+            target_project: Some("home/alice".to_string()),
+            ..BranchOptions::default()
+        };
+        assert!(client
+            .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_package_dry_run_records_plan_and_branches_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let result = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: branch package test:factory/test-pkgA to the server default branch project/test-pkgA"
+                    .to_string()
+            ]
+        );
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_package_dry_run_names_revision_linkrev_and_comment() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = BranchOptions {
+            revision: Some("42".to_string()),
+            linkrev: Some("7".to_string()),
+            comment: Some("backport".to_string()),
+            ..BranchOptions::default()
+        };
+        let result = client
+            .branch_package("test:factory", "test-pkgA", &options, &dry_run)
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: branch package test:factory/test-pkgA to the server default branch project/test-pkgA (revision 42, link revision 7, comment backport)"
+                    .to_string()
+            ]
+        );
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_package_dry_run_without_credentials_names_no_target() {
+        // Without credentials the default branch project cannot be
+        // named, so the plan says so instead of guessing — and still
+        // makes no request.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dry_run = DryRun::new(true);
+        let result = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: branch package test:factory/test-pkgA to the server default branch project/test-pkgA"
+                    .to_string()
+            ]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_package_non_ok_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
+            "<status code=\"error\"><summary>nope</summary></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn parse_branch_result_prefers_current_data_names() {
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"targetproject\">old:project</data>\
+            <data name=\"target_project\">home:alice:branches:test:factory</data>\
+            <data name=\"targetpackage\">old-pkg</data>\
+            <data name=\"target_package\">test-pkgA</data>\
+            <data name=\"sourceproject\">old:source</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"sourcepackage\">old-src</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        assert_eq!(
+            parse_branch_result(body),
+            Some(BranchResult {
+                source_project: "test:factory".to_string(),
+                source_package: "test-pkgA".to_string(),
+                target_project: "home:alice:branches:test:factory".to_string(),
+                target_package: "test-pkgA".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_branch_result_falls_back_to_deprecated_data_names() {
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"targetproject\">home:alice:branches:test:factory</data>\
+            <data name=\"targetpackage\">test-pkgA</data>\
+            <data name=\"sourceproject\">test:factory</data>\
+            <data name=\"sourcepackage\">test-pkgA</data></status>";
+        assert_eq!(
+            parse_branch_result(body),
+            Some(BranchResult {
+                source_project: "test:factory".to_string(),
+                source_package: "test-pkgA".to_string(),
+                target_project: "home:alice:branches:test:factory".to_string(),
+                target_package: "test-pkgA".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_branch_result_rejects_non_ok_and_incomplete_bodies() {
+        assert_eq!(
+            parse_branch_result("<status code=\"error\"><summary>nope</summary></status>"),
+            None
+        );
+        // A missing data element is not a result.
+        assert_eq!(
+            parse_branch_result(
+                "<status code=\"ok\"><summary>Ok</summary>\
+                <data name=\"target_project\">home:alice:branches:test:factory</data></status>"
+            ),
+            None
+        );
+        // An empty value is not a result.
+        assert_eq!(
+            parse_branch_result(
+                "<status code=\"ok\"><summary>Ok</summary>\
+                <data name=\"target_project\"></data>\
+                <data name=\"target_package\">test-pkgA</data>\
+                <data name=\"project\">test:factory</data>\
+                <data name=\"package\">test-pkgA</data></status>"
+            ),
+            None
+        );
+        assert_eq!(parse_branch_result(""), None);
+    }
     #[test]
     fn create_project_puts_meta_and_returns_ok() {
         let http = FakeHttp::new().with_put(
