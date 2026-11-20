@@ -39,7 +39,7 @@
 use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::ObsClient;
+use geectl::obs::{DryRun, ObsClient};
 
 /// Whether `url` points at a loopback host.
 ///
@@ -327,6 +327,7 @@ fn temporal_create_project_shows_up_on_server() {
             &name,
             "geectl temporal test project",
             "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
         )
         .expect("create a project on the temporal instance");
     // Read the project's stored meta back: a project directory

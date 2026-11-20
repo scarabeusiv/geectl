@@ -820,7 +820,10 @@ impl<'a> ObsClient<'a> {
 
     /// Create project `project` on OBS (`PUT /source/<project>/_meta`)
     /// with the given title and description. Requires credentials;
-    /// without them the call fails loudly before any request.
+    /// without them the call fails loudly before any request. In
+    /// dry-run the creation is recorded in the plan and nothing is
+    /// created — the guard runs before the credentials check, like
+    /// `delete_package`, so planning a creation needs no credentials.
     ///
     /// An agent creates a branch project before filing a submit
     /// request — a fresh project per update, so the accepted branch
@@ -834,12 +837,20 @@ impl<'a> ObsClient<'a> {
         project: &str,
         title: &str,
         description: &str,
+        dry_run: &DryRun,
     ) -> Result<(), GeectlError> {
         if !valid_obs_name(project) {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 format!("invalid OBS project name: {project:?}"),
             ));
+        }
+        // The dry-run guard: in dry-run the creation is recorded in
+        // the plan and nothing is created — not even the credentials
+        // check runs. Without this, a dry-run caller invoking create
+        // directly would mutate the server.
+        if !dry_run.allow(&format!("create project {project}")) {
+            return Ok(());
         }
         if !self.has_basic() {
             return Err(GeectlError::new(
@@ -868,7 +879,9 @@ impl<'a> ObsClient<'a> {
     /// Create package `package` in project `project` on OBS (`PUT
     /// /source/<project>/<package>/_meta`) with the given title and
     /// description. Requires credentials; without them the call fails
-    /// loudly before any request.
+    /// loudly before any request. In dry-run the creation is recorded
+    /// in the plan and nothing is created — the guard runs before the
+    /// credentials check, like `delete_package`.
     ///
     /// An agent creates the package it submits from — the branch
     /// package — so package creation belongs in the library next to
@@ -882,6 +895,7 @@ impl<'a> ObsClient<'a> {
         package: &str,
         title: &str,
         description: &str,
+        dry_run: &DryRun,
     ) -> Result<(), GeectlError> {
         for (label, value) in [("project", project), ("package", package)] {
             if !valid_obs_name(value) {
@@ -890,6 +904,13 @@ impl<'a> ObsClient<'a> {
                     format!("invalid OBS {label} name: {value:?}"),
                 ));
             }
+        }
+        // The dry-run guard: in dry-run the creation is recorded in
+        // the plan and nothing is created — not even the credentials
+        // check runs. Without this, a dry-run caller invoking create
+        // directly would mutate the server.
+        if !dry_run.allow(&format!("create package {project}/{package}")) {
+            return Ok(());
         }
         if !self.has_basic() {
             return Err(GeectlError::new(
@@ -3229,7 +3250,12 @@ mod tests {
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
-            .create_project("home:alice", "Alice's branch", "Temporal test branch")
+            .create_project(
+                "home:alice",
+                "Alice's branch",
+                "Temporal test branch",
+                &DryRun::new(false)
+            )
             .is_ok());
         let puts = http.put_calls();
         assert_eq!(puts.len(), 1);
@@ -3253,7 +3279,12 @@ mod tests {
         );
         let client = ObsClient::new(&http);
         assert!(client
-            .create_project("home:alice", "Alice's branch", "Temporal test branch")
+            .create_project(
+                "home:alice",
+                "Alice's branch",
+                "Temporal test branch",
+                &DryRun::new(false)
+            )
             .is_err());
         assert!(http.put_calls().is_empty());
     }
@@ -3266,7 +3297,12 @@ mod tests {
         let http = FakeHttp::new();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
-            .create_project("home/alice", "Alice's branch", "Temporal test branch")
+            .create_project(
+                "home/alice",
+                "Alice's branch",
+                "Temporal test branch",
+                &DryRun::new(false)
+            )
             .is_err());
         assert!(http.put_calls().is_empty());
     }
@@ -3281,7 +3317,12 @@ mod tests {
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let err = client
-            .create_project("home:alice", "Alice's branch", "Temporal test branch")
+            .create_project(
+                "home:alice",
+                "Alice's branch",
+                "Temporal test branch",
+                &DryRun::new(false),
+            )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
@@ -3296,7 +3337,12 @@ mod tests {
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
-            .create_project("home:alice", "A <branch> & friends", "x\"y")
+            .create_project(
+                "home:alice",
+                "A <branch> & friends",
+                "x\"y",
+                &DryRun::new(false)
+            )
             .is_ok());
         let puts = http.put_calls();
         assert_eq!(puts.len(), 1);
@@ -3315,6 +3361,27 @@ mod tests {
     }
 
     #[test]
+    fn create_project_dry_run_records_plan_and_creates_nothing() {
+        // A dry-run caller invoking create directly must not mutate
+        // the server: the creation is recorded in the plan and no PUT
+        // runs (no canned response exists, so a PUT would fail). No
+        // credentials are needed either: the guard runs before the
+        // credentials check, like delete_package — so the client here
+        // deliberately has none.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dry = DryRun::default();
+        assert!(client
+            .create_project("home:alice", "Alice's branch", "Temporal test branch", &dry)
+            .is_ok());
+        assert!(http.put_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: create project home:alice"]
+        );
+    }
+
+    #[test]
     fn create_package_puts_meta_and_returns_ok() {
         let http = FakeHttp::new().with_put(
             "https://api.opensuse.org/source/home:alice/foo/_meta",
@@ -3322,7 +3389,13 @@ mod tests {
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
-            .create_package("home:alice", "foo", "Foo", "Temporal test package")
+            .create_package(
+                "home:alice",
+                "foo",
+                "Foo",
+                "Temporal test package",
+                &DryRun::new(false)
+            )
             .is_ok());
         let puts = http.put_calls();
         assert_eq!(puts.len(), 1);
@@ -3345,7 +3418,13 @@ mod tests {
         );
         let client = ObsClient::new(&http);
         assert!(client
-            .create_package("home:alice", "foo", "Foo", "Temporal test package")
+            .create_package(
+                "home:alice",
+                "foo",
+                "Foo",
+                "Temporal test package",
+                &DryRun::new(false)
+            )
             .is_err());
         assert!(http.put_calls().is_empty());
     }
@@ -3355,12 +3434,41 @@ mod tests {
         let http = FakeHttp::new();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
-            .create_package("home/alice", "foo", "Foo", "Temporal test package")
+            .create_package(
+                "home/alice",
+                "foo",
+                "Foo",
+                "Temporal test package",
+                &DryRun::new(false)
+            )
             .is_err());
         assert!(client
-            .create_package("home:alice", "foo/bar", "Foo", "Temporal test package")
+            .create_package(
+                "home:alice",
+                "foo/bar",
+                "Foo",
+                "Temporal test package",
+                &DryRun::new(false)
+            )
             .is_err());
         assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn create_package_dry_run_records_plan_and_creates_nothing() {
+        // As create_project: the creation is recorded in the plan, no
+        // PUT runs, and no credentials are needed.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dry = DryRun::default();
+        assert!(client
+            .create_package("home:alice", "foo", "Foo", "Temporal test package", &dry)
+            .is_ok());
+        assert!(http.put_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: create package home:alice/foo"]
+        );
     }
 
     // --- open_requests_for_package / package_requests_search_url ---

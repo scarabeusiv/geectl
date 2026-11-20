@@ -235,6 +235,7 @@ fn create_source_branch(client: &ObsClient<'_>, package: &str) -> String {
             &source_project,
             "geectl temporal test branch",
             "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
         )
         .expect("create source project on the temporal instance");
     client
@@ -243,6 +244,7 @@ fn create_source_branch(client: &ObsClient<'_>, package: &str) -> String {
             package,
             "geectl temporal test package",
             "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
         )
         .expect("create source package on the temporal instance");
     source_project
@@ -261,6 +263,7 @@ fn setup_branch(client: &ObsClient<'_>) -> (String, String, String) {
             &target_project,
             "geectl temporal test target",
             "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
         )
         .expect("create target project on the temporal instance");
     (source_project, target_project, package)
