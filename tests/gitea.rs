@@ -40,24 +40,15 @@ use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth};
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
 
-/// Whether `url` points at a loopback host.
+/// Whether `url` points at a loopback host over plain HTTP.
 ///
-/// The host is extracted exactly: the authority after `http://` up to
-/// the next `/`, minus any `:port`, minus IPv6 brackets. A prefix check
-/// would also accept `http://127.0.0.1.evil.com`, which is not loopback.
+/// The harness only ever runs against the plain-HTTP disposable
+/// instance, so the scheme must be `http://`. The host parsing is the
+/// production check (`geectl::http::is_loopback_url`), shared rather
+/// than copied: the copy split on the first colon and missed userinfo,
+/// so `http://localhost:3001@evil.com` read as loopback.
 fn is_loopback_url(url: &str) -> bool {
-    let authority = url
-        .strip_prefix("http://")
-        .unwrap_or("")
-        .split('/')
-        .next()
-        .unwrap_or("");
-    let host = if let Some(bracketed) = authority.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or("")
-    } else {
-        authority.split(':').next().unwrap_or("")
-    };
-    host == "127.0.0.1" || host == "localhost" || host == "::1"
+    url.starts_with("http://") && geectl::http::is_loopback_url(url)
 }
 
 /// The Gitea instance's base URL, from the environment.
