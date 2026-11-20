@@ -906,7 +906,13 @@ mod tests {
 
         fn authorization(self) -> Option<String> {
             self.request().and_then(|request| {
-                request
+                // Headers only: a body line that happens to start
+                // with "authorization:" is not a header.
+                let headers = match request.split_once("\r\n\r\n") {
+                    Some((headers, _)) => headers,
+                    None => &request,
+                };
+                headers
                     .lines()
                     .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
                     .map(|l| l["authorization:".len()..].trim().to_string())
@@ -973,10 +979,7 @@ mod tests {
                 .any(|l| l.eq_ignore_ascii_case("content-type: application/json")),
             "POST must carry Content-Type: application/json; request: {request}"
         );
-        let sent_body = request
-            .split("\r\n\r\n")
-            .nth(1)
-            .expect("request has a body");
+        let (_, sent_body) = request.split_once("\r\n\r\n").expect("request has a body");
         assert_eq!(sent_body, body);
         assert!(
             request
