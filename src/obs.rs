@@ -1148,6 +1148,192 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// Change submit request `id` to `state` (`POST
+    /// /request/:id?cmd=changestate&newstate=<state>`), with
+    /// `comment` as the message left with the change. Requires
+    /// credentials; without them the call fails loudly before any
+    /// request. Takes the caller's [`DryRun`]: in dry-run the change
+    /// is recorded in the plan and nothing changes, so a dry-run
+    /// caller cannot mutate the server by invoking this directly.
+    ///
+    /// Semantics, verified against the OBS API server
+    /// (`BsRequest#change_state` and
+    /// `BsRequestPermissionCheck#cmd_changestate_permissions`) and
+    /// the live API — not taken from anywhere else:
+    /// - The server does not pre-check here, and neither does the
+    ///   library: the server stays the authority on the transition,
+    ///   and its 403 is surfaced as-is. A request in `accepted`
+    ///   cannot change state at all, and a final state cannot move to
+    ///   another final state.
+    /// - Accepting requires write permission on the target, and the
+    ///   server can forbid self-accept outright (the
+    ///   `OBS:CreatorCannotAcceptOwnRequests` attribute, set on the
+    ///   target package or project). An agent accepts its own
+    ///   request only when the target allows it; the server's 403
+    ///   says so when it does not.
+    /// - Accepting a request in `review` state requires `force`
+    ///   (`force=1`): without it the server refuses. `force` is only
+    ///   honoured for accept; it is ignored for the other
+    ///   transitions, so the wrappers for decline and revoke do not
+    ///   take one.
+    /// - `superseded` is refused here: superseding needs a
+    ///   replacement id, and [`ObsClient::supersede_request`] is the
+    ///   path that carries it. `deleted` is refused here as well:
+    ///   deleting a request is an admin-only server operation, and
+    ///   revoking is the agent's way to withdraw one.
+    /// - Re-opening a request to `new` or `review` resets its
+    ///   non-accepted reviews to `new` and forces the state to
+    ///   `review` when reviews are still open; that is the server's
+    ///   behaviour, not the library's.
+    /// - Success is the `<status code="ok"/>` body: any other body is
+    ///   a server error, never success.
+    pub fn change_state(
+        &self,
+        id: &str,
+        state: RequestState,
+        comment: &str,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        let id = validate_request_id(id)?;
+        let state_name = match state {
+            RequestState::New
+            | RequestState::Review
+            | RequestState::Accepted
+            | RequestState::Declined
+            | RequestState::Revoked => state.as_str(),
+            RequestState::Superseded => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "superseding a submit request needs a replacement id; use supersede_request",
+                ));
+            }
+            RequestState::Deleted => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "deleting a submit request is an admin-only server operation; revoke it instead",
+                ));
+            }
+        };
+        if !dry_run.allow(&format!(
+            "change state of submit request {id} to {state_name}"
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot change a submit request's state without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("cmd", "changestate"), ("newstate", state_name)];
+        if force {
+            query.push(("force", "1"));
+        }
+        let url = build_url(&self.base, &["request", &id.to_string()], &query);
+        // The comment travels as the request body, as plain text:
+        // the server's `RequestController#request_command` takes
+        // `request.raw_post` as the comment (see
+        // `supersede_request`), so the body is the comment verbatim
+        // and its content type is its actual type (`text/plain`).
+        let body = self.http.post_text(&url, comment, &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS changestate response for submit request {id}"),
+            ))
+        }
+    }
+
+    /// Accept submit request `id` (`POST
+    /// /request/:id?cmd=changestate&newstate=accepted`), with
+    /// `comment` as the message left with the accept. An agent
+    /// accepts a request it reviewed and agrees with — the change
+    /// lands, and the source branch dies on accept when the request
+    /// was filed with cleanup (the default). `force` is for
+    /// accepting a request that is still in `review` state: the
+    /// server refuses that without `force=1`, so passing it is a
+    /// deliberate override of the open reviews, not a default. See
+    /// [`ObsClient::change_state`] for the semantics.
+    pub fn accept_request(
+        &self,
+        id: &str,
+        comment: &str,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        self.change_state(id, RequestState::Accepted, comment, force, dry_run)
+    }
+
+    /// Decline submit request `id` (`POST
+    /// /request/:id?cmd=changestate&newstate=declined`), with
+    /// `comment` as the reason. An agent declines a request it
+    /// reviewed and disagrees with; the reason is the review, so a
+    /// decline without one is possible but the caller should say
+    /// why. See [`ObsClient::change_state`] for the semantics.
+    pub fn decline_request(
+        &self,
+        id: &str,
+        comment: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        self.change_state(id, RequestState::Declined, comment, false, dry_run)
+    }
+
+    /// Revoke submit request `id` (`POST
+    /// /request/:id?cmd=changestate&newstate=revoked`), with
+    /// `comment` as the reason. Revoking is how a request is
+    /// withdrawn — by its creator, or by anyone the server allows to
+    /// withdraw it. See [`ObsClient::change_state`] for the semantics.
+    pub fn revoke_request(
+        &self,
+        id: &str,
+        comment: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        self.change_state(id, RequestState::Revoked, comment, false, dry_run)
+    }
+
+    /// Best-effort [`ObsClient::change_state`]: try the state change,
+    /// and return whether it happened. A transport or server failure
+    /// — the request is already closed, the credentials do not allow
+    /// the change, the server is unreachable — prints one warning to
+    /// stderr and returns `false` instead of failing, so a batch
+    /// triaging many requests does not stop at the first one that
+    /// cannot move. A caller bug does not get swallowed: a malformed
+    /// id or state, and missing credentials, still return an error.
+    /// In dry-run the change is recorded in the plan (as
+    /// [`ObsClient::change_state`] does) and this returns `true`.
+    pub fn try_change_state(
+        &self,
+        id: &str,
+        state: RequestState,
+        comment: &str,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<bool, GeectlError> {
+        match self.change_state(id, state, comment, force, dry_run) {
+            Ok(()) => Ok(true),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::NotFound
+                        | ErrorKind::AuthFailed
+                        | ErrorKind::ServerError
+                        | ErrorKind::Timeout
+                        | ErrorKind::NetworkError
+                        | ErrorKind::TlsError
+                ) =>
+            {
+                eprintln!("warning: could not change state of submit request {id}: {err}");
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Delete `project`/`package` from OBS (`DELETE
     /// /source/<project>/<package>`): the manual branch cleanup.
     /// Requests filed through this library clean up on accept by
@@ -6355,6 +6541,7 @@ mod tests {
         gets: RefCell<HashMap<String, String>>,
         get_errors: RefCell<HashMap<String, ErrorKind>>,
         posts: RefCell<HashMap<String, String>>,
+        post_errors: RefCell<HashMap<String, ErrorKind>>,
         deletes: RefCell<HashMap<String, String>>,
         puts: RefCell<HashMap<String, String>>,
         get_calls: RefCell<Vec<(String, bool)>>,
@@ -6369,6 +6556,7 @@ mod tests {
                 gets: RefCell::new(HashMap::new()),
                 get_errors: RefCell::new(HashMap::new()),
                 posts: RefCell::new(HashMap::new()),
+                post_errors: RefCell::new(HashMap::new()),
                 deletes: RefCell::new(HashMap::new()),
                 puts: RefCell::new(HashMap::new()),
                 get_calls: RefCell::new(Vec::new()),
@@ -6387,6 +6575,11 @@ mod tests {
 
         fn with_get_error(self, url: &str, kind: ErrorKind) -> Self {
             self.get_errors.borrow_mut().insert(url.to_string(), kind);
+            self
+        }
+
+        fn with_post_error(self, url: &str, kind: ErrorKind) -> Self {
+            self.post_errors.borrow_mut().insert(url.to_string(), kind);
             self
         }
 
@@ -6460,6 +6653,12 @@ mod tests {
             self.post_calls
                 .borrow_mut()
                 .push((url.to_string(), body.to_string(), authed));
+            if let Some(kind) = self.post_errors.borrow().get(url).cloned() {
+                return Err(GeectlError::new(
+                    kind,
+                    format!("canned POST error for {url}"),
+                ));
+            }
             self.posts.borrow().get(url).cloned().ok_or_else(|| {
                 GeectlError::new(
                     ErrorKind::NetworkError,
@@ -10923,5 +11122,200 @@ description</description>
         assert_eq!(log[0].description, "Create Request");
         assert_eq!(log[0].comment, "foobar");
         assert_eq!(log[0].who, "creator");
+    }
+
+    // -- Request state changes: change_state / accept / decline /
+    // revoke / try_change_state (the can_fail adoption: a failed
+    // change is swallowed with one warning, a caller bug is not).
+
+    #[test]
+    fn change_state_accept_posts_changestate_with_the_comment() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        obs.change_state("42", RequestState::Accepted, "looks good", false, &dry)
+            .expect("accept posts");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0,
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted"
+        );
+        assert_eq!(calls[0].1, "looks good");
+        assert!(calls[0].2, "the change is credentialed");
+    }
+
+    #[test]
+    fn change_state_force_adds_the_force_param() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted&force=1",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        obs.change_state(
+            "42",
+            RequestState::Accepted,
+            "overriding review",
+            true,
+            &dry,
+        )
+        .expect("forced accept posts");
+        assert_eq!(
+            http.post_calls()[0].0,
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted&force=1"
+        );
+    }
+
+    #[test]
+    fn change_state_refuses_superseded_and_deleted() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let err = obs
+            .change_state("42", RequestState::Superseded, "x", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = obs
+            .change_state("42", RequestState::Deleted, "x", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn change_state_dry_run_records_the_plan_and_posts_nothing() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        obs.change_state("42", RequestState::Accepted, "looks good", false, &dry)
+            .expect("dry-run accept records");
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: change state of submit request 42 to accepted".to_string()]
+        );
+    }
+
+    #[test]
+    fn change_state_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let dry = DryRun::new(false);
+        let err = obs
+            .change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn change_state_unexpected_response_is_error() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=declined",
+            "<status code=\"not_found\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let err = obs
+            .change_state("42", RequestState::Declined, "no", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn accept_decline_revoke_post_the_right_newstate() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                "<status code=\"ok\" />",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/43?cmd=changestate&newstate=declined",
+                "<status code=\"ok\" />",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/44?cmd=changestate&newstate=revoked",
+                "<status code=\"ok\" />",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        obs.accept_request("42", "landing it", false, &dry)
+            .expect("accept posts");
+        obs.decline_request("43", "not this way", &dry)
+            .expect("decline posts");
+        obs.revoke_request("44", "withdrawing", &dry)
+            .expect("revoke posts");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls[0].0,
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted"
+        );
+        assert_eq!(
+            calls[1].0,
+            "https://api.opensuse.org/request/43?cmd=changestate&newstate=declined"
+        );
+        assert_eq!(
+            calls[2].0,
+            "https://api.opensuse.org/request/44?cmd=changestate&newstate=revoked"
+        );
+    }
+
+    #[test]
+    fn try_change_state_true_on_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        assert!(obs
+            .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap());
+    }
+
+    #[test]
+    fn try_change_state_false_on_a_refused_change() {
+        // The server refuses the change (403 here): the failure is
+        // swallowed with a warning and the call reports false, so a
+        // batch triaging many requests does not stop at the first one
+        // that cannot move.
+        let http = FakeHttp::new().with_post_error(
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+            ErrorKind::AuthFailed,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        assert!(!obs
+            .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn try_change_state_propagates_a_caller_bug() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let err = obs
+            .try_change_state("not-an-id", RequestState::Accepted, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn try_change_state_true_in_dry_run() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        assert!(obs
+            .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap());
+        assert!(http.post_calls().is_empty());
     }
 }
