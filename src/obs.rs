@@ -628,6 +628,30 @@ pub struct PackageMeta {
     pub groups: Vec<NamedRole>,
 }
 
+/// A package match from a package search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageMatch {
+    /// Package name.
+    pub name: String,
+    /// The project the package lives in.
+    pub project: String,
+    /// Title, when the match carries one.
+    pub title: Option<String>,
+    /// Description, when the match carries one.
+    pub description: Option<String>,
+}
+
+/// A project match from a project search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMatch {
+    /// Project name.
+    pub name: String,
+    /// Title, when the match carries one.
+    pub title: Option<String>,
+    /// Description, when the match carries one.
+    pub description: Option<String>,
+}
+
 /// The OBS client: the devel-project lookup, the devel version, the
 /// open-submit-request check, submit-request filing, branch setup,
 /// and the remote reads (file and directory reads, history, meta,
@@ -1561,6 +1585,69 @@ impl<'a> ObsClient<'a> {
         );
         let body = self.http.get_with(&url, &Credentials::None)?;
         parse_package_meta(&body)
+    }
+
+    /// Search packages by substring (`GET
+    /// /search/package?match=...`): the match is
+    /// `contains(@name,'term') or contains(title,'term') or
+    /// contains(description,'term')` — a substring match, not the
+    /// exact match osc defaults to. Requires credentials; without
+    /// them the search fails loudly before any request. An unexpected
+    /// response (no `matches` count) is an error, never an empty
+    /// list.
+    pub fn search_packages(&self, term: &str) -> Result<Vec<PackageMatch>, GeectlError> {
+        let term = validate_search_term(term)?;
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching packages requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let match_expr = format!(
+            "contains(@name,'{term}') or contains(title,'{term}') or contains(description,'{term}')"
+        );
+        let url = build_url(
+            &self.base,
+            &["search", "package"],
+            &[("match", &match_expr)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_package_search(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS package search response for {term:?}"),
+            )
+        })
+    }
+
+    /// Search projects by substring (`GET
+    /// /search/project?match=...`): the same substring match as
+    /// [`ObsClient::search_packages`], over project names, titles,
+    /// and descriptions. Requires credentials; an unexpected response
+    /// is an error, never an empty list.
+    pub fn search_projects(&self, term: &str) -> Result<Vec<ProjectMatch>, GeectlError> {
+        let term = validate_search_term(term)?;
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching projects requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let match_expr = format!(
+            "contains(@name,'{term}') or contains(title,'{term}') or contains(description,'{term}')"
+        );
+        let url = build_url(
+            &self.base,
+            &["search", "project"],
+            &[("match", &match_expr)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_project_search(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS project search response for {term:?}"),
+            )
+        })
     }
 
     /// Build the OBS search URL for open submit requests targeting
@@ -2687,6 +2774,96 @@ pub(crate) fn parse_package_meta(body: &str) -> Result<PackageMeta, GeectlError>
         persons,
         groups,
     })
+}
+
+/// True when `body` is an OBS search collection: it carries a
+/// `<collection` tag and a `matches` count. The count is required so
+/// a malformed collection cannot read as empty.
+fn is_search_collection(body: &str) -> bool {
+    body.contains("<collection") && parse_search_matches(body).is_some()
+}
+
+/// Parse a package search response (`<collection matches="N">` of
+/// `<package name project>` elements with `<title>` and
+/// `<description>` children). None when the response is not a
+/// collection at all, carries no `matches` count, or says there are
+/// matches but none parsed: an unexpected response is an error,
+/// never an empty list. An empty collection (with its count) reads
+/// as an empty list. A package element without a `name` or `project`
+/// attribute is skipped, not an error: only the collection envelope
+/// itself is validated here.
+pub(crate) fn parse_package_search(body: &str) -> Option<Vec<PackageMatch>> {
+    if !is_search_collection(body) {
+        return None;
+    }
+    let matches_count = parse_search_matches(body)?;
+    let mut matches = Vec::new();
+    for (element, inner) in elements(body, "package").ok()? {
+        let (Some(name), Some(project)) =
+            (tag_attr(&element, "name"), tag_attr(&element, "project"))
+        else {
+            continue;
+        };
+        matches.push(PackageMatch {
+            name: xml_unescape(&name),
+            project: xml_unescape(&project),
+            title: element_text(&inner, "title"),
+            description: element_text(&inner, "description"),
+        });
+    }
+    // The count says there are matches but none parsed: the server
+    // changed shape underneath us, and an empty list here would hide
+    // results.
+    if matches_count > 0 && matches.is_empty() {
+        return None;
+    }
+    Some(matches)
+}
+
+/// Parse a project search response (`<collection matches="N">` of
+/// `<project name>` elements with `<title>` and `<description>`
+/// children). None on the same fail-closed terms as
+/// [`parse_package_search`].
+pub(crate) fn parse_project_search(body: &str) -> Option<Vec<ProjectMatch>> {
+    if !is_search_collection(body) {
+        return None;
+    }
+    let matches_count = parse_search_matches(body)?;
+    let mut matches = Vec::new();
+    for (element, inner) in elements(body, "project").ok()? {
+        let Some(name) = tag_attr(&element, "name") else {
+            continue;
+        };
+        matches.push(ProjectMatch {
+            name: xml_unescape(&name),
+            title: element_text(&inner, "title"),
+            description: element_text(&inner, "description"),
+        });
+    }
+    if matches_count > 0 && matches.is_empty() {
+        return None;
+    }
+    Some(matches)
+}
+
+/// Validate a search term: non-empty, and without a single quote —
+/// the term goes into a single-quoted XPath string literal, where a
+/// quote would break out of the literal (XPath has no string
+/// escape).
+fn validate_search_term(term: &str) -> Result<&str, GeectlError> {
+    if term.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "search term must not be empty",
+        ));
+    }
+    if term.contains('\'') {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("search term must not contain a single quote: {term:?}"),
+        ));
+    }
+    Ok(term)
 }
 
 /// Validate an OBS request id: a non-empty run of ASCII digits that
@@ -6245,5 +6422,161 @@ mod tests {
         assert!(client.project_meta("openSUSE:Factory/x").is_err());
         assert!(client.package_meta("openSUSE:Factory", "foo/bar").is_err());
         assert!(http.get_calls().is_empty());
+    }
+
+    // --- parse_package_search / parse_project_search ---
+
+    const PACKAGE_SEARCH_FIXTURE: &str = "<collection matches=\"2\">\
+        <package name=\"foo\" project=\"openSUSE:Factory\">\
+        <title>Foo package</title><description>A test package</description>\
+        </package>\
+        <package name=\"foobar\" project=\"devel:languages:python\"/>\
+        </collection>";
+
+    const PROJECT_SEARCH_FIXTURE: &str = "<collection matches=\"1\">\
+        <project name=\"devel:languages:python\">\
+        <title>Python</title><description>Python packages</description>\
+        </project>\
+        </collection>";
+
+    #[test]
+    fn package_search_parses_matches() {
+        let matches = parse_package_search(PACKAGE_SEARCH_FIXTURE).unwrap();
+        assert_eq!(
+            matches,
+            vec![
+                PackageMatch {
+                    name: "foo".to_string(),
+                    project: "openSUSE:Factory".to_string(),
+                    title: Some("Foo package".to_string()),
+                    description: Some("A test package".to_string()),
+                },
+                PackageMatch {
+                    name: "foobar".to_string(),
+                    project: "devel:languages:python".to_string(),
+                    title: None,
+                    description: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn project_search_parses_matches() {
+        let matches = parse_project_search(PROJECT_SEARCH_FIXTURE).unwrap();
+        assert_eq!(
+            matches,
+            vec![ProjectMatch {
+                name: "devel:languages:python".to_string(),
+                title: Some("Python".to_string()),
+                description: Some("Python packages".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn search_parsers_are_fail_closed() {
+        // Not a collection, or no matches count: None.
+        assert_eq!(parse_package_search(""), None);
+        assert_eq!(parse_package_search("<directory></directory>"), None);
+        assert_eq!(
+            parse_package_search("<collection><package name=\"x\" project=\"y\"/></collection>"),
+            None
+        );
+        assert_eq!(parse_project_search(""), None);
+        // An empty collection (with its count) reads as an empty list.
+        assert_eq!(
+            parse_package_search("<collection matches=\"0\"></collection>"),
+            Some(vec![])
+        );
+        assert_eq!(
+            parse_project_search("<collection matches=\"0\"></collection>"),
+            Some(vec![])
+        );
+        // The count says there are matches but none parsed: None.
+        assert_eq!(
+            parse_package_search("<collection matches=\"2\"></collection>"),
+            None
+        );
+        assert_eq!(
+            parse_project_search("<collection matches=\"1\"></collection>"),
+            None
+        );
+        // An element without its name is skipped, not an error.
+        assert_eq!(
+            parse_package_search(
+                "<collection matches=\"2\"><package project=\"y\"/><package name=\"x\" project=\"y\"/></collection>"
+            ),
+            Some(vec![PackageMatch {
+                name: "x".to_string(),
+                project: "y".to_string(),
+                title: None,
+                description: None,
+            }])
+        );
+    }
+
+    // --- search_packages / search_projects ---
+
+    #[test]
+    fn search_packages_sends_the_substring_match_authed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/package?match=contains%28%40name%2C%27foo%27%29%20or%20contains%28title%2C%27foo%27%29%20or%20contains%28description%2C%27foo%27%29",
+            PACKAGE_SEARCH_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let matches = client.search_packages("foo").unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].name, "foo");
+        // The search carries credentials.
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/search/package?match=contains%28%40name%2C%27foo%27%29%20or%20contains%28title%2C%27foo%27%29%20or%20contains%28description%2C%27foo%27%29"
+                    .to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn search_projects_sends_the_substring_match_authed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project?match=contains%28%40name%2C%27python%27%29%20or%20contains%28title%2C%27python%27%29%20or%20contains%28description%2C%27python%27%29",
+            PROJECT_SEARCH_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let matches = client.search_projects("python").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "devel:languages:python");
+    }
+
+    #[test]
+    fn search_requires_credentials() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.search_packages("foo").is_err());
+        assert!(client.search_projects("foo").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn search_rejects_bad_terms() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.search_packages("").is_err());
+        assert!(client.search_packages("foo' or '1'='1").is_err());
+        assert!(client.search_projects("").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn search_unexpected_response_is_an_error() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/package?match=contains%28%40name%2C%27foo%27%29%20or%20contains%28title%2C%27foo%27%29%20or%20contains%28description%2C%27foo%27%29",
+            "<collection><package name=\"x\" project=\"y\"/></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.search_packages("foo").is_err());
     }
 }
