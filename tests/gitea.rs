@@ -54,14 +54,28 @@ fn is_loopback_url(url: &str) -> bool {
 /// The Gitea instance's base URL, from the environment.
 ///
 /// Returns `None` (skip the test) when `GEECTL_GITEA_URL` is unset or
-/// empty. Rejects any URL that is not loopback-only: the instance is
+/// empty — unless the run is in a job that provisions an instance (see
+/// below). Rejects any URL that is not loopback-only: the instance is
 /// plain HTTP, so pointing the harness at a non-localhost server would
 /// send the token in cleartext over a real network. That must fail
 /// fast, not silently.
 fn gitea_url() -> Option<String> {
-    let url = std::env::var("GEECTL_GITEA_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())?;
+    let url = match std::env::var("GEECTL_GITEA_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => {
+            // Only a job that provisions an instance expects the URL:
+            // the `test` job sets GEECTL_GITEA_EXPECTED (see test.yml),
+            // so a missing URL there means provisioning failed to run
+            // or to export it — fail loudly instead of silently
+            // skipping the whole live suite. Other jobs (beta, macOS)
+            // do not provision and skip quietly: `CI` is set in every
+            // GitHub job, so gating on it panicked there too.
+            if std::env::var_os("GEECTL_GITEA_EXPECTED").is_some_and(|v| !v.is_empty()) {
+                panic!("GEECTL_GITEA_URL is not set: the provision step must export it");
+            }
+            return None;
+        }
+    };
     let url = url.trim_end_matches('/').to_string();
     assert!(
         is_loopback_url(&url),

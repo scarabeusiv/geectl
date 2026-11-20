@@ -54,6 +54,13 @@ jobs:
       - name: Provision disposable Gitea instance
         run: bash tests/gitea/provision.sh
       - name: Run the test suite
+        env:
+          # The live Gitea tests expect a provisioned instance in this
+          # job: the harness fails loudly when the URL is missing here,
+          # so a broken provision step cannot silently skip the live
+          # suite. Other jobs (beta, macOS) do not set this and skip
+          # the live tests quietly.
+          GEECTL_GITEA_EXPECTED: "1"
         run: cargo test --locked
       - name: Tear down disposable Gitea instance
         if: always()
