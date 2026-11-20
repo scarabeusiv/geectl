@@ -17,7 +17,8 @@ The library modules at scaffolding time:
 | `error` | The centralized error store (see below). |
 | `url` | The single URL builder (one encoder per context). |
 | `http` | The HTTP client trait with a bounded timeout, plus a ureq implementation. |
-| `auth` | The auth seam — a trait only (see below). |
+| `auth` | The credential types and resolution (see below). |
+| `config` | The XDG config file (URLs only) and the secure-write primitive. |
 
 Later modules (OBS operations, Gitea operations, XML→JSON mapping) plug
 into this shape; they do not change it.
@@ -77,18 +78,28 @@ to encode.
   buffered and replayable by construction. A retry after 401 must verify
   the body is byte-identical or refuse to retry.
 
-## The auth seam (`src/auth.rs`)
+## Auth (`src/auth.rs`, `src/http.rs`)
 
-Auth is a trait only in the scaffold. The credential design is done after
-scaffolding; this trait is the seam it plugs into, so the later design
-does not have to fight the scaffolding.
+Credentials are resolved by providers implementing the `AuthProvider`
+trait (`src/auth.rs`): `EnvObsAuth` (OBS Basic from
+`GEECTL_OBS_USERNAME` + `GEECTL_OBS_PASSWORD` or
+`GEECTL_OBS_PASSWORD_FILE`), `EnvGiteaAuth` (Gitea Bearer from
+`GEECTL_GITEA_TOKEN` or `GEECTL_GITEA_TOKEN_FILE`), and `GiteaSshKey`
+(the SSH private key from `GEECTL_GITEA_SSH_KEY`). Unconfigured
+resolves to `Credentials::None`; a half-configured pair, both secret
+sources set, or a malformed value is a `ConfigError` naming the
+source, never the value. The SSH key must be a PEM private key in a
+file mode 0600 or stricter (unix).
 
-The design will cover:
+The HTTP client (`src/http.rs`) applies the credentials per request:
+Basic as an `Authorization: Basic` header, Bearer as
+`Authorization: Bearer`. An SSH key cannot authenticate an HTTP
+request and is refused before any network traffic. Credentials are
+only sent over `https://`, or to a loopback host (for tests with
+fixture credentials) — cleartext http to any other host is refused
+before connecting.
 
-- OBS: username/password (Basic auth) — OBS has no API key.
-- Gitea: API token (Bearer), plus SSH keys for git operations.
-
-Rules that already hold:
+Rules that hold:
 
 - Credentials come from environment variables or mounted secret files
   only. There is no plaintext fallback and no obfuscation option.
@@ -114,11 +125,16 @@ Rules that already hold:
 
 ## Configuration
 
-- One config file location. Explicit precedence, documented in one place:
-  flag > environment variable > config file > built-in default.
+- One config file: `$XDG_CONFIG_HOME/geectl/config.toml` (default
+  `~/.config/geectl/config.toml`). Explicit precedence, documented in
+  one place: flag > environment variable > config file > built-in
+  default. The built-in defaults are `https://api.opensuse.org` (OBS)
+  and `https://src.opensuse.org` (Gitea).
 - A `config show` command prints the effective configuration with the
-  source of each value. If two config files are found, that is an error,
-  not a warning.
+  source of each value. If two config files are found, that is an
+  error, not a warning.
+- A `config init` command writes the template (endpoints only) and
+  refuses to overwrite an existing file.
 
 ## Testing
 

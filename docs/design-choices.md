@@ -154,6 +154,32 @@ marks the connection as unverified, and the option lives in the same
 file as the password, so anyone who can edit the config can strip TLS
 without the operator noticing.
 
+### Where credentials come from: env vars and mounted secret files
+
+OBS takes a username and password (`GEECTL_OBS_USERNAME` +
+`GEECTL_OBS_PASSWORD`, or `GEECTL_OBS_PASSWORD_FILE` for the
+password); Gitea takes an API token (`GEECTL_GITEA_TOKEN`, or
+`GEECTL_GITEA_TOKEN_FILE`) and, for git operations, an SSH private
+key (`GEECTL_GITEA_SSH_KEY`). The `*_FILE` form names a file whose
+whole content is the secret — the mounted-secret shape. A
+half-configured pair, both secret sources set, or a malformed value
+fails at startup as a config error naming the variable, never the
+value, so a bad credential never reaches a request.
+
+Rationale: an agent's credentials arrive as environment variables or
+mounted secrets, not as interactive input. Failing at startup — with
+the variable named — turns a credential misconfiguration into a
+diagnosis, not a 401 halfway through a run.
+
+### Keyring is deferred
+
+There is no keyring backend in this PR. A keyring needs a platform
+secret service (and a daemon on Linux), and it only serves
+interactive human use — an agent has no desktop session to unlock.
+Agents use environment variables or mounted secrets. The
+`AuthProvider` trait is the seam a keyring provider would plug into
+when a human-facing use case needs it.
+
 ## Output and errors
 
 ### Stdout is only the result payload
@@ -250,10 +276,13 @@ mysterious re-authentication.
 
 ### One config file, explicit precedence, `config show`
 
-One config file location. Explicit precedence, documented in one place:
-flag > environment variable > config file > built-in default. A `config
-show` command prints the effective configuration with the source of each
-value. If two config files are found, that is an error, not a warning.
+One config file: `$XDG_CONFIG_HOME/geectl/config.toml` (default
+`~/.config/geectl/config.toml`). Explicit precedence, documented in
+one place: flag > environment variable > config file > built-in
+default. A `config show` command prints the effective configuration
+with the source of each value; `config init` writes the template and
+refuses to overwrite. If two config files are found, that is an
+error, not a warning.
 
 Rationale: an agent that writes one config location while another exists
 gets its settings silently ignored, and the only signal is a warning

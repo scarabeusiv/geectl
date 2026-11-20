@@ -55,6 +55,41 @@ decisions behind these guarantees, including the risks found by reading
 another CLI's source and the rules geectl follows instead. See
 [docs/architecture.md](docs/architecture.md) for the crate layout.
 
+## Authentication
+
+Credentials come from environment variables or mounted secret files
+only — never from a config file, never prompted, never logged.
+
+| Service | Credential | Variables |
+| ------- | ---------- | --------- |
+| OBS | username + password (Basic auth; OBS has no API key) | `GEECTL_OBS_USERNAME` + `GEECTL_OBS_PASSWORD`, or `GEECTL_OBS_PASSWORD_FILE` |
+| Gitea | API token (Bearer) | `GEECTL_GITEA_TOKEN`, or `GEECTL_GITEA_TOKEN_FILE` |
+| Gitea | SSH private key (git operations) | `GEECTL_GITEA_SSH_KEY` |
+
+The `*_FILE` variables name a file whose whole content is the secret
+(trailing newlines are trimmed); they are how a mounted secret (e.g.
+a container secret) is used. Setting both a variable and its `_FILE`
+form is an error, as is a half-configured pair. A malformed value fails
+at startup as a config error naming the variable, never the value.
+
+The SSH key must be a PEM private key in a file mode 0600 or stricter;
+a group/world-readable key is a config error.
+
+The config file (`$XDG_CONFIG_HOME/geectl/config.toml`, default
+`~/.config/geectl/config.toml`) holds endpoint URLs only (`obs_url`,
+`gitea_url`). A credential-shaped key in it is a refusal to run.
+`config show` prints the effective URLs with their source and the
+credential status (username only for Basic auth, never a secret value);
+`config init` writes the template and refuses to overwrite.
+
+A keyring backend is deferred: it needs a platform secret service and
+only serves interactive human use, while agents use environment
+variables or mounted secrets. The `AuthProvider` trait is the seam a
+keyring provider would plug into.
+
+Credentials are only sent over `https://` (or to a loopback host for
+tests). There is no option to disable TLS verification, ever.
+
 ## Build and test
 
 ```sh
