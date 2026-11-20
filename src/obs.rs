@@ -1732,7 +1732,11 @@ impl SrPayload {
     /// out of its element. The action carries
     /// `<options><sourceupdate>…</sourceupdate></options>` with the
     /// payload's source-update value (`cleanup` by default).
-    pub fn to_xml(&self) -> String {
+    ///
+    /// Crate-internal: the rendering is used by [`SrFiling`] (the
+    /// dry-run note) and by the unit tests. Consumers never see XML;
+    /// they file the typed payload through [`SrFiling::file`].
+    pub(crate) fn to_xml(&self) -> String {
         format!(
             "<request>\n  <action type=\"submit\">\n    <source project=\"{}\" package=\"{}\" />\n    <target project=\"{}\" package=\"{}\" />\n    <options><sourceupdate>{}</sourceupdate></options>\n  </action>\n  <description>{}</description>\n</request>",
             xml_escape(&self.source_project),
