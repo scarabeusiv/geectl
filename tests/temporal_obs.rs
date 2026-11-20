@@ -213,17 +213,22 @@ fn unique_suffix() -> String {
     format!("{}-{nanos}", std::process::id())
 }
 
-/// The package every temporal SR test submits. The same name in every
-/// test is safe: the projects differ per test (see `unique_suffix`),
-/// so the packages never collide.
-const TEMPORAL_PACKAGE: &str = "geectl-temporal-pkg";
+/// A package name unique to this test run. The projects already
+/// differ per test, so the package entities never collide — but the
+/// name must still be unique: the open-SR search is scoped by target
+/// package name only, so a shared name lets one test's open request
+/// block another test's filing (the refile test hit exactly that:
+/// the filing test's open request targeted the same package name).
+fn temporal_package() -> String {
+    format!("geectl-temporal-pkg-{}", unique_suffix())
+}
 
 /// Create a uniquely-named source project plus the package in it.
 /// Returns the source project name. The project is deliberately NOT
 /// a `home:<user>` project: the accept-cleanup test asserts the
 /// server deletes it once it is empty, and the server keeps
 /// top-level `home:<user>` projects (see `SourceUpdate::Cleanup`).
-fn create_source_branch(client: &ObsClient<'_>) -> String {
+fn create_source_branch(client: &ObsClient<'_>, package: &str) -> String {
     let source_project = format!("geectl-tmp-src-{}", unique_suffix());
     client
         .create_project(
@@ -235,7 +240,7 @@ fn create_source_branch(client: &ObsClient<'_>) -> String {
     client
         .create_package(
             &source_project,
-            TEMPORAL_PACKAGE,
+            package,
             "geectl temporal test package",
             "Created by the geectl temporal live test; the instance is destroyed after the run.",
         )
@@ -248,7 +253,8 @@ fn create_source_branch(client: &ObsClient<'_>) -> String {
 /// package)`. The target project only needs to exist: the submitted
 /// package is created in it on accept.
 fn setup_branch(client: &ObsClient<'_>) -> (String, String, String) {
-    let source_project = create_source_branch(client);
+    let package = temporal_package();
+    let source_project = create_source_branch(client, &package);
     let target_project = format!("geectl-tmp-tgt-{}", unique_suffix());
     client
         .create_project(
@@ -257,7 +263,7 @@ fn setup_branch(client: &ObsClient<'_>) -> (String, String, String) {
             "Created by the geectl temporal live test; the instance is destroyed after the run.",
         )
         .expect("create target project on the temporal instance");
-    (source_project, target_project, TEMPORAL_PACKAGE.to_string())
+    (source_project, target_project, package)
 }
 
 /// A submit-request payload for the temporal tests: source branch to
@@ -536,7 +542,7 @@ fn temporal_refile_supersedes_and_deletes_on_server() {
         .expect("file the first submit request on the temporal instance")
         .expect("live filing returns a request id");
     // The refile comes from a second branch, same target.
-    let source_b = create_source_branch(&client);
+    let source_b = create_source_branch(&client, &package);
     let id2 = filing
         .refile(
             &temporal_payload(&source_b, &package, &target_project, "2.1"),
