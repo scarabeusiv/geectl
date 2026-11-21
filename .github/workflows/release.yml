@@ -1,0 +1,415 @@
+---
+# Release: build binaries, sign them, create the GitHub release.
+#
+# Triggered by a bare `v`-prefixed tag (vX.Y.Z only; suffixed tags are
+# ignored at the trigger). The version is the tag minus the `v` and must
+# equal the [package] version in Cargo.toml, or the run fails before
+# building anything. A manual workflow_dispatch run only builds
+# (dry-run): artifacts land on the run, no release is created. After a
+# release is published, the post-release-bump job opens the X.Y.(Z+1)
+# development bump PR.
+#
+# Signing is required for tag builds: the `GPG_PRIVATE_KEY` secret must
+# hold the dedicated signing SUBKEY (ASCII-armored; never the primary
+# key), `GPG_PASSPHRASE` its passphrase, and `GPG_SIGNING_FINGERPRINT`
+# the subkey's fingerprint. A missing secret fails the job rather than
+# shipping unsigned artifacts. Every published file (tarballs, their
+# per-asset checksums, the combined checksums) gets a detached `.asc`
+# signature, signed as the pinned subkey.
+#
+# Deliberately not here: no benchmark job (geectl has no release corpus
+# to A/B against), no crates.io publish (registry versions burn the
+# version number; re-add once the release cadence is settled), no OBS
+# submission (separate packaging track), and no tag-signature
+# verification (rpmcrab does not do it either).
+name: release
+on:
+  push:
+    tags:
+      # Bare vX.Y.Z only. Push-tag filters are globs, not regex, so a
+      # `+` quantifier would be a literal character and never match;
+      # each segment is a digit followed by anything, and the negated
+      # pattern below excludes the suffixed tags the star would
+      # otherwise admit (a glob cannot say "ends with a digit").
+      # `tags` and `tags-ignore` cannot be used on the same event, so
+      # the exclusion lives here as a negated pattern. check-version
+      # still requires exact equality with the manifest version, so
+      # a four-segment tag fails there before building anything.
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+      - '!v*.*.*-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. X.Y.Z). Dry-run only: no release is created.'
+        required: true
+
+permissions:
+  contents: read
+
+# One release run per tag: overlapping tag or dispatch runs would race
+# the post-release-bump push to the same bump branch. A release in
+# flight is never cancelled.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Derive the release version and refuse anything that disagrees with the
+  # manifest, so a mistyped tag can never ship the wrong version string.
+  check-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Derive and check the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+          else
+            # Strip the leading `v`: vX.Y.Z -> X.Y.Z.
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          # Scope to the [package] table and tolerate spacing and a
+          # trailing comment around the value, so a `version =` in any
+          # earlier table cannot win and valid formatting is accepted.
+          # A workspace-inherited version yields nothing and fails
+          # closed below, as it must: there is no literal to compare.
+          manifest=$(sed -n '/^\[package\]/,/^\[/s/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          test -n "$manifest" || { echo "no [package] version found" >&2; exit 1; }
+          if [ "$version" != "$manifest" ]; then
+            echo "version $version != manifest version $manifest" >&2
+            exit 1
+          fi
+          # A tag must point at main: a matching-version tag on a
+          # feature branch or stale commit never publishes, and the
+          # post-release bump assumes main. Dispatch runs build only.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            ahead=$(gh api "repos/${{ github.repository }}/compare/main...$GITHUB_SHA" --jq .ahead_by)
+            test "$ahead" = "0" || { echo "tag commit $GITHUB_SHA is $ahead commit(s) ahead of main; refusing to release" >&2; exit 1; }
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both legs pinned, not floating: a latest rollover must
+          # never ship the two arches from different OS baselines.
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          # Native arm64 runner: no cross toolchain to maintain.
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          # Pinned, not floating stable: release artifacts must be
+          # reproducible; bump deliberately (matches rust-toolchain.toml).
+          toolchain: 1.99.1
+      # Releases are built hermetically — no cargo cache, so restored build
+      # state can never influence published artifacts.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          version="$PACKAGE_VERSION"
+          target="${{ matrix.target }}"
+          stage="dist-$target"
+          mkdir -p "$stage"
+          cp "target/$target/release/geectl" "$stage/"
+          cp LICENSE README.md "$stage/"
+          out="geectl-${version}-${target}.tar.gz"
+          tar -czf "$out" -C "$stage" geectl LICENSE README.md
+          shasum -a 256 "$out" > "$out.sha256"
+          echo "asset=$out" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    # Tag pushes only: a dispatch run is a dry-run and stops after build.
+    if: github.event_name == 'push'
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      # Attestation mints the OIDC token for build provenance.
+      id-token: write
+      attestations: write
+    steps:
+      # gh release create/upload resolve the repo from git remotes, so the job
+      # needs a checkout even though it builds nothing itself.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+          if-no-files-found: error
+
+      - name: Write combined checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          # Completeness gate: the matrix has two legs (x86_64,
+          # aarch64). A skipped or cancelled leg must never publish a
+          # single-arch release, so the tarball count and the checksum
+          # coverage are asserted before anything is attested or
+          # published.
+          count=$(find . -maxdepth 1 -type f -name 'geectl-*.tar.gz' | wc -l)
+          test "$count" = "2" || { echo "expected 2 tarballs, found $count" >&2; exit 1; }
+          cat ./*.sha256 > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+          for t in geectl-*.tar.gz; do
+            grep -Fq "$t" SHA256SUMS || { echo "$t has no checksum entry" >&2; exit 1; }
+          done
+
+      - name: Sign artifacts
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          GPG_SIGNING_FINGERPRINT: ${{ secrets.GPG_SIGNING_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          # Signing is required for tag builds: a missing secret fails
+          # the job rather than shipping unsigned artifacts with no
+          # trace. The key secret must hold only the dedicated signing
+          # SUBKEY (ASCII-armored), never the primary key.
+          test -n "${GPG_PRIVATE_KEY:-}" || { echo "::error::GPG_PRIVATE_KEY is not set; refusing to publish unsigned artifacts" >&2; exit 1; }
+          test -n "${GPG_SIGNING_FINGERPRINT:-}" || { echo "::error::GPG_SIGNING_FINGERPRINT is not set; refusing to sign with an unpinned identity" >&2; exit 1; }
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # The expected fingerprint must be a signing-capable subkey
+          # in the imported keyring — never the primary key, never
+          # another key the secret might hold. Field 12 of the
+          # --with-colons record carries the capabilities (`s` signs).
+          if ! gpg --batch --list-secret-keys --with-colons | awk -F: -v fpr="$GPG_SIGNING_FINGERPRINT" '
+            /^ssb:/ { subkey=1; caps=$12; next }
+            /^sec:/ { subkey=0; next }
+            /^fpr:/ && subkey && index(caps, "s") && $10 == fpr { found=1 }
+            END { exit(!found) }'; then
+            echo "::error::GPG_SIGNING_FINGERPRINT $GPG_SIGNING_FINGERPRINT is not a signing subkey in the imported key" >&2
+            exit 1
+          fi
+          echo "signing with subkey: $GPG_SIGNING_FINGERPRINT"
+          sign_args=(--batch --yes --pinentry-mode loopback --detach-sign --armor --local-user "$GPG_SIGNING_FINGERPRINT")
+          cd dist
+          # Every published file gets a detached signature: the
+          # tarballs, their per-asset checksums, and the combined
+          # checksums. The passphrase is fed fresh per file — a pipe
+          # delivers its bytes exactly once, so a single shared pipe
+          # would starve every file after the first.
+          for f in geectl-*.tar.gz geectl-*.tar.gz.sha256 SHA256SUMS; do
+            if [ -n "${GPG_PASSPHRASE:-}" ]; then
+              printf '%s' "$GPG_PASSPHRASE" | gpg "${sign_args[@]}" --passphrase-fd 0 -o "$f.asc" "$f"
+            else
+              gpg "${sign_args[@]}" -o "$f.asc" "$f"
+            fi
+          done
+
+      # Attest the tarballs' build provenance between download and release, so
+      # a provenance failure costs the tag and leaves nothing published.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          # Only the tarballs: the checksums and signatures are
+          # generated in this job, not received from the build jobs,
+          # so attesting them would misrepresent provenance.
+          subject-path: |
+            dist/*.tar.gz
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          # The trigger admits bare vX.Y.Z only and check-version
+          # requires exact equality with the manifest, so every tag
+          # reaching this job is a plain release, never a pre-release.
+          # The release stays untitled (version tag only, no name): the
+          # notes body is generated first — a read-only API call that
+          # creates nothing — and handed to the create calls below as a
+          # file. Neither --title nor --generate-notes may reach them:
+          # either flag alone titles the release after the tag.
+          gh api -X POST "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="$tag" --jq .body > notes.md
+          # Assets ride the create call, not a later upload: gh creates as a
+          # draft, uploads, then publishes, which is the only sequence an
+          # immutable release accepts (a published release freezes its
+          # assets, so create-then-upload 422s). Recovery by leftover kind:
+          # a published release with assets is left alone; a draft (with or
+          # without assets) is deleted and recreated; a published mutable
+          # asset-less leftover is deleted and recreated; a published
+          # immutable asset-less release fails loudly — deleting it would
+          # retire the tag name without any release to recreate, so the way
+          # out is a new version, not a re-run.
+          # Existence check: only a 404 reads as "no release yet".
+          # Any other failure (network, auth, rate limit) fails loudly
+          # instead of attempting create over an existing release and
+          # masking the root cause.
+          view_err=$(mktemp)
+          if info="$(gh release view "$tag" --json isDraft,isImmutable,assets 2>"$view_err")"; then
+            :
+          elif grep -qi "404\|not found" "$view_err"; then
+            gh release create "$tag" --notes-file notes.md dist/*
+            exit 0
+          else
+            echo "::error::gh release view failed for $tag:" >&2
+            cat "$view_err" >&2
+            exit 1
+          fi
+          if [ "$(jq -r .isDraft <<<"$info")" = "false" ] \
+            && [ -n "$(jq -r '.assets[].name' <<<"$info")" ]; then
+            echo "release $tag already published with assets; leaving it alone"
+          elif [ "$(jq -r .isDraft <<<"$info")" = "true" ]; then
+            gh release delete "$tag" --yes
+            gh release create "$tag" --notes-file notes.md dist/*
+          elif [ "$(jq -r .isImmutable <<<"$info")" = "true" ]; then
+            echo "::error::release $tag is published, immutable, and has no assets; the tag name is retired and cannot back another release — bump the version and tag again"
+            exit 1
+          else
+            gh release delete "$tag" --yes
+            gh release create "$tag" --notes-file notes.md dist/*
+          fi
+
+  # Opens the post-release development bump (X.Y.Z -> X.Y.(Z+1)) as a PR
+  # with auto-merge on, so main stops carrying the shipped version as
+  # soon as the release is out. The PR still needs its human approval,
+  # and CI on a bot-opened PR waits for a maintainer's "Approve and run
+  # workflows". Lives here rather than in a workflow triggered by the
+  # release event, because events the GITHUB_TOKEN creates start no other
+  # workflow. A failure leaves the published release as it is: re-running
+  # the job updates the same branch and PR.
+  post-release-bump:
+    if: github.event_name == 'push'
+    needs: [check-version, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Compute the next development version
+        id: next
+        env:
+          RELEASED: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASED" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "next=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((10#${BASH_REMATCH[3]} + 1))" >> "$GITHUB_OUTPUT"
+          else
+            # Unreachable: check-version guarantees a bare X.Y.Z, so a
+            # non-bare value here means the workflow itself is broken.
+            echo "::error::released version $RELEASED is not a bare X.Y.Z" >&2
+            exit 1
+          fi
+      # No stored token: the bump script runs our own code. The push
+      # authenticates through gh's credential helper from GH_TOKEN.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.next.outputs.next
+        with:
+          ref: main
+          # Full history: the bump job creates a branch, commits and
+          # pushes from this checkout, and a depth-1 clone can fail or
+          # truncate history there.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check main still carries the released version
+        id: current
+        if: steps.next.outputs.next
+        env:
+          RELEASED: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          current=$(sed -n '/^\[package\]/,/^\[/s/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          test -n "$current" || { echo "no [package] version found on main" >&2; exit 1; }
+          if [ "$current" = "$RELEASED" ]; then
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main already carries $current; nothing to bump"
+          fi
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        if: steps.current.outputs.bump
+        with:
+          toolchain: 1.99.1
+      - name: Bump every version surface
+        if: steps.current.outputs.bump
+        env:
+          NEXT: ${{ steps.next.outputs.next }}
+        run: bash scripts/bump-version.sh "$NEXT"
+      - name: Open the bump PR with auto-merge
+        if: steps.current.outputs.bump
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXT: ${{ steps.next.outputs.next }}
+          RELEASED: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git --hostname github.com
+          branch="release/bump-$NEXT"
+          title="chore(release): bump to $NEXT for post-release development"
+          # Stage only the version surfaces: the bump script touches
+          # nothing else, and anything else it touched must fail the
+          # job rather than ride along in a version-bump PR.
+          git add Cargo.toml Cargo.lock
+          stray=$(git status --porcelain | grep -v '^[AMD] ' || true)
+          if [ -n "$stray" ]; then
+            echo "::error::the bump changed files outside the version surfaces:" >&2
+            echo "$stray" >&2
+            exit 1
+          fi
+          # A rerun finds the branch already pushed: it is left as is, so a
+          # maintainer's fix on the open bump PR is never overwritten, and
+          # the job only makes sure the PR and its auto-merge exist.
+          # ls-remote --exit-code: 0 = exists, 2 = absent, anything else is
+          # a real failure that must not read as "absent".
+          rc=0
+          git ls-remote --exit-code --heads origin "$branch" >/dev/null || rc=$?
+          case "$rc" in
+            0) echo "$branch already exists; leaving it as is" ;;
+            2)
+              git -c user.name=github-actions -c user.email=github-actions@github.com \
+                checkout -b "$branch"
+              git -c user.name=github-actions -c user.email=github-actions@github.com \
+                commit -m "$title"
+              git push -u origin "$branch"
+              ;;
+            *) echo "::error::git ls-remote failed ($rc)" >&2; exit 1 ;;
+          esac
+          body="v$RELEASED is out; main moves to $NEXT for post-release development. Opened by the release workflow."
+          # --head matches fork PRs by branch name too: only this repo's
+          # own branch may receive auto-merge.
+          pr=$(gh pr list --head "$branch" --json number,isCrossRepository \
+            --jq 'map(select(.isCrossRepository | not)) | .[0].number // empty')
+          if [ -z "$pr" ]; then
+            pr=$(gh pr create --base main --head "$branch" --title "$title" --body "$body")
+          fi
+          gh pr merge "$pr" --auto --rebase
