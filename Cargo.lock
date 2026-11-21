@@ -171,6 +171,7 @@ dependencies = [
  "base64",
  "clap",
  "libc",
+ "log",
  "serde",
  "serde_json",
  "toml",

@@ -17,6 +17,9 @@
 //!   credentials are stored anywhere here.
 //! - [`config`]: the XDG config file (endpoint URLs only, never
 //!   credentials) and the secure-write primitive.
+//! - [`debug`]: the debug channel — one coherent `--debug` stream of
+//!   human-readable lines on stderr (HTTP attempts, retries, library
+//!   decision points), with bodies only behind `--debug-body`.
 //! - [`obs`]: the OBS operations a tool uses to move a package update
 //!   through the distribution — devel-project lookup, devel version,
 //!   open-submit-request check, submit-request filing, superseding,
@@ -30,6 +33,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod debug;
 pub mod error;
 pub mod http;
 pub mod obs;
