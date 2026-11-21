@@ -1240,13 +1240,35 @@ pub struct PackageDeps {
 /// `<package>` without a name — is a server error, never an empty
 /// list.
 pub(crate) fn parse_builddepinfo(body: &str) -> Result<Vec<PackageDeps>, GeectlError> {
+    let body = body.trim();
+    // A malformed builddepinfo response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <builddepinfo> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS builddepinfo response: not a <builddepinfo> document",
+            format!(
+                "unexpected OBS builddepinfo response: not a <builddepinfo> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <builddepinfo> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <builddepinfo>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<builddepinfo") else {
         return Err(malformed());
     };
@@ -3892,6 +3914,52 @@ mod tests {
             "<builddepinfo><package name=\"a\"><pkgdep>x</pkgdep></builddepinfo>"
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_builddepinfo_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <builddepinfo>
+        // element; the result is the same as without one.
+        let plain = "<builddepinfo/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_builddepinfo(&prolog).unwrap(),
+            parse_builddepinfo(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_builddepinfo(&format!("<?xml?>{plain}")).unwrap(),
+            parse_builddepinfo(plain).unwrap()
+        );
+        assert_eq!(
+            parse_builddepinfo(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_builddepinfo(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <builddepinfo>.
+        assert!(parse_builddepinfo("<?xml version=\"1.0\" <builddepinfo></builddepinfo>").is_err());
+        assert!(parse_builddepinfo("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(
+            parse_builddepinfo("<?xmlfoo version=\"1.0\"?><builddepinfo></builddepinfo>").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_builddepinfo_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_builddepinfo("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_builddepinfo(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_builddepinfo("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
