@@ -70,10 +70,12 @@ use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{sanitize_url_for_error, HttpClient, Timeout, UreqClient};
 use geectl::obs::{
-    AggregateOptions, BranchOptions, CopyOptions, CopyProjectOptions, CreatePackageOptions,
-    DeleteProjectOptions, DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision,
-    ObsClient, PackageDiffStatus, ReleaseOptions, Request, RequestAction, RequestSearch,
-    RequestState, ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling, SrPayload,
+    AggregateOptions, BranchOptions, ChangeDevelPayload, CopyOptions, CopyProjectOptions,
+    CreatePackageOptions, DeletePayload, DeleteProjectOptions, DeleteTarget, DryRun,
+    FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision, MaintenanceBranchOptions,
+    MaintenanceIncidentPayload, ObsClient, PackageDiffStatus, ReleaseOptions, Request,
+    RequestAction, RequestSearch, RequestState, ReviewState, ReviewTarget, RevisionRange,
+    SourceUpdate, SrFiling, SrPayload,
 };
 
 /// Whether `url` points at a loopback host.
@@ -3786,4 +3788,635 @@ fn live_branch_new_package_nonexistent_succeeds() {
             .is_none_or(|p| p == missing.as_str()),
         "the branch must link at the missing package name; link: {link}"
     );
+}
+
+/// Create a uniquely-named project carrying `kind` in its `_meta`.
+/// Returns the project name.
+fn create_kind_project(client: &ObsClient<'_>, base: &str, kind: &str) -> String {
+    let project = format!("geectl-tmp-{kind}-{}", unique_suffix());
+    client
+        .create_project(
+            &project,
+            "geectl live test",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create project on the live instance");
+    set_project_kind(base, &project, kind);
+    project
+}
+
+/// Create a project of `kind` whose name carries a colon, so the live
+/// run exercises the `:` to `_` translation where the name feeds an
+/// extended package name.
+fn create_kind_project_colon(client: &ObsClient<'_>, base: &str, kind: &str) -> String {
+    let project = format!("geectl-tmp-{kind}:{}", unique_suffix());
+    client
+        .create_project(
+            &project,
+            "geectl live test",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create project on the live instance");
+    set_project_kind(base, &project, kind);
+    project
+}
+
+/// A maintenance incident payload for the live tests: the source
+/// branch to the maintenance project, releasing into the release
+/// project.
+fn incident_payload(
+    source_project: &str,
+    package: &str,
+    target_project: &str,
+    release_project: &str,
+) -> MaintenanceIncidentPayload {
+    MaintenanceIncidentPayload::new(
+        source_project,
+        &[package],
+        target_project,
+        &format!("Maintenance incident for {package}: live test"),
+    )
+    .expect("live maintenance incident payload")
+    .with_release_project(release_project)
+    .expect("live incident release project")
+}
+
+/// Accepting a change devel request re-points the target package's
+/// devel at the source package.
+#[test]
+fn live_change_devel_accept_sets_devel_on_server() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    // The package whose devel changes, and the project that will be
+    // its new devel. Both need to exist as packages.
+    let target_project = create_source_branch(&client, &package);
+    let devel_project = create_source_branch(&client, &package);
+    let dry = DryRun::new(false);
+    let filing = SrFiling::new(&client, &dry);
+    let payload = ChangeDevelPayload::new(
+        &devel_project,
+        &package,
+        &target_project,
+        &package,
+        &format!("Change devel of {package} to {devel_project}: live test"),
+    )
+    .expect("live change devel payload");
+    let id = filing
+        .file_change_devel(&payload)
+        .expect("file a change devel request on the live instance")
+        .expect("live filing returns a request id");
+    let body = request_xml(&base, &id);
+    assert_eq!(
+        request_state(&body).as_deref(),
+        Some("new"),
+        "filed request {id} must be new; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<action ", "type").as_deref(),
+        Some("change_devel"),
+        "filed request {id} must be a change devel; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<source ", "project").as_deref(),
+        Some(devel_project.as_str()),
+        "filed request {id} must name the new devel project; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<target ", "project").as_deref(),
+        Some(target_project.as_str()),
+        "filed request {id} must target the package's project; body: {body}"
+    );
+    client
+        .accept_request(&id, "accepted by the geectl live test", false, &dry)
+        .expect("accept the request on the live instance");
+    let accepted = request_xml(&base, &id);
+    assert_eq!(
+        request_state(&accepted).as_deref(),
+        Some("accepted"),
+        "request {id} must be accepted; body: {accepted}"
+    );
+    // The target package's _meta now names the devel package.
+    let meta = package_meta(&base, &target_project, &package);
+    assert!(
+        meta.contains(&format!(
+            "<devel project=\"{devel_project}\" package=\"{package}\"/>"
+        )),
+        "the target package {target_project}/{package} must name its new devel; meta: {meta}"
+    );
+}
+
+/// Accepting a delete request deletes the target package.
+#[test]
+fn live_delete_accept_deletes_package_on_server() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let dry = DryRun::new(false);
+    let filing = SrFiling::new(&client, &dry);
+    let payload = DeletePayload::new(
+        &project,
+        DeleteTarget::Package(package.clone()),
+        &format!("Delete {package}: live test"),
+    )
+    .expect("live delete payload");
+    let id = filing
+        .file_delete_request(&payload)
+        .expect("file a delete request on the live instance")
+        .expect("live filing returns a request id");
+    let body = request_xml(&base, &id);
+    assert_eq!(
+        request_state(&body).as_deref(),
+        Some("new"),
+        "filed request {id} must be new; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<action ", "type").as_deref(),
+        Some("delete"),
+        "filed request {id} must be a delete; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<target ", "project").as_deref(),
+        Some(project.as_str()),
+        "filed request {id} must target the package's project; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<target ", "package").as_deref(),
+        Some(package.as_str()),
+        "filed request {id} must target the package; body: {body}"
+    );
+    client
+        .accept_request(&id, "accepted by the geectl live test", false, &dry)
+        .expect("accept the request on the live instance");
+    let accepted = request_xml(&base, &id);
+    assert_eq!(
+        request_state(&accepted).as_deref(),
+        Some("accepted"),
+        "request {id} must be accepted; body: {accepted}"
+    );
+    wait_until_gone(&base, &format!("{project}/{package}"));
+}
+
+/// Listing the maintained instances of a package and branching it:
+/// the dry-run listing reports where the branch would land, and the
+/// live branch lands there.
+#[test]
+fn live_maintenance_branch_lists_and_branches_on_server() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let maintained_project = create_source_branch(&client, &package);
+    upload_spec(&client, &maintained_project, &package);
+    set_project_attribute(&base, &maintained_project, "OBS", "Maintained");
+    let options = MaintenanceBranchOptions::new();
+    let instances = client
+        .maintained_instances(&package, &options)
+        .expect("list maintained instances on the live instance");
+    assert_eq!(
+        instances.len(),
+        1,
+        "the maintained project must yield exactly one instance; got {instances:?}"
+    );
+    let instance = &instances[0];
+    assert_eq!(instance.source_project, maintained_project);
+    assert_eq!(instance.source_package, package);
+    assert_eq!(instance.devel_project, None);
+    assert_eq!(instance.devel_package, None);
+    let branch_project = format!("home:{}:branches:OBS_Maintained:{package}", live_username());
+    assert_eq!(instance.target_project, branch_project);
+    assert_eq!(
+        instance.target_package,
+        format!("{package}.{maintained_project}")
+    );
+    let dry = DryRun::new(false);
+    let result = client
+        .maintenance_branch(&package, &options, &dry)
+        .expect("branch the maintained package on the live instance")
+        .expect("live branch returns a result");
+    assert_eq!(result.target_project, branch_project);
+    assert_eq!(
+        result.target_package.as_deref(),
+        Some(format!("{package}.{maintained_project}").as_str())
+    );
+    assert_eq!(
+        result.source_project.as_deref(),
+        Some(maintained_project.as_str())
+    );
+    assert_eq!(result.source_package.as_deref(), Some(package.as_str()));
+    wait_until_present(
+        &base,
+        &format!("{branch_project}/{package}.{maintained_project}"),
+    );
+}
+
+/// Accepting a maintenance incident creates the incident project
+/// under the maintenance project and merges the package into it.
+#[test]
+fn live_maintenance_incident_accept_creates_incident_on_server() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, target_project, release_project, package) = setup_incident(&client, &base);
+    let dry = DryRun::new(false);
+    let filing = SrFiling::new(&client, &dry);
+    let id = filing
+        .file_maintenance_incident(&incident_payload(
+            &source_project,
+            &package,
+            &target_project,
+            &release_project,
+        ))
+        .expect("file a maintenance incident on the live instance")
+        .expect("live filing returns a request id");
+    client
+        .accept_request(&id, "accepted by the geectl live test", false, &dry)
+        .expect("accept the request on the live instance");
+    let accepted = request_xml(&base, &id);
+    assert_eq!(
+        request_state(&accepted).as_deref(),
+        Some("accepted"),
+        "incident {id} must be accepted; body: {accepted}"
+    );
+    // The accept moves the target to the incident project it created
+    // under the maintenance project.
+    let incident_project = xml_attr_after(&accepted, "<target ", "project")
+        .expect("the accepted incident must name its incident project");
+    assert!(
+        incident_project.starts_with(&format!("{target_project}:")),
+        "the incident project {incident_project} must sit under the maintenance project {target_project}; body: {accepted}"
+    );
+    // The accept merges the package under the extended name
+    // `<package>.<release-project>` — the plain source name never
+    // lands. The accepted request's own target names it.
+    let incident_package = xml_attr_after(&accepted, "<target ", "package")
+        .expect("the accepted incident must name its incident package");
+    assert_eq!(
+        incident_package,
+        format!("{package}.{release_project}").replace(':', "_"),
+        "the incident package must be the source extended with the release project; body: {accepted}"
+    );
+    wait_until_present(&base, &incident_project);
+    wait_until_present(&base, &format!("{incident_project}/{incident_package}"));
+}
+
+/// Filing a real maintenance incident request and reading it back
+/// from the server, then filing the same incident again: the dedup
+/// refuses the duplicate and names the open request.
+#[test]
+fn live_maintenance_incident_filed_and_dedup_on_server() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, target_project, release_project, package) = setup_incident(&client, &base);
+    let dry = DryRun::new(false);
+    let filing = SrFiling::new(&client, &dry);
+    let payload = incident_payload(&source_project, &package, &target_project, &release_project);
+    let id = filing
+        .file_maintenance_incident(&payload)
+        .expect("file a maintenance incident on the live instance")
+        .expect("live filing returns a request id");
+    let body = request_xml(&base, &id);
+    // The filed incident is open, from the branch, to the maintenance
+    // project, releasing into the release project — and the filing
+    // pinned source_rev, so the source carries a rev.
+    assert_eq!(
+        request_state(&body).as_deref(),
+        Some("new"),
+        "filed incident {id} must be new; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<action ", "type").as_deref(),
+        Some("maintenance_incident"),
+        "filed request {id} must be a maintenance incident; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<source ", "project").as_deref(),
+        Some(source_project.as_str()),
+        "filed incident {id} must come from the branch; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<source ", "package").as_deref(),
+        Some(package.as_str()),
+        "filed incident {id} must carry the branch package; body: {body}"
+    );
+    assert!(
+        xml_attr_after(&body, "<source ", "rev").is_some(),
+        "filed incident {id} must pin source_rev (addrevision=1); body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<target ", "project").as_deref(),
+        Some(target_project.as_str()),
+        "filed incident {id} must target the maintenance project; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<target ", "releaseproject").as_deref(),
+        Some(release_project.as_str()),
+        "filed incident {id} must release into the release project; body: {body}"
+    );
+    // Filing the same incident again is refused by the dedup, and
+    // the refusal names the open request.
+    let err = filing
+        .file_maintenance_incident(&incident_payload(
+            &source_project,
+            &package,
+            &target_project,
+            &release_project,
+        ))
+        .expect_err("filing a duplicate maintenance incident must be refused");
+    assert!(
+        format!("{err}").contains(&id),
+        "the refusal must name the open incident {id}; got {err}"
+    );
+}
+
+/// The maintenance incident refile lifecycle against the server:
+/// file, then refile from a second branch and supersede.
+#[test]
+fn live_maintenance_incident_refile_supersedes_on_server() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_a, target_project, release_project, package) = setup_incident(&client, &base);
+    let dry = DryRun::new(false);
+    let filing = SrFiling::new(&client, &dry);
+    let id1 = filing
+        .file_maintenance_incident(&incident_payload(
+            &source_a,
+            &package,
+            &target_project,
+            &release_project,
+        ))
+        .expect("file the first incident on the live instance")
+        .expect("live filing returns a request id");
+    // The refile comes from a second branch, same target.
+    let source_b = create_source_branch(&client, &package);
+    upload_spec(&client, &source_b, &package);
+    let id2 = filing
+        .refile_maintenance_incident(
+            &incident_payload(&source_b, &package, &target_project, &release_project),
+            &id1,
+        )
+        .expect("refile the incident on the live instance")
+        .expect("live refile returns a request id");
+    assert_ne!(id1, id2, "refile must return a new request id");
+    let old = client
+        .show_request(&id1)
+        .expect("read the old incident back from the server");
+    assert_eq!(
+        old.state.name,
+        RequestState::Superseded,
+        "the old incident {id1} must be superseded"
+    );
+    assert_eq!(
+        old.state.superseded_by,
+        Some(id2.parse().expect("the new request id is a number")),
+        "the old incident {id1} must point at the new one"
+    );
+    let new = client
+        .show_request(&id2)
+        .expect("read the new incident back from the server");
+    assert_eq!(
+        new.state.name,
+        RequestState::New,
+        "the new incident {id2} must be new"
+    );
+}
+
+/// Filing and accepting a maintenance incident without a release
+/// project: the release target resolves at filing time, through the
+/// source package's link target — the server raises
+/// `NoMaintenanceReleaseTarget` when the source is unlinked and no
+/// release project is given, so the source here links at the release
+/// project. The source also carries a bumped spec alongside the link:
+/// a pure link diffs empty against the release package, so the server
+/// would drop the action (`MissingAction`) at filing. The accept
+/// merges the package under the extended name, like the
+/// release-project case.
+#[test]
+fn live_maintenance_incident_without_release_project_resolves_via_link_on_server() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    // The release project holds the package; the source branch links
+    // at it, so the filing resolves the release target through the link.
+    let release_project = create_kind_project(&client, &base, "maintenance_release");
+    client
+        .create_package(
+            &release_project,
+            &package,
+            "geectl live test package",
+            "Created by the geectl live live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create package in the release project on the live instance");
+    upload_spec(&client, &release_project, &package);
+    let source_project = create_source_branch(&client, &package);
+    client
+        .upload_file(
+            &source_project,
+            &package,
+            "_link",
+            &format!("<link project=\"{release_project}\" package=\"{package}\"/>"),
+            &DryRun::new(false),
+        )
+        .expect("upload a _link file to the live instance");
+    // A pure link diffs empty against the release package, so the
+    // server would drop the action at filing: the source also carries
+    // a bumped spec, which overrides the linked one in expansion.
+    client
+        .upload_file(
+            &source_project,
+            &package,
+            "geectl-live-pkg.spec",
+            "Name: geectl-live-pkg\nVersion: 2.0\n",
+            &DryRun::new(false),
+        )
+        .expect("upload a bumped spec file to the live instance");
+    let target_project = create_kind_project(&client, &base, "maintenance");
+    // The live instance is a fresh OBS with no project flagged as the
+    // central maintenance project, and the accept path needs one (see
+    // setup_incident): flag this test's maintenance project so the
+    // instance models a production one.
+    set_project_attribute(&base, &target_project, "OBS", "MaintenanceProject");
+    let dry = DryRun::new(false);
+    let filing = SrFiling::new(&client, &dry);
+    let payload = MaintenanceIncidentPayload::new(
+        &source_project,
+        &[&package],
+        &target_project,
+        &format!("Maintenance incident for {package} without release project: live test"),
+    )
+    .expect("live maintenance incident payload");
+    let id = filing
+        .file_maintenance_incident(&payload)
+        .expect("file a maintenance incident without a release project on the live instance")
+        .expect("live filing returns a request id");
+    let body = request_xml(&base, &id);
+    assert_eq!(
+        request_state(&body).as_deref(),
+        Some("new"),
+        "filed incident {id} must be new; body: {body}"
+    );
+    assert_eq!(
+        xml_attr_after(&body, "<action ", "type").as_deref(),
+        Some("maintenance_incident"),
+        "filed request {id} must be a maintenance incident; body: {body}"
+    );
+    // Filing-time expansion stores the resolved release project on
+    // the action, even though the filed XML named none.
+    assert_eq!(
+        xml_attr_after(&body, "<target ", "releaseproject").as_deref(),
+        Some(release_project.as_str()),
+        "filed incident {id} must resolve the release project through the link; body: {body}"
+    );
+    client
+        .accept_request(&id, "accepted by the geectl live test", false, &dry)
+        .expect("accept the request on the live instance");
+    let accepted = request_xml(&base, &id);
+    assert_eq!(
+        request_state(&accepted).as_deref(),
+        Some("accepted"),
+        "incident {id} must be accepted; body: {accepted}"
+    );
+    let incident_project = xml_attr_after(&accepted, "<target ", "project")
+        .expect("the accepted incident must name its incident project");
+    assert!(
+        incident_project.starts_with(&format!("{target_project}:")),
+        "the incident project {incident_project} must sit under the maintenance project {target_project}; body: {accepted}"
+    );
+    // The accept merges the linked package under the extended name.
+    let incident_package = xml_attr_after(&accepted, "<target ", "package")
+        .expect("the accepted incident must name its incident package");
+    assert_eq!(
+        incident_package,
+        format!("{package}.{release_project}").replace(':', "_"),
+        "the incident package must be the source extended with the release project; body: {accepted}"
+    );
+    wait_until_present(&base, &incident_project);
+    wait_until_present(&base, &format!("{incident_project}/{incident_package}"));
+}
+
+/// The login of the live credentials (the bootstrap admin by
+/// default). The maintenance branch project is derived from it
+/// (`home:<user>:branches:...`), so the branch test builds the
+/// expected name from the same source as the credentials.
+fn live_username() -> String {
+    match live_credentials() {
+        Credentials::Basic { username, .. } => username,
+        _ => unreachable!("live credentials are Basic"),
+    }
+}
+
+/// The `_meta` document of a package, read back from the server. The
+/// library has no read-a-package-meta operation, so the harness
+/// reads it through geectl's own HTTP client with the admin
+/// credentials.
+fn package_meta(base: &str, project: &str, package: &str) -> String {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    http.get_with(
+        &format!("{base}/source/{project}/{package}/_meta"),
+        &live_credentials(),
+    )
+    .expect("GET package _meta from the live instance")
+}
+
+/// Set attribute `namespace:name` on a project: POST the
+/// `<attributes>` document to the project's `_attribute`.
+fn set_project_attribute(base: &str, project: &str, namespace: &str, name: &str) {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let xml =
+        format!("<attributes><attribute namespace=\"{namespace}\" name=\"{name}\"/></attributes>");
+    let body = http
+        .post(
+            &format!("{base}/source/{project}/_attribute"),
+            &xml,
+            &live_credentials(),
+        )
+        .expect("POST project attribute on the live instance");
+    assert!(
+        response_is_status_ok(&body),
+        "setting attribute {namespace}:{name} on {project} did not return <status code=\"ok\"/>; body: {body}"
+    );
+}
+
+/// Rewrite a project's `_meta` with the given kind (`maintenance`,
+/// `maintenance_release`, ...). The library's `create_project`
+/// writes no kind; the kind lives in the `_meta` document, so the
+/// harness writes it directly, the same way the library writes
+/// `_meta` for `create_project`.
+fn set_project_kind(base: &str, project: &str, kind: &str) {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let meta = format!(
+        "<project name=\"{project}\" kind=\"{kind}\"><title>geectl live test</title><description>Created by the geectl live live test; the instance is destroyed after the run.</description></project>"
+    );
+    let body = http
+        .put(
+            &format!("{base}/source/{project}/_meta"),
+            &meta,
+            &live_credentials(),
+        )
+        .expect("PUT project _meta with kind on the live instance");
+    assert!(
+        response_is_status_ok(&body),
+        "setting kind {kind} on {project} did not return <status code=\"ok\"/>; body: {body}"
+    );
+}
+
+/// A maintenance incident setup: a source branch holding the package
+/// (with a spec file), a maintenance target project, and a
+/// maintenance_release project. Returns `(source_project,
+/// target_project, release_project, package)`.
+fn setup_incident(client: &ObsClient<'_>, base: &str) -> (String, String, String, String) {
+    let package = live_package();
+    let source_project = create_source_branch(client, &package);
+    upload_spec(client, &source_project, &package);
+    let target_project = create_kind_project(client, base, "maintenance");
+    // The live instance is a fresh OBS with no project flagged as the
+    // central maintenance project, and the accept path needs one: the
+    // branch into the incident runs `add_channels`, which looks the
+    // maintained projects up through `Project.get_maintenance_project!`
+    // and 404s with `unknown_project` when none is flagged. Production
+    // OBS instances have one; flag this test's maintenance project so
+    // the instance models one.
+    set_project_attribute(base, &target_project, "OBS", "MaintenanceProject");
+    // The release project name carries a colon, so the accept test
+    // exercises the `:` to `_` translation in the extended incident
+    // package name live.
+    let release_project = create_kind_project_colon(client, base, "maintenance_release");
+    (source_project, target_project, release_project, package)
+}
+
+/// Upload a spec file into a package so the source has content: the
+/// incident filing pins `source_rev`, which needs an expanded
+/// source, and the branch copies the package's files.
+fn upload_spec(client: &ObsClient<'_>, project: &str, package: &str) {
+    client
+        .upload_file(
+            project,
+            package,
+            "geectl-live-pkg.spec",
+            "Name: geectl-live-pkg\nVersion: 1.0\n",
+            &DryRun::new(false),
+        )
+        .expect("upload a spec file to the live instance");
 }
