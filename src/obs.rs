@@ -1033,6 +1033,111 @@ pub enum LinkRevision {
     Unset,
 }
 
+/// How a dedup search narrows the returned actions beyond their type,
+/// checked client-side in [`parse_request_ids_for_action`]. The search
+/// match cannot express these: a delete search cannot match "no target
+/// package" (the whole-project form), so a package filing's search
+/// would never see an open whole-project delete; and the server's
+/// incident identity includes the release project
+/// (`BsRequestActionMaintenanceIncident#uniq_key`), which the search
+/// does not match on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ActionShape<'a> {
+    /// Any action of the type counts.
+    Any,
+    /// Only actions whose target release project is `release_project`;
+    /// when it is `None`, any stored release project matches — the
+    /// server stores the filing-time-resolved value even when the
+    /// filed action named none, so a filing without a release project
+    /// cannot tell stored values apart. That over-blocks the narrow
+    /// cases where the link-derived release project differs (two
+    /// branches linked at different release projects, or a patchinfo
+    /// incident against a non-patchinfo filing); resolving it
+    /// client-side would need a link read the library has no
+    /// operation for.
+    ReleaseProject(Option<&'a str>),
+    /// Only delete actions whose target shape conflicts with the
+    /// filing target: a whole-project open delete blocks any delete in
+    /// the project; a package open delete blocks the same package; a
+    /// repository open delete blocks the same repository and a
+    /// whole-project filing.
+    DeleteTarget {
+        package: Option<&'a str>,
+        repository: Option<&'a str>,
+    },
+}
+
+impl<'a> ActionShape<'a> {
+    /// True when an action whose inner XML is `inner` (None when the
+    /// action tag is self-closing, so it has no target) counts for
+    /// this shape. `ReleaseProject(None)` counts every action of the
+    /// type: the server stores the filing-time-resolved release
+    /// project even when the filed action named none, so a filing
+    /// without a release project cannot tell stored values apart. A
+    /// target-less action blocks for every other shape: for
+    /// `DeleteTarget` it reads as carrying nothing, and for
+    /// `ReleaseProject(Some(_))` a missing target is malformed, so it
+    /// blocks fail-closed rather than slipping past the dedup.
+    fn matches_action(&self, inner: Option<&str>) -> bool {
+        match self {
+            ActionShape::Any => true,
+            ActionShape::ReleaseProject(expected) => {
+                // No release project expected: any stored value
+                // matches — the server stores the filing-time-resolved
+                // value even when the filed action named none.
+                if expected.is_none() {
+                    return true;
+                }
+                let target = inner.and_then(|inner| find_element_tag(inner, "target"));
+                match target {
+                    // No target element at all: malformed — block,
+                    // fail-closed, rather than slipping past the dedup.
+                    None => true,
+                    Some(tag) => tag_attr(tag, "releaseproject").as_deref() == *expected,
+                }
+            }
+            ActionShape::DeleteTarget {
+                package,
+                repository,
+            } => {
+                let target = inner.and_then(|inner| find_element_tag(inner, "target"));
+                let open_package = target.and_then(|tag| tag_attr(tag, "package"));
+                let open_repository = target.and_then(|tag| tag_attr(tag, "repository"));
+                // A whole-project open delete (neither set) blocks any
+                // delete; a package/repository open delete blocks only
+                // the same target — and a repository open delete also
+                // blocks a whole-project filing, whose target subsumes
+                // it (the server's delete identity carries no
+                // repository, so the two share the key).
+                let open_whole_project = open_package.is_none() && open_repository.is_none();
+                let same_package = open_package.is_some() && open_package.as_deref() == *package;
+                let same_repository =
+                    open_repository.is_some() && open_repository.as_deref() == *repository;
+                let repo_blocks_whole_project =
+                    open_repository.is_some() && package.is_none() && repository.is_none();
+                open_whole_project || same_package || same_repository || repo_blocks_whole_project
+            }
+        }
+    }
+}
+
+/// What a dedup check matches on: the action type plus the
+/// source/target names of the action. Only the parts present are
+/// matched — a delete request has no source, a whole-project delete
+/// has neither a target package nor a repository, and a maintenance
+/// incident target has no package. The `shape` narrows the returned
+/// actions client-side where the search cannot. The struct keeps the
+/// search and the filing-dedup helper from growing a parameter per part.
+struct ActionTarget<'a> {
+    action_type: &'a str,
+    source_project: Option<&'a str>,
+    source_package: Option<&'a str>,
+    target_project: &'a str,
+    target_package: Option<&'a str>,
+    target_repository: Option<&'a str>,
+    shape: ActionShape<'a>,
+}
+
 impl<'a> ObsClient<'a> {
     /// A client for the production OBS API, with no credentials
     /// (public reads only).
@@ -1223,6 +1328,114 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// The ids of the open requests (`new` or `review` state) whose
+    /// single action matches `target` exactly. The search filters on
+    /// source/target, state, and action type (`action/@type`); the
+    /// parser re-checks the type and narrows by shape where the
+    /// search cannot — a delete search cannot match "no target
+    /// package", and the incident identity includes the release
+    /// project. The match mirrors the server's action identity —
+    /// delete shapes are compared by subsumption, not by key (a
+    /// whole-project target subsumes package/repository targets):
+    /// the incident keys on target and source package — and on the
+    /// release project when one is given, while a filing without one
+    /// matches any stored release project — and change-devel keys on
+    /// the target alone. A declined request is closed
+    /// and does not block a re-file, so it is not in the state set —
+    /// only genuinely open requests block a filing. Requires
+    /// credentials; an unexpected response is an error, never an
+    /// empty list.
+    fn open_action_request_ids(
+        &self,
+        target: &ActionTarget<'_>,
+    ) -> Result<Vec<String>, GeectlError> {
+        let states = "(state/@name='new' or state/@name='review')";
+        let mut action_parts: Vec<String> = Vec::new();
+        if let Some(source_project) = target.source_project {
+            if !valid_obs_name(source_project) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS project name for source project: {source_project:?}"),
+                ));
+            }
+            action_parts.push(format!("source/@project='{source_project}'"));
+        }
+        if let Some(source_package) = target.source_package {
+            if !valid_obs_name(source_package) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name for source package: {source_package:?}"),
+                ));
+            }
+            action_parts.push(format!("source/@package='{source_package}'"));
+        }
+        if !valid_obs_name(target.target_project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "invalid OBS project name for target project: {:?}",
+                    target.target_project
+                ),
+            ));
+        }
+        action_parts.push(format!("target/@project='{}'", target.target_project));
+        if let Some(target_package) = target.target_package {
+            if !valid_obs_name(target_package) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name for target package: {target_package:?}"),
+                ));
+            }
+            // A delete search leaves the package out: the whole-project
+            // form has no target package, and a match on one would
+            // never see an open whole-project delete. The parser
+            // narrows by shape instead.
+            if !matches!(target.shape, ActionShape::DeleteTarget { .. }) {
+                action_parts.push(format!("target/@package='{target_package}'"));
+            }
+        }
+        if let Some(target_repository) = target.target_repository {
+            if !valid_obs_name(target_repository) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "invalid OBS repository name for target repository: {target_repository:?}"
+                    ),
+                ));
+            }
+            // Validated but never added to the match: the search
+            // whitelist has no `action/target/@repository`, and a
+            // delete dedup matches the project — the parser narrows
+            // by shape instead.
+        }
+        let match_expr = format!(
+            "{states} and action/@type='{}' and action[{}]",
+            target.action_type,
+            action_parts.join(" and ")
+        );
+        let url = build_url(
+            &self.base,
+            &["search", "request"],
+            &[("match", &match_expr)],
+        );
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "checking for open requests requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_request_ids_for_action(&body, target.action_type, target.shape).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS search response for {} requests",
+                    target.action_type
+                ),
+            )
+        })
+    }
+
     /// File `payload` as a submit request: render it and POST it to
     /// the OBS API (`POST /request?cmd=create`) and return the new
     /// request id. Requires credentials; without them the filing
@@ -1234,14 +1447,50 @@ impl<'a> ObsClient<'a> {
     /// there is no direct call to bypass them with. The request XML
     /// is rendered here from the typed payload; no caller passes XML.
     fn create_request(&self, payload: &SrPayload) -> Result<String, GeectlError> {
+        self.create_request_with_query(&payload.to_xml(), &[("cmd", "create")], "submit")
+    }
+
+    /// File a maintenance incident request: the same filing POST as
+    /// [`ObsClient::create_request`], with `addrevision=1`, which pins
+    /// `source_rev` to the current expanded srcmd5 at filing time and
+    /// refuses to file when the source is broken. The server applies
+    /// it to submit, release, maintenance_incident and
+    /// maintenance_release actions (`RequestController#create` sets it,
+    /// `BsRequest#set_add_revision`, enforced in
+    /// `BsRequestAction#check_for_expand_errors!`); this library sends
+    /// it only for maintenance incidents, where the pin is the point —
+    /// an incident must freeze the exact source it was filed against.
+    /// Same convention as `create_request`: [`SrFiling`] is the single
+    /// permitted caller in this crate.
+    fn create_request_with_add_revision(&self, xml: &str) -> Result<String, GeectlError> {
+        self.create_request_with_query(
+            xml,
+            &[("cmd", "create"), ("addrevision", "1")],
+            "maintenance incident",
+        )
+    }
+
+    /// The shared filing POST: `POST /request` with the given query
+    /// parameters and the request XML as the body, returning the new
+    /// request id. Requires credentials; without them the filing
+    /// fails loudly before any request. `kind` names the request
+    /// type in the credentials error only.
+    fn create_request_with_query(
+        &self,
+        xml: &str,
+        query: &[(&str, &str)],
+        kind: &str,
+    ) -> Result<String, GeectlError> {
         if !self.has_basic() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot file a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                format!(
+                    "cannot file a {kind} request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"
+                ),
             ));
         }
-        let url = build_url(&self.base, &["request"], &[("cmd", "create")]);
-        let body = self.http.post(&url, &payload.to_xml(), &self.credentials)?;
+        let url = build_url(&self.base, &["request"], query);
+        let body = self.http.post(&url, xml, &self.credentials)?;
         parse_request_id(&body).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
@@ -5382,6 +5631,25 @@ pub(crate) fn parse_request_ids(body: &str) -> Option<Vec<String>> {
 /// non-submit reads as an empty list, not an error: that is the
 /// answer "no open submit request".
 pub(crate) fn parse_submit_request_ids(body: &str) -> Option<Vec<String>> {
+    parse_request_ids_for_action(body, "submit", ActionShape::Any)
+}
+
+/// The ids of the requests in a search-response collection whose
+/// action is of type `action_type` (state is whatever the search
+/// matched) and matches `shape`. The search already filters on the
+/// type server-side; the parser re-checks it here, so a misshapen
+/// response cannot let a wrong-type id through the dedup — and it
+/// applies the shape where the search cannot. None when the body is
+/// not a collection at all, or when the count says there are
+/// requests but none parsed at all — the server changed shape
+/// underneath us, and an empty list there would let a filing dedup
+/// pass. A collection of only other action types reads as an empty
+/// list, not None.
+pub(crate) fn parse_request_ids_for_action(
+    body: &str,
+    action_type: &str,
+    shape: ActionShape<'_>,
+) -> Option<Vec<String>> {
     if !body.contains("<collection") {
         return None;
     }
@@ -5411,15 +5679,11 @@ pub(crate) fn parse_submit_request_ids(body: &str) -> Option<Vec<String>> {
         }
         let inner = &after_tag[end + 1..];
         let close = inner.find("</request>")?;
-        if request_block_has_submit_action(&inner[..close]) {
+        if request_block_matches_action(&inner[..close], action_type, shape) {
             ids.push(id);
         }
         rest = &inner[close + "</request>".len()..];
     }
-    // The count says there are requests but none parsed: the server
-    // changed shape underneath us, and an empty list here would let
-    // the filing dedup pass. Non-submit requests do parse, so a
-    // collection of only those reads as an empty list, not None.
     if matches > 0 && parsed == 0 {
         return None;
     }
@@ -5427,26 +5691,50 @@ pub(crate) fn parse_submit_request_ids(body: &str) -> Option<Vec<String>> {
 }
 
 /// True when a `<request>` element's inner XML contains an `<action>`
-/// element whose `type` attribute is `submit`. The `type` is read
-/// from inside the action tag, so its position does not matter and
-/// either quote style works; a mention of "submit" elsewhere in the
-/// block (a description, say) does not count.
-fn request_block_has_submit_action(block: &str) -> bool {
+/// element whose `type` attribute is `action_type` and which matches
+/// `shape`. The `type` is read from inside the action tag, so its
+/// position does not matter and either quote style works; a mention of
+/// the type elsewhere in the block (a description, say) does not count.
+/// The shape is read from the action's `<target>` element the same way.
+fn request_block_matches_action(block: &str, action_type: &str, shape: ActionShape<'_>) -> bool {
     let mut rest = block;
     while let Some(pos) = rest.find("<action") {
         let after_tag = &rest[pos + "<action".len()..];
         let Some(first) = after_tag.chars().next() else {
-            return false;
+            // The block ends mid-tag: truncated — block, fail-closed.
+            return true;
         };
         if !(first.is_whitespace() || first == '/' || first == '>') {
             rest = after_tag;
             continue;
         }
         let Some(end) = after_tag.find('>') else {
-            return false;
-        };
-        if action_tag_type(&after_tag[..end]).as_deref() == Some("submit") {
+            // An action tag with no closing `>` is truncated: block,
+            // fail-closed, rather than slipping past the dedup.
             return true;
+        };
+        let tag = &after_tag[..end];
+        if action_tag_type(tag).as_deref() == Some(action_type) {
+            if tag.trim_end().ends_with('/') {
+                // Self-closing: no children, so no target — the shape
+                // reads it as carrying nothing.
+                if shape.matches_action(None) {
+                    return true;
+                }
+            } else {
+                let inner = &after_tag[end + 1..];
+                let Some(close) = inner.find("</action>") else {
+                    // A type-matching action without a close tag is
+                    // malformed: block, fail-closed, rather than
+                    // letting the filing slip past the dedup.
+                    return true;
+                };
+                if shape.matches_action(Some(&inner[..close])) {
+                    return true;
+                }
+                rest = &inner[close + "</action>".len()..];
+                continue;
+            }
         }
         rest = &after_tag[end..];
     }
@@ -8323,6 +8611,321 @@ impl<'a> SrFiling<'a> {
                 err.kind(),
                 format!(
                     "filed submit request {new_id} but could not supersede {old}: {}; the old request is still open — supersede it manually with the new id",
+                    err.context
+                ),
+            )),
+        }
+    }
+
+    /// File `payload` as a maintenance incident request. Returns the
+    /// new OBS request id in live mode, or None in dry-run (nothing
+    /// was filed). The payload is validated before either path is
+    /// taken. In live mode an open maintenance incident request
+    /// already targeting any of the payload's sources is refused
+    /// (dedup, one check per source package); a filing without a
+    /// release project is refused by any open incident for the same
+    /// source package and target, whatever release project it
+    /// resolved to — that over-blocks the narrow cases where the
+    /// link-derived release project differs. The filing pins
+    /// `source_rev` (`addrevision=1`), so the incident freezes the
+    /// exact source it was filed against. The payload carries no
+    /// sourceupdate by default; see
+    /// [`MaintenanceIncidentPayload::with_cleanup`] for the opt-in
+    /// branch cleanup on accept.
+    pub fn file_maintenance_incident(
+        &self,
+        payload: &MaintenanceIncidentPayload,
+    ) -> Result<Option<String>, GeectlError> {
+        self.file_maintenance_incident_with_except(payload, None)
+    }
+
+    fn file_maintenance_incident_with_except(
+        &self,
+        payload: &MaintenanceIncidentPayload,
+        except: Option<u64>,
+    ) -> Result<Option<String>, GeectlError> {
+        payload.validate_semantics()?;
+        payload.validate_xml()?;
+        let sources = payload
+            .source_packages
+            .iter()
+            .map(|package| format!("{}/{}", payload.source_project, package))
+            .collect::<Vec<String>>()
+            .join(", ");
+        if !self.dry_run.allow(&format!(
+            "file maintenance incident request for {sources} to {}",
+            payload.target_project
+        )) {
+            self.dry_run
+                .note("--- would-be maintenance incident request (dry-run) ---");
+            for package in &payload.source_packages {
+                self.dry_run
+                    .note(&format!("source: {}/{}", payload.source_project, package));
+            }
+            self.dry_run
+                .note(&format!("target: {}", payload.target_project));
+            self.dry_run
+                .note(&format!("description: {}", payload.description));
+            self.dry_run.note(&payload.to_xml());
+            self.dry_run
+                .note("--- end of would-be maintenance incident request ---");
+            return Ok(None);
+        }
+        // Live: the dedup check is part of filing, one check per
+        // source package — an incident carries one action per source,
+        // and an open incident for any of them blocks the filing.
+        // The match mirrors the server's incident identity
+        // (`uniq_key`: target, source package, release project) — the
+        // source project is not part of it, so an equivalent incident
+        // from another branch blocks too, and the server would not
+        // catch it (no cross-request duplicate check).
+        for package in &payload.source_packages {
+            self.check_no_open_action_request(
+                &ActionTarget {
+                    action_type: "maintenance_incident",
+                    source_project: None,
+                    source_package: Some(package),
+                    target_project: &payload.target_project,
+                    target_package: None,
+                    target_repository: None,
+                    shape: ActionShape::ReleaseProject(payload.target_releaseproject.as_deref()),
+                },
+                &format!("{} for {}", payload.target_project, package),
+                except,
+            )?;
+        }
+        let xml = payload.to_xml();
+        let id = self.obs.create_request_with_add_revision(&xml)?;
+        Ok(Some(id))
+    }
+
+    /// File `payload` as a new maintenance incident request and
+    /// supersede `old_id` with it: the full refile flow, same order
+    /// guarantee as [`SrFiling::refile`] — file first, supersede
+    /// second, so `superseded_by` always names a request that
+    /// exists. Returns the new request id in live mode, or None in
+    /// dry-run (nothing was filed or superseded).
+    pub fn refile_maintenance_incident(
+        &self,
+        payload: &MaintenanceIncidentPayload,
+        old_id: &str,
+    ) -> Result<Option<String>, GeectlError> {
+        self.refile_with(
+            |except| self.file_maintenance_incident_with_except(payload, except),
+            old_id,
+            "maintenance incident",
+        )
+    }
+
+    /// File `payload` as a change devel request: move the devel
+    /// project of a package. Returns the new OBS request id in live
+    /// mode, or None in dry-run (nothing was filed). The payload is
+    /// validated before either path is taken. In live mode an open
+    /// change devel request already targeting the same target
+    /// is refused (dedup); the dedup keys on the target alone, and
+    /// the source is not part of the identity. The server sets the
+    /// devel project on accept; there is no branch cleanup to opt into.
+    pub fn file_change_devel(
+        &self,
+        payload: &ChangeDevelPayload,
+    ) -> Result<Option<String>, GeectlError> {
+        payload.validate_semantics()?;
+        payload.validate_xml()?;
+        if !self.dry_run.allow(&format!(
+            "file change devel request for {}/{} to {}/{}",
+            payload.source_project,
+            payload.source_package,
+            payload.target_project,
+            payload.target_package
+        )) {
+            self.dry_run
+                .note("--- would-be change devel request (dry-run) ---");
+            self.dry_run.note(&format!(
+                "source: {}/{}",
+                payload.source_project, payload.source_package
+            ));
+            self.dry_run.note(&format!(
+                "target: {}/{}",
+                payload.target_project, payload.target_package
+            ));
+            self.dry_run
+                .note(&format!("description: {}", payload.description));
+            self.dry_run.note(&payload.to_xml());
+            self.dry_run
+                .note("--- end of would-be change devel request ---");
+            return Ok(None);
+        }
+        // The match mirrors the server's change-devel identity
+        // (`uniq_key`: target project and package only) — the source
+        // is not part of it, so a request naming another new devel
+        // for the same target blocks too, and the server would not
+        // catch it (no cross-request duplicate check).
+        self.check_no_open_action_request(
+            &ActionTarget {
+                action_type: "change_devel",
+                source_project: None,
+                source_package: None,
+                target_project: &payload.target_project,
+                target_package: Some(&payload.target_package),
+                target_repository: None,
+                shape: ActionShape::Any,
+            },
+            &format!("{}/{}", payload.target_project, payload.target_package),
+            None,
+        )?;
+        let xml = payload.to_xml();
+        let id = self
+            .obs
+            .create_request_with_query(&xml, &[("cmd", "create")], "submit")?;
+        Ok(Some(id))
+    }
+
+    /// File `payload` as a delete request: delete a package, a
+    /// repository, or a whole project. Returns the new OBS request id
+    /// in live mode, or None in dry-run (nothing was filed). The
+    /// payload is validated before either path is taken. In live mode
+    /// an open delete request already targeting the same project (and
+    /// package or repository, when the payload names one) is refused
+    /// (dedup). The server deletes the target on accept.
+    pub fn file_delete_request(
+        &self,
+        payload: &DeletePayload,
+    ) -> Result<Option<String>, GeectlError> {
+        payload.validate_semantics()?;
+        payload.validate_xml()?;
+        let target = match &payload.target {
+            DeleteTarget::Package(package) => {
+                format!("{}/{}", payload.target_project, package)
+            }
+            DeleteTarget::Repository(repository) => {
+                format!("{} (repository {repository})", payload.target_project)
+            }
+            DeleteTarget::WholeProject => payload.target_project.clone(),
+        };
+        if !self
+            .dry_run
+            .allow(&format!("file delete request for {target}"))
+        {
+            self.dry_run
+                .note("--- would-be delete request (dry-run) ---");
+            self.dry_run.note(&format!("target: {target}"));
+            self.dry_run
+                .note(&format!("description: {}", payload.description));
+            self.dry_run.note(&payload.to_xml());
+            self.dry_run.note("--- end of would-be delete request ---");
+            return Ok(None);
+        }
+        let (target_package, target_repository) = match &payload.target {
+            DeleteTarget::Package(package) => (Some(package.as_str()), None),
+            DeleteTarget::Repository(repository) => (None, Some(repository.as_str())),
+            DeleteTarget::WholeProject => (None, None),
+        };
+        self.check_no_open_action_request(
+            &ActionTarget {
+                action_type: "delete",
+                source_project: None,
+                source_package: None,
+                target_project: &payload.target_project,
+                target_package,
+                target_repository,
+                shape: ActionShape::DeleteTarget {
+                    package: target_package,
+                    repository: target_repository,
+                },
+            },
+            &target,
+            None,
+        )?;
+        let xml = payload.to_xml();
+        let id = self
+            .obs
+            .create_request_with_query(&xml, &[("cmd", "create")], "submit")?;
+        Ok(Some(id))
+    }
+
+    /// Refuse when an open request already matches `target` exactly.
+    /// The search filters on the action type server-side; the parser
+    /// re-checks the type and narrows by shape (delete target shape,
+    /// incident release project) where the search cannot. `except`,
+    /// when set, is the request the refile flow is about to
+    /// supersede: it is open by definition and does not block.
+    /// `what` names the target in the refusal, e.g.
+    /// `home:alice:branches:foo/foo`. A declined request is closed
+    /// and does not block — only `new`/`review` requests are in the
+    /// search.
+    fn check_no_open_action_request(
+        &self,
+        target: &ActionTarget<'_>,
+        what: &str,
+        except: Option<u64>,
+    ) -> Result<(), GeectlError> {
+        let open = self.obs.open_action_request_ids(target)?;
+        let blocking: Vec<&String> = open
+            .iter()
+            .filter(|id| match except {
+                None => true,
+                // An id that does not parse cannot be the exempted
+                // one: it blocks, rather than being skipped on a
+                // failed comparison.
+                Some(n) => id.parse::<u64>() != Ok(n),
+            })
+            .collect();
+        if !blocking.is_empty() {
+            let blocking = blocking
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<&str>>()
+                .join(", ");
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "an open {} request already targets {what} ({blocking}); not filing a duplicate",
+                    target.action_type
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The shared refile flow: file first, then supersede the old
+    /// request pointing at the new one, so `superseded_by` always
+    /// names a request that exists. `file` is the filing step (with
+    /// the old request exempted from dedup); `kind` names the
+    /// request type in messages ("maintenance incident").
+    /// If superseding fails after the new request is filed, the error
+    /// names the new id: the old request is still open and the new
+    /// one unlinked, and the caller finishes the supersede manually.
+    /// A half-done refile passing silently is a failed refile that
+    /// reads as a success.
+    fn refile_with<F>(
+        &self,
+        file: F,
+        old_id: &str,
+        kind: &str,
+    ) -> Result<Option<String>, GeectlError>
+    where
+        F: FnOnce(Option<u64>) -> Result<Option<String>, GeectlError>,
+    {
+        let old = validate_request_id(old_id)?;
+        let new_id = file(Some(old))?;
+        let Some(new_id) = new_id else {
+            if !self.dry_run.enabled() {
+                return Err(GeectlError::new(
+                    ErrorKind::InternalError,
+                    "filing in live mode returned no request id",
+                ));
+            }
+            self.dry_run.note(&format!(
+                "would: supersede {kind} request {old} with the new request"
+            ));
+            return Ok(None);
+        };
+        match self.obs.supersede_request(old_id, &new_id) {
+            Ok(()) => Ok(Some(new_id)),
+            Err(err) => Err(GeectlError::new(
+                err.kind(),
+                format!(
+                    "filed {kind} request {new_id} but could not supersede {old}: {}; the old request is still open — supersede it manually with the new id",
                     err.context
                 ),
             )),
@@ -19105,11 +19708,42 @@ description</description>
         let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n  <surprise>hello</surprise>\n</request>";
         assert_eq!(parse_request(xml), None);
     }
+    // --- Typed request ids / dedup search ---
+
+    fn mixed_action_collection() -> &'static str {
+        "<collection matches=\"4\">\
+        <request id=\"1\" creator=\"alice\"><action type=\"submit\"><source project=\"home:alice\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request>\
+        <request id=\"2\" creator=\"alice\"><action type=\"maintenance_incident\"><source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" /><target project=\"openSUSE:Maintenance\" /></action><state name=\"review\" /></request>\
+        <request id=\"3\" creator=\"alice\"><action type=\"change_devel\"><source project=\"devel:languages:python\" package=\"foo\" /><target project=\"openSUSE:Factory\" package=\"foo\" /></action><state name=\"new\" /></request>\
+        <request id=\"4\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" package=\"foo\" /></action><state name=\"declined\" /></request>\
+        </collection>"
+    }
 
     #[test]
     fn request_parse_requires_a_state() {
         let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n</request>";
         assert_eq!(parse_request(xml), None);
+    }
+    #[test]
+    fn parse_request_ids_for_action_filters_by_type() {
+        let body = mixed_action_collection();
+        assert_eq!(
+            parse_request_ids_for_action(body, "maintenance_incident", ActionShape::Any).unwrap(),
+            vec!["2".to_string()]
+        );
+        assert_eq!(
+            parse_request_ids_for_action(body, "change_devel", ActionShape::Any).unwrap(),
+            vec!["3".to_string()]
+        );
+        assert_eq!(
+            parse_request_ids_for_action(body, "delete", ActionShape::Any).unwrap(),
+            vec!["4".to_string()]
+        );
+        // The submit path delegates to the same parser.
+        assert_eq!(
+            parse_submit_request_ids(body).unwrap(),
+            vec!["1".to_string()]
+        );
     }
 
     #[test]
@@ -19118,6 +19752,205 @@ description</description>
         assert_eq!(parse_request(no_id), None);
         let zero_id = no_id.replace("creator=\"creator\"", "creator=\"creator\" id=\"0\"");
         assert_eq!(parse_request(&zero_id), None);
+    }
+    #[test]
+    fn parse_request_ids_for_action_filters_delete_shape() {
+        let body = "<collection matches=\"5\"><request id=\"1\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"2\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" package=\"bar\" /></action><state name=\"new\" /></request><request id=\"3\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" repository=\"standard\" /></action><state name=\"new\" /></request><request id=\"4\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" /></action><state name=\"new\" /></request><request id=\"5\" creator=\"alice\"><action type=\"submit\"><source project=\"home:alice\" package=\"foo\" /><target project=\"openSUSE:Factory\" package=\"foo\" /></action><state name=\"new\" /></request></collection>";
+        // A package delete is blocked by the same package and by a
+        // whole-project delete, not by another package or a repository.
+        assert_eq!(
+            parse_request_ids_for_action(
+                body,
+                "delete",
+                ActionShape::DeleteTarget {
+                    package: Some("foo"),
+                    repository: None,
+                }
+            )
+            .unwrap(),
+            vec!["1".to_string(), "4".to_string()]
+        );
+        // A repository delete: the same repository, or whole-project.
+        assert_eq!(
+            parse_request_ids_for_action(
+                body,
+                "delete",
+                ActionShape::DeleteTarget {
+                    package: None,
+                    repository: Some("standard"),
+                }
+            )
+            .unwrap(),
+            vec!["3".to_string(), "4".to_string()]
+        );
+        // A whole-project delete: a whole-project delete blocks it,
+        // and so does a repository delete — the two share the server's
+        // delete identity, which carries no repository.
+        assert_eq!(
+            parse_request_ids_for_action(
+                body,
+                "delete",
+                ActionShape::DeleteTarget {
+                    package: None,
+                    repository: None,
+                }
+            )
+            .unwrap(),
+            vec!["3".to_string(), "4".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_request_ids_for_action_filters_release_project() {
+        let body = "<collection matches=\"2\"><request id=\"1\" creator=\"alice\"><action type=\"maintenance_incident\"><source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" /><target project=\"openSUSE:Maintenance\" releaseproject=\"openSUSE:Leap:15.6:Update\" /></action><state name=\"new\" /></request><request id=\"2\" creator=\"alice\"><action type=\"maintenance_incident\"><source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" /><target project=\"openSUSE:Maintenance\" /></action><state name=\"new\" /></request></collection>";
+        // The server's incident identity includes the release project:
+        // only the same one blocks a filing that names one. A filing
+        // without a release project matches any stored value: the
+        // server stores the filing-time-resolved value even when the
+        // filed action named none.
+        assert_eq!(
+            parse_request_ids_for_action(
+                body,
+                "maintenance_incident",
+                ActionShape::ReleaseProject(Some("openSUSE:Leap:15.6:Update"))
+            )
+            .unwrap(),
+            vec!["1".to_string()]
+        );
+        assert_eq!(
+            parse_request_ids_for_action(
+                body,
+                "maintenance_incident",
+                ActionShape::ReleaseProject(None)
+            )
+            .unwrap(),
+            vec!["1".to_string(), "2".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_request_ids_for_action_blocks_targetless_action_for_release_project() {
+        // A self-closing incident action has no target to read: it
+        // blocks, fail-closed, even when a release project is expected.
+        let body = "<collection matches=\"1\"><request id=\"7\" creator=\"alice\"><action type=\"maintenance_incident\" /></request></collection>";
+        assert_eq!(
+            parse_request_ids_for_action(
+                body,
+                "maintenance_incident",
+                ActionShape::ReleaseProject(Some("openSUSE:Leap:15.6:Update"))
+            )
+            .unwrap(),
+            vec!["7".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_request_ids_for_action_blocks_truncated_matching_action() {
+        // A type-matching action without a close tag is malformed: it
+        // blocks, fail-closed, rather than slipping past the dedup.
+        let body = "<collection matches=\"1\"><request id=\"7\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" package=\"foo\" /></request></collection>";
+        assert_eq!(
+            parse_request_ids_for_action(body, "delete", ActionShape::Any).unwrap(),
+            vec!["7".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_request_ids_for_action_blocks_unterminated_action_tag() {
+        // An action tag with no closing `>` is truncated: it blocks,
+        // fail-closed, rather than slipping past the dedup.
+        let body = "<collection matches=\"1\"><request id=\"7\" creator=\"alice\"><action type=\"delete\"</request></collection>";
+        assert_eq!(
+            parse_request_ids_for_action(body, "delete", ActionShape::Any).unwrap(),
+            vec!["7".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_request_ids_for_action_blocks_bare_action_tag_at_end() {
+        // The request ends with a bare `<action`: truncated — it
+        // blocks, fail-closed, rather than slipping past the dedup.
+        let body = "<collection matches=\"1\"><request id=\"7\" creator=\"alice\"><action</request></collection>";
+        assert_eq!(
+            parse_request_ids_for_action(body, "delete", ActionShape::Any).unwrap(),
+            vec!["7".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_request_ids_for_action_empty_when_no_match() {
+        let body = "<collection matches=\"1\"><request id=\"1\" creator=\"alice\"><action type=\"submit\"><source project=\"home:alice\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>";
+        assert_eq!(
+            parse_request_ids_for_action(body, "maintenance_incident", ActionShape::Any).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn parse_request_ids_for_action_rejects_malformed() {
+        assert!(parse_request_ids_for_action("not xml", "submit", ActionShape::Any).is_none());
+        // The count says there are requests but none parsed: the
+        // server changed shape, and an empty list would let a filing
+        // dedup pass.
+        assert!(parse_request_ids_for_action(
+            "<collection matches=\"1\"><request /></collection>",
+            "submit",
+            ActionShape::Any
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn open_action_request_ids_searches_by_source_target_and_type() {
+        let match_expr = "(state/@name='new' or state/@name='review') and action/@type='maintenance_incident' and action[source/@project='home:alice:branches:OBS_Maintained:foo' and source/@package='foo' and target/@project='openSUSE:Maintenance']";
+        let url = build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[("match", match_expr)],
+        );
+        let http = FakeHttp::new().with_get(
+            &url,
+            "<collection matches=\"2\"><request id=\"2\" creator=\"alice\"><action type=\"maintenance_incident\"><source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" /><target project=\"openSUSE:Maintenance\" /></action><state name=\"review\" /></request><request id=\"9\" creator=\"alice\"><action type=\"submit\"><source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" /><target project=\"openSUSE:Maintenance\" /></action><state name=\"new\" /></request></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        // Only the maintenance_incident request blocks, not the
+        // submit one that happens to match the same source/target.
+        // The parser re-checks the type even though the search
+        // already filtered on it.
+        assert_eq!(
+            client
+                .open_action_request_ids(&ActionTarget {
+                    action_type: "maintenance_incident",
+                    source_project: Some("home:alice:branches:OBS_Maintained:foo"),
+                    source_package: Some("foo"),
+                    target_project: "openSUSE:Maintenance",
+                    target_package: None,
+                    target_repository: None,
+                    shape: ActionShape::ReleaseProject(None),
+                })
+                .unwrap(),
+            vec!["2".to_string()]
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.get_calls()[0].1);
+    }
+
+    #[test]
+    fn open_action_request_ids_without_credentials_fails_loud() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .open_action_request_ids(&ActionTarget {
+                action_type: "maintenance_incident",
+                source_project: Some("home:alice:branches:OBS_Maintained:foo"),
+                source_package: Some("foo"),
+                target_project: "openSUSE:Maintenance",
+                target_package: None,
+                target_repository: None,
+                shape: ActionShape::Any,
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
     }
 
     #[test]
@@ -20401,5 +21234,494 @@ description</description>
         // count is a shape change, not a partial result.
         let collection = format!("<collection matches=\"2\">\n{REQUEST1_XML}\n</collection>");
         assert_eq!(parse_request_collection(&collection), None);
+    }
+
+    // --- SrFiling maintenance methods ---
+
+    /// The search URL for an action-type dedup check, built from the
+    /// same match expression the client builds: state plus the
+    /// action's source/target parts, in production order.
+    fn action_match_url(action_type: &str, parts: &[&str]) -> String {
+        let match_expr = format!(
+            "(state/@name='new' or state/@name='review') and action/@type='{action_type}' and action[{}]",
+            parts.join(" and ")
+        );
+        build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[("match", &match_expr)],
+        )
+    }
+
+    fn change_devel_payload() -> ChangeDevelPayload {
+        ChangeDevelPayload::new(
+            "devel:languages:python",
+            "foo",
+            "openSUSE:Factory",
+            "foo",
+            "Move foo to Factory",
+        )
+        .expect("test change devel payload")
+    }
+
+    fn delete_package_payload() -> DeletePayload {
+        DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::Package("foo".to_string()),
+            "Drop foo",
+        )
+        .expect("test delete payload")
+    }
+
+    fn delete_repository_payload() -> DeletePayload {
+        DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::Repository("standard".to_string()),
+            "Drop the standard repository",
+        )
+        .expect("test delete payload")
+    }
+
+    fn delete_project_payload() -> DeletePayload {
+        DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::WholeProject,
+            "Drop Factory",
+        )
+        .expect("test delete payload")
+    }
+
+    fn incident_payload_with_release_project() -> MaintenanceIncidentPayload {
+        incident_payload()
+            .with_release_project("openSUSE:Leap:15.6:Update")
+            .expect("test incident release project")
+    }
+
+    #[test]
+    fn file_maintenance_incident_dry_run_returns_none_and_makes_no_requests() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        let filing = SrFiling::new(&obs, &dry);
+        let payload = incident_payload();
+        assert_eq!(filing.file_maintenance_incident(&payload).unwrap(), None);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec![
+                "[dry-run] would: file maintenance incident request for home:alice:branches:OBS_Maintained:foo/foo to openSUSE:Maintenance"
+                    .to_string(),
+                "[dry-run] --- would-be maintenance incident request (dry-run) ---".to_string(),
+                "[dry-run] source: home:alice:branches:OBS_Maintained:foo/foo".to_string(),
+                "[dry-run] target: openSUSE:Maintenance".to_string(),
+                "[dry-run] description: Maintenance incident for foo".to_string(),
+                format!("[dry-run] {}", payload.to_xml()),
+                "[dry-run] --- end of would-be maintenance incident request ---".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_maintenance_incident_live_files_with_add_revision() {
+        let search_url = action_match_url(
+            "maintenance_incident",
+            &[
+                "source/@package='foo'",
+                "target/@project='openSUSE:Maintenance'",
+            ],
+        );
+        let http = FakeHttp::new()
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create&addrevision=1",
+                "<request id=\"1400001\" creator=\"alice\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let payload = incident_payload();
+        assert_eq!(
+            filing.file_maintenance_incident(&payload).unwrap(),
+            Some("1400001".to_string())
+        );
+        // The dedup search ran first, then the filing POST — with
+        // addrevision=1, which pins source_rev to the filed source.
+        assert_eq!(http.get_calls().len(), 1);
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(
+            posted[0].0,
+            "https://api.opensuse.org/request?cmd=create&addrevision=1"
+        );
+        assert_eq!(posted[0].1, payload.to_xml());
+    }
+
+    #[test]
+    fn file_maintenance_incident_live_refuses_when_open_incident_exists() {
+        let search_url = action_match_url(
+            "maintenance_incident",
+            &[
+                "source/@package='foo'",
+                "target/@project='openSUSE:Maintenance'",
+            ],
+        );
+        let http = FakeHttp::new().with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"1399001\" creator=\"alice\"><action type=\"maintenance_incident\"><source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" /><target project=\"openSUSE:Maintenance\" /></action><state name=\"new\" /></request></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing
+            .file_maintenance_incident(&incident_payload())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_maintenance_incident_live_refuses_when_open_incident_from_other_branch_exists() {
+        // The server's incident identity has no source project, so an
+        // equivalent incident filed from another branch blocks too.
+        let search_url = action_match_url(
+            "maintenance_incident",
+            &[
+                "source/@package='foo'",
+                "target/@project='openSUSE:Maintenance'",
+            ],
+        );
+        let http = FakeHttp::new().with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"1399001\" creator=\"bob\"><action type=\"maintenance_incident\"><source project=\"home:bob:branches:OBS_Maintained:foo\" package=\"foo\" /><target project=\"openSUSE:Maintenance\" /></action><state name=\"new\" /></request></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing
+            .file_maintenance_incident(&incident_payload())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_maintenance_incident_live_files_when_open_incident_has_other_release_project() {
+        // The open incident releases elsewhere: the server's incident
+        // identity includes the release project, so this is a
+        // different incident, not a duplicate.
+        let search_url = action_match_url(
+            "maintenance_incident",
+            &[
+                "source/@package='foo'",
+                "target/@project='openSUSE:Maintenance'",
+            ],
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                &search_url,
+                "<collection matches=\"1\"><request id=\"1399001\" creator=\"alice\"><action type=\"maintenance_incident\"><source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" /><target project=\"openSUSE:Maintenance\" /></action><state name=\"new\" /></request></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create&addrevision=1",
+                "<request id=\"1400001\" creator=\"alice\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing
+                .file_maintenance_incident(&incident_payload_with_release_project())
+                .unwrap(),
+            Some("1400001".to_string())
+        );
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn refile_maintenance_incident_live_files_then_supersedes_in_order() {
+        let search_url = action_match_url(
+            "maintenance_incident",
+            &[
+                "source/@package='foo'",
+                "target/@project='openSUSE:Maintenance'",
+            ],
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                &search_url,
+                "<collection matches=\"1\"><request id=\"1397357\" creator=\"alice\"><action type=\"maintenance_incident\"><source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" /><target project=\"openSUSE:Maintenance\" /></action><state name=\"new\" /></request></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create&addrevision=1",
+                "<request id=\"1400001\" creator=\"alice\"></request>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/1397357?cmd=changestate&newstate=superseded&superseded_by=1400001",
+                "<status code=\"ok\" />",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing
+                .refile_maintenance_incident(&incident_payload(), "1397357")
+                .unwrap(),
+            Some("1400001".to_string())
+        );
+        // The old incident is open for the same source package,
+        // but the refile exempts it: dedup first, then the filing
+        // POST, then the supersede POST.
+        assert_eq!(http.get_calls().len(), 1);
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 2);
+        assert_eq!(
+            posted[0].0,
+            "https://api.opensuse.org/request?cmd=create&addrevision=1"
+        );
+        assert_eq!(
+            posted[1].0,
+            "https://api.opensuse.org/request/1397357?cmd=changestate&newstate=superseded&superseded_by=1400001"
+        );
+    }
+
+    #[test]
+    fn refile_maintenance_incident_dry_run_returns_none_and_records_both_steps() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        let filing = SrFiling::new(&obs, &dry);
+        let payload = incident_payload();
+        assert_eq!(
+            filing
+                .refile_maintenance_incident(&payload, "1397357")
+                .unwrap(),
+            None
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+        assert!(dry.plan().iter().any(|line| line
+            == "[dry-run] would: file maintenance incident request for home:alice:branches:OBS_Maintained:foo/foo to openSUSE:Maintenance"));
+        assert!(dry.plan().iter().any(|line| line
+            == "[dry-run] would: supersede maintenance incident request 1397357 with the new request"));
+    }
+
+    #[test]
+    fn file_change_devel_live_returns_id() {
+        let search_url = action_match_url(
+            "change_devel",
+            &[
+                "target/@project='openSUSE:Factory'",
+                "target/@package='foo'",
+            ],
+        );
+        let http = FakeHttp::new()
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"alice\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing.file_change_devel(&change_devel_payload()).unwrap(),
+            Some("1400001".to_string())
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_change_devel_live_refuses_when_open_request_exists() {
+        let search_url = action_match_url(
+            "change_devel",
+            &[
+                "target/@project='openSUSE:Factory'",
+                "target/@package='foo'",
+            ],
+        );
+        let http = FakeHttp::new().with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"1399002\" creator=\"alice\"><action type=\"change_devel\"><source project=\"devel:languages:python\" package=\"foo\" /><target project=\"openSUSE:Factory\" package=\"foo\" /></action><state name=\"review\" /></request></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing
+            .file_change_devel(&change_devel_payload())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_change_devel_live_refuses_when_open_request_names_other_source() {
+        // The server's change-devel identity is the target alone, so
+        // an open request naming another new devel blocks too.
+        let search_url = action_match_url(
+            "change_devel",
+            &[
+                "target/@project='openSUSE:Factory'",
+                "target/@package='foo'",
+            ],
+        );
+        let http = FakeHttp::new().with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"1399002\" creator=\"alice\"><action type=\"change_devel\"><source project=\"devel:languages:go\" package=\"foo\" /><target project=\"openSUSE:Factory\" package=\"foo\" /></action><state name=\"review\" /></request></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing
+            .file_change_devel(&change_devel_payload())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_delete_request_live_returns_id_for_package() {
+        let search_url = action_match_url("delete", &["target/@project='openSUSE:Factory'"]);
+        let http = FakeHttp::new()
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"alice\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing
+                .file_delete_request(&delete_package_payload())
+                .unwrap(),
+            Some("1400001".to_string())
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_delete_request_live_refuses_when_open_delete_exists() {
+        let search_url = action_match_url("delete", &["target/@project='openSUSE:Factory'"]);
+        let http = FakeHttp::new().with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"1399003\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing
+            .file_delete_request(&delete_package_payload())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_delete_request_live_files_repository_target() {
+        // A repository delete has no package in the target: the
+        // dedup match carries only the target project, and the parser
+        // narrows by shape instead.
+        let search_url = action_match_url("delete", &["target/@project='openSUSE:Factory'"]);
+        let http = FakeHttp::new()
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"alice\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing
+                .file_delete_request(&delete_repository_payload())
+                .unwrap(),
+            Some("1400001".to_string())
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_delete_request_live_refuses_when_open_whole_project_delete_exists() {
+        // An open whole-project delete covers every package in the
+        // project: filing a package delete under it is refused.
+        let search_url = action_match_url("delete", &["target/@project='openSUSE:Factory'"]);
+        let http = FakeHttp::new().with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"1399004\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" /></action><state name=\"new\" /></request></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing
+            .file_delete_request(&delete_package_payload())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("1399004"));
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_delete_request_live_files_whole_project_when_open_package_delete_exists() {
+        // The reverse is not a conflict: an open package delete does
+        // not block deleting the whole project.
+        let search_url = action_match_url("delete", &["target/@project='openSUSE:Factory'"]);
+        let http = FakeHttp::new()
+            .with_get(
+                &search_url,
+                "<collection matches=\"1\"><request id=\"1399004\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"alice\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing
+                .file_delete_request(&delete_project_payload())
+                .unwrap(),
+            Some("1400001".to_string())
+        );
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_delete_request_live_refuses_whole_project_when_open_repository_delete_exists() {
+        // A repository delete and a whole-project delete share the
+        // server's delete identity, so the open repository delete
+        // blocks deleting the whole project.
+        let search_url = action_match_url("delete", &["target/@project='openSUSE:Factory'"]);
+        let http = FakeHttp::new().with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"1399004\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" repository=\"standard\" /></action><state name=\"new\" /></request></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing
+            .file_delete_request(&delete_project_payload())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_request_with_add_revision_posts_add_revision() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request?cmd=create&addrevision=1",
+            "<request id=\"1400001\" creator=\"alice\"></request>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .create_request_with_add_revision("<request></request>")
+                .unwrap(),
+            "1400001".to_string()
+        );
     }
 }
