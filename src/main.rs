@@ -17,6 +17,7 @@ use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSsh
 use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
+use geectl::obs::OBS_API_BASE;
 use serde_json::json;
 use std::io::Write;
 use std::process::ExitCode;
@@ -29,6 +30,17 @@ enum Format {
     Text,
 }
 
+impl Format {
+    /// The config-file / environment spelling of this format
+    /// (`"json"` / `"text"`).
+    fn as_str(self) -> &'static str {
+        match self {
+            Format::Json => "json",
+            Format::Text => "text",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "geectl",
@@ -38,8 +50,10 @@ enum Format {
 )]
 struct Cli {
     /// Output format for the result payload. Applies to every command.
-    #[arg(long, global = true, value_enum, default_value = "json")]
-    format: Format,
+    /// Default: the `GEECTL_FORMAT` environment variable, else the
+    /// `format` key in the config file, else `json`.
+    #[arg(long, global = true, value_enum)]
+    format: Option<Format>,
 
     /// Enable the debug channel: human-readable diagnostic lines on
     /// stderr (HTTP attempts, retries, library decisions). Off by
@@ -112,7 +126,12 @@ enum ConfigCommand {
     Init,
 }
 
-fn run(cli: Cli, debug: &Debug) -> Result<String, GeectlError> {
+fn run(
+    cli: Cli,
+    debug: &Debug,
+    format: Format,
+    format_source: &'static str,
+) -> Result<String, GeectlError> {
     let (payload, text) = match cli.command {
         Some(Command::Version) | None => {
             let payload = json!({
@@ -126,7 +145,7 @@ fn run(cli: Cli, debug: &Debug) -> Result<String, GeectlError> {
         Some(Command::Build { command }) => cli_build::run_build(debug, command)?,
         Some(Command::Config { command }) => match command {
             ConfigCommand::Show => {
-                let payload = config_show_payload()?;
+                let payload = config_show_payload(format, format_source)?;
                 let text = render_config_show_text(&payload);
                 (payload, text)
             }
@@ -143,10 +162,36 @@ fn run(cli: Cli, debug: &Debug) -> Result<String, GeectlError> {
             (payload, text)
         }
     };
-    Ok(match cli.format {
+    Ok(match format {
         Format::Json => payload.to_string(),
         Format::Text => text,
     })
+}
+
+/// Resolve the output format: the `--format` flag wins, then the
+/// `GEECTL_FORMAT` environment variable, then the config file's
+/// `format` key, then `json`. Returns the format and where it came
+/// from (`"flag"` / `"environment"` / `"config"` / `"default"`) for
+/// `config show`. Resolving loads the config file, so a malformed
+/// config or an invalid `GEECTL_FORMAT` fails even `version` —
+/// fail-fast on misconfiguration, by design — unless the flag is
+/// given, which returns before the config is read.
+fn resolve_format(flag: Option<Format>) -> Result<(Format, &'static str), GeectlError> {
+    if let Some(format) = flag {
+        return Ok((format, "flag"));
+    }
+    let path = config::config_path()?;
+    let file_config = config::load_config_at(&path)?;
+    let effective = config::effective_config(&file_config)?;
+    // effective_config validates the value, so this match is
+    // exhaustive by construction; the fallback is only for the type,
+    // never expected to fire.
+    let format = match effective.config.format.as_deref() {
+        Some("json") => Format::Json,
+        Some("text") => Format::Text,
+        _ => Format::Json,
+    };
+    Ok((format, effective.format_source))
 }
 
 /// Resolve the debug channel from the `--debug` / `--debug-body`
@@ -177,12 +222,15 @@ fn startup_line(argv: &[String]) -> String {
     parts.join(" ")
 }
 
-/// The kind of credentials a provider yields, for the debug config
-/// line: `basic`, `bearer`, `ssh`, `none`, or `error`. Never a
-/// username, never a value — the channel is stricter than `config
-/// show`.
-fn auth_kind(provider: &dyn AuthProvider) -> &'static str {
-    match provider.credentials() {
+/// The OBS auth kind for the debug config line: the per-URL
+/// resolution (alias, else plain for the default) — the plain-only
+/// provider would report `none` for an alias-only setup while every
+/// command authenticates fine, the same staleness
+/// [`obs_auth_status`] fixes for `config show`. `basic`, `bearer`,
+/// `ssh`, `none`, or `error`. Never a username, never a value — the
+/// channel is stricter than `config show`.
+fn obs_auth_kind(url: &str, instances: &[(String, String)]) -> &'static str {
+    match EnvObsAuth::credentials_for_url(url, url, instances) {
         Ok(Credentials::None) => "none",
         Ok(Credentials::Basic { .. }) => "basic",
         Ok(Credentials::Bearer { .. }) => "bearer",
@@ -225,18 +273,23 @@ fn debug_config_line() -> Option<String> {
     Some(format!(
         "config: obs {} (auth: {}), gitea {} (auth: {})",
         geectl::debug::url_host(obs_url),
-        auth_kind(&EnvObsAuth),
+        obs_auth_kind(obs_url, &file_config.instances),
         geectl::debug::url_host(gitea_url),
         gitea_auth_kind()
     ))
 }
 
 /// The `config show` payload: the effective endpoint URLs with the
-/// source of each value (environment / config / default), and the
-/// credential status for each provider. A status is never a secret:
-/// Basic auth shows the username only, Bearer shows "configured"
-/// only, and an SSH key shows its path.
-fn config_show_payload() -> Result<serde_json::Value, GeectlError> {
+/// source of each value (environment / config / default), the
+/// effective output format with its source (flag / environment /
+/// config / default), the named-instance table, and the credential
+/// status for each provider. A
+/// status is never a secret: Basic auth shows the username only,
+/// Bearer shows "configured" only, and an SSH key shows its path.
+fn config_show_payload(
+    format: Format,
+    format_source: &'static str,
+) -> Result<serde_json::Value, GeectlError> {
     // The config path is resolved once and passed to the load: a
     // second `config_path()` call here could diverge from the one
     // inside `load_config()` if the environment changed in between.
@@ -246,16 +299,34 @@ fn config_show_payload() -> Result<serde_json::Value, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
     let effective = config::effective_config(&file_config)?;
+    let obs_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
+    let mut instances_json = serde_json::Map::new();
+    for (alias, url) in &effective.config.instances {
+        instances_json.insert(alias.clone(), json!(url));
+    }
     Ok(json!({
         "config_file": path.to_string_lossy(),
         "obs_url": effective.config.obs_url,
         "obs_url_source": effective.obs_url_source,
         "gitea_url": effective.config.gitea_url,
         "gitea_url_source": effective.gitea_url_source,
-        "obs_auth": auth_status(&EnvObsAuth),
+        "format": format.as_str(),
+        "format_source": format_source,
+        "instances": instances_json,
+        "obs_auth": obs_auth_status(obs_url, &effective.config.instances),
         "gitea_auth": auth_status(&EnvGiteaAuth),
         "gitea_ssh_key": auth_status(&GiteaSshKey),
     }))
+}
+
+/// The OBS credential status for one URL: the matching instance
+/// alias's variables win, else the plain variables when it is the
+/// configured default — so `config show` reports what the commands
+/// would actually use, instead of the plain variables only (an
+/// alias-only setup used to report `not_configured` while every
+/// command authenticated fine).
+fn obs_auth_status(url: &str, instances: &[(String, String)]) -> serde_json::Value {
+    credentials_status(EnvObsAuth::credentials_for_url(url, url, instances))
 }
 
 /// The credential status as JSON: `{"status": "configured"}` plus,
@@ -263,7 +334,11 @@ fn config_show_payload() -> Result<serde_json::Value, GeectlError> {
 /// the path; for a misconfiguration, `{"status": "error", "message":
 /// ...}` naming the variable, never the value.
 fn auth_status(provider: &dyn AuthProvider) -> serde_json::Value {
-    match provider.credentials() {
+    credentials_status(provider.credentials())
+}
+
+fn credentials_status(result: Result<Credentials, GeectlError>) -> serde_json::Value {
+    match result {
         Ok(Credentials::None) => json!({"status": "not_configured"}),
         Ok(Credentials::Basic { username, .. }) => {
             json!({"status": "configured", "username": username})
@@ -309,6 +384,15 @@ fn render_config_show_text(payload: &serde_json::Value) -> String {
             payload["gitea_url"].as_str().unwrap_or(""),
             payload["gitea_url_source"].as_str().unwrap_or("")
         ),
+        format!(
+            "format: {} ({})",
+            payload["format"].as_str().unwrap_or(""),
+            payload["format_source"].as_str().unwrap_or("")
+        ),
+        format!(
+            "instances: {}",
+            render_instances_text(&payload["instances"])
+        ),
         format!("obs_auth: {}", render_auth_text(&payload["obs_auth"])),
         format!("gitea_auth: {}", render_auth_text(&payload["gitea_auth"])),
         format!(
@@ -317,6 +401,19 @@ fn render_config_show_text(payload: &serde_json::Value) -> String {
         ),
     ]
     .join("\n")
+}
+
+/// The `[instances]` table as text: `alias -> url` pairs sorted by
+/// alias, or `none` when the table is empty.
+fn render_instances_text(instances: &serde_json::Value) -> String {
+    match instances.as_object() {
+        Some(map) if !map.is_empty() => map
+            .iter()
+            .map(|(alias, url)| format!("{alias} -> {}", url.as_str().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "none".to_string(),
+    }
 }
 
 fn render_auth_text(auth: &serde_json::Value) -> String {
@@ -466,10 +563,18 @@ fn main() -> ExitCode {
             debug.emit(&line);
         }
     }
-    // The format is read before `run` moves `cli`: the error path
-    // needs it to render in the selected format.
-    let format = cli.format;
-    match run(cli, &debug) {
+    // The format is resolved before `run` moves `cli`: the error
+    // path needs it to render in the selected format. A resolution
+    // failure (malformed config, invalid GEECTL_FORMAT) is a JSON
+    // error — no format was selected yet.
+    let (format, format_source) = match resolve_format(cli.format) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            write_error(&err, Format::Json);
+            return ExitCode::from(err.exit_code() as u8);
+        }
+    };
+    match run(cli, &debug, format, format_source) {
         Ok(payload) => match write_payload(&payload) {
             Ok(()) => ExitCode::from(0),
             Err(err) => {
@@ -491,7 +596,7 @@ mod tests {
     #[test]
     fn version_payload_is_json_with_name_and_version() {
         let cli = Cli::parse_from(["geectl", "version"]);
-        let payload = run(cli, &Debug::disabled()).unwrap();
+        let payload = run(cli, &Debug::disabled(), Format::Json, "default").unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["name"], "geectl");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
@@ -500,7 +605,24 @@ mod tests {
     #[test]
     fn no_subcommand_prints_version_payload() {
         let cli = Cli::parse_from(["geectl"]);
-        assert!(run(cli, &Debug::disabled()).is_ok());
+        assert!(run(cli, &Debug::disabled(), Format::Json, "default").is_ok());
+    }
+
+    #[test]
+    fn resolve_format_flag_wins_without_config() {
+        // The flag short-circuits: no config file is read at all.
+        let (format, source) = resolve_format(Some(Format::Text)).unwrap();
+        assert_eq!(format, Format::Text);
+        assert_eq!(source, "flag");
+    }
+
+    #[test]
+    fn config_show_payload_reports_format_and_source() {
+        let payload = config_show_payload(Format::Text, "config").unwrap();
+        assert_eq!(payload["format"], "text");
+        assert_eq!(payload["format_source"], "config");
+        let text = render_config_show_text(&payload);
+        assert!(text.contains("format: text (config)"), "{text}");
     }
 
     #[test]

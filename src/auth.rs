@@ -788,13 +788,6 @@ pub(crate) fn snapshot_env(names: &[&str]) -> Result<HashMap<String, String>, Ge
 /// [`resolve_obs_basic`] for the variables and the rules.
 pub struct EnvObsAuth;
 
-impl AuthProvider for EnvObsAuth {
-    fn credentials(&self) -> Result<Credentials, GeectlError> {
-        let env = snapshot_env(&[OBS_USERNAME_VAR, OBS_PASSWORD_VAR, OBS_PASSWORD_FILE_VAR])?;
-        resolve_obs_basic(&|name| env.get(name).cloned(), &read_secret_file_production)
-    }
-}
-
 impl EnvObsAuth {
     /// OBS Basic credentials for one API URL from the process
     /// environment. See [`resolve_obs_basic_for_url`] for the

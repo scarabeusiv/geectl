@@ -85,12 +85,16 @@ to encode.
 
 ## Auth (`src/auth.rs`, `src/http.rs`)
 
-Credentials are resolved by providers implementing the `AuthProvider`
-trait (`src/auth.rs`): `EnvObsAuth` (OBS Basic from
-`GEECTL_OBS_USERNAME` + `GEECTL_OBS_PASSWORD` or
-`GEECTL_OBS_PASSWORD_FILE`), `EnvGiteaAuth` (Gitea Bearer from
-`GEECTL_GITEA_TOKEN` or `GEECTL_GITEA_TOKEN_FILE`), and `GiteaSshKey`
-(the SSH private key from `GEECTL_GITEA_SSH_KEY`). Unconfigured
+OBS Basic credentials come from `EnvObsAuth` (per-URL, via
+`credentials_for_url` — not an `AuthProvider`): the matching
+instance alias's variables (`GEECTL_OBS_USERNAME_<ALIAS>` and
+friends), else the plain `GEECTL_OBS_USERNAME` +
+`GEECTL_OBS_PASSWORD` or `GEECTL_OBS_PASSWORD_FILE` when the URL is
+the configured default. Credentials are otherwise resolved by
+providers implementing the `AuthProvider` trait (`src/auth.rs`):
+`EnvGiteaAuth` (Gitea Bearer from `GEECTL_GITEA_TOKEN` or
+`GEECTL_GITEA_TOKEN_FILE`) and `GiteaSshKey` (the SSH private key
+from `GEECTL_GITEA_SSH_KEY`). Unconfigured
 resolves to `Credentials::None`; a half-configured pair, both secret
 sources set, or a malformed value is a `ConfigError` naming the
 source, never the value. The SSH key must be a PEM private key in a

@@ -1,8 +1,10 @@
-//! XDG config file: endpoint URLs only, never credentials.
+//! XDG config file: endpoint URLs and the output-format default,
+//! never credentials.
 //!
 //! The config file lives at `$XDG_CONFIG_HOME/geectl/config.toml`
 //! (default `~/.config/geectl/config.toml`). It holds only the two
-//! endpoint URLs (`obs_url`, `gitea_url`) and the named-instance
+//! endpoint URLs (`obs_url`, `gitea_url`), the output-format
+//! default (`format`, `json` or `text`), and the named-instance
 //! table (`[instances]`, alias → URL — see [`Config::instances`]).
 //! Credentials are never
 //! stored here: a key that looks like a credential is a refusal to
@@ -39,6 +41,8 @@ use std::collections::{HashMap, HashSet};
 pub const OBS_URL_VAR: &str = "GEECTL_OBS_URL";
 /// Environment variable overriding the Gitea endpoint URL.
 pub const GITEA_URL_VAR: &str = "GEECTL_GITEA_URL";
+/// Environment variable overriding the output-format default.
+pub const FORMAT_VAR: &str = "GEECTL_FORMAT";
 
 /// The built-in OBS endpoint (the OBS API, not the web UI).
 pub const DEFAULT_OBS_URL: &str = "https://api.opensuse.org";
@@ -46,13 +50,15 @@ pub const DEFAULT_OBS_URL: &str = "https://api.opensuse.org";
 /// the same host).
 pub const DEFAULT_GITEA_URL: &str = "https://src.opensuse.org";
 
-/// The effective (non-secret) configuration: endpoint URLs only.
-/// A field is `None` when neither the config file nor the environment
-/// set it; [`effective_config`] fills in the built-in defaults.
+/// The effective (non-secret) configuration: endpoint URLs and
+/// the output-format default. A field is `None` when neither the
+/// config file nor the environment set it; [`effective_config`]
+/// fills in the built-in defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pub obs_url: Option<String>,
     pub gitea_url: Option<String>,
+    pub format: Option<String>,
     /// Named OBS instances from the config file's `[instances]`
     /// table, sorted by alias: `(alias, url)` pairs, e.g.
     /// `myloveinstance = "https://api.opensuse.org"`. The alias
@@ -68,10 +74,10 @@ pub struct Config {
     pub instances: Vec<(String, String)>,
 }
 
-/// The effective endpoints plus where each value came from. The
-/// source is computed once, here, with the values — callers must not
-/// re-derive it by re-reading the environment (a second precedence
-/// copy drifts). The `[instances]`
+/// The effective endpoints and output format, plus where each
+/// value came from. The source is computed once, here, with the
+/// values — callers must not re-derive it by re-reading the
+/// environment (a second precedence copy drifts). The `[instances]`
 /// table rides through unchanged: it has no environment override
 /// and no source to report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +85,7 @@ pub struct EffectiveConfig {
     pub config: Config,
     pub obs_url_source: &'static str,
     pub gitea_url_source: &'static str,
+    pub format_source: &'static str,
 }
 
 /// Read one endpoint URL from a snapshot (see [`snapshot_env`]):
@@ -155,15 +162,17 @@ fn validate_endpoint_url(text: &str, source: &str) -> Result<String, GeectlError
     Ok(text.to_string())
 }
 
-/// The effective endpoints: env vars (`GEECTL_OBS_URL` /
-/// `GEECTL_GITEA_URL`) win over the config file, which wins over the
-/// built-in defaults. URLs only — never a secret. An env value is
-/// validated like a file value (see [`validate_endpoint_url`]); a bad
-/// one is a `ConfigError` naming the variable.
+/// The effective endpoints and output format: env vars
+/// (`GEECTL_OBS_URL` / `GEECTL_GITEA_URL` / `GEECTL_FORMAT`) win
+/// over the config file, which wins over the built-in defaults.
+/// URLs only — never a secret. An env value is validated like a
+/// file value (see [`validate_endpoint_url`]); a bad one is a
+/// `ConfigError` naming the variable. The format value is validated
+/// the same way (see [`validate_format`]).
 pub fn effective_config(config: &Config) -> Result<EffectiveConfig, GeectlError> {
-    // One snapshot for both URLs: the two resolutions see the same
-    // environment.
-    let env = snapshot_env(&[OBS_URL_VAR, GITEA_URL_VAR])?;
+    // One snapshot for the URLs and the format: the resolutions see
+    // the same environment.
+    let env = snapshot_env(&[OBS_URL_VAR, GITEA_URL_VAR, FORMAT_VAR])?;
     let resolve = |var: &str, from_file: &Option<String>, default: &str| {
         if let Some(value) = env_url(&env, var) {
             let value = validate_endpoint_url(&value, var)?;
@@ -181,15 +190,43 @@ pub fn effective_config(config: &Config) -> Result<EffectiveConfig, GeectlError>
     let (obs_url, obs_url_source) = resolve(OBS_URL_VAR, &config.obs_url, DEFAULT_OBS_URL)?;
     let (gitea_url, gitea_url_source) =
         resolve(GITEA_URL_VAR, &config.gitea_url, DEFAULT_GITEA_URL)?;
+    let (format, format_source) = match env_url(&env, FORMAT_VAR) {
+        Some(value) => (validate_format(&value, FORMAT_VAR)?, "environment"),
+        None => match &config.format {
+            // Validated like the env value: parse_config validates
+            // too, but effective_config takes any Config, and a value
+            // built without the parse path must not slip through.
+            Some(value) => (validate_format(value, "config file")?, "config"),
+            None => ("json".to_string(), "default"),
+        },
+    };
     Ok(EffectiveConfig {
         config: Config {
             obs_url: Some(obs_url),
             gitea_url: Some(gitea_url),
+            format: Some(format),
             instances: config.instances.clone(),
         },
         obs_url_source,
         gitea_url_source,
+        format_source,
     })
+}
+
+/// Validate an output-format value (from the config file or the
+/// environment): `json` or `text`, exactly. A format value is not a
+/// secret, so the error names the value — the user typed it, and the
+/// fix is to spell it right. `source` names where the value came
+/// from (an env var or the config file).
+fn validate_format(value: &str, source: &str) -> Result<String, GeectlError> {
+    let value = value.trim();
+    match value {
+        "json" | "text" => Ok(value.to_string()),
+        _ => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{source}: invalid output format {value:?}; expected \"json\" or \"text\""),
+        )),
+    }
 }
 
 /// The two candidate config paths: the XDG one (only when
@@ -345,13 +382,14 @@ fn toml_position(text: &str, offset: usize) -> String {
     format!(" at line {line}, column {col}")
 }
 
-/// Parse config TOML. Only `obs_url` / `gitea_url` / `instances`
-/// are recognised; anything else is an error (a typo must not
-/// silently do nothing), and a credential-shaped key anywhere in
-/// the file is a refusal to run. URL values must be `https://`
-/// with a host — validated here, at load time, not at the first
-/// request. The `[instances]` table maps an alias to an endpoint
-/// URL (see [`as_instances_table`]).
+/// Parse config TOML. Only `obs_url` / `gitea_url` / `format` /
+/// `instances` are recognised; anything else is an error (a typo
+/// must not silently do nothing), and a credential-shaped key
+/// anywhere in the file is a refusal to run. URL values must be
+/// `https://` with a host — validated here, at load time, not at
+/// the first request. The `format` value must be `json` or `text`.
+/// The `[instances]` table maps an alias to an endpoint URL (see
+/// [`as_instances_table`]).
 pub fn parse_config(text: &str, path: &Path) -> Result<Config, GeectlError> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
         // The parser error embeds the offending line, which could be
@@ -368,7 +406,7 @@ pub fn parse_config(text: &str, path: &Path) -> Result<Config, GeectlError> {
     })?;
     check_no_credentials(&table, path)?;
     for key in table.keys() {
-        if key != "obs_url" && key != "gitea_url" && key != "instances" {
+        if key != "obs_url" && key != "gitea_url" && key != "format" && key != "instances" {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
                 format!("{}: unknown config key '{key}'", path.display()),
@@ -382,10 +420,25 @@ pub fn parse_config(text: &str, path: &Path) -> Result<Config, GeectlError> {
     if let Some(value) = table.get("gitea_url") {
         config.gitea_url = Some(as_url_string(value, "gitea_url", path)?);
     }
+    if let Some(value) = table.get("format") {
+        config.format = Some(as_format_string(value, "format", path)?);
+    }
     if let Some(value) = table.get("instances") {
         config.instances = as_instances_table(value, path)?;
     }
     Ok(config)
+}
+
+/// A format value must be a string and a valid output format (see
+/// [`validate_format`]).
+fn as_format_string(value: &toml::Value, key: &str, path: &Path) -> Result<String, GeectlError> {
+    let text = value.as_str().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{}: '{key}' must be a string", path.display()),
+        )
+    })?;
+    validate_format(text, &format!("{}: '{key}'", path.display()))
 }
 
 /// A URL value must be a string and a usable `https://` endpoint
@@ -628,7 +681,7 @@ fn credential_env_hint(key: &str) -> String {
 
 /// The template `config init` writes: endpoints only, with the
 /// credential rule spelled out in a comment.
-pub const CONFIG_TEMPLATE: &str = r#"# geectl configuration — endpoint URLs only.
+pub const CONFIG_TEMPLATE: &str = r#"# geectl configuration — endpoint URLs and the output-format default.
 #
 # Credentials are NEVER stored here. Pass them via the environment
 # (or mounted secret files):
@@ -639,6 +692,9 @@ pub const CONFIG_TEMPLATE: &str = r#"# geectl configuration — endpoint URLs on
 # A credential-shaped key in this file is a refusal to run.
 obs_url = "https://api.opensuse.org"
 gitea_url = "https://src.opensuse.org"
+# The output format default: "json" (default) or "text". The
+# --format flag wins over it, and GEECTL_FORMAT wins over this key.
+# format = "json"
 "#;
 
 /// Write the template to `path`, refusing if the file already exists
@@ -1304,8 +1360,8 @@ mod tests {
         let config = Config {
             obs_url: Some("https://user:secret@api.opensuse.org".to_string()),
             gitea_url: None,
+            format: None,
             instances: vec![],
-
         };
         let err = effective_config(&config).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
@@ -1314,8 +1370,8 @@ mod tests {
         let config = Config {
             obs_url: Some("https://api.opensuse.org".to_string()),
             gitea_url: None,
+            format: None,
             instances: vec![],
-
         };
         let effective = effective_config(&config).unwrap();
         assert_eq!(
@@ -1408,5 +1464,56 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(err.context.contains("already exists"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "first\n");
+    }
+
+    #[test]
+    fn format_parses_from_config_file() {
+        let config = parse_config("format = \"text\"\n", Path::new("config.toml")).unwrap();
+        assert_eq!(config.format.as_deref(), Some("text"));
+    }
+
+    #[test]
+    fn format_rejects_unknown_values() {
+        let err = parse_config("format = \"yaml\"\n", Path::new("config.toml")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("yaml"));
+        let err = parse_config("format = 3\n", Path::new("config.toml")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("format"));
+    }
+
+    #[test]
+    fn effective_config_resolves_format_from_file() {
+        let config = Config {
+            obs_url: None,
+            gitea_url: None,
+            format: Some("text".to_string()),
+            instances: vec![],
+        };
+        let effective = effective_config(&config).unwrap();
+        assert_eq!(effective.config.format.as_deref(), Some("text"));
+        assert_eq!(effective.format_source, "config");
+    }
+
+    #[test]
+    fn effective_config_revalidates_format() {
+        // A Config built without going through parse_config must not
+        // smuggle an unvalidated format past effective_config.
+        let config = Config {
+            obs_url: None,
+            gitea_url: None,
+            format: Some("yaml".to_string()),
+            instances: vec![],
+        };
+        let err = effective_config(&config).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("yaml"));
+    }
+
+    #[test]
+    fn effective_config_defaults_format_to_json() {
+        let effective = effective_config(&Config::default()).unwrap();
+        assert_eq!(effective.config.format.as_deref(), Some("json"));
+        assert_eq!(effective.format_source, "default");
     }
 }

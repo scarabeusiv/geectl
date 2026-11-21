@@ -13,6 +13,11 @@ side.
 
 It is a pure agentic flow. Human flows already exist and are not disrupted.
 
+## Usage
+
+See [docs/cli.md](docs/cli.md) for the command reference with real
+`--help` output.
+
 [![test](https://github.com/scarabeusiv/geectl/actions/workflows/test.yml/badge.svg)](https://github.com/scarabeusiv/geectl/actions/workflows/test.yml)
 [![freshness](https://github.com/scarabeusiv/geectl/actions/workflows/freshness.yml/badge.svg)](https://github.com/scarabeusiv/geectl/actions/workflows/freshness.yml)
 [![CodeQL](https://github.com/scarabeusiv/geectl/actions/workflows/codeql.yml/badge.svg)](https://github.com/scarabeusiv/geectl/actions/workflows/codeql.yml)
@@ -32,6 +37,14 @@ only the parts needed for management and processing as agents.
   to OBS directly or via git. This is **not** initial work. If anyone opens
   a PR for it, we review and support it if it bites us, but it is not on
   the roadmap.
+
+## How it differs from osc
+
+geectl is not osc with a new name: one noun per operation family,
+explicit flags instead of positionals, no working-copy inference,
+JSON by default with opt-in text, and dry-run by default for
+mutations. The full list of deliberate deviations, with reasons, is
+[docs/cli-swaps.md](docs/cli-swaps.md).
 
 ## What geectl guarantees
 

@@ -125,7 +125,8 @@ fn geectl_isolated(dir: &TempDir) -> Command {
         .env_remove("GEECTL_GITEA_TOKEN")
         .env_remove("GEECTL_GITEA_TOKEN_FILE")
         .env_remove("GEECTL_GITEA_SSH_KEY")
-        .env_remove("GEECTL_DEBUG");
+        .env_remove("GEECTL_DEBUG")
+        .env_remove("GEECTL_FORMAT");
     cmd
 }
 
@@ -552,6 +553,33 @@ fn debug_config_line_never_shows_a_secret() {
     for secret in ["alice-test", "hunter2-fake", "tok-fake"] {
         assert!(!stderr.contains(secret), "debug line leaked {secret}");
     }
+}
+
+#[test]
+fn debug_config_line_reports_alias_credentials() {
+    // Alias-only credentials (no plain variables): the debug
+    // config line must report the OBS auth kind for the effective
+    // URL, not the plain variables only.
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[instances]\nmyloveinstance = \"https://api.opensuse.org\"\n",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["--debug", "version"])
+        .env("GEECTL_OBS_USERNAME_MYLOVEINSTANCE", "target-user")
+        .env("GEECTL_OBS_PASSWORD_MYLOVEINSTANCE", "target-secret")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(
+        "config: obs api.opensuse.org (auth: basic), gitea src.opensuse.org (auth: none)"
+    ));
+    assert!(!stderr.contains("target-secret"));
 }
 
 // --- remote-read integration tests ---
@@ -1425,6 +1453,82 @@ fn build_unknown_subcommand_fails_with_parse_error() {
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
 }
 
+// --- PR #83 fix-round tests: docs golden test, alias credentials,
+// supersede guard, whole-project guard, output-format default ---
+
+/// Extract the `--help` blocks from docs/cli.md: each ``` fence
+/// whose content holds a `Usage: geectl ...` line. Returns
+/// `(argv, expected_stdout)` per block, where argv is the path from
+/// the Usage line (the tokens after `geectl`, up to the first `[` or
+/// `<` token). The ```sh and ```toml fences are usage/config
+/// snippets, not --help output, and are skipped (they hold no Usage
+/// line).
+fn help_blocks(docs: &str) -> Vec<(Vec<String>, String)> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in docs.lines() {
+        // Any fenced block toggles: ```, ```sh, ```toml — a
+        // fenced snippet that is not a --help block is skipped below
+        // for holding no Usage line.
+        if line.trim().starts_with("```") {
+            if let Some(lines) = current.take() {
+                let text = lines.join("\n");
+                if let Some(usage) = text.lines().find(|l| l.starts_with("Usage: geectl")) {
+                    let argv: Vec<String> = usage
+                        .trim_start_matches("Usage: geectl")
+                        .split_whitespace()
+                        .take_while(|t| !t.starts_with('[') && !t.starts_with('<'))
+                        .map(str::to_string)
+                        .collect();
+                    blocks.push((argv, format!("{text}\n")));
+                }
+            } else {
+                current = Some(Vec::new());
+            }
+        } else if let Some(lines) = &mut current {
+            lines.push(line);
+        }
+    }
+    blocks
+}
+
+#[test]
+fn docs_help_blocks_match_the_binary() {
+    // The docs carry the binary's --help output verbatim; this test
+    // makes that permanent. A block that drifts fails here — regenerate
+    // it from the built binary (`geectl <path> --help`), never by hand.
+    // The docs carry 11 blocks (top level, 5 groups, 5 leaves) — a
+    // sampled surface, not every leaf: a leaf with no docs block can
+    // change --help undetected. That is deliberate — the docs show the
+    // groups and one leaf each — and the count assertion guards the
+    // docs side only.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let docs = fs::read_to_string(manifest.join("docs/cli.md")).expect("docs/cli.md");
+    let blocks = help_blocks(&docs);
+    assert_eq!(
+        blocks.len(),
+        11,
+        "docs/cli.md should carry 11 --help blocks (top level, 5 groups, 5 leaves);          update this count when a block is deliberately added or removed"
+    );
+    for (argv, expected) in blocks {
+        let mut cmd = geectl();
+        cmd.args(&argv).arg("--help");
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "geectl {argv:?} --help failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let actual = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            actual,
+            expected,
+            "docs/cli.md --help block drifted for `geectl {}`",
+            argv.join(" ")
+        );
+    }
+}
+
 #[test]
 fn copy_package_to_apiurl_with_plain_credentials_fails_clearly() {
     // Plain (default-instance) credentials must never be forwarded
@@ -1679,3 +1783,155 @@ fn request_file_delete_whole_project_dry_run_with_flag() {
     assert!(!plan.is_empty(), "plan must not be empty: {value}");
 }
 
+#[test]
+fn geectl_format_env_selects_text_output() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["version"])
+        .env("GEECTL_FORMAT", "text")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .starts_with("geectl "),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn geectl_format_env_invalid_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["version"])
+        .env("GEECTL_FORMAT", "yaml")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("GEECTL_FORMAT"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn config_show_reports_format_from_env() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["config", "show"])
+        .env("GEECTL_FORMAT", "text")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The env selects text output, so the format line is in the text
+    // rendering, not a JSON field.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("format: text (environment)"), "{stdout}");
+}
+
+#[test]
+fn config_show_reports_format_from_config_file() {
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("config.toml"), "format = \"text\"\n").unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("format: text (config)"), "{stdout}");
+}
+
+#[test]
+fn config_show_reports_obs_auth_from_alias_credentials() {
+    // Alias-only credentials (no plain variables): config show
+    // must report the OBS status for the effective URL, not the
+    // plain variables only.
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[instances]\nmyloveinstance = \"https://api.opensuse.org\"\n",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["config", "show"])
+        .env("GEECTL_OBS_USERNAME_MYLOVEINSTANCE", "target-user")
+        .env("GEECTL_OBS_PASSWORD_MYLOVEINSTANCE", "target-secret")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["obs_auth"]["status"], "configured");
+    assert_eq!(value["obs_auth"]["username"], "target-user");
+    assert_eq!(
+        value["instances"]["myloveinstance"],
+        "https://api.opensuse.org"
+    );
+    assert!(!stdout.contains("target-secret"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("target-secret"));
+}
+
+#[test]
+fn config_show_reports_instances_table() {
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[instances]\nmyloveinstance = \"https://api.opensuse.org\"\nlocal = \"http://127.0.0.1:3001\"\n",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        value["instances"]["myloveinstance"],
+        "https://api.opensuse.org"
+    );
+    assert_eq!(value["instances"]["local"], "http://127.0.0.1:3001");
+    // And in text form, as `alias -> url` pairs sorted by alias.
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "config", "show"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "instances: local -> http://127.0.0.1:3001, myloveinstance -> https://api.opensuse.org"
+        ),
+        "{stdout}"
+    );
+}
