@@ -1,0 +1,2238 @@
+//! `request` command group: read and act on OBS submit requests, and
+//! file new ones. Thin over the library (`ObsClient` request
+//! operations, `SrFiling`); every leaf returns the (payload, text)
+//! pair, so JSON and `--format text` agree on every id, name and
+//! state. No XML in any user-facing surface — typed values only.
+//!
+//! The command surface covers the full request inventory, but not
+//! its inconsistencies: every request operation lives under the
+//! `request` noun, one flag name per concept everywhere (`--comment`
+//! for state-change and review messages, `--description` for a
+//! filing's description), and subcommand names are the library
+//! operation names in kebab-case. Deliberate deviations from the
+//! inventory are tracked as swap rows in the rollout's swaps table.
+//!
+//! Mutations are dry-run by default, like the library: the global
+//! `--live` performs them. A dry-run mutation prints its plan on stderr (the
+//! library's `[dry-run]` narration) and returns a payload with
+//! `dry_run: true`, the recorded `plan`, and no id. In a dry run
+//! `try-change-state` reports `changed: true`: that is the library's
+//! would-change answer, not a change that happened — read it together
+//! with `dry_run`. The one exception is `request supersede`: the
+//! library's raw supersede has no dry-run, so without `--live` that
+//! command refuses — `request refile --supersede` is the
+//! dry-runnable supersede flow.
+//!
+//! Credentials in dry-run: this group swallows a half-configured
+//! credential pair in dry-run (the plan prints without credentials;
+//! the dropped error goes to the debug channel and to stderr as a
+//! warning), so a request preview
+//! never needs credentials at all. A live run — and every read —
+//! still resolves credentials up front and fails fast. The other
+//! groups differ deliberately: they fail fast on a half-configured
+//! pair even in dry-run (see `cli_branch`, `cli_remote`,
+//! `cli_build`, `maintenance`).
+//!
+//! Text output echoes the query coordinates in one header line per
+//! command: the request id for the single-request reads and the
+//! one-line actions (`show` opens with `id:`, `log` and
+//! `list-comments` with `id:` in the non-empty case — the id is
+//! echoed in the `no …` line when empty), and the filters actually
+//! given plus the result count for `search`. `diff` is a content
+//! command and is exempt from the header (design rule 1, rule 4):
+//! its text is the diff verbatim, and the coordinates live in the
+//! JSON payload. An empty diff — a request with no submit action,
+//! for which the server returns an empty body — renders
+//! `no diff for request <id>` instead of empty output (design
+//! rule 5). Tables stay narrow by design — the search table shows
+//! id, state, creator and actions only, and the actions column is a
+//! compact summary (`submit foo`): target names and `source_rev` are
+//! omitted there, by decision, and stay in the JSON payload and in
+//! `request show <id>`. In `show`, the accepted revision renders but
+//! the acceptinfo hashes and origin project/package do not — they stay
+//! in the JSON payload. `--with-history` enriches the JSON payload
+//! only; the table never renders history. Action texts are one-line
+//! summaries naming the id and the outcome; the full result is the
+//! JSON payload. These omissions are decided, not gaps: do not
+//! expand the tables to echo the full payload.
+
+use clap::{Args, Subcommand};
+use geectl::auth::{Credentials, EnvObsAuth};
+use geectl::config;
+use geectl::debug::Debug;
+use geectl::error::{ErrorKind, GeectlError};
+use geectl::http::{Timeout, UreqClient};
+use geectl::obs::{
+    AcceptInfo, ChangeDevelPayload, CveId, DeletePayload, DeleteTarget, DryRun,
+    MaintenanceIncidentPayload, ObsClient, Request, RequestAction, RequestComment, RequestHistory,
+    RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewTarget, SrFiling,
+    SrPayload, OBS_API_BASE,
+};
+use serde_json::{json, Value};
+
+/// The `request` subcommands: one leaf per library operation, named
+/// after the operation in kebab-case.
+#[derive(Debug, Subcommand)]
+pub enum RequestCommand {
+    /// Show one submit request: source/target/message, reviews, history.
+    Show {
+        /// The request id.
+        id: String,
+    },
+    /// Show one submit request's history: creation, then each state change.
+    Log {
+        /// The request id.
+        id: String,
+    },
+    /// List the submit requests matching the filters: a typed search,
+    /// not a plain listing.
+    Search {
+        /// Only requests with these ids.
+        #[arg(long = "request-id")]
+        request_ids: Vec<u64>,
+        /// Only requests with an action from or to these projects.
+        #[arg(long)]
+        project: Vec<String>,
+        /// Only requests with an action from or to these packages.
+        #[arg(long)]
+        package: Vec<String>,
+        /// Only requests with an action from these source projects.
+        #[arg(long)]
+        source_project: Vec<String>,
+        /// Only requests with an action from these source packages.
+        #[arg(long)]
+        source_package: Vec<String>,
+        /// Only requests with an action to these target projects.
+        #[arg(long)]
+        target_project: Vec<String>,
+        /// Only requests with an action to these target packages.
+        #[arg(long)]
+        target_package: Vec<String>,
+        /// Only requests filed by these users.
+        #[arg(long)]
+        creator: Vec<String>,
+        /// Only requests involving these users.
+        #[arg(long)]
+        who: Vec<String>,
+        /// Only requests in these states. When none are given, only
+        /// new, review and declined requests are listed.
+        #[arg(long, value_parser = [
+            "new", "review", "accepted", "declined", "revoked", "superseded", "deleted",
+        ])]
+        state: Vec<String>,
+        /// Only requests with an action of these types.
+        #[arg(long = "type")]
+        types: Vec<String>,
+        /// Exclude requests with an action targeting these projects.
+        #[arg(long)]
+        exclude_target_project: Vec<String>,
+        /// Include the history of each request.
+        #[arg(long)]
+        with_history: bool,
+        /// Include the full history of each request.
+        #[arg(long)]
+        with_full_history: bool,
+    },
+    /// Show the diff of a submit request: the unified diff, or the
+    /// request XML with the diff injected with `--xml`.
+    Diff {
+        /// The request id.
+        id: String,
+        /// Render the request XML with the diff injected, instead of
+        /// the unified diff.
+        #[arg(long)]
+        xml: bool,
+    },
+    /// List the comments on a submit request, in id order.
+    ListComments {
+        /// The request id.
+        id: String,
+    },
+    /// Accept a submit request, with a comment as the message left
+    /// with the accept.
+    Accept {
+        /// The request id.
+        id: String,
+        /// The message left with the accept. Values starting with `-` are taken literally: a comment may open with a `- ` bullet.
+        #[arg(long, default_value = "", allow_hyphen_values = true)]
+        comment: String,
+        /// Accept a request still in `review` state, overriding its
+        /// open reviews.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Decline a submit request, with a comment as the reason.
+    Decline {
+        /// The request id.
+        id: String,
+        /// The reason for the decline. Values starting with `-` are taken literally: a comment may open with a `- ` bullet.
+        #[arg(long, default_value = "", allow_hyphen_values = true)]
+        comment: String,
+    },
+    /// Revoke (withdraw) a submit request, with a comment as the reason.
+    Revoke {
+        /// The request id.
+        id: String,
+        /// The reason for the revocation. Values starting with `-` are taken literally: a comment may open with a `- ` bullet.
+        #[arg(long, default_value = "", allow_hyphen_values = true)]
+        comment: String,
+    },
+    /// Change a submit request's state to one of
+    /// new/review/accepted/declined/revoked.
+    ChangeState {
+        /// The request id.
+        id: String,
+        /// The state to change to.
+        #[arg(value_parser = ["new", "review", "accepted", "declined", "revoked"])]
+        state: String,
+        /// The message left with the change. Values starting with `-` are taken literally: a comment may open with a `- ` bullet.
+        #[arg(long, default_value = "", allow_hyphen_values = true)]
+        comment: String,
+        /// Force the change, overriding open reviews. Only honoured when changing to accepted.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Best-effort state change: try it, and report whether it
+    /// happened instead of failing when the request cannot move.
+    TryChangeState {
+        /// The request id.
+        id: String,
+        /// The state to change to.
+        #[arg(value_parser = ["new", "review", "accepted", "declined", "revoked"])]
+        state: String,
+        /// The message left with the change. Values starting with `-` are taken literally: a comment may open with a `- ` bullet.
+        #[arg(long, default_value = "", allow_hyphen_values = true)]
+        comment: String,
+        /// Force the change, overriding open reviews. Only honoured when changing to accepted.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Ask a user, group, project, or package to review a submit request.
+    AddReview {
+        /// The request id.
+        id: String,
+        /// The user the review is asked of.
+        #[arg(long)]
+        user: Option<String>,
+        /// The group the review is asked of.
+        #[arg(long)]
+        group: Option<String>,
+        /// The project the review is asked of.
+        #[arg(long)]
+        project: Option<String>,
+        /// The package the review is asked of (needs its project).
+        #[arg(long)]
+        package: Option<String>,
+        /// The reason the review is asked for. Values starting with `-` are taken literally: a comment may open with a `- ` bullet.
+        #[arg(long, allow_hyphen_values = true)]
+        comment: String,
+    },
+    /// Comment on a submit request, optionally as a reply to another comment.
+    AddComment {
+        /// The request id.
+        id: String,
+        /// The comment text. Values starting with `-` are taken literally: the body may open with a `- ` bullet.
+        #[arg(long, allow_hyphen_values = true)]
+        body: String,
+        /// The comment being replied to, when this is a reply.
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// File a submit request: source package to a devel project.
+    File {
+        #[command(flatten)]
+        file: FileArgs,
+    },
+    /// File a submit request and supersede an old one with it: the
+    /// new request is filed first, and only then is the old one
+    /// superseded pointing at it.
+    Refile {
+        #[command(flatten)]
+        file: FileArgs,
+        /// The open request this filing supersedes.
+        #[arg(long)]
+        supersede: String,
+    },
+    /// Supersede one request with another existing one. A mutation
+    /// that needs `--live`: the library's raw supersede has no
+    /// dry-run, so without `--live` this command refuses — use
+    /// `request refile --supersede` for the dry-runnable flow.
+    Supersede {
+        /// The open request being superseded.
+        old_id: String,
+        /// The existing request superseding it.
+        new_id: String,
+    },
+    /// File a change-devel request: change a package's devel project.
+    FileChangeDevel {
+        /// The project the package lives in.
+        #[arg(long)]
+        source_project: String,
+        /// The package whose devel project changes.
+        #[arg(long)]
+        source_package: String,
+        /// The project that becomes the devel project.
+        #[arg(long)]
+        target_project: String,
+        /// The package in the devel project.
+        #[arg(long)]
+        target_package: String,
+        /// The request description. Values starting with `-` are
+        /// taken literally: a description may open with a `- ` bullet.
+        #[arg(long, allow_hyphen_values = true)]
+        description: String,
+    },
+    /// File a delete request: delete a package, a repository, or a
+    /// whole project.
+    FileDelete {
+        /// The project the deletion targets.
+        #[arg(long)]
+        target_project: String,
+        /// The package to delete. Omit both this and `--repository`
+        /// to delete the whole project (with `--whole-project`).
+        #[arg(long, conflicts_with = "repository")]
+        package: Option<String>,
+        /// The repository to delete. Omit both this and `--package`
+        /// to delete the whole project (with `--whole-project`).
+        #[arg(long)]
+        repository: Option<String>,
+        /// Delete the whole project: required when neither
+        /// `--package` nor `--repository` is given. A whole-project
+        /// deletion is destructive, so omitting the target is not
+        /// enough — the flag is the explicit confirmation.
+        #[arg(long, conflicts_with_all = ["package", "repository"])]
+        whole_project: bool,
+        /// The request description. Values starting with `-` are
+        /// taken literally: a description may open with a `- ` bullet.
+        #[arg(long, allow_hyphen_values = true)]
+        description: String,
+    },
+    /// File a maintenance incident request: ask the maintenance team
+    /// to start a maintenance incident from a maintenance update.
+    FileMaintenanceIncident {
+        #[command(flatten)]
+        incident: MaintenanceIncidentArgs,
+    },
+    /// File a maintenance incident request and supersede an old one
+    /// with it: the new request is filed first, and only then is the
+    /// old one superseded pointing at it.
+    RefileMaintenanceIncident {
+        #[command(flatten)]
+        incident: MaintenanceIncidentArgs,
+        /// The open request this filing supersedes.
+        #[arg(long)]
+        supersede: String,
+    },
+}
+
+/// The flags shared by `request file` and `request refile`: the
+/// submit-request payload, mirroring `SrPayload::new`.
+#[derive(Debug, Args)]
+pub struct FileArgs {
+    /// The project the change comes from (the branch).
+    #[arg(long)]
+    source_project: String,
+    /// The package in the source project.
+    #[arg(long)]
+    source_package: String,
+    /// The project the request targets (the devel project, never
+    /// openSUSE:Factory directly).
+    #[arg(long)]
+    target_project: String,
+    /// The package in the target project.
+    #[arg(long)]
+    target_package: String,
+    /// The request description: one headline, then `- ` lines for
+    /// staging, needs, and rebuilds. Values starting with `-` are
+    /// taken literally: a description may open with a `- ` bullet.
+    #[arg(long, allow_hyphen_values = true)]
+    description: String,
+    /// The one `.changes` entry for this submission. It must name
+    /// every CVE passed with `--cve`. Values starting with `-` are
+    /// taken literally: a `.changes` entry starts with `- `.
+    #[arg(long, allow_hyphen_values = true)]
+    changes_entry: String,
+    /// A CVE this submission claims to fix. Repeatable; each one
+    /// must be named in `--changes-entry`.
+    #[arg(long)]
+    cve: Vec<String>,
+    /// Keep the source branch on accept instead of deleting it
+    /// (cleanup is the default).
+    #[arg(long)]
+    without_cleanup: bool,
+}
+
+/// The flags shared by `request file-maintenance-incident` and
+/// `request refile-maintenance-incident`: the maintenance incident
+/// payload, mirroring `MaintenanceIncidentPayload::new`. Unlike a
+/// submit request, the branch survives the incident by default;
+/// `--with-cleanup` opts into deleting it on accept.
+#[derive(Debug, Args)]
+pub struct MaintenanceIncidentArgs {
+    /// The project the maintenance update comes from.
+    #[arg(long)]
+    source_project: String,
+    /// A package in the source project. Repeatable: one action per
+    /// package; at least one is required.
+    #[arg(long)]
+    source_package: Vec<String>,
+    /// The maintenance project the incident goes to.
+    #[arg(long)]
+    target_project: String,
+    /// The release project the update releases into. When omitted,
+    /// the server resolves it from the maintenance project.
+    #[arg(long)]
+    release_project: Option<String>,
+    /// The request description. Values starting with `-` are
+    /// taken literally: a description may open with a `- ` bullet.
+    #[arg(long, allow_hyphen_values = true)]
+    description: String,
+    /// Delete the source branch when the incident is accepted. By
+    /// default the branch survives the incident.
+    #[arg(long)]
+    with_cleanup: bool,
+}
+
+/// Run one `request` subcommand, returning the (payload, text) pair:
+/// the JSON payload and a human rendering of the same data.
+pub fn run(
+    command: RequestCommand,
+    debug: &Debug,
+    live: bool,
+) -> Result<(Value, String), GeectlError> {
+    match command {
+        RequestCommand::Show { id } => with_client(debug, true, |client| {
+            let request = client.show_request(&id)?;
+            Ok((request_json(&request), render_request_text(&request)))
+        }),
+        RequestCommand::Log { id } => with_client(debug, true, |client| {
+            let history = client.request_log(&id)?;
+            let payload = json!({
+                "id": request_id_json(&id),
+                "history": history.iter().map(history_json).collect::<Vec<_>>(),
+            });
+            Ok((payload, render_history_text(&id, &history)))
+        }),
+        RequestCommand::Search {
+            request_ids,
+            project,
+            package,
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+            creator,
+            who,
+            state,
+            types,
+            exclude_target_project,
+            with_history,
+            with_full_history,
+        } => {
+            // The coordinates are read before `build_search` moves
+            // the filter values, and the search is built and
+            // validated before any credential resolution, so an
+            // invalid filter fails as InvalidInput whether or not
+            // credentials are configured (the file arms already
+            // validate their payloads this way).
+            let ids: Vec<String> = request_ids.iter().map(u64::to_string).collect();
+            let coordinates = search_coordinates(&[
+                ("request-id", &ids),
+                ("project", &project),
+                ("package", &package),
+                ("source-project", &source_project),
+                ("source-package", &source_package),
+                ("target-project", &target_project),
+                ("target-package", &target_package),
+                ("creator", &creator),
+                ("who", &who),
+                ("state", &state),
+                ("type", &types),
+                ("exclude-target-project", &exclude_target_project),
+            ]);
+            let search = build_search(
+                request_ids,
+                project,
+                package,
+                source_project,
+                source_package,
+                target_project,
+                target_package,
+                creator,
+                who,
+                state,
+                types,
+                exclude_target_project,
+                with_history,
+                with_full_history,
+            )?;
+            search.match_expr()?;
+            with_client(debug, true, |client| {
+                let requests = client.search_requests(&search)?;
+                let payload = json!({
+                    "requests": requests.iter().map(request_json).collect::<Vec<_>>(),
+                    "count": requests.len(),
+                });
+                Ok((payload, render_search_text(&coordinates, &requests)))
+            })
+        }
+        RequestCommand::Diff { id, xml } => with_client(debug, true, |client| {
+            let diff = client.request_diff(&id, xml)?;
+            // A content command: the payload is the diff, and the
+            // text rendering is the diff verbatim. Content commands
+            // are exempt from the coordinate header (design rule 1):
+            // the coordinates live in the JSON payload. The one
+            // exception is an empty diff, which renders an explicit
+            // line naming the request (design rule 5) instead of
+            // empty stdout.
+            let payload = json!({ "id": request_id_json(&id), "diff": diff, "xml": xml });
+            Ok((payload, render_diff_text(&id, &diff)))
+        }),
+        RequestCommand::ListComments { id } => with_client(debug, true, |client| {
+            let comments = client.list_comments(&id)?;
+            let payload = json!({
+                "id": request_id_json(&id),
+                "comments": comments.iter().map(comment_json).collect::<Vec<_>>(),
+            });
+            Ok((payload, render_comments_text(&id, &comments)))
+        }),
+        RequestCommand::Accept { id, comment, force } => act(
+            debug,
+            &id,
+            RequestState::Accepted,
+            &comment,
+            force,
+            live,
+            "accepted",
+        ),
+        RequestCommand::Decline { id, comment } => act(
+            debug,
+            &id,
+            RequestState::Declined,
+            &comment,
+            false,
+            live,
+            "declined",
+        ),
+        RequestCommand::Revoke { id, comment } => act(
+            debug,
+            &id,
+            RequestState::Revoked,
+            &comment,
+            false,
+            live,
+            "revoked",
+        ),
+        RequestCommand::ChangeState {
+            id,
+            state,
+            comment,
+            force,
+        } => {
+            let state = parse_state(&state)?;
+            let verb = state.as_str();
+            act(debug, &id, state, &comment, force, live, verb)
+        }
+        RequestCommand::TryChangeState {
+            id,
+            state,
+            comment,
+            force,
+        } => {
+            let state = parse_state(&state)?;
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            with_client(debug, live, |client| {
+                let changed = client.try_change_state(&id, state, &comment, force, &dry_run)?;
+                // `changed` is the library's would-change answer: in
+                // a dry run it is true by design (the change is only
+                // planned, not performed), so read it together with
+                // `dry_run`, never as "the state changed".
+                let mut payload = json!({
+                    "id": request_id_json(&id),
+                    "target_state": state.as_str(),
+                    "comment": comment,
+                    "changed": changed,
+                    "dry_run": dry_run.enabled(),
+                });
+                add_plan(&mut payload, &dry_run);
+                let mut text = if dry_run.enabled() {
+                    format!(
+                        "dry-run: would try to change request {id} to {}",
+                        state.as_str()
+                    )
+                } else if changed {
+                    format!("changed request {id} to {}", state.as_str())
+                } else {
+                    format!("request {id} not changed to {}", state.as_str())
+                };
+                if !comment.is_empty() {
+                    text.push_str(&format!(" — {comment}"));
+                }
+                Ok((payload, text))
+            })
+        }
+        RequestCommand::AddReview {
+            id,
+            user,
+            group,
+            project,
+            package,
+            comment,
+        } => {
+            let target = ReviewTarget::new(
+                user.as_deref(),
+                group.as_deref(),
+                project.as_deref(),
+                package.as_deref(),
+            )?;
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            with_client(debug, live, |client| {
+                client.add_review(&id, &target, &comment, &dry_run)?;
+                let mut payload = json!({
+                    "id": request_id_json(&id),
+                    "review": {
+                        "by_user": target.by_user,
+                        "by_group": target.by_group,
+                        "by_project": target.by_project,
+                        "by_package": target.by_package,
+                    },
+                    "comment": comment,
+                    "dry_run": dry_run.enabled(),
+                });
+                add_plan(&mut payload, &dry_run);
+                let mut text = if dry_run.enabled() {
+                    format!(
+                        "dry-run: would ask {} to review request {id}",
+                        target.describe()
+                    )
+                } else {
+                    format!("asked {} to review request {id}", target.describe())
+                };
+                if !comment.is_empty() {
+                    text.push_str(&format!(" — {comment}"));
+                }
+                Ok((payload, text))
+            })
+        }
+        RequestCommand::AddComment { id, body, parent } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            with_client(debug, live, |client| {
+                client.add_comment(&id, &body, parent.as_deref(), &dry_run)?;
+                let mut payload = json!({
+                    "id": request_id_json(&id),
+                    "body": body,
+                    "dry_run": dry_run.enabled(),
+                });
+                add_plan(&mut payload, &dry_run);
+                let text = if dry_run.enabled() {
+                    format!("dry-run: would comment on request {id}: {body}")
+                } else {
+                    format!("commented on request {id}: {body}")
+                };
+                Ok((payload, text))
+            })
+        }
+        RequestCommand::File { file } => file_request(debug, live, &file, None),
+        RequestCommand::Refile { file, supersede } => {
+            file_request(debug, live, &file, Some(&supersede))
+        }
+        RequestCommand::FileMaintenanceIncident { incident } => {
+            file_maintenance_incident(debug, live, &incident, None)
+        }
+        RequestCommand::RefileMaintenanceIncident {
+            incident,
+            supersede,
+        } => file_maintenance_incident(debug, live, &incident, Some(&supersede)),
+        RequestCommand::Supersede { old_id, new_id } => {
+            if !live {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "request supersede has no dry-run: pass --live to perform it, or use `request refile --supersede` for the dry-runnable supersede flow",
+                ));
+            }
+            with_client(debug, true, |client| {
+                client.supersede_request(&old_id, &new_id)?;
+                let payload = json!({
+                    "old_id": request_id_json(&old_id),
+                    "new_id": request_id_json(&new_id),
+                    "dry_run": false,
+                });
+                Ok((
+                    payload,
+                    format!("superseded request {old_id} with {new_id}"),
+                ))
+            })
+        }
+        RequestCommand::FileChangeDevel {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+            description,
+        } => {
+            let payload = ChangeDevelPayload::new(
+                &source_project,
+                &source_package,
+                &target_project,
+                &target_package,
+                &description,
+            )?;
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            with_client(debug, live, |client| {
+                let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
+                let id = filing.file_change_devel(&payload)?;
+                let filed = filed_payload(&id, &dry_run, |id| {
+                    json!({
+                        "id": id.map(request_id_json).unwrap_or(Value::Null),
+                        "source_project": source_project,
+                        "source_package": source_package,
+                        "target_project": target_project,
+                        "target_package": target_package,
+                        "description": description,
+                    })
+                });
+                let text = match &id {
+                    Some(id) => format!(
+                        "filed change-devel request {id} for {source_project}/{source_package} to {target_project}/{target_package}"
+                    ),
+                    None => format!(
+                        "dry-run: would file change-devel request for {source_project}/{source_package} to {target_project}/{target_package}"
+                    ),
+                };
+                Ok((filed, text))
+            })
+        }
+        RequestCommand::FileDelete {
+            target_project,
+            package,
+            repository,
+            whole_project,
+            description,
+        } => {
+            let target = match (package, repository) {
+                (Some(package), None) => DeleteTarget::Package(package),
+                (None, Some(repository)) => DeleteTarget::Repository(repository),
+                (None, None) if whole_project => DeleteTarget::WholeProject,
+                (None, None) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "deleting a whole project needs --whole-project: pass it to confirm, or --package / --repository to delete part of the project",
+                    ));
+                }
+                // clap's `conflicts_with` refuses both flags together,
+                // so this arm is unreachable; it stays so a future
+                // flag change fails loudly instead of silently
+                // deleting the whole project.
+                (Some(_), Some(_)) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "pass exactly one of --package and --repository, or --whole-project to delete the whole project",
+                    ));
+                }
+            };
+            let target_text = match &target {
+                DeleteTarget::Package(package) => format!("{target_project}/{package}"),
+                DeleteTarget::Repository(repository) => {
+                    format!("{target_project} (repository {repository})")
+                }
+                DeleteTarget::WholeProject => target_project.clone(),
+            };
+            let payload = DeletePayload::new(&target_project, target, &description)?;
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            with_client(debug, live, |client| {
+                let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
+                let id = filing.file_delete_request(&payload)?;
+                let filed = filed_payload(&id, &dry_run, |id| {
+                    json!({
+                        "id": id.map(request_id_json).unwrap_or(Value::Null),
+                        "target": target_text,
+                        "description": description,
+                    })
+                });
+                let text = match &id {
+                    Some(id) => format!("filed delete request {id} for {target_text}"),
+                    None => format!("dry-run: would file delete request for {target_text}"),
+                };
+                Ok((filed, text))
+            })
+        }
+    }
+}
+
+/// Parse a state name. The domain is restricted by clap's
+/// `value_parser` at each call site — five changeable states for
+/// `change-state` / `try-change-state`, all seven for `search` —
+/// so a failure here is a caller bug, not user input.
+fn parse_state(value: &str) -> Result<RequestState, GeectlError> {
+    RequestState::parse(value).ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid request state: {value:?}"),
+        )
+    })
+}
+
+/// Build the `RequestSearch` from the `search` flags. The flags
+/// mirror the builder methods one to one; an unknown `--state`
+/// value is refused here rather than silently matching nothing.
+/// When no `--state` is given, the builder's own default applies
+/// (new/review/declined): passing
+/// an empty state list would instead mean "no state filter at
+/// all", so the states are only set when the caller named some.
+#[allow(clippy::too_many_arguments)]
+fn build_search(
+    request_ids: Vec<u64>,
+    project: Vec<String>,
+    package: Vec<String>,
+    source_project: Vec<String>,
+    source_package: Vec<String>,
+    target_project: Vec<String>,
+    target_package: Vec<String>,
+    creator: Vec<String>,
+    who: Vec<String>,
+    state: Vec<String>,
+    types: Vec<String>,
+    exclude_target_project: Vec<String>,
+    with_history: bool,
+    with_full_history: bool,
+) -> Result<RequestSearch, GeectlError> {
+    let mut states = Vec::new();
+    for value in &state {
+        states.push(parse_state(value)?);
+    }
+    let mut search = RequestSearch::new()
+        .request_ids(request_ids)
+        .projects(project)
+        .packages(package)
+        .source_projects(source_project)
+        .source_packages(source_package)
+        .target_projects(target_project)
+        .target_packages(target_package)
+        .creators(creator)
+        .who(who)
+        .types(types)
+        .exclude_target_projects(exclude_target_project)
+        .with_history(with_history)
+        .with_full_history(with_full_history);
+    if !states.is_empty() {
+        search = search.states(states);
+    }
+    Ok(search)
+}
+
+/// File a submit request, or refile one when `supersede` names the
+/// old request: build the payload from the flags, then file it.
+/// Cleanup is the default on the payload; `--without-cleanup`
+/// selects update instead.
+fn file_request(
+    debug: &Debug,
+    live: bool,
+    file: &FileArgs,
+    supersede: Option<&str>,
+) -> Result<(Value, String), GeectlError> {
+    let mut cves = Vec::new();
+    for value in &file.cve {
+        cves.push(CveId::parse(value)?);
+    }
+    let mut payload = SrPayload::new(
+        &file.source_project,
+        &file.source_package,
+        &file.target_project,
+        &file.target_package,
+        &file.description,
+        &file.changes_entry,
+        &cves,
+    )?;
+    if file.without_cleanup {
+        payload = payload.without_cleanup();
+    }
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    with_client(debug, live, |client| {
+        let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
+        let id = match supersede {
+            Some(old_id) => filing.refile(&payload, old_id)?,
+            None => filing.file(&payload)?,
+        };
+        let filed = filed_payload(&id, &dry_run, |id| {
+            json!({
+                "id": id.map(request_id_json).unwrap_or(Value::Null),
+                "source_project": file.source_project,
+                "source_package": file.source_package,
+                "target_project": file.target_project,
+                "target_package": file.target_package,
+                "description": file.description,
+                "changes_entry": file.changes_entry,
+                "cve": file.cve,
+                "without_cleanup": file.without_cleanup,
+            })
+        });
+        let text = match (&id, supersede) {
+            (Some(id), Some(old_id)) => format!(
+                "filed request {id} for {}/{} to {}/{}, superseded {old_id}",
+                file.source_project, file.source_package, file.target_project, file.target_package
+            ),
+            (Some(id), None) => format!(
+                "filed request {id} for {}/{} to {}/{}",
+                file.source_project, file.source_package, file.target_project, file.target_package
+            ),
+            (None, Some(old_id)) => format!(
+                "dry-run: would file request for {}/{} to {}/{} and supersede {old_id}",
+                file.source_project, file.source_package, file.target_project, file.target_package
+            ),
+            (None, None) => format!(
+                "dry-run: would file request for {}/{} to {}/{}",
+                file.source_project, file.source_package, file.target_project, file.target_package
+            ),
+        };
+        Ok((filed, text))
+    })
+}
+
+/// File a maintenance incident request, or refile one when
+/// `supersede` names the old request: build the payload from the
+/// flags, then file it. The branch survives the incident by
+/// default; `--with-cleanup` opts into deleting it on accept.
+fn file_maintenance_incident(
+    debug: &Debug,
+    live: bool,
+    incident: &MaintenanceIncidentArgs,
+    supersede: Option<&str>,
+) -> Result<(Value, String), GeectlError> {
+    let source_packages: Vec<&str> = incident.source_package.iter().map(String::as_str).collect();
+    let mut payload = MaintenanceIncidentPayload::new(
+        &incident.source_project,
+        &source_packages,
+        &incident.target_project,
+        &incident.description,
+    )?;
+    if let Some(release_project) = &incident.release_project {
+        payload = payload.with_release_project(release_project)?;
+    }
+    if incident.with_cleanup {
+        payload = payload.with_cleanup()?;
+    }
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    with_client(debug, live, |client| {
+        let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
+        let id = match supersede {
+            Some(old_id) => filing.refile_maintenance_incident(&payload, old_id)?,
+            None => filing.file_maintenance_incident(&payload)?,
+        };
+        let filed = filed_payload(&id, &dry_run, |id| {
+            json!({
+                "id": id.map(request_id_json).unwrap_or(Value::Null),
+                "source_project": incident.source_project,
+                "source_packages": incident.source_package,
+                "target_project": incident.target_project,
+                "release_project": incident.release_project,
+                "description": incident.description,
+                "with_cleanup": incident.with_cleanup,
+            })
+        });
+        let packages = incident.source_package.join(", ");
+        let release = match &incident.release_project {
+            Some(release) => format!(", releasing into {release}"),
+            None => String::new(),
+        };
+        let text = match (&id, supersede) {
+            (Some(id), Some(old_id)) => format!(
+                "filed maintenance incident request {id} for {packages} from {} to {}{release}, superseded {old_id}",
+                incident.source_project, incident.target_project
+            ),
+            (Some(id), None) => format!(
+                "filed maintenance incident request {id} for {packages} from {} to {}{release}",
+                incident.source_project, incident.target_project
+            ),
+            (None, Some(old_id)) => format!(
+                "dry-run: would file maintenance incident request for {packages} from {} to {}{release} and supersede {old_id}",
+                incident.source_project, incident.target_project
+            ),
+            (None, None) => format!(
+                "dry-run: would file maintenance incident request for {packages} from {} to {}{release}",
+                incident.source_project, incident.target_project
+            ),
+        };
+        Ok((filed, text))
+    })
+}
+
+/// Add the dry-run `plan` to a mutation payload, like the other
+/// groups' `finish()`: the recorded plan lines, only when this run
+/// is a dry run. A live run's plan is empty by construction (the
+/// library records plan lines only when dry-run is enabled), so the
+/// field is omitted there.
+fn add_plan(payload: &mut Value, dry_run: &DryRun) {
+    if dry_run.enabled() {
+        if let Value::Object(map) = payload {
+            map.insert(
+                "plan".to_string(),
+                Value::Array(dry_run.plan().into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+}
+
+/// The payload for a filing result: the new id in live mode, `null`
+/// in dry-run, plus `dry_run` and the fields the caller passed, so
+/// the payload is complete in both modes.
+fn filed_payload(
+    id: &Option<String>,
+    dry_run: &DryRun,
+    with_id: impl FnOnce(Option<&str>) -> Value,
+) -> Value {
+    let mut payload = with_id(id.as_deref());
+    if let Value::Object(map) = &mut payload {
+        map.insert("dry_run".to_string(), Value::Bool(dry_run.enabled()));
+    }
+    add_plan(&mut payload, dry_run);
+    payload
+}
+
+/// One state-change act (`accept`, `decline`, `revoke`,
+/// `change-state`): change the state, or record the plan in dry-run.
+fn act(
+    debug: &Debug,
+    id: &str,
+    state: RequestState,
+    comment: &str,
+    force: bool,
+    live: bool,
+    verb: &str,
+) -> Result<(Value, String), GeectlError> {
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    with_client(debug, live, |client| {
+        client.change_state(id, state, comment, force, &dry_run)?;
+        let mut payload = json!({
+            "id": request_id_json(id),
+            "state": state.as_str(),
+            "comment": comment,
+            "dry_run": dry_run.enabled(),
+        });
+        add_plan(&mut payload, &dry_run);
+        let mut text = if dry_run.enabled() {
+            format!("dry-run: would change request {id} to {verb}")
+        } else {
+            format!("changed request {id} to {verb}")
+        };
+        if !comment.is_empty() {
+            text.push_str(&format!(" — {comment}"));
+        }
+        Ok((payload, text))
+    })
+}
+
+/// Build the OBS client from the effective config and the
+/// environment credentials for the configured base URL (resolved
+/// for the URL from its instance alias — see
+/// `auth::resolve_obs_basic_for_url`), wiring the debug sink
+/// through. The client borrows the transport, so both live in this
+/// scope and the caller runs inside it.
+///
+/// `live` says whether this run may perform live work. A dry-run
+/// mutation never touches the server, so a half-configured
+/// credential set (a username without a password source, or the
+/// reverse) must not fail it: the resolution error is replaced with
+/// no credentials and the plan prints. The dropped error is reported
+/// as a stderr warning (and on the debug channel), so a dry run still
+/// shows that the same credentials would fail a `--live` run — the
+/// debug channel alone would leave it silent without `--debug`.
+/// A live run — and every
+/// read, which is always live — still resolves credentials up front,
+/// so a misconfiguration fails fast with the precise error.
+fn with_client<T>(
+    debug: &Debug,
+    live: bool,
+    f: impl FnOnce(&ObsClient) -> Result<T, GeectlError>,
+) -> Result<T, GeectlError> {
+    let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+    let path = config::config_path()?;
+    let file_config = config::load_config_at(&path)?;
+    let effective = config::effective_config(&file_config)?;
+    let base = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
+    let credentials = match EnvObsAuth::credentials_for_url(base, base, &file_config.instances) {
+        Ok(credentials) => credentials,
+        Err(err) if !live => {
+            // The dry run prints the plan without credentials, but
+            // the failure must not be silent: the same credentials
+            // would fail a `--live` run, so the error goes on the
+            // debug channel and as a stderr warning.
+            debug.emit(&format!(
+                "ignoring credential resolution error in dry-run mode: {err}"
+            ));
+            eprintln!("warning: ignoring credential resolution error in dry-run mode: {err}");
+            Credentials::None
+        }
+        Err(err) => return Err(err),
+    };
+    let client =
+        ObsClient::with_base_and_credentials(&http, base, credentials)?.with_debug(debug.clone());
+    f(&client)
+}
+
+// ---------- JSON converters ----------
+// The payloads name the same fields as the library types, with
+// `null` for absent optionals, so a consumer can read them without
+// knowing the server's XML shape.
+
+/// The request id as a JSON number: the server's ids are numeric,
+/// and `show`/`search` already emit numbers, so every arm agrees.
+/// Falls back to the string if the id is not numeric — unreachable
+/// for a server-validated id, but the payload stays total without
+/// an unwrap.
+fn request_id_json(id: &str) -> Value {
+    match id.parse::<u64>() {
+        Ok(number) => json!(number),
+        Err(_) => json!(id),
+    }
+}
+
+fn request_json(request: &Request) -> Value {
+    json!({
+        "id": request.id,
+        "creator": request.creator,
+        "title": request.title,
+        "description": request.description,
+        "actions": request.actions.iter().map(action_json).collect::<Vec<_>>(),
+        "priority": request.priority.map(|priority| priority.as_str()),
+        "state": state_json(&request.state),
+        "reviews": request.reviews.iter().map(review_json).collect::<Vec<_>>(),
+        "history": request.history.iter().map(history_json).collect::<Vec<_>>(),
+        "accept_at": request.accept_at,
+    })
+}
+
+fn action_json(action: &RequestAction) -> Value {
+    match action {
+        RequestAction::Submit {
+            source_project,
+            source_package,
+            source_rev,
+            target_project,
+            target_package,
+            sourceupdate,
+            updatelink,
+            makeoriginolder,
+            acceptinfo,
+        } => json!({
+            "type": "submit",
+            "source_project": source_project,
+            "source_package": source_package,
+            "source_rev": source_rev,
+            "target_project": target_project,
+            "target_package": target_package,
+            "sourceupdate": sourceupdate.map(|update| update.as_str()),
+            "updatelink": updatelink,
+            "makeoriginolder": makeoriginolder,
+            "acceptinfo": acceptinfo.as_ref().map(accept_info_json),
+        }),
+        RequestAction::Delete {
+            target_project,
+            target_package,
+            target_repository,
+        } => json!({
+            "type": "delete",
+            "target_project": target_project,
+            "target_package": target_package,
+            "target_repository": target_repository,
+        }),
+        RequestAction::AddRole {
+            target_project,
+            target_package,
+            person,
+            group,
+        } => json!({
+            "type": "add_role",
+            "target_project": target_project,
+            "target_package": target_package,
+            "person": person.as_ref().map(|(name, role)| json!({ "name": name, "role": role })),
+            "group": group.as_ref().map(|(name, role)| json!({ "name": name, "role": role })),
+        }),
+        RequestAction::SetBugowner {
+            target_project,
+            target_package,
+            person_name,
+            group_name,
+        } => json!({
+            "type": "set_bugowner",
+            "target_project": target_project,
+            "target_package": target_package,
+            "person_name": person_name,
+            "group_name": group_name,
+        }),
+        RequestAction::ChangeDevel {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        } => json!({
+            "type": "change_devel",
+            "source_project": source_project,
+            "source_package": source_package,
+            "target_project": target_project,
+            "target_package": target_package,
+        }),
+        RequestAction::MaintenanceIncident {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        } => json!({
+            "type": "maintenance_incident",
+            "source_project": source_project,
+            "source_package": source_package,
+            "target_project": target_project,
+            "target_package": target_package,
+        }),
+        RequestAction::MaintenanceRelease {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        } => json!({
+            "type": "maintenance_release",
+            "source_project": source_project,
+            "source_package": source_package,
+            "target_project": target_project,
+            "target_package": target_package,
+        }),
+        RequestAction::Release {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        } => json!({
+            "type": "release",
+            "source_project": source_project,
+            "source_package": source_package,
+            "target_project": target_project,
+            "target_package": target_package,
+        }),
+    }
+}
+
+fn accept_info_json(info: &AcceptInfo) -> Value {
+    json!({
+        "rev": info.rev,
+        "srcmd5": info.srcmd5,
+        "oproject": info.oproject,
+        "opackage": info.opackage,
+        "osrcmd5": info.osrcmd5,
+        "xsrcmd5": info.xsrcmd5,
+        "oxsrcmd5": info.oxsrcmd5,
+    })
+}
+
+fn state_json(state: &RequestStateInfo) -> Value {
+    json!({
+        "name": state.name.as_str(),
+        "who": state.who,
+        "when": state.when,
+        "created": state.created,
+        "superseded_by": state.superseded_by,
+        "approver": state.approver,
+        "comment": state.comment,
+    })
+}
+
+fn review_json(review: &RequestReview) -> Value {
+    json!({
+        "state": review.state.as_str(),
+        "when": review.when,
+        "who": review.who,
+        "by_user": review.by_user,
+        "by_group": review.by_group,
+        "by_project": review.by_project,
+        "by_package": review.by_package,
+        "comment": review.comment,
+        "history": review.history.iter().map(history_json).collect::<Vec<_>>(),
+    })
+}
+
+fn history_json(entry: &RequestHistory) -> Value {
+    json!({
+        "who": entry.who,
+        "when": entry.when,
+        "description": entry.description,
+        "comment": entry.comment,
+    })
+}
+
+fn comment_json(comment: &RequestComment) -> Value {
+    json!({
+        "id": comment.id,
+        "who": comment.who,
+        "when": comment.when,
+        "parent_id": comment.parent_id,
+        "body": comment.body,
+    })
+}
+
+// ---------- Text renderers ----------
+// One line per value, `key: value`; lists are tables with a header
+// and space-aligned columns, never truncated; empty results print an
+// explicit line. Every id, name and revision in the JSON payload
+// appears in the text rendering of `show`, `log` and `list-comments` —
+// except the acceptinfo hashes (`srcmd5`, `osrcmd5`, `xsrcmd5`,
+// `oxsrcmd5`) and origin (`oproject`, `opackage`) in `show`, which
+// stay in the JSON payload (see the module docs);
+// `diff` is a content command (verbatim text, coordinates in JSON);
+// an empty diff prints `no diff for request <id>` instead of empty
+// stdout (design rule 5) — a request with no submit action has no
+// diff, and the server returns an empty body for it (verified live
+// against api.opensuse.org, request 43359: `add_role` +
+// `set_bugowner` only). The search table and the one-line action
+// texts carry the documented omissions (see the module docs and
+// design rule 1).
+
+/// The diff text: the diff verbatim, except an empty diff, which
+/// renders an explicit line naming the request.
+fn render_diff_text(id: &str, diff: &str) -> String {
+    if diff.is_empty() {
+        format!("no diff for request {id}")
+    } else {
+        diff.to_string()
+    }
+}
+
+fn render_request_text(request: &Request) -> String {
+    let mut lines = vec![
+        format!("id: {}", request.id),
+        format!("state: {}", request.state.name.as_str()),
+        format!("state by: {}", request.state.who),
+        format!("state at: {}", request.state.when),
+    ];
+    if let Some(created) = &request.state.created {
+        lines.push(format!("created: {created}"));
+    }
+    lines.push(format!("creator: {}", request.creator));
+    if let Some(title) = &request.title {
+        lines.push(format!("title: {title}"));
+    }
+    if !request.description.is_empty() {
+        lines.push(format!("description: {}", request.description));
+    }
+    if let Some(priority) = request.priority {
+        lines.push(format!("priority: {}", priority.as_str()));
+    }
+    if let Some(accept_at) = &request.accept_at {
+        lines.push(format!("accept at: {accept_at}"));
+    }
+    if let Some(superseded_by) = request.state.superseded_by {
+        lines.push(format!("superseded by: {superseded_by}"));
+    }
+    if let Some(approver) = &request.state.approver {
+        lines.push(format!("approver: {approver}"));
+    }
+    if !request.state.comment.is_empty() {
+        lines.push(format!("state comment: {}", request.state.comment));
+    }
+    for (index, action) in request.actions.iter().enumerate() {
+        lines.push(format!("action {}: {}", index + 1, action_text(action)));
+    }
+    for (index, review) in request.reviews.iter().enumerate() {
+        lines.push(review_text(index + 1, review));
+        for (history_index, entry) in review.history.iter().enumerate() {
+            lines.push(format!(
+                "review {} history {}: {}",
+                index + 1,
+                history_index + 1,
+                history_text(entry)
+            ));
+        }
+    }
+    for (index, entry) in request.history.iter().enumerate() {
+        lines.push(format!("history {}: {}", index + 1, history_text(entry)));
+    }
+    lines.join("\n")
+}
+
+/// The full action line for `request show`: type, source, target,
+/// and the options that change what accept does.
+fn action_text(action: &RequestAction) -> String {
+    match action {
+        RequestAction::Submit {
+            source_project,
+            source_package,
+            source_rev,
+            target_project,
+            target_package,
+            sourceupdate,
+            updatelink,
+            makeoriginolder,
+            acceptinfo,
+        } => {
+            let mut line = format!(
+                "submit {source_project}/{source_package} -> {}",
+                target_text(target_project.as_deref(), target_package.as_deref())
+            );
+            if let Some(rev) = source_rev {
+                line.push_str(&format!(" rev {rev}"));
+            }
+            if let Some(update) = sourceupdate {
+                line.push_str(&format!(" ({})", update.as_str()));
+            }
+            if *updatelink {
+                line.push_str(" (updatelink)");
+            }
+            if *makeoriginolder {
+                line.push_str(" (makeoriginolder)");
+            }
+            if let Some(info) = acceptinfo {
+                line.push_str(&format!(" (accepted rev {})", info.rev));
+            }
+            line
+        }
+        RequestAction::Delete {
+            target_project,
+            target_package,
+            target_repository,
+        } => {
+            let mut line = format!(
+                "delete {}",
+                target_text(Some(target_project), target_package.as_deref())
+            );
+            if let Some(repository) = target_repository {
+                line.push_str(&format!(" (repository {repository})"));
+            }
+            line
+        }
+        RequestAction::AddRole {
+            target_project,
+            target_package,
+            person,
+            group,
+        } => {
+            let mut who = Vec::new();
+            if let Some((name, role)) = person {
+                who.push(format!("user {name} as {role}"));
+            }
+            if let Some((name, role)) = group {
+                who.push(format!("group {name} as {role}"));
+            }
+            format!(
+                "add_role {} on {}",
+                who.join(", "),
+                target_text(Some(target_project), target_package.as_deref())
+            )
+        }
+        RequestAction::SetBugowner {
+            target_project,
+            target_package,
+            person_name,
+            group_name,
+        } => {
+            let mut who = Vec::new();
+            if let Some(name) = person_name {
+                who.push(format!("user {name}"));
+            }
+            if let Some(name) = group_name {
+                who.push(format!("group {name}"));
+            }
+            format!(
+                "set_bugowner {} on {}",
+                who.join(", "),
+                target_text(Some(target_project), target_package.as_deref())
+            )
+        }
+        RequestAction::ChangeDevel {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        } => format!(
+            "change_devel {source_project}/{source_package} -> {target_project}/{target_package}"
+        ),
+        RequestAction::MaintenanceIncident {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        } => format!(
+            "maintenance_incident {source_project}/{source_package} -> {}",
+            target_text(Some(target_project), target_package.as_deref())
+        ),
+        RequestAction::MaintenanceRelease {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        } => format!(
+            "maintenance_release {source_project}/{source_package} -> {}",
+            target_text(Some(target_project), target_package.as_deref())
+        ),
+        RequestAction::Release {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        } => format!(
+            "release {source_project}/{source_package} -> {}",
+            target_text(Some(target_project), target_package.as_deref())
+        ),
+    }
+}
+
+/// A `project/package` target, or the project alone, or `(no target)`
+/// when a submit names neither.
+fn target_text(project: Option<&str>, package: Option<&str>) -> String {
+    match (project, package) {
+        (Some(project), Some(package)) => format!("{project}/{package}"),
+        (Some(project), None) => project.to_string(),
+        (None, Some(package)) => package.to_string(),
+        (None, None) => "(no target)".to_string(),
+    }
+}
+
+/// The compact action summary for the `search` table: type plus the
+/// package it acts on. Deliberately narrow: target names and
+/// `source_rev` are omitted here, by decision (see the module docs),
+/// and stay in the JSON payload and in `request show`. A party-less
+/// `add_role` / `set_bugowner` (degenerate server data) renders
+/// `(unknown party)`, never a bare sentinel.
+fn action_summary(action: &RequestAction) -> String {
+    match action {
+        RequestAction::Submit { source_package, .. } => format!("submit {source_package}"),
+        RequestAction::Delete {
+            target_package,
+            target_project,
+            ..
+        } => format!(
+            "delete {}",
+            target_package.as_deref().unwrap_or(target_project)
+        ),
+        RequestAction::AddRole { person, group, .. } => format!(
+            "add_role {}",
+            person
+                .as_ref()
+                .map(|(name, _)| name.as_str())
+                .or_else(|| group.as_ref().map(|(name, _)| name.as_str()))
+                .unwrap_or("(unknown party)")
+        ),
+        RequestAction::SetBugowner {
+            person_name,
+            group_name,
+            ..
+        } => format!(
+            "set_bugowner {}",
+            person_name
+                .as_deref()
+                .or(group_name.as_deref())
+                .unwrap_or("(unknown party)")
+        ),
+        RequestAction::ChangeDevel { source_package, .. } => {
+            format!("change_devel {source_package}")
+        }
+        RequestAction::MaintenanceIncident { source_package, .. } => {
+            format!("maintenance_incident {source_package}")
+        }
+        RequestAction::MaintenanceRelease { source_package, .. } => {
+            format!("maintenance_release {source_package}")
+        }
+        RequestAction::Release { source_package, .. } => format!("release {source_package}"),
+    }
+}
+
+fn review_text(index: usize, review: &RequestReview) -> String {
+    let target = review_target_text(review);
+    let mut line = if target.is_empty() {
+        format!("review {index}: state {}", review.state.as_str())
+    } else {
+        format!(
+            "review {index}: by {target} state {}",
+            review.state.as_str()
+        )
+    };
+    match (&review.who, &review.when) {
+        (Some(who), Some(when)) => line.push_str(&format!(", by {who} at {when}")),
+        (Some(who), None) => line.push_str(&format!(", by {who}")),
+        (None, Some(when)) => line.push_str(&format!(", at {when}")),
+        (None, None) => {}
+    }
+    if !review.comment.is_empty() {
+        line.push_str(&format!(" — {}", review.comment));
+    }
+    line
+}
+
+fn review_target_text(review: &RequestReview) -> String {
+    let mut parts = Vec::new();
+    if let Some(by_user) = &review.by_user {
+        parts.push(format!("user:{by_user}"));
+    }
+    if let Some(by_group) = &review.by_group {
+        parts.push(format!("group:{by_group}"));
+    }
+    if let Some(by_project) = &review.by_project {
+        parts.push(format!("project:{by_project}"));
+    }
+    if let Some(by_package) = &review.by_package {
+        parts.push(format!("package:{by_package}"));
+    }
+    parts.join(", ")
+}
+
+fn history_text(entry: &RequestHistory) -> String {
+    let mut line = format!("{} {}", entry.who, entry.when);
+    if !entry.description.is_empty() {
+        line.push_str(&format!(" {}", entry.description));
+    }
+    if !entry.comment.is_empty() {
+        line.push_str(&format!(" — {}", entry.comment));
+    }
+    line
+}
+
+fn render_history_text(id: &str, history: &[RequestHistory]) -> String {
+    if history.is_empty() {
+        return format!("no history for request {id}");
+    }
+    let mut lines = vec![format!("id: {id}")];
+    lines.extend(
+        history
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| format!("history {}: {}", index + 1, history_text(entry))),
+    );
+    lines.join("\n")
+}
+
+fn render_comments_text(id: &str, comments: &[RequestComment]) -> String {
+    if comments.is_empty() {
+        return format!("no comments on request {id}");
+    }
+    let mut lines = vec![format!("id: {id}")];
+    lines.extend(comments.iter().map(|comment| {
+        let mut line = format!(
+            "comment {} by {} at {}: {}",
+            comment.id, comment.who, comment.when, comment.body
+        );
+        if let Some(parent) = comment.parent_id {
+            line.push_str(&format!(" (reply to {parent})"));
+        }
+        line
+    }));
+    lines.join("\n")
+}
+
+/// The search coordinates as one fragment: the filters actually
+/// given, as `key=value` pairs joined by spaces, with a leading
+/// space — or empty when no filter was given. One argument (a slice
+/// of key/value pairs) so the twelve filters do not become twelve
+/// parameters. `with_history` and `with_full_history` are output
+/// shape, not coordinates, so they are not echoed.
+fn search_coordinates(filters: &[(&str, &[String])]) -> String {
+    let coordinates: Vec<String> = filters
+        .iter()
+        .filter(|(_, values)| !values.is_empty())
+        .map(|(key, values)| format!("{key}={}", values.join(",")))
+        .collect();
+    if coordinates.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", coordinates.join(" "))
+    }
+}
+
+/// One header line echoing the search coordinates and the result
+/// count: `search project=home:foo state=new (2 requests)`, or
+/// `search (0 requests)` when no filter was given.
+fn search_header(coordinates: &str, count: usize) -> String {
+    format!(
+        "search{coordinates} ({} request{})",
+        count,
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+/// The search text: one header line echoing the coordinates, then
+/// the narrow table (id, state, creator, actions) — or `no requests`
+/// under the header when nothing matched. The table never renders
+/// history, even with `--with-history`: that flag enriches the JSON
+/// payload only.
+fn render_search_text(coordinates: &str, requests: &[Request]) -> String {
+    let header = search_header(coordinates, requests.len());
+    if requests.is_empty() {
+        return format!("{header}\nno requests");
+    }
+    let rows: Vec<Vec<String>> = requests
+        .iter()
+        .map(|request| {
+            vec![
+                request.id.to_string(),
+                request.state.name.as_str().to_string(),
+                request.creator.clone(),
+                request
+                    .actions
+                    .iter()
+                    .map(action_summary)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ]
+        })
+        .collect();
+    format!(
+        "{header}\n{}",
+        render_table(&["ID", "STATE", "CREATOR", "ACTIONS"], &rows)
+    )
+}
+
+/// A table with a header and space-aligned columns, never truncated:
+/// the last column is unpadded, the rest are padded to the widest
+/// cell, and columns are joined with two spaces.
+fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|header| header.chars().count())
+        .collect();
+    for row in rows {
+        // A row longer than the headers would panic on the width
+        // lookup below; fail with a clear message instead of an
+        // index-out-of-bounds panic in the shipped binary.
+        assert_eq!(
+            row.len(),
+            headers.len(),
+            "row has {} cells, headers have {}",
+            row.len(),
+            headers.len()
+        );
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+    let render_row = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                if index + 1 == cells.len() {
+                    cell.clone()
+                } else {
+                    format!("{:<width$}", cell, width = widths[index])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let mut lines = vec![render_row(
+        &headers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    )];
+    for row in rows {
+        lines.push(render_row(row));
+    }
+    lines.join("\n")
+}
+
+// ---------- Tests ----------
+// Fixture requests come from the library's public `parse_request`
+// on server-shaped XML, so the converters and renderers are tested
+// against the same documents the client reads.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use geectl::obs::{parse_comments, parse_request};
+
+    const REQUEST_XML: &str = r#"<request creator="creator" id="123">
+  <action type="submit">
+    <source package="abc" project="xyz" />
+    <options>
+      <sourceupdate>cleanup</sourceupdate>
+      <updatelink>1</updatelink>
+    </options>
+    <acceptinfo rev="5" srcmd5="deadbeef" />
+  </action>
+  <action type="add_role">
+    <target project="home:foo" />
+    <person name="bar" role="maintainer" />
+    <group name="groupxyz" role="reader" />
+  </action>
+  <state approver="someone" name="review" when="2010-12-27T01:36:29" who="abc" />
+  <review by_group="group1" state="new" when="2010-12-28T00:11:22" who="abc">
+    <comment>review start</comment>
+  </review>
+  <history when="2010-12-11T00:00:00" who="creator">
+    <description>Created request</description>
+  </history>
+</request>"#;
+
+    const COMMENTS_XML: &str = r#"<comments request="42">
+  <comment who="user1" when="2010-12-29T10:00:00" id="1">first comment</comment>
+  <comment who="user2" when="2010-12-29T11:00:00" id="2" parent="1">a reply</comment>
+</comments>"#;
+
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: RequestCommand,
+    }
+
+    fn fixture_request() -> Request {
+        parse_request(REQUEST_XML).expect("fixture request parses")
+    }
+
+    #[test]
+    fn request_json_and_text_agree() {
+        let request = fixture_request();
+        let payload = request_json(&request);
+        assert_eq!(payload["id"], 123);
+        assert_eq!(payload["creator"], "creator");
+        assert_eq!(payload["state"]["name"], "review");
+        assert_eq!(payload["state"]["approver"], "someone");
+        assert_eq!(payload["actions"][0]["type"], "submit");
+        assert_eq!(payload["actions"][0]["sourceupdate"], "cleanup");
+        assert_eq!(payload["actions"][0]["updatelink"], true);
+        assert_eq!(payload["actions"][1]["person"]["name"], "bar");
+        assert_eq!(payload["actions"][1]["person"]["role"], "maintainer");
+        assert_eq!(payload["reviews"][0]["by_group"], "group1");
+        assert_eq!(payload["reviews"][0]["comment"], "review start");
+
+        // Every id, name and revision in the JSON appears in the text.
+        let text = render_request_text(&request);
+        for expected in [
+            "123",
+            "creator",
+            "review",
+            "someone",
+            "xyz/abc",
+            "cleanup",
+            "updatelink",
+            "bar",
+            "maintainer",
+            "groupxyz",
+            "reader",
+            "home:foo",
+            "group:group1",
+            "review start",
+            "2010-12-27T01:36:29",
+            "2010-12-28T00:11:22",
+            "Created request",
+            "accepted rev 5",
+        ] {
+            assert!(
+                text.contains(expected),
+                "text missing {expected:?}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_text_renders_a_table_and_names_the_empty_case() {
+        let request = fixture_request();
+        let text = render_search_text("", &[request]);
+        let mut lines = text.lines();
+        let header = lines.next().expect("a header line");
+        assert_eq!(header, "search (1 request)");
+        let columns = lines.next().expect("a column header line");
+        assert!(columns.contains("ID"));
+        assert!(columns.contains("STATE"));
+        assert!(columns.contains("CREATOR"));
+        assert!(columns.contains("ACTIONS"));
+        let row = lines.next().expect("a row line");
+        assert!(row.contains("123"));
+        assert!(row.contains("review"));
+        assert!(row.contains("creator"));
+        assert!(row.contains("submit abc"));
+        assert!(row.contains("add_role bar"));
+        assert_eq!(
+            render_search_text(" project=home:foo", &[]),
+            "search project=home:foo (0 requests)\nno requests"
+        );
+    }
+
+    #[test]
+    fn render_table_measures_widths_in_characters() {
+        // Widths are characters, not bytes: a two-byte `é` is one
+        // column wide, so the second column still aligns.
+        let text = render_table(
+            &["ID", "STATE"],
+            &[
+                vec!["é".to_string(), "x".to_string()],
+                vec!["yy".to_string(), "z".to_string()],
+            ],
+        );
+        assert_eq!(text, "ID  STATE\né   x\nyy  z");
+    }
+
+    #[test]
+    fn party_less_role_actions_name_the_unknown_party() {
+        assert_eq!(
+            action_summary(&RequestAction::AddRole {
+                target_project: "home:foo".to_string(),
+                target_package: None,
+                person: None,
+                group: None,
+            }),
+            "add_role (unknown party)"
+        );
+        assert_eq!(
+            action_summary(&RequestAction::SetBugowner {
+                target_project: "home:foo".to_string(),
+                target_package: None,
+                person_name: None,
+                group_name: None,
+            }),
+            "set_bugowner (unknown party)"
+        );
+    }
+
+    #[test]
+    fn search_coordinates_echo_only_the_given_filters() {
+        assert_eq!(search_coordinates(&[]), "");
+        assert_eq!(
+            search_coordinates(&[
+                ("request-id", &["42".to_string()]),
+                ("project", &["home:foo".to_string(), "home:bar".to_string()],),
+                ("state", &["new".to_string()]),
+            ]),
+            " request-id=42 project=home:foo,home:bar state=new"
+        );
+        assert_eq!(search_header("", 0), "search (0 requests)");
+        assert_eq!(
+            search_header(" project=home:foo state=new", 2),
+            "search project=home:foo state=new (2 requests)"
+        );
+    }
+
+    #[test]
+    fn comments_text_threads_replies_and_names_the_empty_case() {
+        let comments = parse_comments(COMMENTS_XML).expect("comments parse");
+        let text = render_comments_text("42", &comments);
+        assert!(text.contains("id: 42"));
+        assert!(text.contains("first comment"));
+        assert!(text.contains("a reply"));
+        assert!(text.contains("(reply to 1)"));
+        assert_eq!(render_comments_text("42", &[]), "no comments on request 42");
+    }
+
+    #[test]
+    fn history_text_names_the_empty_case() {
+        let request = fixture_request();
+        let text = render_history_text(&request.id.to_string(), &request.history);
+        assert!(text.contains("id: 123"));
+        assert!(text.contains("Created request"));
+        assert_eq!(render_history_text("42", &[]), "no history for request 42");
+    }
+
+    #[test]
+    fn diff_text_is_verbatim_but_names_the_empty_case() {
+        assert_eq!(
+            render_diff_text("42", "--- a/foo\n+++ b/foo\n"),
+            "--- a/foo\n+++ b/foo\n"
+        );
+        assert_eq!(render_diff_text("42", ""), "no diff for request 42");
+    }
+
+    #[test]
+    fn clap_parses_the_search_flags() {
+        let cli = TestCli::try_parse_from([
+            "geectl",
+            "search",
+            "--state",
+            "new",
+            "--state",
+            "review",
+            "--creator",
+            "alice",
+            "--with-history",
+        ])
+        .expect("search parses");
+        match cli.command {
+            RequestCommand::Search {
+                state,
+                creator,
+                with_history,
+                ..
+            } => {
+                assert_eq!(state, vec!["new", "review"]);
+                assert_eq!(creator, vec!["alice"]);
+                assert!(with_history);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_the_filing_flags() {
+        let cli = TestCli::try_parse_from([
+            "geectl",
+            "file",
+            "--source-project",
+            "home:scarabeus_iv:branches:devel:languages:python",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "devel:languages:python",
+            "--target-package",
+            "foo",
+            "--description",
+            "Submit foo",
+            "--changes-entry",
+            "- Fix CVE-2026-12345.",
+            "--cve",
+            "CVE-2026-12345",
+            "--cve",
+            "CVE-2026-12346",
+        ])
+        .expect("file parses");
+        match cli.command {
+            RequestCommand::File { file } => {
+                assert_eq!(file.cve, vec!["CVE-2026-12345", "CVE-2026-12346"]);
+                assert!(!file.without_cleanup);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_the_maintenance_incident_flags() {
+        let cli = TestCli::try_parse_from([
+            "geectl",
+            "file-maintenance-incident",
+            "--source-project",
+            "home:scarabeus_iv:branches:openSUSE:Maintenance",
+            "--source-package",
+            "foo",
+            "--source-package",
+            "bar",
+            "--target-project",
+            "openSUSE:Maintenance",
+            "--release-project",
+            "openSUSE:Leap:15.6:Update",
+            "--description",
+            "Fix foo and bar",
+            "--with-cleanup",
+        ])
+        .expect("file-maintenance-incident parses");
+        match cli.command {
+            RequestCommand::FileMaintenanceIncident { incident } => {
+                assert_eq!(incident.source_package, vec!["foo", "bar"]);
+                assert_eq!(
+                    incident.release_project.as_deref(),
+                    Some("openSUSE:Leap:15.6:Update")
+                );
+                assert!(incident.with_cleanup);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_refuses_the_old_per_command_live_flag() {
+        // The leaf no longer defines `--live` (it is a global on the
+        // top-level `Cli` now); the move itself is proven by the
+        // integration tests against the real binary.
+        let err = TestCli::try_parse_from(["geectl", "accept", "42", "--live"])
+            .expect_err("per-command --live must not parse");
+        assert!(err.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn clap_accepts_a_changes_entry_starting_with_a_bullet() {
+        let cli = TestCli::try_parse_from([
+            "geectl",
+            "file",
+            "--source-project",
+            "a",
+            "--source-package",
+            "b",
+            "--target-project",
+            "c",
+            "--target-package",
+            "d",
+            "--description",
+            "Submit b",
+            "--changes-entry",
+            "- Fix CVE-2026-12345.",
+            "--cve",
+            "CVE-2026-12345",
+        ])
+        .expect("a bullet changes entry parses");
+        match cli.command {
+            RequestCommand::File { file } => {
+                assert_eq!(file.changes_entry, "- Fix CVE-2026-12345.");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_refuses_conflicting_delete_targets() {
+        let err = TestCli::try_parse_from([
+            "geectl",
+            "file-delete",
+            "--target-project",
+            "foo",
+            "--package",
+            "bar",
+            "--repository",
+            "baz",
+        ])
+        .expect_err("package and repository conflict");
+        assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn clap_refuses_a_final_state_for_change_state() {
+        let err = TestCli::try_parse_from(["geectl", "change-state", "42", "superseded"])
+            .expect_err("superseded is not a changeable state");
+        assert!(err.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn state_parsing_accepts_valid_states_and_rejects_garbage() {
+        for value in [
+            "new",
+            "review",
+            "accepted",
+            "declined",
+            "revoked",
+            "superseded",
+            "deleted",
+        ] {
+            assert!(parse_state(value).is_ok(), "{value} parses");
+        }
+        assert!(parse_state("bogus").is_err());
+        assert!(parse_state("").is_err());
+    }
+
+    #[test]
+    fn build_search_keeps_the_default_states_and_honours_named_ones() {
+        let search = build_search(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .expect("an empty search builds");
+        let expr = search.match_expr().expect("a match builds");
+        for state in ["new", "review", "declined"] {
+            assert!(expr.contains(state), "default match names {state}: {expr}");
+        }
+        let search = build_search(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["accepted".to_string()],
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .expect("a state search builds");
+        let expr = search.match_expr().expect("a match builds");
+        assert!(
+            expr.contains("accepted"),
+            "named match names accepted: {expr}"
+        );
+        assert!(
+            !expr.contains("declined"),
+            "named match drops the default: {expr}"
+        );
+    }
+
+    #[test]
+    fn clap_accepts_a_comment_starting_with_a_bullet() {
+        let cli = TestCli::try_parse_from(["geectl", "accept", "42", "--comment", "- looks good"])
+            .expect("a bullet comment parses");
+        match cli.command {
+            RequestCommand::Accept { comment, .. } => {
+                assert_eq!(comment, "- looks good");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_text_keeps_a_lone_who_or_when_and_names_no_reviewer() {
+        use geectl::obs::ReviewState;
+        let who_only = RequestReview {
+            state: ReviewState::New,
+            when: None,
+            who: Some("alice".to_string()),
+            by_user: None,
+            by_group: None,
+            by_project: None,
+            by_package: None,
+            comment: String::new(),
+            history: Vec::new(),
+        };
+        let text = review_text(1, &who_only);
+        assert!(text.contains("state new"), "{text}");
+        assert!(text.contains("by alice"), "{text}");
+        assert!(!text.contains("by  state"), "{text}");
+        let when_only = RequestReview {
+            state: ReviewState::New,
+            when: Some("2010-12-28T00:11:22".to_string()),
+            who: None,
+            by_user: None,
+            by_group: None,
+            by_project: None,
+            by_package: None,
+            comment: String::new(),
+            history: Vec::new(),
+        };
+        let text = review_text(2, &when_only);
+        assert!(text.contains("at 2010-12-28T00:11:22"), "{text}");
+        assert!(!text.contains("by  state"), "{text}");
+    }
+
+    #[test]
+    fn show_text_renders_the_accepted_revision_but_not_the_hashes() {
+        let request = fixture_request();
+        let text = render_request_text(&request);
+        assert!(text.contains("accepted rev 5"));
+        // The acceptinfo hashes stay in the JSON payload by decision
+        // (see the module docs); only the revision renders.
+        assert!(!text.contains("deadbeef"));
+    }
+
+    #[test]
+    fn add_plan_inserts_recorded_lines_in_dry_run_only() {
+        let dry_run = DryRun::new(true);
+        dry_run.allow("file delete request for test:delete-me");
+        let mut payload = json!({ "dry_run": true });
+        add_plan(&mut payload, &dry_run);
+        let plan = payload["plan"].as_array().expect("plan is present");
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].as_str().unwrap().contains("file delete request"));
+
+        // A live run's plan is empty by construction, so the field is
+        // omitted there.
+        let live = DryRun::new(false);
+        let mut payload = json!({ "dry_run": false });
+        add_plan(&mut payload, &live);
+        assert!(payload.get("plan").is_none());
+    }
+
+    #[test]
+    fn filed_payload_carries_dry_run_and_plan() {
+        let dry_run = DryRun::new(true);
+        dry_run.allow("change request 123 state to accepted");
+        let payload = filed_payload(
+            &None,
+            &dry_run,
+            |id| json!({ "id": id.map(request_id_json).unwrap_or(Value::Null) }),
+        );
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(payload["id"], Value::Null);
+        let plan = payload["plan"].as_array().expect("plan is present");
+        assert_eq!(plan.len(), 1);
+    }
+}

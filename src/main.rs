@@ -6,6 +6,9 @@
 //! every diagnostic, warning, and error goes to stderr. There is exactly
 //! one exit path: the error kind's exit code.
 
+mod cli_remote;
+mod cli_request;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
 use geectl::config;
@@ -14,8 +17,6 @@ use geectl::error::{ErrorKind, GeectlError};
 use serde_json::json;
 use std::io::Write;
 use std::process::ExitCode;
-
-mod cli_remote;
 
 /// The output format. JSON is the default; it is the only format an agent
 /// should parse. `text` is a human-readable rendering of the same data.
@@ -49,6 +50,11 @@ struct Cli {
     #[arg(long, global = true)]
     debug_body: bool,
 
+    /// Actually perform mutations. Without it, only the plan is
+    /// printed: dry-run is the default for mutations.
+    #[arg(long, global = true)]
+    live: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -66,6 +72,11 @@ enum Command {
     Remote {
         #[command(subcommand)]
         command: cli_remote::RemoteCommand,
+    },
+    /// Read and act on OBS submit requests, and file new ones.
+    Request {
+        #[command(subcommand)]
+        command: Box<cli_request::RequestCommand>,
     },
 }
 
@@ -90,6 +101,7 @@ fn run(cli: Cli, debug: &Debug) -> Result<String, GeectlError> {
             let text = format!("geectl {}", env!("CARGO_PKG_VERSION"));
             (payload, text)
         }
+        Some(Command::Request { command }) => cli_request::run(*command, debug, cli.live)?,
         Some(Command::Config { command }) => match command {
             ConfigCommand::Show => {
                 let payload = config_show_payload()?;
@@ -330,78 +342,44 @@ fn terminated(payload: &str) -> String {
     }
 }
 
-/// Write an error to stderr, in the selected format. JSON mode keeps
-/// the structured payload; text mode prints `error: <message>` plus
-/// `remediation: <...>` and, when non-empty, `context: <...>`. A
-/// failure to write to stderr is ignored: there is nowhere else to
+/// Write an error to stderr, in the selected format: the JSON error
+/// payload by default, `error:` + `remediation:` lines in text mode.
+/// A failure to write to stderr is ignored: there is nowhere else to
 /// report it, and panicking while already handling an error helps no
 /// one.
-///
-/// Shared infrastructure: every command group reports errors through
-/// this one function, so the format stays uniform across the CLI.
-/// (A parse error has no parsed Cli yet, so it renders in the format
-/// selected on the command line, if any — see `format_from_argv` —
-/// else JSON.)
 fn write_error(err: &GeectlError, format: Format) {
     let stderr = std::io::stderr();
     let mut handle = stderr.lock();
-    match format {
-        Format::Json => {
-            let _ = writeln!(handle, "{}", err.to_json());
-        }
-        Format::Text => {
-            let _ = writeln!(handle, "{}", render_error_text(err));
-        }
-    }
+    let rendered = match format {
+        Format::Json => err.to_json().to_string(),
+        Format::Text => render_error_text(err),
+    };
+    let _ = writeln!(handle, "{rendered}");
 }
 
-/// The text-mode error rendering: `error: <message>`, then
-/// `context: <...>` when the error carries one, then `remediation:
-/// <...>`.
+/// The text rendering of an error: `error: <message>` plus
+/// `remediation: <...>` lines. The message is the error's context
+/// when it names the failure, else the kind's one-sentence message.
+/// The exit code is unchanged.
 fn render_error_text(err: &GeectlError) -> String {
-    let mut lines = vec![format!("error: {}", err.kind().message())];
-    if !err.context.is_empty() {
-        lines.push(format!("context: {}", err.context));
-    }
-    lines.push(format!("remediation: {}", err.kind().remediation()));
-    lines.join("\n")
-}
-
-/// The output format selected on the command line, if any: scan argv
-/// for `--format text|json` or `--format=text|json`. Used only when
-/// clap fails to parse (there is no Cli yet to ask); anything
-/// unrecognized, or an absent flag, means JSON.
-fn format_from_argv(argv: &[String]) -> Format {
-    let mut rest = argv.iter();
-    while let Some(arg) = rest.next() {
-        // Past `--` everything is a positional, never a flag.
-        if arg == "--" {
-            break;
-        }
-        if arg == "--format" {
-            return match rest.next().map(String::as_str) {
-                Some("text") => Format::Text,
-                _ => Format::Json,
-            };
-        }
-        if let Some(value) = arg.strip_prefix("--format=") {
-            return if value == "text" {
-                Format::Text
-            } else {
-                Format::Json
-            };
-        }
-    }
-    Format::Json
+    let message = if err.context.is_empty() {
+        err.kind.message().to_string()
+    } else {
+        err.context.clone()
+    };
+    format!(
+        "error: {message}
+remediation: {}",
+        err.kind.remediation()
+    )
 }
 
 fn main() -> ExitCode {
     // Parse errors go through the single error path, not clap's
     // default (usage on stderr, exit 2, no JSON). Help and version are
     // the exception: they print clap's text to stdout and exit 0.
-    // The argv is collected once, lossily: the parse-error path needs
-    // it to find a `--format` selection, and the debug startup line
-    // reuses it. Parsing itself uses the raw `OsString` argv, so a
+    // The argv is collected once, lossily, for the debug startup line
+    // below. Parsing itself uses the raw `OsString` argv, so a
     // non-UTF-8 argument still gets clap's invalid-UTF-8 error instead
     // of being silently replaced by U+FFFD and sent on as a value.
     let argv = lossy_argv(std::env::args_os());
@@ -420,14 +398,16 @@ fn main() -> ExitCode {
                     match write_payload(e.render().to_string().trim_end()) {
                         Ok(()) => return ExitCode::from(0),
                         Err(err) => {
-                            write_error(&err, format_from_argv(&argv));
+                            write_error(&err, Format::Json);
                             return ExitCode::from(err.exit_code() as u8);
                         }
                     }
                 }
                 _ => {
+                    // No `cli` exists yet — the format flag itself may
+                    // be the parse failure — so this stays JSON.
                     let err = GeectlError::new(ErrorKind::InvalidInput, e.to_string());
-                    write_error(&err, format_from_argv(&argv));
+                    write_error(&err, Format::Json);
                     return ExitCode::from(err.exit_code() as u8);
                 }
             }
@@ -457,8 +437,8 @@ fn main() -> ExitCode {
             debug.emit(&line);
         }
     }
-    // The format is captured before `run` takes the Cli: the error
-    // path below needs it, and `cli` is moved by the call.
+    // The format is read before `run` moves `cli`: the error path
+    // needs it to render in the selected format.
     let format = cli.format;
     match run(cli, &debug) {
         Ok(payload) => match write_payload(&payload) {
@@ -496,10 +476,12 @@ mod tests {
 
     #[test]
     fn text_error_renders_message_context_and_remediation() {
+        // Unified rendering (the request group owns write_error):
+        // the context names the failure when present, else the kind's
+        // message; there is no separate `context:` line.
         let err = GeectlError::new(ErrorKind::InvalidInput, "bad name".to_string());
         let text = render_error_text(&err);
-        assert!(text.starts_with("error: the input is invalid"));
-        assert!(text.contains("context: bad name"));
+        assert!(text.starts_with("error: bad name"));
         assert!(text.contains("remediation: fix the input and retry"));
     }
 
@@ -512,66 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn format_from_argv_finds_text_in_both_forms() {
-        let argv = vec![
-            "geectl".to_string(),
-            "--format".to_string(),
-            "text".to_string(),
-            "remote".to_string(),
-            "frobnicate".to_string(),
-        ];
-        assert_eq!(format_from_argv(&argv), Format::Text);
-        let argv = vec![
-            "geectl".to_string(),
-            "remote".to_string(),
-            "--format=text".to_string(),
-            "frobnicate".to_string(),
-        ];
-        assert_eq!(format_from_argv(&argv), Format::Text);
-    }
-
-    #[test]
-    fn format_from_argv_defaults_to_json() {
-        assert_eq!(format_from_argv(&["geectl".to_string()]), Format::Json);
-        let argv = vec![
-            "geectl".to_string(),
-            "--format".to_string(),
-            "json".to_string(),
-        ];
-        assert_eq!(format_from_argv(&argv), Format::Json);
-        // `--format` with no value, or with a non-format value, is a
-        // parse error of its own: JSON, never a guess.
-        let argv = vec!["geectl".to_string(), "--format".to_string()];
-        assert_eq!(format_from_argv(&argv), Format::Json);
-        let argv = vec![
-            "geectl".to_string(),
-            "--format".to_string(),
-            "remote".to_string(),
-        ];
-        assert_eq!(format_from_argv(&argv), Format::Json);
-    }
-
-    #[test]
-    fn format_from_argv_ignores_positionals_after_double_dash() {
-        let argv = vec![
-            "geectl".to_string(),
-            "--".to_string(),
-            "--format=text".to_string(),
-        ];
-        assert_eq!(format_from_argv(&argv), Format::Json);
-        let argv = vec![
-            "geectl".to_string(),
-            "--".to_string(),
-            "--format".to_string(),
-            "text".to_string(),
-        ];
-        assert_eq!(format_from_argv(&argv), Format::Json);
-        // An empty `--format=` value is not text.
-        let argv = vec!["geectl".to_string(), "--format=".to_string()];
-        assert_eq!(format_from_argv(&argv), Format::Json);
-    }
-
-    #[test]
     fn terminated_ensures_a_trailing_newline() {
         assert_eq!(terminated("abc"), "abc\n");
         assert_eq!(terminated("abc\n"), "abc\n");
@@ -579,6 +501,19 @@ mod tests {
         // than one trailing newline: verbatim wins over tidiness.
         assert_eq!(terminated("abc\n\n"), "abc\n\n");
         assert_eq!(terminated(""), "");
+    }
+
+    #[test]
+    fn error_text_uses_context_when_present() {
+        let with_context = GeectlError::new(ErrorKind::ConfigError, "missing credentials");
+        let text = render_error_text(&with_context);
+        assert!(text.starts_with("error: missing credentials"), "{text}");
+        assert!(text.contains("remediation: "), "{text}");
+        let bare = GeectlError::new(ErrorKind::ConfigError, "");
+        assert_eq!(
+            render_error_text(&bare),
+            "error: the configuration is invalid\nremediation: check the configuration (flag, environment variable, or config file) and retry"
+        );
     }
 
     #[test]

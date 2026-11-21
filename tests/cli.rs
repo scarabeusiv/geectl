@@ -645,9 +645,11 @@ fn remote_invalid_name_in_text_mode_renders_text_error() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("error: the input is invalid"));
+    // Unified error rendering (the request group owns write_error):
+    // the context names the failure in the `error:` line itself;
+    // there is no separate `context:` line.
+    assert!(stderr.contains("error: invalid OBS project name: \"!!not-a-name\""));
     assert!(stderr.contains("remediation:"));
-    assert!(stderr.contains("context:"));
     // Text mode carries no JSON error payload.
     assert!(!stderr.contains("\"error\""));
 }
@@ -765,9 +767,9 @@ fn remote_list_packages_json_mode_renders_the_payload() {
 }
 
 #[test]
-fn remote_unknown_command_in_text_mode_renders_text_error() {
-    // The format was selected on the command line, so even a parse
-    // error renders in it (decision 52.3).
+fn remote_unknown_command_in_text_mode_stays_json() {
+    // A parse error has no parsed Cli yet, so it stays JSON even in
+    // text mode: the parse-error path is JSON, never a guess.
     let out = geectl()
         .args(["--format", "text", "remote", "frobnicate"])
         .output()
@@ -775,8 +777,89 @@ fn remote_unknown_command_in_text_mode_renders_text_error() {
     assert!(!out.status.success());
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("error: the input is invalid"));
-    assert!(stderr.contains("remediation:"));
-    assert!(!stderr.contains("\"error\""));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
 }
+
+#[test]
+fn request_supersede_without_live_refuses() {
+    // The library's raw supersede has no dry-run, so without --live
+    // the command refuses and points at the dry-runnable flow.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "supersede", "123", "124"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("request refile --supersede"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn request_file_delete_whole_project_without_flag_refuses() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "file-delete",
+            "--target-project",
+            "test:delete-me",
+            "--description",
+            "removing",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("--whole-project"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn request_file_delete_whole_project_dry_run_with_flag() {
+    // With --whole-project the dry run files nothing, returns no id,
+    // and carries the plan (B3: request payloads include `plan` like
+    // the other groups).
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "file-delete",
+            "--target-project",
+            "test:delete-me",
+            "--whole-project",
+            "--description",
+            "removing",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["id"], serde_json::Value::Null);
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert!(!plan.is_empty(), "plan must not be empty: {value}");
+}
+
