@@ -107,6 +107,7 @@
 //! supersede -> delete branch) is documented on [`SrFiling::refile`].
 
 use crate::auth::Credentials;
+use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{is_loopback_url, HttpClient};
 use crate::url::{encode_path_segment, encode_query_value, UrlBuilder};
@@ -418,6 +419,7 @@ pub fn changelog_names_cve(changelog: &str, cve: &CveId) -> bool {
 pub struct DryRun {
     enabled: bool,
     plan: RefCell<Vec<String>>,
+    debug: Debug,
 }
 
 impl DryRun {
@@ -427,7 +429,16 @@ impl DryRun {
         DryRun {
             enabled,
             plan: RefCell::new(Vec::new()),
+            debug: Debug::disabled(),
         }
+    }
+
+    /// Report the channel's decision lines to `debug` instead of
+    /// dropping them. The sink is off by default; the caller that
+    /// owns the debug channel passes its sink here.
+    pub fn with_debug(mut self, debug: Debug) -> Self {
+        self.debug = debug;
+        self
     }
 
     /// True when dry-run is on (nothing is written or filed).
@@ -451,6 +462,9 @@ impl DryRun {
     /// records and prints the would-do action and returns false.
     pub fn allow(&self, action: &str) -> bool {
         if self.enabled {
+            self.debug.emit(&format!(
+                "decision: dry-run: mutation refused, plan only: {action}"
+            ));
             self.note(&format!("would: {action}"));
             false
         } else {
@@ -808,6 +822,7 @@ pub struct ObsClient<'a> {
     http: &'a dyn HttpClient,
     base: String,
     credentials: Credentials,
+    debug: Debug,
 }
 
 /// Options for [`ObsClient::branch_package`]. All fields are optional
@@ -1173,6 +1188,7 @@ impl<'a> ObsClient<'a> {
             http,
             base: OBS_API_BASE.to_string(),
             credentials: Credentials::None,
+            debug: Debug::disabled(),
         }
     }
 
@@ -1185,6 +1201,7 @@ impl<'a> ObsClient<'a> {
             http,
             base: base.trim_end_matches('/').to_string(),
             credentials: Credentials::None,
+            debug: Debug::disabled(),
         })
     }
 
@@ -1201,6 +1218,7 @@ impl<'a> ObsClient<'a> {
                 http,
                 base: OBS_API_BASE.to_string(),
                 credentials,
+                debug: Debug::disabled(),
             }),
             Credentials::Bearer { .. } | Credentials::SshKey { .. } => Err(GeectlError::new(
                 ErrorKind::ConfigError,
@@ -1221,12 +1239,23 @@ impl<'a> ObsClient<'a> {
                 http,
                 base: base.trim_end_matches('/').to_string(),
                 credentials,
+                debug: Debug::disabled(),
             }),
             Credentials::Bearer { .. } | Credentials::SshKey { .. } => Err(GeectlError::new(
                 ErrorKind::ConfigError,
                 "OBS accepts Basic credentials only; a Bearer token or SSH key cannot authenticate it",
             )),
         }
+    }
+
+    /// Report the channel's decision and retry lines to
+    /// `debug` instead of dropping them. The sink is off by
+    /// default; the caller that owns the debug channel passes its
+    /// sink here. (The HTTP attempt lines come from the HTTP client
+    /// itself, which the caller configures separately.)
+    pub fn with_debug(mut self, debug: Debug) -> Self {
+        self.debug = debug;
+        self
     }
 
     /// The credentials, if any.
@@ -1730,6 +1759,19 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// Format a retry budget for a probe line: whole seconds as
+    /// `30s`, anything else in milliseconds (`1500ms`).
+    /// `Duration::as_secs` truncates, so a 1500 ms budget used to
+    /// print as `1s`.
+    fn format_budget(budget: std::time::Duration) -> String {
+        let millis = budget.as_millis();
+        if millis.is_multiple_of(1000) {
+            format!("{}s", millis / 1000)
+        } else {
+            format!("{millis}ms")
+        }
+    }
+
     /// POST the changestate command at `url` with `comment` as the
     /// body, retrying transient failures while `budget` lasts and
     /// checking the request's state before any re-issue: the
@@ -1783,6 +1825,7 @@ impl<'a> ObsClient<'a> {
         budget: std::time::Duration,
     ) -> Result<(), GeectlError> {
         let deadline = std::time::Instant::now() + budget;
+        let mut probe = 0;
         loop {
             match self.http.post_text(url, comment, &self.credentials) {
                 Ok(body) => {
@@ -1807,10 +1850,41 @@ impl<'a> ObsClient<'a> {
                     // landed, so check before re-issuing: a request
                     // already in the target state means the change
                     // went through, and the retry returns success
-                    // without posting again.
-                    if let Ok(request) = self.show_request(&id.to_string()) {
-                        if request.state.name == state {
+                    // without posting again. The check is a decision
+                    // point on the debug channel, and the probe that
+                    // carries it reports its number against the
+                    // retry budget.
+                    match self.show_request(&id.to_string()) {
+                        Ok(request) if request.state.name == state => {
+                            self.debug.emit(&format!(
+                                "decision: request {id} already {}; change landed, not re-issuing",
+                                state.as_str()
+                            ));
                             return Ok(());
+                        }
+                        Ok(request) => {
+                            probe += 1;
+                            self.debug.emit(&format!(
+                                "retry: change_state request {id} probe {probe}/{}: still {}",
+                                Self::format_budget(budget),
+                                request.state.name.as_str()
+                            ));
+                            self.debug.emit(&format!(
+                                "decision: request {id} still {}, re-issuing {}",
+                                request.state.name.as_str(),
+                                state.as_str()
+                            ));
+                        }
+                        Err(_) => {
+                            probe += 1;
+                            self.debug.emit(&format!(
+                                "retry: change_state request {id} probe {probe}/{}: state unknown",
+                                Self::format_budget(budget)
+                            ));
+                            self.debug.emit(&format!(
+                                "decision: request {id} state unknown, re-issuing {}",
+                                state.as_str()
+                            ));
                         }
                     }
                     if std::time::Instant::now() >= deadline {
@@ -1986,8 +2060,9 @@ impl<'a> ObsClient<'a> {
     /// Best-effort [`ObsClient::change_state`]: try the state change,
     /// and return whether it happened. A transport or server failure
     /// — the request is already closed, the credentials do not allow
-    /// the change, the server is unreachable — prints one warning to
-    /// stderr and returns `false` instead of failing, so a batch
+    /// the change, the server is unreachable — reports the failure
+    /// on the debug channel (gated on `--debug`) and returns `false`
+    /// instead of failing, so a batch
     /// triaging many requests does not stop at the first one that
     /// cannot move. A caller bug does not get swallowed: a malformed
     /// id or state, and missing credentials, still return an error.
@@ -2014,7 +2089,9 @@ impl<'a> ObsClient<'a> {
                         | ErrorKind::TlsError
                 ) =>
             {
-                eprintln!("warning: could not change state of submit request {id}: {err}");
+                self.debug.emit(&format!(
+                    "decision: could not change state of submit request {id}: {err}"
+                ));
                 Ok(false)
             }
             Err(err) => Err(err),
@@ -2422,6 +2499,7 @@ impl<'a> ObsClient<'a> {
         budget: std::time::Duration,
     ) -> Result<String, GeectlError> {
         let deadline = std::time::Instant::now() + budget;
+        let mut probe = 0;
         loop {
             match self.http.put(url, body, &self.credentials) {
                 Ok(body) => return Ok(body),
@@ -2429,6 +2507,11 @@ impl<'a> ObsClient<'a> {
                     if err.kind() == ErrorKind::NotFound
                         && std::time::Instant::now() < deadline =>
                 {
+                    probe += 1;
+                    self.debug.emit(&format!(
+                        "retry: create_package registration probe {probe}/{}: still not found",
+                        Self::format_budget(budget)
+                    ));
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
                 Err(err) => return Err(err),
@@ -11036,11 +11119,24 @@ const SUBMIT_REQUIRED_PATHS: &[&str] = &[
 pub struct SrFiling<'a> {
     obs: &'a ObsClient<'a>,
     dry_run: &'a DryRun,
+    debug: Debug,
 }
 
 impl<'a> SrFiling<'a> {
     pub fn new(obs: &'a ObsClient<'a>, dry_run: &'a DryRun) -> Self {
-        SrFiling { obs, dry_run }
+        SrFiling {
+            obs,
+            dry_run,
+            debug: Debug::disabled(),
+        }
+    }
+
+    /// Report the channel's dedup decision lines to `debug`
+    /// instead of dropping them. The sink is off by default; the
+    /// caller that owns the debug channel passes its sink here.
+    pub fn with_debug(mut self, debug: Debug) -> Self {
+        self.debug = debug;
+        self
     }
 
     /// File `payload`. Returns the new OBS request id in live mode, or
@@ -11122,6 +11218,10 @@ impl<'a> SrFiling<'a> {
                 .map(|id| id.as_str())
                 .collect::<Vec<&str>>()
                 .join(", ");
+            self.debug.emit(&format!(
+                "decision: open submit request(s) {blocking} already target {}; refusing to file",
+                payload.target_package
+            ));
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 format!(
@@ -11130,6 +11230,11 @@ impl<'a> SrFiling<'a> {
                 ),
             ));
         }
+        self.debug.emit(&format!(
+            "decision: no open submit request targets {}; filing",
+            payload.target_package
+        ));
+
         let id = self.obs.create_request(payload)?;
         Ok(Some(id))
     }
@@ -11457,6 +11562,10 @@ impl<'a> SrFiling<'a> {
                 .map(|id| id.as_str())
                 .collect::<Vec<&str>>()
                 .join(", ");
+            self.debug.emit(&format!(
+                "decision: open {} request(s) {blocking} already target {what}; refusing to file",
+                target.action_type
+            ));
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 format!(
@@ -11465,6 +11574,10 @@ impl<'a> SrFiling<'a> {
                 ),
             ));
         }
+        self.debug.emit(&format!(
+            "decision: no open {} request targets {what}; filing",
+            target.action_type
+        ));
         Ok(())
     }
 
@@ -25022,6 +25135,109 @@ description</description>
         );
     }
 
+    // --- debug channel ---
+
+    #[test]
+    fn debug_dry_run_refusal_reports_the_guard() {
+        let (debug, lines) = Debug::captured(true, false);
+        let dry = DryRun::new(true).with_debug(debug);
+        assert!(!dry.allow("file submit request for foo to devel:languages:python"));
+        let got: Vec<String> = lines.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["decision: dry-run: mutation refused, plan only: file submit request for foo to devel:languages:python"
+                .to_string()]
+        );
+        // The [dry-run] plan echo is unchanged: it is unconditional
+        // narration, not a debug line.
+        assert_eq!(
+            dry.plan(),
+            [
+                "[dry-run] would: file submit request for foo to devel:languages:python"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn debug_dry_run_refusal_reports_nothing_when_debug_is_off() {
+        let (debug, lines) = Debug::captured(false, false);
+        let dry = DryRun::new(true).with_debug(debug);
+        assert!(!dry.allow("file submit request for foo to devel:languages:python"));
+        assert!(lines.lock().unwrap().is_empty());
+        assert_eq!(dry.plan().len(), 1);
+    }
+
+    #[test]
+    fn debug_create_package_probe_reports_each_retry() {
+        // One 404 on the just-created project, then the PUT lands:
+        // the probe line names the retry against the 30 s budget.
+        let (debug, lines) = Debug::captured(true, false);
+        let http = FakeHttp::new()
+            .with_put_error_sequence(
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
+                &[ErrorKind::NotFound],
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials())
+            .unwrap()
+            .with_debug(debug);
+        assert!(client
+            .create_package(
+                "home:alice",
+                "foo",
+                "Foo",
+                "Live test package",
+                &DryRun::new(false)
+            )
+            .is_ok());
+        assert_eq!(http.put_calls().len(), 2);
+        let got: Vec<String> = lines.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["retry: create_package registration probe 1/30s: still not found".to_string()]
+        );
+    }
+
+    #[test]
+    fn debug_change_state_retry_reports_probe_and_decision() {
+        // The changestate POST 500s, the state check reads the
+        // request back as still new, and the retry goes ahead: one
+        // probe line and one accept-state decision line, in time
+        // order.
+        let (debug, lines) = Debug::captured(true, false);
+        let http = FakeHttp::new()
+            .with_post_error_sequence(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                &[ErrorKind::ServerError],
+            )
+            .with_post(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/42?withhistory=1",
+                &REQUEST1_XML.replace("name=\"accepted\"", "name=\"new\""),
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials())
+            .unwrap()
+            .with_debug(debug);
+        let dry = DryRun::new(false);
+        obs.change_state("42", RequestState::Accepted, "looks good", false, &dry)
+            .expect("accept retries and lands");
+        let got: Vec<String> = lines.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            [
+                "retry: change_state request 42 probe 1/60s: still new".to_string(),
+                "decision: request 42 still new, re-issuing accepted".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn wait_for_results_ignores_a_caller_set_oldstate() {
         let query = ResultsQuery {
@@ -25049,6 +25265,35 @@ description</description>
                     true
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn debug_change_state_already_accepted_reports_the_decision() {
+        let (debug, lines) = Debug::captured(true, false);
+        let http = FakeHttp::new()
+            .with_post_error_sequence(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                &[ErrorKind::ServerError],
+            )
+            .with_post(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/42?withhistory=1",
+                REQUEST1_XML,
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials())
+            .unwrap()
+            .with_debug(debug);
+        let dry = DryRun::new(false);
+        obs.change_state("42", RequestState::Accepted, "looks good", false, &dry)
+            .expect("an already-accepted request reads as success");
+        let got: Vec<String> = lines.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["decision: request 42 already accepted; change landed, not re-issuing".to_string()]
         );
     }
 
@@ -26269,6 +26514,148 @@ description</description>
     }
 
     #[test]
+    fn debug_change_state_unknown_state_reports_probe_and_decision() {
+        // No canned read for the state check, so every probe reads
+        // the state as unknown and keeps retrying: with a 1500 ms
+        // budget the helper tries four times (three 500 ms sleeps).
+        let (debug, lines) = Debug::captured(true, false);
+        let http = FakeHttp::new().with_post_error_sequence(
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+            &[
+                ErrorKind::ServerError,
+                ErrorKind::ServerError,
+                ErrorKind::ServerError,
+                ErrorKind::ServerError,
+            ],
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials())
+            .unwrap()
+            .with_debug(debug);
+        let err = obs
+            .post_changestate_with_retry(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                "looks good",
+                42,
+                RequestState::Accepted,
+                std::time::Duration::from_millis(1500),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert_eq!(http.post_calls().len(), 4);
+        let got: Vec<String> = lines.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            [
+                "retry: change_state request 42 probe 1/1500ms: state unknown".to_string(),
+                "decision: request 42 state unknown, re-issuing accepted".to_string(),
+                "retry: change_state request 42 probe 2/1500ms: state unknown".to_string(),
+                "decision: request 42 state unknown, re-issuing accepted".to_string(),
+                "retry: change_state request 42 probe 3/1500ms: state unknown".to_string(),
+                "decision: request 42 state unknown, re-issuing accepted".to_string(),
+                "retry: change_state request 42 probe 4/1500ms: state unknown".to_string(),
+                "decision: request 42 state unknown, re-issuing accepted".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_budget_prints_whole_seconds_and_millis() {
+        assert_eq!(
+            ObsClient::format_budget(std::time::Duration::from_secs(30)),
+            "30s"
+        );
+        assert_eq!(
+            ObsClient::format_budget(std::time::Duration::from_secs(60)),
+            "60s"
+        );
+        assert_eq!(
+            ObsClient::format_budget(std::time::Duration::from_millis(1500)),
+            "1500ms"
+        );
+        assert_eq!(
+            ObsClient::format_budget(std::time::Duration::from_millis(500)),
+            "500ms"
+        );
+        assert_eq!(
+            ObsClient::format_budget(std::time::Duration::from_millis(0)),
+            "0s"
+        );
+    }
+
+    #[test]
+    fn debug_try_change_state_reports_a_refused_change() {
+        let (debug, lines) = Debug::captured(true, false);
+        let http = FakeHttp::new().with_post_error(
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+            ErrorKind::AuthFailed,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials())
+            .unwrap()
+            .with_debug(debug);
+        let dry = DryRun::new(false);
+        assert!(!obs
+            .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap());
+        let got: Vec<String> = lines.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["decision: could not change state of submit request 42: auth_failed: authentication failed (canned POST error for https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted)"
+                .to_string()]
+        );
+    }
+
+    #[test]
+    fn debug_file_reports_the_dedup_decision() {
+        let (debug, lines) = Debug::captured(true, false);
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = obs.search_url("foo").unwrap();
+        let http = FakeHttp::new()
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_debug(debug);
+        assert_eq!(
+            filing.file(&payload()).unwrap(),
+            Some("1400001".to_string())
+        );
+        let got: Vec<String> = lines.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["decision: no open submit request targets foo; filing".to_string()]
+        );
+    }
+
+    #[test]
+    fn debug_file_reports_the_dedup_refusal() {
+        let (debug, lines) = Debug::captured(true, false);
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = obs.search_url("foo").unwrap();
+        let http = FakeHttp::new().with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_debug(debug);
+        let err = filing.file(&payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let got: Vec<String> = lines.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            [
+                "decision: open submit request(s) 1398492 already target foo; refusing to file"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn list_repositories_404_is_an_error_not_an_empty_list() {
         let http = FakeHttp::new().with_get_error(
             "https://api.opensuse.org/public/source/nosuchproject/_meta",
@@ -26285,5 +26672,88 @@ description</description>
         let client = ObsClient::new(&http);
         assert!(client.list_repositories("bad/project").is_err());
         assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn debug_file_reports_nothing_when_debug_is_off() {
+        let (debug, lines) = Debug::captured(false, false);
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = obs.search_url("foo").unwrap();
+        let http = FakeHttp::new()
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_debug(debug);
+        assert_eq!(
+            filing.file(&payload()).unwrap(),
+            Some("1400001".to_string())
+        );
+        assert!(lines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn debug_maintenance_incident_reports_the_dedup_decision() {
+        let (debug, lines) = Debug::captured(true, false);
+        let search_url = action_match_url(
+            "maintenance_incident",
+            &[
+                "source/@package='foo'",
+                "target/@project='openSUSE:Maintenance'",
+            ],
+        );
+        let http = FakeHttp::new()
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create&addrevision=1",
+                "<request id=\"1400001\" creator=\"alice\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_debug(debug);
+        let payload = incident_payload();
+        assert_eq!(
+            filing.file_maintenance_incident(&payload).unwrap(),
+            Some("1400001".to_string())
+        );
+        let got: Vec<String> = lines.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["decision: no open maintenance_incident request targets openSUSE:Maintenance for foo; filing"
+                .to_string()]
+        );
+    }
+
+    #[test]
+    fn debug_maintenance_incident_reports_the_dedup_refusal() {
+        let (debug, lines) = Debug::captured(true, false);
+        let search_url = action_match_url(
+            "maintenance_incident",
+            &[
+                "source/@package='foo'",
+                "target/@project='openSUSE:Maintenance'",
+            ],
+        );
+        let http = FakeHttp::new().with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"1399001\" creator=\"alice\"><action type=\"maintenance_incident\"><source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" /><target project=\"openSUSE:Maintenance\" /></action><state name=\"new\" /></request></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_debug(debug);
+        let err = filing
+            .file_maintenance_incident(&incident_payload())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let got: Vec<String> = lines.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            ["decision: open maintenance_incident request(s) 1399001 already target openSUSE:Maintenance for foo; refusing to file"
+                .to_string()]
+        );
     }
 }
