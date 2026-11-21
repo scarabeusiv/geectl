@@ -1,7 +1,12 @@
-# The toolchain is pinned here, not in the workflows: the dtolnay
-# action reads this file, and local `cargo` does too, so CI and
-# developers use the same compiler. Bump the channel deliberately
-# (and `rust-version` in Cargo.toml with it).
+# The canonical pin lives here: rustup reads this file — it outranks
+# the rustup default the dtolnay action sets — and local `cargo` does
+# too, so CI and developers use the same compiler. Bump the
+# channel deliberately
+# (and `rust-version` in Cargo.toml with it) — and the reverse holds
+# too: a `rust-version` bump must also bump the channel, since the
+# release workflow follows `rust-version`, local dev follows the
+# channel via rustup, and test.yml pins the same version literally
+# in two `toolchain:` inputs — bump those too.
 [toolchain]
 channel = "1.99.1"
 components = ["rustfmt", "clippy"]

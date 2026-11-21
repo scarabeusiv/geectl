@@ -127,12 +127,12 @@ jobs:
           persist-credentials: false
       # Derive the release toolchain from Cargo.toml `rust-version` —
       # the single source of truth; updating `rust-version` is the one
-      # line that moves the release toolchain. rust-toolchain.toml says
-      # `stable`, which outranks the rustup default the dtolnay action
-      # sets, so export the derived version as RUSTUP_TOOLCHAIN to make
-      # it stick. $GITHUB_ENV, not job-level env: job-level env cannot
-      # see step outputs. Same extraction as the freshcrab release
-      # derivation.
+      # line that moves the release toolchain. The channel in
+      # rust-toolchain.toml already agrees with the derived version,
+      # so exporting it as RUSTUP_TOOLCHAIN is belt-and-braces to make
+      # it stick, not a fix for a gap. $GITHUB_ENV, not job-level env:
+      # job-level env cannot see step outputs. Same extraction as the
+      # freshcrab release derivation.
       - name: Derive the release toolchain from Cargo.toml
         id: toolchain
         run: |
