@@ -9,6 +9,7 @@
 mod cli_branch;
 mod cli_remote;
 mod cli_request;
+mod maintenance;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
@@ -93,6 +94,12 @@ enum Command {
         // larger than the other variants (clippy::large_enum_variant).
         command: Box<cli_branch::BranchCommand>,
     },
+    /// Maintenance operations: maintained-instances listing and
+    /// maintenance branching.
+    Maintenance {
+        #[command(subcommand)]
+        command: maintenance::MaintenanceCommand,
+    },
 }
 
 /// The `config` subcommands.
@@ -132,6 +139,10 @@ fn run(cli: Cli, debug: &Debug) -> Result<String, GeectlError> {
         },
         Some(Command::Remote { command }) => cli_remote::run_remote(command, debug)?,
         Some(Command::Branch { command }) => cli_branch::run_branch(*command, debug, cli.live)?,
+        Some(Command::Maintenance { command }) => {
+            let (payload, text) = maintenance::run(command, debug, cli.live)?;
+            (payload, text)
+        }
     };
     Ok(match cli.format {
         Format::Json => payload.to_string(),
