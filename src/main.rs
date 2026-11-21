@@ -4,7 +4,8 @@
 //! Missing required input fails fast with a structured error naming the
 //! missing flag. Stdout carries only the result payload (JSON by default);
 //! every diagnostic, warning, and error goes to stderr. There is exactly
-//! one exit path: the error kind's exit code.
+/// one exit path: the error kind's exit code.
+mod cli_branch;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
@@ -47,6 +48,11 @@ struct Cli {
     #[arg(long, global = true)]
     debug_body: bool,
 
+    /// Actually perform mutations. Without it, only the plan is
+    /// printed: dry-run is the default for mutations.
+    #[arg(long, global = true)]
+    live: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -59,6 +65,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Branch, copy, and link packages.
+    Branch {
+        #[command(subcommand)]
+        command: cli_branch::BranchCommand,
     },
 }
 
@@ -73,7 +84,7 @@ enum ConfigCommand {
     Init,
 }
 
-fn run(cli: Cli) -> Result<String, GeectlError> {
+fn run(cli: Cli, debug: &Debug) -> Result<String, GeectlError> {
     let (payload, text) = match cli.command {
         Some(Command::Version) | None => {
             let payload = json!({
@@ -95,6 +106,7 @@ fn run(cli: Cli) -> Result<String, GeectlError> {
                 (payload, text)
             }
         },
+        Some(Command::Branch { command }) => cli_branch::run_branch(command, debug, cli.live)?,
     };
     Ok(match cli.format {
         Format::Json => payload.to_string(),
@@ -306,13 +318,29 @@ fn write_payload(payload: &str) -> Result<(), GeectlError> {
     }
 }
 
-/// Write a JSON error payload to stderr. A failure to write to stderr
-/// is ignored: there is nowhere else to report it, and panicking while
-/// already handling an error helps no one.
-fn write_error(err: &GeectlError) {
+/// Write an error to stderr in the selected format. JSON mode keeps
+/// the JSON payload; text mode prints `error: <message>` plus
+/// `remediation: <...>` lines (decision 52.3). The message carries the
+/// error's context when it has one, so the specifics are not lost.
+/// A failure to write to stderr is ignored: there is nowhere else to
+/// report it, and panicking while already handling an error helps no
+/// one.
+fn write_error(err: &GeectlError, format: Format) {
     let stderr = std::io::stderr();
     let mut handle = stderr.lock();
-    let _ = writeln!(handle, "{}", err.to_json());
+    match format {
+        Format::Json => {
+            let _ = writeln!(handle, "{}", err.to_json());
+        }
+        Format::Text => {
+            if err.context.is_empty() {
+                let _ = writeln!(handle, "error: {}", err.kind().message());
+            } else {
+                let _ = writeln!(handle, "error: {} ({})", err.kind().message(), err.context);
+            }
+            let _ = writeln!(handle, "remediation: {}", err.kind().remediation());
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -333,14 +361,17 @@ fn main() -> ExitCode {
                     match write_payload(e.render().to_string().trim_end()) {
                         Ok(()) => return ExitCode::from(0),
                         Err(err) => {
-                            write_error(&err);
+                            write_error(&err, Format::Json);
                             return ExitCode::from(err.exit_code() as u8);
                         }
                     }
                 }
                 _ => {
+                    // No Cli exists on this path — clap failed to
+                    // parse — so the format is unknowable; the JSON
+                    // default applies.
                     let err = GeectlError::new(ErrorKind::InvalidInput, e.to_string());
-                    write_error(&err);
+                    write_error(&err, Format::Json);
                     return ExitCode::from(err.exit_code() as u8);
                 }
             }
@@ -370,16 +401,19 @@ fn main() -> ExitCode {
             debug.emit(&line);
         }
     }
-    match run(cli) {
+    // The format is captured before `run` moves the Cli: the
+    // error path below needs it, and the Cli is gone by then.
+    let format = cli.format;
+    match run(cli, &debug) {
         Ok(payload) => match write_payload(&payload) {
             Ok(()) => ExitCode::from(0),
             Err(err) => {
-                write_error(&err);
+                write_error(&err, format);
                 ExitCode::from(err.exit_code() as u8)
             }
         },
         Err(err) => {
-            write_error(&err);
+            write_error(&err, format);
             ExitCode::from(err.exit_code() as u8)
         }
     }
@@ -392,7 +426,7 @@ mod tests {
     #[test]
     fn version_payload_is_json_with_name_and_version() {
         let cli = Cli::parse_from(["geectl", "version"]);
-        let payload = run(cli).unwrap();
+        let payload = run(cli, &Debug::disabled()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["name"], "geectl");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
@@ -401,7 +435,7 @@ mod tests {
     #[test]
     fn no_subcommand_prints_version_payload() {
         let cli = Cli::parse_from(["geectl"]);
-        assert!(run(cli).is_ok());
+        assert!(run(cli, &Debug::disabled()).is_ok());
     }
 
     #[test]
