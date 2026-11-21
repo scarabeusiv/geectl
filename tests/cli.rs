@@ -743,7 +743,42 @@ fn remote_list_packages_text_mode_renders_the_table() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(stdout.trim(), "NAME\ncurl\nvim");
+    assert_eq!(stdout.trim(), "project: openSUSE:Factory\nNAME\ncurl\nvim");
+}
+
+#[test]
+fn remote_list_files_text_mode_opens_with_the_coordinate_header() {
+    let addr = serve_once(
+        "<directory><entry name=\"vim.spec\" size=\"1234\" mtime=\"1700000000\" md5=\"deadbeef\"/></directory>",
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "list-files",
+            "openSUSE:Factory",
+            "vim",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some("project: openSUSE:Factory package: vim"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("vim.spec"), "{stdout}");
+    // The md5 stays JSON-only.
+    assert!(!stdout.contains("deadbeef"), "{stdout}");
 }
 
 #[test]

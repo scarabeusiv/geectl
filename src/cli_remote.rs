@@ -23,9 +23,31 @@
 //! issues many requests and a differing binary file fails the call.
 //! And osc `rdiff`'s two-package form has no counterpart here at all:
 //! the library has no public two-package diff op (see issue #74).
+//!
+//! Coordinate header (design rule 1, decided 2026-11-21, Tom):
+//! every text rendering opens with one header line echoing the query
+//! coordinates — the required positionals, in the order project,
+//! package (`project: p package: k`), or the command's own coordinate
+//! where the query has no project (`term:`, `login:`, `binary:`).
+//! Tables stay as designed; the header is the only addition. Two
+//! commands are content commands and stay verbatim (design rule 4):
+//! `cat` (the file itself) and the diffs (`revision-patch`,
+//! `project-diff`) — a synthetic empty line (`no changes …`,
+//! `no packages`) still carries the header. Three single-object
+//! renders need no separate header because their first line already
+//! is the coordinate: `project-meta` (`name:`), `package-meta`
+//! (`name:` + `project:`) and `whois` (`login:`).
+//!
+//! Documented omissions (decided, not gaps): `list-files` text
+//! carries no md5 (a verification value, not an identifier);
+//! `package-log` text carries no comment or srcmd5 (long free text
+//! and a verification value); search tables carry no description
+//! (long free text — titles stay); `revision-patch` and
+//! `project-diff` diffs are the server text itself, not re-rendered.
+//! The JSON payload remains the complete record in every case.
 
 use clap::Subcommand;
-use geectl::auth::{AuthProvider, Credentials, EnvObsAuth};
+use geectl::auth::{Credentials, EnvObsAuth};
 use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::GeectlError;
@@ -41,7 +63,10 @@ use serde_json::{json, Value};
 /// source tree.
 #[derive(Debug, Subcommand)]
 pub enum RemoteCommand {
-    /// Print a source file to standard output.
+    /// Print a source file to standard output. Text only: the
+    /// library reads the file as a UTF-8 string, so a binary file
+    /// fails the call with a server error ("response body is not
+    /// valid UTF-8") instead of printing bytes.
     Cat {
         /// The project the package lives in.
         project: String,
@@ -209,7 +234,13 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
                 "package": package,
                 "files": files.iter().map(source_file_json).collect::<Vec<_>>(),
             });
-            Ok((payload, render_source_files(&files)))
+            Ok((
+                payload,
+                with_header(
+                    &format!("project: {project} package: {package}"),
+                    render_source_files(&files),
+                ),
+            ))
         }
         RemoteCommand::ListPackages { project } => {
             let packages = client.list_packages(&project)?;
@@ -228,7 +259,13 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
                 "range": range,
                 "entries": entries.iter().map(history_entry_json).collect::<Vec<_>>(),
             });
-            Ok((payload, render_history(&entries)))
+            Ok((
+                payload,
+                with_header(
+                    &format!("project: {project} package: {package}"),
+                    render_history(&entries),
+                ),
+            ))
         }
         RemoteCommand::RevisionPatch {
             project,
@@ -242,7 +279,15 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
                 "rev": rev,
                 "files": patch.files.iter().map(file_patch_json).collect::<Vec<_>>(),
             });
-            Ok((payload, render_revision_patch(&patch)))
+            let text = render_revision_patch(&patch);
+            // Content stays verbatim; only the synthetic empty line
+            // carries the header (design rule 1).
+            let text = if patch.files.is_empty() {
+                with_header(&format!("project: {project} package: {package}"), text)
+            } else {
+                text
+            };
+            Ok((payload, text))
         }
         RemoteCommand::ProjectMeta { project } => {
             let meta = client.project_meta(&project)?;
@@ -263,7 +308,13 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
                 "exact": exact,
                 "packages": matches.iter().map(package_match_json).collect::<Vec<_>>(),
             });
-            Ok((payload, render_package_matches(&term, &matches)))
+            Ok((
+                payload,
+                with_header(
+                    &format!("term: {term}"),
+                    render_package_matches(&term, &matches),
+                ),
+            ))
         }
         RemoteCommand::SearchProjects { term, exact } => {
             let matches = apply_exact(client.search_projects(&term)?, &term, exact, |match_| {
@@ -274,7 +325,13 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
                 "exact": exact,
                 "projects": matches.iter().map(project_match_json).collect::<Vec<_>>(),
             });
-            Ok((payload, render_project_matches(&term, &matches)))
+            Ok((
+                payload,
+                with_header(
+                    &format!("term: {term}"),
+                    render_project_matches(&term, &matches),
+                ),
+            ))
         }
         RemoteCommand::Owners { project, package } => {
             let owners = client.owners(&project, &package)?;
@@ -283,7 +340,13 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
                 "package": package,
                 "owners": owners.iter().map(owner_json).collect::<Vec<_>>(),
             });
-            Ok((payload, render_owners(&owners)))
+            Ok((
+                payload,
+                with_header(
+                    &format!("project: {project} package: {package}"),
+                    render_owners(&owners),
+                ),
+            ))
         }
         RemoteCommand::OwnersForBinary { binary } => {
             let owners = client.owners_for_binary(&binary)?;
@@ -291,7 +354,10 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
                 "binary": binary,
                 "owners": owners.iter().map(owner_json).collect::<Vec<_>>(),
             });
-            Ok((payload, render_owners(&owners)))
+            Ok((
+                payload,
+                with_header(&format!("binary: {binary}"), render_owners(&owners)),
+            ))
         }
         RemoteCommand::Maintainers { project, package } => {
             let maintainers = client.maintainers(&project, &package)?;
@@ -325,7 +391,15 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
                 "annotate_requests": annotate_requests,
                 "packages": packages.iter().map(package_diff_json).collect::<Vec<_>>(),
             });
-            Ok((payload, render_project_diff(&packages)))
+            let text = render_project_diff(&packages);
+            // Content stays verbatim; only the synthetic empty line
+            // carries the header (design rule 1).
+            let text = if packages.is_empty() {
+                with_header(&format!("old: {old} new: {new}"), text)
+            } else {
+                text
+            };
+            Ok((payload, text))
         }
         RemoteCommand::DevelProject { package } => {
             // Factory-only by design (see the swaps table): the
@@ -349,7 +423,10 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
 /// failing fast on a half-set credential env is a deliberate
 /// choice — a genuine misconfiguration fails early, at startup,
 /// rather than halfway through a run. Per-command lazy resolution
-/// is follow-up work.
+/// is follow-up work. This group differs from `request` deliberately:
+/// remote commands are reads, so a half-set pair is a misconfiguration
+/// to surface at startup; `request` swallows it in dry-run because a
+/// request preview never needs credentials at all.
 fn obs_endpoint() -> Result<(String, Credentials), GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
@@ -358,7 +435,7 @@ fn obs_endpoint() -> Result<(String, Credentials), GeectlError> {
         .config
         .obs_url
         .unwrap_or_else(|| OBS_API_BASE.to_string());
-    let credentials = EnvObsAuth.credentials()?;
+    let credentials = EnvObsAuth::credentials_for_url(&base, &base, &file_config.instances)?;
     Ok((base, credentials))
 }
 
@@ -366,6 +443,12 @@ fn obs_endpoint() -> Result<(String, Credentials), GeectlError> {
 // Per-command result builders: pure functions of the typed values, so
 // every command's payload and text are unit-testable without a server.
 // ---------------------------------------------------------------------
+
+/// Prepend the one-line coordinate header to a text rendering
+/// (design rule 1): `header` first, then the body unchanged.
+fn with_header(header: &str, text: String) -> String {
+    format!("{header}\n{text}")
+}
 
 fn cat_result(
     project: &str,
@@ -390,7 +473,13 @@ fn list_packages_result(project: &str, packages: Vec<String>) -> (Value, String)
         "project": project,
         "packages": packages,
     });
-    (payload, render_package_names(&packages))
+    (
+        payload,
+        with_header(
+            &format!("project: {project}"),
+            render_package_names(&packages),
+        ),
+    )
 }
 
 fn render_package_names(packages: &[String]) -> String {
@@ -411,7 +500,13 @@ fn maintainers_result(
         "package": package,
         "maintainers": maintainers.iter().map(named_role_json).collect::<Vec<_>>(),
     });
-    (payload, render_maintainers(&maintainers))
+    (
+        payload,
+        with_header(
+            &format!("project: {project} package: {package}"),
+            render_maintainers(&maintainers),
+        ),
+    )
 }
 
 fn render_maintainers(maintainers: &[NamedRole]) -> String {
@@ -442,7 +537,10 @@ fn link_target_result(
         Some((project, package)) => format!("link: {project}/{package}"),
         None => "no link".to_string(),
     };
-    (payload, text)
+    (
+        payload,
+        with_header(&format!("project: {project} package: {package}"), text),
+    )
 }
 
 fn devel_project_result(package: &str, devel: Option<(String, String)>) -> (Value, String) {
@@ -457,7 +555,7 @@ fn devel_project_result(package: &str, devel: Option<(String, String)>) -> (Valu
         }
         None => "no devel project".to_string(),
     };
-    (payload, text)
+    (payload, with_header(&format!("package: {package}"), text))
 }
 
 /// Keep only exact-name matches when `exact` is set; otherwise the
@@ -1408,10 +1506,13 @@ mod tests {
         );
         assert_eq!(payload["target"]["project"], "editors");
         assert_eq!(payload["target"]["package"], "vim");
-        assert_eq!(text, "link: editors/vim");
+        assert_eq!(
+            text,
+            "project: openSUSE:Factory package: vim\nlink: editors/vim"
+        );
         let (payload, text) = link_target_result("openSUSE:Factory", "vim", &None);
         assert_eq!(payload["target"], Value::Null);
-        assert_eq!(text, "no link");
+        assert_eq!(text, "project: openSUSE:Factory package: vim\nno link");
     }
 
     #[test]
@@ -1446,10 +1547,10 @@ mod tests {
         assert_eq!(payload["project"], "openSUSE:Factory");
         assert_eq!(payload["packages"][0], "curl");
         assert_eq!(payload["packages"][1], "vim");
-        assert_eq!(text, "NAME\ncurl\nvim");
+        assert_eq!(text, "project: openSUSE:Factory\nNAME\ncurl\nvim");
         let (payload, text) = list_packages_result("openSUSE:Factory", vec![]);
         assert_eq!(payload["packages"], json!([]));
-        assert_eq!(text, "no packages");
+        assert_eq!(text, "project: openSUSE:Factory\nno packages");
     }
 
     #[test]
@@ -1469,7 +1570,10 @@ mod tests {
         assert!(text.contains("maintainer"));
         let (payload, text) = maintainers_result("openSUSE:Factory", "vim", vec![]);
         assert_eq!(payload["maintainers"], json!([]));
-        assert_eq!(text, "no maintainers");
+        assert_eq!(
+            text,
+            "project: openSUSE:Factory package: vim\nno maintainers"
+        );
     }
 
     #[test]

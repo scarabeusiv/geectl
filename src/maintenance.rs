@@ -6,9 +6,26 @@
 //! rendering of the same data — per the #51/#52 design: text stays
 //! opt-in via `--format text`, stdout carries only the result payload,
 //! and nothing here touches raw XML (typed values only).
+//!
+//! Coordinate header (design rule 1, decided 2026-11-21, Tom):
+//! every text rendering opens with one header line echoing the query
+//! coordinates (`package: <package>`). The live branch result already
+//! opens with `package:`; the instances table gains it above the
+//! table, and the dry-run branch text gains it above `dry_run:` and
+//! the plan. The empty instances line (`no maintained instances for
+//! <package>`) already names the package, so it carries the
+//! coordinate itself and gains no second line.
+//!
+//! Credentials in dry-run: like `branch`, this group fails fast on a
+//! half-configured credential pair before any work, in dry-run too.
+//! An unconfigured pair resolves to `None` and the operations fail
+//! closed themselves when they need credentials. The request group
+//! differs deliberately: it swallows a half-configured pair in
+//! dry-run (see `cli_request`), so a request preview never needs
+//! credentials at all.
 
 use clap::{Args, Subcommand};
-use geectl::auth::{AuthProvider, EnvObsAuth};
+use geectl::auth::EnvObsAuth;
 use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::GeectlError;
@@ -114,9 +131,11 @@ fn dry_run_for(live: bool, debug: &Debug) -> DryRun {
 }
 
 /// An `ObsClient` for the effective OBS base (config file / env /
-/// default) with the environment OBS credentials, reporting on the
-/// debug channel. Credentials resolve to `None` when unconfigured;
-/// the operations fail closed themselves when they need them.
+/// default) with the environment OBS credentials for that URL,
+/// reporting on the debug channel. Credentials resolve to `None`
+/// when unconfigured; the operations fail closed themselves when
+/// they need them. A half-configured pair fails fast here, even in
+/// dry-run (see the module docs).
 fn obs_client<'a>(http: &'a dyn HttpClient, debug: &Debug) -> Result<ObsClient<'a>, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
@@ -125,7 +144,7 @@ fn obs_client<'a>(http: &'a dyn HttpClient, debug: &Debug) -> Result<ObsClient<'
     // Some(obs_url) — but kept as a defensive default rather than an
     // unwrap: a config change must not turn into a panic here.
     let obs_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
-    let credentials = EnvObsAuth.credentials()?;
+    let credentials = EnvObsAuth::credentials_for_url(obs_url, obs_url, &file_config.instances)?;
     ObsClient::with_base_and_credentials(http, obs_url, credentials)
         .map(|client| client.with_debug(debug.clone()))
 }
@@ -189,7 +208,7 @@ fn render_instances_text(package: &str, instances: &[MaintainedInstance]) -> Str
             ]
         })
         .collect();
-    render_table(
+    let table = render_table(
         [
             "SOURCE_PROJECT",
             "SOURCE_PACKAGE",
@@ -199,7 +218,8 @@ fn render_instances_text(package: &str, instances: &[MaintainedInstance]) -> Str
             "TARGET_PACKAGE",
         ],
         &rows,
-    )
+    );
+    format!("package: {package}\n{table}")
 }
 
 /// Render a header row plus one row per item, columns space-aligned to
@@ -224,7 +244,7 @@ fn render_row<const N: usize>(cells: &[String; N], widths: &[usize; N]) -> Strin
     let joined = cells
         .iter()
         .enumerate()
-        .map(|(i, cell)| format!("{cell:<width$}", width = widths[i]))
+        .map(|(i, cell)| format!("{:<width$}", cell, width = widths[i]))
         .collect::<Vec<_>>()
         .join(" ");
     joined.trim_end().to_string()
@@ -253,7 +273,7 @@ fn maintenance_branch(
                 "dry_run": true,
                 "plan": plan,
             });
-            Ok((payload, plan.join("\n")))
+            Ok((payload, render_dry_run_text(&args.package, &plan)))
         }
         Some(result) => {
             let payload = branch_result_json(&args.package, &result);
@@ -274,6 +294,15 @@ fn branch_result_json(package: &str, result: &MaintenanceBranchResult) -> Value 
         "source_project": result.source_project,
         "source_package": result.source_package,
     })
+}
+
+/// Render a dry-run branch result as text: the coordinate header,
+/// the dry-run mode, then the plan verbatim — the same order as the
+/// live result (`package:`, `dry_run:`, then the outcome).
+fn render_dry_run_text(package: &str, plan: &[String]) -> String {
+    let mut lines = vec![format!("package: {package}"), "dry_run: true".to_string()];
+    lines.extend(plan.iter().cloned());
+    lines.join("\n")
 }
 
 /// Render a live branch result as `key: value` lines, one fact per
@@ -496,9 +525,10 @@ mod tests {
         let payload: Vec<Value> = instances.iter().map(instance_json).collect();
         let text = render_instances_text("foo", &instances);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "text:\n{text}");
+        assert_eq!(lines.len(), 4, "text:\n{text}");
+        assert_eq!(lines[0], "package: foo");
         assert_eq!(
-            lines[0].split_whitespace().collect::<Vec<_>>(),
+            lines[1].split_whitespace().collect::<Vec<_>>(),
             [
                 "SOURCE_PROJECT",
                 "SOURCE_PACKAGE",
@@ -508,10 +538,10 @@ mod tests {
                 "TARGET_PACKAGE"
             ]
         );
-        assert!(lines[1].contains("openSUSE:Leap:15.6:Update"));
-        assert!(lines[1].contains("devel:languages:python"));
-        assert!(lines[2].contains("openSUSE:Leap:15.5:Update"));
-        assert!(lines[2].contains(" - "), "text:\n{text}");
+        assert!(lines[2].contains("openSUSE:Leap:15.6:Update"));
+        assert!(lines[2].contains("devel:languages:python"));
+        assert!(lines[3].contains("openSUSE:Leap:15.5:Update"));
+        assert!(lines[3].contains(" - "), "text:\n{text}");
         assert!(
             !lines.iter().any(|line| line.ends_with(' ')),
             "no trailing spaces:\n{text}"
@@ -595,6 +625,18 @@ mod tests {
         assert_eq!(
             plan.join("\n"),
             "[dry-run] would: branch maintained package foo"
+        );
+    }
+
+    #[test]
+    fn dry_run_text_opens_with_the_coordinate_header() {
+        let text = render_dry_run_text(
+            "foo",
+            &["[dry-run] would: branch maintained package foo".to_string()],
+        );
+        assert_eq!(
+            text,
+            "package: foo\ndry_run: true\n[dry-run] would: branch maintained package foo"
         );
     }
 }

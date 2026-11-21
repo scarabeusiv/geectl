@@ -7,6 +7,7 @@
 //! one exit path: the error kind's exit code.
 
 mod cli_branch;
+mod cli_build;
 mod cli_remote;
 mod cli_request;
 mod maintenance;
@@ -19,8 +20,6 @@ use geectl::error::{ErrorKind, GeectlError};
 use serde_json::json;
 use std::io::Write;
 use std::process::ExitCode;
-
-mod cli_build;
 
 /// The output format. JSON is the default; it is the only format an agent
 /// should parse. `text` is a human-readable rendering of the same data.
@@ -67,11 +66,6 @@ struct Cli {
 enum Command {
     /// Print version information as the result payload.
     Version,
-    /// Build-status commands: results, logs, histories, binaries.
-    Build {
-        #[command(subcommand)]
-        command: cli_build::BuildCommand,
-    },
     /// Inspect or initialise the config file.
     Config {
         #[command(subcommand)]
@@ -93,6 +87,11 @@ enum Command {
         // Boxed: the ten branch subcommands make BranchCommand far
         // larger than the other variants (clippy::large_enum_variant).
         command: Box<cli_branch::BranchCommand>,
+    },
+    /// Build-status commands: results, logs, histories, binaries.
+    Build {
+        #[command(subcommand)]
+        command: cli_build::BuildCommand,
     },
     /// Maintenance operations: maintained-instances listing and
     /// maintenance branching.
