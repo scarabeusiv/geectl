@@ -5134,11 +5134,8 @@ pub(crate) fn parse_devel_project(body: &str) -> Result<Option<String>, GeectlEr
             return Err(malformed());
         };
         let element = &after_tag[..end];
-        if let Some(attr_pos) = element.find("project=\"") {
-            let start = attr_pos + "project=\"".len();
-            if let Some(quote) = element[start..].find('"') {
-                return Ok(Some(element[start..start + quote].to_string()));
-            }
+        if let Some(project) = quoted_attr_value(element, "project") {
+            return Ok(Some(project));
         }
         rest = &after_tag[end..];
     }
@@ -5162,11 +5159,46 @@ pub(crate) fn parse_spec_version(spec_text: &str) -> Option<String> {
 /// (`<collection matches="N">...</collection>`). None when the
 /// response does not carry a count.
 pub(crate) fn parse_search_matches(body: &str) -> Option<u32> {
-    let marker = "matches=\"";
-    let pos = body.find(marker)?;
-    let start = pos + marker.len();
-    let end = body[start..].find('"')?;
-    body[start..start + end].parse::<u32>().ok()
+    quoted_attr_value(body, "matches")?.parse::<u32>().ok()
+}
+
+/// The value of attribute `name` in `element` (the text between a
+/// tag name and its `>`), in either quote style: `name="v"` or
+/// `name='v'`. None when the attribute is absent or unterminated.
+/// The attribute name must stand on its own — `subproject="..."` must
+/// not match `project=` — so the character before `name` has to be
+/// whitespace.
+fn quoted_attr_value(element: &str, name: &str) -> Option<String> {
+    let mut rest = element;
+    while let Some(pos) = rest.find(name) {
+        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
+            rest = &rest[pos + name.len()..];
+            continue;
+        }
+        let after_name = &rest[pos + name.len()..];
+        let Some(after_eq) = after_name.strip_prefix('=') else {
+            rest = after_name;
+            continue;
+        };
+        // A malformed occurrence (an unquoted value, or a value whose
+        // closing quote never comes) does not stop the scan: the server
+        // never emits one, but a later well-formed occurrence still
+        // carries the value.
+        let Some(quote) = after_eq.chars().next() else {
+            rest = after_eq;
+            continue;
+        };
+        if quote != '"' && quote != '\'' {
+            rest = after_eq;
+            continue;
+        }
+        let Some(close) = after_eq[1..].find(quote) else {
+            rest = &after_eq[1..];
+            continue;
+        };
+        return Some(after_eq[1..1 + close].to_string());
+    }
+    None
 }
 
 /// The numeric `id` attribute of a `<request ...>` opening tag's
@@ -10362,6 +10394,42 @@ mod tests {
             Some(0)
         );
         assert_eq!(parse_search_matches("<collection></collection>"), None);
+        // Either quote style carries the count.
+        assert_eq!(
+            parse_search_matches("<collection matches='7'></collection>"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn quoted_attr_value_skips_a_malformed_first_occurrence() {
+        // An unquoted first occurrence does not stop the scan: the
+        // well-formed later one wins.
+        assert_eq!(
+            quoted_attr_value(" project=devel:bad project=\"devel:foo\"", "project"),
+            Some("devel:foo".to_string())
+        );
+        // An unterminated first occurrence likewise does not stop it:
+        // its opening quote never closes (the later value quotes with
+        // the other style, so it cannot close the first one).
+        assert_eq!(
+            quoted_attr_value(" project=\"devel:bad project='devel:foo'", "project"),
+            Some("devel:foo".to_string())
+        );
+        // Every occurrence malformed: None, not a partial value.
+        assert_eq!(quoted_attr_value(" project=devel:bad", "project"), None);
+        assert_eq!(quoted_attr_value(" project=\"devel:bad", "project"), None);
+    }
+
+    #[test]
+    fn quoted_attr_value_matches_the_attribute_name_only() {
+        // `subproject="..."` must not match `project=`.
+        assert_eq!(quoted_attr_value(" subproject=\"foo\"", "project"), None);
+        // With both present, the real `project` value wins.
+        assert_eq!(
+            quoted_attr_value(" subproject=\"foo\" project=\"bar\"", "project"),
+            Some("bar".to_string())
+        );
     }
 
     // --- create_request ---
@@ -10879,6 +10947,11 @@ mod tests {
         // the tag, not the element balance.
         assert_eq!(
             parse_devel_project("<directory><devel project=\"devel:foo\"></directory>").unwrap(),
+            Some("devel:foo".to_string())
+        );
+        // Either quote style carries the project.
+        assert_eq!(
+            parse_devel_project("<directory><devel project='devel:foo'/></directory>").unwrap(),
             Some("devel:foo".to_string())
         );
         // Trailing junk after the closing tag is malformed.
