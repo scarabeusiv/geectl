@@ -7277,7 +7277,7 @@ impl SrPayload {
 /// so a future edit to `to_xml` that changes the action type fails
 /// here, at payload build time, instead of at the API.
 fn validate_sr_xml(xml: &str) -> Result<(), GeectlError> {
-    check_well_formed(xml)?;
+    check_well_formed(xml, SUBMIT_REQUIRED_PATHS)?;
     // The rendered XML must carry exactly one <sourceupdate> with
     // a value the server accepts. The value comes from the
     // `SourceUpdate` enum, so it is always one of the three —
@@ -7301,7 +7301,7 @@ fn validate_sr_xml(xml: &str) -> Result<(), GeectlError> {
             ));
         }
     }
-    if !request_block_has_submit_action(xml) {
+    if !request_block_matches_action(xml, "submit", ActionShape::Any) {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             "malformed SR XML: <action> is not type=\"submit\"",
@@ -7327,6 +7327,617 @@ fn sourceupdate_value(xml: &str) -> Option<&str> {
         return None;
     }
     Some(value)
+}
+
+/// The validated maintenance-incident payload: which packages from
+/// which project go into which maintenance project, and what the
+/// incident says.
+///
+/// One action per source package: a single request carries the whole
+/// incident, so the packages land together. The target is the
+/// maintenance project itself (`openSUSE:Maintenance`, or the
+/// incident project for a follow-up); the target package is never
+/// specified — the server forbids it (`IllegalRequest`); the incident
+/// package is named at accept time, when the server merges the source
+/// into the incident project. The optional release project is the maintained product
+/// the update releases into; the server resolves it to its update
+/// instance and requires `maintenance_release` kind.
+///
+/// No source-update by default: unlike a submit request, whose
+/// branch is a throwaway by default, the incident source is the
+/// maintenance working area, which the maintainer may reuse for the
+/// next incident. Opt in with [`MaintenanceIncidentPayload::with_cleanup`]
+/// when the branch must die on accept.
+///
+/// A project-level incident (no packages at all) is legal on the
+/// server but out of scope here: the skill files incidents per
+/// package, and the dedup check keys on the source package. The
+/// fields are private: a payload can only be built through
+/// [`MaintenanceIncidentPayload::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceIncidentPayload {
+    /// The project the update comes from (the maintenance branch).
+    source_project: String,
+    /// The packages in the source project, one action each.
+    source_packages: Vec<String>,
+    /// The maintenance project the incident targets.
+    target_project: String,
+    /// The maintained product the update releases into, if any.
+    target_releaseproject: Option<String>,
+    /// What OBS does with the source branch when the incident is
+    /// accepted. None renders no `<options>` at all.
+    source_update: Option<SourceUpdate>,
+    /// The incident description text.
+    description: String,
+}
+
+impl MaintenanceIncidentPayload {
+    /// Build and validate a payload. Every name must be a valid OBS
+    /// project/package name, at least one source package is required,
+    /// with no duplicates, and the description must be non-empty.
+    /// Returns Err instead of
+    /// building a payload that could not be filed.
+    pub fn new(
+        source_project: &str,
+        source_packages: &[&str],
+        target_project: &str,
+        description: &str,
+    ) -> Result<Self, GeectlError> {
+        let payload = MaintenanceIncidentPayload {
+            source_project: source_project.to_string(),
+            source_packages: source_packages.iter().map(|p| p.to_string()).collect(),
+            target_project: target_project.to_string(),
+            target_releaseproject: None,
+            source_update: None,
+            description: description.to_string(),
+        };
+        payload.validate_semantics()?;
+        payload.validate_xml()?;
+        Ok(payload)
+    }
+
+    /// Set the release project the update releases into. The name
+    /// must be a valid OBS project name; the server resolves it to
+    /// its update instance at filing time, requires
+    /// `maintenance_release` kind, and stores the resolved name. The
+    /// dedup keys on the release project as filed, so a release
+    /// project that resolves elsewhere may slip past a later dedup;
+    /// a `maintenance_release` project resolves to itself, so the
+    /// normal case is unaffected.
+    pub fn with_release_project(mut self, release_project: &str) -> Result<Self, GeectlError> {
+        if !valid_obs_name(release_project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name for release project: {release_project:?}"),
+            ));
+        }
+        self.target_releaseproject = Some(release_project.to_string());
+        self.validate_xml()?;
+        Ok(self)
+    }
+
+    /// Opt in to branch cleanup: the source branch is deleted when
+    /// the incident is accepted. Use this only when the branch is a
+    /// throwaway; by default the branch survives the incident.
+    pub fn with_cleanup(mut self) -> Result<Self, GeectlError> {
+        self.source_update = Some(SourceUpdate::Cleanup);
+        self.validate_xml()?;
+        Ok(self)
+    }
+
+    /// The project the update comes from.
+    pub fn source_project(&self) -> &str {
+        &self.source_project
+    }
+
+    /// The packages in the source project, one action each.
+    pub fn source_packages(&self) -> &[String] {
+        &self.source_packages
+    }
+
+    /// The maintenance project the incident targets.
+    pub fn target_project(&self) -> &str {
+        &self.target_project
+    }
+
+    /// The maintained product the update releases into, if any.
+    pub fn target_releaseproject(&self) -> Option<&str> {
+        self.target_releaseproject.as_deref()
+    }
+
+    /// What OBS does with the source branch on accept, if any.
+    pub fn source_update(&self) -> Option<SourceUpdate> {
+        self.source_update
+    }
+
+    /// The incident description text.
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// The semantic checks [`MaintenanceIncidentPayload::new`] runs:
+    /// every name must be a valid OBS project/package name, at least
+    /// one source package is required, with no duplicates, and the
+    /// description must be non-empty.
+    /// [`SrFiling::file_maintenance_incident`] runs the
+    /// same checks again on the filing path.
+    pub fn validate_semantics(&self) -> Result<(), GeectlError> {
+        if !valid_obs_name(&self.source_project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "invalid OBS project name for source project: {:?}",
+                    self.source_project
+                ),
+            ));
+        }
+        if self.source_packages.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a maintenance incident needs at least one source package",
+            ));
+        }
+        // One action per source package: a duplicate would render two
+        // identical actions, which the server refuses
+        // (`ConflictingActions` on the incident `uniq_key`).
+        let mut seen: Vec<&String> = Vec::new();
+        for package in &self.source_packages {
+            if !valid_obs_name(package) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name for source package: {package:?}"),
+                ));
+            }
+            if seen.contains(&package) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("a maintenance incident lists source package {package:?} twice"),
+                ));
+            }
+            seen.push(package);
+        }
+        if !valid_obs_name(&self.target_project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "invalid OBS project name for target project: {:?}",
+                    self.target_project
+                ),
+            ));
+        }
+        if let Some(release_project) = &self.target_releaseproject {
+            if !valid_obs_name(release_project) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS project name for release project: {release_project:?}"),
+                ));
+            }
+        }
+        if self.description.trim().is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "maintenance incident description must not be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Render the OBS request XML for this payload: one
+    /// `maintenance_incident` action per source package, each with
+    /// its source and the shared target (plus the release project,
+    /// when set), and an `<options>` block only when cleanup is
+    /// opted in. All text is XML-escaped.
+    pub fn to_xml(&self) -> String {
+        let mut actions = String::new();
+        for package in &self.source_packages {
+            actions.push_str("  <action type=\"maintenance_incident\">\n");
+            actions.push_str(&format!(
+                "    <source project=\"{}\" package=\"{}\" />\n",
+                xml_escape(&self.source_project),
+                xml_escape(package),
+            ));
+            actions.push_str(&format!(
+                "    <target project=\"{}\"{} />\n",
+                xml_escape(&self.target_project),
+                match &self.target_releaseproject {
+                    Some(release_project) =>
+                        format!(" releaseproject=\"{}\"", xml_escape(release_project)),
+                    None => String::new(),
+                },
+            ));
+            if let Some(source_update) = self.source_update {
+                actions.push_str(&format!(
+                    "    <options><sourceupdate>{}</sourceupdate></options>\n",
+                    source_update.as_str(),
+                ));
+            }
+            actions.push_str("  </action>\n");
+        }
+        format!(
+            "<request>\n{actions}  <description>{}</description>\n</request>",
+            xml_escape(&self.description),
+        )
+    }
+
+    /// Verify the rendered XML is well-formed and carries exactly
+    /// one `maintenance_incident` action per source package, each
+    /// with its source and target, plus the description — and a
+    /// `<sourceupdate>` in every action exactly when cleanup is
+    /// opted in, with a value the server accepts.
+    pub fn validate_xml(&self) -> Result<(), GeectlError> {
+        let xml = self.to_xml();
+        check_well_formed(
+            &xml,
+            &[
+                "request/action",
+                "request/action/source",
+                "request/action/target",
+                "request/description",
+            ],
+        )?;
+        let types = action_types(&xml)?;
+        if types.len() != self.source_packages.len()
+            || types.iter().any(|t| t != "maintenance_incident")
+        {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "malformed maintenance incident XML: expected {} maintenance_incident action(s), found {} action(s) of type(s) {types:?}",
+                    self.source_packages.len(),
+                    types.len(),
+                ),
+            ));
+        }
+        let expected = if self.source_update.is_some() {
+            self.source_packages.len()
+        } else {
+            0
+        };
+        if xml.matches("<sourceupdate>cleanup</sourceupdate>").count() != expected
+            || xml.matches("<sourceupdate>").count() != expected
+        {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "malformed maintenance incident XML: <sourceupdate> does not match the opted-in cleanup",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The validated change-devel payload: which package's devel
+/// project changes, and to what.
+///
+/// The source is the NEW devel (project + package); the target is
+/// the package whose devel definition changes. On accept the server
+/// points the target package's devel at the source. No options are
+/// ever sent: the server forbids `sourceupdate`, `source_rev`,
+/// `target_releaseproject`, and `target_repository` on this action
+/// type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeDevelPayload {
+    /// The project holding the new devel package.
+    source_project: String,
+    /// The new devel package.
+    source_package: String,
+    /// The project holding the package whose devel changes.
+    target_project: String,
+    /// The package whose devel changes.
+    target_package: String,
+    /// The request description text.
+    description: String,
+}
+
+impl ChangeDevelPayload {
+    /// Build and validate a payload. Every name must be a valid OBS
+    /// project/package name and the description must be non-empty.
+    pub fn new(
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+        description: &str,
+    ) -> Result<Self, GeectlError> {
+        let payload = ChangeDevelPayload {
+            source_project: source_project.to_string(),
+            source_package: source_package.to_string(),
+            target_project: target_project.to_string(),
+            target_package: target_package.to_string(),
+            description: description.to_string(),
+        };
+        payload.validate_semantics()?;
+        payload.validate_xml()?;
+        Ok(payload)
+    }
+
+    /// The project holding the new devel package.
+    pub fn source_project(&self) -> &str {
+        &self.source_project
+    }
+
+    /// The new devel package.
+    pub fn source_package(&self) -> &str {
+        &self.source_package
+    }
+
+    /// The project holding the package whose devel changes.
+    pub fn target_project(&self) -> &str {
+        &self.target_project
+    }
+
+    /// The package whose devel changes.
+    pub fn target_package(&self) -> &str {
+        &self.target_package
+    }
+
+    /// The request description text.
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// The semantic checks [`ChangeDevelPayload::new`] runs: every
+    /// name must be a valid OBS project/package name and the
+    /// description must be non-empty.
+    pub fn validate_semantics(&self) -> Result<(), GeectlError> {
+        for (label, value) in [
+            ("source project", self.source_project.as_str()),
+            ("target project", self.target_project.as_str()),
+        ] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS project name for {label}: {value:?}"),
+                ));
+            }
+        }
+        for (label, value) in [
+            ("source package", self.source_package.as_str()),
+            ("target package", self.target_package.as_str()),
+        ] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name for {label}: {value:?}"),
+                ));
+            }
+        }
+        if self.description.trim().is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "change-devel description must not be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Render the OBS request XML for this payload: one
+    /// `change_devel` action with its source and target. All text
+    /// is XML-escaped. No `<options>`: the server forbids them here.
+    pub fn to_xml(&self) -> String {
+        format!(
+            "<request>\n  <action type=\"change_devel\">\n    <source project=\"{}\" package=\"{}\" />\n    <target project=\"{}\" package=\"{}\" />\n  </action>\n  <description>{}</description>\n</request>",
+            xml_escape(&self.source_project),
+            xml_escape(&self.source_package),
+            xml_escape(&self.target_project),
+            xml_escape(&self.target_package),
+            xml_escape(&self.description),
+        )
+    }
+
+    /// Verify the rendered XML is well-formed and carries exactly
+    /// one `change_devel` action with its source and target, plus
+    /// the description — and no `<options>` block.
+    pub fn validate_xml(&self) -> Result<(), GeectlError> {
+        let xml = self.to_xml();
+        check_well_formed(
+            &xml,
+            &[
+                "request/action",
+                "request/action/source",
+                "request/action/target",
+                "request/description",
+            ],
+        )?;
+        if action_types(&xml)? != ["change_devel"] {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "malformed change-devel XML: expected exactly one change_devel action",
+            ));
+        }
+        if xml.contains("<options>") {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "malformed change-devel XML: <options> is forbidden on this action type",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What a delete request targets: one package, one repository, or
+/// the whole project. The server forbids a target package and a
+/// target repository together, so the shape is an enum, not two
+/// optional fields — the forbidden combination is unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteTarget {
+    /// Delete one package from the target project.
+    Package(String),
+    /// Delete one repository from the target project.
+    Repository(String),
+    /// Delete the whole target project.
+    WholeProject,
+}
+
+/// The validated delete-request payload: what gets deleted, and
+/// what the request says.
+///
+/// The target project is always required; the target (package,
+/// repository, or whole project) comes from [`DeleteTarget`]. On
+/// accept the server deletes exactly that — a package, a repository,
+/// or the project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletePayload {
+    /// The project the deletion targets.
+    target_project: String,
+    /// What inside it gets deleted.
+    target: DeleteTarget,
+    /// The request description text.
+    description: String,
+}
+
+impl DeletePayload {
+    /// Build and validate a payload. The target project and (for a
+    /// package or repository target) the target name must be valid
+    /// OBS names, and the description must be non-empty.
+    pub fn new(
+        target_project: &str,
+        target: DeleteTarget,
+        description: &str,
+    ) -> Result<Self, GeectlError> {
+        let payload = DeletePayload {
+            target_project: target_project.to_string(),
+            target,
+            description: description.to_string(),
+        };
+        payload.validate_semantics()?;
+        payload.validate_xml()?;
+        Ok(payload)
+    }
+
+    /// The project the deletion targets.
+    pub fn target_project(&self) -> &str {
+        &self.target_project
+    }
+
+    /// What inside it gets deleted.
+    pub fn target(&self) -> &DeleteTarget {
+        &self.target
+    }
+
+    /// The request description text.
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// The semantic checks [`DeletePayload::new`] runs: the target
+    /// project and the target name (when there is one) must be valid
+    /// OBS names, and the description must be non-empty.
+    pub fn validate_semantics(&self) -> Result<(), GeectlError> {
+        if !valid_obs_name(&self.target_project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "invalid OBS project name for target project: {:?}",
+                    self.target_project
+                ),
+            ));
+        }
+        match &self.target {
+            DeleteTarget::Package(package) => {
+                if !valid_obs_name(package) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid OBS package name for target package: {package:?}"),
+                    ));
+                }
+            }
+            DeleteTarget::Repository(repository) => {
+                if !valid_obs_name(repository) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "invalid OBS repository name for target repository: {repository:?}"
+                        ),
+                    ));
+                }
+            }
+            DeleteTarget::WholeProject => {}
+        }
+        if self.description.trim().is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "delete description must not be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Render the OBS request XML for this payload: one `delete`
+    /// action with its target (package, repository, or neither for
+    /// a whole-project delete). All text is XML-escaped.
+    pub fn to_xml(&self) -> String {
+        let target_attrs = match &self.target {
+            DeleteTarget::Package(package) => {
+                format!(" package=\"{}\"", xml_escape(package))
+            }
+            DeleteTarget::Repository(repository) => {
+                format!(" repository=\"{}\"", xml_escape(repository))
+            }
+            DeleteTarget::WholeProject => String::new(),
+        };
+        format!(
+            "<request>\n  <action type=\"delete\">\n    <target project=\"{}\"{} />\n  </action>\n  <description>{}</description>\n</request>",
+            xml_escape(&self.target_project),
+            target_attrs,
+            xml_escape(&self.description),
+        )
+    }
+
+    /// Verify the rendered XML is well-formed and carries exactly
+    /// one `delete` action with its target, plus the description.
+    pub fn validate_xml(&self) -> Result<(), GeectlError> {
+        let xml = self.to_xml();
+        check_well_formed(
+            &xml,
+            &[
+                "request/action",
+                "request/action/target",
+                "request/description",
+            ],
+        )?;
+        if action_types(&xml)? != ["delete"] {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "malformed delete XML: expected exactly one delete action",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The `type` attributes of the `<action>` elements in `xml`, in
+/// order. Err when an action tag is unterminated or carries no type
+/// — a generated document is never that shape, so it is malformed,
+/// not skippable. Used by the maintenance payloads' `validate_xml`
+/// to prove the rendered actions are the ones the payload claims.
+fn action_types(xml: &str) -> Result<Vec<String>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "malformed request XML: action element without a type",
+        )
+    };
+    let mut types = Vec::new();
+    let mut rest = xml;
+    while let Some(pos) = rest.find("<action") {
+        let after_tag = &rest[pos + "<action".len()..];
+        let Some(first) = after_tag.chars().next() else {
+            break;
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        let Some(end) = after_tag.find('>') else {
+            return Err(malformed());
+        };
+        let Some(action_type) = action_tag_type(&after_tag[..end]) else {
+            return Err(malformed());
+        };
+        types.push(action_type);
+        rest = &after_tag[end..];
+    }
+    Ok(types)
 }
 
 /// Escape text for an XML element or attribute value.
@@ -7405,10 +8016,13 @@ pub(crate) fn xml_unescape(s: &str) -> String {
 }
 
 /// Check that `xml` is well-formed: every tag is balanced and properly
-/// nested, there is exactly one root element, and it is `request` with
-/// the submit action, source, target, options, and description in the
-/// expected nesting. Returns the first problem found.
-fn check_well_formed(xml: &str) -> Result<(), GeectlError> {
+/// nested, there is exactly one root element, and the element paths in
+/// `required` are all present. Returns the first problem found. The
+/// required paths are the caller's contract — a submit payload needs
+/// its action/source/target/options/sourceupdate/description, a
+/// maintenance incident its own shape — so the balance check is
+/// shared and the structure check is per payload.
+fn check_well_formed(xml: &str, required: &[&str]) -> Result<(), GeectlError> {
     let mut stack: Vec<String> = Vec::new();
     // The element path of each element, for the required-structure check.
     let mut paths: Vec<String> = Vec::new();
@@ -7509,54 +8123,36 @@ fn check_well_formed(xml: &str) -> Result<(), GeectlError> {
             "malformed XML: no root element",
         ));
     }
-    // Required structure: exactly one root `request`, containing an
-    // `action` (which holds `source`, `target`, and `options` with the
-    // source-update value) and a `description`.
+    // Required structure: exactly one root `request`, plus the
+    // element paths the caller requires.
     let has = |path: &str| paths.iter().any(|p| p == path);
     if !has("request") {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "malformed SR XML: root element is not <request>",
+            "malformed request XML: root element is not <request>",
         ));
     }
-    if !has("request/action") {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "malformed SR XML: missing <action> in <request>",
-        ));
-    }
-    if !has("request/action/source") {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "malformed SR XML: missing <source> in <action>",
-        ));
-    }
-    if !has("request/action/target") {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "malformed SR XML: missing <target> in <action>",
-        ));
-    }
-    if !has("request/action/options") {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "malformed SR XML: missing <options> in <action>",
-        ));
-    }
-    if !has("request/action/options/sourceupdate") {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "malformed SR XML: missing <sourceupdate> in <options>",
-        ));
-    }
-    if !has("request/description") {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            "malformed SR XML: missing <description> in <request>",
-        ));
+    for path in required {
+        if !has(path) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("malformed request XML: missing <{path}>"),
+            ));
+        }
     }
     Ok(())
 }
+
+/// The element paths a submit-request payload must carry, for
+/// [`check_well_formed`].
+const SUBMIT_REQUIRED_PATHS: &[&str] = &[
+    "request/action",
+    "request/action/source",
+    "request/action/target",
+    "request/action/options",
+    "request/action/options/sourceupdate",
+    "request/description",
+];
 
 /// Files a submit request through the OBS API, and refiles one over
 /// an existing request.
@@ -10905,29 +11501,231 @@ mod tests {
 
     #[test]
     fn check_well_formed_accepts_generated_xml() {
-        assert!(check_well_formed(&payload().to_xml()).is_ok());
+        assert!(check_well_formed(&payload().to_xml(), SUBMIT_REQUIRED_PATHS).is_ok());
     }
 
     #[test]
     fn check_well_formed_rejects_mismatched_tags() {
-        assert!(check_well_formed("<request><action></request>").is_err());
-        assert!(check_well_formed("<request><action>").is_err());
-        assert!(check_well_formed("<request></request><request></request>").is_err());
-        assert!(check_well_formed("").is_err());
+        assert!(check_well_formed("<request><action></request>", SUBMIT_REQUIRED_PATHS).is_err());
+        assert!(check_well_formed("<request><action>", SUBMIT_REQUIRED_PATHS).is_err());
+        assert!(check_well_formed(
+            "<request></request><request></request>",
+            SUBMIT_REQUIRED_PATHS
+        )
+        .is_err());
+        assert!(check_well_formed("", SUBMIT_REQUIRED_PATHS).is_err());
     }
 
     #[test]
     fn check_well_formed_rejects_missing_elements() {
         // Well-formed XML but not an SR: no action/source/target.
-        assert!(check_well_formed("<request><description>x</description></request>").is_err());
         assert!(check_well_formed(
-            "<request><action><source project=\"a\" package=\"b\" /></action></request>"
+            "<request><description>x</description></request>",
+            SUBMIT_REQUIRED_PATHS
+        )
+        .is_err());
+        assert!(check_well_formed(
+            "<request><action><source project=\"a\" package=\"b\" /></action></request>",
+            SUBMIT_REQUIRED_PATHS
         )
         .is_err());
         // Well-formed SR XML, but without the options block: the
         // cleanup attribute is part of the payload now.
         assert!(check_well_formed(
-            "<request><action><source project=\"a\" package=\"b\" /><target project=\"c\" package=\"b\" /></action><description>x</description></request>"
+            "<request><action><source project=\"a\" package=\"b\" /><target project=\"c\" package=\"b\" /></action><description>x</description></request>",
+            SUBMIT_REQUIRED_PATHS
+        )
+        .is_err());
+    }
+
+    // --- Maintenance payloads ---
+
+    fn incident_payload() -> MaintenanceIncidentPayload {
+        MaintenanceIncidentPayload::new(
+            "home:alice:branches:OBS_Maintained:foo",
+            &["foo"],
+            "openSUSE:Maintenance",
+            "Maintenance incident for foo",
+        )
+        .expect("test incident payload")
+    }
+
+    #[test]
+    fn maintenance_incident_to_xml_renders_one_action_per_package() {
+        assert_eq!(
+            incident_payload().to_xml(),
+            "<request>\n  <action type=\"maintenance_incident\">\n    <source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" />\n    <target project=\"openSUSE:Maintenance\" />\n  </action>\n  <description>Maintenance incident for foo</description>\n</request>",
+        );
+    }
+
+    #[test]
+    fn maintenance_incident_to_xml_with_release_project_and_cleanup() {
+        let payload = MaintenanceIncidentPayload::new(
+            "home:alice:branches:OBS_Maintained:foo",
+            &["foo", "bar"],
+            "openSUSE:Maintenance",
+            "Maintenance incident for foo and bar",
+        )
+        .expect("test incident payload")
+        .with_release_project("openSUSE:Leap:15.6:Update")
+        .expect("release project")
+        .with_cleanup()
+        .expect("cleanup");
+        assert_eq!(
+            payload.to_xml(),
+            "<request>\n  <action type=\"maintenance_incident\">\n    <source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo\" />\n    <target project=\"openSUSE:Maintenance\" releaseproject=\"openSUSE:Leap:15.6:Update\" />\n    <options><sourceupdate>cleanup</sourceupdate></options>\n  </action>\n  <action type=\"maintenance_incident\">\n    <source project=\"home:alice:branches:OBS_Maintained:foo\" package=\"bar\" />\n    <target project=\"openSUSE:Maintenance\" releaseproject=\"openSUSE:Leap:15.6:Update\" />\n    <options><sourceupdate>cleanup</sourceupdate></options>\n  </action>\n  <description>Maintenance incident for foo and bar</description>\n</request>",
+        );
+        assert!(payload.validate_xml().is_ok());
+    }
+
+    #[test]
+    fn maintenance_incident_validation_refuses_bad_input() {
+        // No source packages: a project-level incident is out of scope.
+        assert!(MaintenanceIncidentPayload::new(
+            "home:alice:branches:OBS_Maintained:foo",
+            &[],
+            "openSUSE:Maintenance",
+            "Maintenance incident",
+        )
+        .is_err());
+        // Bad names anywhere.
+        assert!(MaintenanceIncidentPayload::new(
+            "home:alice/bad",
+            &["foo"],
+            "openSUSE:Maintenance",
+            "Maintenance incident",
+        )
+        .is_err());
+        assert!(MaintenanceIncidentPayload::new(
+            "home:alice:branches:OBS_Maintained:foo",
+            &["foo/bar"],
+            "openSUSE:Maintenance",
+            "Maintenance incident",
+        )
+        .is_err());
+        assert!(MaintenanceIncidentPayload::new(
+            "home:alice:branches:OBS_Maintained:foo",
+            &["foo"],
+            "openSUSE:Maintenance?",
+            "Maintenance incident",
+        )
+        .is_err());
+        // Empty description.
+        assert!(MaintenanceIncidentPayload::new(
+            "home:alice:branches:OBS_Maintained:foo",
+            &["foo"],
+            "openSUSE:Maintenance",
+            "   ",
+        )
+        .is_err());
+        // Bad release project.
+        assert!(incident_payload()
+            .with_release_project("openSUSE:Leap/15.6")
+            .is_err());
+    }
+
+    #[test]
+    fn maintenance_incident_validation_refuses_duplicate_source_packages() {
+        // Two identical actions would render, which the server refuses
+        // (`ConflictingActions` on the incident `uniq_key`).
+        assert!(MaintenanceIncidentPayload::new(
+            "home:alice:branches:OBS_Maintained:foo",
+            &["foo", "foo"],
+            "openSUSE:Maintenance",
+            "Maintenance incident",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn maintenance_incident_xml_escapes_description() {
+        let payload = MaintenanceIncidentPayload::new(
+            "home:alice:branches:OBS_Maintained:foo",
+            &["foo"],
+            "openSUSE:Maintenance",
+            "Fix foo & bar <baz>",
+        )
+        .expect("test incident payload");
+        assert!(payload.to_xml().contains("Fix foo &amp; bar &lt;baz&gt;"));
+        assert!(payload.validate_xml().is_ok());
+    }
+
+    #[test]
+    fn change_devel_to_xml_and_validation() {
+        let payload = ChangeDevelPayload::new(
+            "devel:languages:python",
+            "python-foo",
+            "openSUSE:Factory",
+            "python-foo",
+            "Change the devel project for python-foo",
+        )
+        .expect("test change-devel payload");
+        assert_eq!(
+            payload.to_xml(),
+            "<request>\n  <action type=\"change_devel\">\n    <source project=\"devel:languages:python\" package=\"python-foo\" />\n    <target project=\"openSUSE:Factory\" package=\"python-foo\" />\n  </action>\n  <description>Change the devel project for python-foo</description>\n</request>",
+        );
+        assert!(payload.validate_xml().is_ok());
+        assert!(ChangeDevelPayload::new(
+            "devel:languages:python",
+            "python-foo",
+            "openSUSE:Factory",
+            "python-foo?",
+            "Change the devel project",
+        )
+        .is_err());
+        assert!(ChangeDevelPayload::new(
+            "devel:languages:python",
+            "python-foo",
+            "openSUSE:Factory",
+            "python-foo",
+            "",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn delete_to_xml_and_validation() {
+        let package = DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::Package("foo".to_string()),
+            "Drop foo",
+        )
+        .expect("test delete payload");
+        assert_eq!(
+            package.to_xml(),
+            "<request>\n  <action type=\"delete\">\n    <target project=\"openSUSE:Factory\" package=\"foo\" />\n  </action>\n  <description>Drop foo</description>\n</request>",
+        );
+        assert!(package.validate_xml().is_ok());
+        let repository = DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::Repository("standard".to_string()),
+            "Drop the standard repository",
+        )
+        .expect("test delete payload");
+        assert!(repository
+            .to_xml()
+            .contains("<target project=\"openSUSE:Factory\" repository=\"standard\" />"));
+        assert!(repository.validate_xml().is_ok());
+        let project = DeletePayload::new(
+            "home:alice:branches:foo",
+            DeleteTarget::WholeProject,
+            "Drop the branch project",
+        )
+        .expect("test delete payload");
+        assert!(project
+            .to_xml()
+            .contains("<target project=\"home:alice:branches:foo\" />"));
+        assert!(project.validate_xml().is_ok());
+        assert!(DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::Package("foo/bar".to_string()),
+            "Drop foo",
+        )
+        .is_err());
+        assert!(DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::Package("foo".to_string()),
+            "   ",
         )
         .is_err());
     }
