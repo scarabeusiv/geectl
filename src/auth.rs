@@ -343,13 +343,34 @@ pub fn resolve_obs_basic(
     vars: VarLookup<'_>,
     read_file: FileReader<'_>,
 ) -> Result<Credentials, GeectlError> {
-    let username = vars(OBS_USERNAME_VAR);
-    let password = vars(OBS_PASSWORD_VAR);
-    let password_file = vars(OBS_PASSWORD_FILE_VAR);
+    resolve_obs_basic_with(
+        OBS_USERNAME_VAR,
+        OBS_PASSWORD_VAR,
+        OBS_PASSWORD_FILE_VAR,
+        vars,
+        read_file,
+    )
+}
+
+/// The same resolution as [`resolve_obs_basic`], but from the named
+/// variables: the plain names for the configured instance, the
+/// alias names (`GEECTL_OBS_USERNAME_<ALIAS>` and friends) for one
+/// other instance. The error messages name the variables actually
+/// read, so an alias misconfiguration points at the alias names.
+fn resolve_obs_basic_with(
+    username_var: &str,
+    password_var: &str,
+    password_file_var: &str,
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    let username = vars(username_var);
+    let password = vars(password_var);
+    let password_file = vars(password_file_var);
     if password.is_some() && password_file.is_some() {
         return Err(GeectlError::new(
             ErrorKind::ConfigError,
-            format!("both {OBS_PASSWORD_VAR} and {OBS_PASSWORD_FILE_VAR} are set; set exactly one"),
+            format!("both {password_var} and {password_file_var} are set; set exactly one"),
         ));
     }
     let password_from_file = password_file.is_some();
@@ -368,11 +389,11 @@ pub fn resolve_obs_basic(
             // variable (or to the file variable when it came from
             // the environment, and vice versa).
             let username = validate_basic_username(&username)
-                .map_err(|e| config_error(OBS_USERNAME_VAR, e))?;
+                .map_err(|e| config_error(username_var, e))?;
             let password_source = if password_from_file {
-                OBS_PASSWORD_FILE_VAR
+                password_file_var
             } else {
-                OBS_PASSWORD_VAR
+                password_var
             };
             let password = validate_basic_password(&password)
                 .map_err(|e| config_error(password_source, e))?;
@@ -381,14 +402,238 @@ pub fn resolve_obs_basic(
         (Some(_), None) => Err(GeectlError::new(
             ErrorKind::ConfigError,
             format!(
-                "{OBS_USERNAME_VAR} is set but no password source is ({OBS_PASSWORD_VAR} or {OBS_PASSWORD_FILE_VAR})"
+                "{username_var} is set but no password source is ({password_var} or {password_file_var})"
             ),
         )),
         (None, Some(_)) => Err(GeectlError::new(
             ErrorKind::ConfigError,
             format!(
-                "a password source is set ({OBS_PASSWORD_VAR} or {OBS_PASSWORD_FILE_VAR}) but {OBS_USERNAME_VAR} is not"
+                "a password source is set ({password_var} or {password_file_var}) but {username_var} is not"
             ),
+        )),
+    }
+}
+
+/// Split an API base URL into (scheme, host, explicit port): the
+/// scheme and host lowercased, the port the explicit one when the URL
+/// carries one. `http` and `https` only; a missing scheme, a missing
+/// host, userinfo (`@` in the authority — a credential in the URL),
+/// and a malformed port are `InvalidInput` naming the URL. IPv6 hosts
+/// arrive without their brackets.
+fn split_api_url(url: &str) -> Result<(String, String, Option<u16>), GeectlError> {
+    let invalid = |what: &str| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid API URL {url:?}: {what}"),
+        )
+    };
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| invalid("expected scheme://host"))?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(invalid("scheme must be http or https"));
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(invalid("must have a host"));
+    }
+    if authority.contains('@') {
+        // The URL is not echoed here: the authority before the `@`
+        // is a credential, and the error must never carry one.
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "invalid API URL: must not contain userinfo ('@')".to_string(),
+        ));
+    }
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, rest) = bracketed
+            .split_once(']')
+            .ok_or_else(|| invalid("unclosed IPv6 bracket"))?;
+        let port = match rest.strip_prefix(':') {
+            Some(port) => Some(parse_port(port).map_err(|_| invalid("invalid port"))?),
+            None if rest.is_empty() => None,
+            None => return Err(invalid("unexpected text after IPv6 host")),
+        };
+        (host.to_string(), port)
+    } else {
+        let parts: Vec<&str> = authority.split(':').collect();
+        match parts.as_slice() {
+            [host] => (host.to_string(), None),
+            [host, port] => (
+                host.to_string(),
+                Some(parse_port(port).map_err(|_| invalid("invalid port"))?),
+            ),
+            _ => return Err(invalid("too many ':' in authority")),
+        }
+    };
+    if host.is_empty() {
+        return Err(invalid("must have a host"));
+    }
+    Ok((scheme, host.to_ascii_lowercase(), port))
+}
+
+/// Parse a port from an authority: digits only, 1-65535. Zero is not
+/// a port a server listens on, and a non-numeric value is a typo.
+fn parse_port(text: &str) -> Result<u16, ()> {
+    if text.is_empty() || !text.chars().all(|c| c.is_ascii_digit()) {
+        return Err(());
+    }
+    match text.parse::<u16>() {
+        Ok(0) | Err(_) => Err(()),
+        Ok(port) => Ok(port),
+    }
+}
+
+/// The effective port of a split URL: the explicit one, else the
+/// scheme default (443 for https, 80 for http).
+fn effective_port(scheme: &str, port: Option<u16>) -> u16 {
+    port.unwrap_or(if scheme == "https" { 443 } else { 80 })
+}
+
+/// True when two API base URLs name the same instance: same scheme,
+/// same host (case-insensitive), same effective port. The spelling
+/// does not matter — `https://api.opensuse.org` and
+/// `https://api.opensuse.org:443` are the same instance, as are
+/// `https://API.OPENSUSE.ORG` and the lowercase form.
+pub fn same_api_url(a: &str, b: &str) -> Result<bool, GeectlError> {
+    let (scheme_a, host_a, port_a) = split_api_url(a)?;
+    let (scheme_b, host_b, port_b) = split_api_url(b)?;
+    Ok(scheme_a == scheme_b
+        && host_a == host_b
+        && effective_port(&scheme_a, port_a) == effective_port(&scheme_b, port_b))
+}
+
+/// The alias whose configured URL matches `url` under
+/// [`same_api_url`] — the first match in alias order — or `None`
+/// when no alias names this URL. The alias is returned as written
+/// in the config; the env-var names derive from its uppercased
+/// form (see [`obs_alias_vars`]).
+pub fn alias_for_url<'a>(
+    url: &str,
+    instances: &'a [(String, String)],
+) -> Result<Option<&'a str>, GeectlError> {
+    for (alias, instance_url) in instances {
+        if same_api_url(url, instance_url)? {
+            return Ok(Some(alias.as_str()));
+        }
+    }
+    Ok(None)
+}
+
+/// The credential variable names for one instance alias: the alias
+/// as written in the config, uppercased (env vars are conventionally
+/// uppercase). The API-key pattern (`GEECTL_OBS_APIKEY_<ALIAS>`) is
+/// reserved for the future API-key credential; it is named here so
+/// the pattern extends cleanly, not implemented.
+pub fn obs_alias_vars(alias: &str) -> (String, String, String) {
+    let upper = alias.to_ascii_uppercase();
+    (
+        format!("{OBS_USERNAME_VAR}_{upper}"),
+        format!("{OBS_PASSWORD_VAR}_{upper}"),
+        format!("{OBS_PASSWORD_FILE_VAR}_{upper}"),
+    )
+}
+
+/// Resolve OBS Basic credentials for one API URL.
+///
+/// Precedence, in order:
+/// 1. The matching alias's variables (`GEECTL_OBS_USERNAME_<ALIAS>`
+///    / `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>`, with `<ALIAS>` the
+///    alias as written in the config file's `[instances]` table,
+///    uppercased) win when any of them is set — resolved strictly
+///    from that set, with the same rules as [`resolve_obs_basic`].
+///    The alias is the one whose configured URL matches this URL
+///    under [`same_api_url`].
+/// 2. Otherwise the plain variables apply when the URL is the
+///    configured default (`default_url`, compared with
+///    [`same_api_url`]): one configured URL works exactly as before.
+/// 3. Otherwise — a different URL, credentials configured for the
+///    default, none for this URL — a `ConfigError` naming what to
+///    set: the alias variables when an alias matches this URL, or
+///    the `[instances]` entry to add when none does. The default's
+///    credentials are never forwarded to another instance.
+///
+/// When nothing is configured at all the result is [`Credentials::None`]:
+/// public reads and dry runs need no credentials.
+pub fn resolve_obs_basic_for_url(
+    url: &str,
+    default_url: &str,
+    instances: &[(String, String)],
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    if let Some(alias) = alias_for_url(url, instances)? {
+        let (username_var, password_var, password_file_var) = obs_alias_vars(alias);
+        let alias_set = vars(&username_var).is_some()
+            || vars(&password_var).is_some()
+            || vars(&password_file_var).is_some();
+        if alias_set {
+            return resolve_obs_basic_with(
+                &username_var,
+                &password_var,
+                &password_file_var,
+                vars,
+                read_file,
+            );
+        }
+        // No alias variables set: the URL may still be the
+        // configured default, which takes the plain variables.
+        if same_api_url(url, default_url)? {
+            return resolve_obs_basic(vars, read_file);
+        }
+        return resolve_unmatched_url(
+            url,
+            &format!(
+                "instance alias '{alias}' matches this URL — set {username_var} and {password_var} (or {password_file_var})"
+            ),
+            vars,
+            read_file,
+        );
+    }
+    if same_api_url(url, default_url)? {
+        return resolve_obs_basic(vars, read_file);
+    }
+    // The example is rendered by the TOML serializer, not
+    // `Debug`: `Debug` renders control characters as `\u{...}`,
+    // which TOML rejects, so the copied example would not parse.
+    let example = toml::Value::String(url.to_string());
+    resolve_unmatched_url(
+        url,
+        &format!(
+            "no instance alias matches it; add an [instances] entry for it in the config file (e.g. [instances] myinstance = {example}) and set GEECTL_OBS_USERNAME_<ALIAS> and GEECTL_OBS_PASSWORD[_FILE]_<ALIAS> for that alias"
+        ),
+        vars,
+        read_file,
+    )
+}
+
+/// The fallback when neither alias nor plain variables apply to
+/// this URL: `None` when nothing is configured at all, else a
+/// `ConfigError` naming what to set (`guidance` — the alias
+/// variables when an alias matches, the `[instances]` entry to add
+/// when none does). The plain pair, when configured, belongs to
+/// the default instance and is never forwarded.
+fn resolve_unmatched_url(
+    url: &str,
+    guidance: &str,
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    match resolve_obs_basic(vars, read_file) {
+        Ok(Credentials::None) => Ok(Credentials::None),
+        Ok(_) => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "no credentials configured for {url}; {guidance} — the credentials configured for the default instance are never forwarded to another instance"
+            ),
+        )),
+        // A half-configured plain pair errors about the plain
+        // variables — but for a different URL those are not the ones
+        // to fix, so the error carries the guidance too.
+        Err(err) => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{} — for {url}, {guidance}", err.context),
         )),
     }
 }
@@ -550,6 +795,41 @@ impl AuthProvider for EnvObsAuth {
     }
 }
 
+impl EnvObsAuth {
+    /// OBS Basic credentials for one API URL from the process
+    /// environment. See [`resolve_obs_basic_for_url`] for the
+    /// precedence and the fail-clear rule. `instances` is the
+    /// config file's `[instances]` table: the alias variables for
+    /// the matching alias are snapshotted alongside the plain ones,
+    /// so resolution sees one consistent view of the environment.
+    pub fn credentials_for_url(
+        url: &str,
+        default_url: &str,
+        instances: &[(String, String)],
+    ) -> Result<Credentials, GeectlError> {
+        let mut names: Vec<String> = vec![
+            OBS_USERNAME_VAR.to_string(),
+            OBS_PASSWORD_VAR.to_string(),
+            OBS_PASSWORD_FILE_VAR.to_string(),
+        ];
+        if let Some(alias) = alias_for_url(url, instances)? {
+            let (username_var, password_var, password_file_var) = obs_alias_vars(alias);
+            names.push(username_var);
+            names.push(password_var);
+            names.push(password_file_var);
+        }
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let env = snapshot_env(&refs)?;
+        resolve_obs_basic_for_url(
+            url,
+            default_url,
+            instances,
+            &|name| env.get(name).cloned(),
+            &read_secret_file_production,
+        )
+    }
+}
+
 /// Gitea Bearer auth from the process environment. See
 /// [`resolve_gitea_bearer`].
 pub struct EnvGiteaAuth;
@@ -665,6 +945,13 @@ mod tests {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn instances(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(alias, url)| (alias.to_string(), url.to_string()))
             .collect()
     }
 
@@ -1106,8 +1393,360 @@ mod tests {
             .status()
             .expect("mkfifo must be available to create the test FIFO");
         assert!(status.success(), "mkfifo must create the test FIFO");
+
         let err = open_secret_file_production(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn same_api_url_rejects_malformed_urls() {
+        for bad in [
+            "notaurl",
+            "ftp://api.opensuse.org",
+            "https://",
+            "https://user:secret@api.opensuse.org",
+            "https://api.opensuse.org:0",
+            "https://api.opensuse.org:notaport",
+            "https://[::1",
+        ] {
+            let err = same_api_url(bad, "https://api.opensuse.org").unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{bad}");
+            assert!(!err.context.contains("secret"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn alias_for_url_matches_under_same_api_url() {
+        let table = instances(&[("example", "https://api.example.org")]);
+        // The spelling does not matter: the default port and the
+        // case of the host are the same instance.
+        assert_eq!(
+            alias_for_url("https://api.example.org:443", &table).unwrap(),
+            Some("example")
+        );
+        assert_eq!(
+            alias_for_url("https://API.EXAMPLE.ORG", &table).unwrap(),
+            Some("example")
+        );
+        // A different scheme or host is a different instance.
+        assert_eq!(
+            alias_for_url("http://api.example.org", &table).unwrap(),
+            None
+        );
+        assert_eq!(
+            alias_for_url("https://build.opensuse.org", &table).unwrap(),
+            None
+        );
+        // Two aliases for one URL: the first in alias order wins.
+        let table = instances(&[
+            ("alpha", "https://api.example.org"),
+            ("beta", "https://api.example.org"),
+        ]);
+        assert_eq!(
+            alias_for_url("https://api.example.org", &table).unwrap(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn obs_alias_vars_uppercase_the_alias_as_written() {
+        assert_eq!(
+            obs_alias_vars("MyInstance"),
+            (
+                "GEECTL_OBS_USERNAME_MYINSTANCE".to_string(),
+                "GEECTL_OBS_PASSWORD_MYINSTANCE".to_string(),
+                "GEECTL_OBS_PASSWORD_FILE_MYINSTANCE".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn alias_vars_win_over_plain_vars_for_their_url() {
+        let map = vars(&[
+            (OBS_USERNAME_VAR, "plain-user"),
+            (OBS_PASSWORD_VAR, "plain-secret"),
+            ("GEECTL_OBS_USERNAME_EXAMPLE", "target-user"),
+            ("GEECTL_OBS_PASSWORD_EXAMPLE", "target-secret"),
+        ]);
+        let creds = resolve_obs_basic_for_url(
+            "https://api.example.org",
+            "https://api.opensuse.org",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(
+            matches!(creds, Credentials::Basic { ref username, ref password }
+            if username == "target-user" && password == "target-secret")
+        );
+    }
+
+    #[test]
+    fn default_url_falls_back_to_plain_vars() {
+        let map = vars(&[
+            (OBS_USERNAME_VAR, "plain-user"),
+            (OBS_PASSWORD_VAR, "plain-secret"),
+        ]);
+        let creds = resolve_obs_basic_for_url(
+            "https://api.opensuse.org",
+            "https://api.opensuse.org",
+            &instances(&[]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(
+            matches!(creds, Credentials::Basic { ref username, ref password }
+            if username == "plain-user" && password == "plain-secret")
+        );
+        // The same instance spelled with its default port still
+        // takes the plain variables.
+        let creds = resolve_obs_basic_for_url(
+            "https://api.opensuse.org:443",
+            "https://api.opensuse.org",
+            &instances(&[]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::Basic { .. }));
+    }
+
+    #[test]
+    fn alias_defined_but_unset_with_plain_vars_configured_names_the_alias_vars() {
+        let map = vars(&[
+            (OBS_USERNAME_VAR, "plain-user"),
+            (OBS_PASSWORD_VAR, "plain-secret"),
+        ]);
+        let err = resolve_obs_basic_for_url(
+            "https://api.example.org",
+            "https://api.opensuse.org",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("GEECTL_OBS_USERNAME_EXAMPLE"),
+            "alias username var name missing from the error"
+        );
+        assert!(
+            err.context.contains("GEECTL_OBS_PASSWORD_EXAMPLE"),
+            "alias password var name missing from the error"
+        );
+        // The default's credentials never leak into the message.
+        assert!(!err.context.contains("plain-user"));
+        assert!(!err.context.contains("plain-secret"));
+    }
+
+    #[test]
+    fn other_url_with_no_alias_names_the_instances_entry() {
+        let map = vars(&[
+            (OBS_USERNAME_VAR, "plain-user"),
+            (OBS_PASSWORD_VAR, "plain-secret"),
+        ]);
+        let err = resolve_obs_basic_for_url(
+            "https://api.example.org",
+            "https://api.opensuse.org",
+            &instances(&[]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("[instances]"),
+            "instances entry missing from the error"
+        );
+        assert!(
+            err.context.contains("https://api.example.org"),
+            "URL missing from the error"
+        );
+        assert!(!err.context.contains("plain-user"));
+        assert!(!err.context.contains("plain-secret"));
+    }
+
+    #[test]
+    fn no_alias_guidance_quotes_the_url_for_toml() {
+        // A quote in the URL must not break the TOML example in
+        // the error: the TOML serializer renders it as a literal
+        // string, so the quote needs no escape and the line stays
+        // one valid TOML assignment.
+        let map = vars(&[
+            (OBS_USERNAME_VAR, "plain-user"),
+            (OBS_PASSWORD_VAR, "plain-secret"),
+        ]);
+        let err = resolve_obs_basic_for_url(
+            "http://127.0.0.1\"x:3000",
+            "https://api.opensuse.org",
+            &instances(&[]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        // The TOML serializer renders a string containing a
+        // quote as a literal string ('...'), not a basic string
+        // with an escape — still valid TOML (see
+        // no_alias_guidance_example_is_valid_toml).
+        assert!(
+            err.context
+                .contains("myinstance = 'http://127.0.0.1\"x:3000'"),
+            "TOML example did not use the expected literal-string rendering: {}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn no_alias_guidance_example_is_valid_toml() {
+        // The example must parse as TOML and round-trip the URL —
+        // including a control character, which `Debug` would render
+        // as `\u{...}` (not valid TOML), and a quote, which the
+        // serializer renders as a literal string.
+        for url in ["http://127.0.0.1\u{1}x:3000", "http://127.0.0.1\"x:3000"] {
+            let map = vars(&[
+                (OBS_USERNAME_VAR, "plain-user"),
+                (OBS_PASSWORD_VAR, "plain-secret"),
+            ]);
+            let err = resolve_obs_basic_for_url(
+                url,
+                "https://api.opensuse.org",
+                &instances(&[]),
+                &lookup(&map),
+                &reader(&empty_files()),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError);
+            let example = err
+                .context
+                .split("myinstance = ")
+                .nth(1)
+                .expect("guidance example missing")
+                .split(") and set")
+                .next()
+                .expect("guidance example unterminated");
+            let doc = format!("[instances]\nmyinstance = {example}\n");
+            let value: toml::Value = toml::from_str(&doc).expect("example must parse as TOML");
+            assert_eq!(value["instances"]["myinstance"].as_str(), Some(url));
+        }
+    }
+
+    #[test]
+    fn other_url_with_nothing_configured_is_none() {
+        let map = vars(&[]);
+        let creds = resolve_obs_basic_for_url(
+            "https://api.example.org",
+            "https://api.opensuse.org",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::None));
+    }
+
+    #[test]
+    fn alias_half_configured_is_config_error_naming_the_alias_var() {
+        let map = vars(&[("GEECTL_OBS_USERNAME_EXAMPLE", "target-user")]);
+        let err = resolve_obs_basic_for_url(
+            "https://api.example.org",
+            "https://api.opensuse.org",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("GEECTL_OBS_USERNAME_EXAMPLE"),
+            "alias username var name missing from the error"
+        );
+    }
+
+    #[test]
+    fn different_url_half_configured_plain_pair_names_the_alias_vars() {
+        let map = vars(&[(OBS_USERNAME_VAR, "plain-user")]);
+        let err = resolve_obs_basic_for_url(
+            "https://api.example.org",
+            "https://api.opensuse.org",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("GEECTL_OBS_USERNAME_EXAMPLE"),
+            "alias username var name missing from the error"
+        );
+        assert!(
+            err.context.contains("GEECTL_OBS_PASSWORD_EXAMPLE"),
+            "alias password var name missing from the error"
+        );
+    }
+
+    #[test]
+    fn alias_password_file_is_read() {
+        let map = vars(&[
+            ("GEECTL_OBS_USERNAME_TARGET", "admin"),
+            (
+                "GEECTL_OBS_PASSWORD_FILE_TARGET",
+                "/run/secrets/target-password",
+            ),
+        ]);
+        let files = files(&[("/run/secrets/target-password", "target-secret\n")]);
+        let creds = resolve_obs_basic_for_url(
+            "http://127.0.0.1:3001",
+            "http://127.0.0.1:3000",
+            &instances(&[("target", "http://127.0.0.1:3001")]),
+            &lookup(&map),
+            &reader(&files),
+        )
+        .unwrap();
+        assert!(
+            matches!(creds, Credentials::Basic { ref username, ref password }
+            if username == "admin" && password == "target-secret")
+        );
+    }
+
+    #[test]
+    fn ports_distinguish_instances_on_one_host() {
+        // The two live stacks share 127.0.0.1 and differ only by
+        // port: the alias variables for one must not apply to the
+        // other.
+        let table = instances(&[
+            ("live1", "http://127.0.0.1:3000"),
+            ("live2", "http://127.0.0.1:3001"),
+        ]);
+        let map = vars(&[
+            ("GEECTL_OBS_USERNAME_LIVE2", "target-user"),
+            ("GEECTL_OBS_PASSWORD_LIVE2", "target-secret"),
+        ]);
+        // Port 3000 sees none of the 3001 variables.
+        let creds = resolve_obs_basic_for_url(
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:3000",
+            &table,
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::None));
+        // Port 3001 sees its own.
+        let creds = resolve_obs_basic_for_url(
+            "http://127.0.0.1:3001",
+            "http://127.0.0.1:3000",
+            &table,
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(
+            matches!(creds, Credentials::Basic { ref username, ref password }
+            if username == "target-user" && password == "target-secret")
+        );
     }
 }

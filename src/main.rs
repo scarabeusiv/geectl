@@ -6,6 +6,7 @@
 //! every diagnostic, warning, and error goes to stderr. There is exactly
 //! one exit path: the error kind's exit code.
 
+mod cli_branch;
 mod cli_remote;
 mod cli_request;
 
@@ -78,6 +79,13 @@ enum Command {
         #[command(subcommand)]
         command: Box<cli_request::RequestCommand>,
     },
+    /// Branch, copy, and link packages.
+    Branch {
+        #[command(subcommand)]
+        // Boxed: the ten branch subcommands make BranchCommand far
+        // larger than the other variants (clippy::large_enum_variant).
+        command: Box<cli_branch::BranchCommand>,
+    },
 }
 
 /// The `config` subcommands.
@@ -115,6 +123,7 @@ fn run(cli: Cli, debug: &Debug) -> Result<String, GeectlError> {
             }
         },
         Some(Command::Remote { command }) => cli_remote::run_remote(command, debug)?,
+        Some(Command::Branch { command }) => cli_branch::run_branch(*command, debug, cli.live)?,
     };
     Ok(match cli.format {
         Format::Json => payload.to_string(),

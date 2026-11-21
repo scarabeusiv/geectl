@@ -47,6 +47,25 @@ OBS checkout plus the frontend image build take several minutes. Later
 runs reuse both. Set `COMPOSE="podman compose"` if you use podman
 instead of docker.
 
+## Two instances (cross-instance copy)
+
+The cross-instance test (`tests/live_cross_instance.rs`, the proof
+for `branch copy-package --to-apiurl`) needs a second OBS instance.
+Provision it as a second stack — its own compose project, frontend
+port, and OBS checkout — alongside the first:
+
+```sh
+COMPOSE_PROJECT_NAME=geectl-live-2 FRONTEND_PORT=3001 OBS_SOURCE_DIR=tests/live/obs-2 bash tests/live/provision.sh
+GEECTL_LIVE_URL=http://127.0.0.1:3000 GEECTL_LIVE_URL_2=http://127.0.0.1:3001 cargo test --locked --test live_cross_instance
+COMPOSE_PROJECT_NAME=geectl-live-2 OBS_SOURCE_DIR=tests/live/obs-2 bash tests/live/teardown.sh
+```
+
+The second stack's frontend build is a cache hit (the first stack
+already built the image), but its bootstrap runs again against its
+own database. The two stacks share nothing but the host. The second
+checkout exists because the two backends mount the checkout, and
+sharing one between two running backends is unproven.
+
 ## The instance's credentials
 
 The bootstrap seeds the Admin user `Admin` / `opensuse` — the OBS
@@ -72,3 +91,12 @@ bootstrap admin credentials only for the mutation tests. The mutation
 assertion (create a project through geectl, read it back) runs live
 (`live_create_project_shows_up_on_server`); the submit-request
 tests live in `tests/live_obs.rs`.
+
+`tests/live_cross_instance.rs` is env-gated on both `GEECTL_LIVE_URL`
+and `GEECTL_LIVE_URL_2`: without both, it skips. With both, it copies
+a package (text + binary files) from the first instance to the second
+through geectl's own `copy_package_to_instance` and asserts on the
+second instance's server state — same files, same md5s, byte-identical
+reads, carried-over title and description — then copies again (nothing
+to copy: the md5 skip) and copies a link package (expanded, no `_link`
+file on the target).

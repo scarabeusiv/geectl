@@ -1,4 +1,5 @@
 use super::build_url;
+use super::parse_directory;
 use super::parse_directory_rev;
 use super::parse_linkinfo;
 use super::parse_package_names;
@@ -11,11 +12,14 @@ use super::BranchOptions;
 use super::BranchResult;
 use super::CopyOptions;
 use super::CopyProjectOptions;
+use super::CrossInstanceCopyResult;
+use super::DirectoryListing;
 use super::DryRun;
 use super::LinkOptions;
 use super::LinkRevision;
 use super::MaintenanceBranchOptions;
 use super::ObsClient;
+use crate::auth::Credentials;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::xml::xml_escape;
@@ -655,6 +659,324 @@ impl<'a> ObsClient<'a> {
             ),
             dry_run,
         )
+    }
+
+    /// Copy package `source_package` in project `source_project` to
+    /// package `target_package` in project `target_project` on
+    /// ANOTHER OBS instance (`target`): the cross-instance copy
+    /// (`osc copypac --to-apiurl`). A server-side copy cannot span
+    /// instances, so the transfer is client-side: the source's
+    /// expanded file listing is read, each file is downloaded as
+    /// bytes from the source and uploaded to the target. The copy is
+    /// always expanded: a link package copies as its resolved
+    /// files, never as a link — a kept link would point at the
+    /// source instance.
+    ///
+    /// The target client is built by the caller with the target
+    /// instance's base URL and credentials: in v1 the CLI builds it
+    /// with the SAME credentials as the source client, which works
+    /// when the same account exists on both instances; a failure on
+    /// the target names the target instance, so the failure points
+    /// at the account, not the copy. Per-instance target
+    /// credentials are a config-model change, not part of this
+    /// operation.
+    ///
+    /// Server-side copy options have no meaning here and are refused
+    /// with the reason instead of silently dropped: `keep_link` (a
+    /// kept link would point at the source instance), `comment`
+    /// (there is no commit operation to record it on — a
+    /// single-revision commit is a follow-up), `noservice`,
+    /// `dont_update_source`, and `with_vrev` (server-side copy
+    /// parameters). `expand` is accepted and ignored: the copy is
+    /// always expanded. `revision` pins the source revision copied.
+    ///
+    /// A scmsync-managed source is refused: the source's files are
+    /// generated from git, and copying them would freeze a snapshot
+    /// the target can never refresh. The source must be publicly
+    /// readable: its meta, listing, and files are read on the
+    /// public route, so a private source fails closed here.
+    ///
+    /// Files already identical on the target (same name and md5)
+    /// are skipped without a download, so a retry after a partial
+    /// copy is cheap — but a failure mid-copy still leaves a
+    /// partial target behind, exactly like osc: the caller re-runs
+    /// the copy to finish it. `_service:` files (service-generated
+    /// output) are never copied; the `_service` definition itself
+    /// is, so the target's services regenerate them. A `_link` file
+    /// is never copied: the expanded listing carries the resolved
+    /// files instead, and a link file on the target would point at
+    /// the source instance. If the expanded listing carries a
+    /// `_link` entry and nothing else copyable, expansion yielded
+    /// nothing to copy and the copy is refused before the target
+    /// package is created.
+    ///
+    /// Downloads are pinned to the listing's `srcmd5`, so a file
+    /// that changes on the source between the listing and the
+    /// download cannot slip into the copy. A file over the
+    /// transport's body cap fails with the transport error, like any
+    /// other binary download.
+    ///
+    /// Returns the target revision after the copy, and how many
+    /// files were copied and skipped. The revision is None when
+    /// nothing was uploaded: in dry-run, or when every file was
+    /// already identical on the target. The target package is
+    /// created (with the source's title and description) only when
+    /// it does not exist yet; an existing target's meta is never
+    /// overwritten. The target project must already exist.
+    // Eight arguments: `copy_package`'s seven, plus the target
+    // client. A coordinates struct would break the library's
+    // positional convention for exactly this one op.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_package_to_instance(
+        &self,
+        target: &ObsClient,
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+        options: &CopyOptions,
+        dry_run: &DryRun,
+    ) -> Result<CrossInstanceCopyResult, GeectlError> {
+        for (label, value) in [
+            ("project", source_project),
+            ("package", source_package),
+            ("project", target_project),
+            ("package", target_package),
+        ] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        // The server-side copy options have no meaning for a
+        // client-side copy: refuse them with the reason instead of
+        // silently dropping a flag the caller explicitly set.
+        if options.keep_link {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "keeping the link across instances would point the target's link at the source instance; copy without --keep-link to copy the expanded files",
+            ));
+        }
+        if options.comment.is_some() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a comment cannot be recorded on a cross-instance copy: there is no commit operation to carry it (a single-revision commit is a follow-up)",
+            ));
+        }
+        if options.noservice {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "noservice is a server-side copy option and has no meaning for a client-side copy; the copied _service file runs on the target",
+            ));
+        }
+        if options.dont_update_source {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "dont-update-source is meaningful only when copying a link onto its target on the same instance",
+            ));
+        }
+        if options.with_vrev {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "with-vrev is a server-side copy option and has no meaning for a client-side copy",
+            ));
+        }
+        // The dry-run guard runs before any server read: a dry-run
+        // copy needs neither credentials nor a server, like every
+        // other dry-run operation. The plan line names both
+        // instances, so the dry-run reads what the copy would span.
+        if !dry_run.allow(&format!(
+            "copy package {source_project}/{source_package} to {target_project}/{target_package} on {}",
+            target.base,
+        )) {
+            return Ok(CrossInstanceCopyResult {
+                revision: None,
+                copied_files: 0,
+                skipped_files: 0,
+            });
+        }
+        if !target.has_basic() {
+            // The plain variables are never forwarded to the target
+            // (see `resolve_obs_basic_for_url`), so the error must
+            // name the alias setup for the target — naming the plain
+            // ones would send the user in a circle: set them, and the
+            // resolver refuses to forward them. The library has no
+            // config file to read the alias from, so it names the
+            // `[instances]` entry to add; the CLI resolver names the
+            // concrete variables once the alias exists.
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "no credentials configured for {}; add an [instances] entry for it in the config file and set GEECTL_OBS_USERNAME_<ALIAS> and GEECTL_OBS_PASSWORD[_FILE]_<ALIAS> for that alias — the source instance's credentials are never forwarded to the target",
+                    target.base,
+                ),
+            ));
+        }
+        // A scmsync-managed source is generated from git: copying
+        // its files would freeze a snapshot the target can never
+        // refresh. Refuse it with the reason, like osc's note-and-
+        // skip — but fail-closed, not silent.
+        let source_meta = self.package_meta(source_project, source_package)?;
+        if source_meta.scmsync.is_some() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot copy {source_project}/{source_package} across instances: it is scmsync-managed (syncs from {})",
+                    source_meta.scmsync.as_deref().unwrap_or(""),
+                ),
+            ));
+        }
+        let listing =
+            self.expanded_source_listing(source_project, source_package, &options.revision)?;
+        // The expanded listing must carry the resolved files: a
+        // `_link` entry with nothing else copyable means expansion
+        // yielded nothing to copy, and copying on would create an empty
+        // target package and report success with nothing copied. A
+        // `_link` entry alongside real files is fine — the link
+        // itself is skipped below while the files copy. Refuse
+        // before the target package is created, instead of leaving
+        // that behind.
+        let has_link = listing.entries.iter().any(|entry| entry.name == "_link");
+        let has_copyable = listing
+            .entries
+            .iter()
+            .any(|entry| entry.name != "_link" && !entry.name.starts_with("_service:"));
+        if has_link && !has_copyable {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot copy {source_project}/{source_package} across instances: the expanded source listing has no copyable files after excluding the `_link` entry and `_service:*` entries, so expansion yielded nothing to copy"
+                ),
+            ));
+        }
+        // The target's files, read on the authenticated route: the
+        // public route cannot see a private target package, and a
+        // package the public route cannot see must not read as
+        // missing — `create_package` would then overwrite its meta.
+        // Only NotFound means "no target package yet"; any other
+        // read error propagates.
+        let target_url = build_url(
+            &target.base,
+            &["source", target_project, target_package],
+            &[],
+        );
+        let (target_files, target_exists) =
+            match target.http.get_with(&target_url, &target.credentials) {
+                Ok(body) => (parse_directory(&body)?.entries, true),
+                Err(err) if err.kind() == ErrorKind::NotFound => (Vec::new(), false),
+                Err(err) => return Err(err),
+            };
+        if !target_exists {
+            target.create_package(
+                target_project,
+                target_package,
+                source_meta.title.as_deref().unwrap_or(""),
+                source_meta.description.as_deref().unwrap_or(""),
+                dry_run,
+            )?;
+        }
+        let mut copied = 0usize;
+        let mut skipped = 0usize;
+        let mut last_revision: Option<u64> = None;
+        for entry in &listing.entries {
+            if entry.name == "_link" {
+                // A link file on the target would point at the
+                // source instance: the expanded listing carries the
+                // resolved files instead, so a _link entry here
+                // means expansion did not happen — skip it rather
+                // than copy a pointer across instances.
+                continue;
+            }
+            if entry.name.starts_with("_service:") {
+                // Service-generated output: never copied. The
+                // _service definition itself is copied, so the
+                // target's services regenerate these.
+                continue;
+            }
+            if let Some(target_md5) = target_files
+                .iter()
+                .find(|file| file.name == entry.name)
+                .and_then(|file| file.md5.as_ref())
+            {
+                if Some(target_md5) == entry.md5.as_ref() {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            let bytes = self.download_source_file(
+                source_project,
+                source_package,
+                &entry.name,
+                listing.srcmd5.as_deref(),
+                &options.revision,
+            )?;
+            let revision = target.upload_file_bytes(
+                target_project,
+                target_package,
+                &entry.name,
+                &bytes,
+                dry_run,
+            )?;
+            if let Some(revision) = revision {
+                last_revision = Some(revision);
+            }
+            copied += 1;
+        }
+        Ok(CrossInstanceCopyResult {
+            revision: last_revision,
+            copied_files: copied,
+            skipped_files: skipped,
+        })
+    }
+
+    /// Read the source package's EXPANDED file listing (`?expand=1`
+    /// on the public route): a link package lists as its resolved
+    /// files, never as a `_link` entry. The requested revision pins
+    /// the listing when set. A public read: the source must be
+    /// publicly readable (see `copy_package_to_instance`).
+    fn expanded_source_listing(
+        &self,
+        project: &str,
+        package: &str,
+        revision: &Option<String>,
+    ) -> Result<DirectoryListing, GeectlError> {
+        let mut query: Vec<(&str, &str)> = vec![("expand", "1")];
+        if let Some(revision) = revision {
+            query.push(("rev", revision.as_str()));
+        }
+        let url = build_url(&self.base, &["public", "source", project, package], &query);
+        let body = self.http.get_with(&url, &Credentials::None)?;
+        parse_directory(&body)
+    }
+
+    /// Download one source file as bytes, pinned to the listing's
+    /// `srcmd5` when the listing carries one: the pin reads exactly
+    /// the files listed, never a newer revision that landed between
+    /// the listing and the download. Without a srcmd5, the requested
+    /// revision (or the latest) is used. A public read, like the
+    /// listing.
+    fn download_source_file(
+        &self,
+        project: &str,
+        package: &str,
+        file: &str,
+        srcmd5: Option<&str>,
+        revision: &Option<String>,
+    ) -> Result<Vec<u8>, GeectlError> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(srcmd5) = srcmd5 {
+            query.push(("rev", srcmd5));
+        } else if let Some(revision) = revision {
+            query.push(("rev", revision.as_str()));
+        }
+        let url = build_url(
+            &self.base,
+            &["public", "source", project, package, file],
+            &query,
+        );
+        self.http.get_bytes(&url, &Credentials::None)
     }
 
     /// Copy project `source_project` to project `target_project` on
@@ -2394,6 +2716,459 @@ mod tests {
                 &DryRun::new(false),
             )
             .is_ok());
+    }
+
+    fn cross_instance_source_http() -> FakeHttp {
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA?expand=1",
+                "<directory name=\"test-pkgA\" rev=\"3\" vrev=\"1\" srcmd5=\"0123456789abcdef0123456789abcdef\"><entry name=\"foo.spec\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" size=\"1234\" mtime=\"1700000000\"/><entry name=\"foo.tar.gz\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"99\" mtime=\"1700000001\"/><entry name=\"_service:foo.tar.gz\" md5=\"cccccccccccccccccccccccccccccccc\" size=\"99\" mtime=\"1700000002\"/></directory>",
+            )
+            .with_get_bytes(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/foo.spec?rev=0123456789abcdef0123456789abcdef",
+                b"Name: foo\nVersion: 1.0\n",
+            )
+            .with_get_bytes(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/foo.tar.gz?rev=0123456789abcdef0123456789abcdef",
+                &[0xED, 0xAB, 0xEE, 0xDB, 0x00, 0x50, 0x4B],
+            )
+    }
+
+    fn cross_instance_target_missing(http: FakeHttp) -> FakeHttp {
+        http.with_get_error(
+            "https://api.example.org/source/test:target/test-pkgA",
+            ErrorKind::NotFound,
+        )
+        .with_put(
+            "https://api.example.org/source/test:target/test-pkgA/_meta",
+            "<status code=\"ok\" />",
+        )
+        .with_put_bytes(
+            "https://api.example.org/source/test:target/test-pkgA/foo.spec",
+            "<revision rev=\"4\" vrev=\"1\" srcmd5=\"aaaa\" />",
+        )
+        .with_put_bytes(
+            "https://api.example.org/source/test:target/test-pkgA/foo.tar.gz",
+            "<revision rev=\"5\" vrev=\"1\" srcmd5=\"bbbb\" />",
+        )
+    }
+
+    fn cross_instance_clients(http: &FakeHttp) -> (ObsClient<'_>, ObsClient<'_>) {
+        let source = ObsClient::with_credentials(http, basic_credentials()).unwrap();
+        let target = ObsClient::with_base_and_credentials(
+            http,
+            "https://api.example.org",
+            basic_credentials(),
+        )
+        .unwrap();
+        (source, target)
+    }
+
+    #[test]
+    fn copy_package_to_instance_without_target_credentials_names_the_alias_setup() {
+        let http = cross_instance_source_http();
+        let source = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let target = ObsClient::with_base_and_credentials(
+            &http,
+            "https://api.example.org",
+            Credentials::None,
+        )
+        .unwrap();
+        let err = source
+            .copy_package_to_instance(
+                &target,
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("[instances]"), "{}", err.context);
+        assert!(
+            err.context.contains("GEECTL_OBS_USERNAME_<ALIAS>"),
+            "{}",
+            err.context
+        );
+        assert!(
+            err.context.contains("GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>"),
+            "{}",
+            err.context
+        );
+        // The plain variable names must not appear: they would send
+        // the user in a circle (the resolver refuses to forward them).
+        assert!(
+            !err.context.contains("GEECTL_OBS_USERNAME "),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn copy_package_to_instance_copies_text_and_binary_files() {
+        let http = cross_instance_target_missing(cross_instance_source_http());
+        let (source, target) = cross_instance_clients(&http);
+        let result = source
+            .copy_package_to_instance(
+                &target,
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            CrossInstanceCopyResult {
+                revision: Some(5),
+                copied_files: 2,
+                skipped_files: 0,
+            }
+        );
+        // The target package is created with the source's title and
+        // description before any file lands.
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"test-pkgA\" project=\"test:target\"><title>Test</title><description>A test package</description></package>"
+        );
+        // Both files are downloaded pinned to the listing's srcmd5 —
+        // and the service-generated file is never downloaded.
+        assert_eq!(
+            http.get_bytes_calls(),
+            vec![
+                (
+                    "https://api.opensuse.org/public/source/test:factory/test-pkgA/foo.spec?rev=0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                    false
+                ),
+                (
+                    "https://api.opensuse.org/public/source/test:factory/test-pkgA/foo.tar.gz?rev=0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                    false
+                ),
+            ]
+        );
+        // The bytes arrive verbatim, including the non-UTF-8 tarball.
+        assert_eq!(
+            http.put_bytes_calls(),
+            vec![
+                (
+                    "https://api.example.org/source/test:target/test-pkgA/foo.spec".to_string(),
+                    b"Name: foo\nVersion: 1.0\n".to_vec(),
+                    true
+                ),
+                (
+                    "https://api.example.org/source/test:target/test-pkgA/foo.tar.gz".to_string(),
+                    vec![0xED, 0xAB, 0xEE, 0xDB, 0x00, 0x50, 0x4B],
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_package_to_instance_skips_files_already_identical_on_target() {
+        let http = cross_instance_source_http().with_get(
+            "https://api.example.org/source/test:target/test-pkgA",
+            "<directory name=\"test-pkgA\" rev=\"2\" vrev=\"1\" srcmd5=\"dddddddddddddddddddddddddddddddd\"><entry name=\"foo.spec\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" size=\"1234\" mtime=\"1700000000\"/><entry name=\"foo.tar.gz\" md5=\"dddddddddddddddddddddddddddddddd\" size=\"88\" mtime=\"1700000000\"/></directory>",
+        ).with_put_bytes(
+            "https://api.example.org/source/test:target/test-pkgA/foo.tar.gz",
+            "<revision rev=\"5\" vrev=\"1\" srcmd5=\"bbbb\" />",
+        );
+        let (source, target) = cross_instance_clients(&http);
+        let result = source
+            .copy_package_to_instance(
+                &target,
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            CrossInstanceCopyResult {
+                revision: Some(5),
+                copied_files: 1,
+                skipped_files: 1,
+            }
+        );
+        // The target exists, so no package is created; the identical
+        // spec is neither downloaded nor uploaded.
+        assert!(http.put_calls().is_empty());
+        assert_eq!(
+            http.get_bytes_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/foo.tar.gz?rev=0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                false
+            )]
+        );
+        assert_eq!(http.put_bytes_calls().len(), 1);
+    }
+
+    #[test]
+    fn copy_package_to_instance_dry_run_records_plan_and_reads_nothing() {
+        let http = FakeHttp::new();
+        let (source, target) = cross_instance_clients(&http);
+        let dry_run = DryRun::new(true);
+        let result = source
+            .copy_package_to_instance(
+                &target,
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            CrossInstanceCopyResult {
+                revision: None,
+                copied_files: 0,
+                skipped_files: 0,
+            }
+        );
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: copy package test:factory/test-pkgA to test:target/test-pkgA on https://api.example.org".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.get_bytes_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+        assert!(http.put_bytes_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_package_to_instance_refuses_an_unexpanded_listing() {
+        // A listing that still carries `_link` means `?expand=1`
+        // did not expand: copying on would create an empty target
+        // package and report success with nothing copied.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA?expand=1",
+                "<directory name=\"test-pkgA\" rev=\"3\" vrev=\"1\" srcmd5=\"0123456789abcdef0123456789abcdef\"><entry name=\"_link\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" size=\"123\" mtime=\"1700000000\"/></directory>",
+            );
+        let (source, target) = cross_instance_clients(&http);
+        let err = source
+            .copy_package_to_instance(
+                &target,
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .expect_err("an unexpanded listing must fail the copy");
+        assert!(err.to_string().contains("_link"), "{err}");
+        // Refused before the target package is created: no PUT at
+        // all, so no empty package is left behind.
+        assert!(http.put_calls().is_empty());
+        assert!(http.put_bytes_calls().is_empty());
+        assert!(http.get_bytes_calls().is_empty());
+    }
+
+    #[test]
+    fn copy_package_to_instance_refuses_server_side_only_options() {
+        // Each flag is a server-side copy parameter with no meaning
+        // for a client-side copy: refused with the reason, never
+        // silently dropped. A fresh fixture per case proves no read
+        // happens before the refusal.
+        let cases: Vec<(&str, CopyOptions)> = vec![
+            (
+                "keep_link",
+                CopyOptions {
+                    keep_link: true,
+                    ..CopyOptions::default()
+                },
+            ),
+            (
+                "comment",
+                CopyOptions {
+                    comment: Some("move".to_string()),
+                    ..CopyOptions::default()
+                },
+            ),
+            (
+                "noservice",
+                CopyOptions {
+                    noservice: true,
+                    ..CopyOptions::default()
+                },
+            ),
+            (
+                "dont_update_source",
+                CopyOptions {
+                    dont_update_source: true,
+                    ..CopyOptions::default()
+                },
+            ),
+            (
+                "with_vrev",
+                CopyOptions {
+                    with_vrev: true,
+                    ..CopyOptions::default()
+                },
+            ),
+        ];
+        for (label, options) in cases {
+            let http = FakeHttp::new();
+            let (source, target) = cross_instance_clients(&http);
+            let err = source
+                .copy_package_to_instance(
+                    &target,
+                    "test:factory",
+                    "test-pkgA",
+                    "test:target",
+                    "test-pkgA",
+                    &options,
+                    &DryRun::new(false),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "case {label}");
+            assert!(http.get_calls().is_empty(), "case {label}");
+            assert!(http.get_bytes_calls().is_empty(), "case {label}");
+            assert!(http.put_calls().is_empty(), "case {label}");
+            assert!(http.put_bytes_calls().is_empty(), "case {label}");
+        }
+    }
+
+    #[test]
+    fn copy_package_to_instance_refuses_scmsync_source() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/test:factory/test-pkgA/_meta",
+            "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><scmsync>https://example.com#main</scmsync></package>",
+        );
+        let (source, target) = cross_instance_clients(&http);
+        let err = source
+            .copy_package_to_instance(
+                &target,
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // Only the meta read happens: the listing is never read.
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn copy_package_to_instance_never_copies_a_link_file() {
+        // A listing that still carries a `_link` entry — expansion
+        // did not happen — must not copy the pointer across
+        // instances. The listing carries no srcmd5 and no revision
+        // is requested, so the download carries no `rev` query.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA?expand=1",
+                "<directory name=\"test-pkgA\" rev=\"3\" vrev=\"1\"><entry name=\"_link\"/><entry name=\"foo.spec\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" size=\"1234\" mtime=\"1700000000\"/></directory>",
+            )
+            .with_get_bytes(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/foo.spec",
+                b"Name: foo\n",
+            );
+        let http = cross_instance_target_missing(http);
+        let (source, target) = cross_instance_clients(&http);
+        let result = source
+            .copy_package_to_instance(
+                &target,
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &CopyOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            CrossInstanceCopyResult {
+                revision: Some(4),
+                copied_files: 1,
+                skipped_files: 0,
+            }
+        );
+        assert_eq!(
+            http.get_bytes_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/foo.spec"
+                    .to_string(),
+                false
+            )]
+        );
+        assert_eq!(http.put_bytes_calls().len(), 1);
+    }
+
+    #[test]
+    fn copy_package_to_instance_pins_download_to_the_requested_revision_without_a_srcmd5() {
+        // No srcmd5 on the listing: the requested revision pins the
+        // download instead of the latest.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA?expand=1&rev=2",
+                "<directory name=\"test-pkgA\" rev=\"2\" vrev=\"1\"><entry name=\"foo.spec\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" size=\"1234\" mtime=\"1700000000\"/></directory>",
+            )
+            .with_get_bytes(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/foo.spec?rev=2",
+                b"Name: foo\n",
+            );
+        let http = cross_instance_target_missing(http);
+        let (source, target) = cross_instance_clients(&http);
+        let options = CopyOptions {
+            revision: Some("2".to_string()),
+            ..CopyOptions::default()
+        };
+        let result = source
+            .copy_package_to_instance(
+                &target,
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(result.copied_files, 1);
+        assert_eq!(
+            http.get_bytes_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/foo.spec?rev=2"
+                    .to_string(),
+                false
+            )]
+        );
     }
 
     #[test]

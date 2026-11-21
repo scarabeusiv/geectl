@@ -782,6 +782,638 @@ fn remote_unknown_command_in_text_mode_stays_json() {
     assert_eq!(value["error"]["code"], "invalid_input");
 }
 
+// --- branch/copy/link integration tests (isolated env, dry-run) ---
+//
+// The dry-run guard runs before the first HTTP call in all ten
+// operations, so these need neither credentials nor a server: the
+// isolated env has none of either. The plan lives in the JSON
+// payload in JSON mode and on stdout in text mode; the guard also
+// prints each plan line to stderr as it records it.
+
+/// Run an isolated dry-run branch command and return its JSON
+/// payload: exit 0, stdout is the payload with `dry_run: true` and
+/// a non-empty `[dry-run]` plan. The plan lines are also printed to
+/// stderr, one per line, as the dry-run guard records them — that
+/// is the `[dry-run]` output, not the debug channel.
+fn branch_dry_json(dir: &TempDir, args: &[&str]) -> serde_json::Value {
+    let out = geectl_isolated(dir)
+        .args(["branch"])
+        .args(args)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "args: {args:?}\nstderr: {stderr}");
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true, "payload: {value}");
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert!(!plan.is_empty(), "plan must not be empty: {value}");
+    let stderr_lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(
+        stderr_lines.len(),
+        plan.len(),
+        "stderr lines must match the plan: {stderr:?} vs {plan:?}"
+    );
+    for (line, expected) in stderr_lines.iter().zip(plan.iter()) {
+        assert!(line.contains("[dry-run]"), "stderr line: {line}");
+        assert_eq!(*line, expected.as_str().expect("plan lines are strings"));
+    }
+    value
+}
+
+/// A branch command with missing required flags: exit 2, a JSON
+/// error on stderr, empty stdout.
+fn branch_missing_flags(args: &[&str]) {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["branch"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "args: {args:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(value["error"]["message"].is_string());
+}
+
+#[test]
+fn branch_help_exits_zero() {
+    let out = geectl().args(["branch", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("branch-package"), "{stdout}");
+    assert!(stdout.contains("copy-package"), "{stdout}");
+}
+
+#[test]
+fn branch_commands_reject_missing_required_flags() {
+    for args in [
+        ["branch-package"],
+        ["copy-package"],
+        ["copy-project"],
+        ["set-devel-project"],
+        ["link-package"],
+        ["repair-link"],
+        ["set-link-rev"],
+        ["set-link-rev-project"],
+        ["link-to-branch"],
+        ["detach-branch"],
+    ] {
+        branch_missing_flags(&args);
+    }
+}
+
+#[test]
+fn branch_package_dry_run() {
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "branch-package",
+            "--project",
+            "test:factory",
+            "--package",
+            "foo",
+        ],
+    );
+    assert_eq!(value["source_project"], "test:factory");
+    assert_eq!(value["source_package"], "foo");
+    // The target is the requested one when the flags named it, else
+    // null: the server resolves it only when live.
+    assert_eq!(value["target_project"], serde_json::Value::Null);
+    assert_eq!(value["target_package"], serde_json::Value::Null);
+}
+
+#[test]
+fn copy_package_dry_run() {
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+        ],
+    );
+    assert_eq!(value["source_project"], "test:factory");
+    assert_eq!(value["target_project"], "test:target");
+    assert_eq!(value["revision"], serde_json::Value::Null);
+}
+
+#[test]
+fn copy_package_to_apiurl_dry_run() {
+    // A valid URL value: loopback http is a valid base, and the
+    // dry-run guard runs before any server read, so no second
+    // instance needs to exist.
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+            "--to-apiurl",
+            "http://127.0.0.1:3000",
+        ],
+    );
+    assert_eq!(value["target_api_url"], "http://127.0.0.1:3000");
+    assert_eq!(value["revision"], serde_json::Value::Null);
+    // Dry text never reports counts: the payload omits them.
+    assert!(value.get("copied_files").is_none());
+    assert!(value.get("skipped_files").is_none());
+}
+
+#[test]
+fn copy_project_dry_run() {
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "copy-project",
+            "--source-project",
+            "test:factory",
+            "--target-project",
+            "test:target",
+        ],
+    );
+    assert_eq!(value["source_project"], "test:factory");
+    assert_eq!(value["target_project"], "test:target");
+}
+
+#[test]
+fn set_devel_project_dry_run() {
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "set-devel-project",
+            "--project",
+            "test:factory",
+            "--package",
+            "foo",
+            "--devel-project",
+            "devel:languages:python",
+            "--devel-package",
+            "foo",
+        ],
+    );
+    assert_eq!(value["project"], "test:factory");
+    assert_eq!(value["package"], "foo");
+    assert_eq!(value["devel_project"], "devel:languages:python");
+    assert_eq!(value["devel_package"], "foo");
+}
+
+#[test]
+fn set_devel_project_removal_dry_run() {
+    // Without --devel-project the devel project is removed: the
+    // payload's devel fields are null.
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "set-devel-project",
+            "--project",
+            "test:factory",
+            "--package",
+            "foo",
+        ],
+    );
+    assert_eq!(value["devel_project"], serde_json::Value::Null);
+    assert_eq!(value["devel_package"], serde_json::Value::Null);
+}
+
+#[test]
+fn link_package_dry_run() {
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "link-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+        ],
+    );
+    assert_eq!(value["source_project"], "test:factory");
+    assert_eq!(value["target_package"], "foo");
+}
+
+#[test]
+fn repair_link_dry_run() {
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "repair-link",
+            "--project",
+            "test:factory",
+            "--package",
+            "foo",
+        ],
+    );
+    assert_eq!(value["project"], "test:factory");
+    assert_eq!(value["package"], "foo");
+}
+
+#[test]
+fn set_link_rev_dry_run() {
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "set-link-rev",
+            "--project",
+            "test:factory",
+            "--package",
+            "foo",
+            "--revision",
+            "latest",
+        ],
+    );
+    assert_eq!(value["project"], "test:factory");
+    assert_eq!(value["package"], "foo");
+    // The requested revision is not echoed in dry text: the payload
+    // revision is null until the set happens.
+    assert_eq!(value["revision"], serde_json::Value::Null);
+}
+
+#[test]
+fn set_link_rev_project_dry_run() {
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "set-link-rev-project",
+            "--project",
+            "test:factory",
+            "--revision",
+            "latest",
+        ],
+    );
+    assert_eq!(value["project"], "test:factory");
+    // The set is empty by construction in dry-run.
+    assert_eq!(value["set"], serde_json::json!([]));
+}
+
+#[test]
+fn link_to_branch_dry_run() {
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "link-to-branch",
+            "--project",
+            "test:factory",
+            "--package",
+            "foo",
+        ],
+    );
+    assert_eq!(value["project"], "test:factory");
+    assert_eq!(value["package"], "foo");
+}
+
+#[test]
+fn detach_branch_dry_run() {
+    let dir = TempDir::new();
+    let value = branch_dry_json(
+        &dir,
+        &[
+            "detach-branch",
+            "--project",
+            "test:factory",
+            "--package",
+            "foo",
+        ],
+    );
+    assert_eq!(value["project"], "test:factory");
+    assert_eq!(value["package"], "foo");
+    assert_eq!(value["revision"], serde_json::Value::Null);
+}
+
+#[test]
+fn branch_package_dry_run_text_echoes_the_header() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "branch",
+            "branch-package",
+            "--project",
+            "test:factory",
+            "--package",
+            "foo",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The header line echoes the query coordinates; the JSON
+    // payload's names appear in it.
+    assert!(
+        stdout.starts_with("branch-package test:factory/foo\ndry_run: true\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[dry-run]"), "{stdout}");
+}
+
+#[test]
+fn set_link_rev_project_dry_run_text_echoes_the_header() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "branch",
+            "set-link-rev-project",
+            "--project",
+            "test:factory",
+            "--revision",
+            "latest",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("set-link-rev-project test:factory\ndry_run: true\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[dry-run]"), "{stdout}");
+    // Dry: the set is empty by construction, so there is no
+    // `no links set` line.
+    assert!(!stdout.contains("no links set"), "{stdout}");
+}
+
+#[test]
+fn copy_package_to_apiurl_rejects_a_malformed_url_in_dry_run() {
+    // The target client is built (and its base validated) before the
+    // copy runs, so a malformed URL fails fast in dry-run too —
+    // before any read, with no network touched.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "branch",
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+            "--to-apiurl",
+            "notaurl",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(value["error"]["message"].is_string());
+}
+
+#[test]
+fn copy_package_to_apiurl_dry_run_text_echoes_the_target_instance() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "branch",
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+            "--to-apiurl",
+            "http://127.0.0.1:3000",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The target instance rides the header after `@`.
+    assert!(
+        stdout.starts_with(
+            "copy-package test:factory/foo -> test:target/foo @ http://127.0.0.1:3000\ndry_run: true\n"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[dry-run]"), "{stdout}");
+}
+
+#[test]
+fn copy_package_to_apiurl_with_plain_credentials_fails_clearly() {
+    // Plain (default-instance) credentials must never be forwarded
+    // to the target: a different-URL target with only plain creds
+    // configured fails with a config error naming the `[instances]`
+    // entry to add (no alias matches the target URL yet).
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "branch",
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+            "--to-apiurl",
+            "http://127.0.0.1:3000",
+        ])
+        .env("GEECTL_OBS_USERNAME", "plain-user")
+        .env("GEECTL_OBS_PASSWORD", "plain-secret")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    // The specific failure is in `context`; `message` is the kind's
+    // one-sentence summary.
+    let message = value["error"]["context"].as_str().unwrap();
+    assert!(message.contains("[instances]"), "stderr: {stderr}");
+    assert!(
+        message.contains("http://127.0.0.1:3000"),
+        "stderr: {stderr}"
+    );
+    // The default's credentials never leak into the message.
+    assert!(!stderr.contains("plain-user"));
+    assert!(!stderr.contains("plain-secret"));
+}
+
+#[test]
+fn copy_package_to_apiurl_with_alias_defined_but_unset_names_the_alias_vars() {
+    // An alias matches the target URL but its variables are not
+    // set, while plain credentials exist: the error names the alias
+    // variables, not the `[instances]` entry (the alias exists).
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[instances]\ntarget = \"http://127.0.0.1:3000\"\n",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "branch",
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+            "--to-apiurl",
+            "http://127.0.0.1:3000",
+        ])
+        .env("GEECTL_OBS_USERNAME", "plain-user")
+        .env("GEECTL_OBS_PASSWORD", "plain-secret")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    let message = value["error"]["context"].as_str().unwrap();
+    assert!(
+        message.contains("GEECTL_OBS_USERNAME_TARGET"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        message.contains("GEECTL_OBS_PASSWORD_TARGET"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("plain-user"));
+    assert!(!stderr.contains("plain-secret"));
+}
+
+#[test]
+fn copy_package_to_apiurl_with_alias_credentials_dry_runs() {
+    // Alias credentials for the target let the dry run proceed;
+    // the source needs none in dry-run (the guard runs before any
+    // server read).
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[instances]\ntarget = \"http://127.0.0.1:3000\"\n",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "branch",
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+            "--to-apiurl",
+            "http://127.0.0.1:3000",
+        ])
+        .env("GEECTL_OBS_USERNAME_TARGET", "target-user")
+        .env("GEECTL_OBS_PASSWORD_TARGET", "target-secret")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["target_api_url"], "http://127.0.0.1:3000");
+}
+
+#[test]
+fn copy_package_to_apiurl_same_instance_refuses() {
+    // `--to-apiurl` means another instance: pointing it at the
+    // configured instance would silently take the degraded
+    // client-side copy instead of the same-instance server copy,
+    // so it is refused with the fix (omit the flag).
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "branch",
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+            "--to-apiurl",
+            "https://api.opensuse.org",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("omit --to-apiurl"),
+        "{}",
+        value["error"]["context"]
+    );
+}
+
 #[test]
 fn request_supersede_without_live_refuses() {
     // The library's raw supersede has no dry-run, so without --live

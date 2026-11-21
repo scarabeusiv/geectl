@@ -2,7 +2,9 @@
 //!
 //! The config file lives at `$XDG_CONFIG_HOME/geectl/config.toml`
 //! (default `~/.config/geectl/config.toml`). It holds only the two
-//! endpoint URLs (`obs_url`, `gitea_url`). Credentials are never
+//! endpoint URLs (`obs_url`, `gitea_url`) and the named-instance
+//! table (`[instances]`, alias → URL — see [`Config::instances`]).
+//! Credentials are never
 //! stored here: a key that looks like a credential is a refusal to
 //! run, naming the key, the file, and the environment variable to use
 //! instead. (This is the plaintext-fallback failure the design doc's
@@ -25,13 +27,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::auth::{
-    open_file_nonblocking, snapshot_env, GITEA_SSH_KEY_VAR, GITEA_TOKEN_FILE_VAR, GITEA_TOKEN_VAR,
-    OBS_PASSWORD_FILE_VAR, OBS_PASSWORD_VAR, OBS_USERNAME_VAR,
+    open_file_nonblocking, same_api_url, snapshot_env, GITEA_SSH_KEY_VAR, GITEA_TOKEN_FILE_VAR,
+    GITEA_TOKEN_VAR, OBS_PASSWORD_FILE_VAR, OBS_PASSWORD_VAR, OBS_USERNAME_VAR,
 };
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::is_loopback_url;
 use crate::url::UrlBuilder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Environment variable overriding the OBS endpoint URL.
 pub const OBS_URL_VAR: &str = "GEECTL_OBS_URL";
@@ -51,12 +53,27 @@ pub const DEFAULT_GITEA_URL: &str = "https://src.opensuse.org";
 pub struct Config {
     pub obs_url: Option<String>,
     pub gitea_url: Option<String>,
+    /// Named OBS instances from the config file's `[instances]`
+    /// table, sorted by alias: `(alias, url)` pairs, e.g.
+    /// `myloveinstance = "https://api.opensuse.org"`. The alias
+    /// names the instance's credential variables
+    /// (`GEECTL_OBS_USERNAME_<ALIAS>` and friends — see
+    /// [`crate::auth::resolve_obs_basic_for_url`]); the table itself
+    /// carries no secret, only the alias → URL mapping. The shape is
+    /// backend-neutral (alias → URL, not OBS-specific) so the Gitea
+    /// per-instance half can reuse it later. The first alias whose
+    /// URL matches a call's URL (under
+    /// [`crate::auth::same_api_url`]) wins. Two aliases for the
+    /// same URL are refused at load (see [`as_instances_table`]).
+    pub instances: Vec<(String, String)>,
 }
 
 /// The effective endpoints plus where each value came from. The
 /// source is computed once, here, with the values — callers must not
 /// re-derive it by re-reading the environment (a second precedence
-/// copy drifts).
+/// copy drifts). The `[instances]`
+/// table rides through unchanged: it has no environment override
+/// and no source to report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveConfig {
     pub config: Config,
@@ -168,6 +185,7 @@ pub fn effective_config(config: &Config) -> Result<EffectiveConfig, GeectlError>
         config: Config {
             obs_url: Some(obs_url),
             gitea_url: Some(gitea_url),
+            instances: config.instances.clone(),
         },
         obs_url_source,
         gitea_url_source,
@@ -327,11 +345,13 @@ fn toml_position(text: &str, offset: usize) -> String {
     format!(" at line {line}, column {col}")
 }
 
-/// Parse config TOML. Only `obs_url` / `gitea_url` are recognised;
-/// anything else is an error (a typo must not silently do nothing),
-/// and a credential-shaped key anywhere in the file is a refusal to
-/// run. URL values must be `https://` with a host — validated here,
-/// at load time, not at the first request.
+/// Parse config TOML. Only `obs_url` / `gitea_url` / `instances`
+/// are recognised; anything else is an error (a typo must not
+/// silently do nothing), and a credential-shaped key anywhere in
+/// the file is a refusal to run. URL values must be `https://`
+/// with a host — validated here, at load time, not at the first
+/// request. The `[instances]` table maps an alias to an endpoint
+/// URL (see [`as_instances_table`]).
 pub fn parse_config(text: &str, path: &Path) -> Result<Config, GeectlError> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
         // The parser error embeds the offending line, which could be
@@ -348,7 +368,7 @@ pub fn parse_config(text: &str, path: &Path) -> Result<Config, GeectlError> {
     })?;
     check_no_credentials(&table, path)?;
     for key in table.keys() {
-        if key != "obs_url" && key != "gitea_url" {
+        if key != "obs_url" && key != "gitea_url" && key != "instances" {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
                 format!("{}: unknown config key '{key}'", path.display()),
@@ -361,6 +381,9 @@ pub fn parse_config(text: &str, path: &Path) -> Result<Config, GeectlError> {
     }
     if let Some(value) = table.get("gitea_url") {
         config.gitea_url = Some(as_url_string(value, "gitea_url", path)?);
+    }
+    if let Some(value) = table.get("instances") {
+        config.instances = as_instances_table(value, path)?;
     }
     Ok(config)
 }
@@ -375,6 +398,91 @@ fn as_url_string(value: &toml::Value, key: &str, path: &Path) -> Result<String, 
         )
     })?;
     validate_endpoint_url(text, &format!("{}: '{key}'", path.display()))
+}
+
+/// The `[instances]` table: alias → endpoint URL. The value must
+/// be a table of strings; each URL is validated like `obs_url`
+/// (see [`validate_endpoint_url`]) and each alias like an env-var
+/// segment (see [`validate_alias`]). The pairs come back sorted by
+/// alias, so alias matching (see [`crate::auth::alias_for_url`])
+/// is deterministic regardless of the file's key order.
+fn as_instances_table(
+    value: &toml::Value,
+    path: &Path,
+) -> Result<Vec<(String, String)>, GeectlError> {
+    let table = value.as_table().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{}: 'instances' must be a table", path.display()),
+        )
+    })?;
+    let mut seen_upper: HashSet<String> = HashSet::new();
+    let mut instances = Vec::new();
+    for (alias, url) in table {
+        validate_alias(alias, &mut seen_upper, path)?;
+        let url = as_url_string(url, &format!("[instances] {alias}"), path)?;
+        instances.push((alias.clone(), url));
+    }
+    instances.sort();
+    // Two aliases for the same URL name the same instance twice:
+    // resolution could only ever use the first one's variables,
+    // so the duplicate is refused at load like the case
+    // collision — name each instance once.
+    for (index, (alias, url)) in instances.iter().enumerate() {
+        for (other_alias, other_url) in &instances[index + 1..] {
+            // `same_api_url` rejects shapes the per-alias check
+            // accepts (a bad port passes `UrlBuilder`): report that
+            // as a load failure naming the file, like every other
+            // load failure, not a bare `InvalidInput`.
+            if same_api_url(url, other_url).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!("{}: {}", path.display(), e.context),
+                )
+            })? {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!(
+                        "{}: instance aliases {alias:?} and {other_alias:?} name the same URL ({url}); name each instance once",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(instances)
+}
+
+/// Validate one instance alias: non-empty, ASCII alphanumeric plus
+/// underscore only — the alias becomes an env-var segment
+/// (`GEECTL_OBS_USERNAME_<ALIAS>`, uppercased), so anything else
+/// cannot name a variable. Two aliases that differ only by case
+/// name the same variables and are refused too. A bad alias is a
+/// `ConfigError` at load time naming the alias.
+fn validate_alias(
+    alias: &str,
+    seen_upper: &mut HashSet<String>,
+    path: &Path,
+) -> Result<(), GeectlError> {
+    if alias.is_empty() || !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "{}: invalid instance alias {alias:?}; aliases must be ASCII alphanumeric plus underscore",
+                path.display()
+            ),
+        ));
+    }
+    if !seen_upper.insert(alias.to_ascii_uppercase()) {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "{}: instance alias {alias:?} collides with another alias after uppercasing; aliases must differ after uppercasing",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Credential-shaped keys, refused anywhere in the config file: an
@@ -461,7 +569,9 @@ fn is_credential_key(key: &str) -> bool {
 /// Recursively refuse credential-shaped keys anywhere in the table
 /// (nested tables and tables inside arrays included). The error names
 /// the key, the file, and the environment variable to use instead —
-/// never the value.
+/// never the value. The `[instances]` table is exempt: its keys are
+/// aliases, not config keys, so an alias like `my_token` is valid
+/// there even though `token` is a credential-shaped key.
 fn check_no_credentials(table: &toml::Table, path: &Path) -> Result<(), GeectlError> {
     for (key, value) in table {
         if is_credential_key(key) {
@@ -475,7 +585,10 @@ fn check_no_credentials(table: &toml::Table, path: &Path) -> Result<(), GeectlEr
             ));
         }
         match value {
-            toml::Value::Table(inner) => check_no_credentials(inner, path)?,
+            // The `[instances]` table's keys are aliases, not
+            // config keys, so the refusal does not apply below it.
+            toml::Value::Table(inner) if key != "instances" => check_no_credentials(inner, path)?,
+            toml::Value::Table(_) => {}
             toml::Value::Array(items) => {
                 for item in items {
                     if let toml::Value::Table(inner) = item {
@@ -780,6 +893,119 @@ mod tests {
     }
 
     #[test]
+    fn instances_table_parses_sorted_by_alias() {
+        let config = parse_config(
+            "[instances]\nmyloveinstance = \"https://api.opensuse.org\"\nlocal = \"http://127.0.0.1:3001\"\n",
+            &config_path(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.instances,
+            vec![
+                ("local".to_string(), "http://127.0.0.1:3001".to_string()),
+                (
+                    "myloveinstance".to_string(),
+                    "https://api.opensuse.org".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn instances_alias_must_be_an_env_var_segment() {
+        for alias in ["my-instance", "my instance", "mylove.instance"] {
+            let text = format!("[instances]\n\"{alias}\" = \"https://api.opensuse.org\"\n");
+            let err = parse_config(&text, &config_path()).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError, "alias {alias:?}");
+            assert!(
+                err.context.contains(&format!("{alias:?}")),
+                "alias {alias:?}"
+            );
+        }
+        // An empty alias (a quoted empty key) is not a segment either.
+        let err = parse_config(
+            "[instances]\n\"\" = \"https://api.opensuse.org\"\n",
+            &config_path(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+    }
+
+    #[test]
+    fn instances_alias_collision_after_uppercasing_is_an_error() {
+        let err = parse_config(
+            "[instances]\nmyalias = \"https://api.opensuse.org\"\nMYALIAS = \"https://build.opensuse.org\"\n",
+            &config_path(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        // The message names the collision, not a specific alias:
+        // which alias is reported second depends on table order.
+        assert!(err
+            .context
+            .contains("collides with another alias after uppercasing"));
+    }
+
+    #[test]
+    fn instances_alias_may_look_like_a_credential_key() {
+        // An alias is any key under `[instances]`; the
+        // credential-key refusal is for config keys, not aliases.
+        let config = parse_config(
+            "[instances]\nmy_token = \"https://api.opensuse.org\"\ntoken = \"https://build.opensuse.org\"\n",
+            &config_path(),
+        )
+        .unwrap();
+        assert_eq!(config.instances.len(), 2);
+    }
+
+    #[test]
+    fn instances_duplicate_url_is_an_error() {
+        // The same instance spelled twice — explicit `:443` is
+        // the same URL under `same_api_url` — names one instance
+        // twice and is refused at load.
+        let err = parse_config(
+            "[instances]\nalpha = \"https://api.example.org\"\nbeta = \"https://api.example.org:443\"\n",
+            &config_path(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("alpha"));
+        assert!(err.context.contains("beta"));
+    }
+
+    #[test]
+    fn instances_duplicate_url_with_bad_port_is_a_config_error() {
+        // A bad port passes per-alias validation (`UrlBuilder`
+        // does not check it) but fails `same_api_url` in the
+        // duplicate loop: the load failure must still be a
+        // `ConfigError` naming the file, like every other load
+        // failure.
+        let err = parse_config(
+            "[instances]\nalpha = \"https://api.example.org:notaport\"\nbeta = \"https://api.example.org\"\n",
+            &config_path(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("/x/geectl/config.toml"));
+        assert!(err.context.contains("invalid port"));
+    }
+
+    #[test]
+    fn instances_value_must_be_a_url_string() {
+        let err = parse_config("[instances]\nmyloveinstance = 42\n", &config_path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("myloveinstance"));
+    }
+
+    #[test]
+    fn instances_must_be_a_table() {
+        let err =
+            parse_config("instances = \"https://api.opensuse.org\"\n", &config_path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("instances"));
+    }
+
+    #[test]
     fn empty_config_parses_to_defaults() {
         assert_eq!(parse_config("", &config_path()).unwrap(), Config::default());
         assert_eq!(
@@ -1078,6 +1304,8 @@ mod tests {
         let config = Config {
             obs_url: Some("https://user:secret@api.opensuse.org".to_string()),
             gitea_url: None,
+            instances: vec![],
+
         };
         let err = effective_config(&config).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
@@ -1086,6 +1314,8 @@ mod tests {
         let config = Config {
             obs_url: Some("https://api.opensuse.org".to_string()),
             gitea_url: None,
+            instances: vec![],
+
         };
         let effective = effective_config(&config).unwrap();
         assert_eq!(

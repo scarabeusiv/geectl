@@ -574,6 +574,10 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
         return Err(malformed());
     };
     let open_tag = &after_open[..end];
+    // The listing's srcmd5 pins the revision the entries belong to
+    // (see the `srcmd5` field): read it off the opening tag once,
+    // before the self-closing early return.
+    let srcmd5 = tag_attr(open_tag, "srcmd5").map(|value| xml_unescape(&value));
     if open_tag.trim_end().ends_with('/') {
         // Self-closing `<directory .../>`: no children, so no files
         // and no service state.
@@ -581,6 +585,7 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
             entries: Vec::new(),
             linkinfo: None,
             serviceinfo: None,
+            srcmd5,
         });
     }
     let inner = &after_open[end + 1..];
@@ -744,6 +749,7 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
         entries,
         linkinfo,
         serviceinfo,
+        srcmd5,
     })
 }
 
@@ -1731,6 +1737,62 @@ impl<'a> ObsClient<'a> {
         }
         let url = build_url(&self.base, &["source", project, package, filename], &[]);
         let body = self.http.put_file(&url, content, &self.credentials)?;
+        match parse_revision(&body) {
+            Some(rev) => Ok(Some(rev)),
+            None => Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS upload response for file {project}/{package}/{filename}"),
+            )),
+        }
+    }
+
+    /// Upload file `filename` with binary `content` into package
+    /// `package` in project `project` on OBS (`PUT
+    /// /source/<project>/<package>/<filename>`). The byte counterpart
+    /// of [`ObsClient::upload_file`]: same validation, same dry-run
+    /// guard, same revision-document success — but the content is
+    /// bytes, not text, so a binary file (a tarball, an RPM) uploads
+    /// instead of failing the UTF-8 check a text upload would hit.
+    /// Binary content is why this exists: the cross-instance copy
+    /// downloads each file as bytes and uploads it the same way.
+    /// Returns the new revision number, like `upload_file`.
+    pub fn upload_file_bytes(
+        &self,
+        project: &str,
+        package: &str,
+        filename: &str,
+        content: &[u8],
+        dry_run: &DryRun,
+    ) -> Result<Option<u64>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !valid_obs_filename(filename) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS filename: {filename:?}"),
+            ));
+        }
+        // The dry-run guard: in dry-run the upload is recorded in the
+        // plan and nothing is uploaded — not even the credentials
+        // check runs. Without this, a dry-run caller invoking upload
+        // directly would mutate the server.
+        if !dry_run.allow(&format!("upload file {project}/{package}/{filename}")) {
+            return Ok(None);
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot upload a file without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let url = build_url(&self.base, &["source", project, package, filename], &[]);
+        let body = self.http.put_bytes(&url, content, &self.credentials)?;
         match parse_revision(&body) {
             Some(rev) => Ok(Some(rev)),
             None => Err(GeectlError::new(
@@ -5577,6 +5639,26 @@ mod tests {
             listing.linkinfo,
             Some(("home:Admin".to_string(), "foo".to_string()))
         );
+        // The fixture carries a srcmd5 on the opening tag: the
+        // listing pins the revision its entries belong to.
+        assert_eq!(
+            listing.srcmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        // A listing without one reads as None, not an error.
+        let listing = parse_directory("<directory name=\"foo\"></directory>").unwrap();
+        assert_eq!(listing.srcmd5, None);
+        // A self-closing listing carries the srcmd5 too: it is read
+        // off the opening tag before the self-closing early return.
+        let listing = parse_directory(
+            "<directory name=\"foo\" srcmd5=\"0123456789abcdef0123456789abcdef\"/>",
+        )
+        .unwrap();
+        assert_eq!(
+            listing.srcmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(listing.entries.is_empty());
     }
 
     #[test]
