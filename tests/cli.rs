@@ -553,3 +553,230 @@ fn debug_config_line_never_shows_a_secret() {
         assert!(!stderr.contains(secret), "debug line leaked {secret}");
     }
 }
+
+// --- remote-read integration tests ---
+
+#[test]
+fn remote_help_lists_every_command() {
+    let out = geectl().args(["remote", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for command in [
+        "cat",
+        "list-files",
+        "list-packages",
+        "package-log",
+        "revision-patch",
+        "project-meta",
+        "package-meta",
+        "search-packages",
+        "search-projects",
+        "owners",
+        "owners-for-binary",
+        "maintainers",
+        "whois",
+        "link-target",
+        "project-diff",
+        "devel-project",
+    ] {
+        assert!(
+            stdout.contains(command),
+            "remote --help is missing {command}"
+        );
+    }
+}
+
+#[test]
+fn remote_cat_help_names_the_rev_flag() {
+    let out = geectl().args(["remote", "cat", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--rev"));
+    assert!(stdout.contains("project"));
+    assert!(stdout.contains("package"));
+    assert!(stdout.contains("file"));
+}
+
+#[test]
+fn remote_unknown_command_fails_with_json_error() {
+    let out = geectl().args(["remote", "frobnicate"]).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn remote_invalid_name_fails_fast_without_network() {
+    // An invalid OBS name is rejected by the library before any HTTP
+    // call: the error is InvalidInput (exit 2) and the run never
+    // touches the network, so no server is needed.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "list-packages", "!!not-a-name"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(value["error"]["message"].is_string());
+    assert!(value["error"]["remediation"].is_string());
+}
+
+#[test]
+fn remote_invalid_name_in_text_mode_renders_text_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "list-packages",
+            "!!not-a-name",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error: the input is invalid"));
+    assert!(stderr.contains("remediation:"));
+    assert!(stderr.contains("context:"));
+    // Text mode carries no JSON error payload.
+    assert!(!stderr.contains("\"error\""));
+}
+
+#[test]
+fn remote_invalid_range_fails_fast_without_network() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "package-log",
+            "openSUSE:Factory",
+            "vim",
+            "--range",
+            "not-a-range",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn remote_unreachable_server_fails_with_network_error() {
+    // The base URL points at a closed loopback port: no server
+    // answers, so the library fails with a network error and the CLI
+    // reports it structurally, without ever reaching a real OBS.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "list-packages", "openSUSE:Factory"])
+        .env("GEECTL_OBS_URL", "http://127.0.0.1:1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "network_error");
+    assert!(value["error"]["message"].is_string());
+    assert!(value["error"]["remediation"].is_string());
+}
+
+// --- remote-read success-path fixture tests ---
+
+/// A one-shot HTTP fixture: serves a single canned response to the
+/// first connection, then the thread ends. Lets a remote command run
+/// its success path offline. The thread is deliberately not joined:
+/// if the binary never connects, the test fails on its own assertion
+/// and the blocked thread dies with the test process.
+fn serve_once(body: &str) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+    addr
+}
+
+#[test]
+fn remote_list_packages_text_mode_renders_the_table() {
+    let addr = serve_once("<directory><entry name=\"curl\"/><entry name=\"vim\"/></directory>");
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "list-packages",
+            "openSUSE:Factory",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), "NAME\ncurl\nvim");
+}
+
+#[test]
+fn remote_list_packages_json_mode_renders_the_payload() {
+    let addr = serve_once("<directory><entry name=\"curl\"/><entry name=\"vim\"/></directory>");
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "list-packages", "openSUSE:Factory"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["project"], "openSUSE:Factory");
+    assert_eq!(value["packages"], serde_json::json!(["curl", "vim"]));
+}
+
+#[test]
+fn remote_unknown_command_in_text_mode_renders_text_error() {
+    // The format was selected on the command line, so even a parse
+    // error renders in it (decision 52.3).
+    let out = geectl()
+        .args(["--format", "text", "remote", "frobnicate"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error: the input is invalid"));
+    assert!(stderr.contains("remediation:"));
+    assert!(!stderr.contains("\"error\""));
+}
