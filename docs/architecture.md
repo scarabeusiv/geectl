@@ -520,6 +520,17 @@ loopback.
 - Stdout is only the result payload (JSON by default, one uniform
   `--format` across every command). Every diagnostic, progress line,
   warning, and error goes to stderr. Verbosity never changes stdout.
+- The debug channel (`--debug`, or `GEECTL_DEBUG=1`) is the one
+  exception to silence on stderr: human-readable lines prefixed by
+  component (`http:`, `retry:`, `decision:`, `config:`), one level,
+  off by default, identical in both output formats. `--debug-body`
+  also prints request and response bodies, capped at 2048 bytes,
+  redacted, never with headers; binary bodies are never dumped.
+  The channel never carries a secret value, and it never fails a
+  run. The channel is library-complete and proven by fixture tests;
+  end-to-end lines via the CLI await the first OBS command (the
+  binary has only `version` + `config` today), which must pass the
+  Debug sink when it lands.
 - JSON output means server text is data, never terminal input, so there
   is nothing to sanitize in machine output. Human-readable output is
   rendered from parsed data through one renderer that escapes by
