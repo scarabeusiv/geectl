@@ -1837,6 +1837,16 @@ impl<'a> ObsClient<'a> {
     /// fails the call (its contents cannot be rendered as a text
     /// diff). Added and deleted files always appear; a modified file
     /// appears only when its contents actually differ.
+    ///
+    /// Cost: the patch is one sequential fan-out — two file listings,
+    /// then one file read per added or deleted file and two per
+    /// changed file, with no concurrency bound and no cap: the client
+    /// is synchronous (`&dyn HttpClient` carries no `Sync` bound, and
+    /// the test fake is `RefCell`-based), so the fan-out cannot be
+    /// parallelized without a transport refactor. A package with many
+    /// changed files is that many sequential round-trips. Each item
+    /// still fails closed: the first failed read aborts the whole
+    /// patch with its error, never a partial list.
     pub fn revision_patch(
         &self,
         project: &str,
