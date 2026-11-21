@@ -721,13 +721,35 @@ pub(crate) fn parse_build_history(body: &str) -> Result<Vec<BuildHistoryEntry>, 
 /// `<jobhist>` missing its package or code, or carrying a non-numeric
 /// number — is a server error, never an empty history.
 pub(crate) fn parse_job_history(body: &str) -> Result<Vec<JobHistoryEntry>, GeectlError> {
+    let body = body.trim();
+    // A malformed job history response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <jobhistlist> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS job history response: not a <jobhistlist> document",
+            format!(
+                "unexpected OBS job history response: not a <jobhistlist> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <jobhistlist> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <jobhistlist>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<jobhistlist") else {
         return Err(malformed());
     };
@@ -3226,6 +3248,52 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parse_job_history_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <jobhistlist>
+        // element; the result is the same as without one.
+        let plain = "<jobhistlist/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_job_history(&prolog).unwrap(),
+            parse_job_history(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_job_history(&format!("<?xml?>{plain}")).unwrap(),
+            parse_job_history(plain).unwrap()
+        );
+        assert_eq!(
+            parse_job_history(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_job_history(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <jobhistlist>.
+        assert!(parse_job_history("<?xml version=\"1.0\" <jobhistlist></jobhistlist>").is_err());
+        assert!(parse_job_history("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(
+            parse_job_history("<?xmlfoo version=\"1.0\"?><jobhistlist></jobhistlist>").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_job_history_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_job_history("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_job_history(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_job_history("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
