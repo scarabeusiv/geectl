@@ -1148,6 +1148,99 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// POST the changestate command at `url` with `comment` as the
+    /// body, retrying transient failures while `budget` lasts and
+    /// checking the request's state before any re-issue: the
+    /// server's API replies before its backend has registered a
+    /// just-filed request, so the changestate POST that follows a
+    /// filing can fail while the request is about to exist (seen on
+    /// temporal run 44880250442: the accept POST returned 500, while
+    /// the same accept passed on earlier runs). Only transient
+    /// failures retry — a 5xx, a timeout, a network error, or a
+    /// not-found (the just-filed request is not visible yet while
+    /// the backend registers it, the same race as the package-create
+    /// retry). A deterministic failure fails fast instead of
+    /// burning the budget — bad credentials, or a malformed id
+    /// refused client-side. A well-formed id that does not exist is
+    /// different: it 404s, which is in the retry set, so it takes
+    /// up to 60 s to fail, the same tradeoff as `create_package`'s
+    /// genuinely-missing project. A failed state read is just
+    /// "state unknown" —
+    /// the same backend that 500s the POST can 500 the follow-up
+    /// GET — and the retry keeps going until the deadline, which
+    /// still fails loudly. The retry sleeps 500 ms between
+    /// attempts, so a request that never changes state still fails
+    /// loudly once the budget runs out instead of hanging.
+    ///
+    /// The state check is what makes this retry safe where the
+    /// HTTP layer's POST policy is not: a POST is never retried
+    /// there, because a retried mutation can duplicate — but here
+    /// the read-back proves whether the change already landed, so
+    /// a mutation that went through is never re-issued. The check is
+    /// end-state-based, not attribution-based: it proves the request
+    /// is in the target state, not that this call's POST put it
+    /// there — if another actor moved it first, this call's comment
+    /// is never posted, and the request is already where the caller
+    /// wanted it. There is a narrow window between the state read
+    /// and the re-POST: if another actor moves the request in
+    /// between, the re-POST can fail fast (a 403 on an
+    /// already-accepted request, for example) even though the request
+    /// is in the target state; the window is one sleep wide and the
+    /// caller's flow is sequential, so the retry documents it rather
+    /// than closing it. A 200 with a non-ok body keeps the
+    /// pre-existing fail-fast: the retry covers transport-level
+    /// transient failures, and a non-ok body is read as the server
+    /// refusing the change. Callers pass the budget;
+    /// [`ObsClient::change_state`] passes 60 s.
+    fn post_changestate_with_retry(
+        &self,
+        url: &str,
+        comment: &str,
+        id: u64,
+        state: RequestState,
+        budget: std::time::Duration,
+    ) -> Result<(), GeectlError> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            match self.http.post_text(url, comment, &self.credentials) {
+                Ok(body) => {
+                    if parse_status_ok(&body) {
+                        return Ok(());
+                    }
+                    return Err(GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!("unexpected OBS changestate response for submit request {id}"),
+                    ));
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::ServerError
+                            | ErrorKind::Timeout
+                            | ErrorKind::NetworkError
+                            | ErrorKind::NotFound
+                    ) =>
+                {
+                    // The 500 can come after the state change
+                    // landed, so check before re-issuing: a request
+                    // already in the target state means the change
+                    // went through, and the retry returns success
+                    // without posting again.
+                    if let Ok(request) = self.show_request(&id.to_string()) {
+                        if request.state.name == state {
+                            return Ok(());
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(err);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// Change submit request `id` to `state` (`POST
     /// /request/:id?cmd=changestate&newstate=<state>`), with
     /// `comment` as the message left with the change. Requires
@@ -1187,6 +1280,20 @@ impl<'a> ObsClient<'a> {
     ///   behaviour, not the library's.
     /// - Success is the `<status code="ok"/>` body: any other body is
     ///   a server error, never success.
+    /// - The POST retries transient failures for a bounded 60 s:
+    ///   the server's API replies before its backend has
+    ///   registered a just-filed request, so the changestate POST
+    ///   that follows a filing can fail while the request is about
+    ///   to exist (seen on temporal run 44880250442: the accept
+    ///   POST returned 500, while the same accept passed on
+    ///   earlier runs). Before any re-issue the retry reads the
+    ///   request back, so a change that already landed is never
+    ///   posted again; a request that never changes state still
+    ///   fails loudly once the budget runs out. Only transient
+    ///   failures retry — anything else fails fast, except a
+    ///   well-formed id that does not exist, which 404s and retries
+    ///   for up to 60 s (the same tradeoff as a genuinely-missing
+    ///   project for `create_package`).
     pub fn change_state(
         &self,
         id: &str,
@@ -1236,15 +1343,13 @@ impl<'a> ObsClient<'a> {
         // `request.raw_post` as the comment (see
         // `supersede_request`), so the body is the comment verbatim
         // and its content type is its actual type (`text/plain`).
-        let body = self.http.post_text(&url, comment, &self.credentials)?;
-        if parse_status_ok(&body) {
-            Ok(())
-        } else {
-            Err(GeectlError::new(
-                ErrorKind::ServerError,
-                format!("unexpected OBS changestate response for submit request {id}"),
-            ))
-        }
+        self.post_changestate_with_retry(
+            &url,
+            comment,
+            id,
+            state,
+            std::time::Duration::from_secs(60),
+        )
     }
 
     /// Accept submit request `id` (`POST
@@ -6808,7 +6913,7 @@ mod tests {
         gets: RefCell<HashMap<String, String>>,
         get_errors: RefCell<HashMap<String, ErrorKind>>,
         posts: RefCell<HashMap<String, String>>,
-        post_errors: RefCell<HashMap<String, ErrorKind>>,
+        post_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
         deletes: RefCell<HashMap<String, String>>,
         puts: RefCell<HashMap<String, String>>,
         put_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
@@ -6848,7 +6953,20 @@ mod tests {
         }
 
         fn with_post_error(self, url: &str, kind: ErrorKind) -> Self {
-            self.post_errors.borrow_mut().insert(url.to_string(), kind);
+            self.post_errors
+                .borrow_mut()
+                .insert(url.to_string(), VecDeque::from([kind]));
+            self
+        }
+
+        /// Answer the next POSTs to `url` with these errors, in order;
+        /// once the queue is empty the canned `posts` body answers.
+        /// The POST twin of `with_put_error_sequence`: lets a test
+        /// model a backend that is not ready yet and then catches up.
+        fn with_post_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
+            self.post_errors
+                .borrow_mut()
+                .insert(url.to_string(), kinds.iter().copied().collect());
             self
         }
 
@@ -6933,7 +7051,12 @@ mod tests {
             self.post_calls
                 .borrow_mut()
                 .push((url.to_string(), body.to_string(), authed));
-            if let Some(kind) = self.post_errors.borrow().get(url).cloned() {
+            if let Some(kind) = self
+                .post_errors
+                .borrow_mut()
+                .get_mut(url)
+                .and_then(|queue| queue.pop_front())
+            {
                 return Err(GeectlError::new(
                     kind,
                     format!("canned POST error for {url}"),
@@ -11600,6 +11723,120 @@ description</description>
             .change_state("42", RequestState::Declined, "no", false, &dry)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn change_state_retries_server_error_then_succeeds() {
+        // The server's API replies before its backend has
+        // registered a just-filed request, so the changestate POST
+        // that follows a filing can 500 while the request is about
+        // to exist (temporal run 44880250442). The library retries
+        // a transient failure; the second POST lands. The state
+        // check between attempts reads the request back as still
+        // new, so the retry goes ahead.
+        let http = FakeHttp::new()
+            .with_post_error_sequence(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                &[ErrorKind::ServerError],
+            )
+            .with_post(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/42?withhistory=1",
+                &REQUEST1_XML.replace("name=\"accepted\"", "name=\"new\""),
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        obs.change_state("42", RequestState::Accepted, "looks good", false, &dry)
+            .expect("accept retries and lands");
+        assert_eq!(http.post_calls().len(), 2);
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn change_state_does_not_reissue_when_already_accepted() {
+        // The 500 can come after the state change landed, so the
+        // retry reads the request back first: a request already in
+        // the target state means the change went through, and the
+        // POST is never issued again.
+        let http = FakeHttp::new()
+            .with_post_error_sequence(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                &[ErrorKind::ServerError],
+            )
+            .with_post(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/42?withhistory=1",
+                REQUEST1_XML,
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        obs.change_state("42", RequestState::Accepted, "looks good", false, &dry)
+            .expect("an already-accepted request reads as success");
+        assert_eq!(http.post_calls().len(), 1);
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn change_state_persistent_server_error_surfaces_after_the_budget() {
+        // A request that never changes state still fails loudly
+        // once the budget runs out: with a 400 ms budget the helper
+        // tries twice (the first failure, one 500 ms sleep, the
+        // second failure past the deadline) and returns the server
+        // error instead of hanging. The production budget is 60 s,
+        // passed by change_state; the helper takes the budget so
+        // this test does not have to wait it out. The state check
+        // between attempts has no canned read, so it treats the
+        // state as unknown and keeps retrying.
+        let http = FakeHttp::new().with_post_error_sequence(
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+            &[
+                ErrorKind::ServerError,
+                ErrorKind::ServerError,
+                ErrorKind::ServerError,
+            ],
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = obs
+            .post_changestate_with_retry(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                "looks good",
+                42,
+                RequestState::Accepted,
+                std::time::Duration::from_millis(400),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert_eq!(http.post_calls().len(), 2);
+    }
+
+    #[test]
+    fn change_state_does_not_retry_deterministic_errors() {
+        // Only transient failures retry: bad credentials fail fast
+        // on the first attempt instead of burning the budget, and
+        // no state read runs.
+        let http = FakeHttp::new()
+            .with_post_error_sequence(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                &[ErrorKind::AuthFailed],
+            )
+            .with_post(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                "<status code=\"ok\" />",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let err = obs
+            .change_state("42", RequestState::Accepted, "looks good", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+        assert_eq!(http.post_calls().len(), 1);
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]
