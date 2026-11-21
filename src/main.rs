@@ -19,6 +19,8 @@ use serde_json::json;
 use std::io::Write;
 use std::process::ExitCode;
 
+mod cli_build;
+
 /// The output format. JSON is the default; it is the only format an agent
 /// should parse. `text` is a human-readable rendering of the same data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -64,6 +66,11 @@ struct Cli {
 enum Command {
     /// Print version information as the result payload.
     Version,
+    /// Build-status commands: results, logs, histories, binaries.
+    Build {
+        #[command(subcommand)]
+        command: cli_build::BuildCommand,
+    },
     /// Inspect or initialise the config file.
     Config {
         #[command(subcommand)]
@@ -110,6 +117,7 @@ fn run(cli: Cli, debug: &Debug) -> Result<String, GeectlError> {
             (payload, text)
         }
         Some(Command::Request { command }) => cli_request::run(*command, debug, cli.live)?,
+        Some(Command::Build { command }) => cli_build::run_build(debug, command)?,
         Some(Command::Config { command }) => match command {
             ConfigCommand::Show => {
                 let payload = config_show_payload()?;
@@ -407,6 +415,8 @@ fn main() -> ExitCode {
                     match write_payload(e.render().to_string().trim_end()) {
                         Ok(()) => return ExitCode::from(0),
                         Err(err) => {
+                            // No parsed CLI here, so no selected format:
+                            // parse-time errors are always JSON.
                             write_error(&err, Format::Json);
                             return ExitCode::from(err.exit_code() as u8);
                         }
@@ -523,6 +533,33 @@ mod tests {
             render_error_text(&bare),
             "error: the configuration is invalid\nremediation: check the configuration (flag, environment variable, or config file) and retry"
         );
+    }
+
+    #[test]
+    fn build_subcommand_parses() {
+        let cli = Cli::parse_from([
+            "geectl",
+            "build",
+            "results",
+            "openSUSE:Factory",
+            "--code",
+            "failed",
+        ]);
+        assert!(matches!(cli.command, Some(Command::Build { .. })));
+    }
+
+    #[test]
+    fn error_text_renders_code_message_and_remediation() {
+        // Unified rendering (the request group owns write_error):
+        // the context names the failure in the `error:` line itself.
+        let err = GeectlError::new(
+            ErrorKind::ConfigError,
+            "build reads need GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD",
+        );
+        let text = render_error_text(&err);
+        assert!(text.starts_with("error: build reads need "));
+        assert!(text.contains("GEECTL_OBS_USERNAME"));
+        assert!(text.contains("remediation: check the configuration"));
     }
 
     #[test]

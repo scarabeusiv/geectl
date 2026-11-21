@@ -1241,6 +1241,155 @@ fn copy_package_to_apiurl_dry_run_text_echoes_the_target_instance() {
     assert!(stdout.contains("[dry-run]"), "{stdout}");
 }
 
+// --- build commands integration tests (isolated env) ---
+
+#[test]
+fn build_help_lists_all_fifteen_subcommands() {
+    let out = geectl().args(["build", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    for name in [
+        "results",
+        "wait-for-results",
+        "build-log",
+        "build-status",
+        "job-status",
+        "buildinfo",
+        "build-history",
+        "job-history",
+        "list-binaries",
+        "download-binary",
+        "fileinfo",
+        "dependson",
+        "whatdependson",
+        "check-constraints",
+        "list-repositories",
+    ] {
+        assert!(text.contains(name), "build --help misses {name}");
+    }
+}
+
+#[test]
+fn build_results_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["build", "results", "openSUSE:Factory"])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; the build reads require OBS Basic
+    // credentials and fail loudly without them.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
+}
+
+#[test]
+fn build_results_without_credentials_renders_text_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "build", "results", "openSUSE:Factory"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Text mode renders `error:` + `remediation:` lines, not JSON.
+    assert!(stderr.contains("error: reading build state requires OBS credentials"));
+    assert!(stderr.contains("remediation: check the configuration"));
+    assert!(serde_json::from_str::<serde_json::Value>(stderr.trim()).is_err());
+}
+
+#[test]
+fn build_download_binary_without_output_fails_with_parse_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "build",
+            "download-binary",
+            "openSUSE:Factory",
+            "foo",
+            "standard",
+            "x86_64",
+            "foo-1.0-1.x86_64.rpm",
+        ])
+        .output()
+        .unwrap();
+    // `--output` is required: a missing required argument is a parse
+    // error (exit 2, InvalidInput) with a JSON error on stderr.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn build_list_repositories_needs_no_credentials() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["build", "list-repositories", "openSUSE:Factory"])
+        .output()
+        .unwrap();
+    // The public read: whatever the outcome (success, or a network /
+    // server failure in a sandbox without OBS access), it must not be
+    // the ConfigError the credentialed reads fail with.
+    assert_ne!(out.status.code(), Some(9));
+    if !out.status.success() {
+        let value: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+        assert_ne!(value["error"]["code"], "config_error");
+    }
+}
+
+#[test]
+fn build_list_repositories_ignores_half_set_credentials() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["build", "list-repositories", "openSUSE:Factory"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    // Username without password is a ConfigError for the credentialed
+    // reads — but the public read never resolves credentials, so it
+    // must not fail that way.
+    assert_ne!(out.status.code(), Some(9));
+    if !out.status.success() {
+        let value: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+        assert_ne!(value["error"]["code"], "config_error");
+    }
+}
+
+#[test]
+fn build_results_with_half_set_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["build", "results", "openSUSE:Factory"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    // The credentialed reads resolve credentials eagerly and fail loud
+    // on a half-set env — the asymmetry with the public read is
+    // intended.
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn build_unknown_subcommand_fails_with_parse_error() {
+    let out = geectl().args(["build", "frobnicate"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+}
+
 #[test]
 fn copy_package_to_apiurl_with_plain_credentials_fails_clearly() {
     // Plain (default-instance) credentials must never be forwarded
