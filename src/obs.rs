@@ -242,11 +242,27 @@ fn validate_base(base: &str) -> Result<(), GeectlError> {
 }
 
 /// True when `authority` is a bare authority: non-empty, with no path,
-/// query, fragment, or userinfo. The authority ends at the first `/`,
-/// `?`, or `#`; an `@` inside it is userinfo, which a base must never
-/// carry (credentials belong in `Credentials`, not in the URL).
+/// query, fragment, userinfo, or whitespace, and with a non-empty host.
+/// The authority ends at the first `/`, `?`, or `#`; an `@` inside it
+/// is userinfo, which a base must never carry (credentials belong in
+/// `Credentials`, not in the URL). An authority starting with `:` or
+/// `[]` carries no host at all. A bracketed host is only a bracketed
+/// host if the closing bracket is followed by the end of the authority
+/// or a `:port`: without that, `[::1]evil.com` is not a host at all.
 fn is_bare_authority(authority: &str) -> bool {
-    !authority.is_empty() && !authority.contains(['/', '?', '#', '@'])
+    !authority.is_empty()
+        && !authority.contains(['/', '?', '#', '@'])
+        && !authority.chars().any(|c| c.is_whitespace())
+        && !authority.starts_with(':')
+        && !authority.starts_with("[]")
+        && (!authority.starts_with('[')
+            || match authority.find(']') {
+                Some(end) => {
+                    let rest = &authority[end + 1..];
+                    rest.is_empty() || rest.starts_with(':')
+                }
+                None => false,
+            })
 }
 
 /// A CVE identifier, e.g. `CVE-2026-12345`. Stored in canonical
@@ -10549,6 +10565,8 @@ mod tests {
             "https://api.opensuse.org#frag",
             "https://user@api.opensuse.org",
             "https://user:pass@api.opensuse.org",
+            "https://api.opensuse.org ",
+            "https://:443",
             "http://127.0.0.1:3000/evil",
             "http://user@127.0.0.1:3000",
         ] {
@@ -10563,6 +10581,28 @@ mod tests {
         let url = client.search_url("foo").unwrap();
         assert!(url.starts_with("https://api.opensuse.org/search/request?match="));
         assert!(!url.contains("/evil"));
+    }
+
+    #[test]
+    fn bare_authority_rejects_whitespace_and_empty_host() {
+        assert!(is_bare_authority("api.opensuse.org"));
+        assert!(is_bare_authority("127.0.0.1:3000"));
+        assert!(is_bare_authority("[::1]:3000"));
+        assert!(is_bare_authority("[::1]"));
+        assert!(is_bare_authority("[::1]:8080"));
+        // Whitespace anywhere in the authority is not a host.
+        assert!(!is_bare_authority("api.opensuse.org "));
+        assert!(!is_bare_authority("api .opensuse.org"));
+        assert!(!is_bare_authority("api\t.opensuse.org"));
+        // An empty host: a bare port, or empty brackets.
+        assert!(!is_bare_authority(":3000"));
+        assert!(!is_bare_authority("[]"));
+        assert!(!is_bare_authority("[]:3000"));
+        // An unterminated or spoofed bracketed host is not a host.
+        assert!(!is_bare_authority("["));
+        assert!(!is_bare_authority("[::1"));
+        assert!(!is_bare_authority("[::1]evil.com"));
+        assert!(!is_bare_authority(""));
     }
 
     // --- SrPayload ---
