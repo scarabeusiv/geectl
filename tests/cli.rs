@@ -124,7 +124,8 @@ fn geectl_isolated(dir: &TempDir) -> Command {
         .env_remove("GEECTL_GITEA_URL")
         .env_remove("GEECTL_GITEA_TOKEN")
         .env_remove("GEECTL_GITEA_TOKEN_FILE")
-        .env_remove("GEECTL_GITEA_SSH_KEY");
+        .env_remove("GEECTL_GITEA_SSH_KEY")
+        .env_remove("GEECTL_DEBUG");
     cmd
 }
 
@@ -409,4 +410,146 @@ fn config_show_text_format_renders_an_auth_error() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("obs_auth: error:"), "{stdout}");
     assert!(stdout.contains("GEECTL_OBS_USERNAME"), "{stdout}");
+}
+
+// --- debug channel ---
+
+/// The two debug lines for an isolated `version` run: the startup
+/// line for the given arguments, then the config line for the
+/// default endpoints with no credentials.
+fn expected_debug_lines(args: &str) -> String {
+    format!(
+        "geectl {} {args}\nconfig: obs api.opensuse.org (auth: none), gitea src.opensuse.org (auth: none)\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[test]
+fn debug_off_by_default_emits_no_debug_lines() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir).arg("version").output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).is_empty());
+}
+
+#[test]
+fn debug_flag_emits_startup_and_config_lines() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--debug", "version"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // Stdout is exactly the JSON payload: debug never changes it.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["name"], "geectl");
+    assert_eq!(stdout.trim().lines().count(), 1);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        expected_debug_lines("--debug version")
+    );
+}
+
+#[test]
+fn debug_env_enables_without_flag() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DEBUG", "1")
+        .arg("version")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        expected_debug_lines("version")
+    );
+}
+
+#[test]
+fn debug_env_values_other_than_one_disable_without_flag() {
+    for value in ["", "0", "yes"] {
+        let dir = TempDir::new();
+        let out = geectl_isolated(&dir)
+            .env("GEECTL_DEBUG", value)
+            .arg("version")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).is_empty(),
+            "GEECTL_DEBUG={value:?} must not enable the channel"
+        );
+    }
+}
+
+#[test]
+fn debug_flag_after_subcommand_works() {
+    // The flags are global, so they parse after the subcommand too.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["version", "--debug"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        expected_debug_lines("version --debug")
+    );
+}
+
+#[test]
+fn debug_body_implies_debug() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--debug-body", "version"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        expected_debug_lines("--debug-body version")
+    );
+}
+
+#[test]
+fn debug_lines_are_identical_in_text_format() {
+    // Composition with --format is orthogonal: the same debug lines
+    // in both modes, and stdout carries the text payload.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "--debug", "version"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        format!("geectl {}", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        expected_debug_lines("--format text --debug version")
+    );
+}
+
+#[test]
+fn debug_config_line_never_shows_a_secret() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--debug", "version"])
+        .env("GEECTL_OBS_USERNAME", "alice-test")
+        .env("GEECTL_OBS_PASSWORD", "hunter2-fake")
+        .env("GEECTL_GITEA_TOKEN", "tok-fake")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The config line names the auth kinds, never the values.
+    assert!(stderr.contains(
+        "config: obs api.opensuse.org (auth: basic), gitea src.opensuse.org (auth: bearer)"
+    ));
+    for secret in ["alice-test", "hunter2-fake", "tok-fake"] {
+        assert!(!stderr.contains(secret), "debug line leaked {secret}");
+    }
 }

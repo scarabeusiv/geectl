@@ -9,6 +9,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
 use geectl::config;
+use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use serde_json::json;
 use std::io::Write;
@@ -33,6 +34,18 @@ struct Cli {
     /// Output format for the result payload. Applies to every command.
     #[arg(long, global = true, value_enum, default_value = "json")]
     format: Format,
+
+    /// Enable the debug channel: human-readable diagnostic lines on
+    /// stderr (HTTP attempts, retries, library decisions). Off by
+    /// default; `GEECTL_DEBUG=1` enables it without the flag.
+    #[arg(long, global = true)]
+    debug: bool,
+
+    /// Also print request and response bodies on the debug channel
+    /// (capped at 2048 bytes, redacted, never headers). Implies
+    /// `--debug`.
+    #[arg(long, global = true)]
+    debug_body: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -87,6 +100,88 @@ fn run(cli: Cli) -> Result<String, GeectlError> {
         Format::Json => payload.to_string(),
         Format::Text => text,
     })
+}
+
+/// Resolve the debug channel from the `--debug` / `--debug-body`
+/// flags and the `GEECTL_DEBUG` environment variable. The flag wins
+/// over the environment; `--debug-body` implies `--debug`. Only the
+/// exact value `1` enables the channel via the environment; unset,
+/// empty, or anything else disables it. Returns `(enabled, bodies)`.
+fn resolve_debug(debug_flag: bool, debug_body_flag: bool, env: Option<&str>) -> (bool, bool) {
+    let enabled = debug_flag || debug_body_flag || env == Some("1");
+    (enabled, debug_body_flag)
+}
+
+/// Collect argv without panicking on non-UTF-8 arguments:
+/// `std::env::args()` panics on them, so go through `args_os()`
+/// and convert lossily (an invalid sequence becomes U+FFFD rather
+/// than crashing the run before it starts).
+fn lossy_argv(args: impl Iterator<Item = std::ffi::OsString>) -> Vec<String> {
+    args.map(|arg| arg.to_string_lossy().into_owned()).collect()
+}
+
+/// The startup line for the debug channel: `geectl <version>` plus
+/// the arguments as invoked (skipping argv[0], the binary path).
+/// There is no secret-valued flag today; a future one must be masked
+/// here, by construction, before it reaches this line.
+fn startup_line(argv: &[String]) -> String {
+    let mut parts = vec!["geectl".to_string(), env!("CARGO_PKG_VERSION").to_string()];
+    parts.extend(argv.iter().skip(1).cloned());
+    parts.join(" ")
+}
+
+/// The kind of credentials a provider yields, for the debug config
+/// line: `basic`, `bearer`, `ssh`, `none`, or `error`. Never a
+/// username, never a value — the channel is stricter than `config
+/// show`.
+fn auth_kind(provider: &dyn AuthProvider) -> &'static str {
+    match provider.credentials() {
+        Ok(Credentials::None) => "none",
+        Ok(Credentials::Basic { .. }) => "basic",
+        Ok(Credentials::Bearer { .. }) => "bearer",
+        Ok(Credentials::SshKey { .. }) => "ssh",
+        Err(_) => "error",
+    }
+}
+
+/// The Gitea auth kind for the debug config line. Gitea has two
+/// providers, so the kind prefers bearer, then ssh, then error,
+/// else none: a bearer token wins over a key, and a key wins over a
+/// misconfiguration in the other provider.
+fn gitea_auth_kind() -> &'static str {
+    let bearer = EnvGiteaAuth.credentials();
+    let key = GiteaSshKey.credentials();
+    if matches!(bearer, Ok(Credentials::Bearer { .. })) {
+        "bearer"
+    } else if matches!(key, Ok(Credentials::SshKey { .. })) {
+        "ssh"
+    } else if bearer.is_err() || key.is_err() {
+        "error"
+    } else {
+        "none"
+    }
+}
+
+/// The config line for the debug channel: the effective OBS and
+/// Gitea base hosts with their auth kinds. None on any config-load
+/// failure, so a debug run never fails for want of a config line —
+/// including `version`, which does not otherwise touch config.
+fn debug_config_line() -> Option<String> {
+    let path = config::config_path().ok()?;
+    let file_config = config::load_config_at(&path).ok()?;
+    let effective = config::effective_config(&file_config).ok()?;
+    // effective_config resolves env > file > default, so both URLs
+    // are present by construction; the fallback is only for the
+    // type, never expected to fire.
+    let obs_url = effective.config.obs_url.as_deref().unwrap_or("");
+    let gitea_url = effective.config.gitea_url.as_deref().unwrap_or("");
+    Some(format!(
+        "config: obs {} (auth: {}), gitea {} (auth: {})",
+        geectl::debug::url_host(obs_url),
+        auth_kind(&EnvObsAuth),
+        geectl::debug::url_host(gitea_url),
+        gitea_auth_kind()
+    ))
 }
 
 /// The `config show` payload: the effective endpoint URLs with the
@@ -251,6 +346,30 @@ fn main() -> ExitCode {
             }
         }
     };
+    // The debug channel: one backend install for the process,
+    // then the startup and config lines on stderr. Off by default,
+    // so without `--debug` / `GEECTL_DEBUG=1` this is a no-op.
+    // Debug never fails a run: a config line that cannot be built
+    // is skipped, and a stderr write failure is ignored like any
+    // other diagnostic write. The backend installs only when the
+    // channel is on: installing it unconditionally would raise the
+    // global max level for every run, and ureq's own `debug!`
+    // records would print on the first real HTTP command.
+    let (debug_enabled, debug_bodies) = resolve_debug(
+        cli.debug,
+        cli.debug_body,
+        std::env::var("GEECTL_DEBUG").ok().as_deref(),
+    );
+    if debug_enabled {
+        geectl::debug::install();
+    }
+    let debug = Debug::new(debug_enabled, debug_bodies);
+    if debug.enabled() {
+        debug.emit(&startup_line(&lossy_argv(std::env::args_os())));
+        if let Some(line) = debug_config_line() {
+            debug.emit(&line);
+        }
+    }
     match run(cli) {
         Ok(payload) => match write_payload(&payload) {
             Ok(()) => ExitCode::from(0),
@@ -283,5 +402,74 @@ mod tests {
     fn no_subcommand_prints_version_payload() {
         let cli = Cli::parse_from(["geectl"]);
         assert!(run(cli).is_ok());
+    }
+
+    #[test]
+    fn resolve_debug_flag_enables_without_env() {
+        assert_eq!(resolve_debug(true, false, None), (true, false));
+    }
+
+    #[test]
+    fn resolve_debug_env_one_enables_without_flag() {
+        assert_eq!(resolve_debug(false, false, Some("1")), (true, false));
+    }
+
+    #[test]
+    fn resolve_debug_env_other_values_disable_without_flag() {
+        assert_eq!(resolve_debug(false, false, None), (false, false));
+        assert_eq!(resolve_debug(false, false, Some("")), (false, false));
+        assert_eq!(resolve_debug(false, false, Some("0")), (false, false));
+        assert_eq!(resolve_debug(false, false, Some("yes")), (false, false));
+    }
+
+    #[test]
+    fn resolve_debug_flag_wins_over_env() {
+        assert_eq!(resolve_debug(true, false, Some("0")), (true, false));
+    }
+
+    #[test]
+    fn resolve_debug_body_implies_debug() {
+        assert_eq!(resolve_debug(false, true, None), (true, true));
+        assert_eq!(resolve_debug(false, true, Some("0")), (true, true));
+    }
+
+    #[test]
+    fn resolve_debug_flag_without_body_prints_no_bodies() {
+        assert_eq!(resolve_debug(true, false, Some("1")), (true, false));
+    }
+
+    #[test]
+    fn startup_line_joins_the_arguments() {
+        assert_eq!(
+            startup_line(&[
+                "geectl".to_string(),
+                "--debug".to_string(),
+                "version".to_string()
+            ]),
+            format!("geectl {} --debug version", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn startup_line_without_arguments_has_no_trailing_space() {
+        assert_eq!(
+            startup_line(&["geectl".to_string()]),
+            format!("geectl {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lossy_argv_replaces_non_utf8_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+        let argv = lossy_argv(
+            vec![
+                std::ffi::OsString::from("geectl"),
+                std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(argv[0], "geectl");
+        assert!(argv[1].contains('\u{FFFD}'), "argv[1]: {:?}", argv[1]);
     }
 }
