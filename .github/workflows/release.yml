@@ -89,12 +89,22 @@ jobs:
             echo "version $version != manifest version $manifest" >&2
             exit 1
           fi
-          # A tag must point at main: a matching-version tag on a
-          # feature branch or stale commit never publishes, and the
-          # post-release bump assumes main. Dispatch runs build only.
+          # A tag must point at main's tip: a matching-version tag on a
+          # feature branch or a stale commit never publishes, and the
+          # post-release bump assumes main. `ahead_by` alone is
+          # one-sided — a stale ancestor is 0 ahead — so `behind_by`
+          # is checked too; only 0/0 (the tag commit is main's tip)
+          # passes. Dispatch runs build only.
           if [ "${{ github.event_name }}" = "push" ]; then
+            # Two calls, not one stringified pair: a jq string result
+            # is JSON-quoted ("0 0"), which would never equal 0, while
+            # the bare numbers print raw, as the old ahead_by call did.
             ahead=$(gh api "repos/${{ github.repository }}/compare/main...$GITHUB_SHA" --jq .ahead_by)
-            test "$ahead" = "0" || { echo "tag commit $GITHUB_SHA is $ahead commit(s) ahead of main; refusing to release" >&2; exit 1; }
+            behind=$(gh api "repos/${{ github.repository }}/compare/main...$GITHUB_SHA" --jq .behind_by)
+            if [ "$ahead" != "0" ] || [ "$behind" != "0" ]; then
+              echo "tag commit $GITHUB_SHA is $ahead ahead / $behind behind main; refusing to release" >&2
+              exit 1
+            fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -211,12 +221,21 @@ jobs:
           # in the imported keyring — never the primary key, never
           # another key the secret might hold. Field 12 of the
           # --with-colons record carries the capabilities (`s` signs).
+          # Subkey-only is enforced, not just subkey presence: a usable
+          # `sec` record (primary secret material) fails the check, so
+          # a full-key export can never sit in the runner. The stub
+          # marker is field 15 of the --with-colons record (`#` when
+          # the secret is not present, as a subkey-only export leaves
+          # the primary; `+` when it is) — there is no `sec#` record
+          # type in colons output. The same field guards the subkey:
+          # a stub subkey cannot sign, so it must not satisfy the
+          # fingerprint check either.
           if ! gpg --batch --list-secret-keys --with-colons | awk -F: -v fpr="$GPG_SIGNING_FINGERPRINT" '
-            /^ssb:/ { subkey=1; caps=$12; next }
-            /^sec:/ { subkey=0; next }
-            /^fpr:/ && subkey && index(caps, "s") && $10 == fpr { found=1 }
-            END { exit(!found) }'; then
-            echo "::error::GPG_SIGNING_FINGERPRINT $GPG_SIGNING_FINGERPRINT is not a signing subkey in the imported key" >&2
+            /^sec:/ { if ($15 != "#") primary_secret=1; subkey=0; next }
+            /^ssb:/ { subkey=1; caps=$12; usable=($15 != "#"); next }
+            /^fpr:/ && subkey && usable && index(caps, "s") && $10 == fpr { found=1 }
+            END { exit(!(found && !primary_secret)) }'; then
+            echo "::error::GPG_SIGNING_FINGERPRINT $GPG_SIGNING_FINGERPRINT is not a signing subkey in the imported key, or the imported key holds primary secret material" >&2
             exit 1
           fi
           echo "signing with subkey: $GPG_SIGNING_FINGERPRINT"
@@ -380,7 +399,12 @@ jobs:
           # nothing else, and anything else it touched must fail the
           # job rather than ride along in a version-bump PR.
           git add Cargo.toml Cargo.lock
-          stray=$(git status --porcelain | grep -v '^[AMD] ' || true)
+          # Exactly the two version surfaces, staged as modifications,
+          # may be present — nothing else. The old `^[AMD] ` filter let
+          # staged adds/deletes through; renames (`R` lines) fell
+          # outside its vocabulary too (failing closed, noisily). An
+          # exact allowlist fails closed on any of those.
+          stray=$(git status --porcelain=v1 | grep -v '^M  Cargo\.toml$' | grep -v '^M  Cargo\.lock$' || true)
           if [ -n "$stray" ]; then
             echo "::error::the bump changed files outside the version surfaces:" >&2
             echo "$stray" >&2
