@@ -34,12 +34,15 @@ use super::ReleaseOptions;
 use super::Repository;
 use super::RevisionPatch;
 use super::RevisionRange;
+use super::ServiceCode;
+use super::ServiceState;
 use super::SourceFile;
 use super::FACTORY_PROJECT;
 use crate::auth::Credentials;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::xml::find_attr;
+use crate::xml::find_tag_end;
 use crate::xml::scan_tag;
 use crate::xml::skip_xml_prolog;
 use crate::xml::xml_escape;
@@ -662,10 +665,12 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
     };
     let open_tag = &after_open[..end];
     if open_tag.trim_end().ends_with('/') {
-        // Self-closing `<directory .../>`: no children, so no files.
+        // Self-closing `<directory .../>`: no children, so no files
+        // and no service state.
         return Ok(DirectoryListing {
             entries: Vec::new(),
             linkinfo: None,
+            serviceinfo: None,
         });
     }
     let inner = &after_open[end + 1..];
@@ -738,7 +743,98 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
         }
         rest = &after_tag[end..];
     }
-    Ok(DirectoryListing { entries, linkinfo })
+    // The service run state, when the listing carries one: the
+    // first `<serviceinfo>` wins (a listing carries at most one). An
+    // unknown `code` is a malformed listing, not a state to guess at.
+    let mut serviceinfo = None;
+    let mut rest = inner;
+    while let Some(pos) = rest.find("<serviceinfo") {
+        let after_tag = &rest[pos + "<serviceinfo".len()..];
+        // The tag name must end here: `<serviceinformation>` is not a
+        // serviceinfo element. The next character is whitespace, `/`,
+        // or `>`.
+        let Some(first) = after_tag.chars().next() else {
+            return Err(malformed());
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        // The open tag ends at the first `>` outside a quoted
+        // attribute value: an unterminated serviceinfo is a malformed
+        // listing, not a skippable element.
+        let Some(end) = find_tag_end(after_tag) else {
+            return Err(malformed());
+        };
+        let element = &after_tag[..end];
+        let code = match tag_attr(element, "code").as_deref() {
+            Some("running") => ServiceCode::Running,
+            Some("failed") => ServiceCode::Failed,
+            Some("succeeded") => ServiceCode::Succeeded,
+            _ => return Err(malformed()),
+        };
+        let xsrcmd5 = tag_attr(element, "xsrcmd5").map(|value| xml_unescape(&value));
+        let lsrcmd5 = tag_attr(element, "lsrcmd5").map(|value| xml_unescape(&value));
+        let error = if element.trim_end().ends_with('/') {
+            None
+        } else {
+            let after_open = &after_tag[end + 1..];
+            let Some(close_pos) = after_open.find("</serviceinfo>") else {
+                return Err(malformed());
+            };
+            let inner_si = &after_open[..close_pos];
+            let error = element_text(inner_si, "error");
+            // An <error> element that never closes is a malformed
+            // listing, not a failure without text: element_text
+            // returns None for both a self-closing <error/> and an
+            // unclosed one, so tell them apart. A self-closing tag
+            // (with or without a space before the slash) carries no
+            // text and is fine; a paired tag that never closes is
+            // not. The first <error> wins, as in element_text, so a
+            // second <error> behind a first self-closing <error/>
+            // is malformed: the server writes at most one, and an
+            // unclosed or text-carrying second one must not be
+            // silently dropped behind the first self-closing one.
+            if error.is_none() {
+                let mut rest = inner_si;
+                let mut seen_error = false;
+                while let Some(pos) = rest.find("<error") {
+                    let after = &rest[pos + "<error".len()..];
+                    let Some(first) = after.chars().next() else {
+                        return Err(malformed());
+                    };
+                    if !(first.is_whitespace() || first == '/' || first == '>') {
+                        rest = after;
+                        continue;
+                    }
+                    if seen_error {
+                        return Err(malformed());
+                    }
+                    seen_error = true;
+                    let Some(gt) = find_tag_end(after) else {
+                        return Err(malformed());
+                    };
+                    if !after[..gt].trim_end().ends_with('/') {
+                        return Err(malformed());
+                    }
+                    rest = &after[gt..];
+                }
+            }
+            error
+        };
+        serviceinfo = Some(ServiceState {
+            code,
+            xsrcmd5,
+            lsrcmd5,
+            error,
+        });
+        break;
+    }
+    Ok(DirectoryListing {
+        entries,
+        linkinfo,
+        serviceinfo,
+    })
 }
 
 /// Parse an OBS package history (`<revisionlist>` with `<revision
@@ -1738,6 +1834,29 @@ impl<'a> ObsClient<'a> {
         parse_directory(&body)
     }
 
+    /// GET an authenticated directory listing (`/source/...`) and
+    /// parse it. The authed source endpoints resolve the `_project`
+    /// (and `_pattern`) pseudo-packages via the project, where the
+    /// public routes cannot address them at all: the public access
+    /// check looks up a Package row, and `_project` is not one.
+    pub(crate) fn authed_directory_listing(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<DirectoryListing, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let url = build_url(&self.base, &["source", project, package], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_directory(&body)
+    }
+
     /// Read file `file` of package `package` in project `project`
     /// (`GET /public/source/<project>/<package>/<file>`), optionally
     /// at revision `rev` (`?rev=N`, which the backend forwards to the
@@ -1784,11 +1903,19 @@ impl<'a> ObsClient<'a> {
         self.http.get_with(&url, &Credentials::None)
     }
 
-    /// List the files of package `package` in project `project`
-    /// (`GET /public/source/<project>/<package>`). A public read: no
-    /// credentials. The listing carries each file's name, size,
-    /// modification time, and md5, in server order.
-    pub fn list_files(&self, project: &str, package: &str) -> Result<Vec<SourceFile>, GeectlError> {
+    /// Read file `file` of package `package` in project `project`
+    /// via the authenticated source endpoint
+    /// (`GET /source/<project>/<package>/<file>`). Same `_project`
+    /// reason as `authed_directory_listing`: the public file route
+    /// cannot address the pseudo-package. A missing file is an
+    /// error, never an empty string. No revision parameter: the
+    /// service read needs none.
+    pub(crate) fn authed_cat(
+        &self,
+        project: &str,
+        package: &str,
+        file: &str,
+    ) -> Result<String, GeectlError> {
         for (label, value) in [("project", project), ("package", package)] {
             if !valid_obs_name(value) {
                 return Err(GeectlError::new(
@@ -1797,7 +1924,43 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        Ok(self.public_directory(&[project, package])?.entries)
+        if !valid_obs_filename(file) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS filename: {file:?}"),
+            ));
+        }
+        let url = build_url(&self.base, &["source", project, package, file], &[]);
+        self.http.get_with(&url, &self.credentials)
+    }
+
+    /// GET a public directory listing (`/public/source/...`) and
+    /// parse it, returning the full listing: files, link target, and
+    /// service state. A public read: no credentials. Shared by the
+    /// listing readers that need more than the file entries
+    /// ([`ObsClient::service_state`]).
+    pub(crate) fn directory_listing(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<DirectoryListing, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        self.public_directory(&[project, package])
+    }
+
+    /// List the files of package `package` in project `project`
+    /// (`GET /public/source/<project>/<package>`). A public read: no
+    /// credentials. The listing carries each file's name, size,
+    /// modification time, and md5, in server order.
+    pub fn list_files(&self, project: &str, package: &str) -> Result<Vec<SourceFile>, GeectlError> {
+        Ok(self.directory_listing(project, package)?.entries)
     }
 
     /// List the packages of project `project` (`GET
