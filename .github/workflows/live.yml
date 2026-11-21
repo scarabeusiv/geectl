@@ -13,6 +13,12 @@
 # on every pull request, weekly (Mondays 06:00 UTC, the same slot as
 # the freshness workflow), and on demand.
 #
+# A second OBS instance (port 3001) is provisioned alongside the
+# first, for the cross-instance copy test in
+# `tests/live_cross_instance.rs` (the proof for `branch copy-package
+# --to-apiurl`): its own compose project, checkout, containers,
+# volumes, and database. Both instances are torn down afterwards.
+#
 # It is slow on purpose: the OBS source checkout plus the frontend
 # image build take several minutes, and the bootstrap plus readiness
 # wait add more. The timeout is 60 minutes. The frontend image build
@@ -91,6 +97,18 @@ jobs:
           # Local runs leave it unset and build uncached, as before.
           LIVE_CACHE: "1"
         run: bash tests/live/provision.sh
+      - name: Provision second live OBS instance
+        env:
+          LIVE_CACHE: "1"
+          # Its own compose project (containers, volumes), frontend
+          # port, and OBS checkout: the two stacks share nothing but
+          # the host. The frontend image build is a cache hit — the
+          # first stack already built it — but the bootstrap runs
+          # again against the second stack's own database.
+          COMPOSE_PROJECT_NAME: geectl-live-2
+          FRONTEND_PORT: "3001"
+          OBS_SOURCE_DIR: tests/live/obs-2
+        run: bash tests/live/provision.sh
       - name: Run live tests against the live instance
         env:
           GEECTL_LIVE_URL: http://127.0.0.1:3000
@@ -107,6 +125,20 @@ jobs:
           # so a silent skip would hide drift.
           GEECTL_LIVE_REQUIRED: "true"
         run: cargo test --locked --test live_obs
+      - name: Run cross-instance live test against both instances
+        env:
+          GEECTL_LIVE_URL: http://127.0.0.1:3000
+          GEECTL_LIVE_URL_2: http://127.0.0.1:3001
+          # Same marker as above: in this job both URLs must be wired,
+          # so a silent skip would hide drift.
+          GEECTL_LIVE_REQUIRED: "true"
+        run: cargo test --locked --test live_cross_instance
+      - name: Tear down second live OBS instance
+        if: always()
+        env:
+          COMPOSE_PROJECT_NAME: geectl-live-2
+          OBS_SOURCE_DIR: tests/live/obs-2
+        run: bash tests/live/teardown.sh
       - name: Tear down live OBS instance
         if: always()
         run: bash tests/live/teardown.sh

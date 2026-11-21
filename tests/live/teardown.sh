@@ -11,6 +11,9 @@
 #   OBS_SOURCE_DIR=/path/to/open-build-service bash tests/live/teardown.sh
 #   (defaults to <repo>/tests/live/obs, matching provision.sh)
 #   COMPOSE="podman compose" bash tests/live/teardown.sh
+#   COMPOSE_PROJECT_NAME=geectl-live-2 OBS_SOURCE_DIR=/path/to/open-build-service-2 bash tests/live/teardown.sh
+#   (tears down the second stack: the project name selects its own
+#   containers and volumes)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,6 +22,13 @@ COMPOSE="${COMPOSE:-docker compose}"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 
 export OBS_SOURCE_DIR
+
+# The second stack's project name (see provision.sh): it selects
+# that stack's containers and volumes for `down -v`.
+if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
+    export COMPOSE_PROJECT_NAME
+    echo "Compose project: $COMPOSE_PROJECT_NAME"
+fi
 
 $COMPOSE -f "$COMPOSE_FILE" down -v
 echo "Live OBS instance torn down (containers and volumes removed)."

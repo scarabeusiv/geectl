@@ -35,6 +35,13 @@
 #   LIVE_CACHE=1 bash tests/live/provision.sh
 #   (loads docker-compose.cache.yml, the CI-only BuildKit cache for
 #   the frontend image build; local runs leave it unset)
+#   COMPOSE_PROJECT_NAME=geectl-live-2 FRONTEND_PORT=3001 \
+#     OBS_SOURCE_DIR=tests/live/obs-2 bash tests/live/provision.sh
+#   (a second stack on port 3001: its own containers, volumes, and
+#   database, sharing nothing with the first stack but the host. The
+#   cross-instance live test needs both stacks up. The second stack
+#   gets its own OBS checkout: the two backends mount the checkout,
+#   and sharing one between two running backends is unproven.)
 #
 # Exit code is non-zero if any step fails. The instance is left running
 # on failure for inspection; `tests/live/teardown.sh` removes it.
@@ -130,6 +137,15 @@ fi
 export OBS_SOURCE_DIR
 export CONTAINER_USERID="$(id -u)"
 export FRONTEND_PORT
+
+# A second stack gets its own compose project (its own containers
+# and volumes) through COMPOSE_PROJECT_NAME: compose reads it from
+# the environment, so every invocation below picks it up without a
+# flag. Unset means the default directory-derived project, as before.
+if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
+    export COMPOSE_PROJECT_NAME
+    echo "Compose project: $COMPOSE_PROJECT_NAME"
+fi
 
 # The database and cache first: the bootstrap and the backend both need
 # the database up, and the frontend will not boot without it.
