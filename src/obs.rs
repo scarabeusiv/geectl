@@ -5072,6 +5072,22 @@ pub(crate) fn parse_devel_project(body: &str) -> Result<Option<String>, GeectlEr
         )
     };
     let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the directory element; skip it. The prolog must
+    // terminate (`?>`) — an unterminated prolog is malformed, not a
+    // missing directory.
+    let body = if let Some(after) = body.strip_prefix("<?xml") {
+        let first = after.chars().next();
+        if !matches!(first, Some(c) if c.is_whitespace() || c == '?') {
+            return Err(malformed());
+        }
+        let Some(end) = after.find("?>") else {
+            return Err(malformed());
+        };
+        after[end + 2..].trim_start()
+    } else {
+        body
+    };
     let Some(after_open) = body.strip_prefix("<directory") else {
         return Err(malformed());
     };
@@ -10867,6 +10883,30 @@ mod tests {
         );
         // Trailing junk after the closing tag is malformed.
         assert!(parse_devel_project("<directory></directory>junk").is_err());
+    }
+
+    #[test]
+    fn parse_devel_project_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the directory
+        // element; the result is the same as without one.
+        assert_eq!(
+            parse_devel_project(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><directory name=\"foo\"><devel project=\"devel:foo\"/></directory>"
+            )
+            .unwrap(),
+            Some("devel:foo".to_string())
+        );
+        assert_eq!(
+            parse_devel_project("<?xml version=\"1.0\"?>\n<directory></directory>").unwrap(),
+            None
+        );
+        // A prolog that never terminates is malformed, not a missing
+        // directory.
+        assert!(parse_devel_project("<?xml version=\"1.0\" <directory></directory>").is_err());
+        assert!(parse_devel_project("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_devel_project("<?xmlfoo version=\"1.0\"?><directory></directory>").is_err());
     }
 
     #[test]
