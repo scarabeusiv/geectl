@@ -390,6 +390,23 @@ fn request_xml(base: &str, id: &str) -> String {
         .expect("GET the filed request back from the server")
 }
 
+/// The request's state, read back best-effort: `None` when the read
+/// itself fails or the body carries no state. The accept retry uses
+/// this instead of `request_xml`, because the same flaky backend
+/// that 500s the changestate POST can 500 the follow-up GET — a
+/// panicking read there would kill the retry and lose the original
+/// POST error. A failed read is just "state unknown", and the retry
+/// keeps going until the deadline, which still fails loudly.
+fn request_state_or_none(base: &str, id: &str) -> Option<String> {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let body = http
+        .get_with(&format!("{base}/request/{id}"), &temporal_credentials())
+        .ok()?;
+    request_state(&body)
+}
+
 /// True when `body` is a `<status code="ok"/>` document. The harness
 /// cannot use the crate-internal `parse_status_ok` (integration tests
 /// cannot see `pub(crate)` items), so it carries this small check:
@@ -424,21 +441,60 @@ fn response_is_status_ok(body: &str) -> bool {
 /// is a maintainer action), so the harness POSTs the changestate
 /// directly, the same `cmd=changestate` form `supersede_request`
 /// uses.
+///
+/// The accept retries on a failed POST for a bounded time: accepting
+/// runs the server's backend copy and cleanup, and on a fresh
+/// instance those can fail while the backend is still registering
+/// the just-created source (seen on run 44880250442: the changestate
+/// POST returned 500, while the same accept passed on earlier runs).
+/// A retry first checks whether the request already reads back as
+/// accepted — the 500 can come after the state change landed — so a
+/// mutation that already went through is never re-issued blindly.
+/// The retry is bounded (60 s); a request that never accepts still
+/// fails loudly instead of hanging. Only transient failures are
+/// retried — a 5xx, a timeout, a network error, or a not-found (the
+/// just-filed request is not visible yet while the backend registers
+/// it, the same race as the package-create retry). A deterministic
+/// failure (bad credentials, a bad request id, an invalid state)
+/// fails fast instead of burning the whole minute.
 fn accept_request(base: &str, id: &str) {
     let http = Box::leak(Box::new(
         UreqClient::new(Timeout::default()).expect("default timeout is valid"),
     ));
-    let body = http
-        .post_text(
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match http.post_text(
             &format!("{base}/request/{id}?cmd=changestate&newstate=accepted"),
             "accepted by the geectl temporal test",
             &temporal_credentials(),
-        )
-        .expect("accept the request on the temporal instance");
-    assert!(
-        response_is_status_ok(&body),
-        "accepting request {id} did not return <status code=\"ok\"/>; body: {body}"
-    );
+        ) {
+            Ok(body) => {
+                assert!(
+                    response_is_status_ok(&body),
+                    "accepting request {id} did not return <status code=\"ok\"/>; body: {body}"
+                );
+                return;
+            }
+            Err(err) => {
+                if !matches!(
+                    err.kind(),
+                    ErrorKind::ServerError
+                        | ErrorKind::Timeout
+                        | ErrorKind::NetworkError
+                        | ErrorKind::NotFound
+                ) {
+                    panic!("accept the request on the temporal instance: {err:?}");
+                }
+                if request_state_or_none(base, id).as_deref() == Some("accepted") {
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("accept the request on the temporal instance: {err:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
 }
 
 /// True when the public directory listing for `path` (`project`, or
