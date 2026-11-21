@@ -448,7 +448,10 @@ pub(crate) fn parse_request_ids_for_action(
         }
         let inner = &after_tag[end + 1..];
         let close = inner.find("</request>")?;
-        if request_block_matches_action(&inner[..close], action_type, shape) {
+        // A truncated action block is a malformed response, not a
+        // match: the parse fails so the caller reports a server
+        // error instead of treating the request as blocking.
+        if request_block_matches_action(&inner[..close], action_type, shape)? {
             ids.push(id);
         }
         rest = &inner[close + "</request>".len()..];
@@ -465,26 +468,29 @@ pub(crate) fn parse_request_ids_for_action(
 /// position does not matter and either quote style works; a mention of
 /// the type elsewhere in the block (a description, say) does not count.
 /// The shape is read from the action's `<target>` element the same way.
+/// None when the block is truncated (an action tag with no closing
+/// `>` or a type-matching action with no close tag): the caller fails
+/// closed on a malformed response — a truncated block is a server
+/// error, not a block that happens to match.
 pub(crate) fn request_block_matches_action(
     block: &str,
     action_type: &str,
     shape: ActionShape<'_>,
-) -> bool {
+) -> Option<bool> {
     let mut rest = block;
     while let Some(pos) = rest.find("<action") {
         let after_tag = &rest[pos + "<action".len()..];
         let Some(first) = after_tag.chars().next() else {
-            // The block ends mid-tag: truncated — block, fail-closed.
-            return true;
+            // The block ends mid-tag: truncated.
+            return None;
         };
         if !(first.is_whitespace() || first == '/' || first == '>') {
             rest = after_tag;
             continue;
         }
         let Some(end) = after_tag.find('>') else {
-            // An action tag with no closing `>` is truncated: block,
-            // fail-closed, rather than slipping past the dedup.
-            return true;
+            // An action tag with no closing `>` is truncated.
+            return None;
         };
         let tag = &after_tag[..end];
         if action_tag_type(tag).as_deref() == Some(action_type) {
@@ -492,18 +498,17 @@ pub(crate) fn request_block_matches_action(
                 // Self-closing: no children, so no target — the shape
                 // reads it as carrying nothing.
                 if shape.matches_action(None) {
-                    return true;
+                    return Some(true);
                 }
             } else {
                 let inner = &after_tag[end + 1..];
                 let Some(close) = inner.find("</action>") else {
                     // A type-matching action without a close tag is
-                    // malformed: block, fail-closed, rather than
-                    // letting the filing slip past the dedup.
-                    return true;
+                    // truncated.
+                    return None;
                 };
                 if shape.matches_action(Some(&inner[..close])) {
-                    return true;
+                    return Some(true);
                 }
                 rest = &inner[close + "</action>".len()..];
                 continue;
@@ -511,7 +516,7 @@ pub(crate) fn request_block_matches_action(
         }
         rest = &after_tag[end..];
     }
-    false
+    Some(false)
 }
 
 /// The `type` attribute of an `<action ...>` opening tag's text,
@@ -1083,6 +1088,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_submit_request_ids_truncated_action_is_malformed() {
+        // A type-matching action with no close tag is a malformed
+        // response, not a block: the parse fails so filing reports a
+        // server error instead of "already targets".
+        assert_eq!(
+            parse_submit_request_ids(
+                "<collection matches=\"1\"><request id=\"1\"><action type=\"submit\"><target project=\"b\" package=\"foo\" /></request></collection>"
+            ),
+            None
+        );
+        // An action tag with no closing `>` is truncated the same way.
+        assert_eq!(
+            parse_submit_request_ids(
+                "<collection matches=\"1\"><request id=\"1\"><action type=\"submit\"</request></collection>"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn parse_request_ids_collects_all_ids() {
         assert_eq!(
             parse_request_ids(
@@ -1295,36 +1320,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_request_ids_for_action_blocks_truncated_matching_action() {
-        // A type-matching action without a close tag is malformed: it
-        // blocks, fail-closed, rather than slipping past the dedup.
+    fn parse_request_ids_for_action_rejects_truncated_matching_action() {
+        // A type-matching action without a close tag is malformed:
+        // the parse fails instead of the id slipping past the dedup
+        // as a duplicate — the caller reports an unexpected response,
+        // not "already targets".
         let body = "<collection matches=\"1\"><request id=\"7\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" package=\"foo\" /></request></collection>";
-        assert_eq!(
-            parse_request_ids_for_action(body, "delete", ActionShape::Any).unwrap(),
-            vec!["7".to_string()]
-        );
+        assert!(parse_request_ids_for_action(body, "delete", ActionShape::Any).is_none());
     }
 
     #[test]
-    fn parse_request_ids_for_action_blocks_unterminated_action_tag() {
-        // An action tag with no closing `>` is truncated: it blocks,
-        // fail-closed, rather than slipping past the dedup.
+    fn parse_request_ids_for_action_rejects_unterminated_action_tag() {
+        // An action tag with no closing `>` is truncated: malformed,
+        // not a match.
         let body = "<collection matches=\"1\"><request id=\"7\" creator=\"alice\"><action type=\"delete\"</request></collection>";
-        assert_eq!(
-            parse_request_ids_for_action(body, "delete", ActionShape::Any).unwrap(),
-            vec!["7".to_string()]
-        );
+        assert!(parse_request_ids_for_action(body, "delete", ActionShape::Any).is_none());
     }
 
     #[test]
-    fn parse_request_ids_for_action_blocks_bare_action_tag_at_end() {
-        // The request ends with a bare `<action`: truncated — it
-        // blocks, fail-closed, rather than slipping past the dedup.
+    fn parse_request_ids_for_action_rejects_bare_action_tag_at_end() {
+        // The request ends with a bare `<action`: truncated —
+        // malformed, not a match.
         let body = "<collection matches=\"1\"><request id=\"7\" creator=\"alice\"><action</request></collection>";
-        assert_eq!(
-            parse_request_ids_for_action(body, "delete", ActionShape::Any).unwrap(),
-            vec!["7".to_string()]
-        );
+        assert!(parse_request_ids_for_action(body, "delete", ActionShape::Any).is_none());
     }
 
     #[test]

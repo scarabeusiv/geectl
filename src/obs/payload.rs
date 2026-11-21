@@ -322,7 +322,7 @@ fn validate_sr_xml(xml: &str) -> Result<(), GeectlError> {
             ));
         }
     }
-    if !request_block_matches_action(xml, "submit", ActionShape::Any) {
+    if request_block_matches_action(xml, "submit", ActionShape::Any) != Some(true) {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             "malformed SR XML: <action> is not type=\"submit\"",

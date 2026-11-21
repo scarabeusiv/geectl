@@ -18,7 +18,9 @@ use crate::error::GeectlError;
 /// malformed (missing source names, or no target). An empty
 /// collection reads as an empty list, not None. The report's target
 /// package carries the source project appended, colons intact; the
-/// parser translates `:` to `_`, matching the live branch name.
+/// parser translates `:` to `_`, matching the live branch name. A
+/// network name that is not a valid OBS name is malformed, never
+/// stored: an invalid target would only fail later, when reused.
 pub(crate) fn parse_maintained_instances(body: &str) -> Option<Vec<MaintainedInstance>> {
     if !body.contains("<collection") {
         return None;
@@ -60,6 +62,18 @@ pub(crate) fn parse_maintained_instances(body: &str) -> Option<Vec<MaintainedIns
         // the same — otherwise it would report a package name that
         // never lands.
         let target_package = tag_attr(target_tag, "package")?.replace(':', "_");
+        // Every network name is validated before it is stored: an
+        // invalid name from the server is a malformed report, not a
+        // listing to hand back.
+        if !valid_obs_name(&source_project)
+            || !valid_obs_name(&source_package)
+            || !valid_obs_name(&target_project)
+            || !valid_obs_name(&target_package)
+            || !devel_project.as_deref().is_none_or(valid_obs_name)
+            || !devel_package.as_deref().is_none_or(valid_obs_name)
+        {
+            return None;
+        }
         instances.push(MaintainedInstance {
             source_project,
             source_package,
@@ -77,7 +91,11 @@ pub(crate) fn parse_maintained_instances(body: &str) -> Option<Vec<MaintainedIns
 /// `<status code="ok"><data name="target_project">...</data>...`.
 /// `target_project` is required; the rest is present only for a
 /// single-package branch. None when the status is not ok or the
-/// target project is missing.
+/// target project is missing. A nameless or self-closing `<data>`
+/// element is skipped — the parser anticipates extensions, so an
+/// element it cannot read must not abort the whole parse — and a
+/// network name that is not a valid OBS name is malformed, never
+/// stored.
 pub(crate) fn parse_maintenance_branch_result(body: &str) -> Option<MaintenanceBranchResult> {
     if !parse_status_ok(body) {
         return None;
@@ -96,10 +114,19 @@ pub(crate) fn parse_maintenance_branch_result(body: &str) -> Option<MaintenanceB
         }
         let end = after_tag.find('>')?;
         let tag = &after_tag[..end];
-        let name = tag_attr(tag, "name")?;
+        if tag.trim_end().ends_with('/') {
+            // Self-closing: no value to read; skip the element.
+            rest = &after_tag[end + 1..];
+            continue;
+        }
         let inner = &after_tag[end + 1..];
         let close = inner.find("</data>")?;
         let value = &inner[..close];
+        // Nameless: skip the element instead of aborting the parse.
+        let Some(name) = tag_attr(tag, "name") else {
+            rest = &inner[close + "</data>".len()..];
+            continue;
+        };
         if !value.is_empty() {
             match name.as_str() {
                 "target_project" => target_project = Some(value.to_string()),
@@ -111,8 +138,19 @@ pub(crate) fn parse_maintenance_branch_result(body: &str) -> Option<MaintenanceB
         }
         rest = &inner[close + "</data>".len()..];
     }
+    // Every network name is validated before it is stored: an invalid
+    // name from the server is a malformed response, not a result to
+    // hand back.
+    let target_project = target_project?;
+    if !valid_obs_name(&target_project)
+        || !target_package.as_deref().is_none_or(valid_obs_name)
+        || !source_project.as_deref().is_none_or(valid_obs_name)
+        || !source_package.as_deref().is_none_or(valid_obs_name)
+    {
+        return None;
+    }
     Some(MaintenanceBranchResult {
-        target_project: target_project?,
+        target_project,
         target_package,
         source_project,
         source_package,
@@ -437,6 +475,22 @@ mod tests {
     }
 
     #[test]
+    fn maintained_instances_invalid_network_name_is_server_error() {
+        // A report naming a project that is not a valid OBS name is
+        // malformed, never a listing: the name would only fail later,
+        // when reused.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source?cmd=branch&attribute=OBS%3AMaintained&update_project_attribute=OBS%3AUpdateProject&package=foo&dryrun=1",
+            "<collection><package project=\"openSUSE:Leap:15.6:Update!\" package=\"foo\"><target project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.6:Update\" /></package></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .maintained_instances("foo", &MaintenanceBranchOptions::new())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
     fn parse_maintenance_branch_result_rejects_non_ok_and_missing_target() {
         assert!(parse_maintenance_branch_result(
             "<status code=\"error\"><summary>nope</summary></status>"
@@ -447,5 +501,44 @@ mod tests {
         )
         .is_none());
         assert!(parse_maintenance_branch_result("not xml").is_none());
+    }
+
+    #[test]
+    fn parse_maintenance_branch_result_rejects_an_invalid_network_name() {
+        // A target project that is not a valid OBS name is a
+        // malformed response, never a result.
+        assert!(parse_maintenance_branch_result(
+            "<status code=\"ok\"><data name=\"target_project\">home:alice:branches:foo bar</data></status>"
+        )
+        .is_none());
+        assert!(parse_maintenance_branch_result(
+            "<status code=\"ok\"><data name=\"target_project\">home:alice:branches:OBS_Maintained:foo</data><data name=\"package\">foo/bar</data></status>"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_maintenance_branch_result_skips_nameless_and_self_closing_data() {
+        // A nameless element and a self-closing element are skipped,
+        // not fatal: the target project still parses.
+        let parsed = parse_maintenance_branch_result(
+            "<status code=\"ok\"><data>unlabelled</data><data name=\"target_package\"/><data name=\"target_project\">home:alice:branches:OBS_Maintained:foo</data></status>",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            MaintenanceBranchResult {
+                target_project: "home:alice:branches:OBS_Maintained:foo".to_string(),
+                target_package: None,
+                source_project: None,
+                source_package: None,
+            }
+        );
+        // A self-closing target project carries no value, so the
+        // result is still missing its target.
+        assert!(parse_maintenance_branch_result(
+            "<status code=\"ok\"><data name=\"target_project\"/></status>"
+        )
+        .is_none());
     }
 }
