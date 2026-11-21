@@ -640,7 +640,7 @@ fn copy_package(
                 &args.source_project,
                 &args.source_package,
                 &args.target_project,
-                &target_package,
+                target_package,
                 &options,
                 &dry_run,
             )?;
@@ -1479,7 +1479,7 @@ mod tests {
 
     #[test]
     fn link_rev_set_table_carries_every_package_and_revision() {
-        let set = vec![
+        let set = [
             ("foo".to_string(), Some("1".to_string())),
             ("bar".to_string(), None),
         ];

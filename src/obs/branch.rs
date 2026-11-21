@@ -615,6 +615,10 @@ impl<'a> ObsClient<'a> {
     /// created (with the source's title and description) only when
     /// it does not exist yet; an existing target's meta is never
     /// overwritten. The target project must already exist.
+    // Eight arguments: `copy_package`'s seven, plus the target
+    // client. A coordinates struct would break the library's
+    // positional convention for exactly this one op.
+    #[allow(clippy::too_many_arguments)]
     pub fn copy_package_to_instance(
         &self,
         target: &ObsClient,

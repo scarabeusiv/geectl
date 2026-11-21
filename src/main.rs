@@ -69,7 +69,10 @@ enum Command {
     /// Branch, copy, and link packages.
     Branch {
         #[command(subcommand)]
-        command: cli_branch::BranchCommand,
+        // Boxed: the ten branch subcommands make BranchCommand far
+        // larger than the other variants (clippy::large_enum_variant).
+        // The integrator boxes each group's command the same way.
+        command: Box<cli_branch::BranchCommand>,
     },
 }
 
@@ -106,7 +109,7 @@ fn run(cli: Cli, debug: &Debug) -> Result<String, GeectlError> {
                 (payload, text)
             }
         },
-        Some(Command::Branch { command }) => cli_branch::run_branch(command, debug, cli.live)?,
+        Some(Command::Branch { command }) => cli_branch::run_branch(*command, debug, cli.live)?,
     };
     Ok(match cli.format {
         Format::Json => payload.to_string(),

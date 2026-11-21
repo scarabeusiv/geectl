@@ -27,9 +27,7 @@
 use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{
-    CopyOptions, DryRun, LinkOptions, ObsClient, SourceFile,
-};
+use geectl::obs::{CopyOptions, DryRun, LinkOptions, ObsClient, SourceFile};
 
 /// Whether `url` points at a loopback host.
 ///
@@ -401,7 +399,10 @@ fn live_cross_instance_copy() {
     for (name, expected) in [("hello.spec", spec.as_bytes()), ("data.bin", binary)] {
         let got = live_authed_get_bytes(&format!("{base_b}/source/{tgt_project}/foo/{name}"))
             .expect("download the copied file from instance B");
-        assert_eq!(got, expected, "the copied file {name} must read back byte-identical");
+        assert_eq!(
+            got, expected,
+            "the copied file {name} must read back byte-identical"
+        );
     }
     // The title and description travel with the package.
     let meta = live_authed_get(&format!("{base_b}/source/{tgt_project}/foo/_meta"))
@@ -445,7 +446,10 @@ fn live_cross_instance_copy() {
             &live,
         )
         .expect("copy the link package from instance A to instance B");
-    assert_eq!(link_result.copied_files, 2, "the link must expand to two files");
+    assert_eq!(
+        link_result.copied_files, 2,
+        "the link must expand to two files"
+    );
     assert_eq!(link_result.skipped_files, 0);
     let link_files = target
         .list_files(&tgt_project, "linkcopy")
@@ -468,10 +472,12 @@ fn live_cross_instance_copy() {
         "the expanded link copy must hold the same files with the same md5s"
     );
     for (name, expected) in [("hello.spec", spec.as_bytes()), ("data.bin", binary)] {
-        let got =
-            live_authed_get_bytes(&format!("{base_b}/source/{tgt_project}/linkcopy/{name}"))
-                .expect("download the expanded link file from instance B");
-        assert_eq!(got, expected, "the expanded link file {name} must read back byte-identical");
+        let got = live_authed_get_bytes(&format!("{base_b}/source/{tgt_project}/linkcopy/{name}"))
+            .expect("download the expanded link file from instance B");
+        assert_eq!(
+            got, expected,
+            "the expanded link file {name} must read back byte-identical"
+        );
     }
     // A missing target package maps to geectl's NotFound, not to a
     // generic failure: the error mapping is exercised against a real

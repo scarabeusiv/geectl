@@ -574,10 +574,7 @@ fn branch_dry_json(dir: &TempDir, args: &[&str]) -> serde_json::Value {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "args: {args:?}\nstderr: {stderr}"
-    );
+    assert!(out.status.success(), "args: {args:?}\nstderr: {stderr}");
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["dry_run"], true, "payload: {value}");
