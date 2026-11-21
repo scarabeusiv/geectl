@@ -635,13 +635,35 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
 /// `<entry>` missing a required attribute or carrying a non-numeric
 /// one — is a server error, never an empty history.
 pub(crate) fn parse_build_history(body: &str) -> Result<Vec<BuildHistoryEntry>, GeectlError> {
+    let body = body.trim();
+    // A malformed build history response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <buildhistory> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS build history response: not a <buildhistory> document",
+            format!(
+                "unexpected OBS build history response: not a <buildhistory> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <buildhistory> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <buildhistory>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<buildhistory") else {
         return Err(malformed());
     };
@@ -3097,6 +3119,54 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parse_build_history_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <buildhistory>
+        // element; the result is the same as without one.
+        let plain = "<buildhistory/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_build_history(&prolog).unwrap(),
+            parse_build_history(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_build_history(&format!("<?xml?>{plain}")).unwrap(),
+            parse_build_history(plain).unwrap()
+        );
+        assert_eq!(
+            parse_build_history(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_build_history(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <buildhistory>.
+        assert!(
+            parse_build_history("<?xml version=\"1.0\" <buildhistory></buildhistory>").is_err()
+        );
+        assert!(parse_build_history("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(
+            parse_build_history("<?xmlfoo version=\"1.0\"?><buildhistory></buildhistory>").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_build_history_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_build_history("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_build_history(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_build_history("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
