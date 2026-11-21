@@ -224,11 +224,34 @@ fn config_error(source: &str, err: GeectlError) -> GeectlError {
 /// whole keyring dumped into the file, say), not a secret.
 pub const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 
+/// Open `path` for reading without blocking on unix: a FIFO at the
+/// path has no writer, so a plain open would block until one arrives;
+/// `O_NONBLOCK` makes the open return at once, and the caller then
+/// refuses non-regular files before reading. For a regular file the
+/// flag is a no-op for reads. On non-unix this is a plain open.
+pub(crate) fn open_file_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
 /// Open a secret file in production and return its unix mode
 /// together with its contents. The file must be a regular file (not
 /// a device, pipe, or directory — reading those could block or
 /// return unbounded data) and at most [`MAX_SECRET_FILE_BYTES`]
-/// long. The size check is enforced while reading (`take(MAX + 1)`),
+/// long. The open itself is non-blocking on unix, so a FIFO at the
+/// path cannot block the open either: the regular-file check below
+/// refuses it before any read. The size check is enforced while
+/// reading (`take(MAX + 1)`),
 /// so a file that grows between the open and the read is still
 /// capped.
 ///
@@ -240,7 +263,9 @@ pub const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 /// after the open are both refused rather than silently read.
 pub fn open_secret_file_production(path: &Path) -> std::io::Result<(Option<u32>, String)> {
     use std::io::Read;
-    let file = std::fs::File::open(path)?;
+    // Non-blocking on unix, so a FIFO at the path cannot block the
+    // open; the regular-file check below refuses it before any read.
+    let file = open_file_nonblocking(path)?;
     let meta = file.metadata()?;
     #[cfg(unix)]
     let mode = {
@@ -1062,5 +1087,27 @@ mod tests {
     fn production_secret_opener_refuses_a_directory() {
         let err = open_secret_file_production(&std::env::temp_dir()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn production_secret_opener_does_not_block_on_a_fifo() {
+        // A FIFO with no writer blocks a plain open forever; the
+        // non-blocking open returns at once, and the regular-file
+        // check refuses it. If the open ever blocked, this test
+        // would hang rather than fail — that is the signal.
+        let path = std::env::temp_dir().join(format!(
+            "geectl-secret-fifo-{}-{}",
+            std::process::id(),
+            SECRET_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo must be available to create the test FIFO");
+        assert!(status.success(), "mkfifo must create the test FIFO");
+        let err = open_secret_file_production(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_file(&path);
     }
 }
