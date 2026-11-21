@@ -699,29 +699,30 @@ fn gitea_typed_call_emits_a_debug_attempt_line() {
     );
 }
 
-/// Create the mirrored `pool/systemd` source repo if it does not
-/// exist yet. Idempotent: a re-run against the same instance reuses
-/// the existing org/repo instead of failing on the duplicate — the
-/// fixed names cannot be unique per run, and that is the point of
-/// the mirror.
-fn ensure_pool_systemd(http: &UreqClient, base: &str) {
-    if http.get(&format!("{base}/api/v1/orgs/pool")).is_err() {
-        let body = serde_json::json!({ "username": "pool" }).to_string();
-        http.post_json(&format!("{base}/api/v1/orgs"), &body)
-            .expect("POST /api/v1/orgs creates the pool org");
-    }
-    if http
-        .get(&format!("{base}/api/v1/repos/pool/systemd"))
-        .is_err()
-    {
-        let body = serde_json::json!({
-            "name": "systemd",
-            "private": false,
-            "default_branch": "factory",
-        })
-        .to_string();
-        http.post_json(&format!("{base}/api/v1/orgs/pool/repos"), &body)
-            .expect("POST /api/v1/orgs/pool/repos creates pool/systemd");
+/// The mirrored `pool/systemd` fixture must already exist on the
+/// live instance: it is populated by `tests/gitea/populate-fixtures.sh`,
+/// which CI runs as its own step after provisioning (and the local
+/// gate runs before the test step). Fail clearly — naming the
+/// populate step — instead of creating the fixture inline, so a
+/// missing populate step can never silently pass as a passing
+/// mirror test.
+fn assert_pool_systemd_mirror(http: &UreqClient, base: &str) {
+    match http.get(&format!("{base}/api/v1/repos/pool/systemd")) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            panic!(
+                "pool/systemd is missing on the live Gitea instance: run \
+                 tests/gitea/populate-fixtures.sh after provisioning \
+                 (CI runs it as its own step; see tests/gitea/README.md)"
+            );
+        }
+        Err(e) => {
+            panic!(
+                "could not read pool/systemd from the live Gitea instance: {e}; \
+                 check the instance is up and the token is valid — the fixture \
+                 may exist, so this is not a missing-populate failure"
+            );
+        }
     }
 }
 
@@ -735,12 +736,14 @@ fn gitea_pool_systemd_layout_mirrored() {
     // The real layout, mirrored exactly: org `pool`, repo
     // `systemd`, default branch `factory` — fetched live
     // 2026-11-21 from https://src.opensuse.org (see the layout
-    // note in src/gitea.rs). The fork owner is the disposable
+    // note in src/gitea.rs) and populated by
+    // tests/gitea/populate-fixtures.sh, which runs as its own
+    // step after provisioning. The fork owner is the disposable
     // instance's own user, not a real forker: the token owner is
     // always the forker, and the instance has one user. The
     // clone/ssh URLs are the instance's own (the server derives
     // them from its base), so only their tails are asserted.
-    ensure_pool_systemd(&http, &base);
+    assert_pool_systemd_mirror(&http, &base);
     let client = typed_client(&http, &base);
     let source = client
         .repo_get("pool", "systemd")

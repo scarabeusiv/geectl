@@ -53,6 +53,11 @@ jobs:
       # and destroyed after the run.
       - name: Provision disposable Gitea instance
         run: bash tests/gitea/provision.sh
+      # Fixtures are a separate step from provisioning: the live
+      # tests assume pool/systemd exists and fail clearly when it
+      # does not, so a missing populate step cannot silently pass.
+      - name: Populate Gitea fixtures
+        run: bash tests/gitea/populate-fixtures.sh
       - name: Run the test suite
         env:
           # The live Gitea tests expect a provisioned instance in this

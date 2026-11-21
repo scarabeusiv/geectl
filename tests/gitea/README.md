@@ -23,6 +23,7 @@ commands, so it cannot track the pin.)
 
 ```sh
 CONTAINER=podman bash tests/gitea/provision.sh   # starts Gitea, creates the user + token
+bash tests/gitea/populate-fixtures.sh            # creates the pool/systemd mirror fixture
 GEECTL_GITEA_URL=http://127.0.0.1:3001 GEECTL_GITEA_TOKEN_FILE=tests/gitea/.gitea-token cargo test --locked --test gitea
 CONTAINER=podman bash tests/gitea/teardown.sh    # removes the container, volume, and token file
 ```
@@ -36,8 +37,9 @@ installed, so compose does not work there at all.
 
 `provision.sh` creates the test user (`geectl`, admin) and an API token
 with the minimal scopes the tests need
-(`read:user,read:repository,write:repository,write:user` — repo creation
-needs `write:user` as well as `write:repository`). The token is written
+(`read:user,read:repository,write:repository,write:user,write:organization` — repo creation
+needs `write:user` as well as `write:repository`; `write:organization` for the `pool` org
+the fixtures create and the cross-org fork-refusal test). The token is written
 to a 0600 file (`.gitea-token`, gitignored) and never printed. The
 instance is destroyed after the run, so the token never outlives it.
 
