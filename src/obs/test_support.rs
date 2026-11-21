@@ -16,6 +16,7 @@ pub(crate) struct FakeHttp {
     gets: RefCell<HashMap<String, String>>,
     get_sequences: RefCell<HashMap<String, VecDeque<String>>>,
     get_errors: RefCell<HashMap<String, ErrorKind>>,
+    get_error_sequences: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     posts: RefCell<HashMap<String, String>>,
     post_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     deletes: RefCell<HashMap<String, String>>,
@@ -35,6 +36,7 @@ impl FakeHttp {
             gets: RefCell::new(HashMap::new()),
             get_sequences: RefCell::new(HashMap::new()),
             get_errors: RefCell::new(HashMap::new()),
+            get_error_sequences: RefCell::new(HashMap::new()),
             posts: RefCell::new(HashMap::new()),
             post_errors: RefCell::new(HashMap::new()),
             deletes: RefCell::new(HashMap::new()),
@@ -76,6 +78,18 @@ impl FakeHttp {
 
     pub(crate) fn with_get_error(self, url: &str, kind: ErrorKind) -> Self {
         self.get_errors.borrow_mut().insert(url.to_string(), kind);
+        self
+    }
+
+    /// Answer the next GETs of `url` with these errors, in order;
+    /// once the queue is empty the canned `gets` body answers. The
+    /// GET twin of `with_post_error_sequence`: lets a test model a
+    /// resource that does not exist yet and then appears (a fork
+    /// pre-check 404 followed by the re-read 200).
+    pub(crate) fn with_get_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
+        self.get_error_sequences
+            .borrow_mut()
+            .insert(url.to_string(), kinds.iter().copied().collect());
         self
     }
 
@@ -158,6 +172,17 @@ impl HttpClient for FakeHttp {
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
         let authed = !matches!(credentials, Credentials::None);
         self.get_calls.borrow_mut().push((url.to_string(), authed));
+        if let Some(kind) = self
+            .get_error_sequences
+            .borrow_mut()
+            .get_mut(url)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Err(GeectlError::new(
+                kind,
+                format!("canned GET error for {url}"),
+            ));
+        }
         if let Some(kind) = self.get_errors.borrow().get(url).cloned() {
             return Err(GeectlError::new(
                 kind,

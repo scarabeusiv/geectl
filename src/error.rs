@@ -27,6 +27,11 @@ pub enum ErrorKind {
     ServerError,
     /// The caller's input is invalid (bad package/project name, bad flag).
     InvalidInput,
+    /// A resource with that name already exists (a fork, a repo). A
+    /// distinct, actionable state: reuse the existing resource, or
+    /// pick another name — not an invalid input and not a server
+    /// error.
+    AlreadyExists,
     /// A request exceeded its bounded timeout.
     Timeout,
     /// A network error that is not a timeout (DNS, connection refused).
@@ -47,6 +52,7 @@ impl ErrorKind {
             ErrorKind::AuthFailed => "auth_failed",
             ErrorKind::ServerError => "server_error",
             ErrorKind::InvalidInput => "invalid_input",
+            ErrorKind::AlreadyExists => "already_exists",
             ErrorKind::Timeout => "timeout",
             ErrorKind::NetworkError => "network_error",
             ErrorKind::TlsError => "tls_error",
@@ -62,6 +68,7 @@ impl ErrorKind {
             ErrorKind::AuthFailed => "authentication failed",
             ErrorKind::ServerError => "the server returned an error",
             ErrorKind::InvalidInput => "the input is invalid",
+            ErrorKind::AlreadyExists => "the resource already exists",
             ErrorKind::Timeout => "the request timed out",
             ErrorKind::NetworkError => "a network error occurred",
             ErrorKind::TlsError => "TLS verification failed",
@@ -79,6 +86,9 @@ impl ErrorKind {
             }
             ErrorKind::ServerError => "retry later; if it persists, the server is at fault",
             ErrorKind::InvalidInput => "fix the input and retry; see --help for the expected form",
+            ErrorKind::AlreadyExists => {
+                "reuse the existing resource, or pick another name and retry"
+            }
             ErrorKind::Timeout => "retry; if it persists, the server may be slow or unreachable",
             ErrorKind::NetworkError => "check the network and the server address, then retry",
             ErrorKind::TlsError => {
@@ -104,6 +114,7 @@ impl ErrorKind {
             ErrorKind::NetworkError => 7,
             ErrorKind::TlsError => 8,
             ErrorKind::ConfigError => 9,
+            ErrorKind::AlreadyExists => 10,
         }
     }
 
@@ -114,6 +125,7 @@ impl ErrorKind {
             ErrorKind::AuthFailed,
             ErrorKind::ServerError,
             ErrorKind::InvalidInput,
+            ErrorKind::AlreadyExists,
             ErrorKind::Timeout,
             ErrorKind::NetworkError,
             ErrorKind::TlsError,

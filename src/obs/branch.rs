@@ -108,6 +108,42 @@ pub(crate) fn parse_branch_result(body: &str) -> Option<BranchResult> {
     })
 }
 
+/// Parse the `<status code="ok">` answer to a `cmd=fork` POST into a
+/// [`BranchResult`]. Like [`parse_branch_result`], except a project
+/// fork (package `"_project"`) answers only `targetproject` /
+/// `sourceproject` — the server's `create_fork` returns no package
+/// names for it — so the package fields default to `"_project"`
+/// there, while a package fork without them is malformed and
+/// returns `None`.
+pub(crate) fn parse_fork_result(body: &str, package: &str) -> Option<BranchResult> {
+    if !parse_status_ok(body) {
+        return None;
+    }
+    let target_project =
+        status_data(body, "target_project").or_else(|| status_data(body, "targetproject"))?;
+    let source_project =
+        status_data(body, "project").or_else(|| status_data(body, "sourceproject"))?;
+    let is_project_fork = package == "_project";
+    let target_package =
+        match status_data(body, "target_package").or_else(|| status_data(body, "targetpackage")) {
+            Some(name) => name,
+            None if is_project_fork => "_project".to_string(),
+            None => return None,
+        };
+    let source_package =
+        match status_data(body, "package").or_else(|| status_data(body, "sourcepackage")) {
+            Some(name) => name,
+            None if is_project_fork => "_project".to_string(),
+            None => return None,
+        };
+    Some(BranchResult {
+        source_project,
+        source_package,
+        target_project,
+        target_package,
+    })
+}
+
 /// The option suffix for a copy plan line: the set options, in the
 /// order they appear in [`CopyOptions`], so a dry-run plan reads what
 /// the copy would have done.
@@ -452,6 +488,75 @@ impl<'a> ObsClient<'a> {
             None => Err(GeectlError::new(
                 ErrorKind::ServerError,
                 format!("unexpected OBS branch response for package {project}/{package}"),
+            )),
+        }
+    }
+
+    /// Fork a git-backed package on OBS (`POST
+    /// /source/<project>/<package>?cmd=fork&scmsync=<url>`): the
+    /// server creates the target package (or project, for package
+    /// `"_project"`) wired to the fork's scmsync URL, with no source
+    /// copy — the sync backend clones the URL. Requires OBS
+    /// credentials; without them the call fails loudly before any
+    /// request. This is the OBS half of the `branch` composite
+    /// (`GiteaClient::branch`); it is not a standalone operation,
+    /// so it carries no DryRun of its own — the composite's guard
+    /// runs first and the composite never calls this in dry-run.
+    /// `target_project` / `target_package` are omitted when `None`,
+    /// so the server applies its defaults (`home:<user>:branches:<project>`
+    /// and the package name); the answer names the actual targets.
+    pub(crate) fn fork_package(
+        &self,
+        project: &str,
+        package: &str,
+        scmsync: &str,
+        target_project: Option<&str>,
+        target_package: Option<&str>,
+    ) -> Result<BranchResult, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if let Some(target) = target_project {
+            if !valid_obs_name(target) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS target project name: {target:?}"),
+                ));
+            }
+        }
+        if let Some(target) = target_package {
+            if !valid_obs_name(target) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS target package name: {target:?}"),
+                ));
+            }
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot fork a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("cmd", "fork"), ("scmsync", scmsync)];
+        if let Some(target_project) = target_project {
+            query.push(("target_project", target_project));
+        }
+        if let Some(target_package) = target_package {
+            query.push(("target_package", target_package));
+        }
+        let url = build_url(&self.base, &["source", project, package], &query);
+        let body = self.http.post(&url, "", &self.credentials)?;
+        match parse_fork_result(&body, package) {
+            Some(result) => Ok(result),
+            None => Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS fork response for package {project}/{package}"),
             )),
         }
     }
@@ -2115,6 +2220,58 @@ mod tests {
             None
         );
         assert_eq!(parse_branch_result(""), None);
+    }
+
+    #[test]
+    fn parse_fork_result_parses_a_package_fork() {
+        // The shape mirrors the real fork of jengelh/descent3:
+        // the OBS fork of games/descent3 lands in
+        // home:fbui:branches:games (see the layout note in
+        // src/gitea.rs).
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"targetproject\">home:fbui:branches:games</data>\
+            <data name=\"targetpackage\">descent3</data>\
+            <data name=\"sourceproject\">games</data>\
+            <data name=\"sourcepackage\">descent3</data></status>";
+        assert_eq!(
+            parse_fork_result(body, "descent3"),
+            Some(BranchResult {
+                source_project: "games".to_string(),
+                source_package: "descent3".to_string(),
+                target_project: "home:fbui:branches:games".to_string(),
+                target_package: "descent3".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_fork_result_defaults_a_project_fork_to_project() {
+        // A project fork answers only targetproject /
+        // sourceproject — no package names at all. The shape
+        // mirrors the real fork of the network:messaging:xmpp
+        // project.
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"targetproject\">home:fbui:branches:network:messaging:xmpp</data>\
+            <data name=\"sourceproject\">network:messaging:xmpp</data></status>";
+        assert_eq!(
+            parse_fork_result(body, "_project"),
+            Some(BranchResult {
+                source_project: "network:messaging:xmpp".to_string(),
+                source_package: "_project".to_string(),
+                target_project: "home:fbui:branches:network:messaging:xmpp".to_string(),
+                target_package: "_project".to_string(),
+            })
+        );
+        // The same answer for a package fork is malformed: the
+        // package names are missing, not defaulted.
+        assert_eq!(parse_fork_result(body, "test-pkgA"), None);
+        assert_eq!(
+            parse_fork_result(
+                "<status code=\"error\"><summary>nope</summary></status>",
+                "_project"
+            ),
+            None
+        );
     }
 
     #[test]
