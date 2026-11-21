@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_package_rejects_repositories_block_without_add_repositories() {
+    fn branch_package_rejects_repositories_options_without_add_repositories() {
         // A block/rebuild the live run would silently drop must fail
         // at parse time: the options are only sent with
         // `--add-repositories`.

@@ -19,10 +19,15 @@
 //! `tests/live_obs.rs` does): one copy per live test target, since
 //! integration targets cannot share modules. Their unit tests live
 //! in `tests/live.rs` and are not duplicated here — the code is
-//! identical, so testing it twice adds no signal. The same
-//! loopback-only, ephemeral-instance, ephemeral-credential rules
-//! apply (see `tests/live.rs`): the instances are plain HTTP on
-//! localhost, and the bootstrap admin credentials go only to them.
+//! identical, so testing it twice adds no signal — with one
+//! exception: the local `validate_live_base` also rejects a
+//! non-decimal or out-of-range port, which `live.rs` does not check.
+//! This target needs it: `live_instance_key` maps a missing port to
+//! 80, and without the check a garbage port would silently key as
+//! 80. The same loopback-only, ephemeral-instance,
+//! ephemeral-credential rules apply (see `tests/live.rs`): the
+//! instances are plain HTTP on localhost, and the bootstrap admin
+//! credentials go only to them.
 
 use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
@@ -137,6 +142,29 @@ fn validate_live_base(raw: &str) -> Result<String, String> {
             "must be a loopback URL (http://127.0.0.1, http://localhost, or http://[::1]); got {shown}"
         ));
     }
+    // A `:port`, when present, must be decimal and in range:
+    // `http://127.0.0.1:abc` names no server, and the instance key
+    // in `live_urls` maps a missing port to 80 — without this check
+    // a garbage port would silently key as 80 and the inequality
+    // check would blame the wrong URL. (`live.rs` does not check
+    // the port; this target needs the check, see the module docs.)
+    // The authority is bare (no path/query/fragment) at this point.
+    // A bracketed host (`[::1]`) carries its colons inside the
+    // brackets, so the port splits off after the closing bracket.
+    let port = if let Some(bracketed) = after_scheme.strip_prefix('[') {
+        bracketed
+            .split_once(']')
+            .and_then(|(_, rest)| rest.strip_prefix(':'))
+    } else {
+        after_scheme.split_once(':').map(|(_, port)| port)
+    };
+    if let Some(port) = port {
+        if port.parse::<u16>().is_err() {
+            return Err(format!(
+                "port must be a decimal number (0-65535); got {shown}"
+            ));
+        }
+    }
     Ok(url)
 }
 
@@ -148,8 +176,9 @@ fn validate_live_base(raw: &str) -> Result<String, String> {
 /// `http://localhost:3000` are one instance, not two. A bracketed
 /// host (`[::1]`) carries its colons inside the brackets, so the
 /// port splits off after the closing bracket, not at the first `:`.
-/// The URLs are already validated bare by `validate_live_base`
-/// when this runs.
+/// The URLs are already validated bare — loopback host, decimal
+/// port when present — by `validate_live_base` when this runs, so
+/// a missing port is the only reason the fallback to 80 fires.
 fn live_instance_key(url: &str) -> (String, u16) {
     let authority = url.strip_prefix("http://").unwrap_or(url);
     let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
@@ -554,9 +583,23 @@ mod tests {
             live_instance_key("http://[::1]:3000"),
             ("127.0.0.1".to_string(), 3000)
         );
+        // A missing port is 80 — the only case the fallback may
+        // fire for, since `validate_live_base` rejects a garbage
+        // port before this runs.
+        assert_eq!(
+            live_instance_key("http://127.0.0.1"),
+            ("127.0.0.1".to_string(), 80)
+        );
         assert_ne!(
             live_instance_key("http://127.0.0.1:3000"),
             live_instance_key("http://127.0.0.1:3001")
         );
+        // A garbage port never reaches the key: it is rejected at
+        // the boundary, not silently coerced to 80.
+        assert!(validate_live_base("http://127.0.0.1:abc").is_err());
+        assert!(validate_live_base("http://127.0.0.1:99999").is_err());
+        assert!(validate_live_base("http://127.0.0.1:3000:4000").is_err());
+        assert!(validate_live_base("http://127.0.0.1:3000").is_ok());
+        assert!(validate_live_base("http://127.0.0.1").is_ok());
     }
 }
