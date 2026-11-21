@@ -4916,3 +4916,232 @@ fn set_project_meta(base: &str, project: &str, meta: &str) {
         "PUT project meta for {project} did not return <status code=\"ok\"/>; body: {body}"
     );
 }
+
+/// The services batch live tests: the two read-only operations
+/// against the live instance. The instance's backend image may not
+/// ship the service binaries, so no test asserts a live service RUN:
+/// the positive live cases are round-trips of the stored `_service`
+/// text, and the state cases read whatever the server recorded
+/// (none on a fresh package).
+const LIVE_SERVICE_MIXED: &str = r#"<services>
+  <service name="download_url" mode="manual">
+    <param name="host">example.com</param>
+    <param name="protocol">https</param>
+    <param name="query">a&amp;b</param>
+  </service>
+  <service name="set_version" mode="trylocal">
+    <param name="file">version.txt</param>
+    <param name="empty"></param>
+    <param name="blank"/>
+  </service>
+  <service name="tar_scm" mode="disabled"/>
+  <service name="obs_scm" mode="buildtime">
+    <param name="url">https://example.com/repo.git</param>
+  </service>
+  <service name="format_spec_file">
+    <param name="files">*.spec</param>
+  </service>
+  <service name="run_source_validator" mode="serveronly"/>
+</services>
+"#;
+
+/// The `osc` invalid-`_service` fixture, exact bytes: well-formed
+/// XML whose "invalid" is execution-time, so the typed view returns
+/// the definition.
+const LIVE_SERVICE_INVALID_OSC: &str = "<services>\n  <service name=\"set_version\" mode=\"manual\">\n    <param name=\"fromfile\">invalid</param>\n  </service>\n</services>\n";
+
+/// The stored `_service` text round-trips as typed definitions:
+/// all six modes, parameters verbatim including empty values and an
+/// entity.
+#[test]
+fn live_list_services_round_trips_stored_file() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "_service",
+            LIVE_SERVICE_MIXED,
+            &DryRun::new(false),
+        )
+        .expect("upload _service on the live instance");
+    let public = live_client(&base);
+    let services = public
+        .list_services(&source_project, &package)
+        .expect("list services on the live instance")
+        .expect("the uploaded _service must be present");
+    assert_eq!(services.len(), 6);
+    assert_eq!(services[0].name, "download_url");
+    assert_eq!(services[0].mode, "manual");
+    assert_eq!(services[0].params[2].value, "a&b");
+    assert_eq!(services[1].name, "set_version");
+    assert_eq!(services[1].mode, "trylocal");
+    assert_eq!(services[1].params[1].value, "");
+    assert_eq!(services[1].params[2].value, "");
+    assert_eq!(services[2].mode, "disabled");
+    assert_eq!(services[3].mode, "buildtime");
+    assert_eq!(services[4].name, "format_spec_file");
+    assert_eq!(services[4].mode, "");
+    assert_eq!(services[5].mode, "serveronly");
+}
+
+// No live round-trip for an unknown mode: the server rejects the
+// upload with 400, so no such file can be stored via upload;
+// the parse is covered by `unknown_mode_is_stored_verbatim`.
+
+/// The `osc` invalid fixture parses on the live instance too: its
+/// failure is a service run failing, not a parse failure.
+#[test]
+fn live_list_services_osc_fixture_parses() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "_service",
+            LIVE_SERVICE_INVALID_OSC,
+            &DryRun::new(false),
+        )
+        .expect("upload the osc fixture _service on the live instance");
+    let public = live_client(&base);
+    let services = public
+        .list_services(&source_project, &package)
+        .expect("list services on the live instance")
+        .expect("the uploaded _service must be present");
+    assert_eq!(services.len(), 1);
+    assert_eq!(services[0].name, "set_version");
+    assert_eq!(services[0].mode, "manual");
+    assert_eq!(services[0].params[0].value, "invalid");
+}
+
+/// A package with no `_service` file reads back as none.
+#[test]
+fn live_list_services_none_without_service_file() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let public = live_client(&base);
+    assert_eq!(
+        public
+            .list_services(&source_project, &package)
+            .expect("list services on the live instance"),
+        None
+    );
+}
+
+/// A missing package is NotFound, not "no _service file".
+#[test]
+fn live_list_services_missing_package_is_not_found() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let public = live_client(&base);
+    assert_eq!(
+        public
+            .list_services(&source_project, "no-such-package")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// The project's own `_service` file reads back the same way.
+/// No `<link>` element here: the server rejects a link-bearing
+/// `_service` upload with 400, so the link skip is covered by the
+/// `project_link_is_skipped_not_a_service` unit test. The read uses
+/// the authed client: the project `_service` has no public route.
+#[test]
+fn live_list_services_on_project_reads_project_file() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let project_service =
+        "<services>\n  <service name=\"download_url\" mode=\"manual\">\n    <param name=\"host\">example.com</param>\n  </service>\n</services>\n";
+    authed
+        .upload_file(
+            &source_project,
+            "_project",
+            "_service",
+            project_service,
+            &DryRun::new(false),
+        )
+        .expect("upload the project _service on the live instance");
+    let services = authed
+        .list_services(&source_project, "_project")
+        .expect("list project services on the live instance")
+        .expect("the uploaded project _service must be present");
+    assert_eq!(services.len(), 1);
+    assert_eq!(services[0].name, "download_url");
+}
+
+/// A fresh package carries no service run: the state is none.
+#[test]
+fn live_service_state_none_on_fresh_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let public = live_client(&base);
+    assert_eq!(
+        public
+            .service_state(&source_project, &package)
+            .expect("read service state on the live instance"),
+        None
+    );
+}
+
+/// A missing package is NotFound, not "no service run".
+#[test]
+fn live_service_state_missing_package_is_not_found() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let public = live_client(&base);
+    assert_eq!(
+        public
+            .service_state(&source_project, "no-such-package")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// Probe (P4): the project's own service state has no asserted
+/// expectation until observed — the outcome is printed for the run
+/// log, whatever it is. The probe uses the authed client: the
+/// project listing has no public route.
+#[test]
+fn live_service_state_on_project_probe() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let outcome = authed.service_state(&source_project, "_project");
+    eprintln!("P4 probe: service_state on _project returned {outcome:?}");
+}
