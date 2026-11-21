@@ -68,7 +68,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
-use geectl::http::{HttpClient, Timeout, UreqClient};
+use geectl::http::{sanitize_url_for_error, HttpClient, Timeout, UreqClient};
 use geectl::obs::{
     AggregateOptions, BranchOptions, CopyOptions, CopyProjectOptions, CreatePackageOptions,
     DeleteProjectOptions, DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision,
@@ -139,7 +139,21 @@ fn validate_live_base(raw: &str) -> Result<String, String> {
     // bare-base violation instead of a scheme violation.
     if !url.starts_with("http://") {
         return Err(format!(
-            "must be an http:// URL (the live instance is plain HTTP on loopback); got {raw}"
+            "must be an http:// URL (the live instance is plain HTTP on loopback); got {}",
+            sanitize_url_for_error(&url)
+        ));
+    }
+    // Credentials go through the auth provider, never the URL: a base
+    // carrying userinfo is rejected outright, before any other check
+    // could report it.
+    let after_scheme = url.strip_prefix("http://").unwrap_or(&url);
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    if after_scheme[..authority_end].contains('@') {
+        return Err(format!(
+            "must not contain userinfo (credentials go through the auth provider, not the URL); got {}",
+            sanitize_url_for_error(&url)
         ));
     }
     // The base must be bare (scheme + authority only): the tests
@@ -147,15 +161,16 @@ fn validate_live_base(raw: &str) -> Result<String, String> {
     // query, or fragment would double the path or silently drop it.
     // Reject at the boundary with a clear message, not a confusing
     // loopback-assert failure downstream.
-    let after_scheme = url.strip_prefix("http://").unwrap_or(&url);
     if after_scheme.contains(['/', '?', '#']) {
         return Err(format!(
-            "must be a bare base URL (http://127.0.0.1:3000), with no path, query, or fragment; got {raw}"
+            "must be a bare base URL (http://127.0.0.1:3000), with no path, query, or fragment; got {}",
+            sanitize_url_for_error(&url)
         ));
     }
     if !is_loopback_url(&url) {
         return Err(format!(
-            "must be a loopback URL (http://127.0.0.1, http://localhost, or http://[::1]); got {raw}"
+            "must be a loopback URL (http://127.0.0.1, http://localhost, or http://[::1]); got {}",
+            sanitize_url_for_error(&url)
         ));
     }
     Ok(url)
@@ -3412,6 +3427,26 @@ mod tests {
         // Non-loopback is rejected, including behind userinfo.
         assert!(validate_live_base("http://example.com").is_err());
         assert!(validate_live_base("http://127.0.0.1:80@evil.com").is_err());
+        // A userinfo-bearing loopback base is rejected outright:
+        // credentials go through the auth provider, never the URL.
+        assert!(validate_live_base("http://user:pass@127.0.0.1:3000").is_err());
+        // No error reason echoes credentials: the userinfo is
+        // stripped from the reported URL.
+        let userinfo_err = validate_live_base("http://user:s3cret@127.0.0.1:3000").unwrap_err();
+        assert!(
+            !userinfo_err.contains("s3cret"),
+            "an error reason must not echo credentials; got {userinfo_err}"
+        );
+        assert!(
+            userinfo_err.contains("http://127.0.0.1:3000"),
+            "the stripped URL is still reported; got {userinfo_err}"
+        );
+        let userinfo_scheme_err =
+            validate_live_base("https://user:s3cret@127.0.0.1:3000").unwrap_err();
+        assert!(
+            !userinfo_scheme_err.contains("s3cret"),
+            "a scheme error must not echo credentials; got {userinfo_scheme_err}"
+        );
         // A non-http URL reports a scheme error, not a bare-base one:
         // the bare-base check would otherwise see the `//` in `https://`.
         let scheme_err = validate_live_base("https://127.0.0.1:3000").unwrap_err();
