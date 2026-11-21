@@ -130,7 +130,10 @@ impl ErrorKind {
 pub struct GeectlError {
     pub kind: ErrorKind,
     /// Context for this instance (e.g. the URL, the package name). May be
-    /// empty. Never contains a credential or raw document content.
+    /// empty. Never contains a credential. A malformed server response
+    /// may carry a bounded, redacted preview of what was received
+    /// (see `debug::format_body_preview`), so the failure is
+    /// diagnosable; never an unbounded document.
     /// `to_json()` omits it when empty; there is no serde field attribute
     /// here because `Serialize` is implemented manually (see below).
     pub context: String,
