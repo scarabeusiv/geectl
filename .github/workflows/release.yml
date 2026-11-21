@@ -125,11 +125,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Derive the release toolchain from Cargo.toml `rust-version` —
+      # the single source of truth; updating `rust-version` is the one
+      # line that moves the release toolchain. rust-toolchain.toml says
+      # `stable`, which outranks the rustup default the dtolnay action
+      # sets, so export the derived version as RUSTUP_TOOLCHAIN to make
+      # it stick. $GITHUB_ENV, not job-level env: job-level env cannot
+      # see step outputs. Same extraction as the freshcrab release
+      # derivation.
+      - name: Derive the release toolchain from Cargo.toml
+        id: toolchain
+        run: |
+          toolchain=$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$toolchain" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          # Pinned, not floating stable: release artifacts must be
-          # reproducible; bump deliberately (matches rust-toolchain.toml).
-          toolchain: 1.99.1
+          # Derived from Cargo.toml rust-version, not floating stable:
+          # release artifacts must be reproducible.
+          toolchain: ${{ steps.toolchain.outputs.toolchain }}
       # Releases are built hermetically — no cargo cache, so restored build
       # state can never influence published artifacts.
       - name: Build
@@ -375,10 +390,20 @@ jobs:
           else
             echo "main already carries $current; nothing to bump"
           fi
+      # Same derivation as the build job, for the same reason: the
+      # lockfile the bump writes must come from the release toolchain.
+      - name: Derive the release toolchain from Cargo.toml
+        id: toolchain
+        if: steps.current.outputs.bump
+        run: |
+          toolchain=$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$toolchain" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         if: steps.current.outputs.bump
         with:
-          toolchain: 1.99.1
+          toolchain: ${{ steps.toolchain.outputs.toolchain }}
       - name: Bump every version surface
         if: steps.current.outputs.bump
         env:
