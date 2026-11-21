@@ -206,6 +206,27 @@ pub trait HttpClient {
         body: &str,
         credentials: &Credentials,
     ) -> Result<String, GeectlError>;
+    /// PUT a binary body as `application/octet-stream` (a source file
+    /// in a package whose content is not UTF-8 text). The byte
+    /// counterpart of [`HttpClient::put_file`]: same transport guard,
+    /// same retry policy — but the body is bytes, not a string, so a
+    /// binary file (a tarball, an RPM) survives the transfer instead
+    /// of failing the UTF-8 check a text body would hit. The default
+    /// implementation refuses: a client that only PUTs text cannot
+    /// upload binaries, and a caller that needs bytes gets an honest
+    /// error instead of a mojibake upload. [`UreqClient`] overrides it.
+    fn put_bytes(
+        &self,
+        url: &str,
+        body: &[u8],
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        let _ = (url, body, credentials);
+        Err(GeectlError::new(
+            ErrorKind::InternalError,
+            "this HTTP client cannot upload binary bodies",
+        ))
+    }
     fn delete(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
 }
 
@@ -753,12 +774,13 @@ impl UreqClient {
         }
     }
 
-    fn put_with_content_type(
+    fn put_with_content_type_body(
         &self,
         url: &str,
-        body: &str,
+        body: &[u8],
         content_type: &str,
         credentials: &Credentials,
+        debug_request_body: impl Fn(&Self),
     ) -> Result<String, GeectlError> {
         // PUT is idempotent (re-PUTting the same `_meta` returns the
         // same 200; re-PUTting the same file stores the same bytes),
@@ -769,6 +791,15 @@ impl UreqClient {
         // atomically — so unlike DELETE there is no 404 ambiguity on
         // retry. A file retry records a second revision with identical
         // content; the bytes on the server are the same either way.
+        //
+        // The loop is shared by the text and byte callers
+        // (`put_with_content_type` / `put_bytes_with_content_type`):
+        // the body is always bytes — a text body arrives as
+        // `body.as_bytes()` — and the caller supplies the per-attempt
+        // debug line for the request body, because the loop never
+        // looks at the body: a text preview, or a byte-count marker
+        // for binary. The response is always text (a revision
+        // document), so the response handling is shared unchanged.
         require_credentials_transport(url, credentials)?;
         let mut last_error: Option<GeectlError> = None;
         let mut last_desc = String::new();
@@ -784,7 +815,7 @@ impl UreqClient {
                 .header("Content-Type", content_type)
                 .header("Accept", "application/xml");
             let request = self.apply_auth(request, credentials)?;
-            self.debug_body("request", "PUT", url, body);
+            debug_request_body(self);
             match request.send(body) {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
@@ -951,6 +982,45 @@ impl UreqClient {
         Err(last_error.unwrap_or_else(|| {
             GeectlError::new(ErrorKind::InternalError, "PUT failed without an error")
         }))
+    }
+
+    /// PUT a text body with an explicit content type: the text caller
+    /// of the shared retry loop. The request body gets its preview
+    /// in the `--debug-body` channel, like every text mutation.
+    fn put_with_content_type(
+        &self,
+        url: &str,
+        body: &str,
+        content_type: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        self.put_with_content_type_body(url, body.as_bytes(), content_type, credentials, |this| {
+            this.debug_body("request", "PUT", url, body);
+        })
+    }
+
+    /// PUT a binary body with an explicit content type: the byte
+    /// caller of the shared retry loop. The request body is never
+    /// dumped to the `--debug-body` channel — it is not text, and a
+    /// preview would be mojibake at best; the channel records the
+    /// byte count only. The response is still text (a revision
+    /// document), so its preview is shared with the text caller.
+    fn put_bytes_with_content_type(
+        &self,
+        url: &str,
+        body: &[u8],
+        content_type: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        self.put_with_content_type_body(url, body, content_type, credentials, |this| {
+            if this.debug.bodies_enabled() {
+                this.debug.emit(&format!(
+                    "http: PUT {} request body ({} bytes): <binary, not shown>",
+                    crate::debug::url_path(url),
+                    body.len()
+                ));
+            }
+        })
     }
 }
 
@@ -1236,6 +1306,15 @@ impl HttpClient for UreqClient {
         credentials: &Credentials,
     ) -> Result<String, GeectlError> {
         self.put_with_content_type(url, body, "application/octet-stream", credentials)
+    }
+
+    fn put_bytes(
+        &self,
+        url: &str,
+        body: &[u8],
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        self.put_bytes_with_content_type(url, body, "application/octet-stream", credentials)
     }
 
     fn delete(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
@@ -2634,6 +2713,63 @@ mod tests {
         assert_eq!(
             client
                 .put_file(&url, "Name: foo\n", &Credentials::None)
+                .unwrap(),
+            "<status code=\"ok\" />"
+        );
+        handle.join().expect("server thread");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn put_bytes_sends_octet_stream_body_verbatim() {
+        let server = LoopbackServer::serve("<revision>1</revision>");
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        // Bytes a text body could not carry in the general case — a
+        // NUL byte and a multi-byte UTF-8 sequence — but still valid
+        // UTF-8, so the loopback server's lossy recording preserves
+        // them exactly (a non-UTF-8 byte flow is pinned at the
+        // FakeHttp level, where the recorded body is a Vec<u8>, not
+        // a String).
+        let body: &[u8] = b"PK\x03\x04\x00binary\xc3\xa9";
+        assert_eq!(
+            client
+                .put_bytes(&server.url(), body, &Credentials::None)
+                .unwrap(),
+            "<revision>1</revision>"
+        );
+        let request = server.request().expect("server recorded the request");
+        assert!(
+            request.starts_with("PUT /test HTTP/1.1\r\n"),
+            "PUT method line wrong; request: {request}"
+        );
+        assert!(
+            request
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("content-type: application/octet-stream")),
+            "PUT bytes must carry Content-Type: application/octet-stream; request: {request}"
+        );
+        let sent_body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("request has a body");
+        assert_eq!(sent_body.as_bytes(), body);
+    }
+
+    #[test]
+    fn put_bytes_retries_after_500() {
+        // A 500 on the first attempt must be retried, and the retry
+        // must return the 200 body: PUT is idempotent (re-PUTting the
+        // same file stores the same bytes), so like `put_file` a
+        // transient failure cannot corrupt anything. The retry
+        // records a second revision with identical content on a real
+        // server; the counting server here only proves the retry
+        // happens.
+        let (port, count, handle) = serve_500_then_ok();
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/source/home:alice/foo/foo.bin");
+        assert_eq!(
+            client
+                .put_bytes(&url, b"PK\x03\x04", &Credentials::None)
                 .unwrap(),
             "<status code=\"ok\" />"
         );

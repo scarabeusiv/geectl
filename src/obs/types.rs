@@ -270,6 +270,12 @@ pub(crate) struct DirectoryListing {
     /// `(project, package)` from `<linkinfo project package/>`, when
     /// the listing carries one.
     pub linkinfo: Option<(String, String)>,
+    /// Source md5 of the listing (`srcmd5` attribute on the
+    /// `<directory>` element), when the listing carries one. It pins
+    /// the expanded revision the entries belong to: a download at
+    /// this srcmd5 reads exactly the files listed, never a newer
+    /// revision that landed between the listing and the download.
+    pub srcmd5: Option<String>,
 }
 
 /// One entry in a package's history (`<revision>` in
@@ -556,6 +562,24 @@ pub struct BranchResult {
     pub target_project: String,
     /// The branch package name.
     pub target_package: String,
+}
+
+/// The result of [`ObsClient::copy_package_to_instance`]: the target
+/// revision when files were uploaded, plus how many files were
+/// copied and how many were already identical on the target.
+/// `_link` and `_service:` entries are excluded from both counts:
+/// they are never copied, so they are neither copied nor skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossInstanceCopyResult {
+    /// The target revision after the copy, or None when nothing was
+    /// uploaded: in dry-run, or when every file was already
+    /// identical on the target.
+    pub revision: Option<u64>,
+    /// Files downloaded from the source and uploaded to the target.
+    pub copied_files: usize,
+    /// Files already identical on the target (same name and md5),
+    /// skipped without a download.
+    pub skipped_files: usize,
 }
 
 /// Options for [`ObsClient::delete_project`]. All fields are
