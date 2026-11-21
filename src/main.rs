@@ -15,6 +15,8 @@ use serde_json::json;
 use std::io::Write;
 use std::process::ExitCode;
 
+mod cli_remote;
+
 /// The output format. JSON is the default; it is the only format an agent
 /// should parse. `text` is a human-readable rendering of the same data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -60,6 +62,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Remote reads: inspect what the distribution holds.
+    Remote {
+        #[command(subcommand)]
+        command: cli_remote::RemoteCommand,
+    },
 }
 
 /// The `config` subcommands.
@@ -73,7 +80,7 @@ enum ConfigCommand {
     Init,
 }
 
-fn run(cli: Cli) -> Result<String, GeectlError> {
+fn run(cli: Cli, debug: &Debug) -> Result<String, GeectlError> {
     let (payload, text) = match cli.command {
         Some(Command::Version) | None => {
             let payload = json!({
@@ -95,6 +102,7 @@ fn run(cli: Cli) -> Result<String, GeectlError> {
                 (payload, text)
             }
         },
+        Some(Command::Remote { command }) => cli_remote::run_remote(command, debug)?,
     };
     Ok(match cli.format {
         Format::Json => payload.to_string(),
@@ -292,55 +300,134 @@ fn render_config_init_text(payload: &serde_json::Value) -> String {
     format!("created {}", payload["config_file"].as_str().unwrap_or(""))
 }
 
-/// Write a payload to stdout. A closed pipe (`BrokenPipe`, e.g. the
-/// output piped to `head`) is not an error — the consumer just stopped
-/// reading. Any other write failure is an internal error. `println!`
-/// would panic on either; this is the single stdout writer.
+/// Write a payload to stdout, terminated with a trailing newline
+/// (an empty payload writes nothing).
+/// A closed pipe (`BrokenPipe`, e.g. the output piped to `head`) is
+/// not an error — the consumer just stopped reading. Any other write
+/// failure is an internal error. `println!` would panic on either;
+/// this is the single stdout writer.
 fn write_payload(payload: &str) -> Result<(), GeectlError> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    match writeln!(handle, "{payload}") {
+    match write!(handle, "{}", terminated(payload)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         Err(e) => Err(GeectlError::new(ErrorKind::InternalError, e.to_string())),
     }
 }
 
-/// Write a JSON error payload to stderr. A failure to write to stderr
-/// is ignored: there is nowhere else to report it, and panicking while
-/// already handling an error helps no one.
-fn write_error(err: &GeectlError) {
+/// Terminate a payload with a trailing newline: a payload that does
+/// not end with one gains one; an already-terminated payload is
+/// returned untouched (so a `cat` file ending in two newlines keeps
+/// both — verbatim wins over tidiness). JSON payloads never end with
+/// a newline. An empty payload stays empty, so `remote cat` of an
+/// empty file prints zero bytes instead of one newline.
+fn terminated(payload: &str) -> String {
+    if payload.is_empty() || payload.ends_with('\n') {
+        payload.to_string()
+    } else {
+        format!("{payload}\n")
+    }
+}
+
+/// Write an error to stderr, in the selected format. JSON mode keeps
+/// the structured payload; text mode prints `error: <message>` plus
+/// `remediation: <...>` and, when non-empty, `context: <...>`. A
+/// failure to write to stderr is ignored: there is nowhere else to
+/// report it, and panicking while already handling an error helps no
+/// one.
+///
+/// Shared infrastructure: every command group reports errors through
+/// this one function, so the format stays uniform across the CLI.
+/// (A parse error has no parsed Cli yet, so it renders in the format
+/// selected on the command line, if any — see `format_from_argv` —
+/// else JSON.)
+fn write_error(err: &GeectlError, format: Format) {
     let stderr = std::io::stderr();
     let mut handle = stderr.lock();
-    let _ = writeln!(handle, "{}", err.to_json());
+    match format {
+        Format::Json => {
+            let _ = writeln!(handle, "{}", err.to_json());
+        }
+        Format::Text => {
+            let _ = writeln!(handle, "{}", render_error_text(err));
+        }
+    }
+}
+
+/// The text-mode error rendering: `error: <message>`, then
+/// `context: <...>` when the error carries one, then `remediation:
+/// <...>`.
+fn render_error_text(err: &GeectlError) -> String {
+    let mut lines = vec![format!("error: {}", err.kind().message())];
+    if !err.context.is_empty() {
+        lines.push(format!("context: {}", err.context));
+    }
+    lines.push(format!("remediation: {}", err.kind().remediation()));
+    lines.join("\n")
+}
+
+/// The output format selected on the command line, if any: scan argv
+/// for `--format text|json` or `--format=text|json`. Used only when
+/// clap fails to parse (there is no Cli yet to ask); anything
+/// unrecognized, or an absent flag, means JSON.
+fn format_from_argv(argv: &[String]) -> Format {
+    let mut rest = argv.iter();
+    while let Some(arg) = rest.next() {
+        // Past `--` everything is a positional, never a flag.
+        if arg == "--" {
+            break;
+        }
+        if arg == "--format" {
+            return match rest.next().map(String::as_str) {
+                Some("text") => Format::Text,
+                _ => Format::Json,
+            };
+        }
+        if let Some(value) = arg.strip_prefix("--format=") {
+            return if value == "text" {
+                Format::Text
+            } else {
+                Format::Json
+            };
+        }
+    }
+    Format::Json
 }
 
 fn main() -> ExitCode {
-    // Parse errors go through the single JSON error path, not clap's
+    // Parse errors go through the single error path, not clap's
     // default (usage on stderr, exit 2, no JSON). Help and version are
     // the exception: they print clap's text to stdout and exit 0.
-    let cli = match Cli::try_parse() {
+    // The argv is collected once, lossily: the parse-error path needs
+    // it to find a `--format` selection, and the debug startup line
+    // reuses it. Parsing itself uses the raw `OsString` argv, so a
+    // non-UTF-8 argument still gets clap's invalid-UTF-8 error instead
+    // of being silently replaced by U+FFFD and sent on as a value.
+    let argv = lossy_argv(std::env::args_os());
+    let cli = match Cli::try_parse_from(std::env::args_os()) {
         Ok(cli) => cli,
         Err(e) => {
             use clap::error::ErrorKind as ClapErrorKind;
             match e.kind() {
                 ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion => {
                     // Help/version text is the payload here. It already
-                    // ends with a newline, so trim it before writeln!
-                    // adds exactly one. A write failure is handled like
-                    // the normal path (InternalError + its exit code),
-                    // not swallowed: ENOSPC/EIO must not exit 0.
+                    // ends with a newline, so trim it before
+                    // write_payload adds exactly one. A write failure
+                    // is handled like the normal path (InternalError +
+                    // its exit code), not swallowed: ENOSPC/EIO must
+                    // not exit 0.
                     match write_payload(e.render().to_string().trim_end()) {
                         Ok(()) => return ExitCode::from(0),
                         Err(err) => {
-                            write_error(&err);
+                            write_error(&err, format_from_argv(&argv));
                             return ExitCode::from(err.exit_code() as u8);
                         }
                     }
                 }
                 _ => {
                     let err = GeectlError::new(ErrorKind::InvalidInput, e.to_string());
-                    write_error(&err);
+                    write_error(&err, format_from_argv(&argv));
                     return ExitCode::from(err.exit_code() as u8);
                 }
             }
@@ -365,21 +452,24 @@ fn main() -> ExitCode {
     }
     let debug = Debug::new(debug_enabled, debug_bodies);
     if debug.enabled() {
-        debug.emit(&startup_line(&lossy_argv(std::env::args_os())));
+        debug.emit(&startup_line(&argv));
         if let Some(line) = debug_config_line() {
             debug.emit(&line);
         }
     }
-    match run(cli) {
+    // The format is captured before `run` takes the Cli: the error
+    // path below needs it, and `cli` is moved by the call.
+    let format = cli.format;
+    match run(cli, &debug) {
         Ok(payload) => match write_payload(&payload) {
             Ok(()) => ExitCode::from(0),
             Err(err) => {
-                write_error(&err);
+                write_error(&err, format);
                 ExitCode::from(err.exit_code() as u8)
             }
         },
         Err(err) => {
-            write_error(&err);
+            write_error(&err, format);
             ExitCode::from(err.exit_code() as u8)
         }
     }
@@ -392,7 +482,7 @@ mod tests {
     #[test]
     fn version_payload_is_json_with_name_and_version() {
         let cli = Cli::parse_from(["geectl", "version"]);
-        let payload = run(cli).unwrap();
+        let payload = run(cli, &Debug::disabled()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["name"], "geectl");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
@@ -401,7 +491,94 @@ mod tests {
     #[test]
     fn no_subcommand_prints_version_payload() {
         let cli = Cli::parse_from(["geectl"]);
-        assert!(run(cli).is_ok());
+        assert!(run(cli, &Debug::disabled()).is_ok());
+    }
+
+    #[test]
+    fn text_error_renders_message_context_and_remediation() {
+        let err = GeectlError::new(ErrorKind::InvalidInput, "bad name".to_string());
+        let text = render_error_text(&err);
+        assert!(text.starts_with("error: the input is invalid"));
+        assert!(text.contains("context: bad name"));
+        assert!(text.contains("remediation: fix the input and retry"));
+    }
+
+    #[test]
+    fn text_error_omits_empty_context() {
+        let err = GeectlError::new(ErrorKind::NotFound, String::new());
+        let text = render_error_text(&err);
+        assert!(!text.contains("context:"));
+        assert!(text.contains("error: the requested resource does not exist"));
+    }
+
+    #[test]
+    fn format_from_argv_finds_text_in_both_forms() {
+        let argv = vec![
+            "geectl".to_string(),
+            "--format".to_string(),
+            "text".to_string(),
+            "remote".to_string(),
+            "frobnicate".to_string(),
+        ];
+        assert_eq!(format_from_argv(&argv), Format::Text);
+        let argv = vec![
+            "geectl".to_string(),
+            "remote".to_string(),
+            "--format=text".to_string(),
+            "frobnicate".to_string(),
+        ];
+        assert_eq!(format_from_argv(&argv), Format::Text);
+    }
+
+    #[test]
+    fn format_from_argv_defaults_to_json() {
+        assert_eq!(format_from_argv(&["geectl".to_string()]), Format::Json);
+        let argv = vec![
+            "geectl".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+        assert_eq!(format_from_argv(&argv), Format::Json);
+        // `--format` with no value, or with a non-format value, is a
+        // parse error of its own: JSON, never a guess.
+        let argv = vec!["geectl".to_string(), "--format".to_string()];
+        assert_eq!(format_from_argv(&argv), Format::Json);
+        let argv = vec![
+            "geectl".to_string(),
+            "--format".to_string(),
+            "remote".to_string(),
+        ];
+        assert_eq!(format_from_argv(&argv), Format::Json);
+    }
+
+    #[test]
+    fn format_from_argv_ignores_positionals_after_double_dash() {
+        let argv = vec![
+            "geectl".to_string(),
+            "--".to_string(),
+            "--format=text".to_string(),
+        ];
+        assert_eq!(format_from_argv(&argv), Format::Json);
+        let argv = vec![
+            "geectl".to_string(),
+            "--".to_string(),
+            "--format".to_string(),
+            "text".to_string(),
+        ];
+        assert_eq!(format_from_argv(&argv), Format::Json);
+        // An empty `--format=` value is not text.
+        let argv = vec!["geectl".to_string(), "--format=".to_string()];
+        assert_eq!(format_from_argv(&argv), Format::Json);
+    }
+
+    #[test]
+    fn terminated_ensures_a_trailing_newline() {
+        assert_eq!(terminated("abc"), "abc\n");
+        assert_eq!(terminated("abc\n"), "abc\n");
+        // Already-terminated payloads are untouched, even with more
+        // than one trailing newline: verbatim wins over tidiness.
+        assert_eq!(terminated("abc\n\n"), "abc\n\n");
+        assert_eq!(terminated(""), "");
     }
 
     #[test]
