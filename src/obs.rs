@@ -1081,12 +1081,13 @@ impl<'a> ObsClient<'a> {
         let project = parse_devel_project(&body)?;
         // The project comes from network XML, so it is validated at
         // the source like any other interpolated value: a devel
-        // project that is not a valid OBS name is a server response
-        // that cannot be trusted, not a project.
+        // project that is not a valid OBS name is unexpected server
+        // data (ServerError), not a caller mistake — the
+        // caller-supplied package name is what InvalidInput is for.
         if let Some(project) = &project {
             if !valid_obs_name(project) {
                 return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
+                    ErrorKind::ServerError,
                     format!("invalid OBS project name: {project:?}"),
                 ));
             }
@@ -1104,10 +1105,11 @@ impl<'a> ObsClient<'a> {
         };
         // The project comes from network XML (`<devel project>`), so
         // it is validated and encoded like any other interpolated
-        // value before it goes into a URL.
+        // value before it goes into a URL. Like `devel_project`,
+        // an invalid network-sourced name is unexpected server data.
         if !valid_obs_name(&project) {
             return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
+                ErrorKind::ServerError,
                 format!("invalid OBS project name: {project:?}"),
             ));
         }
@@ -10237,14 +10239,17 @@ mod tests {
     #[test]
     fn devel_project_invalid_project_from_xml_is_error() {
         // The network-sourced project is validated at the source: a
-        // name that cannot go into a URL is an error, not a project.
+        // name that cannot go into a URL is unexpected server data,
+        // not a caller mistake — the caller-supplied package name
+        // (see the invalid-package test above) is what InvalidInput
+        // is for.
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
             "<directory name=\"foo\"><devel project=\"devel/foo\" package=\"foo\"/></directory>",
         );
         let client = ObsClient::new(&http);
         let err = client.devel_project("foo").unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]
@@ -10290,7 +10295,8 @@ mod tests {
     #[test]
     fn devel_version_rejects_invalid_project_from_xml() {
         // A project name from network XML is validated too: a value
-        // that cannot be a project name errors rather than being
+        // that cannot be a project name is unexpected server data,
+        // not a caller mistake, so it errors rather than being
         // interpolated into a URL.
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
@@ -10298,7 +10304,7 @@ mod tests {
         );
         let client = ObsClient::new(&http);
         let err = client.devel_version("foo").unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     // --- has_open_sr ---
