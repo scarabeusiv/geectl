@@ -2226,6 +2226,18 @@ impl<'a> ObsClient<'a> {
     /// (`OnlyInNew`), not folded into identical: the caller decides
     /// what a new package means. The file comparison is by md5, so a
     /// file that only changed metadata does not count as changed.
+    ///
+    /// Cost: the diff is one sequential fan-out — two package
+    /// listings, then per package present in both projects two file
+    /// listings plus one file read per added or deleted file and two
+    /// per changed file, and with `annotate_requests` one open-request
+    /// search per differing package. A large project is that many
+    /// sequential round-trips, with no concurrency bound and no cap:
+    /// the client is synchronous (`&dyn HttpClient` carries no `Sync`
+    /// bound, and the test fake is `RefCell`-based), so the fan-out
+    /// cannot be parallelized without a transport refactor. Each
+    /// item still fails closed: the first failed read aborts the
+    /// whole diff with its error, never a partial list.
     pub fn project_diff(
         &self,
         old: &str,

@@ -2987,15 +2987,26 @@ impl<'a> ObsClient<'a> {
     }
 
     /// Best-effort [`ObsClient::change_state`]: try the state change,
-    /// and return whether it happened. A transport or server failure
-    /// — the request is already closed, the credentials do not allow
-    /// the change, the server is unreachable — reports the failure
-    /// on the debug channel (gated on `--debug`) and returns `false`
-    /// instead of failing, so a batch
-    /// triaging many requests does not stop at the first one that
-    /// cannot move. A caller bug does not get swallowed: a malformed
-    /// id or state, and missing credentials, still return an error.
-    /// In dry-run the change is recorded in the plan (as
+    /// and return whether it happened. A request-side or transport
+    /// failure — the request is already closed or does not exist, the
+    /// server is unreachable or errored — reports the failure on the
+    /// debug channel (gated on `--debug`) and returns `false`
+    /// instead of failing, so a batch triaging many requests does not
+    /// stop at the first one that cannot move. An authentication
+    /// failure does not get swallowed: it almost always means
+    /// misconfiguration (wrong or expired credentials), not a missing
+    /// request, so it propagates — a batch with bad credentials fails
+    /// loudly instead of reporting all-false. The one exception is a
+    /// request already in the target state: the server answers a
+    /// changestate on such a request with the same 403 as a genuine
+    /// auth failure, so the status alone cannot tell them apart and
+    /// this reads the request back — already in the target state
+    /// reports `false` (the change is a no-op), while a request in
+    /// another state, or a read that fails itself (bad credentials
+    /// fail the read too), propagates the auth failure. A caller bug
+    /// does not get swallowed either: a malformed id or state, and
+    /// missing credentials ([`ErrorKind::ConfigError`]), still return
+    /// an error. In dry-run the change is recorded in the plan (as
     /// [`ObsClient::change_state`] does) and this returns `true`.
     pub fn try_change_state(
         &self,
@@ -3011,7 +3022,6 @@ impl<'a> ObsClient<'a> {
                 if matches!(
                     err.kind(),
                     ErrorKind::NotFound
-                        | ErrorKind::AuthFailed
                         | ErrorKind::ServerError
                         | ErrorKind::Timeout
                         | ErrorKind::NetworkError
@@ -3022,6 +3032,27 @@ impl<'a> ObsClient<'a> {
                     "decision: could not change state of submit request {id}: {err}"
                 ));
                 Ok(false)
+            }
+            Err(err) if err.kind() == ErrorKind::AuthFailed => {
+                // The server answers a changestate on a request
+                // already in the target state with the same 403 as a
+                // genuine auth failure, so the status alone cannot
+                // tell them apart: read the request back. Already in
+                // the target state means the change is a no-op and
+                // this reports false; a request in another state, or
+                // a read that fails itself (bad credentials fail the
+                // read too), means the 403 was real and the auth
+                // failure propagates.
+                match self.show_request(id) {
+                    Ok(request) if request.state.name == state => {
+                        self.debug.emit(&format!(
+                            "decision: submit request {id} already {}; not re-issuing",
+                            state.as_str()
+                        ));
+                        Ok(false)
+                    }
+                    _ => Err(err),
+                }
             }
             Err(err) => Err(err),
         }
@@ -4987,13 +5018,14 @@ description</description>
 
     #[test]
     fn try_change_state_false_on_a_refused_change() {
-        // The server refuses the change (403 here): the failure is
-        // swallowed with a warning and the call reports false, so a
-        // batch triaging many requests does not stop at the first one
-        // that cannot move.
+        // A transport failure (TLS verification here — a kind the
+        // changestate retry does not retry, so the test stays fast)
+        // is swallowed with a warning and the call reports false, so
+        // a batch triaging many requests does not stop at the first
+        // one that cannot move.
         let http = FakeHttp::new().with_post_error(
             "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
-            ErrorKind::AuthFailed,
+            ErrorKind::TlsError,
         );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dry = DryRun::new(false);
@@ -5001,6 +5033,110 @@ description</description>
             .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
             .unwrap());
         assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn try_change_state_propagates_an_auth_failure() {
+        // An auth failure is misconfiguration, not a refused change:
+        // it propagates so a batch with wrong or expired credentials
+        // fails loudly instead of reporting all-false.
+        let http = FakeHttp::new().with_post_error(
+            "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+            ErrorKind::AuthFailed,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let err = obs
+            .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn try_change_state_false_when_already_in_the_target_state() {
+        // The server answers a changestate on a request already in
+        // the target state with the same 403 as a genuine auth
+        // failure, so the status alone cannot tell them apart: the
+        // read-back finds request 42 already accepted and the
+        // lenient call reports false instead of failing.
+        let http = FakeHttp::new()
+            .with_post_error(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                ErrorKind::AuthFailed,
+            )
+            .with_get(
+                "https://api.opensuse.org/request/42?withhistory=1",
+                REQUEST1_XML,
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        assert!(!obs
+            .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap());
+        assert_eq!(http.post_calls().len(), 1);
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn try_change_state_propagates_auth_failure_when_state_differs() {
+        // The read-back finds request 123 in review, not accepted,
+        // so the 403 was a real refusal and the auth failure
+        // propagates.
+        let http = FakeHttp::new()
+            .with_post_error(
+                "https://api.opensuse.org/request/123?cmd=changestate&newstate=accepted",
+                ErrorKind::AuthFailed,
+            )
+            .with_get(
+                "https://api.opensuse.org/request/123?withhistory=1",
+                REQUEST2_XML,
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let err = obs
+            .try_change_state("123", RequestState::Accepted, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+        assert_eq!(http.post_calls().len(), 1);
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn try_change_state_propagates_auth_failure_when_the_read_fails() {
+        // Bad credentials fail the read-back too, so a failed read
+        // cannot clear the 403: the auth failure propagates.
+        let http = FakeHttp::new()
+            .with_post_error(
+                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                ErrorKind::AuthFailed,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/request/42?withhistory=1",
+                ErrorKind::AuthFailed,
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let err = obs
+            .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+        assert_eq!(http.post_calls().len(), 1);
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn try_change_state_propagates_missing_credentials() {
+        // Missing credentials are a configuration failure, not a
+        // refused change: they propagate before any request.
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let dry = DryRun::new(false);
+        let err = obs
+            .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]
@@ -5621,7 +5757,7 @@ description</description>
         let (debug, lines) = Debug::captured(true, false);
         let http = FakeHttp::new().with_post_error(
             "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
-            ErrorKind::AuthFailed,
+            ErrorKind::TlsError,
         );
         let obs = ObsClient::with_credentials(&http, basic_credentials())
             .unwrap()
@@ -5633,7 +5769,7 @@ description</description>
         let got: Vec<String> = lines.lock().unwrap().clone();
         assert_eq!(
             got,
-            ["decision: could not change state of submit request 42: auth_failed: authentication failed (canned POST error for https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted)"
+            ["decision: could not change state of submit request 42: tls_error: TLS verification failed (canned POST error for https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted)"
                 .to_string()]
         );
     }
