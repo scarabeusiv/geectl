@@ -556,13 +556,35 @@ pub struct JobHistoryEntry {
 /// document that is not a buildinfo — or a `<bdep>` without a name —
 /// is a server error, never an empty buildinfo.
 pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
+    let body = body.trim();
+    // A malformed buildinfo response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <buildinfo> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS buildinfo response: not a <buildinfo> document",
+            format!(
+                "unexpected OBS buildinfo response: not a <buildinfo> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <buildinfo> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <buildinfo>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<buildinfo") else {
         return Err(malformed());
     };
@@ -2985,6 +3007,50 @@ mod tests {
         assert!(parse_buildinfo("<collection></collection>").is_err());
         assert!(parse_buildinfo("<buildinfo>").is_err());
         assert!(parse_buildinfo("<buildinfo><bdep version=\"1\"/></buildinfo>").is_err());
+    }
+
+    #[test]
+    fn parse_buildinfo_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <buildinfo>
+        // element; the result is the same as without one.
+        let plain = "<buildinfo project=\"p\"/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_buildinfo(&prolog).unwrap(),
+            parse_buildinfo(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_buildinfo(&format!("<?xml?>{plain}")).unwrap(),
+            parse_buildinfo(plain).unwrap()
+        );
+        assert_eq!(
+            parse_buildinfo(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_buildinfo(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <buildinfo>.
+        assert!(parse_buildinfo("<?xml version=\"1.0\" <buildinfo></buildinfo>").is_err());
+        assert!(parse_buildinfo("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_buildinfo("<?xmlfoo version=\"1.0\"?><buildinfo></buildinfo>").is_err());
+    }
+
+    #[test]
+    fn parse_buildinfo_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_buildinfo("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_buildinfo(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_buildinfo("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
