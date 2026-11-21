@@ -317,13 +317,35 @@ pub struct JobStatus {
 /// `workerid`, `hostarch`, `uri`, `arch`, `job`, `jobid`, `attempt`)
 /// are child elements.
 pub(crate) fn parse_job_status(body: &str) -> Result<Option<JobStatus>, GeectlError> {
+    let body = body.trim();
+    // A malformed job status response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <jobstatus> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS job status response: not a <jobstatus> document",
+            format!(
+                "unexpected OBS job status response: not a <jobstatus> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <jobstatus> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <jobstatus>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     // The document must start with the root element: a `<jobstatus>`
     // found later in the body is not a jobstatus document.
     let Some(after_tag) = body.strip_prefix("<jobstatus") else {
@@ -2630,6 +2652,50 @@ mod tests {
         assert!(parse_job_status("<jobstatus/>junk").is_err());
         assert!(parse_job_status("<jobstatus code=\"building\"></jobstatus>junk").is_err());
         assert!(parse_job_status("<jobstatusx/>").is_err());
+    }
+
+    #[test]
+    fn parse_job_status_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <jobstatus>
+        // element; the result is the same as without one.
+        let plain = "<jobstatus/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_job_status(&prolog).unwrap(),
+            parse_job_status(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_job_status(&format!("<?xml?>{plain}")).unwrap(),
+            parse_job_status(plain).unwrap()
+        );
+        assert_eq!(
+            parse_job_status(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_job_status(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <jobstatus>.
+        assert!(parse_job_status("<?xml version=\"1.0\" <jobstatus></jobstatus>").is_err());
+        assert!(parse_job_status("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_job_status("<?xmlfoo version=\"1.0\"?><jobstatus></jobstatus>").is_err());
+    }
+
+    #[test]
+    fn parse_job_status_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_job_status("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_job_status(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_job_status("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
