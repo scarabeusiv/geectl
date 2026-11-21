@@ -27,6 +27,7 @@
 //! remember to check the status.
 
 use crate::auth::{validate_basic, validate_bearer_token, AuthProvider, Credentials};
+use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
 use std::io::Read;
 use std::time::Duration;
@@ -214,6 +215,7 @@ pub trait HttpClient {
 pub struct UreqClient {
     agent: ureq::Agent,
     auth: Option<Box<dyn AuthProvider>>,
+    debug: Debug,
 }
 
 impl UreqClient {
@@ -250,7 +252,19 @@ impl UreqClient {
             .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
             .build();
         let agent: ureq::Agent = config.into();
-        Ok(UreqClient { agent, auth })
+        Ok(UreqClient {
+            agent,
+            auth,
+            debug: Debug::disabled(),
+        })
+    }
+
+    /// Attach the debug sink: HTTP attempts, retries, and endpoint
+    /// selection are reported on the channel when it is on. The
+    /// default is off, so the existing constructors are unaffected.
+    pub fn with_debug(mut self, debug: Debug) -> Self {
+        self.debug = debug;
+        self
     }
 
     fn apply_auth<B>(
@@ -289,18 +303,26 @@ impl UreqClient {
     /// closure that consumes its captures is fine. A redirect is
     /// refused, like POST: automatic redirects are disabled, so a 3xx
     /// is an error, not a body.
+    ///
+    /// `emit_debug_attempts` selects the debug channel's per-attempt
+    /// lines: text reads emit them, binary downloads do not. The debug
+    /// change instrumented text reads only, so a byte download stays
+    /// silent even though it shares this loop.
     fn get_with_body<T>(
         &self,
         url: &str,
         credentials: &Credentials,
         accept: Option<&str>,
+        emit_debug_attempts: bool,
         read_body: impl FnOnce(ureq::Body) -> Result<T, GeectlError>,
     ) -> Result<T, GeectlError> {
         // Credentials never travel over cleartext http, except to a
         // loopback host (see require_credentials_transport).
         require_credentials_transport(url, credentials)?;
         let mut last_error: Option<GeectlError> = None;
+        let mut last_desc = String::new();
         for attempt in 0..=RETRY_POLICY.max_retries {
+            let started = std::time::Instant::now();
             // Ask for XML when the caller wants it: the deployment
             // serves the WebUI HTML page for a path that exists in
             // both the API and WebUI route sets (the owner search
@@ -312,17 +334,62 @@ impl UreqClient {
             }
             match request.call() {
                 Ok(resp) => {
+                    let status = resp.status().as_u16();
                     if resp.status().is_redirection() {
                         let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
-                        return Err(redirect_error(resp.status().as_u16(), location));
+                        if emit_debug_attempts {
+                            self.debug_attempt(
+                                "GET",
+                                url,
+                                &status.to_string(),
+                                started.elapsed(),
+                                attempt + 1,
+                                None,
+                            );
+                        }
+                        return Err(redirect_error(status, location));
+                    }
+                    if emit_debug_attempts {
+                        self.debug_attempt(
+                            "GET",
+                            url,
+                            &status.to_string(),
+                            started.elapsed(),
+                            attempt + 1,
+                            None,
+                        );
                     }
                     return read_body(resp.into_body());
                 }
                 Err(ureq::Error::StatusCode(code)) => {
                     let safe_url = sanitize_url_for_error(url);
                     match status_action(code, &safe_url) {
-                        StatusAction::Return(err) => return Err(err),
+                        StatusAction::Return(err) => {
+                            if emit_debug_attempts {
+                                self.debug_attempt(
+                                    "GET",
+                                    url,
+                                    &code.to_string(),
+                                    started.elapsed(),
+                                    attempt + 1,
+                                    None,
+                                );
+                            }
+                            return Err(err);
+                        }
                         StatusAction::Retry(err) => {
+                            if emit_debug_attempts {
+                                let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                                self.debug_attempt(
+                                    "GET",
+                                    url,
+                                    &code.to_string(),
+                                    started.elapsed(),
+                                    attempt + 1,
+                                    Some((backoff, &format!("transient status {code}"))),
+                                );
+                            }
+                            last_desc = code.to_string();
                             last_error = Some(err);
                         }
                     }
@@ -332,33 +399,99 @@ impl UreqClient {
                     // handshake or an untrusted certificate cannot
                     // succeed, and it would hammer a server that
                     // already refused us.
+                    if emit_debug_attempts {
+                        self.debug_attempt(
+                            "GET",
+                            url,
+                            "TLS error",
+                            started.elapsed(),
+                            attempt + 1,
+                            None,
+                        );
+                    }
                     return Err(GeectlError::new(
                         ErrorKind::TlsError,
                         format!("TLS error: {msg}"),
                     ));
                 }
                 Err(ureq::Error::Rustls(e)) => {
+                    if emit_debug_attempts {
+                        self.debug_attempt(
+                            "GET",
+                            url,
+                            "TLS error",
+                            started.elapsed(),
+                            attempt + 1,
+                            None,
+                        );
+                    }
                     return Err(GeectlError::new(
                         ErrorKind::TlsError,
                         format!("TLS error: {e}"),
                     ));
                 }
                 Err(ureq::Error::Pem(e)) => {
+                    if emit_debug_attempts {
+                        self.debug_attempt(
+                            "GET",
+                            url,
+                            "TLS error",
+                            started.elapsed(),
+                            attempt + 1,
+                            None,
+                        );
+                    }
                     return Err(GeectlError::new(
                         ErrorKind::TlsError,
                         format!("TLS error: {e}"),
                     ));
                 }
                 Err(ureq::Error::Timeout(_)) => {
+                    if emit_debug_attempts {
+                        let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                        self.debug_attempt(
+                            "GET",
+                            url,
+                            "timeout",
+                            started.elapsed(),
+                            attempt + 1,
+                            Some((backoff, "timeout")),
+                        );
+                    }
+                    last_desc = "timeout".to_string();
                     last_error = Some(GeectlError::new(
                         ErrorKind::Timeout,
                         format!("request to {} timed out", sanitize_url_for_error(url)),
                     ));
                 }
                 Err(ureq::Error::Io(e)) => {
+                    if emit_debug_attempts {
+                        let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                        self.debug_attempt(
+                            "GET",
+                            url,
+                            "network error",
+                            started.elapsed(),
+                            attempt + 1,
+                            Some((backoff, "network error")),
+                        );
+                    }
+                    last_desc = "network error".to_string();
                     last_error = Some(GeectlError::new(ErrorKind::NetworkError, e.to_string()));
                 }
                 Err(e) => {
+                    if emit_debug_attempts {
+                        let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                        self.debug_attempt(
+                            "GET",
+                            url,
+                            "server error",
+                            started.elapsed(),
+                            attempt + 1,
+                            Some((backoff, "server error")),
+                        );
+                    }
+                    last_desc = "server error".to_string();
                     last_error = Some(GeectlError::new(ErrorKind::ServerError, e.to_string()));
                 }
             }
@@ -375,9 +508,156 @@ impl UreqClient {
                 std::thread::sleep(RETRY_POLICY.backoff_base * 2u32.pow(attempt));
             }
         }
+        if emit_debug_attempts && last_error.is_some() {
+            self.debug_exhausted("GET", url, RETRY_POLICY.max_retries + 1, &last_desc);
+        }
         Err(last_error.unwrap_or_else(|| {
             GeectlError::new(ErrorKind::InternalError, "GET failed without an error")
         }))
+    }
+
+    /// Emit one HTTP attempt line for a retried method: method,
+    /// path, status or error kind, duration, attempt against the
+    /// retry budget. On a retryable failure `retry` carries the
+    /// backoff and the reason. Nothing is formatted when the channel
+    /// is off.
+    fn debug_attempt(
+        &self,
+        method: &str,
+        url: &str,
+        outcome: &str,
+        duration: Duration,
+        attempt: u32,
+        retry: Option<(Duration, &str)>,
+    ) {
+        if !self.debug.enabled() {
+            return;
+        }
+        let total = RETRY_POLICY.max_retries + 1;
+        let path = crate::debug::url_path(url);
+        // The last attempt has no retry after it, so its line must
+        // not promise one: a caller that computed a backoff for a
+        // failed final attempt still reports a plain attempt line.
+        let retry = retry.filter(|_| attempt < total);
+        match retry {
+            Some((backoff, reason)) => self.debug.emit(&format!(
+                "http: {method} {path} -> {outcome} in {duration:?} (attempt {attempt}/{total}, retry in {backoff:?}: {reason})"
+            )),
+            None => self.debug.emit(&format!(
+                "http: {method} {path} -> {outcome} in {duration:?} (attempt {attempt}/{total})"
+            )),
+        }
+    }
+
+    /// Emit one attempt line for a method that never retries
+    /// (POST, DELETE): a single attempt, so the budget is 1 of 1.
+    /// Nothing is formatted when the channel is off.
+    fn debug_single_attempt(&self, method: &str, url: &str, outcome: &str, duration: Duration) {
+        if !self.debug.enabled() {
+            return;
+        }
+        let path = crate::debug::url_path(url);
+        self.debug.emit(&format!(
+            "http: {method} {path} -> {outcome} in {duration:?} (attempt 1/1)"
+        ));
+    }
+
+    /// Emit the exhaustion line after the retry budget runs out.
+    fn debug_exhausted(&self, method: &str, url: &str, attempts: u32, last: &str) {
+        if !self.debug.enabled() {
+            return;
+        }
+        let path = crate::debug::url_path(url);
+        self.debug.emit(&format!(
+            "http: {method} {path} failed after {attempts} attempts (last: {last})"
+        ));
+    }
+
+    /// Emit a request or response body line, behind `--debug-body`
+    /// only. The body is capped and redacted by
+    /// [`crate::debug::format_body_preview`]; headers are never
+    /// printed.
+    fn debug_body(&self, direction: &str, method: &str, url: &str, body: &str) {
+        if !self.debug.bodies_enabled() {
+            return;
+        }
+        let path = crate::debug::url_path(url);
+        let preview = crate::debug::format_body_preview(body);
+        self.debug.emit(&format!(
+            "http: {method} {path} {direction} body ({} bytes): {preview}",
+            body.len()
+        ));
+    }
+
+    /// Emit the binary marker for a response body that failed UTF-8
+    /// decoding, behind `--debug-body` only. The caller still
+    /// returns the exact `ServerError` for the undecodable body, so
+    /// the marker is the only difference: the transcript shows the
+    /// body was binary rather than absent.
+    fn debug_binary_body(&self, method: &str, url: &str, len: usize) {
+        if !self.debug.bodies_enabled() {
+            return;
+        }
+        let path = crate::debug::url_path(url);
+        self.debug.emit(&format!(
+            "http: {method} {path} response body ({len} bytes): <binary body, {len} bytes>"
+        ));
+    }
+
+    /// Read a response body for a `method` request to `url`. On
+    /// success the caller still emits the `response body` line (after
+    /// the attempt line, as before). A body that is not valid UTF-8
+    /// still errors exactly as before (`ServerError`, same message);
+    /// the binary marker line is emitted behind `--debug-body` only,
+    /// so a non-UTF-8 response is visible in the transcript instead
+    /// of vanishing at the `?`. The caller emits the attempt line
+    /// before calling this: on a read error the marker is the only
+    /// body line, and it must follow its attempt line rather than
+    /// standing alone. The cap, the error kind, and the message are
+    /// unchanged.
+    fn read_response_body(
+        &self,
+        reader: impl Read,
+        method: &str,
+        url: &str,
+    ) -> Result<String, GeectlError> {
+        let bytes = read_body_bytes_capped(reader)?;
+        match String::from_utf8(bytes) {
+            Ok(body) => Ok(body),
+            Err(e) => {
+                let len = e.as_bytes().len();
+                self.debug_binary_body(method, url, len);
+                Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("response body is not valid UTF-8: {e}"),
+                ))
+            }
+        }
+    }
+
+    /// Emit the endpoint-selection decision for a read: which route
+    /// the request takes, and whether it carries credentials. The
+    /// route is the first path segment (`/public/source` for public
+    /// reads, `/source` or `/request` otherwise); an SSH key never
+    /// authenticates HTTP, so it reports no selection.
+    fn debug_endpoint(&self, url: &str, credentials: &Credentials) {
+        if !self.debug.enabled() {
+            return;
+        }
+        let auth = match credentials {
+            Credentials::None => "no credentials",
+            Credentials::Basic { .. } | Credentials::Bearer { .. } => "authenticated",
+            Credentials::SshKey { .. } => return,
+        };
+        let path = crate::debug::url_path(url);
+        let mut segments = path.split('/').filter(|s| !s.is_empty());
+        let route = match (segments.next(), segments.next()) {
+            (Some("public"), Some(second)) => format!("/public/{second}"),
+            (Some(first), _) => format!("/{first}"),
+            _ => "/".to_string(),
+        };
+        self.debug
+            .emit(&format!("decision: read via {route} ({auth})"));
     }
 
     /// One POST attempt with the given content type. POST is never
@@ -408,42 +688,68 @@ impl UreqClient {
             .header("Content-Type", content_type)
             .header("Accept", "application/xml");
         let request = self.apply_auth(request, credentials)?;
+        // A single attempt: POST is never retried.
+        let started = std::time::Instant::now();
+        self.debug_body("request", "POST", url, body);
         match request.send(body) {
             Ok(resp) => {
+                let status = resp.status().as_u16();
                 if resp.status().is_redirection() {
                     let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
-                    return Err(redirect_error(resp.status().as_u16(), location));
+                    self.debug_single_attempt("POST", url, &status.to_string(), started.elapsed());
+                    return Err(redirect_error(status, location));
                 }
-                read_body_capped(resp.into_body().into_reader())
+                // Attempt line first (see read_response_body).
+                self.debug_single_attempt("POST", url, &status.to_string(), started.elapsed());
+                let body = self.read_response_body(resp.into_body().into_reader(), "POST", url)?;
+                self.debug_body("response", "POST", url, &body);
+                Ok(body)
             }
             Err(ureq::Error::StatusCode(code)) => {
                 let safe_url = sanitize_url_for_error(url);
+                self.debug_single_attempt("POST", url, &code.to_string(), started.elapsed());
                 match status_action(code, &safe_url) {
                     // No retry for POST: a Retry action is returned
                     // as the error, immediately.
                     StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
                 }
             }
-            Err(ureq::Error::Tls(msg)) => Err(GeectlError::new(
-                ErrorKind::TlsError,
-                format!("TLS error: {msg}"),
-            )),
-            Err(ureq::Error::Rustls(e)) => Err(GeectlError::new(
-                ErrorKind::TlsError,
-                format!("TLS error: {e}"),
-            )),
-            Err(ureq::Error::Pem(e)) => Err(GeectlError::new(
-                ErrorKind::TlsError,
-                format!("TLS error: {e}"),
-            )),
-            Err(ureq::Error::Timeout(_)) => Err(GeectlError::new(
-                ErrorKind::Timeout,
-                format!("request to {} timed out", sanitize_url_for_error(url)),
-            )),
+            Err(ureq::Error::Tls(msg)) => {
+                self.debug_single_attempt("POST", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {msg}"),
+                ))
+            }
+            Err(ureq::Error::Rustls(e)) => {
+                self.debug_single_attempt("POST", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {e}"),
+                ))
+            }
+            Err(ureq::Error::Pem(e)) => {
+                self.debug_single_attempt("POST", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {e}"),
+                ))
+            }
+            Err(ureq::Error::Timeout(_)) => {
+                self.debug_single_attempt("POST", url, "timeout", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::Timeout,
+                    format!("request to {} timed out", sanitize_url_for_error(url)),
+                ))
+            }
             Err(ureq::Error::Io(e)) => {
+                self.debug_single_attempt("POST", url, "network error", started.elapsed());
                 Err(GeectlError::new(ErrorKind::NetworkError, e.to_string()))
             }
-            Err(e) => Err(GeectlError::new(ErrorKind::ServerError, e.to_string())),
+            Err(e) => {
+                self.debug_single_attempt("POST", url, "server error", started.elapsed());
+                Err(GeectlError::new(ErrorKind::ServerError, e.to_string()))
+            }
         }
     }
 
@@ -465,7 +771,9 @@ impl UreqClient {
         // content; the bytes on the server are the same either way.
         require_credentials_transport(url, credentials)?;
         let mut last_error: Option<GeectlError> = None;
+        let mut last_desc = String::new();
         for attempt in 0..=RETRY_POLICY.max_retries {
+            let started = std::time::Instant::now();
             // Ask for XML, the same defence as GET: the owner search proved
             // a dual-routed path serves the WebUI HTML page unless the request
             // asks for XML. No mutation path has been seen doing it yet, so
@@ -476,19 +784,61 @@ impl UreqClient {
                 .header("Content-Type", content_type)
                 .header("Accept", "application/xml");
             let request = self.apply_auth(request, credentials)?;
+            self.debug_body("request", "PUT", url, body);
             match request.send(body) {
                 Ok(resp) => {
+                    let status = resp.status().as_u16();
                     if resp.status().is_redirection() {
                         let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
-                        return Err(redirect_error(resp.status().as_u16(), location));
+                        self.debug_attempt(
+                            "PUT",
+                            url,
+                            &status.to_string(),
+                            started.elapsed(),
+                            attempt + 1,
+                            None,
+                        );
+                        return Err(redirect_error(status, location));
                     }
-                    return read_body_capped(resp.into_body().into_reader());
+                    // Attempt line first (see read_response_body).
+                    self.debug_attempt(
+                        "PUT",
+                        url,
+                        &status.to_string(),
+                        started.elapsed(),
+                        attempt + 1,
+                        None,
+                    );
+                    let body =
+                        self.read_response_body(resp.into_body().into_reader(), "PUT", url)?;
+                    self.debug_body("response", "PUT", url, &body);
+                    return Ok(body);
                 }
                 Err(ureq::Error::StatusCode(code)) => {
                     let safe_url = sanitize_url_for_error(url);
                     match status_action(code, &safe_url) {
-                        StatusAction::Return(err) => return Err(err),
+                        StatusAction::Return(err) => {
+                            self.debug_attempt(
+                                "PUT",
+                                url,
+                                &code.to_string(),
+                                started.elapsed(),
+                                attempt + 1,
+                                None,
+                            );
+                            return Err(err);
+                        }
                         StatusAction::Retry(err) => {
+                            let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                            self.debug_attempt(
+                                "PUT",
+                                url,
+                                &code.to_string(),
+                                started.elapsed(),
+                                attempt + 1,
+                                Some((backoff, &format!("transient status {code}"))),
+                            );
+                            last_desc = code.to_string();
                             last_error = Some(err);
                         }
                     }
@@ -498,33 +848,87 @@ impl UreqClient {
                     // handshake or an untrusted certificate cannot
                     // succeed, and it would hammer a server that
                     // already refused us.
+                    self.debug_attempt(
+                        "PUT",
+                        url,
+                        "TLS error",
+                        started.elapsed(),
+                        attempt + 1,
+                        None,
+                    );
                     return Err(GeectlError::new(
                         ErrorKind::TlsError,
                         format!("TLS error: {msg}"),
                     ));
                 }
                 Err(ureq::Error::Rustls(e)) => {
+                    self.debug_attempt(
+                        "PUT",
+                        url,
+                        "TLS error",
+                        started.elapsed(),
+                        attempt + 1,
+                        None,
+                    );
                     return Err(GeectlError::new(
                         ErrorKind::TlsError,
                         format!("TLS error: {e}"),
                     ));
                 }
                 Err(ureq::Error::Pem(e)) => {
+                    self.debug_attempt(
+                        "PUT",
+                        url,
+                        "TLS error",
+                        started.elapsed(),
+                        attempt + 1,
+                        None,
+                    );
                     return Err(GeectlError::new(
                         ErrorKind::TlsError,
                         format!("TLS error: {e}"),
                     ));
                 }
                 Err(ureq::Error::Timeout(_)) => {
+                    let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                    self.debug_attempt(
+                        "PUT",
+                        url,
+                        "timeout",
+                        started.elapsed(),
+                        attempt + 1,
+                        Some((backoff, "timeout")),
+                    );
+                    last_desc = "timeout".to_string();
                     last_error = Some(GeectlError::new(
                         ErrorKind::Timeout,
                         format!("request to {} timed out", sanitize_url_for_error(url)),
                     ));
                 }
                 Err(ureq::Error::Io(e)) => {
+                    let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                    self.debug_attempt(
+                        "PUT",
+                        url,
+                        "network error",
+                        started.elapsed(),
+                        attempt + 1,
+                        Some((backoff, "network error")),
+                    );
+                    last_desc = "network error".to_string();
                     last_error = Some(GeectlError::new(ErrorKind::NetworkError, e.to_string()));
                 }
                 Err(e) => {
+                    let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                    self.debug_attempt(
+                        "PUT",
+                        url,
+                        "server error",
+                        started.elapsed(),
+                        attempt + 1,
+                        Some((backoff, "server error")),
+                    );
+                    last_desc = "server error".to_string();
                     last_error = Some(GeectlError::new(ErrorKind::ServerError, e.to_string()));
                 }
             }
@@ -540,6 +944,9 @@ impl UreqClient {
             if attempt < RETRY_POLICY.max_retries {
                 std::thread::sleep(RETRY_POLICY.backoff_base * 2u32.pow(attempt));
             }
+        }
+        if last_error.is_some() {
+            self.debug_exhausted("PUT", url, RETRY_POLICY.max_retries + 1, &last_desc);
         }
         Err(last_error.unwrap_or_else(|| {
             GeectlError::new(ErrorKind::InternalError, "PUT failed without an error")
@@ -593,11 +1000,16 @@ fn redirect_error(status: u16, location: Option<&str>) -> GeectlError {
     )
 }
 
-/// Read a response body with a cap. Reads at most `MAX_BODY_BYTES + 1`
-/// bytes; a body longer than the cap fails with `ServerError` instead
-/// of growing the process without bound. The `+ 1` distinguishes "at
-/// the cap" (accepted) from "over the cap" (rejected).
-fn read_bytes_capped(reader: impl Read) -> Result<Vec<u8>, GeectlError> {
+/// Read a response body with a cap, as raw bytes. Reads at most
+/// `MAX_BODY_BYTES + 1` bytes; a body longer than the cap fails with
+/// `ServerError` instead of growing the process without bound. The
+/// `+ 1` distinguishes "at the cap" (accepted) from "over the cap"
+/// (rejected). Bytes are read first and converted to UTF-8 after the
+/// cap check: converting while reading would split a multi-byte
+/// character at the cap (and report the over-cap body as a network
+/// error), and an in-cap body that is not valid UTF-8 is a server
+/// error, not a transport failure.
+fn read_body_bytes_capped(reader: impl Read) -> Result<Vec<u8>, GeectlError> {
     let mut bytes = Vec::new();
     reader
         .take(MAX_BODY_BYTES as u64 + 1)
@@ -610,21 +1022,6 @@ fn read_bytes_capped(reader: impl Read) -> Result<Vec<u8>, GeectlError> {
         ));
     }
     Ok(bytes)
-}
-
-/// Read a response body as text: the capped bytes, converted to
-/// UTF-8 after the cap check. Converting while reading would split a
-/// multi-byte character at the cap (and report the over-cap body as a
-/// network error), and an in-cap body that is not valid UTF-8 is a
-/// server error, not a transport failure.
-fn read_body_capped(reader: impl Read) -> Result<String, GeectlError> {
-    let bytes = read_bytes_capped(reader)?;
-    String::from_utf8(bytes).map_err(|e| {
-        GeectlError::new(
-            ErrorKind::ServerError,
-            format!("response body is not valid UTF-8: {e}"),
-        )
-    })
 }
 
 /// What to do with a non-2xx status. `Return` ends the call with this
@@ -778,14 +1175,19 @@ impl HttpClient for UreqClient {
     }
 
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
-        self.get_with_body(url, credentials, Some("application/xml"), |body| {
-            read_body_capped(body.into_reader())
+        // The endpoint selection for this read: public or
+        // authenticated, reported once per call, not per attempt.
+        self.debug_endpoint(url, credentials);
+        self.get_with_body(url, credentials, Some("application/xml"), true, |body| {
+            let text = self.read_response_body(body.into_reader(), "GET", url)?;
+            self.debug_body("response", "GET", url, &text);
+            Ok(text)
         })
     }
 
     fn get_bytes(&self, url: &str, credentials: &Credentials) -> Result<Vec<u8>, GeectlError> {
-        self.get_with_body(url, credentials, None, |body| {
-            read_bytes_capped(body.into_reader())
+        self.get_with_body(url, credentials, None, false, |body| {
+            read_body_bytes_capped(body.into_reader())
         })
     }
 
@@ -858,42 +1260,73 @@ impl HttpClient for UreqClient {
         // for mutations this is preventive.
         let request = self.agent.delete(url).header("Accept", "application/xml");
         let request = self.apply_auth(request, credentials)?;
+        // A single attempt: DELETE is never retried.
+        let started = std::time::Instant::now();
         match request.call() {
             Ok(resp) => {
+                let status = resp.status().as_u16();
                 if resp.status().is_redirection() {
                     let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
-                    return Err(redirect_error(resp.status().as_u16(), location));
+                    self.debug_single_attempt(
+                        "DELETE",
+                        url,
+                        &status.to_string(),
+                        started.elapsed(),
+                    );
+                    return Err(redirect_error(status, location));
                 }
-                read_body_capped(resp.into_body().into_reader())
+                // Attempt line first (see read_response_body).
+                self.debug_single_attempt("DELETE", url, &status.to_string(), started.elapsed());
+                let body =
+                    self.read_response_body(resp.into_body().into_reader(), "DELETE", url)?;
+                self.debug_body("response", "DELETE", url, &body);
+                Ok(body)
             }
             Err(ureq::Error::StatusCode(code)) => {
                 let safe_url = sanitize_url_for_error(url);
+                self.debug_single_attempt("DELETE", url, &code.to_string(), started.elapsed());
                 match status_action(code, &safe_url) {
                     // No retry for DELETE: a Retry action is returned
                     // as the error, immediately.
                     StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
                 }
             }
-            Err(ureq::Error::Tls(msg)) => Err(GeectlError::new(
-                ErrorKind::TlsError,
-                format!("TLS error: {msg}"),
-            )),
-            Err(ureq::Error::Rustls(e)) => Err(GeectlError::new(
-                ErrorKind::TlsError,
-                format!("TLS error: {e}"),
-            )),
-            Err(ureq::Error::Pem(e)) => Err(GeectlError::new(
-                ErrorKind::TlsError,
-                format!("TLS error: {e}"),
-            )),
-            Err(ureq::Error::Timeout(_)) => Err(GeectlError::new(
-                ErrorKind::Timeout,
-                format!("request to {} timed out", sanitize_url_for_error(url)),
-            )),
+            Err(ureq::Error::Tls(msg)) => {
+                self.debug_single_attempt("DELETE", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {msg}"),
+                ))
+            }
+            Err(ureq::Error::Rustls(e)) => {
+                self.debug_single_attempt("DELETE", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {e}"),
+                ))
+            }
+            Err(ureq::Error::Pem(e)) => {
+                self.debug_single_attempt("DELETE", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {e}"),
+                ))
+            }
+            Err(ureq::Error::Timeout(_)) => {
+                self.debug_single_attempt("DELETE", url, "timeout", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::Timeout,
+                    format!("request to {} timed out", sanitize_url_for_error(url)),
+                ))
+            }
             Err(ureq::Error::Io(e)) => {
+                self.debug_single_attempt("DELETE", url, "network error", started.elapsed());
                 Err(GeectlError::new(ErrorKind::NetworkError, e.to_string()))
             }
-            Err(e) => Err(GeectlError::new(ErrorKind::ServerError, e.to_string())),
+            Err(e) => {
+                self.debug_single_attempt("DELETE", url, "server error", started.elapsed());
+                Err(GeectlError::new(ErrorKind::ServerError, e.to_string()))
+            }
         }
     }
 }
@@ -1031,14 +1464,14 @@ mod tests {
     #[test]
     fn body_at_the_cap_is_accepted() {
         let data = vec![b'a'; MAX_BODY_BYTES];
-        let body = read_body_capped(std::io::Cursor::new(data)).unwrap();
+        let body = read_body_bytes_capped(std::io::Cursor::new(data)).unwrap();
         assert_eq!(body.len(), MAX_BODY_BYTES);
     }
 
     #[test]
     fn body_over_the_cap_is_rejected() {
         let data = vec![b'a'; MAX_BODY_BYTES + 1];
-        let err = read_body_capped(std::io::Cursor::new(data)).unwrap_err();
+        let err = read_body_bytes_capped(std::io::Cursor::new(data)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
@@ -1050,7 +1483,7 @@ mod tests {
         // invalid-UTF-8 I/O error mapped to NetworkError.)
         let mut data = vec![b'a'; MAX_BODY_BYTES];
         data.push(0xC3); // first byte of a 2-byte UTF-8 sequence
-        let err = read_body_capped(std::io::Cursor::new(data)).unwrap_err();
+        let err = read_body_bytes_capped(std::io::Cursor::new(data)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
@@ -1058,15 +1491,31 @@ mod tests {
     fn in_cap_invalid_utf8_is_server_error() {
         // A body within the cap that is not valid UTF-8 is a server
         // error, not a transport failure.
+        let (debug, _) = Debug::captured(false, false);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
         let data = vec![0xFF; 4];
-        let err = read_body_capped(std::io::Cursor::new(data)).unwrap_err();
+        let err = client
+            .read_response_body(std::io::Cursor::new(data), "GET", "https://example.com/x")
+            .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]
     fn valid_multibyte_body_is_accepted() {
         let data = "h\u{e9}llo w\u{f6}rld".repeat(10);
-        let body = read_body_capped(std::io::Cursor::new(data.clone())).unwrap();
+        let (debug, _) = Debug::captured(false, false);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        let body = client
+            .read_response_body(
+                std::io::Cursor::new(data.clone().into_bytes()),
+                "GET",
+                "https://example.com/x",
+            )
+            .unwrap();
         assert_eq!(body, data);
     }
 
@@ -1196,7 +1645,7 @@ mod tests {
         /// that yields the recorded request. The read is
         /// Content-Length-aware: reading headers only would leave a
         /// POST body unread and the recorded request incomplete.
-        fn serve_once(response: String) -> (u16, std::thread::JoinHandle<Option<String>>) {
+        fn serve_once(response: Vec<u8>) -> (u16, std::thread::JoinHandle<Option<String>>) {
             let listener =
                 std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
             listener.set_nonblocking(true).expect("nonblocking");
@@ -1219,10 +1668,17 @@ mod tests {
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let buf = read_request(&mut stream);
                 let request = String::from_utf8_lossy(&buf).into_owned();
-                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&response);
                 Some(request)
             });
             (port, handle)
+        }
+
+        /// Answer one request with raw `response` bytes: for
+        /// bodies that are not valid UTF-8, which cannot be a `String`.
+        fn serve_raw(response: Vec<u8>) -> Self {
+            let (port, handle) = Self::serve_once(response);
+            LoopbackServer { port, handle }
         }
 
         fn serve(body: &'static str) -> Self {
@@ -1236,7 +1692,7 @@ mod tests {
                 body.len(),
                 body
             );
-            let (port, handle) = Self::serve_once(response);
+            let (port, handle) = Self::serve_once(response.into_bytes());
             LoopbackServer { port, handle }
         }
 
@@ -1246,7 +1702,7 @@ mod tests {
             let response = format!(
                 "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
-            let (port, handle) = Self::serve_once(response);
+            let (port, handle) = Self::serve_once(response.into_bytes());
             LoopbackServer { port, handle }
         }
 
@@ -2384,5 +2840,294 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    // --- Debug channel tests (fixture transports, never a live server) ---
+
+    /// The lines a captured sink recorded, as owned strings.
+    fn take_debug_lines(lines: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        lines.lock().unwrap().clone()
+    }
+
+    /// Debug lines with the per-attempt duration stripped: durations
+    /// are real timing, so an exact-line assertion must not depend
+    /// on them.
+    fn debug_lines_without_durations(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| match (line.find(" in "), line.find(" (attempt")) {
+                (Some(start), Some(end)) if start < end => {
+                    format!("{}{}", &line[..start], &line[end..])
+                }
+                _ => line.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn debug_off_records_no_lines() {
+        let server = LoopbackServer::serve("hello");
+        let (debug, lines) = Debug::captured(false, false);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        assert_eq!(client.get(&server.url()).unwrap(), "hello");
+        assert!(take_debug_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn debug_on_records_attempt_lines_for_500_then_200() {
+        let (port, count, handle) = serve_500_then_ok();
+        let (debug, lines) = Debug::captured(true, false);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        let url = format!("http://127.0.0.1:{port}/public/source/openSUSE:Factory/foo");
+        assert_eq!(client.get(&url).unwrap(), "<status code=\"ok\" />");
+        handle.join().expect("server thread");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            debug_lines_without_durations(&take_debug_lines(&lines)),
+            vec![
+                "decision: read via /public/source (no credentials)".to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo -> 500 (attempt 1/4, retry in 1s: transient status 500)"
+                    .to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo -> 200 (attempt 2/4)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn debug_on_records_one_line_for_404() {
+        // A 404 is not retryable: one attempt line, no retry note,
+        // no exhaustion line.
+        let server = LoopbackServer::serve_status("missing", 404);
+        let (debug, lines) = Debug::captured(true, false);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        let url = format!(
+            "http://127.0.0.1:{}/public/source/openSUSE:Factory/foo",
+            server.port
+        );
+        let err = client.get(&url).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(
+            debug_lines_without_durations(&take_debug_lines(&lines)),
+            vec![
+                "decision: read via /public/source (no credentials)".to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo -> 404 (attempt 1/4)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn debug_on_records_exhaustion_after_retries() {
+        // Four attempts (1s + 2s + 4s of backoff), then the
+        // exhaustion line naming the last status.
+        let server = CountingServer::serve_status("error", 500);
+        let (debug, lines) = Debug::captured(true, false);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        let url = format!(
+            "http://127.0.0.1:{}/public/source/openSUSE:Factory/foo",
+            server.port
+        );
+        let err = client.get(&url).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert_eq!(server.hits(), 4);
+        assert_eq!(
+            debug_lines_without_durations(&take_debug_lines(&lines)),
+            vec![
+                "decision: read via /public/source (no credentials)".to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo -> 500 (attempt 1/4, retry in 1s: transient status 500)"
+                    .to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo -> 500 (attempt 2/4, retry in 2s: transient status 500)"
+                    .to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo -> 500 (attempt 3/4, retry in 4s: transient status 500)"
+                    .to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo -> 500 (attempt 4/4)".to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo failed after 4 attempts (last: 500)"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn debug_endpoint_reports_authenticated_reads() {
+        let server = LoopbackServer::serve("hello");
+        let (debug, lines) = Debug::captured(true, false);
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Basic {
+                username: "alice".to_string(),
+                password: "s3cr3t".to_string(),
+            }))),
+        )
+        .unwrap()
+        .with_debug(debug);
+        assert_eq!(client.get(&server.url()).unwrap(), "hello");
+        let lines = take_debug_lines(&lines);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "decision: read via /test (authenticated)"),
+            "lines: {lines:?}"
+        );
+        // The fixture credential never reaches a debug line.
+        assert!(!lines.iter().any(|l| l.contains("s3cr3t")));
+    }
+
+    #[test]
+    fn debug_body_absent_by_default() {
+        // Default debug never prints bodies: the response body (and
+        // the fake credential in it) stays out of the channel.
+        let server = LoopbackServer::serve("<auth password=\"hunter2-fake\" />");
+        let (debug, lines) = Debug::captured(true, false);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        assert_eq!(
+            client.get(&server.url()).unwrap(),
+            "<auth password=\"hunter2-fake\" />"
+        );
+        let lines = take_debug_lines(&lines);
+        assert!(!lines.iter().any(|l| l.contains("body")));
+        assert!(!lines.iter().any(|l| l.contains("hunter2-fake")));
+    }
+
+    #[test]
+    fn debug_body_present_only_behind_debug_body() {
+        let server = LoopbackServer::serve("<auth password=\"hunter2-fake\" />");
+        let (debug, lines) = Debug::captured(true, true);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        assert_eq!(
+            client.get(&server.url()).unwrap(),
+            "<auth password=\"hunter2-fake\" />"
+        );
+        let lines = take_debug_lines(&lines);
+        assert!(
+            lines.iter().any(|l| l.contains("response body")),
+            "lines: {lines:?}"
+        );
+        // The fake credential appears nowhere; the redaction marker does.
+        assert!(!lines.iter().any(|l| l.contains("hunter2-fake")));
+        assert!(lines.iter().any(|l| l.contains("[redacted]")));
+    }
+
+    #[test]
+    fn debug_body_redacts_request_bodies() {
+        let server = LoopbackServer::serve("<status code=\"ok\" />");
+        let (debug, lines) = Debug::captured(true, true);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        let body = "<request><auth password=\"hunter2-fake\" /></request>";
+        assert_eq!(
+            client
+                .post(&server.url(), body, &Credentials::None)
+                .unwrap(),
+            "<status code=\"ok\" />"
+        );
+        let lines = take_debug_lines(&lines);
+        assert!(
+            lines.iter().any(|l| l.contains("request body")),
+            "lines: {lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("hunter2-fake")));
+    }
+
+    #[test]
+    fn debug_body_never_dumps_binary_bodies() {
+        let body = format!("ok{}binary", char::from(0));
+        let server = LoopbackServer::serve(Box::leak(body.clone().into_boxed_str()));
+        let (debug, lines) = Debug::captured(true, true);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        assert_eq!(client.get(&server.url()).unwrap(), body);
+        let lines = take_debug_lines(&lines);
+        assert!(
+            lines.iter().any(|l| l.contains("<binary body, 9 bytes>")),
+            "lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn debug_body_marks_non_utf8_response_bodies() {
+        // A non-UTF-8 response still errors exactly as before
+        // (ServerError), but the binary marker line is emitted first,
+        // so the transcript shows the body was binary rather than
+        // absent.
+        let (debug, lines) = Debug::captured(true, true);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        let err = client
+            .read_response_body(
+                std::io::Cursor::new(vec![0xFF; 4]),
+                "GET",
+                "https://api.opensuse.org/source/foo",
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        let lines = take_debug_lines(&lines);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l
+                    == "http: GET /source/foo response body (4 bytes): <binary body, 4 bytes>"),
+            "lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn debug_attempt_line_precedes_non_utf8_response_body_error() {
+        // F-H probe: a 200 whose body is not valid UTF-8 errors
+        // exactly as before (ServerError), but the attempt line must
+        // come before the binary marker, so the transcript shows
+        // which attempt the marker belongs to. On the unfixed code
+        // the `?` on the body read returns before any attempt line
+        // is emitted, so the marker stands alone.
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
+            .to_vec();
+        response.extend_from_slice(&[0xFF; 4]);
+        let server = LoopbackServer::serve_raw(response);
+        let (debug, lines) = Debug::captured(true, true);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        let err = client.get(&server.url()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert_eq!(
+            debug_lines_without_durations(&take_debug_lines(&lines)),
+            vec![
+                "decision: read via /test (no credentials)".to_string(),
+                "http: GET /test -> 200 (attempt 1/4)".to_string(),
+                "http: GET /test response body (4 bytes): <binary body, 4 bytes>".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn debug_body_marker_absent_without_debug_body() {
+        // The marker is a body line: without `--debug-body` there is
+        // no marker, and the error is still the same ServerError.
+        let (debug, lines) = Debug::captured(true, false);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        let err = client
+            .read_response_body(
+                std::io::Cursor::new(vec![0xFF; 4]),
+                "GET",
+                "https://api.opensuse.org/source/foo",
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(take_debug_lines(&lines).is_empty());
     }
 }
