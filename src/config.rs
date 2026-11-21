@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::auth::{
-    snapshot_env, GITEA_SSH_KEY_VAR, GITEA_TOKEN_FILE_VAR, GITEA_TOKEN_VAR, OBS_PASSWORD_FILE_VAR,
-    OBS_PASSWORD_VAR, OBS_USERNAME_VAR,
+    open_file_nonblocking, snapshot_env, GITEA_SSH_KEY_VAR, GITEA_TOKEN_FILE_VAR, GITEA_TOKEN_VAR,
+    OBS_PASSWORD_FILE_VAR, OBS_PASSWORD_VAR, OBS_USERNAME_VAR,
 };
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::is_loopback_url;
@@ -251,14 +251,18 @@ pub fn load_config() -> Result<Config, GeectlError> {
 }
 
 /// Load the config file at `path` (a missing file is an empty config).
-/// The largest config file accepted (64 KiB, the same cap as secret
-/// files). A config is two URL lines; anything larger is a
-/// misconfiguration, not a config.
+/// The file must be a regular file: a FIFO or device at the path is
+/// refused, not read. The largest config file accepted (64 KiB, the
+/// same cap as secret files). A config is two URL lines; anything
+/// larger is a misconfiguration, not a config.
 pub const MAX_CONFIG_FILE_BYTES: usize = 64 * 1024;
 
 pub fn load_config_at(path: &Path) -> Result<Config, GeectlError> {
     use std::io::Read;
-    let file = match std::fs::File::open(path) {
+    // The open is non-blocking on unix (see `open_file_nonblocking`
+    // in auth.rs), so a FIFO at the path cannot block the open; the
+    // regular-file check below refuses it before any byte is read.
+    let file = match open_file_nonblocking(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => {
@@ -268,6 +272,21 @@ pub fn load_config_at(path: &Path) -> Result<Config, GeectlError> {
             ));
         }
     };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("{}: not a regular file", path.display()),
+            ));
+        }
+        Err(e) => {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("{}: cannot read config: {e}", path.display()),
+            ));
+        }
+    }
     // Read at most MAX + 1 bytes, so a file that grows while being
     // read is still capped.
     let mut bytes = Vec::new();
@@ -937,6 +956,28 @@ mod tests {
             Some("https://src.opensuse.org")
         );
         assert_eq!(config.obs_url, None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_config_at_does_not_block_on_a_fifo() {
+        // A FIFO with no writer blocks a plain open forever; the
+        // non-blocking open returns at once, and the regular-file
+        // check refuses it before reading.
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo must be available to create the test FIFO");
+        assert!(status.success(), "mkfifo must create the test FIFO");
+        let err = load_config_at(&path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("not a regular file"),
+            "{}",
+            err.context
+        );
     }
 
     #[test]
