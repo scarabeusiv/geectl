@@ -241,6 +241,40 @@ fn validate_base(base: &str) -> Result<(), GeectlError> {
     }
 }
 
+/// True when the authority's `:port`, if present, is a decimal port
+/// number (0-65535). A port is never anything else: `api.opensuse.org:abc`
+/// names no server, and today it sails through validation only to fail
+/// at the first request inside the transport, with a transport error
+/// instead of the bare-base message. Neither downstream check looks at
+/// the port — `UrlBuilder::new` checks scheme and host only, and
+/// `is_loopback_url` classifies the host and ignores the port — so this
+/// is the one place that can reject it early. An empty port
+/// (`api.opensuse.org:`) stays accepted: it means the default port.
+fn port_is_valid(authority: &str) -> bool {
+    // The port separator is the `:` after the closing bracket of a
+    // bracketed host, or the first `:` of a bare host (a bare host
+    // carries no `:` of its own).
+    let after_host = if authority.starts_with('[') {
+        match authority.find(']') {
+            Some(end) => &authority[end + 1..],
+            // Unterminated bracket: the bracket check rejects the
+            // authority; this check has nothing to say about it.
+            None => return true,
+        }
+    } else {
+        match authority.find(':') {
+            Some(pos) => &authority[pos..],
+            None => return true,
+        }
+    };
+    let Some(port) = after_host.strip_prefix(':') else {
+        return true;
+    };
+    port.is_empty()
+        || (port.chars().all(|c| c.is_ascii_digit())
+            && port.parse::<u32>().is_ok_and(|p| p <= 65535))
+}
+
 /// True when `authority` is a bare authority: non-empty, with no path,
 /// query, fragment, userinfo, or whitespace, and with a non-empty host.
 /// The authority ends at the first `/`, `?`, or `#`; an `@` inside it
@@ -249,6 +283,8 @@ fn validate_base(base: &str) -> Result<(), GeectlError> {
 /// `[]` carries no host at all. A bracketed host is only a bracketed
 /// host if the closing bracket is followed by the end of the authority
 /// or a `:port`: without that, `[::1]evil.com` is not a host at all.
+/// A `:port`, when present, must be a decimal port number (see
+/// `port_is_valid`).
 fn is_bare_authority(authority: &str) -> bool {
     !authority.is_empty()
         && !authority.contains(['/', '?', '#', '@'])
@@ -263,6 +299,7 @@ fn is_bare_authority(authority: &str) -> bool {
                 }
                 None => false,
             })
+        && port_is_valid(authority)
 }
 
 /// A CVE identifier, e.g. `CVE-2026-12345`. Stored in canonical
@@ -10670,6 +10707,15 @@ mod tests {
         assert!(!is_bare_authority("[::1"));
         assert!(!is_bare_authority("[::1]evil.com"));
         assert!(!is_bare_authority(""));
+        // A port, when present, is a decimal port number.
+        assert!(is_bare_authority("api.opensuse.org:443"));
+        assert!(is_bare_authority("api.opensuse.org:65535"));
+        // An empty port means the default port: accepted, as before.
+        assert!(is_bare_authority("api.opensuse.org:"));
+        assert!(!is_bare_authority("api.opensuse.org:abc"));
+        assert!(!is_bare_authority("api.opensuse.org:80x"));
+        assert!(!is_bare_authority("api.opensuse.org:99999"));
+        assert!(!is_bare_authority("[::1]:abc"));
     }
 
     // --- SrPayload ---
