@@ -22,15 +22,36 @@ fi
 
 cd "$(git rev-parse --show-toplevel)"
 
-# Standalone robustness: the tree must be clean before the bump, and
-# any failure after the first edit restores the two version surfaces.
+# Standalone robustness: the tree must be clean before the bump.
 # (In the release workflow the checkout is fresh, so the precondition
 # is a no-op there; it protects a developer running the script by hand.)
 if [ -n "$(git status --porcelain)" ]; then
   echo "refusing to bump: the tree has uncommitted changes" >&2
   exit 1
 fi
-trap 'git checkout -- Cargo.toml Cargo.lock 2>/dev/null || true' ERR
+
+# One EXIT cleanup for the whole script: it removes every tempfile
+# the script creates and, on any nonzero exit, restores the two
+# version surfaces. EXIT (not ERR) is what makes explicit `exit 1`
+# validation failures restore too — ERR never fires for an explicit
+# exit, so a post-edit drift/mismatch/stale failure used to leave a
+# dirty tree behind. Installed after the clean-tree precondition: a
+# failure before this point has edited nothing, so there is nothing
+# to restore.
+subst_tmp=""
+stale_tmp=""
+cleanup() {
+  local rc=$?
+  if [ -n "$subst_tmp" ]; then rm -f "$subst_tmp"; fi
+  if [ -n "$stale_tmp" ]; then rm -f "$stale_tmp"; fi
+  if [ "$rc" -ne 0 ]; then
+    # One file at a time: a single checkout naming a surface that is
+    # not in the index (no Cargo.lock yet, say) restores neither.
+    git checkout -- Cargo.toml 2>/dev/null || true
+    git checkout -- Cargo.lock 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
 # Tolerant [package] version read: spaces around `=` and a trailing
 # comment are allowed. A workspace-inherited version
@@ -58,7 +79,6 @@ else
 fi
 if [ "$forward" -ne 1 ]; then
   echo "refusing to move $old to $new: the version only moves forward" >&2
-  echo "(a half-applied earlier run is undone with: git checkout -- Cargo.toml Cargo.lock)" >&2
   exit 1
 fi
 
@@ -66,9 +86,14 @@ fi
 subst() { # sed-script file
   local tmp
   tmp=$(mktemp)
+  # Registered with the script-wide EXIT cleanup, not a trap of its
+  # own (which would replace it): a failure mid-call still removes
+  # the tempfile, and so does any later failure.
+  subst_tmp="$tmp"
   sed "$1" "$2" >"$tmp"
   cat "$tmp" >"$2"
   rm -f "$tmp"
+  subst_tmp=""
 }
 
 old_re=${old//./\\.}
@@ -102,16 +127,20 @@ fi
 # git grep exits 1 on no match (clean) and 0 on a match (stale), but
 # 2-plus on a real error (bad pathspec, corrupt index): only exit 1
 # is tolerated, anything else fails loudly.
-stale_file=$(mktemp)
+stale_tmp=$(mktemp)
 stale_rc=0
-git grep -F -l "$old" -- ':!Cargo.lock' ':!Cargo.toml' >"$stale_file" || stale_rc=$?
+# The old version must match as a whole token, not a substring: a
+# plain -F search also matches longer versions that merely contain
+# it (a 10.x release contains the 0.x string). The ERE requires a
+# non-digit, non-dot (or a line edge) on both sides, so a v-prefixed
+# or quoted occurrence still matches while the longer one does not.
+git grep -E -l "(^|[^0-9.])$old_re([^0-9.]|$)" -- ':!Cargo.lock' ':!Cargo.toml' >"$stale_tmp" || stale_rc=$?
 if [ "$stale_rc" -gt 1 ]; then
   echo "stale-version check failed (git grep exit $stale_rc)" >&2
   exit 1
 fi
-if [ -s "$stale_file" ]; then
+if [ -s "$stale_tmp" ]; then
   echo "old version $old still appears in:" >&2
-  cat "$stale_file" >&2
+  cat "$stale_tmp" >&2
   exit 1
 fi
-rm -f "$stale_file"
