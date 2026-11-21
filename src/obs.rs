@@ -7218,28 +7218,47 @@ impl SrPayload {
     /// server accepts. This is a structural check on the generated
     /// XML, not a re-derivation of the payload.
     pub fn validate_xml(&self) -> Result<(), GeectlError> {
-        let xml = self.to_xml();
-        check_well_formed(&xml)?;
-        // The rendered XML must carry exactly one <sourceupdate> with
-        // a value the server accepts. The value comes from the
-        // `SourceUpdate` enum, so it is always one of the three —
-        // this check exists so a future edit to `to_xml` that drops
-        // or mangles the attribute fails here, at payload build time,
-        // instead of at the API.
-        match sourceupdate_value(&xml) {
-            Some(value) if ["update", "noupdate", "cleanup"].contains(&value) => Ok(()),
-            Some(value) => Err(GeectlError::new(
+        validate_sr_xml(&self.to_xml())
+    }
+}
+
+/// Verify rendered SR XML: well-formed, with the required
+/// structure, a `<sourceupdate>` value the server accepts, and an
+/// `<action>` carrying `type="submit"`. The action-type check exists
+/// so a future edit to `to_xml` that changes the action type fails
+/// here, at payload build time, instead of at the API.
+fn validate_sr_xml(xml: &str) -> Result<(), GeectlError> {
+    check_well_formed(xml)?;
+    // The rendered XML must carry exactly one <sourceupdate> with
+    // a value the server accepts. The value comes from the
+    // `SourceUpdate` enum, so it is always one of the three —
+    // this check exists so a future edit to `to_xml` that drops
+    // or mangles the attribute fails here, at payload build time,
+    // instead of at the API.
+    match sourceupdate_value(xml) {
+        Some(value) if ["update", "noupdate", "cleanup"].contains(&value) => {}
+        Some(value) => {
+            return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 format!("malformed SR XML: unknown <sourceupdate> value {value:?}"),
-            )),
-            // A missing <sourceupdate> is refused by check_well_formed
-            // above, so None here means the element is duplicated.
-            None => Err(GeectlError::new(
+            ));
+        }
+        // A missing <sourceupdate> is refused by check_well_formed
+        // above, so None here means the element is duplicated.
+        None => {
+            return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 "malformed SR XML: duplicated <sourceupdate> in <action>",
-            )),
+            ));
         }
     }
+    if !request_block_has_submit_action(xml) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "malformed SR XML: <action> is not type=\"submit\"",
+        ));
+    }
+    Ok(())
 }
 
 /// The `<sourceupdate>` value the rendered XML carries, if exactly one
@@ -10617,6 +10636,21 @@ mod tests {
         assert!(xml.contains("<options><sourceupdate>cleanup</sourceupdate></options>"));
         assert!(xml.contains("<description>Update foo to 2.0</description>"));
         assert!(xml.contains("</request>"));
+    }
+
+    #[test]
+    fn validate_xml_rejects_a_non_submit_action() {
+        // A future `to_xml` edit that changes the action type must
+        // fail at payload build time, not at the API.
+        let xml = payload().to_xml();
+        assert!(validate_sr_xml(&xml).is_ok());
+        let delete = xml.replace("<action type=\"submit\">", "<action type=\"delete\">");
+        let err = validate_sr_xml(&delete).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("type=\"submit\""), "{}", err.context);
+        // Either quote style counts: a single-quoted submit passes.
+        let single = xml.replace("<action type=\"submit\">", "<action type='submit'>");
+        assert!(validate_sr_xml(&single).is_ok());
     }
 
     #[test]
