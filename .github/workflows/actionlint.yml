@@ -38,5 +38,5 @@ jobs:
         run: shellcheck --version
       - name: actionlint
         run: /tmp/actionlint -color
-      # No `shellcheck scripts/*.sh` step: geectl has no scripts/
-      # directory and no shell scripts to check.
+      - name: shellcheck scripts
+        run: shellcheck scripts/*.sh
