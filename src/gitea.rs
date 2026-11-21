@@ -1,0 +1,2521 @@
+//! The Gitea operations for git-backed packages: repo read, fork,
+//! repo delete, and the `branch` composite (Gitea fork + OBS
+//! `cmd=fork`) behind the uniform flow.
+//!
+//! The client is internal plumbing, not the user-facing surface:
+//! the uniform flow verbs (`branch`, `submit`, …) are what an agent
+//! calls, and the `Gitea*` types never appear in a uniform-flow
+//! signature. The module is public so the live harness can exercise
+//! the typed operations against a real server; the uniform flow
+//! itself dispatches to this client internally on the backend kind
+//! recorded at checkout.
+//!
+//! Wire rules: JSON via `serde` `Deserialize`, unknown fields
+//! ignored — the structs tolerate a newer Gitea than the pinned
+//! test image (1.24.7, `tests/gitea/provision.sh`) without
+//! breaking. Only the fields each operation needs are modelled.
+//! The `HttpClient` trait is reused as-is (`get_with`,
+//! `post_json_with`, `delete`); the Gitea client adds no transport of
+//! its own. Gitea answers fork creation with 202 and the created
+//! fork is NOT verified by the response alone — the fork is
+//! re-read and its `parent` checked before success is reported.
+//!
+//! Auth is a Bearer token (the Gitea API takes no other HTTP
+//! auth); construction fails closed when no token is configured.
+//! The credentials held here are the single source for every call
+//! the client makes: `get_with`, `post_json_with`, and `delete` all
+//! take them explicitly, so the client never consults the HTTP
+//! client's own auth provider — a per-instance client can later
+//! carry different credentials without rework, and no call can
+//! silently authenticate as someone else.
+
+use crate::auth::Credentials;
+use crate::config::DEFAULT_GITEA_URL;
+use crate::debug::Debug;
+use crate::error::ErrorKind;
+use crate::error::GeectlError;
+use crate::http::is_loopback_url;
+use crate::http::HttpClient;
+use crate::obs::build_url;
+use crate::obs::common::is_bare_authority;
+use crate::obs::valid_obs_name;
+use crate::obs::DryRun;
+use crate::obs::ObsClient;
+use crate::url::UrlBuilder;
+use serde::Deserialize;
+use serde::Serialize;
+
+/// A Gitea user: only the login is modelled (the fork target-owner
+/// resolution reads it from `GET /api/v1/user`).
+#[derive(Debug, Deserialize)]
+struct GiteaUser {
+    login: String,
+}
+
+/// A Gitea account (owner): only the login is modelled.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaOwner {
+    /// The login name.
+    pub login: String,
+}
+
+/// The parent of a fork: only the identity is modelled — the fork
+/// verification compares the parent's full name with the source.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaParent {
+    /// The parent's owner.
+    pub owner: GiteaOwner,
+    /// The parent's repo name.
+    pub name: String,
+    /// The parent's `owner/name`.
+    pub full_name: String,
+}
+
+/// A Gitea repository: only the fields the phase-1 operations need
+/// are modelled — identity, parent, default branch, and the clone
+/// URLs the fork result returns. A field the operation does not
+/// need is not parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaRepository {
+    /// The repo's owner.
+    pub owner: GiteaOwner,
+    /// The repo name.
+    pub name: String,
+    /// `owner/name`.
+    pub full_name: String,
+    /// The repo this one was forked from, when it is a fork.
+    #[serde(default)]
+    pub parent: Option<GiteaParent>,
+    /// The repo's default branch.
+    pub default_branch: String,
+    /// The HTTPS clone URL.
+    pub clone_url: String,
+    /// The SSH clone URL.
+    pub ssh_url: String,
+}
+
+/// Options for the Gitea-side fork step (`fork_repo`).
+#[derive(Debug, Clone, Default)]
+pub struct ForkRepoOptions {
+    /// Name for the fork; defaults to the source repo name.
+    pub new_name: Option<String>,
+    /// Organization to fork into; defaults to the token owner's
+    /// account.
+    pub organization: Option<String>,
+}
+
+/// Options for the `branch` composite (Gitea fork + OBS `cmd=fork`).
+#[derive(Debug, Clone, Default)]
+pub struct ForkOptions {
+    /// Name for the fork; defaults to the source repo name.
+    pub new_repo_name: Option<String>,
+    /// Organization to fork into; defaults to the token owner's
+    /// account.
+    pub organization: Option<String>,
+    /// Branch to fork from and name in the fork's scmsync URL (the
+    /// explicit `--git-branch`); defaults to the source branch.
+    pub fork_branch: Option<String>,
+    /// Fork from the named project/package even when it has a devel
+    /// project.
+    pub no_devel_project: bool,
+    /// OBS target project for the fork; defaults to the server
+    /// default (`home:<user>:branches:<project>`).
+    pub target_project: Option<String>,
+    /// OBS target package for the fork; defaults to the package
+    /// name.
+    pub target_package: Option<String>,
+}
+
+/// The result of the `branch` composite: the fork repo, the scmsync
+/// URL the OBS side syncs from, the OBS target project/package, and
+/// the clone URLs for the agent's own `git clone`. No local clone
+/// is made. Plain fields only — no `Gitea*` type leaks into the
+/// uniform-flow result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkResult {
+    /// The fork's owner (the token owner, or the organization).
+    pub owner: String,
+    /// The fork's repo name.
+    pub repo: String,
+    /// The branch named in the fork's scmsync URL.
+    pub branch: String,
+    /// The scmsync URL the OBS fork syncs from.
+    pub scmsync: String,
+    /// The OBS project the fork lives in.
+    pub target_project: String,
+    /// The OBS package the fork lives in.
+    pub target_package: String,
+    /// The HTTPS clone URL of the fork.
+    pub clone_url: String,
+    /// The SSH clone URL of the fork.
+    pub ssh_url: String,
+}
+
+/// The body of `POST /api/v1/repos/{owner}/{repo}/forks`: both
+/// fields optional, both omitted when unset (the server defaults
+/// the name to the source repo and the target to the token owner).
+#[derive(Debug, Serialize)]
+struct ForkRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization: Option<String>,
+}
+
+/// A parsed scmsync URL, following the server's
+/// `generate_scmsyncinfo` (backend `BSSrcServer/ScmsyncDB.pm`):
+/// the repo is scheme + host + path with a trailing `.git`
+/// stripped and a `git+` scheme prefix stripped; the branch is the
+/// `#fragment`; the `trackingbranch` query value is a separate
+/// field, honoured as the branch only when no fragment names one.
+struct ScmsyncUrl {
+    /// The authority (host, plus port when present) of the repo URL.
+    authority: String,
+    /// The repo's owner.
+    owner: String,
+    /// The repo name.
+    repo: String,
+    /// The branch: the `#fragment` when present, else the
+    /// `trackingbranch` query value when present, else `None`.
+    branch: Option<String>,
+}
+
+/// The Gitea client: the transport client for the git-backed
+/// implementation of the uniform flow. Parallel to `ObsClient` —
+/// a different base URL, different auth (Bearer vs OBS Basic), and
+/// a different wire format (JSON, not XML).
+pub struct GiteaClient<'a> {
+    http: &'a dyn HttpClient,
+    base: String,
+    credentials: Credentials,
+    debug: Debug,
+}
+
+impl<'a> GiteaClient<'a> {
+    /// Build a client for the configured Gitea instance
+    /// (`DEFAULT_GITEA_URL`) with the given Bearer credentials.
+    /// Construction fails closed when no token is configured: the
+    /// Gitea API takes a Bearer token and no other HTTP auth.
+    pub fn new(http: &'a dyn HttpClient, credentials: Credentials) -> Result<Self, GeectlError> {
+        Self::with_base(http, DEFAULT_GITEA_URL, credentials)
+    }
+
+    /// Build a client for `base` with the given Bearer
+    /// credentials. The base is a bare `https://` URL (scheme +
+    /// host, no path, query, fragment, or userinfo), or a bare
+    /// `http://` URL on a loopback host (a test instance only).
+    pub fn with_base(
+        http: &'a dyn HttpClient,
+        base: &str,
+        credentials: Credentials,
+    ) -> Result<Self, GeectlError> {
+        validate_gitea_base(base)?;
+        let credentials = match credentials {
+            Credentials::Bearer { .. } => credentials,
+            Credentials::None => {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    "no Gitea token configured (GEECTL_GITEA_TOKEN or GEECTL_GITEA_TOKEN_FILE)",
+                ));
+            }
+            Credentials::Basic { .. } | Credentials::SshKey { .. } => {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    "Gitea takes a Bearer token (GEECTL_GITEA_TOKEN or GEECTL_GITEA_TOKEN_FILE), not a username/password or SSH key",
+                ));
+            }
+        };
+        Ok(Self {
+            http,
+            base: base.trim_end_matches('/').to_string(),
+            credentials,
+            debug: Debug::disabled(),
+        })
+    }
+
+    /// Report the channel's decision lines to `debug` instead of
+    /// dropping them. The sink is off by default; the caller that
+    /// owns the debug channel passes its sink here.
+    pub fn with_debug(mut self, debug: Debug) -> Self {
+        self.debug = debug;
+        self
+    }
+
+    /// The authority (host, plus port when present) of the
+    /// configured base, for the single-instance host check.
+    fn authority(&self) -> &str {
+        self.base
+            .strip_prefix("https://")
+            .or_else(|| self.base.strip_prefix("http://"))
+            .unwrap_or(&self.base)
+    }
+
+    /// Read a repository (`GET /api/v1/repos/{owner}/{repo}`).
+    /// The read every later phase builds on: it resolves the
+    /// default branch and verifies a fork's parent by re-reading.
+    pub fn repo_get(&self, owner: &str, repo: &str) -> Result<GiteaRepository, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        let url = build_url(&self.base, &["api", "v1", "repos", owner, repo], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_repository(&body, owner, repo)
+    }
+
+    /// Read the token owner's login (`GET /api/v1/user`). A private
+    /// helper until `user_get` lands (phase 5): the fork target
+    /// owner defaults to this login.
+    fn current_user_login(&self) -> Result<String, GeectlError> {
+        let url = build_url(&self.base, &["api", "v1", "user"], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        let user: GiteaUser = serde_json::from_str(&body).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected Gitea user response: {err}"),
+            )
+        })?;
+        Ok(user.login)
+    }
+
+    /// Fork a repository (`POST
+    /// /api/v1/repos/{owner}/{repo}/forks`): the Gitea-side step of
+    /// the `branch` composite. `ForkExists` returns the existing
+    /// fork instead of failing — the agent reuses it. A non-fork
+    /// repo of the requested name is an error naming the
+    /// alternative (new name, or delete and retry). Fork creation
+    /// answers 202 and the created fork is NOT verified by the
+    /// response alone: the fork is re-read and its `parent`
+    /// checked before success is reported, so a fork-of-fork with
+    /// a mismatched parent is a `ServerError` naming the re-read.
+    /// In dry-run the fork is recorded in the plan and nothing is
+    /// forked — the guard runs before any server read, like
+    /// `branch_package` — and the result is `None`.
+    pub fn fork_repo(
+        &self,
+        owner: &str,
+        repo: &str,
+        options: &ForkRepoOptions,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaRepository>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        if let Some(name) = &options.new_name {
+            validate_gitea_name(name, "fork name")?;
+        }
+        if let Some(organization) = &options.organization {
+            validate_gitea_name(organization, "organization")?;
+        }
+        let target_name = options.new_name.as_deref().unwrap_or(repo);
+        // The dry-run guard: in dry-run the fork is recorded in the
+        // plan and nothing is forked — not even the target-owner
+        // read runs. The plan names the target owner only when the
+        // caller gave an organization; otherwise it says the
+        // caller's own account instead of guessing it.
+        let target_owner = options.organization.as_deref().unwrap_or("your account");
+        if !dry_run.allow(&format!(
+            "fork repository {owner}/{repo} to {target_owner}/{target_name}"
+        )) {
+            return Ok(None);
+        }
+        let target_owner = match &options.organization {
+            Some(organization) => organization.clone(),
+            None => self.current_user_login()?,
+        };
+        // Pre-check: a repo of the target name may already exist.
+        // The reuse-or-refuse rule decides: a fork of this source
+        // is reused, anything else is `AlreadyExists`.
+        match self.repo_get(&target_owner, target_name) {
+            Ok(existing) => return self.reuse_or_refuse(&existing, owner, repo),
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        let request = ForkRequest {
+            name: options.new_name.clone(),
+            organization: options.organization.clone(),
+        };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea fork request: {err}"),
+            )
+        })?;
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "repos", owner, repo, "forks"],
+            &[],
+        );
+        match self.http.post_json_with(&url, &body, &self.credentials) {
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                // A 409 from the fork: a fork landed first (or the
+                // target name was taken) between the pre-check and
+                // the POST. Only a 409 — AlreadyExists — re-reads
+                // the target; any other refusal (a 400, a 422)
+                // propagates as-is, so a malformed request is never
+                // mistaken for a race. Re-read the target and apply
+                // the same reuse-or-refuse rule; when the target
+                // still does not exist the fork lives under a
+                // different name, so the original refusal stands.
+                return match self.repo_get(&target_owner, target_name) {
+                    Ok(existing) => self.reuse_or_refuse(&existing, owner, repo),
+                    Err(re_err) if re_err.kind() == ErrorKind::NotFound => Err(err),
+                    Err(re_err) => Err(re_err),
+                };
+            }
+            Err(err) => return Err(err),
+        };
+        // The 202 answer is not the verification: re-read the
+        // created fork by its known name and check its parent
+        // before reporting success. The reported repo is the
+        // re-read one — server state after creation, not the 202
+        // body, which is never parsed (a malformed 202 must not
+        // fail a fork the re-read proves exists).
+        let forked = self.verify_fork_parent(&target_owner, target_name, owner, repo)?;
+        Ok(Some(forked))
+    }
+
+    /// The ForkExists rule: an existing target repo that is a fork
+    /// of the source is reused (a decision line records it);
+    /// any other repo of the target name is an `AlreadyExists`
+    /// naming the alternative.
+    fn reuse_or_refuse(
+        &self,
+        existing: &GiteaRepository,
+        source_owner: &str,
+        source_repo: &str,
+    ) -> Result<Option<GiteaRepository>, GeectlError> {
+        let source = format!("{source_owner}/{source_repo}");
+        match &existing.parent {
+            Some(parent) if parent.full_name == source => {
+                self.debug.emit(&format!(
+                    "decision: reusing existing fork {} for {source}",
+                    existing.full_name
+                ));
+                Ok(Some(existing.clone()))
+            }
+            _ => Err(GeectlError::new(
+                ErrorKind::AlreadyExists,
+                format!(
+                    "a repository named {} already exists and is not a fork of {source}; fork to a new name, or delete it and retry",
+                    existing.full_name
+                ),
+            )),
+        }
+    }
+
+    /// Verify a fork by re-reading it by its known name and return
+    /// the re-read repo: the parent must be the source repo. A
+    /// fork-of-fork whose parent is not the source, or a fork that
+    /// is not yet readable, is a `ServerError` naming the re-read
+    /// — the fork was just created, so a re-read failure is the
+    /// server's fault, not a missing resource.
+    fn verify_fork_parent(
+        &self,
+        target_owner: &str,
+        target_name: &str,
+        source_owner: &str,
+        source_repo: &str,
+    ) -> Result<GiteaRepository, GeectlError> {
+        let source = format!("{source_owner}/{source_repo}");
+        let target = format!("{target_owner}/{target_name}");
+        let re_read = match self.repo_get(target_owner, target_name) {
+            Ok(re_read) => re_read,
+            Err(err) => {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("re-read of the fork {target} after creation failed: {err}"),
+                ));
+            }
+        };
+        match &re_read.parent {
+            Some(parent) if parent.full_name == source => Ok(re_read),
+            _ => Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "re-read of the fork {} after creation does not name {source} as its parent",
+                    re_read.full_name
+                ),
+            )),
+        }
+    }
+
+    /// Delete a repository (`DELETE /api/v1/repos/{owner}/{repo}`)
+    /// and return the deleted name. DryRun-guarded like
+    /// `delete_package`: the guard runs before the read, and the
+    /// result is `None` in dry-run. The repo is GET-read first to
+    /// confirm owner/name — the read is a guard, not just the return
+    /// value: `parse_repository` refuses a response naming another
+    /// repo, so a delete never runs against the wrong generation.
+    /// `force` is the confirmation: without it the delete is
+    /// refused client-side (`InvalidInput` naming force) before any
+    /// server read, like `delete_package` refusing without force
+    /// while open requests exist. A dry-run plan needs no force.
+    pub fn repo_delete(
+        &self,
+        owner: &str,
+        repo: &str,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<Option<String>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        if !dry_run.allow(&format!("delete repository {owner}/{repo}")) {
+            return Ok(None);
+        }
+        if !force {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to delete repository {owner}/{repo} without force: deleting a repository is destructive; pass force to confirm"
+                ),
+            ));
+        }
+        let existing = self.repo_get(owner, repo)?;
+        let url = build_url(&self.base, &["api", "v1", "repos", owner, repo], &[]);
+        self.http.delete(&url, &self.credentials)?;
+        Ok(Some(existing.name))
+    }
+
+    /// Give the agent a place to work on a git-backed package (or
+    /// project): Gitea fork + OBS `cmd=fork` wired to the fork's
+    /// scmsync URL, in one call. The user-facing verb `branch` —
+    /// on OBS-native the same verb is `branch_package`; on
+    /// git-backed it is this composite. No local clone is made.
+    ///
+    /// Steps: read the OBS package (or project, for package
+    /// `"_project"`) meta and refuse with `InvalidInput` when it
+    /// carries no `<scmsync>`; resolve the devel project unless
+    /// `no_devel_project` — fork from the devel source, never
+    /// silently from the named project when a devel exists; parse
+    /// the scmsync URL and resolve the branch (the explicit
+    /// `fork_branch`, else the source branch, else the source
+    /// repo's default branch via `repo_get`); Gitea fork (reuse
+    /// when it already exists); OBS fork with the full scmsync
+    /// URL `{base}/{fork-owner}/{fork-repo}#{branch}`. The fork's
+    /// scmsync URL is built from the configured Gitea base, and a
+    /// source repo on another host fails with `ConfigError`
+    /// naming the configured host (one instance per client).
+    ///
+    /// In dry-run the fork is recorded in the plan and nothing is
+    /// created — the guard runs before any server read, like
+    /// `branch_package` — and the result is `None`. The plan names
+    /// what is known without a read; the rest is the server
+    /// default.
+    pub fn branch(
+        &self,
+        obs: &ObsClient,
+        project: &str,
+        package: &str,
+        options: &ForkOptions,
+        dry_run: &DryRun,
+    ) -> Result<Option<ForkResult>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if let Some(name) = &options.new_repo_name {
+            validate_gitea_name(name, "fork name")?;
+        }
+        if let Some(organization) = &options.organization {
+            validate_gitea_name(organization, "organization")?;
+        }
+        if let Some(branch) = &options.fork_branch {
+            validate_git_branch_name(branch)?;
+        }
+        if let Some(target) = &options.target_project {
+            if !valid_obs_name(target) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS target project name: {target:?}"),
+                ));
+            }
+        }
+        if let Some(target) = &options.target_package {
+            if !valid_obs_name(target) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS target package name: {target:?}"),
+                ));
+            }
+        }
+        // The dry-run guard: in dry-run the fork is recorded in the
+        // plan and nothing is created — not even the meta read
+        // runs. The plan names the target only when the caller gave
+        // one; otherwise it says the default target project instead
+        // of guessing it, and the fork name likewise.
+        let target_project = options
+            .target_project
+            .as_deref()
+            .unwrap_or("the default target project");
+        let target_package = options.target_package.as_deref().unwrap_or(package);
+        let fork_name = options
+            .new_repo_name
+            .as_deref()
+            .unwrap_or("the source repository name");
+        let fork_owner = options.organization.as_deref().unwrap_or("your account");
+        if !dry_run.allow(&format!(
+            "fork git-backed package {project}/{package} (Gitea fork {fork_owner}/{fork_name} + OBS fork to {target_project}/{target_package})"
+        )) {
+            return Ok(None);
+        }
+        // Read the meta of the thing being forked and resolve the
+        // source: the package meta, or the project meta for a
+        // project fork ("_project").
+        let (source_project, source_package, scmsync) = if package == "_project" {
+            let meta = obs.project_meta(project)?;
+            let source_project = match (&meta.devel, options.no_devel_project) {
+                (Some(devel_project), false) => {
+                    self.debug.emit(&format!(
+                        "decision: forking project {project} from devel project {devel_project} instead"
+                    ));
+                    devel_project.clone()
+                }
+                _ => project.to_string(),
+            };
+            let scmsync = if source_project == project {
+                meta.scmsync
+            } else {
+                // The devel project's meta carries its own scmsync.
+                obs.project_meta(&source_project)?.scmsync
+            };
+            let scmsync = scmsync.ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "project {source_project} is not managed in Git; forking is possible only with packages managed in Git"
+                    ),
+                )
+            })?;
+            (source_project, "_project".to_string(), scmsync)
+        } else {
+            let meta = obs.package_meta(project, package)?;
+            let (source_project, source_package) = match (&meta.devel, options.no_devel_project) {
+                (Some((devel_project, devel_package)), false) => {
+                    self.debug.emit(&format!(
+                            "decision: forking from devel {devel_project}/{devel_package} instead of {project}/{package}"
+                        ));
+                    (devel_project.clone(), devel_package.clone())
+                }
+                _ => (project.to_string(), package.to_string()),
+            };
+            let scmsync = if source_project == project && source_package == package {
+                meta.scmsync
+            } else {
+                // The devel source's meta carries its own scmsync.
+                obs.package_meta(&source_project, &source_package)?.scmsync
+            };
+            let scmsync = match scmsync {
+                Some(url) => url,
+                None => {
+                    // The package itself is not git-managed. When
+                    // its project is, the actionable alternative
+                    // is forking the project.
+                    let hint = match obs.project_meta(project) {
+                        Ok(project_meta) if project_meta.scmsync.is_some() => format!(
+                            "; the project {project} is managed in Git — fork the project (package \"_project\") instead"
+                        ),
+                        _ => String::new(),
+                    };
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "package {project}/{package} is not managed in Git; forking is possible only with packages managed in Git{hint}"
+                        ),
+                    ));
+                }
+            };
+            (source_project, source_package, scmsync)
+        };
+        let parsed = parse_scmsync_url(&scmsync)?;
+        // Decision 5: one configured Gitea instance per client. A
+        // repo URL on another host fails with `ConfigError` naming
+        // the configured host. Both sides are normalized the same
+        // way, so a base that names the default port explicitly
+        // (`https://src.opensuse.org:443`) still matches the bare
+        // host in the scmsync URL.
+        let scheme = if self.base.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        };
+        if !parsed
+            .authority
+            .eq_ignore_ascii_case(&normalize_authority(self.authority(), scheme))
+        {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "the scmsync URL {scmsync:?} is on another Gitea host; this client is configured for {}",
+                    self.base
+                ),
+            ));
+        }
+        // Resolve the branch: the explicit fork branch, else the
+        // source branch, else the source repo's default branch.
+        let source_branch = match (&options.fork_branch, &parsed.branch) {
+            (Some(explicit), _) => explicit.clone(),
+            (None, Some(branch)) => branch.clone(),
+            (None, None) => {
+                let default = self.repo_get(&parsed.owner, &parsed.repo)?.default_branch;
+                self.debug.emit(&format!(
+                    "decision: no branch named in the scmsync URL; using the default branch {default}"
+                ));
+                default
+            }
+        };
+        // The resolved branch is validated before it is embedded
+        // in the fork's scmsync URL: the explicit fork branch was
+        // validated at entry, but the scmsync fragment (or the
+        // trackingbranch value) and the repo's default branch come
+        // from the server, untrusted here — a fragment carrying
+        // `#` would truncate the scmsync URL the OBS side clones.
+        validate_git_branch_name(&source_branch)?;
+        let fork_options = ForkRepoOptions {
+            new_name: options.new_repo_name.clone(),
+            organization: options.organization.clone(),
+        };
+        let fork = match self.fork_repo(&parsed.owner, &parsed.repo, &fork_options, dry_run)? {
+            Some(fork) => fork,
+            None => {
+                return Err(GeectlError::new(
+                    ErrorKind::InternalError,
+                    "fork_repo returned no fork in live mode",
+                ));
+            }
+        };
+        // The OBS fork's scmsync is the full URL: the server stores
+        // it verbatim and the sync backend clones it.
+        let fork_scmsync = format!(
+            "{}/{}/{}#{source_branch}",
+            self.base, fork.owner.login, fork.name
+        );
+        let forked = obs.fork_package(
+            &source_project,
+            &source_package,
+            &fork_scmsync,
+            options.target_project.as_deref(),
+            options.target_package.as_deref(),
+        )?;
+        Ok(Some(ForkResult {
+            owner: fork.owner.login,
+            repo: fork.name,
+            branch: source_branch,
+            scmsync: fork_scmsync,
+            target_project: forked.target_project,
+            target_package: forked.target_package,
+            clone_url: fork.clone_url,
+            ssh_url: fork.ssh_url,
+        }))
+    }
+}
+
+/// Validate a Gitea API base URL. It must be a bare `https://` URL
+/// (scheme plus authority, no path, query, fragment, or userinfo)
+/// with a host (the production instance), or a bare `http://` URL
+/// on a loopback host (a test instance only). Anything else is
+/// refused at construction, not at the first request. A trailing
+/// slash is stripped, not a path.
+fn validate_gitea_base(base: &str) -> Result<(), GeectlError> {
+    // A base is scheme plus authority only: anything after the
+    // authority would be string-concatenated into every Gitea URL
+    // (see `build_url`), so a base such as
+    // `https://src.opensuse.org/evil` would rewrite them all.
+    let base = base.trim_end_matches('/');
+    if let Some(authority) = base.strip_prefix("https://") {
+        if !is_bare_authority(authority) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "Gitea base URL must be a bare https:// URL (scheme + host, no path, query, fragment, or userinfo)",
+            ));
+        }
+        // Reuse the production builder's validation (https + host).
+        UrlBuilder::new(base).map(|_| ())
+    } else if let Some(authority) = base.strip_prefix("http://") {
+        if !is_bare_authority(authority) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "Gitea base URL must be a bare http:// URL (scheme + host, no path, query, fragment, or userinfo)",
+            ));
+        }
+        if is_loopback_url(base) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "an http:// Gitea base must be a loopback URL (a test instance only)",
+            ))
+        }
+    } else {
+        Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "Gitea base URL must start with https:// (or http:// for a loopback test instance)",
+        ))
+    }
+}
+
+/// A Gitea owner, repo, organization, or fork name: non-empty,
+/// ASCII alphanumerics plus `-_.`, never `.` or `..`. The server
+/// validates the rest; this refuses only what is never a name.
+fn valid_gitea_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn validate_gitea_name(name: &str, label: &str) -> Result<(), GeectlError> {
+    if !valid_gitea_name(name) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid Gitea {label} name: {name:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// A git branch name for the explicit fork branch — and for the
+/// resolved branch before it is embedded in a fork's scmsync URL.
+/// The git-check-ref-format rules, for one-level names
+/// (`refs/heads/<name>`): no control characters, whitespace, `~`,
+/// `^`, `:`, `?`, `*`, `[`, or `\`; no `..`; no `@{`; no leading
+/// or trailing `/`, no `//`; no component starting with `.` or
+/// ending with `.lock`; not `@` alone; no trailing `.`. `#` is
+/// refused as well: it is legal in git, but the branch is embedded
+/// verbatim in a `#fragment`, so a `#` inside it would truncate
+/// the scmsync URL — the value is rejected, never percent-encoded,
+/// because the server stores the scmsync URL verbatim and clones
+/// exactly it. The server is the authority on the rest (slashes
+/// are legal in branch names, so they are allowed here, unlike in
+/// a repo name).
+fn validate_git_branch_name(branch: &str) -> Result<(), GeectlError> {
+    let valid = !branch.is_empty()
+        && branch != "@"
+        && !branch.ends_with('.')
+        && !branch.contains("..")
+        && !branch.contains("@{")
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.contains("//")
+        && branch.chars().all(|c| {
+            !c.is_control()
+                && !c.is_whitespace()
+                && !matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\' | '#')
+        })
+        && branch
+            .split('/')
+            .all(|component| !component.starts_with('.') && !component.ends_with(".lock"));
+    if !valid {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid git branch name: {branch:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Parse a Gitea repository out of a response body. A body that is
+/// not a repository is a server error naming the repo, never a
+/// silent empty value — the caller asked for this repo. A body
+/// that names another repo is a server error too: the callers
+/// (fork verification, the delete pre-read) treat the read as the
+/// requested repo, so a response for `other/name` must fail here
+/// instead of being deleted or verified as `owner/repo`. Gitea
+/// logins are case-insensitive, so the comparison canonicalizes
+/// case on both sides.
+fn parse_repository(body: &str, owner: &str, repo: &str) -> Result<GiteaRepository, GeectlError> {
+    let parsed: GiteaRepository = serde_json::from_str(body).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected Gitea repository response for {owner}/{repo}: {err}"),
+        )
+    })?;
+    let expected = format!("{owner}/{repo}");
+    if !parsed.full_name.eq_ignore_ascii_case(&expected) {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected Gitea repository response for {owner}/{repo}: the server answered for {}",
+                parsed.full_name
+            ),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Strip what does not change which instance an authority names:
+/// userinfo (`user@host`) and the scheme's default port
+/// (`:443` for https, `:80` for http). A non-default port is
+/// kept — it names a different instance.
+fn normalize_authority(authority: &str, scheme: &str) -> String {
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, after)| after)
+        .unwrap_or(authority);
+    let default_port = match scheme {
+        "https" => ":443",
+        "http" => ":80",
+        _ => "",
+    };
+    hostport
+        .strip_suffix(default_port)
+        .unwrap_or(hostport)
+        .to_string()
+}
+
+/// Decode `%XX` sequences in a branch value (the fragment or the
+/// `trackingbranch` value may carry an encoded branch name). A
+/// malformed sequence is left as-is rather than failing the whole
+/// parse — the branch is validated again by the server.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(decoded) = u8::from_str_radix(hex, 16) {
+                out.push(decoded);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse a scmsync URL (`url#branch`, `trackingbranch` query
+/// honoured) into its parts, mirroring the server's
+/// `generate_scmsyncinfo`: the repo is scheme + host + path with a
+/// trailing `.git` stripped and a `git+` scheme prefix stripped;
+/// the branch is the `#fragment`; the `trackingbranch` query value
+/// is honoured as the branch only when no fragment names one.
+fn parse_scmsync_url(scmsync: &str) -> Result<ScmsyncUrl, GeectlError> {
+    let invalid = |reason: &str| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid scmsync URL {scmsync:?}: {reason}"),
+        )
+    };
+    let (before_fragment, fragment) = match scmsync.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (scmsync, None),
+    };
+    let (repo_url, query) = match before_fragment.split_once('?') {
+        Some((before, query)) => (before, Some(query)),
+        None => (before_fragment, None),
+    };
+    let (scheme, rest) = repo_url
+        .split_once("://")
+        .ok_or_else(|| invalid("no scheme"))?;
+    let scheme = scheme.strip_prefix("git+").unwrap_or(scheme);
+    if scheme != "https" && scheme != "http" {
+        return Err(invalid(
+            "the scheme must be https (or http for a test instance)",
+        ));
+    }
+    let (authority, path) = rest
+        .split_once('/')
+        .ok_or_else(|| invalid("no host/path"))?;
+    if authority.is_empty() {
+        return Err(invalid("no host"));
+    }
+    // Userinfo and the scheme's default port do not change which
+    // instance the URL names, so both are stripped before the
+    // authority is compared with the client's.
+    let authority = normalize_authority(authority, scheme);
+    // Strip a trailing `.git` from the path, like the server.
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let owner = segments.next().ok_or_else(|| invalid("no owner"))?;
+    let repo = segments.next().ok_or_else(|| invalid("no repo"))?;
+    if segments.next().is_some() {
+        return Err(invalid("the path must name one owner and one repository"));
+    }
+    if !valid_gitea_name(owner) {
+        return Err(invalid("invalid owner name"));
+    }
+    if !valid_gitea_name(repo) {
+        return Err(invalid("invalid repo name"));
+    }
+    let tracking_branch = query.and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            if key == "trackingbranch" && !value.is_empty() {
+                Some(percent_decode(value))
+            } else {
+                None
+            }
+        })
+    });
+    // The fragment names the branch, like trackingbranch — and
+    // like it, it is percent-decoded: `#feature%2Fx` is the branch
+    // `feature/x`, not the literal `%2F`.
+    let branch = fragment
+        .filter(|fragment| !fragment.is_empty())
+        .map(percent_decode)
+        .or(tracking_branch);
+    Ok(ScmsyncUrl {
+        authority: authority.to_string(),
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        branch,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Credentials;
+    use crate::http::Timeout;
+    use crate::http::UreqClient;
+    use crate::obs::test_support::basic_credentials;
+    use crate::obs::test_support::FakeHttp;
+
+    /// Fixture layout: the real openSUSE Gitea instance and the
+    /// real OBS metas that point at it.
+    ///
+    /// Fetched live 2026-11-21 from https://src.opensuse.org
+    /// (code.opensuse.org) and from the OBS API via osc — the
+    /// instance `DEFAULT_GITEA_URL` points at — and mirrored here
+    /// instead of invented repo/branch names. `FakeHttp` cans the
+    /// responses, so no network happens; the addresses are the
+    /// real ones.
+    /// - Source repos live in the `pool` org, named after the
+    ///   package: `pool/systemd` (default branch `factory`;
+    ///   branches `factory`, `slfo-main`, `slfo-1.0`, `slfo-1.1`,
+    ///   `slfo-1.2`, `slfo-1.3`) and `pool/libstrophe` (default
+    ///   `factory`). Clone
+    ///   `https://src.opensuse.org/pool/<repo>.git`, SSH
+    ///   `gitea@src.opensuse.org:pool/<repo>.git`.
+    /// - Forks keep the source name under the forker: user fork
+    ///   `fbui/systemd` (parent `pool/systemd`, default
+    ///   `factory`), `lbsobolewski/systemd` (parent
+    ///   `pool/systemd`, default `slfo-main`), org fork
+    ///   `rpm/systemd` (parent `pool/systemd`, default
+    ///   `factory`).
+    /// - `xmpp/libstrophe` (parent `pool/libstrophe`, default
+    ///   `main`) is the repo `network:messaging:xmpp/libstrophe`
+    ///   syncs from (its `<scmsync>` pins a commit SHA).
+    /// - The `pool` org is a mirror, not a sync source:
+    ///   `pool/systemd` is fed by the OBS-to-Git bridge (commits
+    ///   authored by "Git OBS Bridge", `OBS-URL:` in the
+    ///   message); neither `openSUSE:Factory/systemd` nor
+    ///   `Base:System/systemd` carries `<scmsync>`, so `branch`
+    ///   on systemd correctly refuses. The `leap-16.0` branch
+    ///   does not exist on `pool/systemd` — it lives on
+    ///   `openSUSE/Leap` (branches `leap-16.0`, `leap-16.1`,
+    ///   `leap-16.2`, default `leap-16.1`).
+    /// - Per-package `<scmsync>` (the shape `branch` reads):
+    ///   `games/descent3` carries `jengelh/descent3#master`
+    ///   (repo default `master`, the only branch; no `<devel>`),
+    ///   and `science/gsl` carries `adamm/gsl.git#factory`
+    ///   (`adamm/gsl` branches `factory`, `slfo-1.2`,
+    ///   `slfo-main`, default `factory`, itself a fork of
+    ///   `pool/gsl`).
+    /// - A real devel pair: `openSUSE:Factory/gsl` has no
+    ///   `<scmsync>` of its own, only `<devel project="science"
+    ///   package="gsl"/>` — the fork resolves to `science/gsl`.
+    /// - Project-level `<scmsync>`: `network:messaging:xmpp`
+    ///   carries `xmpp/_ObsPrj.git#master` (`xmpp/_ObsPrj`
+    ///   default `master`), and `openSUSE:Leap:16.0` carries
+    ///   `openSUSE/Leap#leap-16.0`. Packages in those projects
+    ///   carry their own `<scmsync>` too (e.g. `xmpp/dino`
+    ///   names `trackingbranch=main` with a SHA fragment;
+    ///   `Leap:16.0/CoreFreq` names `trackingbranch=Leap-16.0`
+    ///   with a SHA fragment; `Leap:16.0/000release-packages`
+    ///   syncs via `?subdir=`).
+    /// - `openSUSE:Factory/libstrophe` carries neither
+    ///   `<scmsync>` nor `<devel>` — its git management lives
+    ///   only in project scmsync / `_scmsync.obsinfo`, which
+    ///   phase 1 does not read, so `branch` on it refuses (see
+    ///   the known limitation in the PR body).
+    ///
+    /// Constructed cases (no live equivalent found): the renamed
+    /// fork `systemd-slfo` (no renamed fork exists on the
+    /// instance); the no-devel test, which combines
+    /// `Factory/gsl`'s real `<devel>` with `science/gsl`'s real
+    /// scmsync value in one synthetic meta — no real package
+    /// carries both `<devel>` and `<scmsync>` (0 of the 9,046
+    /// packages with `<scmsync>`); and the project-alternative
+    /// hint, whose project scmsync is synthetic — every package
+    /// checked in a scmsync-managed project (`xmpp`, `Leap:16.0`)
+    /// carries its own `<scmsync>`.
+    const BASE: &str = "https://src.opensuse.org";
+
+    fn bearer() -> Credentials {
+        Credentials::Bearer {
+            token: "test-token".to_string(),
+        }
+    }
+
+    fn client<'a>(http: &'a dyn HttpClient) -> GiteaClient<'a> {
+        GiteaClient::with_base(http, BASE, bearer()).unwrap()
+    }
+
+    fn obs_client<'a>(http: &'a dyn HttpClient) -> ObsClient<'a> {
+        ObsClient::with_credentials(http, basic_credentials()).unwrap()
+    }
+
+    /// A repo JSON body, shaped like Gitea 1.24.7 answers, with
+    /// unknown fields (`future_field`) at the top level and inside
+    /// `owner` / `parent` to prove they are ignored. The default
+    /// branch is `factory` — the real default of the `pool/*`
+    /// repos this helper is used for; repos whose default is
+    /// `master` use `repo_json_branch` instead.
+    fn repo_json(owner: &str, name: &str, parent: Option<(&str, &str)>) -> String {
+        repo_json_branch(owner, name, parent, "factory")
+    }
+
+    /// Like `repo_json`, with the default branch given: the
+    /// descent3 fork and the `_ObsPrj` fork inherit `master`.
+    fn repo_json_branch(
+        owner: &str,
+        name: &str,
+        parent: Option<(&str, &str)>,
+        default_branch: &str,
+    ) -> String {
+        let parent_json = match parent {
+            Some((parent_owner, parent_name)) => format!(
+                r#"{{"owner": {{"login": "{parent_owner}", "future_field": 1}}, "name": "{parent_name}", "full_name": "{parent_owner}/{parent_name}", "future_field": true}}"#
+            ),
+            None => "null".to_string(),
+        };
+        let is_fork = parent.is_some();
+        format!(
+            r#"{{"id": 7, "owner": {{"login": "{owner}", "future_field": 1}}, "name": "{name}", "full_name": "{owner}/{name}", "description": "", "empty": true, "private": false, "fork": {is_fork}, "parent": {parent_json}, "future_field": "tolerated", "html_url": "{BASE}/{owner}/{name}", "ssh_url": "gitea@src.opensuse.org:{owner}/{name}.git", "clone_url": "{BASE}/{owner}/{name}.git", "default_branch": "{default_branch}", "created_at": "2026-11-21T00:00:00Z"}}"#
+        )
+    }
+
+    /// A package meta with a scmsync URL (and, when `devel` is set,
+    /// a devel project/package).
+    fn package_meta(
+        project: &str,
+        package: &str,
+        scmsync: Option<&str>,
+        devel: Option<&str>,
+    ) -> String {
+        let scmsync = scmsync
+            .map(|url| format!("<scmsync>{url}</scmsync>"))
+            .unwrap_or_default();
+        let devel = devel
+            .map(|devel| format!("<devel project=\"{devel}\" package=\"{package}\"/>"))
+            .unwrap_or_default();
+        format!(
+            "<package name=\"{package}\" project=\"{project}\"><title>t</title>{scmsync}{devel}</package>"
+        )
+    }
+
+    /// A project meta with a scmsync URL (and, when `devel` is set,
+    /// a devel project).
+    fn project_meta(project: &str, scmsync: Option<&str>, devel: Option<&str>) -> String {
+        let scmsync = scmsync
+            .map(|url| format!("<scmsync>{url}</scmsync>"))
+            .unwrap_or_default();
+        let devel = devel
+            .map(|devel| format!("<devel project=\"{devel}\"/>"))
+            .unwrap_or_default();
+        format!("<project name=\"{project}\">{scmsync}{devel}</project>")
+    }
+
+    /// An OBS fork answer in the server's shape (deprecated data
+    /// names, as `create_fork` renders them).
+    fn fork_status(
+        target_project: &str,
+        target_package: &str,
+        source_project: &str,
+        source_package: &str,
+    ) -> String {
+        format!(
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"targetproject\">{target_project}</data><data name=\"targetpackage\">{target_package}</data><data name=\"sourceproject\">{source_project}</data><data name=\"sourcepackage\">{source_package}</data></status>"
+        )
+    }
+
+    #[test]
+    fn gitea_name_validation() {
+        for valid in [
+            "foo",
+            "foo-bar",
+            "foo_bar",
+            "foo.bar",
+            "a1",
+            "UPSTREAM-1_x.y",
+        ] {
+            assert!(valid_gitea_name(valid), "{valid} should be valid");
+        }
+        for invalid in [
+            "", ".", "..", "foo/bar", "foo bar", "foo@bar", "foo:bar", "foo?bar",
+        ] {
+            assert!(!valid_gitea_name(invalid), "{invalid} should be invalid");
+        }
+    }
+
+    #[test]
+    fn gitea_base_validation() {
+        assert!(validate_gitea_base("https://src.opensuse.org").is_ok());
+        assert!(validate_gitea_base("http://127.0.0.1:3001").is_ok());
+        assert!(validate_gitea_base("http://localhost:3001").is_ok());
+        assert!(validate_gitea_base("https://src.opensuse.org/evil").is_err());
+        assert!(validate_gitea_base("http://example.com").is_err());
+        assert!(validate_gitea_base("src.opensuse.org").is_err());
+        assert!(validate_gitea_base("https://").is_err());
+        // A trailing slash is stripped, not a path.
+        let http = FakeHttp::new();
+        let client = GiteaClient::with_base(&http, "http://127.0.0.1:3001/", bearer()).unwrap();
+        assert_eq!(client.base, "http://127.0.0.1:3001");
+    }
+
+    #[test]
+    fn git_branch_name_validation() {
+        // Real branch names from the fixtures: one-level names,
+        // slashed names, dotted releases, and a pinned commit SHA.
+        for valid in [
+            "factory",
+            "master",
+            "slfo-main",
+            "leap-16.0",
+            "feature/x",
+            "release-1.2.3",
+            "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa",
+        ] {
+            assert!(
+                validate_git_branch_name(valid).is_ok(),
+                "{valid} should be valid"
+            );
+        }
+        // git-check-ref-format refusals, plus `#`: legal in git,
+        // but it would truncate the scmsync fragment the branch is
+        // embedded in.
+        for invalid in [
+            "", "@", "a..b", "a b", "a\tb", "a\x01b", "a#b", "a?b", "a*b", "a[b", "a~b", "a^b",
+            "a:b", "a\\b", "/a", "a/", "a//b", ".a", "a/.b", "a.lock", "a/b.lock", "a@{b", "a.",
+        ] {
+            assert!(
+                validate_git_branch_name(invalid).is_err(),
+                "{invalid:?} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn construction_fails_closed_without_a_bearer_token() {
+        // No `unwrap_err` here: `GiteaClient` carries `&dyn
+        // HttpClient`, so it has no `Debug` (like `ObsClient`).
+        let http = FakeHttp::new();
+        for credentials in [
+            Credentials::None,
+            basic_credentials(),
+            Credentials::SshKey {
+                path: std::path::PathBuf::from("/tmp/key"),
+            },
+        ] {
+            match GiteaClient::with_base(&http, BASE, credentials) {
+                Ok(_) => panic!("construction without a Bearer token must fail"),
+                Err(err) => assert_eq!(err.kind(), ErrorKind::ConfigError),
+            }
+        }
+    }
+
+    #[test]
+    fn repo_get_parses_a_repo_and_ignores_unknown_fields() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json("pool", "systemd", None),
+        );
+        let repo = client(&http).repo_get("pool", "systemd").unwrap();
+        assert_eq!(repo.owner.login, "pool");
+        assert_eq!(repo.name, "systemd");
+        assert_eq!(repo.full_name, "pool/systemd");
+        assert_eq!(repo.parent, None);
+        assert_eq!(repo.default_branch, "factory");
+        assert_eq!(repo.clone_url, "https://src.opensuse.org/pool/systemd.git");
+        assert_eq!(repo.ssh_url, "gitea@src.opensuse.org:pool/systemd.git");
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn repo_get_parses_a_fork_parent() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+            &repo_json("fbui", "systemd", Some(("pool", "systemd"))),
+        );
+        let repo = client(&http).repo_get("fbui", "systemd").unwrap();
+        assert_eq!(
+            repo.parent,
+            Some(GiteaParent {
+                owner: GiteaOwner {
+                    login: "pool".to_string()
+                },
+                name: "systemd".to_string(),
+                full_name: "pool/systemd".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn repo_get_missing_field_is_a_server_error() {
+        let body = r#"{"owner": {"login": "pool"}, "name": "systemd", "full_name": "pool/systemd", "parent": null, "clone_url": "x", "ssh_url": "y"}"#;
+        let http =
+            FakeHttp::new().with_get("https://src.opensuse.org/api/v1/repos/pool/systemd", body);
+        let err = client(&http).repo_get("pool", "systemd").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn repo_get_not_found_propagates() {
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            ErrorKind::NotFound,
+        );
+        let err = client(&http).repo_get("pool", "systemd").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn repo_get_validates_names_before_any_call() {
+        let http = FakeHttp::new();
+        let err = client(&http).repo_get("up/stream", "foo").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn repo_get_rejects_a_response_for_another_repo() {
+        // The read is a guard, not just a parse: a body naming
+        // another repo fails here instead of being verified or
+        // deleted as the requested one.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json("pool", "libstrophe", None),
+        );
+        let err = client(&http).repo_get("pool", "systemd").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        // Case alone is not a mismatch: Gitea logins are
+        // case-insensitive, so the comparison canonicalizes case.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json("Pool", "systemd", None),
+        );
+        let repo = client(&http).repo_get("pool", "systemd").unwrap();
+        assert_eq!(repo.full_name, "Pool/systemd");
+    }
+
+    #[test]
+    fn repo_delete_dry_run_records_plan_and_deletes_nothing() {
+        let http = FakeHttp::new();
+        let dry_run = DryRun::new(true);
+        // Planning a delete needs no force: the refusal guards the
+        // live delete, not the plan.
+        let result = client(&http)
+            .repo_delete("pool", "systemd", false, &dry_run)
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: delete repository pool/systemd".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn repo_delete_refuses_without_force_and_reads_nothing() {
+        // The confirmation is client-side: without force the delete
+        // is refused before any server read, so a mistaken call
+        // cannot delete the wrong generation — and the refusal
+        // proves the pre-read never ran.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json("pool", "systemd", None),
+        );
+        let err = client(&http)
+            .repo_delete("pool", "systemd", false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn repo_delete_gets_first_then_deletes_and_returns_the_name() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd",
+                &repo_json("pool", "systemd", None),
+            )
+            .with_delete("https://src.opensuse.org/api/v1/repos/pool/systemd", "");
+        let result = client(&http)
+            .repo_delete("pool", "systemd", true, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result, Some("systemd".to_string()));
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd".to_string(),
+                true
+            )]
+        );
+        assert_eq!(
+            http.delete_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn repo_delete_missing_repo_fails_before_delete() {
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            ErrorKind::NotFound,
+        );
+        let err = client(&http)
+            .repo_delete("pool", "systemd", true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn fork_repo_dry_run_records_plan_and_forks_nothing() {
+        let http = FakeHttp::new();
+        let dry_run = DryRun::new(true);
+        let options = ForkRepoOptions {
+            new_name: None,
+            organization: Some("rpm".to_string()),
+        };
+        let result = client(&http)
+            .fork_repo("pool", "systemd", &options, &dry_run)
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: fork repository pool/systemd to rpm/systemd".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+
+        let dry_run = DryRun::new(true);
+        let result = client(&http)
+            .fork_repo("pool", "systemd", &ForkRepoOptions::default(), &dry_run)
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: fork repository pool/systemd to your account/systemd".to_string()
+            ]
+        );
+    }
+
+    /// The fixture for a fork creation: the pre-check 404s, the
+    /// POST answers the fork, the re-read answers the same fork.
+    fn fork_fixture(
+        http: FakeHttp,
+        source_owner: &str,
+        source_repo: &str,
+        target_url: &str,
+        fork_body: &str,
+    ) -> FakeHttp {
+        http.with_get_error_sequence(target_url, &[ErrorKind::NotFound])
+            .with_get(target_url, fork_body)
+            .with_post(
+                &format!("{BASE}/api/v1/repos/{source_owner}/{source_repo}/forks"),
+                fork_body,
+            )
+    }
+
+    #[test]
+    fn fork_repo_creates_and_verifies_by_re_read() {
+        let fork_body = repo_json("fbui", "systemd", Some(("pool", "systemd")));
+        let http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui", "future_field": 1}"#,
+            ),
+            "pool",
+            "systemd",
+            "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+            &fork_body,
+        );
+        let fork = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fork.full_name, "fbui/systemd");
+        assert_eq!(fork.parent.as_ref().unwrap().full_name, "pool/systemd");
+        // The POST body omits the name and organization when unset.
+        // The POST is authenticated with the client's Bearer: the
+        // third tuple element is the auth flag, and it must be true
+        // — a fork POST without it would authenticate as whoever the
+        // HTTP client's own provider resolves, not as this client.
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/forks".to_string(),
+                "{}".to_string(),
+                true
+            )]
+        );
+        // The target owner came from GET /api/v1/user, then the
+        // pre-check, then the re-read.
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                ("https://src.opensuse.org/api/v1/user".to_string(), true),
+                (
+                    "https://src.opensuse.org/api/v1/repos/fbui/systemd".to_string(),
+                    true
+                ),
+                (
+                    "https://src.opensuse.org/api/v1/repos/fbui/systemd".to_string(),
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fork_repo_sends_name_and_organization_when_given() {
+        let fork_body = repo_json("rpm", "systemd-slfo", Some(("pool", "systemd")));
+        let http = FakeHttp::new()
+            .with_get_error_sequence(
+                "https://src.opensuse.org/api/v1/repos/rpm/systemd-slfo",
+                &[ErrorKind::NotFound],
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/rpm/systemd-slfo",
+                &fork_body,
+            )
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/forks",
+                &fork_body,
+            );
+        let options = ForkRepoOptions {
+            new_name: Some("systemd-slfo".to_string()),
+            organization: Some("rpm".to_string()),
+        };
+        let fork = client(&http)
+            .fork_repo("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fork.full_name, "rpm/systemd-slfo");
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/forks".to_string(),
+                r#"{"name":"systemd-slfo","organization":"rpm"}"#.to_string(),
+                true
+            )]
+        );
+        // An explicit organization means no /api/v1/user read.
+        assert!(http
+            .get_calls()
+            .iter()
+            .all(|(url, _)| !url.ends_with("/api/v1/user")));
+    }
+
+    #[test]
+    fn fork_repo_reuses_the_existing_fork() {
+        let fork_body = repo_json("fbui", "systemd", Some(("pool", "systemd")));
+        let (debug, lines) = Debug::captured(true, false);
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &fork_body,
+            );
+        let fork = client(&http)
+            .with_debug(debug)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fork.full_name, "fbui/systemd");
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            lines.lock().unwrap().clone(),
+            vec!["decision: reusing existing fork fbui/systemd for pool/systemd".to_string()]
+        );
+    }
+
+    #[test]
+    fn fork_repo_refuses_a_non_fork_repo_of_the_target_name() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &repo_json("fbui", "systemd", None),
+            );
+        let err = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn fork_repo_refuses_a_fork_of_another_source() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &repo_json("fbui", "systemd", Some(("pool", "libstrophe"))),
+            );
+        let err = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn fork_repo_409_race_re_reads_and_reuses() {
+        let fork_body = repo_json("fbui", "systemd", Some(("pool", "systemd")));
+        let http = fork_fixture(
+            FakeHttp::new()
+                .with_get(
+                    "https://src.opensuse.org/api/v1/user",
+                    r#"{"login": "fbui"}"#,
+                )
+                .with_post_error(
+                    "https://src.opensuse.org/api/v1/repos/pool/systemd/forks",
+                    ErrorKind::AlreadyExists,
+                ),
+            "pool",
+            "systemd",
+            "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+            &fork_body,
+        );
+        let fork = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fork.full_name, "fbui/systemd");
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn fork_repo_409_race_with_no_target_re_raises_the_refusal() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            )
+            .with_get_error_sequence(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &[ErrorKind::NotFound, ErrorKind::NotFound],
+            )
+            .with_post_error(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/forks",
+                ErrorKind::AlreadyExists,
+            );
+        let err = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn fork_repo_non_409_post_error_propagates_without_a_re_read() {
+        // Only a 409 (AlreadyExists) re-reads the target: a 400
+        // (InvalidInput) from the fork POST is the caller's fault,
+        // not a race, so it propagates as-is and the target is
+        // never re-read — the GETs are the user read and the
+        // pre-check only.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            )
+            .with_get_error_sequence(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &[ErrorKind::NotFound],
+            )
+            .with_post_error(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/forks",
+                ErrorKind::InvalidInput,
+            );
+        let err = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                ("https://src.opensuse.org/api/v1/user".to_string(), true),
+                (
+                    "https://src.opensuse.org/api/v1/repos/fbui/systemd".to_string(),
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fork_repo_re_read_parent_mismatch_is_a_server_error() {
+        let fork_body = repo_json("fbui", "systemd", Some(("pool", "systemd")));
+        let mismatched = repo_json("fbui", "systemd", Some(("pool", "libstrophe")));
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            )
+            .with_get_error_sequence(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &[ErrorKind::NotFound],
+            )
+            .with_get_sequence(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &[&mismatched],
+            )
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/forks",
+                &fork_body,
+            );
+        let err = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn fork_repo_re_read_missing_is_a_server_error() {
+        let fork_body = repo_json("fbui", "systemd", Some(("pool", "systemd")));
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            )
+            .with_get_error_sequence(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &[ErrorKind::NotFound, ErrorKind::NotFound],
+            )
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/forks",
+                &fork_body,
+            );
+        let err = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn fork_repo_ignores_a_malformed_202_body_when_the_re_read_proves_the_fork() {
+        // The 202 answer is never parsed: the re-read by the known
+        // target name is the verification, so a body that is not a
+        // repository must not fail a fork that exists.
+        let fork_body = repo_json("fbui", "systemd", Some(("pool", "systemd")));
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            )
+            .with_get_error_sequence(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &[ErrorKind::NotFound],
+            )
+            .with_get_sequence(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &[&fork_body],
+            )
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/forks",
+                "this is not a repository",
+            );
+        let forked = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(forked.full_name, "fbui/systemd");
+    }
+
+    #[test]
+    fn parse_scmsync_url_cases() {
+        // The real scmsync value from `games/descent3`.
+        let parsed = parse_scmsync_url("https://src.opensuse.org/jengelh/descent3#master").unwrap();
+        assert_eq!(parsed.authority, "src.opensuse.org");
+        assert_eq!(parsed.owner, "jengelh");
+        assert_eq!(parsed.repo, "descent3");
+        assert_eq!(parsed.branch, Some("master".to_string()));
+        // A trailing `.git` is stripped, like the server.
+        let parsed =
+            parse_scmsync_url("https://src.opensuse.org/jengelh/descent3.git#master").unwrap();
+        assert_eq!(parsed.repo, "descent3");
+        // A `git+` scheme prefix is stripped, like the server.
+        let parsed =
+            parse_scmsync_url("git+https://src.opensuse.org/jengelh/descent3#master").unwrap();
+        assert_eq!(parsed.authority, "src.opensuse.org");
+        // Userinfo and the default port name the same instance.
+        let parsed =
+            parse_scmsync_url("https://src.opensuse.org:443/jengelh/descent3#master").unwrap();
+        assert_eq!(parsed.authority, "src.opensuse.org");
+        let parsed =
+            parse_scmsync_url("https://fbui@src.opensuse.org/jengelh/descent3#master").unwrap();
+        assert_eq!(parsed.authority, "src.opensuse.org");
+        // A non-default port is kept: it names another instance.
+        let parsed =
+            parse_scmsync_url("https://src.opensuse.org:8443/jengelh/descent3#master").unwrap();
+        assert_eq!(parsed.authority, "src.opensuse.org:8443");
+        // The trackingbranch query names the branch when no
+        // fragment does.
+        let parsed =
+            parse_scmsync_url("https://src.opensuse.org/pool/systemd?trackingbranch=factory")
+                .unwrap();
+        assert_eq!(parsed.branch, Some("factory".to_string()));
+        // The fragment wins over trackingbranch when both name one
+        // — the real value from `network:messaging:xmpp/dino`,
+        // which pins a commit while tracking `main`.
+        let parsed = parse_scmsync_url(
+            "https://src.opensuse.org/xmpp/dino?trackingbranch=main#e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa",
+        )
+        .unwrap();
+        assert_eq!(parsed.owner, "xmpp");
+        assert_eq!(parsed.repo, "dino");
+        assert_eq!(
+            parsed.branch,
+            Some("e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa".to_string())
+        );
+        // A `subdir` query names the package inside a
+        // project-synced repo — the real value from
+        // `openSUSE:Leap:16.0/000release-packages`.
+        let parsed = parse_scmsync_url(
+            "https://src.opensuse.org/openSUSE/Leap?subdir=000release-packages#leap-16.0",
+        )
+        .unwrap();
+        assert_eq!(parsed.owner, "openSUSE");
+        assert_eq!(parsed.repo, "Leap");
+        assert_eq!(parsed.branch, Some("leap-16.0".to_string()));
+        // No branch named at all — the real value from
+        // `home:adamm/git-quick-stats`, whose scmsync carries no
+        // fragment.
+        let parsed = parse_scmsync_url("https://src.opensuse.org/adamm/git-quick-stats").unwrap();
+        assert_eq!(parsed.branch, None);
+        // An empty fragment names no branch.
+        let parsed = parse_scmsync_url("https://src.opensuse.org/pool/systemd#").unwrap();
+        assert_eq!(parsed.branch, None);
+        // An encoded trackingbranch value is decoded.
+        let parsed =
+            parse_scmsync_url("https://src.opensuse.org/pool/systemd?trackingbranch=feature%2Fx")
+                .unwrap();
+        assert_eq!(parsed.branch, Some("feature/x".to_string()));
+        // An encoded fragment is decoded the same way (a decoding
+        // probe — `feature/x` is not a real branch here).
+        let parsed =
+            parse_scmsync_url("https://src.opensuse.org/pool/systemd#feature%2Fx").unwrap();
+        assert_eq!(parsed.branch, Some("feature/x".to_string()));
+        for invalid in [
+            "https://src.opensuse.org/pool",
+            "https://src.opensuse.org/pool/systemd/extra#factory",
+            "pool/systemd#factory",
+            "ssh://git@src.opensuse.org/pool/systemd#factory",
+            "https:///pool/systemd#factory",
+        ] {
+            assert!(
+                parse_scmsync_url(invalid).is_err(),
+                "{invalid} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_dry_run_records_plan_and_touches_nothing() {
+        let gitea_http = FakeHttp::new();
+        let obs_http = FakeHttp::new();
+        let dry_run = DryRun::new(true);
+        let result = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "openSUSE:Factory",
+                "systemd",
+                &ForkOptions::default(),
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: fork git-backed package openSUSE:Factory/systemd (Gitea fork your account/the source repository name + OBS fork to the default target project/systemd)".to_string()]
+        );
+        assert!(gitea_http.get_calls().is_empty());
+        assert!(gitea_http.post_calls().is_empty());
+        assert!(obs_http.get_calls().is_empty());
+        assert!(obs_http.post_calls().is_empty());
+    }
+
+    /// The OBS half of a composite fixture: the package meta GET
+    /// and the fork POST with the server's answer.
+    fn obs_fork_fixture(
+        http: FakeHttp,
+        meta_url: &str,
+        meta_body: &str,
+        fork_url: &str,
+        fork_body: &str,
+    ) -> FakeHttp {
+        http.with_get(meta_url, meta_body)
+            .with_post(fork_url, fork_body)
+    }
+
+    #[test]
+    fn branch_forks_a_package() {
+        // The real per-package scmsync case: `games/descent3`
+        // carries `jengelh/descent3#master` and no `<devel>`.
+        let fork_body =
+            repo_json_branch("fbui", "descent3", Some(("jengelh", "descent3")), "master");
+        let gitea_http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            ),
+            "jengelh",
+            "descent3",
+            "https://src.opensuse.org/api/v1/repos/fbui/descent3",
+            &fork_body,
+        );
+        let meta = package_meta(
+            "games",
+            "descent3",
+            Some("https://src.opensuse.org/jengelh/descent3#master"),
+            None,
+        );
+        let obs_http = obs_fork_fixture(
+            FakeHttp::new(),
+            "https://api.opensuse.org/public/source/games/descent3/_meta",
+            &meta,
+            "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master",
+            &fork_status(
+                "home:fbui:branches:games",
+                "descent3",
+                "games",
+                "descent3",
+            ),
+        );
+        let result = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "games",
+                "descent3",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            ForkResult {
+                owner: "fbui".to_string(),
+                repo: "descent3".to_string(),
+                branch: "master".to_string(),
+                scmsync: "https://src.opensuse.org/fbui/descent3#master".to_string(),
+                target_project: "home:fbui:branches:games".to_string(),
+                target_package: "descent3".to_string(),
+                clone_url: "https://src.opensuse.org/fbui/descent3.git".to_string(),
+                ssh_url: "gitea@src.opensuse.org:fbui/descent3.git".to_string(),
+            }
+        );
+        // The OBS fork POST carries the full scmsync URL,
+        // percent-encoded as a query value, and no target keys —
+        // the server applies its defaults.
+        assert_eq!(obs_http.post_calls().len(), 1);
+        assert_eq!(
+            obs_http.post_calls()[0].0,
+            "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master"
+        );
+        assert!(obs_http.post_calls()[0].2);
+    }
+
+    #[test]
+    fn branch_refuses_an_invalid_scmsync_branch_before_any_fork() {
+        // The scmsync fragment names the branch, and it comes from
+        // the server, untrusted here: a fragment carrying `#` would
+        // truncate the fork's scmsync URL, so the resolved branch
+        // is validated before anything is forked — no Gitea call,
+        // no OBS fork.
+        let gitea_http = FakeHttp::new();
+        let meta = package_meta(
+            "games",
+            "descent3",
+            Some("https://src.opensuse.org/jengelh/descent3#bad#branch"),
+            None,
+        );
+        let obs_http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/games/descent3/_meta",
+            &meta,
+        );
+        let err = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "games",
+                "descent3",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(gitea_http.get_calls().is_empty());
+        assert!(gitea_http.post_calls().is_empty());
+        assert!(obs_http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_resolves_the_devel_source() {
+        // The real devel pair: `openSUSE:Factory/gsl` has no
+        // scmsync of its own, only a devel to `science/gsl`,
+        // whose scmsync is `adamm/gsl.git#factory`.
+        let fork_body = repo_json("fbui", "gsl", Some(("adamm", "gsl")));
+        let gitea_http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            ),
+            "adamm",
+            "gsl",
+            "https://src.opensuse.org/api/v1/repos/fbui/gsl",
+            &fork_body,
+        );
+        let (debug, lines) = Debug::captured(true, false);
+        let named_meta = package_meta("openSUSE:Factory", "gsl", None, Some("science"));
+        let devel_meta = package_meta(
+            "science",
+            "gsl",
+            Some("https://src.opensuse.org/adamm/gsl.git#factory"),
+            None,
+        );
+        let obs_http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/gsl/_meta",
+                &named_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/science/gsl/_meta",
+                &devel_meta,
+            )
+            .with_post(
+                "https://api.opensuse.org/source/science/gsl?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgsl%23factory",
+                &fork_status("home:fbui:branches:science", "gsl", "science", "gsl"),
+            );
+        let result = client(&gitea_http)
+            .with_debug(debug)
+            .branch(
+                &obs_client(&obs_http),
+                "openSUSE:Factory",
+                "gsl",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.owner, "fbui");
+        assert_eq!(result.repo, "gsl");
+        assert_eq!(result.branch, "factory");
+        assert_eq!(
+            result.scmsync,
+            "https://src.opensuse.org/fbui/gsl#factory".to_string()
+        );
+        assert_eq!(result.target_project, "home:fbui:branches:science");
+        assert_eq!(
+            lines.lock().unwrap().clone(),
+            vec![
+                "decision: forking from devel science/gsl instead of openSUSE:Factory/gsl"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_with_no_devel_project_forks_the_named_package() {
+        // SYNTHETIC: the named meta combines `Factory/gsl`'s real
+        // `<devel>` with `science/gsl`'s real scmsync value — no
+        // real package carries both (see the layout note). The
+        // test covers the flag, not a live package.
+        let fork_body = repo_json("fbui", "gsl", Some(("adamm", "gsl")));
+        let gitea_http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            ),
+            "adamm",
+            "gsl",
+            "https://src.opensuse.org/api/v1/repos/fbui/gsl",
+            &fork_body,
+        );
+        let named_meta = package_meta(
+            "openSUSE:Factory",
+            "gsl",
+            Some("https://src.opensuse.org/adamm/gsl.git#factory"),
+            Some("science"),
+        );
+        let obs_http = obs_fork_fixture(
+            FakeHttp::new(),
+            "https://api.opensuse.org/public/source/openSUSE:Factory/gsl/_meta",
+            &named_meta,
+            "https://api.opensuse.org/source/openSUSE:Factory/gsl?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgsl%23factory",
+            &fork_status("home:fbui:branches:openSUSE:Factory", "gsl", "openSUSE:Factory", "gsl"),
+        );
+        let options = ForkOptions {
+            no_devel_project: true,
+            ..ForkOptions::default()
+        };
+        let result = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "openSUSE:Factory",
+                "gsl",
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.target_project, "home:fbui:branches:openSUSE:Factory");
+        // The devel package's meta was never read.
+        assert_eq!(obs_http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn branch_refuses_a_package_without_scmsync() {
+        // The real `Factory/systemd` meta carries a `<devel>` to
+        // `Base:System/systemd`, which carries no `<scmsync>`
+        // either — the refusal runs through the devel leg. The
+        // error names the named package, not the devel source
+        // (the project-fork path is the inconsistent one: it
+        // names the devel-resolved source).
+        let gitea_http = FakeHttp::new();
+        let obs_http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/systemd/_meta",
+                &package_meta("openSUSE:Factory", "systemd", None, Some("Base:System")),
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/Base:System/systemd/_meta",
+                &package_meta("Base:System", "systemd", None, None),
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/_meta",
+                &project_meta("openSUSE:Factory", None, None),
+            );
+        let err = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "openSUSE:Factory",
+                "systemd",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(gitea_http.post_calls().is_empty());
+        assert!(obs_http.post_calls().is_empty());
+        // The devel leg ran: named meta, devel meta, then the
+        // project meta for the hint.
+        assert_eq!(
+            obs_http
+                .get_calls()
+                .iter()
+                .map(|(url, _)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://api.opensuse.org/public/source/openSUSE:Factory/systemd/_meta",
+                "https://api.opensuse.org/public/source/Base:System/systemd/_meta",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/_meta",
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_accepts_an_explicit_default_port_in_the_base() {
+        // A base that names the default port explicitly
+        // (`https://src.opensuse.org:443`) names the same instance
+        // as the bare host, so a same-host scmsync URL is accepted
+        // — the fork's scmsync keeps the base verbatim. The Gitea
+        // cans use the `:443` base too: the client calls it.
+        let base = "https://src.opensuse.org:443";
+        let fork_body =
+            repo_json_branch("fbui", "descent3", Some(("jengelh", "descent3")), "master");
+        let gitea_http = FakeHttp::new()
+            .with_get(&format!("{base}/api/v1/user"), r#"{"login": "fbui"}"#)
+            .with_get_error_sequence(
+                &format!("{base}/api/v1/repos/fbui/descent3"),
+                &[ErrorKind::NotFound],
+            )
+            .with_get(&format!("{base}/api/v1/repos/fbui/descent3"), &fork_body)
+            .with_post(
+                &format!("{base}/api/v1/repos/jengelh/descent3/forks"),
+                &fork_body,
+            );
+        let meta = package_meta(
+            "games",
+            "descent3",
+            Some("https://src.opensuse.org/jengelh/descent3#master"),
+            None,
+        );
+        let obs_http = obs_fork_fixture(
+            FakeHttp::new(),
+            "https://api.opensuse.org/public/source/games/descent3/_meta",
+            &meta,
+            "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%3A443%2Ffbui%2Fdescent3%23master",
+            &fork_status("home:fbui:branches:games", "descent3", "games", "descent3"),
+        );
+        let client =
+            GiteaClient::with_base(&gitea_http, "https://src.opensuse.org:443", bearer()).unwrap();
+        let result = client
+            .branch(
+                &obs_client(&obs_http),
+                "games",
+                "descent3",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.branch, "master");
+        assert_eq!(result.target_project, "home:fbui:branches:games");
+        assert_eq!(
+            result.scmsync,
+            "https://src.opensuse.org:443/fbui/descent3#master".to_string()
+        );
+    }
+
+    #[test]
+    fn branch_names_the_project_alternative_when_the_project_is_git_managed() {
+        // SYNTHETIC combination: the package half is real
+        // (`Factory/systemd` carries no `<scmsync>`) and the
+        // project scmsync value is real (the
+        // `network:messaging:xmpp` project carries
+        // `xmpp/_ObsPrj.git#master`), but no live pair was found
+        // where the package lacks `<scmsync>` while its project
+        // carries one (see the layout note). The test covers the
+        // hint branch, not a live pair.
+        let gitea_http = FakeHttp::new();
+        let obs_http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/systemd/_meta",
+                &package_meta("openSUSE:Factory", "systemd", None, None),
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/_meta",
+                &project_meta(
+                    "openSUSE:Factory",
+                    Some("https://src.opensuse.org/xmpp/_ObsPrj.git#master"),
+                    None,
+                ),
+            );
+        let err = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "openSUSE:Factory",
+                "systemd",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(format!("{err}").contains("fork the project"));
+    }
+
+    #[test]
+    fn branch_refuses_a_repo_on_another_host() {
+        let gitea_http = FakeHttp::new();
+        let obs_http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/systemd/_meta",
+            &package_meta(
+                "openSUSE:Factory",
+                "systemd",
+                Some("https://codeberg.org/other/foo#main"),
+                None,
+            ),
+        );
+        let err = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "openSUSE:Factory",
+                "systemd",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(format!("{err}").contains("https://src.opensuse.org"));
+    }
+
+    #[test]
+    fn branch_resolves_the_default_branch_when_none_is_named() {
+        // The real fragment-less scmsync: `home:adamm/git-quick-stats`
+        // carries `adamm/git-quick-stats` with no `#fragment`, and
+        // the repo's default branch is `main`.
+        let fork_body = repo_json_branch(
+            "fbui",
+            "git-quick-stats",
+            Some(("adamm", "git-quick-stats")),
+            "main",
+        );
+        let gitea_http = fork_fixture(
+            FakeHttp::new()
+                .with_get(
+                    "https://src.opensuse.org/api/v1/user",
+                    r#"{"login": "fbui"}"#,
+                )
+                .with_get(
+                    "https://src.opensuse.org/api/v1/repos/adamm/git-quick-stats",
+                    &repo_json_branch("adamm", "git-quick-stats", None, "main"),
+                ),
+            "adamm",
+            "git-quick-stats",
+            "https://src.opensuse.org/api/v1/repos/fbui/git-quick-stats",
+            &fork_body,
+        );
+        let (debug, lines) = Debug::captured(true, false);
+        let meta = package_meta(
+            "home:adamm",
+            "git-quick-stats",
+            Some("https://src.opensuse.org/adamm/git-quick-stats"),
+            None,
+        );
+        let obs_http = obs_fork_fixture(
+            FakeHttp::new(),
+            "https://api.opensuse.org/public/source/home:adamm/git-quick-stats/_meta",
+            &meta,
+            "https://api.opensuse.org/source/home:adamm/git-quick-stats?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgit-quick-stats%23main",
+            &fork_status("home:fbui:branches:home:adamm", "git-quick-stats", "home:adamm", "git-quick-stats"),
+        );
+        let result = client(&gitea_http)
+            .with_debug(debug)
+            .branch(
+                &obs_client(&obs_http),
+                "home:adamm",
+                "git-quick-stats",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.branch, "main");
+        assert_eq!(
+            lines.lock().unwrap().clone(),
+            vec![
+                "decision: no branch named in the scmsync URL; using the default branch main"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_honours_an_explicit_fork_branch() {
+        // The explicit branch `slfo-main` is a real branch of
+        // `adamm/gsl` (whose scmsync names `factory`); the fork
+        // overrides it.
+        let fork_body = repo_json("fbui", "gsl", Some(("adamm", "gsl")));
+        let gitea_http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            ),
+            "adamm",
+            "gsl",
+            "https://src.opensuse.org/api/v1/repos/fbui/gsl",
+            &fork_body,
+        );
+        let meta = package_meta(
+            "science",
+            "gsl",
+            Some("https://src.opensuse.org/adamm/gsl.git#factory"),
+            None,
+        );
+        let obs_http = obs_fork_fixture(
+            FakeHttp::new(),
+            "https://api.opensuse.org/public/source/science/gsl/_meta",
+            &meta,
+            "https://api.opensuse.org/source/science/gsl?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgsl%23slfo-main",
+            &fork_status("home:fbui:branches:science", "gsl", "science", "gsl"),
+        );
+        let options = ForkOptions {
+            fork_branch: Some("slfo-main".to_string()),
+            ..ForkOptions::default()
+        };
+        let result = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "science",
+                "gsl",
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.branch, "slfo-main");
+        assert_eq!(
+            result.scmsync,
+            "https://src.opensuse.org/fbui/gsl#slfo-main".to_string()
+        );
+    }
+
+    #[test]
+    fn branch_forks_a_project() {
+        // The real project-level scmsync: the
+        // `network:messaging:xmpp` project carries
+        // `xmpp/_ObsPrj.git#master`.
+        let fork_body = repo_json_branch("fbui", "_ObsPrj", Some(("xmpp", "_ObsPrj")), "master");
+        let gitea_http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            ),
+            "xmpp",
+            "_ObsPrj",
+            "https://src.opensuse.org/api/v1/repos/fbui/_ObsPrj",
+            &fork_body,
+        );
+        let meta = project_meta(
+            "network:messaging:xmpp",
+            Some("https://src.opensuse.org/xmpp/_ObsPrj.git#master"),
+            None,
+        );
+        // A project fork answers only targetproject /
+        // sourceproject — no package names.
+        let fork_response = "<status code=\"ok\"><summary>Ok</summary><data name=\"targetproject\">home:fbui:branches:network:messaging:xmpp</data><data name=\"sourceproject\">network:messaging:xmpp</data></status>";
+        let obs_http = obs_fork_fixture(
+            FakeHttp::new(),
+            "https://api.opensuse.org/public/source/network:messaging:xmpp/_meta",
+            &meta,
+            "https://api.opensuse.org/source/network:messaging:xmpp/_project?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2F_ObsPrj%23master",
+            fork_response,
+        );
+        let result = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "network:messaging:xmpp",
+                "_project",
+                &ForkOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.target_project,
+            "home:fbui:branches:network:messaging:xmpp"
+        );
+        assert_eq!(result.target_package, "_project");
+    }
+
+    /// A one-shot loopback HTTP server: serves `body` once with
+    /// `status`, then exits. The fixture transport for the debug
+    /// test below (a Gitea call emits the same attempt lines as an
+    /// OBS call).
+    fn serve_once(body: &'static str, status: u16) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::Read;
+                use std::io::Write;
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn debug_on_records_attempt_lines_for_a_gitea_call() {
+        let body = repo_json("pool", "systemd", None);
+        // The body must outlive the server thread: leak it — the
+        // test process exits right after.
+        let body: &'static str = Box::leak(body.into_boxed_str());
+        let (port, handle) = serve_once(body, 200);
+        let (debug, lines) = Debug::captured(true, false);
+        let transport = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug.clone());
+        let client =
+            GiteaClient::with_base(&transport, &format!("http://127.0.0.1:{port}"), bearer())
+                .unwrap()
+                .with_debug(debug);
+        let repo = client.repo_get("pool", "systemd").unwrap();
+        handle.join().expect("server thread");
+        assert_eq!(repo.name, "systemd");
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("http: GET /api/v1/repos/pool/systemd -> 200")),
+            "attempt lines: {:?}",
+            lines.lock().unwrap().clone()
+        );
+    }
+}

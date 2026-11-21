@@ -30,11 +30,19 @@
 //! - [`xml`]: the minimal XML document editor for the small documents
 //!   geectl rewrites in place (a package `_meta`, a `_link`) —
 //!   internal only, so XML never leaves the library.
+//! - [`gitea`]: the Gitea operations for git-backed packages — repo
+//!   read, fork, repo delete — plus the `branch` composite (Gitea
+//!   fork + OBS `cmd=fork`) behind the uniform flow. Internal
+//!   plumbing, not the user-facing surface: the uniform flow verbs
+//!   (`branch`, `submit`, …) are what an agent calls. The module is
+//!   public so the live harness can exercise the typed operations;
+//!   the `Gitea*` types never appear in a uniform-flow signature.
 
 pub mod auth;
 pub mod config;
 pub mod debug;
 pub mod error;
+pub mod gitea;
 pub mod http;
 pub mod obs;
 pub mod url;

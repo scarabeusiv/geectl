@@ -149,11 +149,17 @@ pub fn is_retryable_method(method: &str) -> bool {
 /// `application/octet-stream` (a source file) and IS retried like
 /// `put`: re-PUTting the same file stores the same bytes.
 /// `post_json` sends the body as `application/json` and resolves
-/// credentials from the client's auth seam instead.
-/// The mutation methods (`post`, `post_text`, `post_json`, `put`,
-/// `put_file`, `delete`) all ask for `application/xml` (`Accept`
-/// header): a path that exists in both the API and WebUI route sets
-/// serves the WebUI HTML page unless the request asks for XML.
+/// credentials from the client's auth seam instead;
+/// `post_json_with` is the same POST with explicit credentials, for
+/// callers that hold their own credentials (the Gitea client, whose
+/// Bearer must be the single source for every call it makes —
+/// a `post_json` here would silently fork as whoever the HTTP
+/// client's seam resolves, not as the Gitea client's token).
+/// The mutation methods (`post`, `post_text`, `post_json`,
+/// `post_json_with`, `put`, `put_file`, `delete`) all ask for
+/// `application/xml` (`Accept` header): a path that exists in both
+/// the API and WebUI route sets serves the WebUI HTML page unless
+/// the request asks for XML.
 pub trait HttpClient {
     fn get(&self, url: &str) -> Result<String, GeectlError>;
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
@@ -182,6 +188,18 @@ pub trait HttpClient {
     /// failure) is returned immediately. Auth and the transport guard
     /// work exactly as for GET.
     fn post_json(&self, url: &str, body: &str) -> Result<String, GeectlError>;
+    /// POST a JSON body with explicit credentials. The `post_json`
+    /// counterpart of [`HttpClient::post`]: same single-attempt POST,
+    /// same `application/json` body, but the credentials come from
+    /// the caller instead of the client's auth seam — so a client
+    /// that holds its own credentials (the Gitea client) never
+    /// authenticates a mutation as someone else.
+    fn post_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError>;
     fn post_text(
         &self,
         url: &str,
@@ -1046,6 +1064,16 @@ fn status_action(code: u16, safe_url: &str) -> StatusAction {
             ErrorKind::AuthFailed,
             format!("{safe_url} returned {code}"),
         )),
+        // 409 is a conflict with existing state: the resource the
+        // caller tried to create already exists (a fork, a repo).
+        // It maps to AlreadyExists, not InvalidInput, so a caller
+        // can match the conflict specifically — a 400/422 InvalidInput
+        // must never be mistaken for one (the fork race re-reads
+        // its target only on AlreadyExists).
+        409 => StatusAction::Return(GeectlError::new(
+            ErrorKind::AlreadyExists,
+            format!("{safe_url} returned 409"),
+        )),
         // 408 is the server timing out on the request: retry it as a
         // timeout, not as a caller error.
         408 => StatusAction::Retry(GeectlError::new(
@@ -1066,7 +1094,8 @@ fn status_action(code: u16, safe_url: &str) -> StatusAction {
             format!("{safe_url} returned {code}"),
         )),
         // Any other 4xx is the caller's fault: wrong name, wrong flag,
-        // wrong method. Retrying would not help.
+        // wrong method — 409 is handled above, as AlreadyExists.
+        // Retrying would not help.
         400..=499 => StatusAction::Return(GeectlError::new(
             ErrorKind::InvalidInput,
             format!("{safe_url} returned {code}"),
@@ -1203,6 +1232,19 @@ impl HttpClient for UreqClient {
         // same transport guard, same error mapping, Content-Type
         // application/json.
         self.post_with_content_type(url, body, "application/json", &credentials)
+    }
+
+    fn post_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // The caller's credentials, not the seam's: a client that
+        // holds its own Bearer (the Gitea client) authenticates its
+        // mutation as itself even when the HTTP client was built
+        // with a different provider — or with none at all.
+        self.post_with_content_type(url, body, "application/json", credentials)
     }
 
     fn post(
@@ -1550,6 +1592,13 @@ mod tests {
         );
         assert!(
             matches!(status_action(422, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::InvalidInput)
+        );
+        // 409 is a conflict with existing state, not a caller
+        // fault: AlreadyExists, so a caller can match it
+        // specifically instead of treating every InvalidInput as
+        // a conflict.
+        assert!(
+            matches!(status_action(409, "u"), StatusAction::Return(e) if e.kind() == ErrorKind::AlreadyExists)
         );
         // 429 and 5xx are transient: retry as ServerError.
         assert!(
@@ -1930,6 +1979,56 @@ mod tests {
             "POST must carry the Bearer <redacted> request: {}",
             redact_authorization(&request)
         );
+    }
+
+    #[test]
+    fn post_json_with_sends_the_explicit_credentials_not_the_seam() {
+        // The split-brain case: the HTTP client was built with one
+        // provider (the seam token) while the caller passes another.
+        // The wire must carry the explicit credentials — a Gitea
+        // fork authenticated as the seam token would fork as the
+        // wrong account while every read/delete went as the caller.
+        let server = LoopbackServer::serve("created");
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Bearer {
+                token: "seam-token".to_string(),
+            }))),
+        )
+        .unwrap();
+        let body = "{\"name\":\"geectl-live\"}";
+        let explicit = Credentials::Bearer {
+            token: "explicit-token".to_string(),
+        };
+        assert_eq!(
+            client
+                .post_json_with(&server.url(), body, &explicit)
+                .unwrap(),
+            "created"
+        );
+        let request = server.request().expect("server recorded the request");
+        assert!(
+            request
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("authorization: Bearer explicit-token")),
+            "POST must carry the explicit Bearer <redacted>, not the seam one; request: {}",
+            redact_authorization(&request)
+        );
+        assert!(
+            !request.contains("seam-token"),
+            "the seam token must not reach the wire; request: {}",
+            redact_authorization(&request)
+        );
+    }
+
+    #[test]
+    fn post_json_with_maps_409_to_already_exists() {
+        let server = LoopbackServer::serve_status("already exists", 409);
+        let client = UreqClient::with_auth(Timeout::default(), None).unwrap();
+        let err = client
+            .post_json_with(&server.url(), "{}", &Credentials::None)
+            .expect_err("a 409 POST must fail");
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
     }
 
     #[test]

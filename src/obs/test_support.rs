@@ -261,6 +261,19 @@ impl HttpClient for FakeHttp {
         self.post(url, body, &Credentials::None)
     }
 
+    fn post_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // The explicit-credentials twin of post_json: the recorded
+        // call carries whether the caller authenticated, so a test
+        // can assert the fork POST went out as the client's Bearer
+        // instead of as no credentials at all.
+        self.post(url, body, credentials)
+    }
+
     fn post_text(
         &self,
         url: &str,

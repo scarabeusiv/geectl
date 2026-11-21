@@ -203,7 +203,10 @@ fn port_is_valid(authority: &str) -> bool {
 }
 
 /// True when `authority` is a bare authority: non-empty, with no path,
-/// query, fragment, userinfo, or whitespace, and with a non-empty host.
+/// query, fragment, userinfo, whitespace, or control character, and with
+/// a non-empty host. A control character is not whitespace (`\x01`,
+/// `\x7f`), so the whitespace check alone lets one through into a base
+/// URL that is then string-concatenated into every request URL.
 /// The authority ends at the first `/`, `?`, or `#`; an `@` inside it
 /// is userinfo, which a base must never carry (credentials belong in
 /// `Credentials`, not in the URL). An authority starting with `:` or
@@ -215,7 +218,9 @@ fn port_is_valid(authority: &str) -> bool {
 pub(crate) fn is_bare_authority(authority: &str) -> bool {
     !authority.is_empty()
         && !authority.contains(['/', '?', '#', '@'])
-        && !authority.chars().any(|c| c.is_whitespace())
+        && !authority
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
         && !authority.starts_with(':')
         && !authority.starts_with("[]")
         && (!authority.starts_with('[')
@@ -937,6 +942,20 @@ mod tests {
         assert!(!valid_obs_name("foo/bar"));
         assert!(!valid_obs_name("foo?x=1"));
         assert!(!valid_obs_name("foo' or '1'='1"));
+    }
+
+    #[test]
+    fn bare_authority_rejects_control_characters() {
+        // A control character is not whitespace, so the whitespace
+        // check alone lets it into a base URL that is then
+        // string-concatenated into every request URL.
+        assert!(is_bare_authority("api.opensuse.org"));
+        assert!(is_bare_authority("api.opensuse.org:443"));
+        assert!(is_bare_authority("[::1]:8080"));
+        assert!(!is_bare_authority("api.opensuse.org\x01"));
+        assert!(!is_bare_authority("api.opensuse.org\x7f"));
+        assert!(!is_bare_authority("api.opensuse.org\x01:443"));
+        assert!(!is_bare_authority("api.opensuse.org "));
     }
 
     #[test]
