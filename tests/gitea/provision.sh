@@ -126,7 +126,11 @@ echo "Gitea is up."
 # Scopes are the minimal set the live tests need: read the user and
 # the repo list, create a repository, read it back. (Repo creation
 # needs `write:user` as well as `write:repository` — `write:repository`
-# alone returns 403.)
+# alone returns 403.) Phase 1 of the Gitea ops (#20) added
+# `write:organization`: the cross-org fork-refusal live test creates
+# an organization, and the token names the scope the server demands
+# (403 otherwise). Scopes are recorded per phase here — do not widen
+# them silently.
 echo "Creating the test user and token ..."
 $CONTAINER exec -u git "$CONTAINER_NAME" \
     gitea admin user create \
@@ -138,7 +142,7 @@ TOKEN_OUTPUT="$($CONTAINER exec -u git "$CONTAINER_NAME" \
     gitea admin user generate-access-token \
     --username "$GITEA_USER" \
     --token-name geectl-live \
-    --scopes read:user,read:repository,write:repository,write:user)"
+    --scopes read:user,read:repository,write:repository,write:user,write:organization)"
 TOKEN="$(printf '%s' "$TOKEN_OUTPUT" | sed -n 's/^Access token was successfully created: //p')"
 if [ -z "$TOKEN" ]; then
     # The raw output is withheld on purpose: it may contain the

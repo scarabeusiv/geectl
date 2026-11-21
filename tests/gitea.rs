@@ -37,8 +37,11 @@
 //! and the status mapping are all exercised against a real server.
 
 use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth};
+use geectl::debug::Debug;
 use geectl::error::ErrorKind;
+use geectl::gitea::{ForkRepoOptions, GiteaClient};
 use geectl::http::{HttpClient, Timeout, UreqClient};
+use geectl::obs::DryRun;
 
 /// Whether `url` points at a loopback host over plain HTTP.
 ///
@@ -222,6 +225,560 @@ fn gitea_create_repo_shows_up_on_server() {
         names.contains(&expected_full_name.as_str()),
         "the created repository is not in the user's repository list; list: {names:?}"
     );
+}
+
+/// A typed `GiteaClient` for the instance, authenticated through
+/// `EnvGiteaAuth` — the same token the raw harness uses, so the typed
+/// operations are exercised through the production auth path. The
+/// client borrows the HTTP client: both live in the test body.
+fn typed_client<'a>(http: &'a UreqClient, base: &str) -> GiteaClient<'a> {
+    let credentials = EnvGiteaAuth
+        .credentials()
+        .expect("reading the Gitea token from the environment");
+    GiteaClient::with_base(http, base, credentials).expect("typed Gitea client construction")
+}
+
+/// Fork through the typed operation in live mode (dry-run off)
+/// and return the fork. A live fork always returns `Some`.
+fn fork_live(
+    client: &GiteaClient,
+    owner: &str,
+    repo: &str,
+    options: &ForkRepoOptions,
+) -> geectl::gitea::GiteaRepository {
+    client
+        .fork_repo(owner, repo, options, &DryRun::new(false))
+        .expect("typed fork_repo forks the repository")
+        .expect("a non-dry-run fork returns the fork")
+}
+
+/// Delete through the typed operation in live mode and return the
+/// deleted name. A live delete always returns `Some`; force is
+/// passed explicitly — the delete is destructive, so the caller
+/// confirms it.
+fn delete_live(client: &GiteaClient, owner: &str, repo: &str) -> String {
+    client
+        .repo_delete(owner, repo, true, &DryRun::new(false))
+        .expect("typed repo_delete deletes the repository")
+        .expect("a non-dry-run delete returns the name")
+}
+
+/// Create a repository through the raw API and return its full name.
+/// Repo creation is not a phase-1 operation, so the setup stays raw;
+/// the assertions then go through the typed operations.
+fn create_repo_raw(http: &UreqClient, base: &str, name: &str) -> String {
+    let body = serde_json::json!({
+        "name": name,
+        "private": false,
+        "description": "geectl live-test repository",
+    })
+    .to_string();
+    let created = http
+        .post_json(&format!("{base}/api/v1/user/repos"), &body)
+        .expect("POST /api/v1/user/repos on the Gitea instance");
+    let created: serde_json::Value =
+        serde_json::from_str(&created).expect("POST /api/v1/user/repos returns valid JSON");
+    created["full_name"]
+        .as_str()
+        .expect("the created repository has a full_name")
+        .to_string()
+}
+
+/// An organization name unique to this run. Shorter than
+/// `unique_repo_name`: Gitea caps usernames at 39 characters, and
+/// `geectl-live-<pid>-<nanos>` can exceed it.
+fn unique_org_name() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time is after the epoch")
+        .as_secs();
+    format!("geectl-org-{}-{secs}", std::process::id())
+}
+
+#[test]
+fn gitea_repo_get_round_trip_and_missing() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let full_name = create_repo_raw(&http, &base, &repo);
+    // The typed read shows the creation on the server, with the
+    // fields the phase-1 operations rely on.
+    let read = client
+        .repo_get(&gitea_user(), &repo)
+        .expect("typed repo_get reads the created repository");
+    assert_eq!(read.full_name, full_name);
+    assert_eq!(read.owner.login, gitea_user());
+    assert_eq!(read.name, repo);
+    assert!(
+        read.parent.is_none(),
+        "a freshly created repository is not a fork; body: {read:?}"
+    );
+    assert!(
+        !read.default_branch.is_empty(),
+        "a freshly created repository has a default branch; body: {read:?}"
+    );
+    // And a missing repository maps to NotFound through the typed
+    // operation, not just the raw transport.
+    let err = client
+        .repo_get(&gitea_user(), "geectl-live-no-such-repo")
+        .expect_err("a missing repository must not return a value");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "a missing repository must map to NotFound; got {err:?}"
+    );
+}
+
+#[test]
+fn gitea_repo_delete_removes_the_repo() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    create_repo_raw(&http, &base, &repo);
+    // Without force the delete is refused client-side, before any
+    // server read — and the repository survives the refusal.
+    let err = client
+        .repo_delete(&gitea_user(), &repo, false, &DryRun::new(false))
+        .expect_err("deleting without force must fail");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::InvalidInput,
+        "deleting without force must map to InvalidInput; got {err:?}"
+    );
+    client
+        .repo_get(&gitea_user(), &repo)
+        .expect("the refused delete must leave the repository in place");
+    let deleted = delete_live(&client, &gitea_user(), &repo);
+    assert_eq!(deleted, repo);
+    // The deletion shows up on the server: the repo no longer reads.
+    let err = client
+        .repo_get(&gitea_user(), &repo)
+        .expect_err("the deleted repository must not read back");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "the deleted repository must map to NotFound; got {err:?}"
+    );
+    // Deleting a missing repository is NotFound too.
+    let err = client
+        .repo_delete(
+            &gitea_user(),
+            "geectl-live-no-such-repo",
+            true,
+            &DryRun::new(false),
+        )
+        .expect_err("deleting a missing repository must fail");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "deleting a missing repository must map to NotFound; got {err:?}"
+    );
+}
+
+#[test]
+fn gitea_fork_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let source = unique_repo_name();
+    let source_full = create_repo_raw(&http, &base, &source);
+    let source_read = client
+        .repo_get(&gitea_user(), &source)
+        .expect("typed repo_get reads the source repository");
+    // A self-fork needs a different name: forking onto the source's
+    // own name would collide with the source itself (409).
+    let fork_name = unique_repo_name();
+    let forked = fork_live(
+        &client,
+        &gitea_user(),
+        &source,
+        &ForkRepoOptions {
+            new_name: Some(fork_name.clone()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(forked.owner.login, gitea_user());
+    assert_eq!(forked.name, fork_name);
+    assert_eq!(forked.full_name, format!("{}/{fork_name}", gitea_user()));
+    // The fork's parent is the source, and the default branch is
+    // inherited — the two facts the composite's re-read verifies.
+    let parent = forked
+        .parent
+        .as_ref()
+        .expect("the fork must name its parent");
+    assert_eq!(parent.full_name, source_full);
+    assert_eq!(forked.default_branch, source_read.default_branch);
+    // And the fork reads back on the server under its own name.
+    let read_back = client
+        .repo_get(&gitea_user(), &fork_name)
+        .expect("typed repo_get reads the fork back");
+    assert_eq!(read_back.full_name, forked.full_name);
+}
+
+#[test]
+fn gitea_fork_twice_with_the_same_name_reuses_the_fork() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let source = unique_repo_name();
+    let source_full = create_repo_raw(&http, &base, &source);
+    let fork_name = unique_repo_name();
+    let first = fork_live(
+        &client,
+        &gitea_user(),
+        &source,
+        &ForkRepoOptions {
+            new_name: Some(fork_name.clone()),
+            ..Default::default()
+        },
+    );
+    // The second fork, same name, reuses the existing fork instead
+    // of failing: Gitea allows one fork per user per source, and the
+    // pre-check finds it with the source as its parent.
+    let second = fork_live(
+        &client,
+        &gitea_user(),
+        &source,
+        &ForkRepoOptions {
+            new_name: Some(fork_name.clone()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(second.full_name, first.full_name);
+    assert_eq!(
+        second
+            .parent
+            .as_ref()
+            .expect("the reused fork has a parent")
+            .full_name,
+        source_full
+    );
+}
+
+#[test]
+fn gitea_fork_twice_with_a_different_name_reports_the_collision() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let source = unique_repo_name();
+    create_repo_raw(&http, &base, &source);
+    let first_name = unique_repo_name();
+    client
+        .fork_repo(
+            &gitea_user(),
+            &source,
+            &ForkRepoOptions {
+                new_name: Some(first_name.clone()),
+                ..Default::default()
+            },
+            &DryRun::new(false),
+        )
+        .expect("the first fork creates the fork");
+    // A second fork under a different name cannot reuse the first:
+    // Gitea's 409 names the existing fork's path, but the transport
+    // discards the server's error body, and listing the existing
+    // forks is a phase-2 operation. So the collision surfaces as the
+    // server's 409 (AlreadyExists), and no repo appears under the
+    // second name.
+    let second_name = unique_repo_name();
+    let err = client
+        .fork_repo(
+            &gitea_user(),
+            &source,
+            &ForkRepoOptions {
+                new_name: Some(second_name.clone()),
+                ..Default::default()
+            },
+            &DryRun::new(false),
+        )
+        .expect_err("a second fork under a different name must fail");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::AlreadyExists,
+        "a renamed re-fork must surface the server's 409; got {err:?}"
+    );
+    let err = client
+        .repo_get(&gitea_user(), &second_name)
+        .expect_err("no repository must exist under the second name");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "no repository must exist under the second name; got {err:?}"
+    );
+}
+
+#[test]
+fn gitea_fork_of_fork_parent_is_the_direct_parent() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let source = unique_repo_name();
+    let source_full = create_repo_raw(&http, &base, &source);
+    let first_name = unique_repo_name();
+    let first = fork_live(
+        &client,
+        &gitea_user(),
+        &source,
+        &ForkRepoOptions {
+            new_name: Some(first_name.clone()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        first
+            .parent
+            .as_ref()
+            .expect("the first fork has a parent")
+            .full_name,
+        source_full
+    );
+    // Forking the fork: the second fork's parent is the first fork
+    // (the direct parent), not the root — that is what the
+    // composite's re-read check verifies.
+    let second_name = unique_repo_name();
+    let second = fork_live(
+        &client,
+        &gitea_user(),
+        &first_name,
+        &ForkRepoOptions {
+            new_name: Some(second_name.clone()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        second
+            .parent
+            .as_ref()
+            .expect("the second fork has a parent")
+            .full_name,
+        first.full_name
+    );
+}
+
+#[test]
+fn gitea_fork_name_collision_retries_with_a_new_name() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    // A plain repository already holds the target name — not a fork
+    // of the source, so the fork is refused, not reused.
+    let blocking = unique_repo_name();
+    create_repo_raw(&http, &base, &blocking);
+    let source = unique_repo_name();
+    create_repo_raw(&http, &base, &source);
+    let err = client
+        .fork_repo(
+            &gitea_user(),
+            &source,
+            &ForkRepoOptions {
+                new_name: Some(blocking.clone()),
+                ..Default::default()
+            },
+            &DryRun::new(false),
+        )
+        .expect_err("forking onto an existing non-fork name must fail");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::AlreadyExists,
+        "forking onto an existing non-fork name must be AlreadyExists; got {err:?}"
+    );
+    // The retry with a fresh name succeeds.
+    let retry = unique_repo_name();
+    let forked = fork_live(
+        &client,
+        &gitea_user(),
+        &source,
+        &ForkRepoOptions {
+            new_name: Some(retry.clone()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(forked.name, retry);
+}
+
+#[test]
+fn gitea_fork_into_org_refuses_when_a_non_fork_exists() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let org = unique_org_name();
+    // Org creation is not a phase-1 operation, so it stays raw.
+    // The token needs `write:organization` (provision.sh).
+    let org_body = serde_json::json!({ "username": org }).to_string();
+    let created = http
+        .post_json(&format!("{base}/api/v1/orgs"), &org_body)
+        .expect("POST /api/v1/orgs on the Gitea instance");
+    let created: serde_json::Value =
+        serde_json::from_str(&created).expect("POST /api/v1/orgs returns valid JSON");
+    assert_eq!(
+        created["username"].as_str(),
+        Some(org.as_str()),
+        "POST /api/v1/orgs did not return the created organization; body: {created}"
+    );
+    // A plain repository of the target name already exists in the
+    // org — not a fork of the source — so forking into the org is
+    // refused, not reused.
+    let source = unique_repo_name();
+    let org_repo_body = serde_json::json!({
+        "name": source,
+        "private": false,
+    })
+    .to_string();
+    http.post_json(&format!("{base}/api/v1/orgs/{org}/repos"), &org_repo_body)
+        .expect("POST /api/v1/orgs/{org}/repos on the Gitea instance");
+    create_repo_raw(&http, &base, &source);
+    let err = client
+        .fork_repo(
+            &gitea_user(),
+            &source,
+            &ForkRepoOptions {
+                organization: Some(org.clone()),
+                ..Default::default()
+            },
+            &DryRun::new(false),
+        )
+        .expect_err("forking into an org that holds a non-fork of that name must fail");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::AlreadyExists,
+        "forking into an org that holds a non-fork of that name must be AlreadyExists; got {err:?}"
+    );
+}
+
+#[test]
+fn gitea_typed_call_emits_a_debug_attempt_line() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let repo = unique_repo_name();
+    // The attempt lines are emitted by the transport, so the same
+    // sink goes on the transport and on the typed client (the unit
+    // test wires it the same way): the client alone only carries
+    // the decision lines.
+    let (debug, lines) = Debug::captured(true, false);
+    let http = UreqClient::with_auth(Timeout::default(), Some(Box::new(EnvGiteaAuth)))
+        .expect("default timeout is valid")
+        .with_debug(debug.clone());
+    create_repo_raw(&http, &base, &repo);
+    let client = typed_client(&http, &base).with_debug(debug);
+    client
+        .repo_get(&gitea_user(), &repo)
+        .expect("typed repo_get with a debug sink reads the repository");
+    let lines = lines.lock().expect("the captured debug lines are readable");
+    let expected = format!("http: GET /api/v1/repos/{}/{} -> 200", gitea_user(), repo);
+    assert!(
+        lines.iter().any(|line| line.contains(&expected)),
+        "a typed call must emit an attempt line; lines: {lines:?}"
+    );
+}
+
+/// Create the mirrored `pool/systemd` source repo if it does not
+/// exist yet. Idempotent: a re-run against the same instance reuses
+/// the existing org/repo instead of failing on the duplicate — the
+/// fixed names cannot be unique per run, and that is the point of
+/// the mirror.
+fn ensure_pool_systemd(http: &UreqClient, base: &str) {
+    if http.get(&format!("{base}/api/v1/orgs/pool")).is_err() {
+        let body = serde_json::json!({ "username": "pool" }).to_string();
+        http.post_json(&format!("{base}/api/v1/orgs"), &body)
+            .expect("POST /api/v1/orgs creates the pool org");
+    }
+    if http
+        .get(&format!("{base}/api/v1/repos/pool/systemd"))
+        .is_err()
+    {
+        let body = serde_json::json!({
+            "name": "systemd",
+            "private": false,
+            "default_branch": "factory",
+        })
+        .to_string();
+        http.post_json(&format!("{base}/api/v1/orgs/pool/repos"), &body)
+            .expect("POST /api/v1/orgs/pool/repos creates pool/systemd");
+    }
+}
+
+#[test]
+fn gitea_pool_systemd_layout_mirrored() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    // The real layout, mirrored exactly: org `pool`, repo
+    // `systemd`, default branch `factory` — fetched live
+    // 2026-11-21 from https://src.opensuse.org (see the layout
+    // note in src/gitea.rs). The fork owner is the disposable
+    // instance's own user, not a real forker: the token owner is
+    // always the forker, and the instance has one user. The
+    // clone/ssh URLs are the instance's own (the server derives
+    // them from its base), so only their tails are asserted.
+    ensure_pool_systemd(&http, &base);
+    let client = typed_client(&http, &base);
+    let source = client
+        .repo_get("pool", "systemd")
+        .expect("typed repo_get reads pool/systemd");
+    assert_eq!(source.full_name, "pool/systemd");
+    assert_eq!(source.owner.login, "pool");
+    assert!(
+        source.parent.is_none(),
+        "pool/systemd is not a fork; body: {source:?}"
+    );
+    assert_eq!(
+        source.default_branch, "factory",
+        "pool/systemd's default branch is factory; body: {source:?}"
+    );
+    assert!(
+        source.clone_url.ends_with("/pool/systemd.git"),
+        "the clone URL names pool/systemd; body: {source:?}"
+    );
+    assert!(
+        source.ssh_url.ends_with("pool/systemd.git"),
+        "the SSH URL names pool/systemd; body: {source:?}"
+    );
+    // Fork it: the fork keeps the source name under the token
+    // owner, its parent is pool/systemd, and it inherits the
+    // factory default branch — the shapes the composite relies on.
+    // A re-run reuses the existing fork (same assertions hold).
+    let forked = fork_live(&client, "pool", "systemd", &ForkRepoOptions::default());
+    assert_eq!(forked.name, "systemd");
+    assert_eq!(forked.owner.login, gitea_user());
+    assert_eq!(
+        forked
+            .parent
+            .as_ref()
+            .expect("the fork must name its parent")
+            .full_name,
+        "pool/systemd"
+    );
+    assert_eq!(forked.default_branch, "factory");
 }
 
 #[test]
