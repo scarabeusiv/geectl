@@ -8380,8 +8380,17 @@ fn parse_root<'a>(xml: &'a str, name: &'a str) -> Option<Element<'a>> {
     let xml = xml.trim();
     let xml = match xml.strip_prefix("<?xml") {
         Some(rest) => {
-            let end = rest.find("?>")?;
-            rest[end + 2..].trim_start()
+            // The prolog must start here, exactly as in
+            // `parse_devel_project`: `<?xmlfoo` is not a prolog, so it
+            // is not stripped — the `<` handling below rejects `<?...`
+            // as not an element.
+            let first = rest.chars().next();
+            if !matches!(first, Some(c) if c.is_whitespace() || c == '?') {
+                xml
+            } else {
+                let end = rest.find("?>")?;
+                rest[end + 2..].trim_start()
+            }
         }
         None => xml,
     };
@@ -19251,6 +19260,25 @@ description</description>
             parse_comments(
                 "<comments request=\"42\"><comment who=\"user1\">no id</comment></comments>"
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_root_strips_only_a_well_formed_xml_prolog() {
+        // A well-formed prolog is stripped.
+        assert_eq!(
+            parse_comments("<?xml version=\"1.0\"?><comments request=\"42\"></comments>"),
+            Some(Vec::new())
+        );
+        // `<?xmlfoo` is not a prolog: the document does not parse.
+        assert_eq!(
+            parse_comments("<?xmlfoo version=\"1.0\"?><comments request=\"42\"></comments>"),
+            None
+        );
+        // An unterminated prolog is not stripped either.
+        assert_eq!(
+            parse_comments("<?xml version=\"1.0\"<comments request=\"42\"></comments>"),
             None
         );
     }
