@@ -2413,6 +2413,13 @@ impl<'a> ObsClient<'a> {
     /// holding packages is refused. `force` ignores other projects
     /// depending on this one; `comment` is recorded on the delete.
     ///
+    /// The list-then-delete is best-effort, not atomic: a package
+    /// created between the listing and the delete is deleted with
+    /// the project anyway. There is no server-side conditional
+    /// delete, so the window cannot be closed from the client; the
+    /// guard only catches a project that already holds packages
+    /// when it is listed.
+    ///
     /// Success is the `<status code="ok"/>` body; any other body is a
     /// server error, never success. Deleting a project that does not
     /// exist reads as `NotFound` from the package-list read (or from

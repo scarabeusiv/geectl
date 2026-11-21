@@ -1286,10 +1286,14 @@ pub(crate) fn xml_attr(element: &str, name: &str) -> Option<String> {
     // whether it is inside a quoted value and only matches outside
     // one. The match position is always an ASCII byte (the first byte
     // of the ASCII needle), so the slicing below stays on UTF-8
-    // boundaries.
-    let needle = format!("{name}=");
+    // boundaries. Whitespace around `=` is allowed: `name = "value"`
+    // is the same attribute. A malformed occurrence (an unquoted
+    // value) is skipped, not fatal — the attribute may still follow.
+    if name.is_empty() {
+        return None;
+    }
     let bytes = element.as_bytes();
-    let first = needle.as_bytes()[0];
+    let first = name.as_bytes()[0];
     let mut in_quote: Option<u8> = None;
     let mut i = 0;
     while i < bytes.len() {
@@ -1307,16 +1311,27 @@ pub(crate) fn xml_attr(element: &str, name: &str) -> Option<String> {
             continue;
         }
         if b == first
-            && element[i..].starts_with(&needle)
+            && element[i..].starts_with(name)
             && (i == 0 || bytes[i - 1].is_ascii_whitespace())
         {
-            let after_eq = &element[i + needle.len()..];
-            let quote = after_eq.chars().next()?;
-            if quote != '"' && quote != '\'' {
-                return None;
+            // The name must be followed by `=`, with optional
+            // whitespace around it.
+            let mut j = i + name.len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
             }
-            let close = after_eq[1..].find(quote)?;
-            return Some(xml_unescape(&after_eq[1..1 + close]));
+            if j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                    let quote = bytes[j];
+                    let after = &element[j + 1..];
+                    let close = after.find(quote as char)?;
+                    return Some(xml_unescape(&after[..close]));
+                }
+            }
         }
         i += 1;
     }
@@ -2110,6 +2125,29 @@ mod tests {
         );
         assert_eq!(
             xml_attr("details=\"code=failed\" code=\"building\"", "code"),
+            Some("building".to_string())
+        );
+    }
+
+    #[test]
+    fn xml_attr_tolerates_whitespace_and_skips_a_malformed_first_occurrence() {
+        // Whitespace around `=` is the same attribute.
+        assert_eq!(
+            xml_attr("code = \"building\"", "code"),
+            Some("building".to_string())
+        );
+        assert_eq!(
+            xml_attr("code= \"building\"", "code"),
+            Some("building".to_string())
+        );
+        // A malformed first occurrence does not stop the scan: the
+        // well-formed later one wins.
+        assert_eq!(
+            xml_attr("code=failed code=\"building\"", "code"),
+            Some("building".to_string())
+        );
+        assert_eq!(
+            xml_attr("code = 'building'", "code"),
             Some("building".to_string())
         );
     }

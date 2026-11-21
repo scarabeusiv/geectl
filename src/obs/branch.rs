@@ -751,6 +751,11 @@ impl<'a> ObsClient<'a> {
         let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
         let meta = self.http.get_with(&url, &self.credentials)?;
         let mut doc = XmlDoc::parse(&meta)?;
+        // The document as fetched, for the no-change check below:
+        // comparing parsed documents (not rendered text) means a
+        // prolog in the fetched meta, or a reorder from an edit that
+        // changes nothing, does not read as a change.
+        let before = doc.clone();
         match devel_project {
             Some(devel) => {
                 let element = match devel_package {
@@ -767,8 +772,10 @@ impl<'a> ObsClient<'a> {
         }
         let rendered = doc.render();
         // No change, no PUT: setting the devel that is already there
-        // (or unsetting one that is not) writes nothing.
-        if rendered == meta.trim() {
+        // (or unsetting one that is not) writes nothing. The
+        // comparison is on the parsed documents, so a prolog in the
+        // fetched meta does not read as a change.
+        if doc == before {
             return Ok(());
         }
         let body = self.http.put(&url, &rendered, &self.credentials)?;
@@ -876,16 +883,23 @@ impl<'a> ObsClient<'a> {
         // target does not exist yet, or when the target only exists
         // through a project link (its meta names another project):
         // the shadow must not supply the target's meta.
-        let (mut doc, put_meta, target_exists_here) = match &target_meta {
+        let (mut doc, put_meta, target_exists_here, before) = match &target_meta {
             Some(meta) => {
                 let doc = XmlDoc::parse(meta)?;
                 if doc.root_attr("project").as_deref() == Some(target_project) {
-                    (doc, false, true)
+                    // The document as fetched, for the no-change
+                    // check below: comparing parsed documents (not
+                    // rendered text) means a prolog in the fetched
+                    // meta, or a reorder from an edit that changes
+                    // nothing, does not read as a change.
+                    let before = doc.clone();
+                    (doc, false, true, Some(before))
                 } else {
                     (
                         build_link_meta(&source_meta, target_project, target_package)?,
                         true,
                         false,
+                        None,
                     )
                 }
             }
@@ -893,6 +907,7 @@ impl<'a> ObsClient<'a> {
                 build_link_meta(&source_meta, target_project, target_package)?,
                 true,
                 false,
+                None,
             ),
         };
         // A link never inherits the source's scmsync — but only the
@@ -934,13 +949,24 @@ impl<'a> ObsClient<'a> {
             }
         }
         let rendered = doc.render();
-        if put_meta || target_meta.as_deref() != Some(rendered.as_str()) {
+        // A meta built from the source is always PUT; an edited
+        // target meta only when the edit changed it — compared on the
+        // parsed documents, so a prolog in the fetched meta does not
+        // read as a change.
+        let changed = before.as_ref().is_some_and(|orig| *orig != doc);
+        if put_meta || changed {
             let body = self.http.put(&target_url, &rendered, &self.credentials)?;
             if !parse_status_ok(&body) {
+                let preview = crate::debug::format_body_preview(&body);
+                let received = if preview.is_empty() {
+                    "<empty response>"
+                } else {
+                    preview.as_str()
+                };
                 return Err(GeectlError::new(
                     ErrorKind::ServerError,
                     format!(
-                        "unexpected OBS link meta response for package {target_project}/{target_package}"
+                        "unexpected OBS link meta response for package {target_project}/{target_package}; received: {received}"
                     ),
                 ));
             }
@@ -971,12 +997,20 @@ impl<'a> ObsClient<'a> {
         let body = self.http.put_file(&link_url, &link, &self.credentials)?;
         match parse_revision(&body) {
             Some(_) => Ok(()),
-            None => Err(GeectlError::new(
-                ErrorKind::ServerError,
-                format!(
-                    "unexpected OBS link response for package {target_project}/{target_package}"
-                ),
-            )),
+            None => {
+                let preview = crate::debug::format_body_preview(&body);
+                let received = if preview.is_empty() {
+                    "<empty response>"
+                } else {
+                    preview.as_str()
+                };
+                Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected OBS link response for package {target_project}/{target_package}; received: {received}"
+                    ),
+                ))
+            }
         }
     }
 
@@ -1449,9 +1483,17 @@ impl<'a> ObsClient<'a> {
             .http
             .put_file(&link_url, &doc.render(), &self.credentials)?;
         if parse_revision(&body).is_none() {
+            let preview = crate::debug::format_body_preview(&body);
+            let received = if preview.is_empty() {
+                "<empty response>"
+            } else {
+                preview.as_str()
+            };
             return Err(GeectlError::new(
                 ErrorKind::ServerError,
-                format!("unexpected OBS link response for package {project}/{package}"),
+                format!(
+                    "unexpected OBS link response for package {project}/{package}; received: {received}"
+                ),
             ));
         }
         Ok(new_rev)
@@ -1459,8 +1501,8 @@ impl<'a> ObsClient<'a> {
 
     /// Resolve the revision a link is set to from the link
     /// target's directory: the directory's `rev` attribute, with
-    /// its `vrev` when the revision is an md5 (32 characters or
-    /// more — a vrev counts versions within an md5 revision, so
+    /// its `vrev` when the revision is an md5 (exactly 32 hex
+    /// characters — a vrev counts versions within an md5 revision, so
     /// a numeric revision has none). `at` pins the directory
     /// revision; `expand` asks for the expanded source. A failed
     /// directory read (expanding a broken link reads as a 400)
@@ -1490,14 +1532,28 @@ impl<'a> ObsClient<'a> {
         // being expanded, which the target here is not.)
         let rev = if expand { srcmd5 } else { rev };
         let Some(rev) = rev else {
+            let preview = crate::debug::format_body_preview(&directory);
+            let received = if preview.is_empty() {
+                "<empty response>"
+            } else {
+                preview.as_str()
+            };
             return Err(GeectlError::new(
                 ErrorKind::ServerError,
                 format!(
-                    "unexpected OBS directory response for package {target_project}/{target_package}"
+                    "unexpected OBS directory response for package {target_project}/{target_package}; received: {received}"
                 ),
             ));
         };
-        let vrev = if rev.len() >= 32 { vrev } else { None };
+        // A vrev counts versions within an md5 revision: it is only
+        // kept when the revision is exactly 32 hex characters. A
+        // longer hex string is not an md5, and a numeric revision has
+        // no vrev.
+        let vrev = if rev.len() == 32 && rev.chars().all(|c| c.is_ascii_hexdigit()) {
+            vrev
+        } else {
+            None
+        };
         Ok((rev, vrev))
     }
 
@@ -2789,6 +2845,50 @@ mod tests {
     }
 
     #[test]
+    fn link_package_no_change_with_prolog_skips_meta_put() {
+        // The fetched target meta may carry an XML prolog, which the
+        // rendered document never does: a string comparison would
+        // read a change where there is none. The no-change check
+        // compares parsed documents, so only the _link is PUT.
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>";
+        let target_meta = "<?xml version=\"1.0\"?><package name=\"test-pkgA\" project=\"test:target\"><title>Test</title><description>A test package</description></package>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_meta",
+                target_meta,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:target/test-pkgA/_link",
+                "<revision rev=\"1\" vrev=\"1\" srcmd5=\"abc\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &LinkOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        // Only the _link PUT: the meta needed no change.
+        assert_eq!(http.put_calls().len(), 1);
+        assert_eq!(
+            http.put_calls()[0].0,
+            "https://api.opensuse.org/source/test:target/test-pkgA/_link"
+        );
+    }
+
+    #[test]
     fn link_package_missing_source_is_not_found() {
         let http = FakeHttp::new().with_get_error(
             "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
@@ -3381,6 +3481,123 @@ mod tests {
         assert_eq!(
             puts[0].1,
             "<link package=\"srcpkg\" project=\"srcprj\" rev=\"42\"/>"
+        );
+    }
+
+    #[test]
+    fn set_link_rev_latest_keeps_vrev_for_an_md5_revision() {
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" />";
+        let md5 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let directory = format!(
+            "<directory name=\"srcpkg\" rev=\"{md5}\" srcmd5=\"{md5}\" vrev=\"3\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>"
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=latest",
+                &directory,
+            )
+            .with_put(
+                &format!(
+                    "https://api.opensuse.org/source/osctest/simple/_link?comment=Set%20link%20revision%20to%20{md5}"
+                ),
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .set_link_rev(
+                    "osctest",
+                    "simple",
+                    &LinkRevision::Latest,
+                    &DryRun::new(false),
+                )
+                .unwrap(),
+            Some(md5.to_string())
+        );
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            format!("<link package=\"srcpkg\" project=\"srcprj\" rev=\"{md5}\" vrev=\"3\"/>")
+        );
+    }
+
+    #[test]
+    fn set_link_rev_latest_drops_vrev_for_a_longer_hex_revision() {
+        // A 40-hex revision is not an md5: the directory's vrev must
+        // not survive onto the link. The old `rev.len() >= 32` kept
+        // it.
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" />";
+        let rev = "a".repeat(40);
+        let directory = format!(
+            "<directory name=\"srcpkg\" rev=\"{rev}\" srcmd5=\"ffffffffffffffffffffffffffffffff\" vrev=\"3\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>"
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/osctest/simple/_link",
+                link,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=latest",
+                &directory,
+            )
+            .with_put(
+                &format!(
+                    "https://api.opensuse.org/source/osctest/simple/_link?comment=Set%20link%20revision%20to%20{rev}"
+                ),
+                "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .set_link_rev(
+                    "osctest",
+                    "simple",
+                    &LinkRevision::Latest,
+                    &DryRun::new(false),
+                )
+                .unwrap(),
+            Some(rev.clone())
+        );
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            format!("<link package=\"srcpkg\" project=\"srcprj\" rev=\"{rev}\"/>")
+        );
+    }
+
+    #[test]
+    fn set_link_rev_missing_revision_error_carries_response_preview() {
+        // A directory with no revision is a server error, and the
+        // error names what was received, so the caller can diagnose
+        // it.
+        let link = "<link package=\"srcpkg\" project=\"srcprj\" />";
+        let directory = "<directory name=\"srcpkg\" srcmd5=\"ffffffffffffffffffffffffffffffff\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>";
+        let http = FakeHttp::new()
+            .with_get("https://api.opensuse.org/source/osctest/simple/_link", link)
+            .with_get(
+                "https://api.opensuse.org/source/srcprj/srcpkg?rev=latest",
+                directory,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .set_link_rev(
+                "osctest",
+                "simple",
+                &LinkRevision::Latest,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.context.contains("received: <directory"),
+            "{}",
+            err.context
         );
     }
 
@@ -4235,6 +4452,31 @@ mod tests {
     fn set_devel_project_no_change_makes_no_put() {
         // The devel is already what was asked: nothing is written.
         let meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/></package>";
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+            meta,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .set_devel_project(
+                "test:factory",
+                "test-pkgA",
+                Some("test:devel"),
+                None,
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_devel_project_no_change_with_prolog_makes_no_put() {
+        // The fetched meta may carry an XML prolog, which the
+        // rendered document never does: a string comparison would
+        // read a change where there is none. The no-change check
+        // compares parsed documents, so nothing is written.
+        let meta = "<?xml version=\"1.0\"?><package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/></package>";
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
             meta,

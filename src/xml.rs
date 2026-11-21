@@ -115,21 +115,57 @@ fn element_name(entry: &str) -> Option<&str> {
 /// with its quotes stripped, unescaped. The name must match exactly
 /// and be preceded by whitespace, so `project=` does not match
 /// `target_project=`. None when the attribute is absent or malformed.
+/// The scan is quote-aware: a `name=` inside an earlier attribute's
+/// value (e.g. `title="see name=x"`) must not match, and a malformed
+/// occurrence (an unquoted value) is skipped, not fatal — the
+/// attribute may still follow. Whitespace around `=` is allowed:
+/// `name = "value"` is the same attribute.
 pub(crate) fn find_attr(tag: &str, name: &str) -> Option<String> {
-    let mut rest = tag;
-    let needle = format!("{name}=");
-    while let Some(pos) = rest.find(&needle) {
-        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
-            rest = &rest[pos + needle.len()..];
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = tag.as_bytes();
+    let first = name.as_bytes()[0];
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
             continue;
         }
-        let after_eq = &rest[pos + needle.len()..];
-        let quote = after_eq.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
         }
-        let close = after_eq[1..].find(quote)?;
-        return Some(xml_unescape(&after_eq[1..1 + close]));
+        if b == first
+            && tag[i..].starts_with(name)
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+        {
+            // The name must be followed by `=`, with optional
+            // whitespace around it.
+            let mut j = i + name.len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                    let quote = bytes[j];
+                    let after = &tag[j + 1..];
+                    let close = after.find(quote as char)?;
+                    return Some(xml_unescape(&after[..close]));
+                }
+            }
+        }
+        i += 1;
     }
     None
 }
@@ -400,19 +436,19 @@ impl XmlDoc {
     }
 
     /// Set attribute `name` on the root element to `value`, replacing
-    /// it when it is already there.
+    /// it when it is already there. The value range is computed first
+    /// and replaced in place; the root open tag is never cloned.
     pub(crate) fn set_root_attr(&mut self, name: &str, value: &str) {
         let escaped = xml_escape(value);
         let needle = format!("{name}=");
-        let mut rest = self.root_open.clone();
         let mut search_from = 0;
-        while let Some(pos) = rest[search_from..].find(&needle) {
+        while let Some(pos) = self.root_open[search_from..].find(&needle) {
             let pos = search_from + pos;
-            if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
+            if pos > 0 && !self.root_open.as_bytes()[pos - 1].is_ascii_whitespace() {
                 search_from = pos + needle.len();
                 continue;
             }
-            let after_eq = &rest[pos + needle.len()..];
+            let after_eq = &self.root_open[pos + needle.len()..];
             let Some(quote) = after_eq.chars().next() else {
                 return;
             };
@@ -424,8 +460,8 @@ impl XmlDoc {
             };
             let value_start = pos + needle.len() + 1;
             let value_end = value_start + close;
-            rest.replace_range(value_start..value_end, &escaped);
-            self.root_open = rest;
+            self.root_open
+                .replace_range(value_start..value_end, &escaped);
             return;
         }
         // Absent: append it to the root open tag.
@@ -512,7 +548,12 @@ impl XmlDoc {
     /// Replace the child element named `name` with `xml`, or append
     /// `xml` when there is no such element. `xml` must be a single
     /// element with that name; anything else is an error, so a bad
-    /// replacement can never be rendered.
+    /// replacement can never be rendered. The replacement takes the
+    /// place of the first matching child, so the document order is
+    /// preserved; any further duplicates are dropped. The old
+    /// remove-then-push moved the element to the end, which reordered
+    /// the document and caused a spurious extra PUT on the next
+    /// no-change comparison.
     pub(crate) fn replace_or_insert_element(
         &mut self,
         name: &str,
@@ -530,8 +571,27 @@ impl XmlDoc {
                 format!("not a single <{name}> element: {xml:?}"),
             ));
         }
-        self.remove_elements(name);
-        self.children.push(xml.trim().to_string());
+        let replacement = xml.trim().to_string();
+        match self
+            .children
+            .iter()
+            .position(|child| element_name(child) == Some(name))
+        {
+            Some(idx) => {
+                self.children[idx] = replacement;
+                // Drop any further duplicates, keeping the replaced
+                // element at its original position.
+                let mut i = idx + 1;
+                while i < self.children.len() {
+                    if element_name(&self.children[i]) == Some(name) {
+                        self.children.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            None => self.children.push(replacement),
+        }
         self.self_closing = false;
         Ok(())
     }
@@ -942,6 +1002,21 @@ mod tests {
     }
 
     #[test]
+    fn replace_or_insert_element_preserves_position() {
+        // Replacing a middle child keeps it in place: the old
+        // remove-then-push moved it to the end, reordering the
+        // document and causing a spurious extra PUT on the next
+        // no-change comparison.
+        let mut doc = XmlDoc::parse(META).unwrap();
+        doc.replace_or_insert_element("devel", "<devel project=\"test:other\"/>")
+            .unwrap();
+        assert_eq!(
+            doc.render(),
+            "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:other\"/><person userid=\"alice\" role=\"maintainer\"/><lock><enable/></lock></package>"
+        );
+    }
+
+    #[test]
     fn replace_or_insert_element_rejects_a_wrong_element() {
         let mut doc = XmlDoc::parse(META).unwrap();
         assert!(doc
@@ -1030,6 +1105,36 @@ mod tests {
         assert_eq!(
             find_attr("name=\"&#65;pple\"", "name").as_deref(),
             Some("Apple")
+        );
+    }
+
+    #[test]
+    fn find_attr_ignores_a_name_inside_an_earlier_quoted_value() {
+        // `project=` inside the details value must not match: the
+        // real `project` attribute follows it.
+        assert_eq!(
+            find_attr("details=\"see project=x\" project=\"foo\"", "project").as_deref(),
+            Some("foo")
+        );
+        // Whitespace around `=` is the same attribute.
+        assert_eq!(
+            find_attr("project = \"foo\"", "project").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            find_attr("project= \"foo\"", "project").as_deref(),
+            Some("foo")
+        );
+        // A malformed first occurrence does not stop the scan: the
+        // well-formed later one wins.
+        assert_eq!(
+            find_attr("project=bad project=\"foo\"", "project").as_deref(),
+            Some("foo")
+        );
+        // Either quote style works.
+        assert_eq!(
+            find_attr("project='foo'", "project").as_deref(),
+            Some("foo")
         );
     }
 

@@ -1,3 +1,4 @@
+use super::build::xml_attr;
 use super::ActionShape;
 use super::HistoryEntry;
 use super::NamedRole;
@@ -9,6 +10,7 @@ use crate::http::is_loopback_url;
 use crate::url::encode_path_segment;
 use crate::url::encode_query_value;
 use crate::url::UrlBuilder;
+use crate::xml::find_tag_end;
 use crate::xml::xml_unescape;
 
 /// The OBS API base (production).
@@ -239,36 +241,66 @@ pub(crate) fn parse_search_matches(body: &str) -> Option<u32> {
 /// `name='v'`. None when the attribute is absent or unterminated.
 /// The attribute name must stand on its own — `subproject="..."` must
 /// not match `project=` — so the character before `name` has to be
-/// whitespace.
+/// whitespace. The scan is quote-aware: a `name=` inside an earlier
+/// attribute's value must not match. Whitespace around `=` is
+/// allowed: `name = "v"` is the same attribute. A malformed
+/// occurrence (an unquoted value, or a value whose closing quote
+/// never comes) does not stop the scan: the server never emits one,
+/// but a later well-formed occurrence still carries the value.
 pub(crate) fn quoted_attr_value(element: &str, name: &str) -> Option<String> {
-    let mut rest = element;
-    while let Some(pos) = rest.find(name) {
-        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
-            rest = &rest[pos + name.len()..];
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = element.as_bytes();
+    let first = name.as_bytes()[0];
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
             continue;
         }
-        let after_name = &rest[pos + name.len()..];
-        let Some(after_eq) = after_name.strip_prefix('=') else {
-            rest = after_name;
-            continue;
-        };
-        // A malformed occurrence (an unquoted value, or a value whose
-        // closing quote never comes) does not stop the scan: the server
-        // never emits one, but a later well-formed occurrence still
-        // carries the value.
-        let Some(quote) = after_eq.chars().next() else {
-            rest = after_eq;
-            continue;
-        };
-        if quote != '"' && quote != '\'' {
-            rest = after_eq;
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
             continue;
         }
-        let Some(close) = after_eq[1..].find(quote) else {
-            rest = &after_eq[1..];
-            continue;
-        };
-        return Some(after_eq[1..1 + close].to_string());
+        if b == first
+            && element[i..].starts_with(name)
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+        {
+            // The name must be followed by `=`, with optional
+            // whitespace around it.
+            let mut j = i + name.len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                    let quote = bytes[j];
+                    let after = &element[j + 1..];
+                    match after.find(quote as char) {
+                        Some(close) => return Some(after[..close].to_string()),
+                        // Unterminated: resume just past the opening
+                        // quote, so a later well-formed occurrence
+                        // still carries the value.
+                        None => {
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
     }
     None
 }
@@ -548,30 +580,16 @@ pub(crate) fn parse_status_ok(body: &str) -> bool {
     }
     // The code must be an attribute of this element, not text after it
     // — and it must be the `code` attribute, not a longer name that
-    // ends in it (`mycode="ok"` is not `code="ok"`).
-    let Some(end) = after_tag.find('>') else {
+    // ends in it (`mycode="ok"` is not `code="ok"`). The tag end is
+    // found quote-aware, so a `>` inside an earlier attribute's value
+    // does not cut the element short; the value is read with
+    // `xml_attr`, which is quote-aware and tolerates whitespace
+    // around `=`.
+    let Some(end) = find_tag_end(after_tag) else {
         return false;
     };
     let element = &after_tag[..end];
-    let mut rest = element;
-    while let Some(pos) = rest.find("code=") {
-        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
-            rest = &rest[pos + "code=".len()..];
-            continue;
-        }
-        let after_eq = &rest[pos + "code=".len()..];
-        let Some(quote) = after_eq.chars().next() else {
-            return false;
-        };
-        if quote != '"' && quote != '\'' {
-            return false;
-        }
-        let Some(close) = after_eq[1..].find(quote) else {
-            return false;
-        };
-        return &after_eq[1..1 + close] == "ok";
-    }
-    false
+    xml_attr(element, "code").is_some_and(|code| code == "ok")
 }
 
 /// The opening tag of the first `<name ...>` element in `body`
@@ -633,56 +651,77 @@ pub(crate) fn parse_status_invoked(body: &str) -> bool {
     }
     // The code must be an attribute of this element, not text after it
     // — and it must be the `code` attribute, not a longer name that
-    // ends in it (`mycode="invoked"` is not `code="invoked"`).
-    let Some(end) = after_tag.find('>') else {
+    // ends in it (`mycode="invoked"` is not `code="invoked"`). The tag
+    // end is found quote-aware, so a `>` inside an earlier attribute's
+    // value does not cut the element short; the value is read with
+    // `xml_attr`, which is quote-aware and tolerates whitespace
+    // around `=`.
+    let Some(end) = find_tag_end(after_tag) else {
         return false;
     };
     let element = &after_tag[..end];
-    let mut rest = element;
-    while let Some(pos) = rest.find("code=") {
-        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
-            rest = &rest[pos + "code=".len()..];
-            continue;
-        }
-        let after_eq = &rest[pos + "code=".len()..];
-        let Some(quote) = after_eq.chars().next() else {
-            return false;
-        };
-        if quote != '"' && quote != '\'' {
-            return false;
-        }
-        let Some(close) = after_eq[1..].find(quote) else {
-            return false;
-        };
-        return &after_eq[1..1 + close] == "invoked";
-    }
-    false
+    xml_attr(element, "code").is_some_and(|code| code == "invoked")
 }
 
 /// The value of attribute `name` in an opening tag's text (the text
 /// between `<tag` and `>`), read order-tolerantly in either quote
 /// style. None when the tag carries no such attribute. The attribute
 /// name must stand on its own — `myname="..."` must not match — so
-/// the character before `name=` has to be whitespace.
+/// the character before the name has to be whitespace. The scan is
+/// quote-aware: a `name=` inside an earlier attribute's value must
+/// not match, and a malformed occurrence (an unquoted value) is
+/// skipped, not fatal. Whitespace around `=` is allowed: `name =
+/// "value"` is the same attribute. An empty value reads as absent.
 pub(crate) fn tag_attr(element: &str, name: &str) -> Option<String> {
-    let needle = format!("{name}=");
-    let mut rest = element;
-    while let Some(pos) = rest.find(&needle) {
-        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
-            rest = &rest[pos + needle.len()..];
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = element.as_bytes();
+    let first = name.as_bytes()[0];
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
             continue;
         }
-        let after_eq = &rest[pos + needle.len()..];
-        let quote = after_eq.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
         }
-        let close = after_eq[1..].find(quote)?;
-        let value = &after_eq[1..1 + close];
-        if value.is_empty() {
-            return None;
+        if b == first
+            && element[i..].starts_with(name)
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+        {
+            // The name must be followed by `=`, with optional
+            // whitespace around it.
+            let mut j = i + name.len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                    let quote = bytes[j];
+                    let after = &element[j + 1..];
+                    let close = after.find(quote as char)?;
+                    let value = &after[..close];
+                    if value.is_empty() {
+                        return None;
+                    }
+                    return Some(value.to_string());
+                }
+            }
         }
-        return Some(value.to_string());
+        i += 1;
     }
     None
 }
@@ -950,6 +989,25 @@ mod tests {
     }
 
     #[test]
+    fn quoted_attr_value_tolerates_whitespace_and_a_name_inside_a_value() {
+        // Whitespace around `=` is the same attribute.
+        assert_eq!(
+            quoted_attr_value(" project = \"devel:foo\"", "project"),
+            Some("devel:foo".to_string())
+        );
+        assert_eq!(
+            quoted_attr_value(" project= \"devel:foo\"", "project"),
+            Some("devel:foo".to_string())
+        );
+        // `project=` inside an earlier attribute's value must not
+        // match: the real `project` attribute follows it.
+        assert_eq!(
+            quoted_attr_value(" title=\"see project=x\" project=\"devel:foo\"", "project"),
+            Some("devel:foo".to_string())
+        );
+    }
+
+    #[test]
     fn parse_request_id_extracts_numeric_id() {
         assert_eq!(
             parse_request_id("<request id=\"1400001\" creator=\"scarabeus_iv\"></request>"),
@@ -1152,6 +1210,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_status_readers_tolerate_whitespace_and_gt_in_values() {
+        // Whitespace around `=` is the same attribute.
+        assert!(parse_status_ok("<status code = \"ok\" />"));
+        assert!(parse_status_ok("<status code= \"ok\" />"));
+        assert!(parse_status_invoked("<status code = \"invoked\" />"));
+        // A `>` inside an earlier attribute's value does not cut the
+        // element short: the code after it still reads.
+        assert!(parse_status_ok("<status summary=\"a > b\" code=\"ok\" />"));
+        assert!(parse_status_ok("<status code=\"ok\" summary=\"x>y\"/>"));
+        assert!(parse_status_invoked(
+            "<status summary=\"a > b\" code=\"invoked\" />"
+        ));
+        // Still fail-closed on the wrong code.
+        assert!(!parse_status_ok("<status code = \"failed\" />"));
+        assert!(!parse_status_invoked("<status code = \"ok\" />"));
+    }
+
+    #[test]
     fn slash_split_drops_empty_segments() {
         // No slash, leading/trailing slash, middle slash, `//` and
         // `/////////` collapse (empty segments dropped).
@@ -1195,6 +1271,36 @@ mod tests {
         assert_eq!(tag_attr("entry myname=\"foo\"", "name"), None);
         assert_eq!(tag_attr("entry name=\"\"", "name"), None);
         assert_eq!(tag_attr("entry", "name"), None);
+    }
+
+    #[test]
+    fn tag_attr_tolerates_whitespace_and_skips_a_malformed_first_occurrence() {
+        // Whitespace around `=` is the same attribute.
+        assert_eq!(
+            tag_attr("entry name = \"foo\"", "name").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            tag_attr("entry name= \"foo\"", "name").as_deref(),
+            Some("foo")
+        );
+        // `name=` inside an earlier attribute's value must not match:
+        // the real `name` attribute follows it.
+        assert_eq!(
+            tag_attr("entry details=\"see name=x\" name=\"foo\"", "name").as_deref(),
+            Some("foo")
+        );
+        // A malformed first occurrence does not stop the scan: the
+        // well-formed later one wins.
+        assert_eq!(
+            tag_attr("entry name=bad name=\"foo\"", "name").as_deref(),
+            Some("foo")
+        );
+        // Either quote style still works with whitespace.
+        assert_eq!(
+            tag_attr("entry name = 'foo'", "name").as_deref(),
+            Some("foo")
+        );
     }
 
     fn mixed_action_collection() -> &'static str {
