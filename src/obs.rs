@@ -111,7 +111,7 @@ use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{is_loopback_url, HttpClient};
 use crate::url::{encode_path_segment, encode_query_value, UrlBuilder};
-use crate::xml::{find_attr, scan_tag, XmlDoc};
+use crate::xml::{find_attr, scan_tag, xml_escape, xml_unescape, XmlDoc};
 use std::cell::RefCell;
 use std::fmt;
 
@@ -10890,81 +10890,6 @@ fn xml_child_elements<'a>(inner: &'a str, name: &str) -> Result<Vec<&'a str>, Ge
         offset = elem_end;
     }
     Ok(out)
-}
-
-/// Escape text for an XML element or attribute value.
-fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Unescape XML text or an attribute value: the five entities
-/// [`xml_escape`] produces, plus numeric character references
-/// (`&#65;`, `&#x41;`). Anything else is left verbatim: an unknown
-/// entity is a server response the library does not understand, and
-/// passing it through beats inventing a character.
-pub(crate) fn xml_unescape(s: &str) -> String {
-    // Fast path: nothing to unescape.
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        let after = &rest[amp + 1..];
-        match after.find(';') {
-            Some(semi) => {
-                let entity = &after[..semi];
-                match entity {
-                    "amp" => out.push('&'),
-                    "lt" => out.push('<'),
-                    "gt" => out.push('>'),
-                    "quot" => out.push('"'),
-                    "apos" => out.push('\''),
-                    _ => {
-                        let numeric = entity
-                            .strip_prefix("#x")
-                            .or_else(|| entity.strip_prefix("#X"))
-                            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-                            .or_else(|| {
-                                entity
-                                    .strip_prefix('#')
-                                    .and_then(|dec| dec.parse::<u32>().ok())
-                            })
-                            .and_then(char::from_u32);
-                        match numeric {
-                            Some(c) => out.push(c),
-                            // Unknown entity: keep it verbatim.
-                            None => {
-                                out.push('&');
-                                out.push_str(entity);
-                                out.push(';');
-                            }
-                        }
-                    }
-                }
-                rest = &after[semi + 1..];
-            }
-            None => {
-                // A bare `&` with no `;` after it: keep it verbatim.
-                out.push('&');
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 /// Check that `xml` is well-formed: every tag is balanced and properly

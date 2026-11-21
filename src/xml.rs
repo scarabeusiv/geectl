@@ -134,21 +134,67 @@ pub(crate) fn find_attr(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Unescape the five standard XML entities in an attribute value.
-/// Anything else (including numeric references) is left as-is: the
-/// values geectl reads are OBS names and revisions, which never
-/// carry them. `&amp;` is unescaped last, so `&amp;lt;` reads as
-/// `&lt;`, not `<`.
-fn xml_unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+/// Unescape XML text or an attribute value: the five entities
+/// [`xml_escape`] produces, plus numeric character references
+/// (`&#65;`, `&#x41;`). Anything else is left verbatim: an unknown
+/// entity is a server response the library does not understand, and
+/// passing it through beats inventing a character.
+pub(crate) fn xml_unescape(s: &str) -> String {
+    // Fast path: nothing to unescape.
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        match after.find(';') {
+            Some(semi) => {
+                let entity = &after[..semi];
+                match entity {
+                    "amp" => out.push('&'),
+                    "lt" => out.push('<'),
+                    "gt" => out.push('>'),
+                    "quot" => out.push('"'),
+                    "apos" => out.push('\''),
+                    _ => {
+                        let numeric = entity
+                            .strip_prefix("#x")
+                            .or_else(|| entity.strip_prefix("#X"))
+                            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                            .or_else(|| {
+                                entity
+                                    .strip_prefix('#')
+                                    .and_then(|dec| dec.parse::<u32>().ok())
+                            })
+                            .and_then(char::from_u32);
+                        match numeric {
+                            Some(c) => out.push(c),
+                            // Unknown entity: keep it verbatim.
+                            None => {
+                                out.push('&');
+                                out.push_str(entity);
+                                out.push(';');
+                            }
+                        }
+                    }
+                }
+                rest = &after[semi + 1..];
+            }
+            None => {
+                // A bare `&` with no `;` after it: keep it verbatim.
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
-/// Escape text for an XML attribute value.
-fn xml_escape_attr(s: &str) -> String {
+/// Escape text for an XML element or attribute value.
+pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -356,7 +402,7 @@ impl XmlDoc {
     /// Set attribute `name` on the root element to `value`, replacing
     /// it when it is already there.
     pub(crate) fn set_root_attr(&mut self, name: &str, value: &str) {
-        let escaped = xml_escape_attr(value);
+        let escaped = xml_escape(value);
         let needle = format!("{name}=");
         let mut rest = self.root_open.clone();
         let mut search_from = 0;
@@ -715,6 +761,30 @@ mod tests {
         assert_eq!(xml_unescape("&amp;lt;"), "&lt;");
         assert_eq!(xml_unescape("&lt;"), "<");
         assert_eq!(xml_unescape("&amp;"), "&");
+    }
+
+    #[test]
+    fn xml_unescape_decodes_numeric_references() {
+        // The single shared implementation decodes numeric character
+        // references too: the old xml.rs copy left them verbatim.
+        assert_eq!(xml_unescape("&#65;"), "A");
+        assert_eq!(xml_unescape("&#x41;"), "A");
+        assert_eq!(xml_unescape("&#X41;"), "A");
+        assert_eq!(xml_unescape("&#65;&#x42;"), "AB");
+        // Unknown entities and a bare `&` still pass through verbatim.
+        assert_eq!(xml_unescape("&nbsp;"), "&nbsp;");
+        assert_eq!(xml_unescape("a & b"), "a & b");
+    }
+
+    #[test]
+    fn find_attr_decodes_numeric_references() {
+        // An attribute read through XmlDoc decodes the same way as the
+        // parse_* functions: a numeric reference is a character, not
+        // literal text.
+        assert_eq!(
+            find_attr("name=\"&#65;pple\"", "name").as_deref(),
+            Some("Apple")
+        );
     }
 
     #[test]
