@@ -2471,6 +2471,31 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_results_sleep_never_overshoots_a_short_deadline() {
+        // A short deadline with an unsettled build: the sleep between
+        // polls is capped at the remaining time, so the loop returns
+        // at the deadline instead of overshooting it by a full sleep
+        // interval (a fixed 2s sleep would take ~2s here).
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/_result",
+            RESULTS_DIRTY_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let start = std::time::Instant::now();
+        let err = client
+            .wait_for_results(
+                "testproject",
+                &ResultsQuery::default(),
+                std::time::Duration::from_millis(150),
+            )
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        assert_eq!(err.kind(), ErrorKind::Timeout);
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(http.get_calls().len(), 2);
+    }
+
+    #[test]
     fn wait_for_results_polls_a_package_filtered_wait_until_the_package_appears() {
         // First poll: settled cells, but the filtered package is
         // absent (never scheduled) — not settled. Second poll: the
