@@ -1334,13 +1334,35 @@ pub(crate) fn parse_builddepinfo(body: &str) -> Result<Vec<PackageDeps>, GeectlE
 /// `<repository>` without a name, or a `<path>` without a project —
 /// is a server error, never an empty list.
 pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlError> {
+    let body = body.trim();
+    // A malformed project meta response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <project> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS project meta response: not a <project> document",
+            format!(
+                "unexpected OBS project meta response: not a <project> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <project> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <project>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<project") else {
         return Err(malformed());
     };
@@ -4018,6 +4040,50 @@ mod tests {
             "<project name=\"p\"><repository name=\"r\"><path project=\"q\" repository=\"s\"/></project>"
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_repositories_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <project>
+        // element; the result is the same as without one.
+        let plain = "<project name=\"testproject\"/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_repositories(&prolog).unwrap(),
+            parse_repositories(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_repositories(&format!("<?xml?>{plain}")).unwrap(),
+            parse_repositories(plain).unwrap()
+        );
+        assert_eq!(
+            parse_repositories(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_repositories(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <project>.
+        assert!(parse_repositories("<?xml version=\"1.0\" <project></project>").is_err());
+        assert!(parse_repositories("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_repositories("<?xmlfoo version=\"1.0\"?><project></project>").is_err());
+    }
+
+    #[test]
+    fn parse_repositories_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_repositories("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_repositories(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_repositories("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
