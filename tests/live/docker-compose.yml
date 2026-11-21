@@ -1,4 +1,4 @@
-# Temporal OBS instance for geectl's scheduled live tests.
+# Live OBS instance for geectl's scheduled live tests.
 #
 # This is the OBS project's own development container setup, trimmed to
 # what the live tests need: the database, the cache, the backend, and
@@ -10,7 +10,7 @@
 # `docker-compose.yml` and `.circleci/conditional_config.yml`):
 # - db, cache, backend: published images at
 #   registry.opensuse.org/obs/server/unstable/containers/containers/openbuildservice/<name>
-#   (OBS master; the temporal job exists to catch drift as OBS changes,
+#   (OBS master; the live job exists to catch drift as OBS changes,
 #   so it tracks master, not a stable release).
 # - frontend: BUILT from the OBS source (`src/api` Dockerfile) on top of
 #   the published `frontend-features` image. There is no published
@@ -25,7 +25,7 @@
 #
 # The frontend serves plain HTTP on localhost:3000. That is the OBS
 # development setup (no TLS). geectl's harness talks to it over
-# loopback only (see `tests/temporal.rs`); the instance is ephemeral
+# loopback only (see `tests/live.rs`); the instance is ephemeral
 # and never exposed beyond the host.
 
 services:
@@ -44,7 +44,7 @@ services:
       - db
       - cache
   frontend:
-    image: geectl-temporal-frontend
+    image: geectl-live-frontend
     build:
       dockerfile: docker-files/Dockerfile
       context: ${OBS_SOURCE_DIR:-./obs}/src/api

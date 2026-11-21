@@ -351,8 +351,8 @@ Three layers, by design:
    cannot do: the unit tests prove geectl sends the right `Authorization`
    header; these prove a real Gitea accepts the token and returns valid
    responses. They gate because they are fast (~20s end to end: a
-   single prebuilt image), unlike the OBS temporal job.
-3. **Live tests against a temporal OBS instance (independent CI job).**
+   single prebuilt image), unlike the OBS live job.
+3. **Live tests against a live OBS instance (independent CI job).**
    We spin up our own (temporary) OBS instance, connect to it, and
    collect responses. The key assertion is on **server state**:
    whatever change the CLI did must actually show up on the server —
@@ -366,9 +366,9 @@ Three layers, by design:
    but the job stays non-gating — a slow or flaky run must never
    block a PR.
 
-### The temporal layer in detail
+### The live layer in detail
 
-**Provisioning (`tests/temporal/`).** The instance is the OBS project's
+**Provisioning (`tests/live/`).** The instance is the OBS project's
 own development container setup, trimmed to what the live tests need:
 MariaDB, memcached, the backend, and the frontend (the API). The build
 worker is omitted — no test builds a package, and the worker needs a
@@ -386,33 +386,33 @@ frontend and the database; project writes go to the backend).
 the job exists to catch drift, so it tracks the newest OBS, not a
 stable release.
 
-**Schedule.** The `temporal` workflow runs on every pull request,
+**Schedule.** The `live` workflow runs on every pull request,
 weekly (Mondays 06:00 UTC, the same slot as `freshness`) and on demand
 (`workflow_dispatch`), on a GitHub-hosted runner. It is not a required
 status check. It is slow on purpose (source checkout, frontend build,
 bootstrap); the timeout is 60 minutes. The frontend image build reuses
-BuildKit's GitHub Actions cache (`tests/temporal/docker-compose.cache.yml`,
-loaded only when `TEMPORAL_CACHE` is set — the workflow sets it, local
+BuildKit's GitHub Actions cache (`tests/live/docker-compose.cache.yml`,
+loaded only when `LIVE_CACHE` is set — the workflow sets it, local
 runs do not), so repeat runs skip the gem install when the OBS source
 has not changed; the cache is content-addressed, so a changed OBS
 master still rebuilds the affected layers and drift is caught.
 
-**Harness (`tests/temporal.rs`, `tests/temporal_obs.rs`).** The tests are env-gated on
-`GEECTL_TEMPORAL_URL`: without it they skip, so `cargo test` stays
+**Harness (`tests/live.rs`, `tests/live_obs.rs`).** The tests are env-gated on
+`GEECTL_LIVE_URL`: without it they skip, so `cargo test` stays
 green with no instance. With it, they assert on live server state
 through geectl's own HTTP client: `GET /about` returns a real OBS
 (title + non-empty revision), a missing project maps to geectl's
 `NotFound`, and the project list at `GET /source` returns a `<directory>` of
 `<entry>` elements. The mutation assertions create a project through geectl and read it
-back (`temporal_create_project_shows_up_on_server`), upload a file
-and read it back (`temporal_upload_file_reads_back_on_server`, in
-`tests/temporal_obs.rs`: the bytes and the revision number), read the
+back (`live_create_project_shows_up_on_server`), upload a file
+and read it back (`live_upload_file_reads_back_on_server`, in
+`tests/live_obs.rs`: the bytes and the revision number), read the
 remote state back through the new read operations
-(`tests/temporal_obs.rs`: cat at a revision, directory and project
+(`tests/live_obs.rs`: cat at a revision, directory and project
 listings, log newest-first with a range, revision patch, meta, search,
 owners, whois, link target, project diff), and file
 real submit requests and assert on the server state they leave behind
-(`tests/temporal_obs.rs`: filing, refile, and accept-time cleanup,
+(`tests/live_obs.rs`: filing, refile, and accept-time cleanup,
 plus the request read/act tests — show, log, state changes, reviews,
 comments, diff, and search — which read and change live requests
 through the library and assert on the server state they find).

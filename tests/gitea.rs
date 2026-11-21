@@ -17,7 +17,7 @@
 //! (e.g. `http://127.0.0.1:3001`), so `cargo test` stays green without
 //! an instance. They are fast enough for the gate (see
 //! `tests/gitea/README.md` for the measured timings): a single prebuilt
-//! image, ~20s end to end, where the OBS temporal job takes minutes.
+//! image, ~20s end to end, where the OBS live job takes minutes.
 //!
 //! The instance is plain HTTP on localhost. That is the single
 //! sanctioned exception to geectl's https-only URL rule, and it is safe

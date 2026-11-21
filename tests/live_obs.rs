@@ -1,4 +1,4 @@
-//! Live tests for the OBS operations against a temporal OBS instance.
+//! Live tests for the OBS operations against a live OBS instance.
 //!
 //! These are layer 2 of the testing design (see `docs/architecture.md`):
 //! scheduled live tests against a real (temporary) OBS instance, asserting
@@ -7,18 +7,18 @@
 //! underneath us, which the per-PR fixture tests cannot do.
 //!
 //! These tests are NOT part of the per-PR gate. They run only in the
-//! scheduled `temporal` CI job, against the instance the provisioning in
-//! `tests/temporal/` spins up. They are skipped unless the
-//! `GEECTL_TEMPORAL_URL` environment variable is set to the instance's
+//! scheduled `live` CI job, against the instance the provisioning in
+//! `tests/live/` spins up. They are skipped unless the
+//! `GEECTL_LIVE_URL` environment variable is set to the instance's
 //! base URL (e.g. `http://127.0.0.1:3000`), so `cargo test` stays green
-//! without an instance. When `GEECTL_TEMPORAL_REQUIRED` is set, a missing
-//! or empty URL panics instead (the temporal workflow sets that marker
+//! without an instance. When `GEECTL_LIVE_REQUIRED` is set, a missing
+//! or empty URL panics instead (the live workflow sets that marker
 //! and wires the URL, so its absence means the wiring broke).
 //!
 //! The instance is plain HTTP on localhost. That is the single sanctioned
 //! exception to geectl's https-only URL rule, and it is safe because:
 //! - the instance is loopback-only (the harness rejects any
-//!   non-loopback URL outright — see `validate_temporal_base`),
+//!   non-loopback URL outright — see `validate_live_base`),
 //! - the instance is ephemeral (created fresh per run, destroyed after),
 //! - the credentials are the ephemeral OBS development defaults
 //!   (Admin / opensuse), never a real credential, and
@@ -32,19 +32,19 @@
 //! their URLs with the encoders from `url.rs`, as `docs/architecture.md`
 //! records).
 //!
-//! The upload test (`temporal_upload_file_reads_back_on_server`)
+//! The upload test (`live_upload_file_reads_back_on_server`)
 //! uploads a spec file into a fresh branch package and reads it back,
 //! asserting the bytes and the revision number.
 //!
-//! The remote-read tests (`temporal_cat_reads_back_uploaded_file`,
-//! `temporal_list_files_and_packages_read_back`,
-//! `temporal_package_log_newest_first_and_range`,
-//! `temporal_revision_patch_diffs_revisions`,
-//! `temporal_meta_reads_back`,
-//! `temporal_search_finds_package_and_project`,
-//! `temporal_owners_call_succeeds`, `temporal_whois_reads_admin`,
-//! `temporal_link_target_reads_linkinfo`, and
-//! `temporal_project_diff_classifies`) exercise the read operations
+//! The remote-read tests (`live_cat_reads_back_uploaded_file`,
+//! `live_list_files_and_packages_read_back`,
+//! `live_package_log_newest_first_and_range`,
+//! `live_revision_patch_diffs_revisions`,
+//! `live_meta_reads_back`,
+//! `live_search_finds_package_and_project`,
+//! `live_owners_call_succeeds`, `live_whois_reads_admin`,
+//! `live_link_target_reads_linkinfo`, and
+//! `live_project_diff_classifies`) exercise the read operations
 //! the same way: create through geectl's own write operations, then
 //! read back through the new operations and assert on server state.
 //! The log and link-target tests poll for up to a minute: the history
@@ -120,12 +120,12 @@ fn is_loopback_url(url: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// Validate a temporal base URL: trim whitespace, strip trailing
+/// Validate a live base URL: trim whitespace, strip trailing
 /// slashes, require a bare base (no path, query, or fragment), and
 /// require a loopback host. Returns the cleaned URL, or the reason it
-/// is invalid. Pure, so it is unit-testable; `temporal_url` turns the
+/// is invalid. Pure, so it is unit-testable; `live_url` turns the
 /// error into a panic at the boundary.
-fn validate_temporal_base(raw: &str) -> Result<String, String> {
+fn validate_live_base(raw: &str) -> Result<String, String> {
     // Trim, strip trailing slashes, and trim again: a space before a
     // trailing slash (`...:3000 /`) would otherwise survive the strip
     // and leave a trailing space in the base.
@@ -136,7 +136,7 @@ fn validate_temporal_base(raw: &str) -> Result<String, String> {
     // bare-base violation instead of a scheme violation.
     if !url.starts_with("http://") {
         return Err(format!(
-            "must be an http:// URL (the temporal instance is plain HTTP on loopback); got {raw}"
+            "must be an http:// URL (the live instance is plain HTTP on loopback); got {raw}"
         ));
     }
     // The base must be bare (scheme + authority only): the tests
@@ -158,73 +158,73 @@ fn validate_temporal_base(raw: &str) -> Result<String, String> {
     Ok(url)
 }
 
-/// The temporal instance's base URL, from the environment.
+/// The live instance's base URL, from the environment.
 ///
-/// Returns `None` (skip the test) when `GEECTL_TEMPORAL_URL` is unset or
-/// empty. When `GEECTL_TEMPORAL_REQUIRED` is set, a missing or empty
-/// value panics instead: the temporal workflow sets that marker and
+/// Returns `None` (skip the test) when `GEECTL_LIVE_URL` is unset or
+/// empty. When `GEECTL_LIVE_REQUIRED` is set, a missing or empty
+/// value panics instead: the live workflow sets that marker and
 /// wires the URL, so its absence means the wiring broke, and a silent
 /// skip would go green while hiding drift. The marker (not `CI` or
 /// `GITHUB_ACTIONS`) is the signal: the per-PR `test` job also runs
-/// under CI, but with no temporal instance, so the tests must skip
+/// under CI, but with no live instance, so the tests must skip
 /// there. A present but invalid value panics in both cases: the
 /// instance is plain HTTP, so pointing the harness at a non-localhost
 /// server would send requests (and, once auth lands, credentials) in
 /// cleartext over a real network. That must fail fast, not silently.
-fn temporal_url() -> Option<String> {
-    let raw = match std::env::var("GEECTL_TEMPORAL_URL") {
+fn live_url() -> Option<String> {
+    let raw = match std::env::var("GEECTL_LIVE_URL") {
         Ok(v) if !v.trim().is_empty() => v,
         _ => {
-            if std::env::var_os("GEECTL_TEMPORAL_REQUIRED").is_some() {
+            if std::env::var_os("GEECTL_LIVE_REQUIRED").is_some() {
                 panic!(
-                    "GEECTL_TEMPORAL_URL is not set or empty: the temporal workflow must wire it (see .github/workflows/temporal.yml)"
+                    "GEECTL_LIVE_URL is not set or empty: the live workflow must wire it (see .github/workflows/live.yml)"
                 );
             }
-            eprintln!("skipping temporal test: GEECTL_TEMPORAL_URL is not set");
+            eprintln!("skipping live test: GEECTL_LIVE_URL is not set");
             return None;
         }
     };
-    match validate_temporal_base(&raw) {
+    match validate_live_base(&raw) {
         Ok(url) => Some(url),
-        Err(reason) => panic!("GEECTL_TEMPORAL_URL {reason}"),
+        Err(reason) => panic!("GEECTL_LIVE_URL {reason}"),
     }
 }
 
-/// The temporal instance's bootstrap admin credentials (the OBS
+/// The live instance's bootstrap admin credentials (the OBS
 /// development defaults, ephemeral, never a real credential).
-/// Overridable via `GEECTL_TEMPORAL_OBS_USERNAME` /
-/// `GEECTL_TEMPORAL_OBS_PASSWORD` if the provisioning ever changes
+/// Overridable via `GEECTL_LIVE_OBS_USERNAME` /
+/// `GEECTL_LIVE_OBS_PASSWORD` if the provisioning ever changes
 /// them.
-fn temporal_credentials() -> Credentials {
+fn live_credentials() -> Credentials {
     let username =
-        std::env::var("GEECTL_TEMPORAL_OBS_USERNAME").unwrap_or_else(|_| "Admin".to_string());
+        std::env::var("GEECTL_LIVE_OBS_USERNAME").unwrap_or_else(|_| "Admin".to_string());
     let password =
-        std::env::var("GEECTL_TEMPORAL_OBS_PASSWORD").unwrap_or_else(|_| "opensuse".to_string());
+        std::env::var("GEECTL_LIVE_OBS_PASSWORD").unwrap_or_else(|_| "opensuse".to_string());
     Credentials::Basic { username, password }
 }
 
-/// A client for the temporal instance, with no credentials (public
+/// A client for the live instance, with no credentials (public
 /// reads only).
-fn temporal_client(base: &str) -> ObsClient<'_> {
+fn live_client(base: &str) -> ObsClient<'_> {
     let http = Box::leak(Box::new(
         UreqClient::new(Timeout::default()).expect("default timeout is valid"),
     ));
-    ObsClient::with_base(http, base).expect("the temporal base is a loopback http URL")
+    ObsClient::with_base(http, base).expect("the live base is a loopback http URL")
 }
 
-/// A client for the temporal instance, authenticated with the
+/// A client for the live instance, authenticated with the
 /// bootstrap admin credentials.
-fn temporal_client_authed(base: &str) -> ObsClient<'_> {
+fn live_client_authed(base: &str) -> ObsClient<'_> {
     let http = Box::leak(Box::new(
         UreqClient::new(Timeout::default()).expect("default timeout is valid"),
     ));
-    ObsClient::with_base_and_credentials(http, base, temporal_credentials())
-        .expect("the temporal base is a loopback http URL")
+    ObsClient::with_base_and_credentials(http, base, live_credentials())
+        .expect("the live base is a loopback http URL")
 }
 
 /// A suffix that makes a test's projects unique: the process id plus
-/// a nanosecond timestamp. The temporal tests run in parallel in one
-/// process, and the instance is shared with the `temporal` target's
+/// a nanosecond timestamp. The live tests run in parallel in one
+/// process, and the instance is shared with the `live` target's
 /// tests, so two tests must never create the same project — a name
 /// collision would file one test's request against another's branch.
 /// Only digits and hyphens: a valid OBS name fragment.
@@ -242,8 +242,8 @@ fn unique_suffix() -> String {
 /// package name only, so a shared name lets one test's open request
 /// block another test's filing (the refile test hit exactly that:
 /// the filing test's open request targeted the same package name).
-fn temporal_package() -> String {
-    format!("geectl-temporal-pkg-{}", unique_suffix())
+fn live_package() -> String {
+    format!("geectl-live-pkg-{}", unique_suffix())
 }
 
 /// Create a uniquely-named source project plus the package in it.
@@ -265,20 +265,20 @@ fn create_source_branch(client: &ObsClient<'_>, package: &str) -> String {
     client
         .create_project(
             &source_project,
-            "geectl temporal test branch",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test branch",
+            "Created by the geectl live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create source project on the temporal instance");
+        .expect("create source project on the live instance");
     client
         .create_package(
             &source_project,
             package,
-            "geectl temporal test package",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test package",
+            "Created by the geectl live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create source package on the temporal instance");
+        .expect("create source package on the live instance");
     source_project
 }
 
@@ -287,24 +287,24 @@ fn create_source_branch(client: &ObsClient<'_>, package: &str) -> String {
 /// package)`. The target project only needs to exist: the submitted
 /// package is created in it on accept.
 fn setup_branch(client: &ObsClient<'_>) -> (String, String, String) {
-    let package = temporal_package();
+    let package = live_package();
     let source_project = create_source_branch(client, &package);
     let target_project = format!("geectl-tmp-tgt-{}", unique_suffix());
     client
         .create_project(
             &target_project,
-            "geectl temporal test target",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test target",
+            "Created by the geectl live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create target project on the temporal instance");
+        .expect("create target project on the live instance");
     (source_project, target_project, package)
 }
 
-/// A submit-request payload for the temporal tests: source branch to
+/// A submit-request payload for the live tests: source branch to
 /// target, with the default cleanup (`opt_sourceupdate="cleanup"`),
 /// so the accept test exercises the server-side branch deletion.
-fn temporal_payload(
+fn live_payload(
     source_project: &str,
     package: &str,
     target_project: &str,
@@ -315,13 +315,13 @@ fn temporal_payload(
         package,
         target_project,
         package,
-        &format!("Update {package} to {version}: temporal test submission"),
+        &format!("Update {package} to {version}: live test submission"),
         &format!(
             "-------------------------------------------------------------------\nFri Nov 20 07:00:00 UTC 2026 - Tomáš Chvátal <tomas.chvatal@gmail.com>\n\n- Update to version {version}.\n"
         ),
         &[],
     )
-    .expect("temporal SR payload")
+    .expect("live SR payload")
 }
 
 /// The submit action of a filed request: its source project and
@@ -353,19 +353,19 @@ fn submit_action(
     )
 }
 
-/// File a submit request on the temporal instance and return its id
+/// File a submit request on the live instance and return its id
 /// and package. Each call files from a fresh, uniquely-named branch
 /// (see `setup_branch`), so parallel tests never share a target
 /// package name — the open-SR search is scoped by target package
 /// name only.
-fn file_temporal_request(client: &ObsClient<'_>, version: &str) -> (String, String) {
+fn file_live_request(client: &ObsClient<'_>, version: &str) -> (String, String) {
     let (source_project, target_project, package) = setup_branch(client);
     let dry = DryRun::new(false);
     let filing = SrFiling::new(client, &dry);
-    let payload = temporal_payload(&source_project, &package, &target_project, version);
+    let payload = live_payload(&source_project, &package, &target_project, version);
     let id = filing
         .file(&payload)
-        .expect("file a submit request on the temporal instance")
+        .expect("file a submit request on the live instance")
         .expect("live filing returns a request id");
     (id, package)
 }
@@ -375,7 +375,7 @@ fn file_temporal_request(client: &ObsClient<'_>, version: &str) -> (String, Stri
 /// to compute from, and the unrescued diff error renders as 404), so
 /// the diff test files from a branch with content. The other tests
 /// keep the empty branch — they never ask the server for a diff.
-fn file_temporal_request_with_file(
+fn file_live_request_with_file(
     client: &ObsClient<'_>,
     version: &str,
     filename: &str,
@@ -385,12 +385,12 @@ fn file_temporal_request_with_file(
     let dry = DryRun::new(false);
     client
         .upload_file(&source_project, &package, filename, content, &dry)
-        .expect("upload a file into the source branch on the temporal instance");
+        .expect("upload a file into the source branch on the live instance");
     let filing = SrFiling::new(client, &dry);
-    let payload = temporal_payload(&source_project, &package, &target_project, version);
+    let payload = live_payload(&source_project, &package, &target_project, version);
     let id = filing
         .file(&payload)
-        .expect("file a submit request on the temporal instance")
+        .expect("file a submit request on the live instance")
         .expect("live filing returns a request id");
     (id, package)
 }
@@ -424,7 +424,7 @@ fn request_xml(base: &str, id: &str) -> String {
     let http = Box::leak(Box::new(
         UreqClient::new(Timeout::default()).expect("default timeout is valid"),
     ));
-    http.get_with(&format!("{base}/request/{id}"), &temporal_credentials())
+    http.get_with(&format!("{base}/request/{id}"), &live_credentials())
         .expect("GET the filed request back from the server")
 }
 
@@ -471,10 +471,10 @@ fn change_review_state(base: &str, id: &str, newstate: &str, by_user: &str) {
             &format!(
                 "{base}/request/{id}?cmd=changereviewstate&newstate={newstate}&by_user={by_user}"
             ),
-            "accepted by the geectl temporal test",
-            &temporal_credentials(),
+            "accepted by the geectl live test",
+            &live_credentials(),
         )
-        .expect("change the review state on the temporal instance");
+        .expect("change the review state on the live instance");
     assert!(
         response_is_status_ok(&body),
         "changing the review state of request {id} did not return <status code=\"ok\"/>; body: {body}"
@@ -527,53 +527,53 @@ fn wait_until_present(base: &str, path: &str) {
 }
 
 #[test]
-fn temporal_obs_devel_project_missing_is_none() {
-    let Some(base) = temporal_url() else {
+fn live_obs_devel_project_missing_is_none() {
+    let Some(base) = live_url() else {
         return;
     };
     // A package that was never created has no devel project on the
     // instance: the lookup must return None from the server's own
     // directory listing, not from a fixture.
-    let client = temporal_client(&base);
+    let client = live_client(&base);
     assert_eq!(
         client
-            .devel_project("geectl-temporal-no-such-package")
-            .expect("devel lookup on the temporal instance"),
+            .devel_project("geectl-live-no-such-package")
+            .expect("devel lookup on the live instance"),
         None
     );
 }
 
 #[test]
-fn temporal_obs_has_open_sr_false_on_fresh_instance() {
-    let Some(base) = temporal_url() else {
+fn live_obs_has_open_sr_false_on_fresh_instance() {
+    let Some(base) = live_url() else {
         return;
     };
     // A fresh instance holds no submit requests at all, so the dedup
     // search must return false — and the search must succeed against
     // the real server with the bootstrap admin credentials, not 401.
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     assert!(
         !client
-            .has_open_sr("geectl-temporal-no-such-package")
-            .expect("open-SR search on the temporal instance"),
-        "a fresh temporal instance must have no open submit request"
+            .has_open_sr("geectl-live-no-such-package")
+            .expect("open-SR search on the live instance"),
+        "a fresh live instance must have no open submit request"
     );
 }
 
 /// Filing a real submit request and reading it back from the server.
 #[test]
-fn temporal_filed_request_shows_up_on_server() {
-    let Some(base) = temporal_url() else {
+fn live_filed_request_shows_up_on_server() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (source_project, target_project, package) = setup_branch(&client);
     let dry = DryRun::new(false);
     let filing = SrFiling::new(&client, &dry);
-    let payload = temporal_payload(&source_project, &package, &target_project, "2.0");
+    let payload = live_payload(&source_project, &package, &target_project, "2.0");
     let id = filing
         .file(&payload)
-        .expect("file a submit request on the temporal instance")
+        .expect("file a submit request on the live instance")
         .expect("live filing returns a request id");
     let request = client
         .show_request(&id)
@@ -586,7 +586,7 @@ fn temporal_filed_request_shows_up_on_server() {
     assert_eq!(request.state.name, RequestState::New);
     assert_eq!(
         request.description,
-        format!("Update {package} to 2.0: temporal test submission")
+        format!("Update {package} to 2.0: live test submission")
     );
     let (src_project, src_package, tgt_project, tgt_package, sourceupdate) =
         submit_action(&request);
@@ -598,8 +598,8 @@ fn temporal_filed_request_shows_up_on_server() {
 }
 
 #[test]
-fn temporal_obs_open_requests_for_package_empty_on_fresh_instance() {
-    let Some(base) = temporal_url() else {
+fn live_obs_open_requests_for_package_empty_on_fresh_instance() {
+    let Some(base) = live_url() else {
         return;
     };
     // A fresh instance holds no requests at all, so the search for
@@ -608,47 +608,39 @@ fn temporal_obs_open_requests_for_package_empty_on_fresh_instance() {
     // the bootstrap admin credentials, not 401. This exercises the
     // delete pre-check's search URL and response parsing against
     // server state, not a fixture.
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     assert!(
         client
-            .open_requests_for_package(
-                "geectl-temporal-no-such-project",
-                "geectl-temporal-no-such-package"
-            )
-            .expect("involved-requests search on the temporal instance")
+            .open_requests_for_package("geectl-live-no-such-project", "geectl-live-no-such-package")
+            .expect("involved-requests search on the live instance")
             .is_empty(),
-        "a fresh temporal instance must have no requests involving the package"
+        "a fresh live instance must have no requests involving the package"
     );
 }
 
 /// The full refile lifecycle against the server: file, supersede,
 /// delete.
 #[test]
-fn temporal_refile_supersedes_and_deletes_on_server() {
-    let Some(base) = temporal_url() else {
+fn live_refile_supersedes_and_deletes_on_server() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (source_a, target_project, package) = setup_branch(&client);
     let dry = DryRun::new(false);
     let filing = SrFiling::new(&client, &dry);
     let id1 = filing
-        .file(&temporal_payload(
-            &source_a,
-            &package,
-            &target_project,
-            "2.0",
-        ))
-        .expect("file the first submit request on the temporal instance")
+        .file(&live_payload(&source_a, &package, &target_project, "2.0"))
+        .expect("file the first submit request on the live instance")
         .expect("live filing returns a request id");
     // The refile comes from a second branch, same target.
     let source_b = create_source_branch(&client, &package);
     let id2 = filing
         .refile(
-            &temporal_payload(&source_b, &package, &target_project, "2.1"),
+            &live_payload(&source_b, &package, &target_project, "2.1"),
             &id1,
         )
-        .expect("refile on the temporal instance")
+        .expect("refile on the live instance")
         .expect("live refile returns a request id");
     assert_ne!(id1, id2, "refile must return a new request id");
     let old = client
@@ -696,18 +688,18 @@ fn temporal_refile_supersedes_and_deletes_on_server() {
 /// (the server's backend can still be registering the just-filed
 /// request), so the test proves the library path absorbs the race.
 #[test]
-fn temporal_accept_deletes_source_branch_on_server() {
-    let Some(base) = temporal_url() else {
+fn live_accept_deletes_source_branch_on_server() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
+    let client = live_client_authed(&base);
     let (source_project, target_project, package) = setup_branch(&client);
     let dry = DryRun::new(false);
     let filing = SrFiling::new(&client, &dry);
-    let payload = temporal_payload(&source_project, &package, &target_project, "2.0");
+    let payload = live_payload(&source_project, &package, &target_project, "2.0");
     let id = filing
         .file(&payload)
-        .expect("file a submit request on the temporal instance")
+        .expect("file a submit request on the live instance")
         .expect("live filing returns a request id");
     let filed = request_xml(&base, &id);
     assert!(
@@ -715,8 +707,8 @@ fn temporal_accept_deletes_source_branch_on_server() {
         "filed request {id} must carry the default cleanup; body: {filed}"
     );
     client
-        .accept_request(&id, "accepted by the geectl temporal test", false, &dry)
-        .expect("accept the request on the temporal instance");
+        .accept_request(&id, "accepted by the geectl live test", false, &dry)
+        .expect("accept the request on the live instance");
     let accepted = request_xml(&base, &id);
     assert_eq!(
         request_state(&accepted).as_deref(),
@@ -744,7 +736,7 @@ fn file_content(base: &str, project: &str, package: &str, filename: &str) -> Str
     ));
     http.get_with(
         &format!("{base}/source/{project}/{package}/{filename}"),
-        &temporal_credentials(),
+        &live_credentials(),
     )
     .expect("GET the uploaded file back from the server")
 }
@@ -754,29 +746,29 @@ fn file_content(base: &str, project: &str, package: &str, filename: &str) -> Str
 /// upload returns the new revision number: the first upload to a fresh
 /// package is revision 1.
 #[test]
-fn temporal_upload_file_reads_back_on_server() {
-    let Some(base) = temporal_url() else {
+fn live_upload_file_reads_back_on_server() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let package = temporal_package();
+    let client = live_client_authed(&base);
+    let package = live_package();
     let source_project = create_source_branch(&client, &package);
-    let content = "Name: geectl-temporal-pkg\nVersion: 1.0\n";
+    let content = "Name: geectl-live-pkg\nVersion: 1.0\n";
     let rev = client
         .upload_file(
             &source_project,
             &package,
-            "geectl-temporal-pkg.spec",
+            "geectl-live-pkg.spec",
             content,
             &DryRun::new(false),
         )
-        .expect("upload a spec file to the temporal instance");
+        .expect("upload a spec file to the live instance");
     assert_eq!(
         rev,
         Some(1),
         "first upload to a fresh package is revision 1"
     );
-    let body = file_content(&base, &source_project, &package, "geectl-temporal-pkg.spec");
+    let body = file_content(&base, &source_project, &package, "geectl-live-pkg.spec");
     assert_eq!(
         body, content,
         "the file the server holds must be the uploaded content"
@@ -791,11 +783,11 @@ fn add_package(client: &ObsClient<'_>, project: &str, package: &str, content: &s
         .create_package(
             project,
             package,
-            "geectl temporal test package",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test package",
+            "Created by the geectl live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create package on the temporal instance");
+        .expect("create package on the live instance");
     client
         .upload_file(
             project,
@@ -804,7 +796,7 @@ fn add_package(client: &ObsClient<'_>, project: &str, package: &str, content: &s
             content,
             &DryRun::new(false),
         )
-        .expect("upload a spec file to the temporal instance")
+        .expect("upload a spec file to the live instance")
 }
 
 /// Poll until `package_log` holds at least `count` entries, for up
@@ -820,7 +812,7 @@ fn wait_until_log(
     loop {
         let log = client
             .package_log(project, package, None)
-            .expect("read the package log on the temporal instance");
+            .expect("read the package log on the live instance");
         if log.len() >= count {
             return log;
         }
@@ -843,7 +835,7 @@ fn wait_until_link_target(
     loop {
         if let Some(target) = client
             .link_target(project, package)
-            .expect("read the link target on the temporal instance")
+            .expect("read the link target on the live instance")
         {
             return target;
         }
@@ -858,60 +850,50 @@ fn wait_until_link_target(
 /// current revision and at an earlier one. The reads are public: no
 /// credentials.
 #[test]
-fn temporal_cat_reads_back_uploaded_file() {
-    let Some(base) = temporal_url() else {
+fn live_cat_reads_back_uploaded_file() {
+    let Some(base) = live_url() else {
         return;
     };
-    let authed = temporal_client_authed(&base);
-    let package = temporal_package();
+    let authed = live_client_authed(&base);
+    let package = live_package();
     let source_project = create_source_branch(&authed, &package);
-    let v1 = "Name: geectl-temporal-pkg\nVersion: 1.0\n";
-    let v2 = "Name: geectl-temporal-pkg\nVersion: 1.1\n";
+    let v1 = "Name: geectl-live-pkg\nVersion: 1.0\n";
+    let v2 = "Name: geectl-live-pkg\nVersion: 1.1\n";
     authed
         .upload_file(
             &source_project,
             &package,
-            "geectl-temporal-pkg.spec",
+            "geectl-live-pkg.spec",
             v1,
             &DryRun::new(false),
         )
-        .expect("upload the first spec on the temporal instance");
+        .expect("upload the first spec on the live instance");
     authed
         .upload_file(
             &source_project,
             &package,
-            "geectl-temporal-pkg.spec",
+            "geectl-live-pkg.spec",
             v2,
             &DryRun::new(false),
         )
-        .expect("upload the second spec on the temporal instance");
-    let public = temporal_client(&base);
+        .expect("upload the second spec on the live instance");
+    let public = live_client(&base);
     assert_eq!(
         public
-            .cat(&source_project, &package, "geectl-temporal-pkg.spec", None)
-            .expect("cat the current revision on the temporal instance"),
+            .cat(&source_project, &package, "geectl-live-pkg.spec", None)
+            .expect("cat the current revision on the live instance"),
         v2
     );
     assert_eq!(
         public
-            .cat(
-                &source_project,
-                &package,
-                "geectl-temporal-pkg.spec",
-                Some(1)
-            )
-            .expect("cat revision 1 on the temporal instance"),
+            .cat(&source_project, &package, "geectl-live-pkg.spec", Some(1))
+            .expect("cat revision 1 on the live instance"),
         v1
     );
     assert_eq!(
         public
-            .cat(
-                &source_project,
-                &package,
-                "geectl-temporal-pkg.spec",
-                Some(2)
-            )
-            .expect("cat revision 2 on the temporal instance"),
+            .cat(&source_project, &package, "geectl-live-pkg.spec", Some(2))
+            .expect("cat revision 2 on the live instance"),
         v2
     );
 }
@@ -919,12 +901,12 @@ fn temporal_cat_reads_back_uploaded_file() {
 /// The directory listing and the project listing read back what was
 /// uploaded and created, through the public reads.
 #[test]
-fn temporal_list_files_and_packages_read_back() {
-    let Some(base) = temporal_url() else {
+fn live_list_files_and_packages_read_back() {
+    let Some(base) = live_url() else {
         return;
     };
-    let authed = temporal_client_authed(&base);
-    let package = temporal_package();
+    let authed = live_client_authed(&base);
+    let package = live_package();
     let source_project = create_source_branch(&authed, &package);
     authed
         .upload_file(
@@ -934,7 +916,7 @@ fn temporal_list_files_and_packages_read_back() {
             "Name: a\nVersion: 1.0\n",
             &DryRun::new(false),
         )
-        .expect("upload a.spec on the temporal instance");
+        .expect("upload a.spec on the live instance");
     authed
         .upload_file(
             &source_project,
@@ -943,11 +925,11 @@ fn temporal_list_files_and_packages_read_back() {
             "Name: b\nVersion: 1.0\n",
             &DryRun::new(false),
         )
-        .expect("upload b.spec on the temporal instance");
-    let public = temporal_client(&base);
+        .expect("upload b.spec on the live instance");
+    let public = live_client(&base);
     let files = public
         .list_files(&source_project, &package)
-        .expect("list the package files on the temporal instance");
+        .expect("list the package files on the live instance");
     let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
     assert!(
         names.contains(&"a.spec") && names.contains(&"b.spec"),
@@ -955,7 +937,7 @@ fn temporal_list_files_and_packages_read_back() {
     );
     let packages = public
         .list_packages(&source_project)
-        .expect("list the project packages on the temporal instance");
+        .expect("list the project packages on the live instance");
     assert!(
         packages.contains(&package),
         "the project listing must hold the created package {package}; got {packages:?}"
@@ -965,31 +947,31 @@ fn temporal_list_files_and_packages_read_back() {
 /// The package log comes back newest-first, and a revision range
 /// narrows it to the revisions in the range.
 #[test]
-fn temporal_package_log_newest_first_and_range() {
-    let Some(base) = temporal_url() else {
+fn live_package_log_newest_first_and_range() {
+    let Some(base) = live_url() else {
         return;
     };
-    let authed = temporal_client_authed(&base);
-    let package = temporal_package();
+    let authed = live_client_authed(&base);
+    let package = live_package();
     let source_project = create_source_branch(&authed, &package);
     authed
         .upload_file(
             &source_project,
             &package,
-            "geectl-temporal-pkg.spec",
-            "Name: geectl-temporal-pkg\nVersion: 1.0\n",
+            "geectl-live-pkg.spec",
+            "Name: geectl-live-pkg\nVersion: 1.0\n",
             &DryRun::new(false),
         )
-        .expect("upload the first spec on the temporal instance");
+        .expect("upload the first spec on the live instance");
     authed
         .upload_file(
             &source_project,
             &package,
-            "geectl-temporal-pkg.spec",
-            "Name: geectl-temporal-pkg\nVersion: 1.1\n",
+            "geectl-live-pkg.spec",
+            "Name: geectl-live-pkg\nVersion: 1.1\n",
             &DryRun::new(false),
         )
-        .expect("upload the second spec on the temporal instance");
+        .expect("upload the second spec on the live instance");
     let log = wait_until_log(&authed, &source_project, &package, 2);
     assert_eq!(log.len(), 2, "two uploads must leave two revisions");
     assert_eq!(log[0].rev, 2, "the log must be newest-first");
@@ -1000,7 +982,7 @@ fn temporal_package_log_newest_first_and_range() {
             &package,
             Some(&RevisionRange::parse("1").unwrap()),
         )
-        .expect("read the ranged log on the temporal instance");
+        .expect("read the ranged log on the live instance");
     assert_eq!(
         first_only.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
         vec![1],
@@ -1011,35 +993,35 @@ fn temporal_package_log_newest_first_and_range() {
 /// The revision patch diffs one revision against the previous one,
 /// and revision 1 has nothing to diff against.
 #[test]
-fn temporal_revision_patch_diffs_revisions() {
-    let Some(base) = temporal_url() else {
+fn live_revision_patch_diffs_revisions() {
+    let Some(base) = live_url() else {
         return;
     };
-    let authed = temporal_client_authed(&base);
-    let package = temporal_package();
+    let authed = live_client_authed(&base);
+    let package = live_package();
     let source_project = create_source_branch(&authed, &package);
     authed
         .upload_file(
             &source_project,
             &package,
-            "geectl-temporal-pkg.spec",
-            "Name: geectl-temporal-pkg\nVersion: 1.0\n",
+            "geectl-live-pkg.spec",
+            "Name: geectl-live-pkg\nVersion: 1.0\n",
             &DryRun::new(false),
         )
-        .expect("upload the first spec on the temporal instance");
+        .expect("upload the first spec on the live instance");
     authed
         .upload_file(
             &source_project,
             &package,
-            "geectl-temporal-pkg.spec",
-            "Name: geectl-temporal-pkg\nVersion: 1.1\n",
+            "geectl-live-pkg.spec",
+            "Name: geectl-live-pkg\nVersion: 1.1\n",
             &DryRun::new(false),
         )
-        .expect("upload the second spec on the temporal instance");
-    let public = temporal_client(&base);
+        .expect("upload the second spec on the live instance");
+    let public = live_client(&base);
     let patch = public
         .revision_patch(&source_project, &package, 2)
-        .expect("diff revision 2 on the temporal instance");
+        .expect("diff revision 2 on the live instance");
     assert_eq!(patch.rev, 2);
     assert_eq!(patch.files.len(), 1, "one file changed between revisions");
     assert_eq!(
@@ -1059,7 +1041,7 @@ fn temporal_revision_patch_diffs_revisions() {
     );
     let first = public
         .revision_patch(&source_project, &package, 1)
-        .expect("diff revision 1 on the temporal instance");
+        .expect("diff revision 1 on the live instance");
     assert!(
         first.files.is_empty(),
         "revision 1 has nothing to diff against"
@@ -1068,45 +1050,45 @@ fn temporal_revision_patch_diffs_revisions() {
 
 /// The project and package meta read back what creation put there.
 #[test]
-fn temporal_meta_reads_back() {
-    let Some(base) = temporal_url() else {
+fn live_meta_reads_back() {
+    let Some(base) = live_url() else {
         return;
     };
-    let authed = temporal_client_authed(&base);
-    let package = temporal_package();
+    let authed = live_client_authed(&base);
+    let package = live_package();
     let source_project = create_source_branch(&authed, &package);
-    let public = temporal_client(&base);
+    let public = live_client(&base);
     let project_meta = public
         .project_meta(&source_project)
-        .expect("read the project meta on the temporal instance");
+        .expect("read the project meta on the live instance");
     assert_eq!(project_meta.name, source_project);
     assert_eq!(
         project_meta.title.as_deref(),
-        Some("geectl temporal test branch")
+        Some("geectl live test branch")
     );
     let package_meta = public
         .package_meta(&source_project, &package)
-        .expect("read the package meta on the temporal instance");
+        .expect("read the package meta on the live instance");
     assert_eq!(package_meta.name, package);
     assert_eq!(package_meta.project, source_project);
     assert_eq!(
         package_meta.title.as_deref(),
-        Some("geectl temporal test package")
+        Some("geectl live test package")
     );
 }
 
 /// The package and project search find what was just created.
 #[test]
-fn temporal_search_finds_package_and_project() {
-    let Some(base) = temporal_url() else {
+fn live_search_finds_package_and_project() {
+    let Some(base) = live_url() else {
         return;
     };
-    let authed = temporal_client_authed(&base);
-    let package = temporal_package();
+    let authed = live_client_authed(&base);
+    let package = live_package();
     let source_project = create_source_branch(&authed, &package);
     let matches = authed
         .search_packages(&package)
-        .expect("search packages on the temporal instance");
+        .expect("search packages on the live instance");
     assert!(
         matches
             .iter()
@@ -1115,7 +1097,7 @@ fn temporal_search_finds_package_and_project() {
     );
     let projects = authed
         .search_projects(&source_project)
-        .expect("search projects on the temporal instance");
+        .expect("search projects on the live instance");
     assert!(
         projects.iter().any(|found| found.name == source_project),
         "the search must find the created project {source_project}; got {projects:?}"
@@ -1126,16 +1108,16 @@ fn temporal_search_finds_package_and_project() {
 /// has no explicit owners, so the call succeeding (not 401, not
 /// 404) is the assertion, plus the shape of whatever it returns.
 #[test]
-fn temporal_owners_call_succeeds() {
-    let Some(base) = temporal_url() else {
+fn live_owners_call_succeeds() {
+    let Some(base) = live_url() else {
         return;
     };
-    let authed = temporal_client_authed(&base);
-    let package = temporal_package();
+    let authed = live_client_authed(&base);
+    let package = live_package();
     let source_project = create_source_branch(&authed, &package);
     let owners = authed
         .owners(&source_project, &package)
-        .expect("owner search on the temporal instance");
+        .expect("owner search on the live instance");
     assert!(
         owners.iter().all(|owner| !owner.project.is_empty()),
         "every returned owner must name a project; got {owners:?}"
@@ -1144,14 +1126,12 @@ fn temporal_owners_call_succeeds() {
 
 /// `whois` reads the bootstrap admin back from the server.
 #[test]
-fn temporal_whois_reads_admin() {
-    let Some(base) = temporal_url() else {
+fn live_whois_reads_admin() {
+    let Some(base) = live_url() else {
         return;
     };
-    let authed = temporal_client_authed(&base);
-    let person = authed
-        .whois("Admin")
-        .expect("whois on the temporal instance");
+    let authed = live_client_authed(&base);
+    let person = authed.whois("Admin").expect("whois on the live instance");
     assert_eq!(person.login, "Admin");
     assert_eq!(person.state, "confirmed");
 }
@@ -1160,30 +1140,30 @@ fn temporal_whois_reads_admin() {
 /// target. The target is a second package in the same project, so
 /// the link resolves.
 #[test]
-fn temporal_link_target_reads_linkinfo() {
-    let Some(base) = temporal_url() else {
+fn live_link_target_reads_linkinfo() {
+    let Some(base) = live_url() else {
         return;
     };
-    let authed = temporal_client_authed(&base);
-    let package = temporal_package();
+    let authed = live_client_authed(&base);
+    let package = live_package();
     let source_project = create_source_branch(&authed, &package);
-    let target_package = format!("geectl-temporal-link-tgt-{}", unique_suffix());
+    let target_package = format!("geectl-live-link-tgt-{}", unique_suffix());
     add_package(
         &authed,
         &source_project,
         &target_package,
         "Name: target\nVersion: 1.0\n",
     );
-    let link_package = format!("geectl-temporal-link-{}", unique_suffix());
+    let link_package = format!("geectl-live-link-{}", unique_suffix());
     authed
         .create_package(
             &source_project,
             &link_package,
-            "geectl temporal test package",
-            "Created by the geectl temporal live test; the instance is destroyed after the run.",
+            "geectl live test package",
+            "Created by the geectl live test; the instance is destroyed after the run.",
             &DryRun::new(false),
         )
-        .expect("create the link package on the temporal instance");
+        .expect("create the link package on the live instance");
     authed
         .upload_file(
             &source_project,
@@ -1192,8 +1172,8 @@ fn temporal_link_target_reads_linkinfo() {
             &format!("<link project=\"{source_project}\" package=\"{target_package}\"/>"),
             &DryRun::new(false),
         )
-        .expect("upload the _link file on the temporal instance");
-    let public = temporal_client(&base);
+        .expect("upload the _link file on the live instance");
+    let public = live_client(&base);
     assert_eq!(
         wait_until_link_target(&public, &source_project, &link_package),
         (source_project, target_package)
@@ -1203,11 +1183,11 @@ fn temporal_link_target_reads_linkinfo() {
 /// Two projects diffed package by package: identical, differs,
 /// only-in-old, and only-in-new all classify.
 #[test]
-fn temporal_project_diff_classifies() {
-    let Some(base) = temporal_url() else {
+fn live_project_diff_classifies() {
+    let Some(base) = live_url() else {
         return;
     };
-    let authed = temporal_client_authed(&base);
+    let authed = live_client_authed(&base);
     let suffix = unique_suffix();
     let old_project = format!("geectl-tmp-diff-old-{suffix}");
     let new_project = format!("geectl-tmp-diff-new-{suffix}");
@@ -1215,11 +1195,11 @@ fn temporal_project_diff_classifies() {
         authed
             .create_project(
                 project,
-                "geectl temporal test project",
-                "Created by the geectl temporal live test; the instance is destroyed after the run.",
+                "geectl live test project",
+                "Created by the geectl live test; the instance is destroyed after the run.",
                 &DryRun::new(false),
             )
-            .expect("create a diff project on the temporal instance");
+            .expect("create a diff project on the live instance");
     }
     let shared = format!("pkg-shared-{suffix}");
     let changed = format!("pkg-changed-{suffix}");
@@ -1261,10 +1241,10 @@ fn temporal_project_diff_classifies() {
         &new_only,
         "Name: new-only\nVersion: 1.0\n",
     );
-    let public = temporal_client(&base);
+    let public = live_client(&base);
     let diffs = public
         .project_diff(&old_project, &new_project, &[], &[], false)
-        .expect("diff the two projects on the temporal instance");
+        .expect("diff the two projects on the live instance");
     let status = |name: &str| {
         diffs
             .iter()
@@ -1291,12 +1271,12 @@ fn temporal_project_diff_classifies() {
 /// creator, state, description, action, and creation history must be
 /// what was filed.
 #[test]
-fn temporal_show_request_reads_back_the_filed_request() {
-    let Some(base) = temporal_url() else {
+fn live_show_request_reads_back_the_filed_request() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, package) = file_temporal_request(&client, "2.0");
+    let client = live_client_authed(&base);
+    let (id, package) = file_live_request(&client, "2.0");
     let request = client
         .show_request(&id)
         .expect("read the filed request back from the server");
@@ -1305,7 +1285,7 @@ fn temporal_show_request_reads_back_the_filed_request() {
     assert_eq!(request.state.name, RequestState::New);
     assert_eq!(
         request.description,
-        format!("Update {package} to 2.0: temporal test submission")
+        format!("Update {package} to 2.0: live test submission")
     );
     let (_, src_package, _, tgt_package, sourceupdate) = submit_action(&request);
     assert_eq!(src_package, package);
@@ -1319,12 +1299,12 @@ fn temporal_show_request_reads_back_the_filed_request() {
 
 /// The log of a fresh request is its creation entry alone.
 #[test]
-fn temporal_request_log_lists_the_creation_entry() {
-    let Some(base) = temporal_url() else {
+fn live_request_log_lists_the_creation_entry() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, package) = file_temporal_request(&client, "2.0");
+    let client = live_client_authed(&base);
+    let (id, package) = file_live_request(&client, "2.0");
     let log = client
         .request_log(&id)
         .expect("read the filed request's log from the server");
@@ -1336,23 +1316,23 @@ fn temporal_request_log_lists_the_creation_entry() {
     assert_eq!(log[0].description, "Request created");
     assert_eq!(
         log[0].comment,
-        format!("Update {package} to 2.0: temporal test submission")
+        format!("Update {package} to 2.0: live test submission")
     );
 }
 
 /// Accepting a request through the library moves it to `accepted` on
 /// the server.
 #[test]
-fn temporal_accept_request_changes_state_on_server() {
-    let Some(base) = temporal_url() else {
+fn live_accept_request_changes_state_on_server() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, _) = file_temporal_request(&client, "2.0");
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
     let dry = DryRun::new(false);
     client
-        .accept_request(&id, "accepted by the geectl temporal test", false, &dry)
-        .expect("accept the request on the temporal instance");
+        .accept_request(&id, "accepted by the geectl live test", false, &dry)
+        .expect("accept the request on the live instance");
     let request = client
         .show_request(&id)
         .expect("read the accepted request back from the server");
@@ -1362,16 +1342,16 @@ fn temporal_accept_request_changes_state_on_server() {
 /// Declining a request through the library moves it to `declined` on
 /// the server.
 #[test]
-fn temporal_decline_request_changes_state_on_server() {
-    let Some(base) = temporal_url() else {
+fn live_decline_request_changes_state_on_server() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, _) = file_temporal_request(&client, "2.0");
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
     let dry = DryRun::new(false);
     client
-        .decline_request(&id, "declined by the geectl temporal test", &dry)
-        .expect("decline the request on the temporal instance");
+        .decline_request(&id, "declined by the geectl live test", &dry)
+        .expect("decline the request on the live instance");
     let request = client
         .show_request(&id)
         .expect("read the declined request back from the server");
@@ -1381,16 +1361,16 @@ fn temporal_decline_request_changes_state_on_server() {
 /// Revoking a request through the library moves it to `revoked` on
 /// the server.
 #[test]
-fn temporal_revoke_request_changes_state_on_server() {
-    let Some(base) = temporal_url() else {
+fn live_revoke_request_changes_state_on_server() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, _) = file_temporal_request(&client, "2.0");
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
     let dry = DryRun::new(false);
     client
-        .revoke_request(&id, "revoked by the geectl temporal test", &dry)
-        .expect("revoke the request on the temporal instance");
+        .revoke_request(&id, "revoked by the geectl live test", &dry)
+        .expect("revoke the request on the live instance");
     let request = client
         .show_request(&id)
         .expect("read the revoked request back from the server");
@@ -1401,18 +1381,18 @@ fn temporal_revoke_request_changes_state_on_server() {
 /// `review` on the server, with the review carrying who it was asked
 /// of and why.
 #[test]
-fn temporal_add_review_marks_the_request_for_review() {
-    let Some(base) = temporal_url() else {
+fn live_add_review_marks_the_request_for_review() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, _) = file_temporal_request(&client, "2.0");
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
     let dry = DryRun::new(false);
     let target = ReviewTarget::new(Some("Admin"), None, None, None)
         .expect("a review asked of a user is a valid target");
     client
         .add_review(&id, &target, "please review", &dry)
-        .expect("ask Admin to review the request on the temporal instance");
+        .expect("ask Admin to review the request on the live instance");
     let request = client
         .show_request(&id)
         .expect("read the reviewed request back from the server");
@@ -1432,18 +1412,18 @@ fn temporal_add_review_marks_the_request_for_review() {
 /// must then read back — the test's subject is the readback, and the
 /// state change is only its setup.
 #[test]
-fn temporal_review_with_history_reads_back() {
-    let Some(base) = temporal_url() else {
+fn live_review_with_history_reads_back() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, _) = file_temporal_request(&client, "2.0");
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
     let dry = DryRun::new(false);
     let target = ReviewTarget::new(Some("Admin"), None, None, None)
         .expect("a review asked of a user is a valid target");
     client
         .add_review(&id, &target, "please review", &dry)
-        .expect("ask Admin to review the request on the temporal instance");
+        .expect("ask Admin to review the request on the live instance");
     change_review_state(&base, &id, "accepted", "Admin");
     let request = client
         .show_request(&id)
@@ -1465,16 +1445,16 @@ fn temporal_review_with_history_reads_back() {
 /// comments back: the comment and its threaded reply must be what
 /// was posted.
 #[test]
-fn temporal_comment_create_and_list_round_trips() {
-    let Some(base) = temporal_url() else {
+fn live_comment_create_and_list_round_trips() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, _) = file_temporal_request(&client, "2.0");
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
     let dry = DryRun::new(false);
     client
         .add_comment(&id, "first comment", None, &dry)
-        .expect("comment on the request on the temporal instance");
+        .expect("comment on the request on the live instance");
     let comments = client
         .list_comments(&id)
         .expect("list the request's comments from the server");
@@ -1486,7 +1466,7 @@ fn temporal_comment_create_and_list_round_trips() {
     let first_id_str = first_id.to_string();
     client
         .add_comment(&id, "reply to the first", Some(&first_id_str), &dry)
-        .expect("reply to the comment on the temporal instance");
+        .expect("reply to the comment on the live instance");
     let comments = client
         .list_comments(&id)
         .expect("list the request's comments from the server");
@@ -1499,22 +1479,22 @@ fn temporal_comment_create_and_list_round_trips() {
 /// XML. The branch holds one file, so the plain diff shows it added;
 /// the XML form must wrap a request element.
 #[test]
-fn temporal_request_diff_returns_the_submit_diff() {
-    let Some(base) = temporal_url() else {
+fn live_request_diff_returns_the_submit_diff() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, _) = file_temporal_request_with_file(
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request_with_file(
         &client,
         "2.0",
-        "geectl-temporal.txt",
-        "geectl temporal diff fixture\n",
+        "geectl-live.txt",
+        "geectl live diff fixture\n",
     );
     let plain = client
         .request_diff(&id, false)
         .expect("read the plain diff of the filed request");
     assert!(
-        plain.contains("geectl-temporal.txt"),
+        plain.contains("geectl-live.txt"),
         "the plain diff must show the added file; got {plain}"
     );
     let xml = client
@@ -1532,18 +1512,18 @@ fn temporal_request_diff_returns_the_submit_diff() {
 /// `action/@type` question: the server accepts it in the match
 /// expression.
 #[test]
-fn temporal_search_requests_finds_the_filed_request() {
-    let Some(base) = temporal_url() else {
+fn live_search_requests_finds_the_filed_request() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, package) = file_temporal_request(&client, "2.0");
+    let client = live_client_authed(&base);
+    let (id, package) = file_live_request(&client, "2.0");
     let search = RequestSearch::new()
         .request_ids(vec![id.parse().expect("the filed request id is a number")])
         .types(vec!["submit".to_string()]);
     let found = client
         .search_requests(&search)
-        .expect("search by id and type on the temporal instance");
+        .expect("search by id and type on the live instance");
     assert_eq!(
         found.len(),
         1,
@@ -1571,7 +1551,7 @@ fn temporal_search_requests_finds_the_filed_request() {
                 .request_ids(vec![id.parse().expect("the filed request id is a number")])
                 .source_packages(vec![package.clone()]),
         )
-        .expect("search by id and source package on the temporal instance");
+        .expect("search by id and source package on the live instance");
     assert_eq!(
         by_source_package.len(),
         1,
@@ -1583,7 +1563,7 @@ fn temporal_search_requests_finds_the_filed_request() {
                 .request_ids(vec![id.parse().expect("the filed request id is a number")])
                 .target_packages(vec![package.clone()]),
         )
-        .expect("search by id and target package on the temporal instance");
+        .expect("search by id and target package on the live instance");
     assert_eq!(
         by_target_package.len(),
         1,
@@ -1595,7 +1575,7 @@ fn temporal_search_requests_finds_the_filed_request() {
                 .request_ids(vec![id.parse().expect("the filed request id is a number")])
                 .exclude_target_projects(vec![target_project.to_string()]),
         )
-        .expect("search excluding the filed request's target on the temporal instance");
+        .expect("search excluding the filed request's target on the live instance");
     assert!(
         excluded.is_empty(),
         "excluding the filed request's target project must hide it"
@@ -1606,7 +1586,7 @@ fn temporal_search_requests_finds_the_filed_request() {
                 .request_ids(vec![id.parse().expect("the filed request id is a number")])
                 .exclude_target_projects(vec!["home:Admin".to_string()]),
         )
-        .expect("search excluding another project on the temporal instance");
+        .expect("search excluding another project on the live instance");
     assert_eq!(
         not_excluded.len(),
         1,
@@ -1614,7 +1594,7 @@ fn temporal_search_requests_finds_the_filed_request() {
     );
     let by_creator = client
         .search_requests(&RequestSearch::new().creators(vec!["Admin".to_string()]))
-        .expect("search by creator on the temporal instance");
+        .expect("search by creator on the live instance");
     assert!(
         by_creator
             .iter()
@@ -1627,16 +1607,16 @@ fn temporal_search_requests_finds_the_filed_request() {
 /// accepting an accepted request reports `false` instead of failing,
 /// so a batch triaging many requests does not stop here.
 #[test]
-fn temporal_try_change_state_false_on_an_accepted_request() {
-    let Some(base) = temporal_url() else {
+fn live_try_change_state_false_on_an_accepted_request() {
+    let Some(base) = live_url() else {
         return;
     };
-    let client = temporal_client_authed(&base);
-    let (id, _) = file_temporal_request(&client, "2.0");
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
     let dry = DryRun::new(false);
     client
-        .accept_request(&id, "accepted by the geectl temporal test", false, &dry)
-        .expect("accept the request on the temporal instance");
+        .accept_request(&id, "accepted by the geectl live test", false, &dry)
+        .expect("accept the request on the live instance");
     assert!(
         !client
             .try_change_state(&id, RequestState::Accepted, "accept again", false, &dry)
@@ -1695,44 +1675,44 @@ mod tests {
     }
 
     #[test]
-    fn temporal_base_validation() {
+    fn live_base_validation() {
         // Bare loopback bases pass, trimmed and slash-stripped.
         assert_eq!(
-            validate_temporal_base("http://127.0.0.1:3000").as_deref(),
+            validate_live_base("http://127.0.0.1:3000").as_deref(),
             Ok("http://127.0.0.1:3000")
         );
         assert_eq!(
-            validate_temporal_base("  http://127.0.0.1:3000/  ").as_deref(),
+            validate_live_base("  http://127.0.0.1:3000/  ").as_deref(),
             Ok("http://127.0.0.1:3000")
         );
         // A space before the trailing slash is stripped too.
         assert_eq!(
-            validate_temporal_base("http://127.0.0.1:3000 /").as_deref(),
+            validate_live_base("http://127.0.0.1:3000 /").as_deref(),
             Ok("http://127.0.0.1:3000")
         );
         // A base with a path, query, or fragment is rejected: the
         // tests append paths themselves, so a non-bare base would
         // double them.
-        assert!(validate_temporal_base("http://127.0.0.1:3000/about").is_err());
-        assert!(validate_temporal_base("http://127.0.0.1:3000?x=1").is_err());
-        assert!(validate_temporal_base("http://127.0.0.1:3000#frag").is_err());
+        assert!(validate_live_base("http://127.0.0.1:3000/about").is_err());
+        assert!(validate_live_base("http://127.0.0.1:3000?x=1").is_err());
+        assert!(validate_live_base("http://127.0.0.1:3000#frag").is_err());
         // Non-loopback is rejected, including behind userinfo.
-        assert!(validate_temporal_base("http://example.com").is_err());
-        assert!(validate_temporal_base("http://127.0.0.1:80@evil.com").is_err());
+        assert!(validate_live_base("http://example.com").is_err());
+        assert!(validate_live_base("http://127.0.0.1:80@evil.com").is_err());
         // A non-http URL reports a scheme error, not a bare-base one:
         // the bare-base check would otherwise see the `//` in `https://`.
-        let scheme_err = validate_temporal_base("https://127.0.0.1:3000").unwrap_err();
+        let scheme_err = validate_live_base("https://127.0.0.1:3000").unwrap_err();
         assert!(
             scheme_err.contains("must be an http:// URL"),
             "a non-http URL must report a scheme error; got {scheme_err}"
         );
         // A bracketed-host spoof is rejected by the loopback check.
-        assert!(validate_temporal_base("http://[::1]evil.com").is_err());
+        assert!(validate_live_base("http://[::1]evil.com").is_err());
     }
 
     #[test]
-    fn temporal_obs_client_uses_the_instance_base() {
-        // The client built for the temporal base must point its reads
+    fn live_obs_client_uses_the_instance_base() {
+        // The client built for the live base must point its reads
         // at that base (not at the production API), and must refuse a
         // non-loopback http base.
         let http = UreqClient::new(Timeout::default()).expect("default timeout is valid");
@@ -1745,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn temporal_filing_path_is_wired_but_not_filed() {
+    fn live_filing_path_is_wired_but_not_filed() {
         // The filing path is wired end to end (payload → SrFiling →
         // dry-run) without a live server: dry-run files nothing and
         // returns None. The live path against the instance is the
@@ -1755,7 +1735,7 @@ mod tests {
         let dry = DryRun::default();
         let filing = SrFiling::new(&client, &dry);
         let payload = SrPayload::new(
-            "home:geectl-temporal",
+            "home:geectl-live",
             "foo",
             "devel:languages:python",
             "foo",

@@ -97,7 +97,7 @@
 //! from `url.rs` (one encoder per context); the base itself is
 //! carried as a string because the URL builder rightly rejects
 //! `http://` bases, and the test instance is plain http on loopback
-//! (the same reason the temporal harness builds its URLs as strings).
+//! (the same reason the live harness builds its URLs as strings).
 //!
 //! The live executor that actually branches, bumps, cleans, builds,
 //! and runs the package gates is NOT part of this module: the library
@@ -205,7 +205,7 @@ fn validate_base(base: &str) -> Result<(), GeectlError> {
     // A base is scheme plus authority only: anything after the
     // authority would be string-concatenated into every OBS URL (see
     // `build_url`), so a base such as `https://api.opensuse.org/evil`
-    // would rewrite them all. The temporal harness enforces the same
+    // would rewrite them all. The live harness enforces the same
     // bare shape for its base URL.
     let base = base.trim_end_matches('/');
     if let Some(authority) = base.strip_prefix("https://") {
@@ -1154,7 +1154,7 @@ impl<'a> ObsClient<'a> {
     /// server's API replies before its backend has registered a
     /// just-filed request, so the changestate POST that follows a
     /// filing can fail while the request is about to exist (seen on
-    /// temporal run 44880250442: the accept POST returned 500, while
+    /// live run 44880250442: the accept POST returned 500, while
     /// the same accept passed on earlier runs). Only transient
     /// failures retry — a 5xx, a timeout, a network error, or a
     /// not-found (the just-filed request is not visible yet while
@@ -1284,7 +1284,7 @@ impl<'a> ObsClient<'a> {
     ///   the server's API replies before its backend has
     ///   registered a just-filed request, so the changestate POST
     ///   that follows a filing can fail while the request is about
-    ///   to exist (seen on temporal run 44880250442: the accept
+    ///   to exist (seen on live run 44880250442: the accept
     ///   POST returned 500, while the same accept passed on
     ///   earlier runs). Before any re-issue the retry reads the
     ///   request back, so a change that already landed is never
@@ -1872,7 +1872,7 @@ impl<'a> ObsClient<'a> {
     /// API and backend are separate processes, and the API replies to
     /// the project creation before the backend has the project
     /// registered — the immediately following package creation can
-    /// then 404 on the just-created project (seen on temporal run
+    /// then 404 on the just-created project (seen on live run
     /// 44876734097). Only a not-found retries, so anything else still
     /// fails loudly; a genuinely missing project takes about 30 s to
     /// fail instead of failing fast.
@@ -8188,7 +8188,7 @@ mod tests {
             .create_project(
                 "home:alice",
                 "Alice's branch",
-                "Temporal test branch",
+                "Live test branch",
                 &DryRun::new(false)
             )
             .is_ok());
@@ -8200,7 +8200,7 @@ mod tests {
         );
         assert_eq!(
             puts[0].1,
-            "<project name=\"home:alice\"><title>Alice&apos;s branch</title><description>Temporal test branch</description></project>"
+            "<project name=\"home:alice\"><title>Alice&apos;s branch</title><description>Live test branch</description></project>"
         );
         // The creation PUT carried the credentials.
         assert!(puts[0].2);
@@ -8217,7 +8217,7 @@ mod tests {
             .create_project(
                 "home:alice",
                 "Alice's branch",
-                "Temporal test branch",
+                "Live test branch",
                 &DryRun::new(false)
             )
             .is_err());
@@ -8235,7 +8235,7 @@ mod tests {
             .create_project(
                 "home/alice",
                 "Alice's branch",
-                "Temporal test branch",
+                "Live test branch",
                 &DryRun::new(false)
             )
             .is_err());
@@ -8255,7 +8255,7 @@ mod tests {
             .create_project(
                 "home:alice",
                 "Alice's branch",
-                "Temporal test branch",
+                "Live test branch",
                 &DryRun::new(false),
             )
             .unwrap_err();
@@ -8307,7 +8307,7 @@ mod tests {
         let client = ObsClient::new(&http);
         let dry = DryRun::default();
         assert!(client
-            .create_project("home:alice", "Alice's branch", "Temporal test branch", &dry)
+            .create_project("home:alice", "Alice's branch", "Live test branch", &dry)
             .is_ok());
         assert!(http.put_calls().is_empty());
         assert_eq!(
@@ -8328,7 +8328,7 @@ mod tests {
                 "home:alice",
                 "foo",
                 "Foo",
-                "Temporal test package",
+                "Live test package",
                 &DryRun::new(false)
             )
             .is_ok());
@@ -8340,7 +8340,7 @@ mod tests {
         );
         assert_eq!(
             puts[0].1,
-            "<package name=\"foo\" project=\"home:alice\"><title>Foo</title><description>Temporal test package</description></package>"
+            "<package name=\"foo\" project=\"home:alice\"><title>Foo</title><description>Live test package</description></package>"
         );
         assert!(puts[0].2);
     }
@@ -8350,7 +8350,7 @@ mod tests {
         // The server's API replies to the project creation before
         // its backend has the project registered, so the immediately
         // following package PUT can 404 on the just-created project
-        // (temporal run 44876734097). The library retries a
+        // (live run 44876734097). The library retries a
         // not-found; the second PUT lands.
         let http = FakeHttp::new()
             .with_put_error_sequence(
@@ -8367,7 +8367,7 @@ mod tests {
                 "home:alice",
                 "foo",
                 "Foo",
-                "Temporal test package",
+                "Live test package",
                 &DryRun::new(false)
             )
             .is_ok());
@@ -8422,7 +8422,7 @@ mod tests {
                 "home:alice",
                 "foo",
                 "Foo",
-                "Temporal test package",
+                "Live test package",
                 &DryRun::new(false),
             )
             .unwrap_err();
@@ -8442,7 +8442,7 @@ mod tests {
                 "home:alice",
                 "foo",
                 "Foo",
-                "Temporal test package",
+                "Live test package",
                 &DryRun::new(false)
             )
             .is_err());
@@ -8458,7 +8458,7 @@ mod tests {
                 "home/alice",
                 "foo",
                 "Foo",
-                "Temporal test package",
+                "Live test package",
                 &DryRun::new(false)
             )
             .is_err());
@@ -8467,7 +8467,7 @@ mod tests {
                 "home:alice",
                 "foo/bar",
                 "Foo",
-                "Temporal test package",
+                "Live test package",
                 &DryRun::new(false)
             )
             .is_err());
@@ -8482,7 +8482,7 @@ mod tests {
         let client = ObsClient::new(&http);
         let dry = DryRun::default();
         assert!(client
-            .create_package("home:alice", "foo", "Foo", "Temporal test package", &dry)
+            .create_package("home:alice", "foo", "Foo", "Live test package", &dry)
             .is_ok());
         assert!(http.put_calls().is_empty());
         assert_eq!(
@@ -11730,7 +11730,7 @@ description</description>
         // The server's API replies before its backend has
         // registered a just-filed request, so the changestate POST
         // that follows a filing can 500 while the request is about
-        // to exist (temporal run 44880250442). The library retries
+        // to exist (live run 44880250442). The library retries
         // a transient failure; the second POST lands. The state
         // check between attempts reads the request back as still
         // new, so the retry goes ahead.

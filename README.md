@@ -108,19 +108,19 @@ cargo run -- version
 cargo run -- --help
 ```
 
-## Temporal live tests
+## Live tests
 
-Beyond the per-PR fixture tests, a scheduled `temporal` workflow runs
+Beyond the per-PR fixture tests, a scheduled `live` workflow runs
 live tests against a real (temporary) OBS instance, weekly on Mondays
 06:00 UTC and on demand. It spins up the instance from the OBS
 project's own development containers, runs the tests in
-`tests/temporal.rs` against it, and tears it down. The assertions are
+`tests/live.rs` against it, and tears it down. The assertions are
 on server state — what geectl reads must reflect what the server
 actually holds — which is what catches drift as OBS changes underneath
 us.
 
 The job is independent and does not gate PRs. The provisioning lives in
-`tests/temporal/` (see its README); the live-test assertions that need
+`tests/live/` (see its README); the live-test assertions that need
 auth are wired up but skipped until the auth layer lands.
 
 ## Distribution

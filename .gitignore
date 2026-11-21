@@ -2,7 +2,7 @@
 # The disposable Gitea instance's token, written by tests/gitea/provision.sh
 # (0600). Never committed; removed by tests/gitea/teardown.sh.
 /tests/gitea/.gitea-token
-# The OBS source checkout for the temporal instance (cloned by
-# tests/temporal/provision.sh). It is a throwaway copy of the OBS
+# The OBS source checkout for the live instance (cloned by
+# tests/live/provision.sh). It is a throwaway copy of the OBS
 # repository, never part of geectl.
-tests/temporal/obs/
+tests/live/obs/

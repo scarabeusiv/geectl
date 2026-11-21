@@ -52,7 +52,7 @@ Measured cold on the Mac (2026-11-20):
 
 Total provisioning + test is ~20s, which is why this runs in the
 per-PR gate (the `test` job) rather than on a schedule like the OBS
-temporal job. The OBS instance is slow on purpose (source checkout +
+live job. The OBS instance is slow on purpose (source checkout +
 frontend build, minutes); Gitea is a single prebuilt image.
 
 ## The harness

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision a temporal OBS instance for geectl's scheduled live tests.
+# Provision a live OBS instance for geectl's scheduled live tests.
 #
 # What it does:
 #   1. Clones the OBS source (depth 1) if it is not already present,
@@ -11,7 +11,7 @@
 #      server image — the OBS project builds it from source, and so do we.
 #   2. Starts the database and cache, waits for the database.
 #   3. Builds the frontend image (with the BuildKit GitHub Actions
-#      cache when TEMPORAL_CACHE is set — see docker-compose.cache.yml).
+#      cache when LIVE_CACHE is set — see docker-compose.cache.yml).
 #   4. Runs `rake dev:bootstrap` in a one-off frontend container. That
 #      creates the database and seeds it, including the Admin user
 #      (`Admin` / `opensuse` — the OBS development default, published in
@@ -22,22 +22,22 @@
 #      answers. /about needs only the frontend and the database, while
 #      project writes go to the backend — /about alone does not prove
 #      a write will work.
-#   6. Prints the base URL for the harness (`GEECTL_TEMPORAL_URL`).
+#   6. Prints the base URL for the harness (`GEECTL_LIVE_URL`).
 #
 # The worker is deliberately not started: no test builds a package, and
 # the worker needs a privileged container.
 #
 # Usage:
-#   OBS_SOURCE_DIR=/path/to/open-build-service bash tests/temporal/provision.sh
-#   (defaults to <repo>/tests/temporal/obs; cloned if missing)
-#   COMPOSE="podman compose" bash tests/temporal/provision.sh
+#   OBS_SOURCE_DIR=/path/to/open-build-service bash tests/live/provision.sh
+#   (defaults to <repo>/tests/live/obs; cloned if missing)
+#   COMPOSE="podman compose" bash tests/live/provision.sh
 #   (defaults to `docker compose`)
-#   TEMPORAL_CACHE=1 bash tests/temporal/provision.sh
+#   LIVE_CACHE=1 bash tests/live/provision.sh
 #   (loads docker-compose.cache.yml, the CI-only BuildKit cache for
 #   the frontend image build; local runs leave it unset)
 #
 # Exit code is non-zero if any step fails. The instance is left running
-# on failure for inspection; `tests/temporal/teardown.sh` removes it.
+# on failure for inspection; `tests/live/teardown.sh` removes it.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,15 +46,15 @@ OBS_REPO="https://github.com/openSUSE/open-build-service.git"
 COMPOSE="${COMPOSE:-docker compose}"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 # CI-only frontend build cache (see docker-compose.cache.yml): when
-# TEMPORAL_CACHE is set, the cache override file is added to every
+# LIVE_CACHE is set, the cache override file is added to every
 # compose invocation. It only affects the frontend build
 # (cache_from/cache_to); all other commands behave identically.
-# Local runs leave TEMPORAL_CACHE unset and never load the file,
+# Local runs leave LIVE_CACHE unset and never load the file,
 # so podman and plain docker runs are unchanged.
 COMPOSE_FILES=(-f "$COMPOSE_FILE")
-if [ -n "${TEMPORAL_CACHE:-}" ]; then
+if [ -n "${LIVE_CACHE:-}" ]; then
     COMPOSE_FILES+=(-f "$SCRIPT_DIR/docker-compose.cache.yml")
-    echo "Frontend build cache enabled (TEMPORAL_CACHE is set)."
+    echo "Frontend build cache enabled (LIVE_CACHE is set)."
 fi
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
 BASE_URL="http://127.0.0.1:${FRONTEND_PORT}"
@@ -202,6 +202,6 @@ until $COMPOSE "${COMPOSE_FILES[@]}" exec -T frontend ruby -r net/http -e 'begin
 done
 echo "Backend is up."
 
-echo "Temporal OBS instance is up."
+echo "Live OBS instance is up."
 echo "Base URL: $BASE_URL"
-echo "Run the live tests with: GEECTL_TEMPORAL_URL=$BASE_URL cargo test --locked --test temporal"
+echo "Run the live tests with: GEECTL_LIVE_URL=$BASE_URL cargo test --locked --test live"

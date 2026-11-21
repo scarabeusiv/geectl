@@ -1,9 +1,9 @@
-# Temporal live tests: scheduled live tests against a temporal OBS instance.
+# Live tests: scheduled live tests against a live OBS instance.
 #
 # This is layer 2 of the testing design (see docs/architecture.md). It
 # spins up a real (temporary) OBS instance from the OBS project's own
-# development containers, runs the live tests in `tests/temporal.rs` and
-# `tests/temporal_obs.rs` against it, and tears it down. The assertions are on server state —
+# development containers, runs the live tests in `tests/live.rs` and
+# `tests/live_obs.rs` against it, and tears it down. The assertions are on server state —
 # what geectl reads must reflect what the server actually holds — which
 # is what catches drift as OBS changes underneath us. Fixtures alone
 # cannot do that.
@@ -17,13 +17,13 @@
 # image build take several minutes, and the bootstrap plus readiness
 # wait add more. The timeout is 60 minutes. The frontend image build
 # reuses BuildKit's GitHub Actions cache (see
-# `tests/temporal/docker-compose.cache.yml`), so repeat runs skip the
+# `tests/live/docker-compose.cache.yml`), so repeat runs skip the
 # gem install when the OBS source has not changed. If it proves too
 # slow or flaky on GitHub-hosted runners, the alternative is a
 # dedicated host — that is a decision for the maintainer, not
 # something to guess here.
 
-name: temporal
+name: live
 
 on:
   pull_request:
@@ -43,7 +43,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  temporal:
+  live:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -84,29 +84,29 @@ jobs:
       # the cache export (no error, no cache). Pinned to the v4 tag's
       # commit; Dependabot tracks SHA pins and proposes updates.
       - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4
-      - name: Provision temporal OBS instance
+      - name: Provision live OBS instance
         env:
           # Enables the BuildKit GitHub Actions cache for the frontend
-          # image build (see tests/temporal/docker-compose.cache.yml).
+          # image build (see tests/live/docker-compose.cache.yml).
           # Local runs leave it unset and build uncached, as before.
-          TEMPORAL_CACHE: "1"
-        run: bash tests/temporal/provision.sh
-      - name: Run live tests against the temporal instance
+          LIVE_CACHE: "1"
+        run: bash tests/live/provision.sh
+      - name: Run live tests against the live instance
         env:
-          GEECTL_TEMPORAL_URL: http://127.0.0.1:3000
+          GEECTL_LIVE_URL: http://127.0.0.1:3000
           # The harness panics (instead of skipping) when this marker
           # is set and the URL is missing: in this job the URL must be
           # wired, so a silent skip would hide drift. Other jobs (and
           # local runs) leave it unset and skip.
-          GEECTL_TEMPORAL_REQUIRED: "true"
-        run: cargo test --locked --test temporal
-      - name: Run OBS live tests against the temporal instance
+          GEECTL_LIVE_REQUIRED: "true"
+        run: cargo test --locked --test live
+      - name: Run OBS live tests against the live instance
         env:
-          GEECTL_TEMPORAL_URL: http://127.0.0.1:3000
+          GEECTL_LIVE_URL: http://127.0.0.1:3000
           # Same marker as above: in this job the URL must be wired,
           # so a silent skip would hide drift.
-          GEECTL_TEMPORAL_REQUIRED: "true"
-        run: cargo test --locked --test temporal_obs
-      - name: Tear down temporal OBS instance
+          GEECTL_LIVE_REQUIRED: "true"
+        run: cargo test --locked --test live_obs
+      - name: Tear down live OBS instance
         if: always()
-        run: bash tests/temporal/teardown.sh
+        run: bash tests/live/teardown.sh
