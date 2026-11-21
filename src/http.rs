@@ -792,6 +792,11 @@ impl HttpClient for UreqClient {
         // state", never a false failure. The caller re-issues the
         // delete itself once it has checked.
         require_credentials_transport(url, credentials)?;
+        // DELETE is single-attempt by design: gate on the retryable set like POST/PUT/GET.
+        debug_assert!(
+            !is_retryable_method("DELETE"),
+            "DELETE must stay non-retryable; a retried delete cannot tell a lost response from a delete that never ran"
+        );
         // Ask for XML, the same defence as GET: the owner search proved
         // a dual-routed path serves the WebUI HTML page unless the request
         // asks for XML. No mutation path has been seen doing it yet, so
