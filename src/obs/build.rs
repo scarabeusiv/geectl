@@ -420,13 +420,35 @@ pub(crate) fn parse_job_status(body: &str) -> Result<Option<JobStatus>, GeectlEr
 /// attribute is a server error, never "no status": no status reads
 /// as `code="unknown"` on the call, not as an empty document.
 pub(crate) fn parse_build_status(body: &str) -> Result<String, GeectlError> {
+    let body = body.trim();
+    // A malformed build status response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <status> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS build status response: not a <status> document",
+            format!(
+                "unexpected OBS build status response: not a <status> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <status> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <status>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     // The document must start with the root element: a `<status>`
     // found later in the body is not a status document, and nothing
     // but whitespace may follow the root element.
@@ -2719,6 +2741,50 @@ mod tests {
         assert!(parse_build_status("junk<status code=\"failed\"/>").is_err());
         assert!(parse_build_status("<status code=\"failed\"/>junk").is_err());
         assert!(parse_build_status("<statusx code=\"failed\"/>").is_err());
+    }
+
+    #[test]
+    fn parse_build_status_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <status>
+        // element; the result is the same as without one.
+        let plain = "<status package=\"foo\" code=\"failed\"/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_build_status(&prolog).unwrap(),
+            parse_build_status(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_build_status(&format!("<?xml?>{plain}")).unwrap(),
+            parse_build_status(plain).unwrap()
+        );
+        assert_eq!(
+            parse_build_status(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_build_status(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <status>.
+        assert!(parse_build_status("<?xml version=\"1.0\" <status></status>").is_err());
+        assert!(parse_build_status("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_build_status("<?xmlfoo version=\"1.0\"?><status></status>").is_err());
+    }
+
+    #[test]
+    fn parse_build_status_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_build_status("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_build_status(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_build_status("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
