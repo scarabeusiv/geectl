@@ -7249,13 +7249,43 @@ pub(crate) fn parse_directory_rev(body: &str) -> Result<DirectoryRev, GeectlErro
 /// `name` of every `<entry>`. An error when the body is not a
 /// `<directory>` document, or when an entry carries no name.
 pub(crate) fn parse_package_names(body: &str) -> Result<Vec<String>, GeectlError> {
+    let body = body.trim();
+    // A malformed listing still fails closed, but the error carries a
+    // bounded preview of what was received, so the failure is
+    // diagnosable instead of a bare "not a directory document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS directory response: not a <directory> document",
+            format!(
+                "unexpected OBS directory response: not a <directory> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the directory element; skip it. The prolog must
+    // terminate (`?>`) — an unterminated prolog is malformed, not a
+    // missing directory.
+    let body = if let Some(after) = body.strip_prefix("<?xml") {
+        let first = after.chars().next();
+        if !matches!(first, Some(c) if c.is_whitespace() || c == '?') {
+            return Err(malformed());
+        }
+        let Some(end) = after.find("?>") else {
+            return Err(malformed());
+        };
+        after[end + 2..].trim_start()
+    } else {
+        body
+    };
     let Some(after_open) = body.strip_prefix("<directory") else {
         return Err(malformed());
     };
@@ -17910,6 +17940,52 @@ mod tests {
         assert!(parse_package_names("<directory name=\"x\">").is_err());
         let body = "<directory name=\"test:factory\"><entry size=\"10\"/></directory>";
         assert!(parse_package_names(body).is_err());
+    }
+
+    #[test]
+    fn parse_package_names_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the directory
+        // element; the result is the same as without one.
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><directory name=\"test:factory\"><entry name=\"pkgA\"/><entry name=\"pkgB\"/></directory>";
+        assert_eq!(
+            parse_package_names(body).unwrap(),
+            vec!["pkgA".to_string(), "pkgB".to_string()]
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_package_names("<?xml?><directory name=\"test:factory\"/>").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_package_names(
+                "<?xml version=\"1.0\"?>\n<directory name=\"test:factory\"><entry name=\"pkgA\"/></directory>"
+            )
+            .unwrap(),
+            vec!["pkgA".to_string()]
+        );
+        // A prolog that never terminates is malformed, not an empty listing.
+        assert!(parse_package_names("<?xml version=\"1.0\" <directory></directory>").is_err());
+        assert!(parse_package_names("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_package_names("<?xmlfoo version=\"1.0\"?><directory></directory>").is_err());
+    }
+
+    #[test]
+    fn parse_package_names_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_package_names("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_package_names(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_package_names("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
