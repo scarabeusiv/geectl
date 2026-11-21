@@ -108,11 +108,14 @@ pub struct BranchPackageArgs {
     /// Add the source project's repositories to the branch project.
     #[arg(long)]
     add_repositories: bool,
-    /// Block the added repositories. Only sent with `--add-repositories`.
-    #[arg(long)]
+    /// Block the added repositories. Only sent with `--add-repositories`
+    /// (clap refuses it without that flag: a block the live run would
+    /// silently drop must fail at parse time, not vanish).
+    #[arg(long, requires = "add_repositories")]
     add_repositories_block: Option<String>,
-    /// Rebuild the added repositories. Only sent with `--add-repositories`.
-    #[arg(long)]
+    /// Rebuild the added repositories. Only sent with `--add-repositories`
+    /// (clap refuses it without that flag, as above).
+    #[arg(long, requires = "add_repositories")]
     add_repositories_rebuild: Option<String>,
     /// Extend the branch package names with the source project name.
     #[arg(long)]
@@ -1075,6 +1078,35 @@ mod tests {
     fn branch_package_requires_project_and_package() {
         parse_fails(&["geectl", "branch", "branch-package", "--package", "foo"]);
         parse_fails(&["geectl", "branch", "branch-package", "--project", "p"]);
+    }
+
+    #[test]
+    fn branch_package_rejects_repositories_block_without_add_repositories() {
+        // A block/rebuild the live run would silently drop must fail
+        // at parse time: the options are only sent with
+        // `--add-repositories`.
+        parse_fails(&[
+            "geectl",
+            "branch",
+            "branch-package",
+            "--project",
+            "p",
+            "--package",
+            "foo",
+            "--add-repositories-block",
+            "local",
+        ]);
+        parse_fails(&[
+            "geectl",
+            "branch",
+            "branch-package",
+            "--project",
+            "p",
+            "--package",
+            "foo",
+            "--add-repositories-rebuild",
+            "local",
+        ]);
     }
 
     #[test]

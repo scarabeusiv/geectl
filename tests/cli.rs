@@ -943,3 +943,72 @@ fn set_link_rev_project_dry_run_text_echoes_the_header() {
     // `no links set` line.
     assert!(!stdout.contains("no links set"), "{stdout}");
 }
+
+#[test]
+fn copy_package_to_apiurl_rejects_a_malformed_url_in_dry_run() {
+    // The target client is built (and its base validated) before the
+    // copy runs, so a malformed URL fails fast in dry-run too —
+    // before any read, with no network touched.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "branch",
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+            "--to-apiurl",
+            "notaurl",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(value["error"]["message"].is_string());
+}
+
+#[test]
+fn copy_package_to_apiurl_dry_run_text_echoes_the_target_instance() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "branch",
+            "copy-package",
+            "--source-project",
+            "test:factory",
+            "--source-package",
+            "foo",
+            "--target-project",
+            "test:target",
+            "--target-package",
+            "foo",
+            "--to-apiurl",
+            "http://127.0.0.1:3000",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The target instance rides the header after `@`.
+    assert!(
+        stdout.starts_with(
+            "copy-package test:factory/foo -> test:target/foo @ http://127.0.0.1:3000\ndry_run: true\n"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[dry-run]"), "{stdout}");
+}

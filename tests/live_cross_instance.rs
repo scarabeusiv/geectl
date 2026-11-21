@@ -140,6 +140,41 @@ fn validate_live_base(raw: &str) -> Result<String, String> {
     Ok(url)
 }
 
+/// The identity of a live instance for the two-URL inequality check:
+/// the normalized loopback host plus the port. `localhost` and `::1`
+/// count as `127.0.0.1`, and a missing port is 80: two URLs naming
+/// the same instance must compare equal even when spelled
+/// differently — `http://127.0.0.1:3000` and
+/// `http://localhost:3000` are one instance, not two. A bracketed
+/// host (`[::1]`) carries its colons inside the brackets, so the
+/// port splits off after the closing bracket, not at the first `:`.
+/// The URLs are already validated bare by `validate_live_base`
+/// when this runs.
+fn live_instance_key(url: &str) -> (String, u16) {
+    let authority = url.strip_prefix("http://").unwrap_or(url);
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((inside, rest)) => (
+                inside,
+                rest.strip_prefix(':')
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(80),
+            ),
+            None => (bracketed, 80),
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, port.parse().unwrap_or(80)),
+            None => (authority, 80),
+        }
+    };
+    let host = match host.to_ascii_lowercase().as_str() {
+        "localhost" | "::1" => "127.0.0.1".to_string(),
+        other => other.to_string(),
+    };
+    (host, port)
+}
+
 /// The two live instances' base URLs, from the environment.
 ///
 /// Returns `None` (skip the test) when either `GEECTL_LIVE_URL` or
@@ -148,9 +183,11 @@ fn validate_live_base(raw: &str) -> Result<String, String> {
 /// instead: the live workflow sets that marker and wires both URLs,
 /// so an absence means the wiring broke, and a silent skip would go
 /// green while hiding drift. A present but invalid value panics in
-/// both cases, as in `tests/live.rs`. The two URLs must differ: both
-/// pointing at the same instance would prove a same-instance copy,
-/// not a cross-instance one, and would pass while proving nothing.
+/// both cases, as in `tests/live.rs`. The two URLs must name
+/// different instances (compared by `live_instance_key`, so
+/// same-instance aliases count as one): both pointing at the same
+/// instance would prove a same-instance copy, not a cross-instance
+/// one, and would pass while proving nothing.
 fn live_urls() -> Option<(String, String)> {
     let first = match std::env::var("GEECTL_LIVE_URL") {
         Ok(v) if !v.trim().is_empty() => v,
@@ -179,7 +216,8 @@ fn live_urls() -> Option<(String, String)> {
     match (validate_live_base(&first), validate_live_base(&second)) {
         (Ok(a), Ok(b)) => {
             assert_ne!(
-                a, b,
+                live_instance_key(&a),
+                live_instance_key(&b),
                 "GEECTL_LIVE_URL and GEECTL_LIVE_URL_2 must point at different instances"
             );
             Some((a, b))
@@ -492,4 +530,33 @@ fn live_cross_instance_copy() {
         ErrorKind::NotFound,
         "a missing package must map to NotFound; got {err:?}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_instance_key_normalizes_loopback_spellings() {
+        assert_eq!(
+            live_instance_key("http://127.0.0.1:3000"),
+            ("127.0.0.1".to_string(), 3000)
+        );
+        assert_eq!(
+            live_instance_key("http://localhost:3000"),
+            ("127.0.0.1".to_string(), 3000)
+        );
+        assert_eq!(
+            live_instance_key("http://LOCALHOST:3000"),
+            ("127.0.0.1".to_string(), 3000)
+        );
+        assert_eq!(
+            live_instance_key("http://[::1]:3000"),
+            ("127.0.0.1".to_string(), 3000)
+        );
+        assert_ne!(
+            live_instance_key("http://127.0.0.1:3000"),
+            live_instance_key("http://127.0.0.1:3001")
+        );
+    }
 }

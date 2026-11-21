@@ -5375,6 +5375,17 @@ mod tests {
         // A listing without one reads as None, not an error.
         let listing = parse_directory("<directory name=\"foo\"></directory>").unwrap();
         assert_eq!(listing.srcmd5, None);
+        // A self-closing listing carries the srcmd5 too: it is read
+        // off the opening tag before the self-closing early return.
+        let listing = parse_directory(
+            "<directory name=\"foo\" srcmd5=\"0123456789abcdef0123456789abcdef\"/>",
+        )
+        .unwrap();
+        assert_eq!(
+            listing.srcmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(listing.entries.is_empty());
     }
 
     #[test]

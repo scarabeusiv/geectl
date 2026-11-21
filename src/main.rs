@@ -4,7 +4,8 @@
 //! Missing required input fails fast with a structured error naming the
 //! missing flag. Stdout carries only the result payload (JSON by default);
 //! every diagnostic, warning, and error goes to stderr. There is exactly
-/// one exit path: the error kind's exit code.
+//! one exit path: the error kind's exit code.
+
 mod cli_branch;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -71,7 +72,6 @@ enum Command {
         #[command(subcommand)]
         // Boxed: the ten branch subcommands make BranchCommand far
         // larger than the other variants (clippy::large_enum_variant).
-        // The integrator boxes each group's command the same way.
         command: Box<cli_branch::BranchCommand>,
     },
 }
