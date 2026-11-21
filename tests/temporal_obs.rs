@@ -250,6 +250,17 @@ fn temporal_package() -> String {
 /// a `home:<user>` project: the accept-cleanup test asserts the
 /// server deletes it once it is empty, and the server keeps
 /// top-level `home:<user>` projects (see `SourceUpdate::Cleanup`).
+///
+/// The package creation retries on a 404 for a bounded time: the
+/// server's API and backend are separate processes, and the API
+/// replies to the project creation before the backend has the
+/// project registered — the immediately following package creation
+/// can then 404 on the just-created project (seen on run 44876734097:
+/// the project PUT returned ok and the package PUT 404'd, while the
+/// same sequence succeeded for the other tests in the same run).
+/// The retry is bounded (30 s) and only retries a not-found
+/// (404, or 410, which the client maps to the same kind), so a
+/// genuinely missing project still fails loudly instead of hanging.
 fn create_source_branch(client: &ObsClient<'_>, package: &str) -> String {
     let source_project = format!("geectl-tmp-src-{}", unique_suffix());
     client
@@ -260,15 +271,24 @@ fn create_source_branch(client: &ObsClient<'_>, package: &str) -> String {
             &DryRun::new(false),
         )
         .expect("create source project on the temporal instance");
-    client
-        .create_package(
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match client.create_package(
             &source_project,
             package,
             "geectl temporal test package",
             "Created by the geectl temporal live test; the instance is destroyed after the run.",
             &DryRun::new(false),
-        )
-        .expect("create source package on the temporal instance");
+        ) {
+            Ok(()) => break,
+            Err(err)
+                if err.kind() == ErrorKind::NotFound && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(err) => panic!("create source package on the temporal instance: {err:?}"),
+        }
+    }
     source_project
 }
 
