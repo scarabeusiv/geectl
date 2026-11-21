@@ -130,6 +130,22 @@ pub fn valid_obs_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | ':'))
 }
 
+/// True when `name` is an OBS attribute name in `NAMESPACE:NAME`
+/// shape: exactly one colon, both sides non-empty. The server's
+/// shape check is only "exactly two parts when split on the colon"
+/// (the branch command's update project attribute, refused with an
+/// ArgumentError otherwise), so an empty namespace passes there and
+/// geectl rejects it deliberately; the maintained attribute is only
+/// looked up by name (`AttribType.find_by_name!`, `RecordNotFound`
+/// when absent), so the same shape check there is client-side
+/// strictness, not a server rule.
+pub fn valid_attribute_name(name: &str) -> bool {
+    let Some((namespace, attr)) = name.split_once(':') else {
+        return false;
+    };
+    !namespace.is_empty() && !attr.is_empty() && !attr.contains(':')
+}
+
 /// True when `name` is a valid OBS source filename for upload.
 /// Mirrors the server's rule (`PackageService::FileVerifier#file_name_invalid?`:
 /// `^[^./][^/]+$` — first character not `.` or `/`, no `/` anywhere;
@@ -3167,6 +3183,121 @@ impl<'a> ObsClient<'a> {
         Ok(diffs)
     }
 
+    /// List the maintained instances of `package`: the projects
+    /// carrying `options`' attribute that the package exists in,
+    /// with where a branch would land. This is the dry-run branch
+    /// call (`POST /source?cmd=branch&dryrun=1`) — it reports, it
+    /// does not branch. The update project attribute in `options`
+    /// decides which update project the report branches from.
+    /// Requires credentials; an unexpected response is an error,
+    /// never an empty list.
+    pub fn maintained_instances(
+        &self,
+        package: &str,
+        options: &MaintenanceBranchOptions,
+    ) -> Result<Vec<MaintainedInstance>, GeectlError> {
+        if !valid_obs_name(package) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS package name: {package:?}"),
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["source"],
+            &self.branch_query(package, options, true),
+        );
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "listing maintained instances requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let body = self.http.post(&url, "", &self.credentials)?;
+        parse_maintained_instances(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS branch dry-run response",
+            )
+        })
+    }
+
+    /// Branch `package` into its maintenance branch project and
+    /// return where it landed. A mutation: the package name is
+    /// validated first, then the DryRun guard — in dry-run nothing is
+    /// branched and None is returned. The branch project defaults to
+    /// `home:<user>:branches:OBS_Maintained:<package>` (the attribute,
+    /// with `:` → `_`); pass a target project in `options` to override
+    /// it. Requires credentials; an unexpected response is an error.
+    /// The server refuses to branch a package whose sources live in
+    /// scmsync ("Fork it instead") — that refusal surfaces as the
+    /// server's error.
+    pub fn maintenance_branch(
+        &self,
+        package: &str,
+        options: &MaintenanceBranchOptions,
+        dry_run: &DryRun,
+    ) -> Result<Option<MaintenanceBranchResult>, GeectlError> {
+        if !valid_obs_name(package) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS package name: {package:?}"),
+            ));
+        }
+        let what = match &options.target_project {
+            Some(target) => format!("branch maintained package {package} to {target}"),
+            None => format!("branch maintained package {package}"),
+        };
+        if !dry_run.allow(&what) {
+            return Ok(None);
+        }
+        let url = build_url(
+            &self.base,
+            &["source"],
+            &self.branch_query(package, options, false),
+        );
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "branching a maintained package requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let body = self.http.post(&url, "", &self.credentials)?;
+        let result = parse_maintenance_branch_result(&body).ok_or_else(|| {
+            GeectlError::new(ErrorKind::ServerError, "unexpected OBS branch response")
+        })?;
+        Ok(Some(result))
+    }
+
+    /// The query parameters for the branch command
+    /// (`POST /source?cmd=branch`), shared by the dry-run listing
+    /// and the live branch: the attribute, the update project
+    /// attribute, the package, and the target project override when
+    /// set. The dry-run flag is added only for the listing.
+    fn branch_query<'b>(
+        &self,
+        package: &'b str,
+        options: &'b MaintenanceBranchOptions,
+        dry_run: bool,
+    ) -> Vec<(&'b str, &'b str)> {
+        let mut query: Vec<(&str, &str)> = vec![
+            ("cmd", "branch"),
+            ("attribute", &options.attribute),
+            (
+                "update_project_attribute",
+                &options.update_project_attribute,
+            ),
+            ("package", package),
+        ];
+        if let Some(target_project) = &options.target_project {
+            query.push(("target_project", target_project));
+        }
+        if dry_run {
+            query.push(("dryrun", "1"));
+        }
+        query
+    }
+
     /// Build the OBS search URL for open submit requests targeting
     /// `package`. The match expression is XPath over the request XML;
     /// the submit restriction is applied client-side in
@@ -5747,27 +5878,8 @@ fn request_block_matches_action(block: &str, action_type: &str, shape: ActionSha
 /// own — `subtype="..."` must not match — so the character before
 /// `type=` has to be whitespace.
 fn action_tag_type(element: &str) -> Option<String> {
-    let mut rest = element;
-    while let Some(pos) = rest.find("type=") {
-        if pos > 0 && !rest.as_bytes()[pos - 1].is_ascii_whitespace() {
-            rest = &rest[pos + "type=".len()..];
-            continue;
-        }
-        let after_eq = &rest[pos + "type=".len()..];
-        let quote = after_eq.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
-        }
-        let close = after_eq[1..].find(quote)?;
-        let value = &after_eq[1..1 + close];
-        if value.is_empty() {
-            return None;
-        }
-        return Some(value.to_string());
-    }
-    None
+    tag_attr(element, "type")
 }
-
 /// True when an OBS response body carries `<status code="ok" ...>`.
 /// The write endpoints (request `changestate`, source delete) answer
 /// `render_ok` on success; any other status code in the body — or no
@@ -5812,6 +5924,134 @@ pub(crate) fn parse_status_ok(body: &str) -> bool {
         return &after_eq[1..1 + close] == "ok";
     }
     false
+}
+
+/// The opening tag of the first `<name ...>` element in `body`
+/// (without the closing `>`), or None when there is none. The name
+/// must end at the tag boundary, so `<package>` does not match
+/// `<packages>`.
+fn find_element_tag<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}");
+    let mut rest = body;
+    while let Some(pos) = rest.find(&open) {
+        let after_tag = &rest[pos + open.len()..];
+        let first = after_tag.chars().next()?;
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        let end = after_tag.find('>')?;
+        return Some(&after_tag[..end]);
+    }
+    None
+}
+
+/// The maintained instances in a dry-run branch report:
+/// `<collection><package project package><devel project package/>?
+/// <target project package/></package>...</collection>`. None when
+/// the body is not a collection at all, or when a package element is
+/// malformed (missing source names, or no target). An empty
+/// collection reads as an empty list, not None. The report's target
+/// package carries the source project appended, colons intact; the
+/// parser translates `:` to `_`, matching the live branch name.
+pub(crate) fn parse_maintained_instances(body: &str) -> Option<Vec<MaintainedInstance>> {
+    if !body.contains("<collection") {
+        return None;
+    }
+    let mut instances = Vec::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find("<package") {
+        let after_tag = &rest[pos + "<package".len()..];
+        let first = after_tag.chars().next()?;
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        let end = after_tag.find('>')?;
+        let tag = &after_tag[..end];
+        let source_project = tag_attr(tag, "project")?;
+        let source_package = tag_attr(tag, "package")?;
+        if tag.trim_end().ends_with('/') {
+            // Self-closing: no children, so no target — malformed.
+            return None;
+        }
+        let after_open = &after_tag[end + 1..];
+        let close = after_open.find("</package>")?;
+        let inner = &after_open[..close];
+        // Optional <devel project package/>: only when the package
+        // has a devel package to copy newer sources from.
+        let (devel_project, devel_package) = match find_element_tag(inner, "devel") {
+            Some(devel_tag) => (
+                Some(tag_attr(devel_tag, "project")?),
+                Some(tag_attr(devel_tag, "package")?),
+            ),
+            None => (None, None),
+        };
+        let target_tag = find_element_tag(inner, "target")?;
+        let target_project = tag_attr(target_tag, "project")?;
+        // The report names the target package with the source project
+        // appended, colons intact (`foo.openSUSE:Leap:15.6:Update`);
+        // the live branch translates `:` to `_`, so the listing does
+        // the same — otherwise it would report a package name that
+        // never lands.
+        let target_package = tag_attr(target_tag, "package")?.replace(':', "_");
+        instances.push(MaintainedInstance {
+            source_project,
+            source_package,
+            devel_project,
+            devel_package,
+            target_project,
+            target_package,
+        });
+        rest = &after_open[close + "</package>".len()..];
+    }
+    Some(instances)
+}
+
+/// The branch result in a `render_ok` branch response:
+/// `<status code="ok"><data name="target_project">...</data>...`.
+/// `target_project` is required; the rest is present only for a
+/// single-package branch. None when the status is not ok or the
+/// target project is missing.
+pub(crate) fn parse_maintenance_branch_result(body: &str) -> Option<MaintenanceBranchResult> {
+    if !parse_status_ok(body) {
+        return None;
+    }
+    let mut target_project = None;
+    let mut target_package = None;
+    let mut source_project = None;
+    let mut source_package = None;
+    let mut rest = body;
+    while let Some(pos) = rest.find("<data") {
+        let after_tag = &rest[pos + "<data".len()..];
+        let first = after_tag.chars().next()?;
+        if !(first.is_whitespace() || first == '>') {
+            rest = after_tag;
+            continue;
+        }
+        let end = after_tag.find('>')?;
+        let tag = &after_tag[..end];
+        let name = tag_attr(tag, "name")?;
+        let inner = &after_tag[end + 1..];
+        let close = inner.find("</data>")?;
+        let value = &inner[..close];
+        if !value.is_empty() {
+            match name.as_str() {
+                "target_project" => target_project = Some(value.to_string()),
+                "target_package" => target_package = Some(value.to_string()),
+                "project" => source_project = Some(value.to_string()),
+                "package" => source_package = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        rest = &inner[close + "</data>".len()..];
+    }
+    Some(MaintenanceBranchResult {
+        target_project: target_project?,
+        target_package,
+        source_project,
+        source_package,
+    })
 }
 
 /// Parse the revision number out of a backend `<revision>` document
@@ -8054,6 +8294,115 @@ pub enum DeleteTarget {
     Repository(String),
     /// Delete the whole target project.
     WholeProject,
+}
+
+/// One maintained instance of a package: a project carrying the
+/// maintenance attribute, with the package it would branch from and
+/// where the branch would land. From the dry-run branch report
+/// (`POST /source?cmd=branch&dryrun=1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintainedInstance {
+    /// The project the package is branched from.
+    pub source_project: String,
+    /// The package that would be branched.
+    pub source_package: String,
+    /// The devel project the branch copies newer sources from, when
+    /// the package has a devel package.
+    pub devel_project: Option<String>,
+    /// The devel package the branch copies newer sources from.
+    pub devel_package: Option<String>,
+    /// The project the branch would land in.
+    pub target_project: String,
+    /// The package the branch would land as — the report's name with
+    /// `:` → `_`, matching the live branch.
+    pub target_package: String,
+}
+
+/// Options for branching a maintained package (`POST
+/// /source?cmd=branch`). The attribute marks which projects maintain
+/// the package; the update project attribute points each of them at
+/// its update project; the target project overrides the
+/// server-derived branch project.
+#[derive(Debug, Clone)]
+pub struct MaintenanceBranchOptions {
+    attribute: String,
+    update_project_attribute: String,
+    target_project: Option<String>,
+}
+
+impl MaintenanceBranchOptions {
+    /// Defaults: attribute `OBS:Maintained`, update project
+    /// attribute `OBS:UpdateProject`, no target project override
+    /// (the server derives
+    /// `home:<user>:branches:OBS_Maintained:<package>` — the attribute
+    /// with `:` → `_`).
+    pub fn new() -> Self {
+        MaintenanceBranchOptions {
+            attribute: "OBS:Maintained".to_string(),
+            update_project_attribute: "OBS:UpdateProject".to_string(),
+            target_project: None,
+        }
+    }
+
+    /// The attribute that marks a project as maintaining the package
+    /// (`NAMESPACE:NAME`, e.g. `OBS:Maintained`).
+    pub fn with_attribute(mut self, attribute: &str) -> Result<Self, GeectlError> {
+        if !valid_attribute_name(attribute) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS attribute name: {attribute:?} (expected NAMESPACE:NAME)"),
+            ));
+        }
+        self.attribute = attribute.to_string();
+        Ok(self)
+    }
+
+    /// The attribute that points a project at its update project
+    /// (`NAMESPACE:NAME`, e.g. `OBS:UpdateProject`). The server
+    /// refuses a value that is not in that shape.
+    pub fn with_update_project_attribute(mut self, attribute: &str) -> Result<Self, GeectlError> {
+        if !valid_attribute_name(attribute) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS attribute name: {attribute:?} (expected NAMESPACE:NAME)"),
+            ));
+        }
+        self.update_project_attribute = attribute.to_string();
+        Ok(self)
+    }
+
+    /// Branch into this project instead of the server-derived one.
+    pub fn with_target_project(mut self, target_project: &str) -> Result<Self, GeectlError> {
+        if !valid_obs_name(target_project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name for target project: {target_project:?}"),
+            ));
+        }
+        self.target_project = Some(target_project.to_string());
+        Ok(self)
+    }
+}
+
+impl Default for MaintenanceBranchOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Where a maintenance branch landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceBranchResult {
+    /// The project the branch landed in.
+    pub target_project: String,
+    /// The package the branch landed as. None when several packages
+    /// were branched: the server then reports only the project.
+    pub target_package: Option<String>,
+    /// The project the package was branched from (single-package
+    /// branches only).
+    pub source_project: Option<String>,
+    /// The package that was branched (single-package branches only).
+    pub source_package: Option<String>,
 }
 
 /// The validated delete-request payload: what gets deleted, and
@@ -21723,5 +22072,285 @@ description</description>
                 .unwrap(),
             "1400001".to_string()
         );
+    }
+
+    // --- maintained_instances / maintenance_branch ---
+
+    fn dry_run_report() -> &'static str {
+        "<collection><package project=\"openSUSE:Leap:15.6:Update\" package=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\" /><target project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.6:Update\" /></package><package project=\"openSUSE:Leap:15.5:Update\" package=\"foo\"><target project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.5:Update\" /></package></collection>"
+    }
+
+    #[test]
+    fn maintained_instances_parses_dry_run_report() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source?cmd=branch&attribute=OBS%3AMaintained&update_project_attribute=OBS%3AUpdateProject&package=foo&dryrun=1",
+            dry_run_report(),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let instances = client
+            .maintained_instances("foo", &MaintenanceBranchOptions::new())
+            .unwrap();
+        assert_eq!(
+            instances,
+            vec![
+                MaintainedInstance {
+                    source_project: "openSUSE:Leap:15.6:Update".to_string(),
+                    source_package: "foo".to_string(),
+                    devel_project: Some("devel:languages:python".to_string()),
+                    devel_package: Some("foo".to_string()),
+                    target_project: "home:alice:branches:OBS_Maintained:foo".to_string(),
+                    target_package: "foo.openSUSE_Leap_15.6_Update".to_string(),
+                },
+                MaintainedInstance {
+                    source_project: "openSUSE:Leap:15.5:Update".to_string(),
+                    source_package: "foo".to_string(),
+                    devel_project: None,
+                    devel_package: None,
+                    target_project: "home:alice:branches:OBS_Maintained:foo".to_string(),
+                    target_package: "foo.openSUSE_Leap_15.5_Update".to_string(),
+                },
+            ]
+        );
+        // The listing is a POST (the branch command), with an empty
+        // body, and it carried the credentials.
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].1, "");
+        assert!(posted[0].2);
+    }
+
+    #[test]
+    fn maintained_instances_empty_collection_is_empty() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source?cmd=branch&attribute=OBS%3AMaintained&update_project_attribute=OBS%3AUpdateProject&package=foo&dryrun=1",
+            "<collection></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .maintained_instances("foo", &MaintenanceBranchOptions::new())
+                .unwrap(),
+            Vec::<MaintainedInstance>::new()
+        );
+    }
+
+    #[test]
+    fn maintained_instances_malformed_is_server_error_not_empty() {
+        // Not a collection at all: a failed lookup, never "no
+        // maintained instances".
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source?cmd=branch&attribute=OBS%3AMaintained&update_project_attribute=OBS%3AUpdateProject&package=foo&dryrun=1",
+            "not xml",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .maintained_instances("foo", &MaintenanceBranchOptions::new())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        // A package element without a target is malformed too.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source?cmd=branch&attribute=OBS%3AMaintained&update_project_attribute=OBS%3AUpdateProject&package=foo&dryrun=1",
+            "<collection><package project=\"openSUSE:Leap:15.6:Update\" package=\"foo\"></package></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .maintained_instances("foo", &MaintenanceBranchOptions::new())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn maintained_instances_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .maintained_instances("foo", &MaintenanceBranchOptions::new())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn maintained_instances_rejects_invalid_package_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .maintained_instances("foo/bar", &MaintenanceBranchOptions::new())
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn maintenance_branch_live_returns_target() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source?cmd=branch&attribute=OBS%3AMaintained&update_project_attribute=OBS%3AUpdateProject&package=foo",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"target_project\">home:alice:branches:OBS_Maintained:foo</data><data name=\"target_package\">foo</data><data name=\"project\">openSUSE:Leap:15.6:Update</data><data name=\"package\">foo</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        assert_eq!(
+            client
+                .maintenance_branch("foo", &MaintenanceBranchOptions::new(), &dry)
+                .unwrap(),
+            Some(MaintenanceBranchResult {
+                target_project: "home:alice:branches:OBS_Maintained:foo".to_string(),
+                target_package: Some("foo".to_string()),
+                source_project: Some("openSUSE:Leap:15.6:Update".to_string()),
+                source_package: Some("foo".to_string()),
+            })
+        );
+        // No dryrun flag on the live call, empty body, credentials sent.
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(
+            posted[0].0,
+            "https://api.opensuse.org/source?cmd=branch&attribute=OBS%3AMaintained&update_project_attribute=OBS%3AUpdateProject&package=foo"
+        );
+        assert_eq!(posted[0].1, "");
+        assert!(posted[0].2);
+    }
+
+    #[test]
+    fn maintenance_branch_multi_package_reports_only_project() {
+        // Several packages branched: the server reports only the
+        // target project (plus the deprecated targetproject alias,
+        // which the parser ignores).
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source?cmd=branch&attribute=OBS%3AMaintained&update_project_attribute=OBS%3AUpdateProject&package=foo",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"target_project\">home:alice:branches:OBS_Maintained:foo</data><data name=\"targetproject\">home:alice:branches:OBS_Maintained:foo</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        assert_eq!(
+            client
+                .maintenance_branch("foo", &MaintenanceBranchOptions::new(), &dry)
+                .unwrap(),
+            Some(MaintenanceBranchResult {
+                target_project: "home:alice:branches:OBS_Maintained:foo".to_string(),
+                target_package: None,
+                source_project: None,
+                source_package: None,
+            })
+        );
+    }
+
+    #[test]
+    fn maintenance_branch_dry_run_returns_none_and_posts_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        assert_eq!(
+            client
+                .maintenance_branch("foo", &MaintenanceBranchOptions::new(), &dry)
+                .unwrap(),
+            None
+        );
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: branch maintained package foo".to_string()]
+        );
+    }
+
+    #[test]
+    fn maintenance_branch_dry_run_rejects_invalid_package() {
+        // Validation runs before the DryRun guard: a dry-run with an
+        // invalid package name fails, like the filing methods.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        assert!(client
+            .maintenance_branch("foo/bar", &MaintenanceBranchOptions::new(), &dry)
+            .is_err());
+        assert!(http.post_calls().is_empty());
+        assert!(dry.plan().is_empty());
+    }
+
+    #[test]
+    fn maintenance_branch_with_target_project_override() {
+        let options = MaintenanceBranchOptions::new()
+            .with_target_project("home:alice:branches:custom")
+            .unwrap();
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source?cmd=branch&attribute=OBS%3AMaintained&update_project_attribute=OBS%3AUpdateProject&package=foo&target_project=home%3Aalice%3Abranches%3Acustom",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"target_project\">home:alice:branches:custom</data><data name=\"target_package\">foo</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        assert_eq!(
+            client
+                .maintenance_branch("foo", &options, &dry)
+                .unwrap()
+                .unwrap()
+                .target_project,
+            "home:alice:branches:custom".to_string()
+        );
+    }
+
+    #[test]
+    fn maintenance_branch_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dry = DryRun::new(false);
+        let err = client
+            .maintenance_branch("foo", &MaintenanceBranchOptions::new(), &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn maintenance_branch_options_reject_invalid_values() {
+        assert!(MaintenanceBranchOptions::new()
+            .with_attribute("no-colon")
+            .is_err());
+        assert!(MaintenanceBranchOptions::new()
+            .with_attribute("OBS:")
+            .is_err());
+        assert!(MaintenanceBranchOptions::new()
+            .with_attribute(":Maintained")
+            .is_err());
+        assert!(MaintenanceBranchOptions::new()
+            .with_update_project_attribute("a:b:c")
+            .is_err());
+        assert!(MaintenanceBranchOptions::new()
+            .with_target_project("foo/bar")
+            .is_err());
+        // The defaults are the server defaults.
+        let options = MaintenanceBranchOptions::new();
+        assert_eq!(options.attribute, "OBS:Maintained");
+        assert_eq!(options.update_project_attribute, "OBS:UpdateProject");
+        assert_eq!(options.target_project, None);
+    }
+
+    #[test]
+    fn parse_maintenance_branch_result_rejects_non_ok_and_missing_target() {
+        assert!(parse_maintenance_branch_result(
+            "<status code=\"error\"><summary>nope</summary></status>"
+        )
+        .is_none());
+        assert!(parse_maintenance_branch_result(
+            "<status code=\"ok\"><summary>Ok</summary></status>"
+        )
+        .is_none());
+        assert!(parse_maintenance_branch_result("not xml").is_none());
+    }
+
+    #[test]
+    fn tag_attr_reads_quoted_values_and_respects_boundaries() {
+        assert_eq!(
+            tag_attr("<package project=\"foo\" package='bar' />", "project").unwrap(),
+            "foo".to_string()
+        );
+        assert_eq!(
+            tag_attr("<package project=\"foo\" package='bar' />", "package").unwrap(),
+            "bar".to_string()
+        );
+        // `myproject` does not read as `project`.
+        assert!(tag_attr("<package myproject=\"foo\" />", "project").is_none());
+        // Unquoted or empty: no value.
+        assert!(tag_attr("<package project=foo />", "project").is_none());
+        assert!(tag_attr("<package project=\"\" />", "project").is_none());
+        assert!(tag_attr("<package />", "project").is_none());
     }
 }
