@@ -801,8 +801,8 @@ pub(crate) fn xml_child_elements<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::obs::xml_attr;
-    use crate::obs::xml_split_element;
+    use crate::obs::build::xml_attr;
+    use crate::obs::build::xml_split_element;
 
     const META: &str = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/><person userid=\"alice\" role=\"maintainer\"/><lock><enable/></lock></package>";
 
