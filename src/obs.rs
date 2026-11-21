@@ -1718,6 +1718,37 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// PUT `url` with `body`, retrying a not-found while `budget`
+    /// lasts: the server's API answers before its backend has
+    /// registered a just-created parent, so a PUT that follows a
+    /// creation can 404 on a parent that is about to exist. Only a
+    /// not-found retries — a 410 maps to the same kind — and the
+    /// retry sleeps 500 ms between attempts, so a genuinely missing
+    /// parent still fails loudly once the budget runs out instead of
+    /// hanging. The PUT is idempotent, so a retry cannot duplicate
+    /// anything. Callers pass the budget; [`ObsClient::create_package`]
+    /// passes 30 s.
+    fn put_with_registration_retry(
+        &self,
+        url: &str,
+        body: &str,
+        budget: std::time::Duration,
+    ) -> Result<String, GeectlError> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            match self.http.put(url, body, &self.credentials) {
+                Ok(body) => return Ok(body),
+                Err(err)
+                    if err.kind() == ErrorKind::NotFound
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// Create package `package` in project `project` on OBS (`PUT
     /// /source/<project>/<package>/_meta`) with the given title and
     /// description. Requires credentials; without them the call fails
@@ -1731,6 +1762,15 @@ impl<'a> ObsClient<'a> {
     /// operation when it migrates its branch creation onto geectl.
     /// Success is the `<status code="ok"/>` body: any other body is
     /// a server error, never success.
+    ///
+    /// The PUT retries a not-found for a bounded 30 s: the server's
+    /// API and backend are separate processes, and the API replies to
+    /// the project creation before the backend has the project
+    /// registered — the immediately following package creation can
+    /// then 404 on the just-created project (seen on temporal run
+    /// 44876734097). Only a not-found retries, so anything else still
+    /// fails loudly; a genuinely missing project takes about 30 s to
+    /// fail instead of failing fast.
     pub fn create_package(
         &self,
         project: &str,
@@ -1768,7 +1808,8 @@ impl<'a> ObsClient<'a> {
             xml_escape(description),
         );
         let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
-        let body = self.http.put(&url, &meta, &self.credentials)?;
+        let body =
+            self.put_with_registration_retry(&url, &meta, std::time::Duration::from_secs(30))?;
         if parse_status_ok(&body) {
             Ok(())
         } else {
@@ -6756,7 +6797,7 @@ fn validate_xpath_value(label: &str, value: &str) -> Result<(), GeectlError> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
 
     /// A fake HTTP client with canned responses, for fixtures. GET,
     /// POST, and DELETE are keyed separately by URL; a URL with no
@@ -6770,6 +6811,7 @@ mod tests {
         post_errors: RefCell<HashMap<String, ErrorKind>>,
         deletes: RefCell<HashMap<String, String>>,
         puts: RefCell<HashMap<String, String>>,
+        put_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
         get_calls: RefCell<Vec<(String, bool)>>,
         post_calls: RefCell<Vec<(String, String, bool)>>,
         delete_calls: RefCell<Vec<(String, bool)>>,
@@ -6785,6 +6827,7 @@ mod tests {
                 post_errors: RefCell::new(HashMap::new()),
                 deletes: RefCell::new(HashMap::new()),
                 puts: RefCell::new(HashMap::new()),
+                put_errors: RefCell::new(HashMap::new()),
                 get_calls: RefCell::new(Vec::new()),
                 post_calls: RefCell::new(Vec::new()),
                 delete_calls: RefCell::new(Vec::new()),
@@ -6827,6 +6870,17 @@ mod tests {
             self.puts
                 .borrow_mut()
                 .insert(url.to_string(), body.to_string());
+            self
+        }
+
+        /// Answer the next PUTs to `url` with these errors, in order;
+        /// once the queue is empty the canned `puts` body answers.
+        /// Lets a test model a backend that is not ready yet and then
+        /// catches up, instead of a single static answer.
+        fn with_put_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
+            self.put_errors
+                .borrow_mut()
+                .insert(url.to_string(), kinds.iter().copied().collect());
             self
         }
 
@@ -6937,6 +6991,17 @@ mod tests {
             self.put_calls
                 .borrow_mut()
                 .push((url.to_string(), body.to_string(), authed));
+            if let Some(kind) = self
+                .put_errors
+                .borrow_mut()
+                .get_mut(url)
+                .and_then(|queue| queue.pop_front())
+            {
+                return Err(GeectlError::new(
+                    kind,
+                    format!("canned PUT error for {url}"),
+                ));
+            }
             self.puts.borrow().get(url).cloned().ok_or_else(|| {
                 GeectlError::new(
                     ErrorKind::NetworkError,
@@ -8155,6 +8220,91 @@ mod tests {
             "<package name=\"foo\" project=\"home:alice\"><title>Foo</title><description>Temporal test package</description></package>"
         );
         assert!(puts[0].2);
+    }
+
+    #[test]
+    fn create_package_retries_not_found_then_succeeds() {
+        // The server's API replies to the project creation before
+        // its backend has the project registered, so the immediately
+        // following package PUT can 404 on the just-created project
+        // (temporal run 44876734097). The library retries a
+        // not-found; the second PUT lands.
+        let http = FakeHttp::new()
+            .with_put_error_sequence(
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
+                &[ErrorKind::NotFound],
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .create_package(
+                "home:alice",
+                "foo",
+                "Foo",
+                "Temporal test package",
+                &DryRun::new(false)
+            )
+            .is_ok());
+        assert_eq!(http.put_calls().len(), 2);
+    }
+
+    #[test]
+    fn create_package_persistent_not_found_surfaces_after_the_budget() {
+        // A genuinely missing project still fails loudly once the
+        // budget runs out: with a 400 ms budget the helper tries
+        // twice (the first failure, one 500 ms sleep, the second
+        // failure past the deadline) and returns the not-found
+        // instead of hanging. The production budget is 30 s, passed
+        // by create_package; the helper takes the budget so this
+        // test does not have to wait it out.
+        let http = FakeHttp::new().with_put_error_sequence(
+            "https://api.opensuse.org/source/home:alice/foo/_meta",
+            &[
+                ErrorKind::NotFound,
+                ErrorKind::NotFound,
+                ErrorKind::NotFound,
+            ],
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .put_with_registration_retry(
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\" />",
+                std::time::Duration::from_millis(400),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(http.put_calls().len(), 2);
+    }
+
+    #[test]
+    fn create_package_does_not_retry_other_errors() {
+        // Only a not-found retries: a server error fails fast on
+        // the first attempt instead of burning the budget.
+        let http = FakeHttp::new()
+            .with_put_error_sequence(
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
+                &[ErrorKind::ServerError],
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:alice/foo/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .create_package(
+                "home:alice",
+                "foo",
+                "Foo",
+                "Temporal test package",
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert_eq!(http.put_calls().len(), 1);
     }
 
     #[test]
