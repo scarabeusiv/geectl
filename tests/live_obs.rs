@@ -64,6 +64,8 @@
 //! requests unless explicitly authorised) is documented on
 //! `ObsClient::change_state` in `src/obs.rs`, and the server stays
 //! the authority on who may move a request.
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
@@ -222,18 +224,28 @@ fn live_client_authed(base: &str) -> ObsClient<'_> {
         .expect("the live base is a loopback http URL")
 }
 
+/// A per-call counter folded into the suffix: the clock reading
+/// alone is not enough — two parallel tests can read the same
+/// nanosecond tick (the clock's granularity is coarser than a
+/// nanosecond), and the dedup guard then trips on the shared name
+/// (issue #39). The counter makes every call distinct within the
+/// process; the pid keeps it distinct across processes.
+static SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// A suffix that makes a test's projects unique: the process id plus
-/// a nanosecond timestamp. The live tests run in parallel in one
-/// process, and the instance is shared with the `live` target's
-/// tests, so two tests must never create the same project — a name
-/// collision would file one test's request against another's branch.
-/// Only digits and hyphens: a valid OBS name fragment.
+/// a nanosecond timestamp plus a per-call counter. The live tests
+/// run in parallel in one process, and the instance is shared with
+/// the `live` target's tests, so two tests must never create the
+/// same project — a name collision would file one test's request
+/// against another's branch. Only digits and hyphens: a valid OBS
+/// name fragment.
 fn unique_suffix() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time is after the epoch")
         .as_nanos();
-    format!("{}-{nanos}", std::process::id())
+    let n = SUFFIX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{nanos}-{n}", std::process::id())
 }
 
 /// A package name unique to this test run. The projects already
@@ -1745,5 +1757,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(filing.file(&payload).unwrap(), None);
+    }
+
+    #[test]
+    fn unique_suffix_is_distinct_across_parallel_calls() {
+        // The live tests run in parallel in one process, and two calls
+        // in the same clock tick used to return the same suffix,
+        // tripping the dedup guard (issue #39). Hammer the generator
+        // from several threads and require every returned suffix
+        // distinct.
+        use std::collections::HashSet;
+        let threads = 8;
+        let per_thread = 1_000;
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    (0..per_thread).map(|_| unique_suffix()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        for handle in handles {
+            for suffix in handle.join().expect("generator thread panicked") {
+                assert!(seen.insert(suffix), "duplicate suffix from parallel calls");
+            }
+        }
+        assert_eq!(seen.len(), threads * per_thread);
     }
 }
