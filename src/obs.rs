@@ -5233,14 +5233,26 @@ fn request_tag_id(element: &str) -> Option<String> {
             continue;
         }
         let after_eq = &rest[pos + "id=".len()..];
-        let quote = after_eq.chars().next()?;
+        // A malformed occurrence (an unquoted value, a value whose
+        // closing quote never comes, or a non-numeric value) does not
+        // stop the scan: a later well-formed occurrence still carries
+        // the id. Same treatment as `quoted_attr_value`.
+        let Some(quote) = after_eq.chars().next() else {
+            rest = after_eq;
+            continue;
+        };
         if quote != '"' && quote != '\'' {
-            return None;
+            rest = after_eq;
+            continue;
         }
-        let close = after_eq[1..].find(quote)?;
+        let Some(close) = after_eq[1..].find(quote) else {
+            rest = &after_eq[1..];
+            continue;
+        };
         let id = &after_eq[1..1 + close];
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
-            return None;
+            rest = &after_eq[1 + close + 1..];
+            continue;
         }
         return Some(id.to_string());
     }
@@ -10534,6 +10546,33 @@ mod tests {
             parse_request_id("<request id='1400001'></request>"),
             Some("1400001".to_string())
         );
+    }
+
+    #[test]
+    fn request_tag_id_skips_a_malformed_first_occurrence() {
+        // An unquoted first occurrence does not stop the scan: the
+        // well-formed later one wins.
+        assert_eq!(
+            request_tag_id(" id=abc id=\"1400001\""),
+            Some("1400001".to_string())
+        );
+        // An unterminated first occurrence likewise does not stop it:
+        // its opening quote never closes (the later value quotes with
+        // the other style, so it cannot close the first one).
+        assert_eq!(
+            request_tag_id(" id=\"1400001 id='1400002'"),
+            Some("1400002".to_string())
+        );
+        // A non-numeric first occurrence likewise does not stop it.
+        assert_eq!(
+            request_tag_id(" id=\"abc\" id=\"1400001\""),
+            Some("1400001".to_string())
+        );
+        // Every occurrence malformed: None, not a partial id.
+        assert_eq!(request_tag_id(" id=abc"), None);
+        assert_eq!(request_tag_id(" id=\"abc\""), None);
+        assert_eq!(request_tag_id(" id=\"1400001"), None);
+        assert_eq!(request_tag_id(" id="), None);
     }
 
     #[test]
