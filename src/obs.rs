@@ -111,7 +111,10 @@ use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{is_loopback_url, HttpClient};
 use crate::url::{encode_path_segment, encode_query_value, UrlBuilder};
-use crate::xml::{find_attr, scan_tag, xml_escape, xml_unescape, XmlDoc};
+use crate::xml::{
+    find_attr, find_tag_end, scan_tag, xml_child_elements, xml_elements, xml_escape, xml_unescape,
+    XmlDoc,
+};
 use std::cell::RefCell;
 use std::fmt;
 
@@ -10641,38 +10644,7 @@ fn action_types(xml: &str) -> Result<Vec<String>, GeectlError> {
     Ok(types)
 }
 
-/// Read the value of attribute `name` in an opening tag's text (the
-/// text between `<tag` and `>`). Either quote style works, and the
-/// attribute name must stand on its own — `valid="..."` must not match
-/// a lookup for `id` — so the character before the name has to be
-/// whitespace. None when the attribute is absent or unquoted. The
-/// value is XML-unescaped: an attribute the server sent as
-/// `details="a &amp; b"` reads as `a & b`.
-/// The index of the first `>` in `s` that is not inside a quoted
-/// attribute value, if any. A `>` inside a value (e.g. in a `details`
-/// attribute) does not end the tag; scanning for it naively would
-/// truncate the tag and drop the attributes after it.
-fn find_tag_end(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut in_quote: Option<u8> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_quote {
-            if b == q {
-                in_quote = None;
-            }
-        } else if b == b'"' || b == b'\'' {
-            in_quote = Some(b);
-        } else if b == b'>' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn xml_attr(element: &str, name: &str) -> Option<String> {
+pub(crate) fn xml_attr(element: &str, name: &str) -> Option<String> {
     // Quote-aware: a `name=` inside an earlier attribute's value
     // (e.g. `details="x dirty=y"`) must not match. The scan tracks
     // whether it is inside a quoted value and only matches outside
@@ -10748,62 +10720,11 @@ fn xml_element_text(body: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Each occurrence of element `name` in `body`, as its full text
-/// including the tags. The tag name must end at whitespace, `/`, or
-/// `>` (so `<resultlist>` never matches a search for `<result`).
-/// An unterminated element is a server error: the scan fails instead
-/// of returning the partial list, so a truncated document never reads
-/// as a smaller matrix.
-fn xml_elements<'a>(body: &'a str, name: &str) -> Result<Vec<&'a str>, GeectlError> {
-    let unterminated = || {
-        GeectlError::new(
-            ErrorKind::ServerError,
-            format!("unexpected OBS response: unterminated <{name}> element"),
-        )
-    };
-    let mut out = Vec::new();
-    let mut offset = 0;
-    let open_marker = format!("<{name}");
-    let close_marker = format!("</{name}>");
-    while offset < body.len() {
-        let rest = &body[offset..];
-        let Some(pos) = rest.find(&open_marker) else {
-            break;
-        };
-        let after_tag = &rest[pos + open_marker.len()..];
-        let Some(first) = after_tag.chars().next() else {
-            return Err(unterminated());
-        };
-        if !(first.is_whitespace() || first == '/' || first == '>') {
-            offset += pos + open_marker.len();
-            continue;
-        }
-        let Some(end) = find_tag_end(after_tag) else {
-            return Err(unterminated());
-        };
-        let tag = &after_tag[..end];
-        let elem_start = offset + pos;
-        if tag.trim_end().ends_with('/') {
-            // Self-closing: the element is just the tag.
-            out.push(&body[elem_start..elem_start + open_marker.len() + end + 1]);
-            offset = elem_start + open_marker.len() + end + 1;
-            continue;
-        }
-        let Some(close) = after_tag[end + 1..].find(&close_marker) else {
-            return Err(unterminated());
-        };
-        let full_end = end + 1 + close + close_marker.len();
-        out.push(&body[elem_start..elem_start + open_marker.len() + full_end]);
-        offset = elem_start + open_marker.len() + full_end;
-    }
-    Ok(out)
-}
-
 /// Split a full element text (`<name ...>...</name>` or `<name .../>`,
 /// as returned by [`xml_elements`]) into its opening tag (without the
 /// brackets) and its inner content. The inner content is empty for a
 /// self-closing element.
-fn xml_split_element<'a>(element: &'a str, name: &str) -> (&'a str, &'a str) {
+pub(crate) fn xml_split_element<'a>(element: &'a str, name: &str) -> (&'a str, &'a str) {
     let after_lt = element.strip_prefix('<').unwrap_or(element);
     let Some(end) = find_tag_end(after_lt) else {
         return (after_lt, "");
@@ -10849,165 +10770,6 @@ where
             format!("unexpected OBS response: missing attribute {name}"),
         )
     })
-}
-
-/// The index just past the element starting at `start` (the `<` of
-/// its opening tag), honouring nesting of the same element name.
-/// None when the element is unterminated. The opening tag must not be
-/// self-closing: the caller checks that first.
-fn xml_element_end(inner: &str, start: usize, name: &str) -> Option<usize> {
-    let after_lt = &inner[start + 1..];
-    let gt = find_tag_end(after_lt)?;
-    let mut depth = 1;
-    let mut scan = start + 1 + gt + 1;
-    while scan < inner.len() {
-        let lt = inner[scan..].find('<')?;
-        let pos = scan + lt;
-        let after = &inner[pos + 1..];
-        if let Some(after_slash) = after.strip_prefix('/') {
-            // Closing tag: which element does it close?
-            let cname_end = after_slash
-                .find(|c: char| c.is_whitespace() || c == '>')
-                .unwrap_or(after_slash.len());
-            if &after_slash[..cname_end] == name {
-                depth -= 1;
-                if depth == 0 {
-                    let cgt = after.find('>')?;
-                    return Some(pos + 1 + cgt + 1);
-                }
-            }
-            scan = pos + 1;
-            continue;
-        }
-        if after.starts_with("<!--") {
-            // Comment: skip to `-->`, not to the first `>`: a `>`
-            // inside a comment does not end it.
-            let end = after.find("-->")?;
-            scan = pos + 1 + end + 3;
-            continue;
-        }
-        if after.starts_with('?') {
-            // Processing instruction: skip to `?>`.
-            let end = after.find("?>")?;
-            scan = pos + 1 + end + 2;
-            continue;
-        }
-        if after.starts_with('!') {
-            // Other markup (e.g. a doctype): skip to `>`.
-            let end = after.find('>')?;
-            scan = pos + 1 + end + 1;
-            continue;
-        }
-        // Opening tag: the same name, not self-closing, nests.
-        let oname_end = after
-            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
-            .unwrap_or(after.len());
-        if &after[..oname_end] == name {
-            let ogt = find_tag_end(after)?;
-            if !after[..ogt].trim_end().ends_with('/') {
-                depth += 1;
-            }
-            scan = pos + 1 + ogt + 1;
-        } else {
-            scan = pos + 1;
-        }
-    }
-    None
-}
-
-/// The direct child elements named `name` in `inner` (the content
-/// between an element's open and close tags), as their full text
-/// including the tags. Unlike [`xml_elements`], this does not descend:
-/// a `<package>` inside a `<cycle>` is a grandchild, not a child, and
-/// is skipped. A malformed remainder — an unterminated child,
-/// comment, processing instruction, or markup, a missing tag end, an
-/// empty tag name, a missing element end, or a stray closing tag at
-/// this level — is a server error, never a partial list: like
-/// [`xml_elements`], the caller treats the missing content as malformed.
-fn xml_child_elements<'a>(inner: &'a str, name: &str) -> Result<Vec<&'a str>, GeectlError> {
-    let unterminated = || {
-        GeectlError::new(
-            ErrorKind::ServerError,
-            format!("unexpected OBS response: unterminated <{name}> element"),
-        )
-    };
-    let stray_close = || {
-        GeectlError::new(
-            ErrorKind::ServerError,
-            "unexpected OBS response: stray closing tag in element content",
-        )
-    };
-    let mut out = Vec::new();
-    let mut offset = 0;
-    while offset < inner.len() {
-        let rest = &inner[offset..];
-        let Some(lt) = rest.find('<') else {
-            break;
-        };
-        let tag_start = offset + lt;
-        let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/') {
-            // A closing tag at this level is stray: the parent's close
-            // was stripped by the caller, so nothing may close here.
-            return Err(stray_close());
-        }
-        if after_lt.starts_with("<!--") {
-            // Comment: skip to `-->`, not to the first `>`.
-            let Some(end) = after_lt.find("-->") else {
-                return Err(unterminated());
-            };
-            offset = tag_start + 1 + end + 3;
-            continue;
-        }
-        if after_lt.starts_with('?') {
-            // Processing instruction: skip to `?>`.
-            let Some(end) = after_lt.find("?>") else {
-                return Err(unterminated());
-            };
-            offset = tag_start + 1 + end + 2;
-            continue;
-        }
-        if after_lt.starts_with('!') {
-            // Other markup (e.g. a doctype): skip to `>`.
-            let Some(end) = after_lt.find('>') else {
-                return Err(unterminated());
-            };
-            offset = tag_start + 1 + end + 1;
-            continue;
-        }
-        let name_end = after_lt
-            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
-            .unwrap_or(after_lt.len());
-        let tag_name = &after_lt[..name_end];
-        let Some(gt) = find_tag_end(after_lt) else {
-            return Err(unterminated());
-        };
-        if tag_name.is_empty() {
-            // An empty tag (`<></>`) has no name to match or to close
-            // against: it is malformed content, not a child to skip.
-            return Err(GeectlError::new(
-                ErrorKind::ServerError,
-                "unexpected OBS response: empty tag name in element content",
-            ));
-        }
-        let tag_end = tag_start + 1 + gt + 1;
-        if after_lt[..gt].trim_end().ends_with('/') {
-            // Self-closing: a direct child when the name matches.
-            if tag_name == name {
-                out.push(&inner[tag_start..tag_end]);
-            }
-            offset = tag_end;
-            continue;
-        }
-        let Some(elem_end) = xml_element_end(inner, tag_start, tag_name) else {
-            return Err(unterminated());
-        };
-        if tag_name == name {
-            out.push(&inner[tag_start..elem_end]);
-        }
-        offset = elem_end;
-    }
-    Ok(out)
 }
 
 /// Check that `xml` is well-formed: every tag is balanced and properly
@@ -13892,7 +13654,8 @@ fn validate_xpath_value(label: &str, value: &str) -> Result<(), GeectlError> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
+    use std::collections::VecDeque;
 
     /// A fake HTTP client with canned responses, for fixtures. GET,
     /// POST, and DELETE are keyed separately by URL; a URL with no
@@ -14223,8 +13986,6 @@ mod tests {
         .unwrap()
     }
 
-    // --- valid_obs_name ---
-
     #[test]
     fn valid_obs_name_accepts_and_rejects() {
         assert!(valid_obs_name("python3-requests"));
@@ -14235,8 +13996,6 @@ mod tests {
         assert!(!valid_obs_name("foo?x=1"));
         assert!(!valid_obs_name("foo' or '1'='1"));
     }
-
-    // --- devel_project ---
 
     #[test]
     fn devel_project_extracted() {
@@ -14346,8 +14105,6 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NetworkError);
     }
 
-    // --- devel_version ---
-
     #[test]
     fn devel_version_reads_the_spec() {
         let http = FakeHttp::new()
@@ -14390,8 +14147,6 @@ mod tests {
         let err = client.devel_version("foo").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
-
-    // --- has_open_sr ---
 
     #[test]
     fn has_open_sr_detects_request() {
@@ -14521,8 +14276,6 @@ mod tests {
             Some("bar".to_string())
         );
     }
-
-    // --- create_request ---
 
     #[test]
     fn create_request_posts_payload_and_returns_id() {
@@ -14708,8 +14461,6 @@ mod tests {
         assert!(!is_bare_authority("api.opensuse.org:99999"));
         assert!(!is_bare_authority("[::1]:abc"));
     }
-
-    // --- SrPayload ---
 
     #[test]
     fn to_xml_renders_submit_action() {
@@ -14933,8 +14684,6 @@ mod tests {
         .is_err());
     }
 
-    // --- Maintenance payloads ---
-
     fn incident_payload() -> MaintenanceIncidentPayload {
         MaintenanceIncidentPayload::new(
             "home:alice:branches:OBS_Maintained:foo",
@@ -15125,8 +14874,6 @@ mod tests {
         .is_err());
     }
 
-    // --- CVE rule ---
-
     #[test]
     fn cve_id_parse_validates_shape() {
         assert_eq!(
@@ -15183,8 +14930,6 @@ mod tests {
         )
         .is_err());
     }
-
-    // --- SrFiling / DryRun ---
 
     #[test]
     fn dry_run_is_the_default() {
@@ -15362,8 +15107,6 @@ mod tests {
         );
     }
 
-    // --- validate_request_id / parse_status_ok / parse_request_ids ---
-
     #[test]
     fn validate_request_id_accepts_and_rejects() {
         assert_eq!(validate_request_id("1398492").unwrap(), 1398492);
@@ -15497,8 +15240,6 @@ mod tests {
         );
     }
 
-    // --- supersede_request ---
-
     #[test]
     fn supersede_request_posts_changestate_with_superseded_by() {
         let http = FakeHttp::new().with_post(
@@ -15565,8 +15306,6 @@ mod tests {
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client.supersede_request("1397357", "1397897").is_err());
     }
-
-    // --- create_project / create_package ---
 
     #[test]
     fn branch_package_posts_branch_command_and_returns_target() {
@@ -15935,6 +15674,7 @@ mod tests {
         );
         assert_eq!(parse_branch_result(""), None);
     }
+
     #[test]
     fn copy_package_posts_copy_command_and_returns_revision() {
         // The copy response is the backend's revision document, not
@@ -16935,6 +16675,7 @@ mod tests {
             "<link project=\"test:factory\" package=\"test-pkgA\" baserev=\"55555555555555555555555555555555\"></link>"
         );
     }
+
     #[test]
     fn repair_link_broken_base_falls_back_to_lastworking() {
         let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" xsrcmd5=\"ffffffffffffffffffffffffffffffff\" error=\"patch bad.patch failed to apply\"/></directory>";
@@ -20062,8 +19803,6 @@ mod tests {
         );
     }
 
-    // --- upload_file ---
-
     #[test]
     fn upload_file_puts_file_and_returns_revision() {
         let http = FakeHttp::new().with_put(
@@ -20205,8 +19944,6 @@ mod tests {
         assert_eq!(parse_revision(""), None);
     }
 
-    // --- open_requests_for_package / package_requests_search_url ---
-
     #[test]
     fn package_requests_search_url_matches_source_or_target() {
         let http = FakeHttp::new();
@@ -20286,8 +20023,6 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(http.get_calls().is_empty());
     }
-
-    // --- delete_package ---
 
     #[test]
     fn delete_package_deletes_when_no_open_requests() {
@@ -20430,8 +20165,6 @@ mod tests {
             vec!["[dry-run] would: delete package home:scarabeus_iv/foo"]
         );
     }
-
-    // --- SrFiling::refile ---
 
     fn refile_http() -> FakeHttp {
         // The canned responses for a live refile: the dedup search is
@@ -20595,8 +20328,6 @@ mod tests {
         assert!(http.post_calls().is_empty());
     }
 
-    // --- split_slash_segments / parse_project_package ---
-
     #[test]
     fn slash_split_drops_empty_segments() {
         // No slash, leading/trailing slash, middle slash, `//` and
@@ -20626,8 +20357,6 @@ mod tests {
         assert!(parse_project_package("a/b/c").is_err());
         assert!(parse_project_package("a//b/c").is_err());
     }
-
-    // --- RevisionSpec / RevisionRange ---
 
     #[test]
     fn revision_spec_parses_numbers_and_md5s() {
@@ -20701,25 +20430,6 @@ mod tests {
         );
     }
 
-    // --- xml_unescape ---
-
-    #[test]
-    fn xml_unescape_reverses_escape() {
-        assert_eq!(xml_unescape("plain"), "plain");
-        assert_eq!(xml_unescape("a &amp; b"), "a & b");
-        assert_eq!(xml_unescape("&lt;tag&gt;"), "<tag>");
-        assert_eq!(xml_unescape("&quot;q&quot;"), "\"q\"");
-        assert_eq!(xml_unescape("&apos;a&apos;"), "'a'");
-        assert_eq!(xml_unescape("&#65;"), "A");
-        assert_eq!(xml_unescape("&#x41;"), "A");
-        // Unknown entities and a bare `&` pass through verbatim.
-        assert_eq!(xml_unescape("&nbsp;"), "&nbsp;");
-        assert_eq!(xml_unescape("a & b"), "a & b");
-        assert_eq!(xml_unescape("a &"), "a &");
-    }
-
-    // --- tag_attr ---
-
     #[test]
     fn tag_attr_reads_either_quote_style_in_any_order() {
         assert_eq!(
@@ -20735,8 +20445,6 @@ mod tests {
         assert_eq!(tag_attr("entry name=\"\"", "name"), None);
         assert_eq!(tag_attr("entry", "name"), None);
     }
-
-    // --- parse_directory ---
 
     const DIRECTORY_FIXTURE: &str = "<directory name=\"foo\" rev=\"3\" vrev=\"1\" srcmd5=\"0123456789abcdef0123456789abcdef\">\
         <entry name=\"foo.spec\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" size=\"1234\" mtime=\"1700000000\"/>\
@@ -20860,8 +20568,6 @@ mod tests {
         assert_eq!(listing.linkinfo, None);
     }
 
-    // --- cat ---
-
     #[test]
     fn cat_reads_the_file_without_credentials() {
         let http = FakeHttp::new().with_get(
@@ -20929,8 +20635,6 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
-    // --- list_files / list_packages ---
-
     #[test]
     fn list_files_reads_the_listing_without_credentials() {
         let http = FakeHttp::new().with_get(
@@ -20976,8 +20680,6 @@ mod tests {
         assert!(client.list_packages("openSUSE:Factory/x").is_err());
         assert!(http.get_calls().is_empty());
     }
-
-    // --- unified_diff ---
 
     #[test]
     fn unified_diff_of_identical_contents_is_empty() {
@@ -21031,8 +20733,6 @@ mod tests {
         assert!(!diff.contains("line 10\n"));
         assert_eq!(diff.matches("@@").count(), 4);
     }
-
-    // --- parse_history ---
 
     const HISTORY_FIXTURE: &str = "<revisionlist>\
         <revision rev=\"1\" vrev=\"1\">\
@@ -21095,8 +20795,6 @@ mod tests {
         );
         assert!(parse_history("<revisionlist/>").unwrap().is_empty());
     }
-
-    // --- package_log ---
 
     #[test]
     fn package_log_returns_newest_first() {
@@ -21195,8 +20893,6 @@ mod tests {
             .is_err());
     }
 
-    // --- revision_patch ---
-
     fn patch_client() -> FakeHttp {
         let rev1 = "<directory><entry name=\"foo.spec\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/><entry name=\"old.txt\" md5=\"oooooooooooooooooooooooooooooooo\"/></directory>";
         let rev2 = "<directory><entry name=\"foo.spec\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/><entry name=\"new.txt\" md5=\"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn\"/></directory>";
@@ -21276,8 +20972,6 @@ mod tests {
         assert!(client.revision_patch("openSUSE:Factory", "foo", 0).is_err());
         assert!(http.get_calls().is_empty());
     }
-
-    // --- parse_project_meta / parse_package_meta ---
 
     const PROJECT_META_FIXTURE: &str = "<project name=\"openSUSE:Factory\">\
         <title>Factory</title>\
@@ -21421,8 +21115,6 @@ mod tests {
         assert!(parse_package_meta("<package name=\"foo\" project=\"p\">").is_err());
     }
 
-    // --- project_meta / package_meta ---
-
     #[test]
     fn project_meta_reads_without_credentials() {
         let http = FakeHttp::new().with_get(
@@ -21463,8 +21155,6 @@ mod tests {
         assert!(client.package_meta("openSUSE:Factory", "foo/bar").is_err());
         assert!(http.get_calls().is_empty());
     }
-
-    // --- parse_package_search / parse_project_search ---
 
     const PACKAGE_SEARCH_FIXTURE: &str = "<collection matches=\"2\">\
         <package name=\"foo\" project=\"openSUSE:Factory\">\
@@ -21556,8 +21246,6 @@ mod tests {
         );
     }
 
-    // --- search_packages / search_projects ---
-
     #[test]
     fn search_packages_sends_the_substring_match_authed() {
         let http = FakeHttp::new().with_get(
@@ -21619,8 +21307,6 @@ mod tests {
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client.search_packages("foo").is_err());
     }
-
-    // --- parse_owners / parse_person ---
 
     const OWNER_SEARCH_FIXTURE: &str = "<collection matches=\"2\">\
         <owner rootproject=\"openSUSE:Factory\" project=\"devel:languages:python\" package=\"foo\">\
@@ -21761,8 +21447,6 @@ mod tests {
         assert!(validate_login(&"a".repeat(100)).is_ok());
     }
 
-    // --- owners / owners_for_binary / maintainers / whois ---
-
     #[test]
     fn owners_searches_by_project_and_package_authed() {
         let http = FakeHttp::new().with_get(
@@ -21856,8 +21540,6 @@ mod tests {
         assert!(http.get_calls().is_empty());
     }
 
-    // --- link_target ---
-
     #[test]
     fn link_target_reads_linkinfo_without_credentials() {
         let http = FakeHttp::new().with_get(
@@ -21907,8 +21589,6 @@ mod tests {
         assert!(http.get_calls().is_empty());
     }
 
-    // --- project_diff ---
-
     /// The request-search URL `open_requests_for_package` builds,
     /// for the FakeHttp fixture keys. The URL builder itself is
     /// tested separately; here it only supplies the fixture key.
@@ -21924,6 +21604,7 @@ mod tests {
         <entry name=\"common-one\"/><entry name=\"common-two\"/>\
         <entry name=\"common-three\"/><entry name=\"old-only\"/>\
         </directory>";
+
     const NEW_PACKAGES_FIXTURE: &str = "<directory>\
         <entry name=\"common-one\"/><entry name=\"common-two\"/>\
         <entry name=\"common-three\"/><entry name=\"new-only\"/>\
@@ -22080,11 +21761,6 @@ mod tests {
         assert!(client.project_diff("o/l", "new", &[], &[], false).is_err());
         assert!(http.get_calls().is_empty());
     }
-
-    // -- Request XML build/parse/round-trip (adopted from the
-    // request XML tests: submit/add_role/set_bugowner/delete/
-    // change_devel construction, action parsing, full-request reads,
-    // empty comment/description, legacy form, action filtering).
 
     const REQUEST1_XML: &str = r#"<request creator="creator" id="42">
   <action type="submit">
@@ -22698,7 +22374,6 @@ description</description>
         let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n  <surprise>hello</surprise>\n</request>";
         assert_eq!(parse_request(xml), None);
     }
-    // --- Typed request ids / dedup search ---
 
     fn mixed_action_collection() -> &'static str {
         "<collection matches=\"4\">\
@@ -22714,6 +22389,7 @@ description</description>
         let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"delete\">\n    <target project=\"foo\" />\n  </action>\n</request>";
         assert_eq!(parse_request(xml), None);
     }
+
     #[test]
     fn parse_request_ids_for_action_filters_by_type() {
         let body = mixed_action_collection();
@@ -22743,6 +22419,7 @@ description</description>
         let zero_id = no_id.replace("creator=\"creator\"", "creator=\"creator\" id=\"0\"");
         assert_eq!(parse_request(&zero_id), None);
     }
+
     #[test]
     fn parse_request_ids_for_action_filters_delete_shape() {
         let body = "<collection matches=\"5\"><request id=\"1\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"2\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" package=\"bar\" /></action><state name=\"new\" /></request><request id=\"3\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" repository=\"standard\" /></action><state name=\"new\" /></request><request id=\"4\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" /></action><state name=\"new\" /></request><request id=\"5\" creator=\"alice\"><action type=\"submit\"><source project=\"home:alice\" package=\"foo\" /><target project=\"openSUSE:Factory\" package=\"foo\" /></action><state name=\"new\" /></request></collection>";
@@ -22979,18 +22656,6 @@ description</description>
     }
 
     #[test]
-    fn xml_unescape_decodes_named_and_numeric_entities() {
-        assert_eq!(
-            xml_unescape("a &amp; b &lt; c &gt; d &quot;e&quot; &apos;f&apos;"),
-            "a & b < c > d \"e\" 'f'"
-        );
-        assert_eq!(xml_unescape("&#65;&#x42;"), "AB");
-        assert_eq!(xml_unescape("&amp;lt;"), "&lt;");
-        assert_eq!(xml_unescape("plain text"), "plain text");
-        assert_eq!(xml_unescape("&bogus; stays"), "&bogus; stays");
-    }
-
-    #[test]
     fn review_target_describe_names_each_part() {
         let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
         assert_eq!(target.describe(), "user Admin");
@@ -23012,10 +22677,6 @@ description</description>
             "user Admin, group reviewers, project openSUSE:Factory"
         );
     }
-
-    // -- XPath query construction (adopted from the `match=` string
-    // forms: noop, not, eq, not-eq, contains, and/or with the
-    // parenthesisation rules, eq lists, and element predicates).
 
     #[test]
     fn xpath_noop_renders_a_bare_comparison() {
@@ -23216,10 +22877,6 @@ description</description>
         assert_eq!(XpathQuery::and_all(vec![]), XpathQuery::Empty);
     }
 
-    // -- Request search `match=` construction (adopted from the
-    // search rules: default states, ids, projects, packages, source
-    // / target, creators, who, states, types, exclusions, history).
-
     fn search_without_states() -> RequestSearch {
         RequestSearch::new().states(Vec::new())
     }
@@ -23392,8 +23049,6 @@ description</description>
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
-    // -- Request read: show / log / search.
-
     #[test]
     fn show_request_reads_a_request_with_its_history() {
         let http = FakeHttp::new().with_get(
@@ -23469,10 +23124,6 @@ description</description>
         assert_eq!(log[0].comment, "foobar");
         assert_eq!(log[0].who, "creator");
     }
-
-    // -- Request state changes: change_state / accept / decline /
-    // revoke / try_change_state (the can_fail adoption: a failed
-    // change is swallowed with one warning, a caller bug is not).
 
     #[test]
     fn change_state_accept_posts_changestate_with_the_comment() {
@@ -23779,8 +23430,6 @@ description</description>
         assert!(http.post_calls().is_empty());
     }
 
-    // -- Review add.
-
     #[test]
     fn add_review_posts_addreview_with_the_reason() {
         let http = FakeHttp::new().with_post(
@@ -23886,8 +23535,6 @@ description</description>
   <comment who="user1" when="2010-12-29T10:00:00" id="1">first comment</comment>
   <comment who="user2" when="2010-12-29T11:00:00" id="2" parent="1">a reply</comment>
 </comments>"#;
-
-    // -- Comments: list and create.
 
     #[test]
     fn parse_comments_reads_comments_and_replies_in_order() {
@@ -24067,8 +23714,6 @@ description</description>
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
-    // -- Request diff.
-
     #[test]
     fn request_diff_plain_posts_diff_and_returns_the_body() {
         let http = FakeHttp::new().with_post(
@@ -24226,8 +23871,6 @@ description</description>
         assert_eq!(parse_request_collection(&collection), None);
     }
 
-    // --- SrFiling maintenance methods ---
-
     /// The search URL for an action-type dedup check, built from the
     /// same match expression the client builds: state plus the
     /// action's source/target parts, in production order.
@@ -24312,8 +23955,6 @@ description</description>
         );
     }
 
-    // --- xml helpers ---
-
     #[test]
     fn xml_attr_reads_either_quote_style_and_requires_a_standalone_name() {
         assert_eq!(
@@ -24337,17 +23978,6 @@ description</description>
     }
 
     #[test]
-    fn xml_unescape_decodes_entities_and_leaves_unknown_ones() {
-        assert_eq!(xml_unescape("a &amp; b"), "a & b");
-        assert_eq!(xml_unescape("&lt;tag&gt; &quot;x&quot;"), "<tag> \"x\"");
-        assert_eq!(xml_unescape("&#65;&#x42;"), "AB");
-        assert_eq!(xml_unescape("a &nosuch; b"), "a &nosuch; b");
-        assert_eq!(xml_unescape("a &amp;amp; b"), "a &amp; b");
-        assert_eq!(xml_unescape("plain"), "plain");
-        assert_eq!(xml_unescape("a & b"), "a & b");
-    }
-
-    #[test]
     fn xml_attr_ignores_a_name_inside_an_earlier_quoted_value() {
         // `dirty=` inside the details value must not match: the real
         // `dirty` attribute follows it.
@@ -24362,42 +23992,6 @@ description</description>
     }
 
     #[test]
-    fn xml_elements_ignores_a_gt_inside_a_quoted_value() {
-        let body = "<resultlist><result project=\"a\" code=\"broken\" details=\"a > b\" dirty=\"true\"/><result project=\"b\" code=\"published\"/></resultlist>";
-        let found = xml_elements(body, "result").unwrap();
-        assert_eq!(found.len(), 2);
-        let (tag, _) = xml_split_element(found[0], "result");
-        assert_eq!(xml_attr(tag, "dirty").as_deref(), Some("true"));
-    }
-
-    #[test]
-    fn xml_unescape_decodes_uppercase_hex_references() {
-        assert_eq!(xml_unescape("&#X41;&#x42;"), "AB");
-    }
-
-    #[test]
-    fn xml_elements_finds_full_elements_and_ignores_prefix_names() {
-        let body = "<resultlist><result project=\"a\"/><resultlistx/><result project=\"b\">x</result></resultlist>";
-        let found = xml_elements(body, "result").unwrap();
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0], "<result project=\"a\"/>");
-        assert_eq!(found[1], "<result project=\"b\">x</result>");
-        assert!(xml_elements(body, "status").unwrap().is_empty());
-    }
-
-    #[test]
-    fn xml_elements_rejects_an_unterminated_element() {
-        // An element with no closing tag is a server error, not a
-        // shorter list: a truncated document must never read as a
-        // smaller matrix.
-        // A complete element followed by an unterminated one is an
-        // error, not a one-element list.
-        assert!(xml_elements("<result project=\"a\"/><result project=\"b\">x", "result").is_err());
-        assert!(xml_elements("<resultlist><result project=\"a\"", "result").is_err());
-        assert!(xml_elements("<resultlist><result project=\"a\">x", "result").is_err());
-    }
-
-    #[test]
     fn xml_element_text_reads_an_attributed_open_tag() {
         assert_eq!(
             xml_element_text("<summary lang=\"en\">hello</summary>", "summary").as_deref(),
@@ -24409,8 +24003,6 @@ description</description>
             Some("yes")
         );
     }
-
-    // --- parse_build_results ---
 
     const RESULTS_FIXTURE: &str = "<resultlist state=\"f1cfebfd13354bcb8e792cb85f6218d8\">\n  <result project=\"testproject\" repository=\"openSUSE_Leap_42.3\" arch=\"x86_64\" code=\"published\" state=\"published\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n  <result project=\"testproject\" repository=\"openSUSE_Leap_15.0\" arch=\"x86_64\" code=\"published\" state=\"published\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n  <result project=\"testproject\" repository=\"SLE_12_SP4\" arch=\"x86_64\" code=\"published\" state=\"published\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n  <result project=\"testproject\" repository=\"SLE_12_SP3\" arch=\"x86_64\" code=\"published\" state=\"published\">\n    <status package=\"python-MarkupSafe\" code=\"disabled\" />\n  </result>\n</resultlist>";
 
@@ -24549,8 +24141,6 @@ description</description>
         assert!(results_settled(&empty, None));
         assert!(!results_settled(&empty, Some("pkg")));
     }
-
-    // --- results ---
 
     #[test]
     fn results_builds_the_per_package_url() {
@@ -24980,8 +24570,6 @@ description</description>
         );
     }
 
-    // --- maintained_instances / maintenance_branch ---
-
     fn dry_run_report() -> &'static str {
         "<collection><package project=\"openSUSE:Leap:15.6:Update\" package=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\" /><target project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.6:Update\" /></package><package project=\"openSUSE:Leap:15.5:Update\" package=\"foo\"><target project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.5:Update\" /></package></collection>"
     }
@@ -25343,8 +24931,6 @@ description</description>
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
-    // --- wait_for_results ---
-
     #[test]
     fn wait_for_results_polls_plain_until_settled() {
         let http = FakeHttp::new().with_get_sequence(
@@ -25375,8 +24961,6 @@ description</description>
             ]
         );
     }
-
-    // --- debug channel ---
 
     #[test]
     fn debug_dry_run_refusal_reports_the_guard() {
@@ -25618,8 +25202,6 @@ description</description>
         assert_eq!(http.get_calls().len(), 1);
     }
 
-    // --- parse_job_status / parse_build_status ---
-
     #[test]
     fn parse_job_status_reads_a_running_job() {
         let parsed = parse_job_status(
@@ -25691,8 +25273,6 @@ description</description>
         assert!(parse_build_status("<status code=\"failed\"/>junk").is_err());
         assert!(parse_build_status("<statusx code=\"failed\"/>").is_err());
     }
-
-    // --- build_log ---
 
     #[test]
     fn build_log_builds_the_url_and_returns_the_text() {
@@ -25779,8 +25359,6 @@ description</description>
         assert!(http.get_calls().is_empty());
     }
 
-    // --- build_status ---
-
     #[test]
     fn build_status_returns_the_code_and_none_on_404() {
         let http = FakeHttp::new()
@@ -25827,8 +25405,6 @@ description</description>
         assert!(http.get_calls().is_empty());
     }
 
-    // --- job_status ---
-
     #[test]
     fn job_status_returns_the_job_and_none_when_idle() {
         let http = FakeHttp::new()
@@ -25867,8 +25443,6 @@ description</description>
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
-    // --- parse_buildinfo ---
-
     #[test]
     fn parse_buildinfo_reads_the_error_and_the_dependencies() {
         let parsed = parse_buildinfo(
@@ -25899,8 +25473,6 @@ description</description>
         assert!(parse_buildinfo("<buildinfo>").is_err());
         assert!(parse_buildinfo("<buildinfo><bdep version=\"1\"/></buildinfo>").is_err());
     }
-
-    // --- parse_build_history ---
 
     #[test]
     fn parse_build_history_reads_entries() {
@@ -25947,8 +25519,6 @@ description</description>
             .is_err()
         );
     }
-
-    // --- parse_job_history ---
 
     #[test]
     fn parse_job_history_reads_entries() {
@@ -26009,8 +25579,6 @@ description</description>
         );
     }
 
-    // --- buildinfo ---
-
     #[test]
     fn buildinfo_returns_the_error_and_dependencies() {
         let http = FakeHttp::new().with_get(
@@ -26043,8 +25611,6 @@ description</description>
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(http.get_calls().is_empty());
     }
-
-    // --- build_history ---
 
     #[test]
     fn build_history_builds_the_url_with_and_without_a_limit() {
@@ -26081,8 +25647,6 @@ description</description>
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
-
-    // --- job_history ---
 
     #[test]
     fn job_history_builds_the_url_with_filters() {
@@ -26145,8 +25709,6 @@ description</description>
         assert!(http.get_calls().is_empty());
     }
 
-    // --- parse_binary_list ---
-
     #[test]
     fn parse_binary_list_reads_the_whole_build_output() {
         let parsed = parse_binary_list(
@@ -26184,8 +25746,6 @@ description</description>
         )
         .is_err());
     }
-
-    // --- parse_fileinfo ---
 
     #[test]
     fn parse_fileinfo_reads_the_plain_view() {
@@ -26263,8 +25823,6 @@ description</description>
         assert!(parse_fileinfo("<fileinfo filename=\"x\"><size>big</size></fileinfo>").is_err());
     }
 
-    // --- list_binaries ---
-
     #[test]
     fn list_binaries_lists_the_package_and_the_whole_repository() {
         let http = FakeHttp::new()
@@ -26335,8 +25893,6 @@ description</description>
         );
     }
 
-    // --- download_binary ---
-
     #[test]
     fn download_binary_returns_raw_bytes_not_text() {
         // Non-UTF-8 bytes: the download must not go through the
@@ -26391,8 +25947,6 @@ description</description>
             .is_err());
         assert!(http.get_bytes_calls().is_empty());
     }
-
-    // --- fileinfo ---
 
     #[test]
     fn fileinfo_reads_both_views() {
@@ -26453,44 +26007,6 @@ description</description>
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
-    // --- xml_child_elements ---
-
-    #[test]
-    fn xml_child_elements_reads_direct_children_only() {
-        let inner = "<package name=\"a\"><pkgdep>x</pkgdep></package><cycle><package name=\"b\"/></cycle><package name=\"c\"/>";
-        let found = xml_child_elements(inner, "package").unwrap();
-        assert_eq!(found.len(), 2);
-        assert!(found[0].contains("name=\"a\""));
-        assert!(found[1].contains("name=\"c\""));
-    }
-
-    #[test]
-    fn xml_child_elements_skips_nested_same_name_elements() {
-        let inner = "<package name=\"a\"><package name=\"inner\"/></package><package name=\"b\"/>";
-        let found = xml_child_elements(inner, "package").unwrap();
-        assert_eq!(found.len(), 2);
-        assert!(found[0].contains("name=\"a\""));
-        assert!(found[0].contains("name=\"inner\""));
-    }
-
-    #[test]
-    fn xml_child_elements_rejects_malformed_remainders() {
-        // Every former fail-open break site is an error now: an
-        // unterminated child, comment, processing instruction, or
-        // markup, a missing tag end, an empty tag name, and a stray
-        // closing tag at this level.
-        assert!(xml_child_elements("<package name=\"a\"><pkgdep>x</pkgdep>", "package").is_err());
-        assert!(xml_child_elements("<!-- never closed", "package").is_err());
-        assert!(xml_child_elements("<?pi never closed", "package").is_err());
-        assert!(xml_child_elements("<!DOCTYPE never closed", "package").is_err());
-        assert!(xml_child_elements("<package name=\"a\"", "package").is_err());
-        assert!(xml_child_elements("</package>", "package").is_err());
-        assert!(xml_child_elements("<></>", "package").is_err());
-        assert!(xml_child_elements("<package name=\"a\"/><></>", "package").is_err());
-    }
-
-    // --- parse_builddepinfo ---
-
     #[test]
     fn parse_builddepinfo_reads_packages_and_ignores_cycles() {
         let parsed = parse_builddepinfo(
@@ -26547,8 +26063,6 @@ description</description>
         )
         .is_err());
     }
-
-    // --- parse_repositories ---
 
     #[test]
     fn parse_repositories_reads_repos_arches_and_paths() {
@@ -26608,8 +26122,6 @@ description</description>
         .is_err());
     }
 
-    // --- dependson / whatdependson ---
-
     #[test]
     fn dependson_builds_the_url_with_and_without_a_package() {
         let http = FakeHttp::new()
@@ -26659,8 +26171,6 @@ description</description>
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
-
-    // --- check_constraints ---
 
     #[test]
     fn check_constraints_posts_the_constraints_and_reads_worker_ids() {
@@ -26727,8 +26237,6 @@ description</description>
             .is_err());
         assert!(http.post_calls().is_empty());
     }
-
-    // --- list_repositories ---
 
     #[test]
     fn list_repositories_reads_the_public_meta() {

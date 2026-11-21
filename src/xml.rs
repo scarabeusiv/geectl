@@ -554,9 +554,255 @@ impl XmlDoc {
     }
 }
 
+/// Read the value of attribute `name` in an opening tag's text (the
+/// text between `<tag` and `>`). Either quote style works, and the
+/// attribute name must stand on its own — `valid="..."` must not match
+/// a lookup for `id` — so the character before the name has to be
+/// whitespace. None when the attribute is absent or unquoted. The
+/// value is XML-unescaped: an attribute the server sent as
+/// `details="a &amp; b"` reads as `a & b`.
+/// The index of the first `>` in `s` that is not inside a quoted
+/// attribute value, if any. A `>` inside a value (e.g. in a `details`
+/// attribute) does not end the tag; scanning for it naively would
+/// truncate the tag and drop the attributes after it.
+pub(crate) fn find_tag_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+        } else if b == b'>' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Each occurrence of element `name` in `body`, as its full text
+/// including the tags. The tag name must end at whitespace, `/`, or
+/// `>` (so `<resultlist>` never matches a search for `<result`).
+/// An unterminated element is a server error: the scan fails instead
+/// of returning the partial list, so a truncated document never reads
+/// as a smaller matrix.
+pub(crate) fn xml_elements<'a>(body: &'a str, name: &str) -> Result<Vec<&'a str>, GeectlError> {
+    let unterminated = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS response: unterminated <{name}> element"),
+        )
+    };
+    let mut out = Vec::new();
+    let mut offset = 0;
+    let open_marker = format!("<{name}");
+    let close_marker = format!("</{name}>");
+    while offset < body.len() {
+        let rest = &body[offset..];
+        let Some(pos) = rest.find(&open_marker) else {
+            break;
+        };
+        let after_tag = &rest[pos + open_marker.len()..];
+        let Some(first) = after_tag.chars().next() else {
+            return Err(unterminated());
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            offset += pos + open_marker.len();
+            continue;
+        }
+        let Some(end) = find_tag_end(after_tag) else {
+            return Err(unterminated());
+        };
+        let tag = &after_tag[..end];
+        let elem_start = offset + pos;
+        if tag.trim_end().ends_with('/') {
+            // Self-closing: the element is just the tag.
+            out.push(&body[elem_start..elem_start + open_marker.len() + end + 1]);
+            offset = elem_start + open_marker.len() + end + 1;
+            continue;
+        }
+        let Some(close) = after_tag[end + 1..].find(&close_marker) else {
+            return Err(unterminated());
+        };
+        let full_end = end + 1 + close + close_marker.len();
+        out.push(&body[elem_start..elem_start + open_marker.len() + full_end]);
+        offset = elem_start + open_marker.len() + full_end;
+    }
+    Ok(out)
+}
+
+/// The index just past the element starting at `start` (the `<` of
+/// its opening tag), honouring nesting of the same element name.
+/// None when the element is unterminated. The opening tag must not be
+/// self-closing: the caller checks that first.
+fn xml_element_end(inner: &str, start: usize, name: &str) -> Option<usize> {
+    let after_lt = &inner[start + 1..];
+    let gt = find_tag_end(after_lt)?;
+    let mut depth = 1;
+    let mut scan = start + 1 + gt + 1;
+    while scan < inner.len() {
+        let lt = inner[scan..].find('<')?;
+        let pos = scan + lt;
+        let after = &inner[pos + 1..];
+        if let Some(after_slash) = after.strip_prefix('/') {
+            // Closing tag: which element does it close?
+            let cname_end = after_slash
+                .find(|c: char| c.is_whitespace() || c == '>')
+                .unwrap_or(after_slash.len());
+            if &after_slash[..cname_end] == name {
+                depth -= 1;
+                if depth == 0 {
+                    let cgt = after.find('>')?;
+                    return Some(pos + 1 + cgt + 1);
+                }
+            }
+            scan = pos + 1;
+            continue;
+        }
+        if after.starts_with("<!--") {
+            // Comment: skip to `-->`, not to the first `>`: a `>`
+            // inside a comment does not end it.
+            let end = after.find("-->")?;
+            scan = pos + 1 + end + 3;
+            continue;
+        }
+        if after.starts_with('?') {
+            // Processing instruction: skip to `?>`.
+            let end = after.find("?>")?;
+            scan = pos + 1 + end + 2;
+            continue;
+        }
+        if after.starts_with('!') {
+            // Other markup (e.g. a doctype): skip to `>`.
+            let end = after.find('>')?;
+            scan = pos + 1 + end + 1;
+            continue;
+        }
+        // Opening tag: the same name, not self-closing, nests.
+        let oname_end = after
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(after.len());
+        if &after[..oname_end] == name {
+            let ogt = find_tag_end(after)?;
+            if !after[..ogt].trim_end().ends_with('/') {
+                depth += 1;
+            }
+            scan = pos + 1 + ogt + 1;
+        } else {
+            scan = pos + 1;
+        }
+    }
+    None
+}
+
+/// The direct child elements named `name` in `inner` (the content
+/// between an element's open and close tags), as their full text
+/// including the tags. Unlike [`xml_elements`], this does not descend:
+/// a `<package>` inside a `<cycle>` is a grandchild, not a child, and
+/// is skipped. A malformed remainder — an unterminated child,
+/// comment, processing instruction, or markup, a missing tag end, an
+/// empty tag name, a missing element end, or a stray closing tag at
+/// this level — is a server error, never a partial list: like
+/// [`xml_elements`], the caller treats the missing content as malformed.
+pub(crate) fn xml_child_elements<'a>(
+    inner: &'a str,
+    name: &str,
+) -> Result<Vec<&'a str>, GeectlError> {
+    let unterminated = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS response: unterminated <{name}> element"),
+        )
+    };
+    let stray_close = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS response: stray closing tag in element content",
+        )
+    };
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset < inner.len() {
+        let rest = &inner[offset..];
+        let Some(lt) = rest.find('<') else {
+            break;
+        };
+        let tag_start = offset + lt;
+        let after_lt = &rest[lt + 1..];
+        if after_lt.starts_with('/') {
+            // A closing tag at this level is stray: the parent's close
+            // was stripped by the caller, so nothing may close here.
+            return Err(stray_close());
+        }
+        if after_lt.starts_with("<!--") {
+            // Comment: skip to `-->`, not to the first `>`.
+            let Some(end) = after_lt.find("-->") else {
+                return Err(unterminated());
+            };
+            offset = tag_start + 1 + end + 3;
+            continue;
+        }
+        if after_lt.starts_with('?') {
+            // Processing instruction: skip to `?>`.
+            let Some(end) = after_lt.find("?>") else {
+                return Err(unterminated());
+            };
+            offset = tag_start + 1 + end + 2;
+            continue;
+        }
+        if after_lt.starts_with('!') {
+            // Other markup (e.g. a doctype): skip to `>`.
+            let Some(end) = after_lt.find('>') else {
+                return Err(unterminated());
+            };
+            offset = tag_start + 1 + end + 1;
+            continue;
+        }
+        let name_end = after_lt
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(after_lt.len());
+        let tag_name = &after_lt[..name_end];
+        let Some(gt) = find_tag_end(after_lt) else {
+            return Err(unterminated());
+        };
+        if tag_name.is_empty() {
+            // An empty tag (`<></>`) has no name to match or to close
+            // against: it is malformed content, not a child to skip.
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS response: empty tag name in element content",
+            ));
+        }
+        let tag_end = tag_start + 1 + gt + 1;
+        if after_lt[..gt].trim_end().ends_with('/') {
+            // Self-closing: a direct child when the name matches.
+            if tag_name == name {
+                out.push(&inner[tag_start..tag_end]);
+            }
+            offset = tag_end;
+            continue;
+        }
+        let Some(elem_end) = xml_element_end(inner, tag_start, tag_name) else {
+            return Err(unterminated());
+        };
+        if tag_name == name {
+            out.push(&inner[tag_start..elem_end]);
+        }
+        offset = elem_end;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obs::xml_attr;
+    use crate::obs::xml_split_element;
 
     const META: &str = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/><person userid=\"alice\" role=\"maintainer\"/><lock><enable/></lock></package>";
 
@@ -794,5 +1040,113 @@ mod tests {
         let xml = "<package name=\"p\"><build><build><disable/></build></build></package>";
         let doc = XmlDoc::parse(xml).unwrap();
         assert_eq!(doc.render(), xml);
+    }
+
+    #[test]
+    fn xml_unescape_reverses_escape() {
+        assert_eq!(xml_unescape("plain"), "plain");
+        assert_eq!(xml_unescape("a &amp; b"), "a & b");
+        assert_eq!(xml_unescape("&lt;tag&gt;"), "<tag>");
+        assert_eq!(xml_unescape("&quot;q&quot;"), "\"q\"");
+        assert_eq!(xml_unescape("&apos;a&apos;"), "'a'");
+        assert_eq!(xml_unescape("&#65;"), "A");
+        assert_eq!(xml_unescape("&#x41;"), "A");
+        // Unknown entities and a bare `&` pass through verbatim.
+        assert_eq!(xml_unescape("&nbsp;"), "&nbsp;");
+        assert_eq!(xml_unescape("a & b"), "a & b");
+        assert_eq!(xml_unescape("a &"), "a &");
+    }
+
+    #[test]
+    fn xml_unescape_decodes_named_and_numeric_entities() {
+        assert_eq!(
+            xml_unescape("a &amp; b &lt; c &gt; d &quot;e&quot; &apos;f&apos;"),
+            "a & b < c > d \"e\" 'f'"
+        );
+        assert_eq!(xml_unescape("&#65;&#x42;"), "AB");
+        assert_eq!(xml_unescape("&amp;lt;"), "&lt;");
+        assert_eq!(xml_unescape("plain text"), "plain text");
+        assert_eq!(xml_unescape("&bogus; stays"), "&bogus; stays");
+    }
+
+    #[test]
+    fn xml_unescape_decodes_entities_and_leaves_unknown_ones() {
+        assert_eq!(xml_unescape("a &amp; b"), "a & b");
+        assert_eq!(xml_unescape("&lt;tag&gt; &quot;x&quot;"), "<tag> \"x\"");
+        assert_eq!(xml_unescape("&#65;&#x42;"), "AB");
+        assert_eq!(xml_unescape("a &nosuch; b"), "a &nosuch; b");
+        assert_eq!(xml_unescape("a &amp;amp; b"), "a &amp; b");
+        assert_eq!(xml_unescape("plain"), "plain");
+        assert_eq!(xml_unescape("a & b"), "a & b");
+    }
+
+    #[test]
+    fn xml_elements_ignores_a_gt_inside_a_quoted_value() {
+        let body = "<resultlist><result project=\"a\" code=\"broken\" details=\"a > b\" dirty=\"true\"/><result project=\"b\" code=\"published\"/></resultlist>";
+        let found = xml_elements(body, "result").unwrap();
+        assert_eq!(found.len(), 2);
+        let (tag, _) = xml_split_element(found[0], "result");
+        assert_eq!(xml_attr(tag, "dirty").as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn xml_unescape_decodes_uppercase_hex_references() {
+        assert_eq!(xml_unescape("&#X41;&#x42;"), "AB");
+    }
+
+    #[test]
+    fn xml_elements_finds_full_elements_and_ignores_prefix_names() {
+        let body = "<resultlist><result project=\"a\"/><resultlistx/><result project=\"b\">x</result></resultlist>";
+        let found = xml_elements(body, "result").unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0], "<result project=\"a\"/>");
+        assert_eq!(found[1], "<result project=\"b\">x</result>");
+        assert!(xml_elements(body, "status").unwrap().is_empty());
+    }
+
+    #[test]
+    fn xml_elements_rejects_an_unterminated_element() {
+        // An element with no closing tag is a server error, not a
+        // shorter list: a truncated document must never read as a
+        // smaller matrix.
+        // A complete element followed by an unterminated one is an
+        // error, not a one-element list.
+        assert!(xml_elements("<result project=\"a\"/><result project=\"b\">x", "result").is_err());
+        assert!(xml_elements("<resultlist><result project=\"a\"", "result").is_err());
+        assert!(xml_elements("<resultlist><result project=\"a\">x", "result").is_err());
+    }
+
+    #[test]
+    fn xml_child_elements_reads_direct_children_only() {
+        let inner = "<package name=\"a\"><pkgdep>x</pkgdep></package><cycle><package name=\"b\"/></cycle><package name=\"c\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found[0].contains("name=\"a\""));
+        assert!(found[1].contains("name=\"c\""));
+    }
+
+    #[test]
+    fn xml_child_elements_skips_nested_same_name_elements() {
+        let inner = "<package name=\"a\"><package name=\"inner\"/></package><package name=\"b\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found[0].contains("name=\"a\""));
+        assert!(found[0].contains("name=\"inner\""));
+    }
+
+    #[test]
+    fn xml_child_elements_rejects_malformed_remainders() {
+        // Every former fail-open break site is an error now: an
+        // unterminated child, comment, processing instruction, or
+        // markup, a missing tag end, an empty tag name, and a stray
+        // closing tag at this level.
+        assert!(xml_child_elements("<package name=\"a\"><pkgdep>x</pkgdep>", "package").is_err());
+        assert!(xml_child_elements("<!-- never closed", "package").is_err());
+        assert!(xml_child_elements("<?pi never closed", "package").is_err());
+        assert!(xml_child_elements("<!DOCTYPE never closed", "package").is_err());
+        assert!(xml_child_elements("<package name=\"a\"", "package").is_err());
+        assert!(xml_child_elements("</package>", "package").is_err());
+        assert!(xml_child_elements("<></>", "package").is_err());
+        assert!(xml_child_elements("<package name=\"a\"/><></>", "package").is_err());
     }
 }
