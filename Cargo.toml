@@ -1,6 +1,6 @@
 [package]
 name = "geectl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.99.1"
 description = "Geeko Controller — a machine-first CLI for agents (OBS + src.opensuse.org)"
