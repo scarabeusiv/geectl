@@ -119,17 +119,21 @@ Rules that hold:
 
 The library surface a tool uses to move a package update through the
 distribution: `ObsClient` (devel-project lookup, devel version, open
-submit-request check, filing, superseding, branch cleanup, branching,
-copying, linking, repairing links, link revisions, converting links to
-branches and detaching them, deleting and restoring packages and
-projects, aggregating binaries, releasing, branch-project and
-branch-package creation, package creation plain or git-backed, file
-upload, the remote reads listed below, and reading and acting on
+submit-request check, filing, superseding, branch cleanup, branching, copying,
+linking, repairing links, link revisions, converting links to branches and
+detaching them, deleting and restoring packages and projects, aggregating
+binaries, releasing, branch-project and branch-package creation, package
+creation plain or git-backed, file upload, maintenance incident / change-devel
+/ delete filing, maintained-instance listing, maintenance branching, the
+remote reads listed below, and reading and acting on
 requests), `SrPayload`
 (the validated submit-request payload), `SrFiling` (the only filing
 path, dry-run by default; `refile` is the file-then-supersede flow),
 `DryRun` (the would-do guard), and `CveId` (CVE id parsing plus the
-changelog-names-CVE rule).
+changelog-names-CVE rule). `MaintenanceIncidentPayload`,
+`ChangeDevelPayload`, and `DeletePayload` are the validated
+maintenance-request payloads; `SrFiling` files them the same way it
+files a submit request.
 Request reading and acting is the typed `Request` model
 (`RequestAction`, `RequestState`, `ReviewState`, `RequestReview`,
 `RequestHistory`, `RequestComment`) with its parser and serializer,
@@ -333,6 +337,72 @@ pre-checking. The operations are backend-agnostic server calls: a
 request is a server object whether the package is OBS-native or
 git-backed, so there is no git-mode split anywhere in this surface.
 
+Maintenance requests cover the other request types an agent files:
+maintenance incidents, change-devel, and deletes. They use the same
+shape as submit requests — a typed payload, validated at construction
+and again on the filing path, filed through `SrFiling` with the DryRun
+guard first and a dedup check over open requests — and the same
+file-first-then-supersede refile flow where one exists.
+
+- A maintenance incident (`MaintenanceIncidentPayload`,
+  `SrFiling::file_maintenance_incident`) carries one action per
+  source package, from one branch project to a maintenance project.
+  It carries no sourceupdate by default — an incident must not delete
+  its branch on accept unless the caller opts in with `with_cleanup`
+  — and the filing pins `source_rev` (`addrevision=1`), so the
+  incident freezes the exact source it was filed against. The server
+  refuses a target that is not a maintenance or maintenance-incident
+  project, and the release target must resolve to a
+  maintenance-release project, either through `target_releaseproject`
+  or through the source package's link target — resolved at filing
+  time, to its update instance in both cases (the server skips that
+  check entirely for patchinfo packages).
+  `refile_maintenance_incident` is the same file-first flow as
+  `refile`, exempting the old incident from the dedup.
+- A change of devel (`ChangeDevelPayload`,
+  `SrFiling::file_change_devel`) moves a package's devel project: the
+  source names the NEW devel package, the target names the package
+  whose devel changes, and on accept the server sets the target
+  package's devel to the source package. All four names are required;
+  the payload carries no source revision, sourceupdate, release
+  project, or repository — the server forbids all four on this action
+  type.
+- A delete (`DeletePayload`, `SrFiling::file_delete_request`)
+  deletes a package, a repository, or a whole project. The target is
+  one of the three — a package and a repository cannot be combined —
+  and the dedup matches the same target shape.
+- The dedup search matches on source/target, state (`new` or
+  `review`; a declined request is closed and does not block a
+  re-file), and action type (`action/@type`, filtered server-side);
+  the response parser re-checks the type, and narrows further
+  client-side where the search cannot: a delete dedup matches the
+  target shape (a whole-project delete blocks any delete in the
+  project, a package delete only the same package, a repository
+  delete the same repository or a whole-project filing), and an
+  incident dedup matches the release project.
+- Branching a maintained package (`ObsClient::maintained_instances`,
+  `ObsClient::maintenance_branch`) goes through the branch command
+  (`POST /source?cmd=branch`): the listing is the dry-run report —
+  which projects carrying the attribute hold the package, with the
+  devel package when there is one and where the branch would land
+  (the parser translates `:` to `_` in the reported target package,
+  matching the live branch name) — and the live branch creates the branch project
+  (by default `home:<user>:branches:OBS_Maintained:<package>` — the
+  attribute, with `:` → `_`) and returns where it landed. The attribute defaults to `OBS:Maintained`, the update
+  project attribute to `OBS:UpdateProject`. The live branch is
+  DryRun-guarded like the other mutations. The server refuses a
+  package whose sources live in scmsync ("Fork it instead"); that
+  refusal surfaces as the server's error, and there is no unified
+  branch-or-fork operation yet.
+- Refile exists for maintenance incidents only. A change-devel or
+  delete request is filed fresh; superseding one is a manual step
+  (`ObsClient::supersede_request`), not a library flow.
+
+The maintenance semantics are validated against the OBS API server
+code (`BsRequestActionMaintenanceIncident`,
+`BsRequestActionChangeDevel`, `BsRequestActionDelete`,
+`BranchPackage` on open-build-service master).
+
 Credentials: the public reads (devel project, devel version, file
 and directory reads, meta, link target, project diff) need none; the
 package log, the open-SR search, the package and project search, the
@@ -465,7 +535,11 @@ real submit requests and assert on the server state they leave behind
 (`tests/live_obs.rs`: filing, refile, and accept-time cleanup,
 plus the request read/act tests — show, log, state changes, reviews,
 comments, diff, and search — which read and change live requests
-through the library and assert on the server state they find).
+through the library and assert on the server state they find, and the
+maintenance tests — incident filing and dedup, incident refile,
+incident accept creating the incident project, change-devel accept
+re-pointing the devel, delete accept deleting the package, and the
+maintained listing plus live branch).
 
 The branch, copy, link, and release operations are covered the same
 way: live tests that create the server state through geectl and read
