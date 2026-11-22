@@ -45,7 +45,7 @@ use geectl::gitea::{
 };
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::DryRun;
-use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef};
+use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus};
 
 /// Whether `url` points at a loopback host over plain HTTP.
 ///
@@ -1834,6 +1834,152 @@ fn gitea_pull_request_cancel_team_review_round_trip() {
     assert!(after.is_empty(), "the cancelled team review must be gone");
 }
 
+/// Merge a live pull request through the unified pull-request
+/// surface: the pull request reads back merged.
+#[test]
+fn gitea_pull_request_merge_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
+    let user = gitea_user();
+    let reference = PullRequestRef::Gitea {
+        owner: user.clone(),
+        repo: repo.clone(),
+        number,
+    };
+    let status = PullRequestClient::new(None, Some(&client))
+        .merge(
+            &reference,
+            Some("Merging."),
+            None,
+            false,
+            &DryRun::new(false),
+        )
+        .expect("typed merge merges the pull request")
+        .expect("a live merge returns the status");
+    assert_eq!(status, PullRequestStatus::Merged);
+    let pr = client
+        .pr_get(&user, &repo, number)
+        .expect("typed pr_get reads the merged PR");
+    assert_eq!(pr.state, "closed");
+    assert!(pr.merged);
+}
+
+/// Decline a live pull request through the unified pull-request
+/// surface: the reason stays visible as an issue comment, and the
+/// pull request reads back closed, not merged.
+#[test]
+fn gitea_pull_request_decline_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
+    let user = gitea_user();
+    let (closer, closer_client) = closing_client(&http, &base, &user, &repo);
+    let reference = PullRequestRef::Gitea {
+        owner: user.clone(),
+        repo: repo.clone(),
+        number,
+    };
+    let status = PullRequestClient::new(None, Some(&closer_client))
+        .decline(&reference, Some("Not now."), &DryRun::new(false))
+        .expect("typed decline declines the pull request")
+        .expect("a live decline returns the status");
+    assert_eq!(status, PullRequestStatus::Closed);
+    let comments = PullRequestClient::new(None, Some(&client))
+        .comments(&reference)
+        .expect("typed comments lists the comments");
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].author, closer);
+    assert_eq!(comments[0].body, "Not now.");
+    let pr = client
+        .pr_get(&user, &repo, number)
+        .expect("typed pr_get reads the declined PR");
+    assert_eq!(pr.state, "closed");
+    assert!(!pr.merged);
+}
+
+/// Withdraw a live pull request through the unified pull-request
+/// surface: the pull request reads back closed, not merged.
+#[test]
+fn gitea_pull_request_withdraw_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
+    let user = gitea_user();
+    let (_, closer_client) = closing_client(&http, &base, &user, &repo);
+    let reference = PullRequestRef::Gitea {
+        owner: user.clone(),
+        repo: repo.clone(),
+        number,
+    };
+    let status = PullRequestClient::new(None, Some(&closer_client))
+        .withdraw(&reference, None, &DryRun::new(false))
+        .expect("typed withdraw withdraws the pull request")
+        .expect("a live withdraw returns the status");
+    assert_eq!(status, PullRequestStatus::Closed);
+    let pr = client
+        .pr_get(&user, &repo, number)
+        .expect("typed pr_get reads the withdrawn PR");
+    assert_eq!(pr.state, "closed");
+    assert!(!pr.merged);
+}
+
+/// Reopen a live pull request through the unified pull-request
+/// surface: decline it, then reopen it.
+#[test]
+fn gitea_pull_request_reopen_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
+    let user = gitea_user();
+    let (_, closer_client) = closing_client(&http, &base, &user, &repo);
+    let reference = PullRequestRef::Gitea {
+        owner: user.clone(),
+        repo: repo.clone(),
+        number,
+    };
+    let pr = PullRequestClient::new(None, Some(&closer_client));
+    let declined = pr
+        .decline(&reference, None, &DryRun::new(false))
+        .expect("typed decline declines the pull request")
+        .expect("a live decline returns the status");
+    assert_eq!(declined, PullRequestStatus::Closed);
+    let status = pr
+        .reopen(&reference, &DryRun::new(false))
+        .expect("typed reopen reopens the pull request")
+        .expect("a live reopen returns the status");
+    assert_eq!(status, PullRequestStatus::Open);
+    let pr = client
+        .pr_get(&user, &repo, number)
+        .expect("typed pr_get reads the reopened PR");
+    assert_eq!(pr.state, "open");
+    assert!(!pr.merged);
+}
+
 /// A username unique to this run, for the second user the
 /// collaborator and team tests create. Shorter than
 /// `unique_repo_name`: Gitea caps usernames at 39 characters.
@@ -1960,6 +2106,33 @@ fn reviewer_client<'a>(http: &'a UreqClient, base: &str) -> (String, GiteaClient
     create_user_with_password_raw(http, base, &reviewer, &password);
     let token = create_token_raw(http, base, &reviewer, &password);
     (reviewer, typed_client_with_token(http, base, &token))
+}
+
+/// A second user with a minted token (`write:repository` +
+/// `write:issue`) added as a collaborator with write access, for
+/// the close/reopen live tests: the provisioned token has no
+/// `write:issue` scope, so it cannot PATCH an issue closed or
+/// open, and a decline comment needs that scope too.
+fn closing_client<'a>(
+    http: &'a UreqClient,
+    base: &str,
+    owner: &str,
+    repo: &str,
+) -> (String, GiteaClient<'a>) {
+    let (reviewer, reviewer_client) = reviewer_client(http, base);
+    let owner_client = typed_client(http, base);
+    owner_client
+        .collaborator_add(
+            owner,
+            repo,
+            &reviewer,
+            GiteaAccess::Write,
+            false,
+            &DryRun::new(false),
+        )
+        .expect("typed collaborator_add adds the closing user")
+        .expect("a non-dry-run add returns the permission");
+    (reviewer, reviewer_client)
 }
 
 /// Request a review from users and teams through the raw API.

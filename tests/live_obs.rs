@@ -81,7 +81,7 @@ use geectl::obs::{
     ReviewState, ReviewTarget, RevisionRange, RoleGrant, SourceUpdate, SrFiling, SrPayload,
     StagingReadOptions,
 };
-use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef};
+use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus};
 
 /// Whether `url` points at a loopback host.
 ///
@@ -2011,6 +2011,101 @@ fn live_pull_request_comment_round_trip() {
     assert_eq!(comments[0].body, "first comment");
     assert_eq!(comments[1].body, "reply to the first");
     assert_eq!(comments[1].parent_id, Some(comment.id));
+}
+
+/// Merge a live request through the unified pull-request
+/// surface: the request reads back accepted.
+#[test]
+fn live_pull_request_merge_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let reference = PullRequestRef::Obs(id.parse().expect("a filed request id is numeric"));
+    let status = PullRequestClient::new(Some(&client), None)
+        .merge(&reference, Some("Merging."), None, false, &dry)
+        .expect("typed merge merges the request")
+        .expect("a live merge returns the status");
+    assert_eq!(status, PullRequestStatus::Merged);
+    let request = client
+        .show_request(&id)
+        .expect("read the merged request back from the server");
+    assert_eq!(request.state.name, RequestState::Accepted);
+}
+
+/// Decline a live request through the unified pull-request
+/// surface: the request reads back declined.
+#[test]
+fn live_pull_request_decline_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let reference = PullRequestRef::Obs(id.parse().expect("a filed request id is numeric"));
+    let status = PullRequestClient::new(Some(&client), None)
+        .decline(&reference, Some("Not now."), &dry)
+        .expect("typed decline declines the request")
+        .expect("a live decline returns the status");
+    assert_eq!(status, PullRequestStatus::Declined);
+    let request = client
+        .show_request(&id)
+        .expect("read the declined request back from the server");
+    assert_eq!(request.state.name, RequestState::Declined);
+}
+
+/// Withdraw a live request through the unified pull-request
+/// surface: the request reads back revoked.
+#[test]
+fn live_pull_request_withdraw_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let reference = PullRequestRef::Obs(id.parse().expect("a filed request id is numeric"));
+    let status = PullRequestClient::new(Some(&client), None)
+        .withdraw(&reference, Some("Withdrawing."), &dry)
+        .expect("typed withdraw withdraws the request")
+        .expect("a live withdraw returns the status");
+    assert_eq!(status, PullRequestStatus::Withdrawn);
+    let request = client
+        .show_request(&id)
+        .expect("read the withdrawn request back from the server");
+    assert_eq!(request.state.name, RequestState::Revoked);
+}
+
+/// Reopen a live request through the unified pull-request surface:
+/// the creator declines it, then reopens it — the declined-to-new
+/// transition is not admin-only.
+#[test]
+fn live_pull_request_reopen_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let reference = PullRequestRef::Obs(id.parse().expect("a filed request id is numeric"));
+    let pr = PullRequestClient::new(Some(&client), None);
+    let declined = pr
+        .decline(&reference, Some("Not now."), &dry)
+        .expect("typed decline declines the request")
+        .expect("a live decline returns the status");
+    assert_eq!(declined, PullRequestStatus::Declined);
+    let status = pr
+        .reopen(&reference, &dry)
+        .expect("typed reopen reopens the request")
+        .expect("a live reopen returns the status");
+    assert_eq!(status, PullRequestStatus::Open);
+    let request = client
+        .show_request(&id)
+        .expect("read the reopened request back from the server");
+    assert_eq!(request.state.name, RequestState::New);
 }
 
 /// changereviewstate does not accept `obsoleted`: the server
