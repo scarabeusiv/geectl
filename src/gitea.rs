@@ -186,8 +186,10 @@ pub struct GiteaBranch {
     pub name: String,
     /// The head commit.
     pub commit: GiteaBranchCommit,
-    /// Whether the branch is protected.
-    #[serde(default)]
+    /// Whether the branch is protected. Required, not
+    /// defaulted: the server always emits it, and a response
+    /// that omits it must fail the parse rather than read the
+    /// branch as unprotected.
     pub protected: bool,
 }
 
@@ -2275,6 +2277,22 @@ mod tests {
                 "https://src.opensuse.org/api/v1/repos/pool/systemd/branches/factory".to_string(),
                 true
             )]
+        );
+    }
+
+    #[test]
+    fn branch_without_protected_fails_to_parse() {
+        // `protected` is required: a server that omits it must
+        // fail the parse instead of reading the branch as
+        // unprotected. Unknown fields stay tolerated. The failure
+        // must name the missing field, so a different parse
+        // breakage in the fixture cannot pass this test.
+        let body = r#"{"name": "factory", "commit": {"id": "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa", "message": "OBS bridge sync"}, "future_field": "tolerated"}"#;
+        let err = serde_json::from_str::<GiteaBranch>(body)
+            .expect_err("a branch without `protected` must fail to parse");
+        assert!(
+            err.to_string().contains("protected"),
+            "the parse failure must name the missing `protected` field; got {err}"
         );
     }
 
