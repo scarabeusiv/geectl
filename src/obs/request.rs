@@ -1823,6 +1823,8 @@ pub enum XpathQuery {
     Not(Box<XpathQuery>),
     /// `contains(path, 'value')`.
     Contains(String, String),
+    /// `path>='value'`.
+    Ge(String, String),
     /// `left and right`.
     And(Box<XpathQuery>, Box<XpathQuery>),
     /// `left or right`.
@@ -1871,6 +1873,7 @@ impl fmt::Display for XpathQuery {
             XpathQuery::Eq(path, value) => write!(f, "{path}='{value}'"),
             XpathQuery::Not(inner) => write!(f, "not({inner})"),
             XpathQuery::Contains(path, value) => write!(f, "contains({path}, '{value}')"),
+            XpathQuery::Ge(path, value) => write!(f, "{path}>='{value}'"),
             XpathQuery::And(left, right) => {
                 let rendered_left = render_xpath_child(left, true);
                 let rendered_right = render_xpath_child(right, true);
@@ -1924,8 +1927,8 @@ const KNOWN_ACTION_TYPES: &[&str] = &[
 /// filter is a list, and a list matches when any of its values
 /// matches; the filters themselves are `and`-joined. The clause order
 /// is fixed (ids, projects, packages, source, target, creators, who,
-/// states, types, exclusions), so the same search always builds the
-/// same expression.
+/// states, since, types, exclusions), so the same search always builds
+/// the same expression.
 ///
 /// The states default to the open states — `new`, `review`,
 /// `declined` — the set a tool triaging open work wants. Pass an
@@ -1940,6 +1943,14 @@ const KNOWN_ACTION_TYPES: &[&str] = &[
 /// History: `with_history` adds the creation entry and the request
 /// history to each result; `with_full_history` adds all history
 /// elements. When both are set the server prefers the full history.
+///
+/// `since` matches requests with a history entry at or after the
+/// date: the `history[@when >= ...]` predicate. A history entry is
+/// any request history element — a state change, a review addition,
+/// a priority change, a supersede — not only the creation entry.
+/// It is not `state[@when >= ...]`: that attribute maps
+/// to the request row's last-update timestamp, which moves on any
+/// touch to the row, not on state changes.
 #[derive(Debug, Clone, Default)]
 pub struct RequestSearch {
     /// Match requests with one of these numbers.
@@ -1973,6 +1984,10 @@ pub struct RequestSearch {
     pub(crate) with_history: bool,
     /// Include all history elements in each result.
     with_full_history: bool,
+    /// Match requests with a history entry at or after this date,
+    /// as `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`. A date alone reads
+    /// as midnight.
+    since: Option<String>,
 }
 
 impl RequestSearch {
@@ -2065,6 +2080,15 @@ impl RequestSearch {
     /// Include all history elements in each result.
     pub fn with_full_history(mut self, with_full_history: bool) -> Self {
         self.with_full_history = with_full_history;
+        self
+    }
+
+    /// Match requests with a history entry at or after this date.
+    /// The value is validated by [`RequestSearch::match_expr`]; an
+    /// invalid date fails the search as `InvalidInput` before any
+    /// request is made.
+    pub fn since(mut self, since: String) -> Self {
+        self.since = Some(since);
         self
     }
 
@@ -2209,6 +2233,13 @@ impl RequestSearch {
                 Box::new(XpathQuery::eq_list("@name", &values)),
             ));
         }
+        if let Some(since) = &self.since {
+            let normalized = parse_since_date(since)?;
+            clauses.push(XpathQuery::Pred(
+                "history".to_string(),
+                Box::new(XpathQuery::Ge("@when".to_string(), normalized)),
+            ));
+        }
         if !self.types.is_empty() {
             clauses.push(XpathQuery::Pred(
                 "action".to_string(),
@@ -2242,6 +2273,78 @@ impl RequestSearch {
         }
         Ok(XpathQuery::and_all(clauses).to_string())
     }
+}
+
+/// Parse and normalize a `--since` date: `YYYY-MM-DD` or
+/// `YYYY-MM-DDTHH:MM:SS`. A date alone normalizes to midnight
+/// (`T00:00:00`). The date must be a real calendar date and the time
+/// in range; anything else — a garbage string, a timezone suffix, a
+/// missing field — is refused. The normalized form contains only
+/// digits, `-`, `T` and `:`, so it cannot break out of the
+/// single-quoted XPath literal it lands in. The server coerces an
+/// unparsable date to a zero date and matches everything, so an
+/// invalid value must never reach the server.
+pub(crate) fn parse_since_date(value: &str) -> Result<String, GeectlError> {
+    fn digits(text: &str) -> bool {
+        !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+    }
+    fn days_in_month(year: u32, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+                {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 0,
+        }
+    }
+    fn invalid(value: &str) -> GeectlError {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid --since date: {value:?} (expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"),
+        )
+    }
+    let (date, time) = match value.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (value, None),
+    };
+    let parts: Vec<&str> = date.split('-').collect();
+    if parts.len() != 3
+        || parts[0].len() != 4
+        || parts[1].len() != 2
+        || parts[2].len() != 2
+        || !parts.iter().all(|part| digits(part))
+    {
+        return Err(invalid(value));
+    }
+    let year: u32 = parts[0].parse().map_err(|_| invalid(value))?;
+    let month: u32 = parts[1].parse().map_err(|_| invalid(value))?;
+    let day: u32 = parts[2].parse().map_err(|_| invalid(value))?;
+    if year == 0 || !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return Err(invalid(value));
+    }
+    let time = match time {
+        None => "00:00:00".to_string(),
+        Some(time) => {
+            let parts: Vec<&str> = time.split(':').collect();
+            if parts.len() != 3 || parts.iter().any(|part| part.len() != 2 || !digits(part)) {
+                return Err(invalid(value));
+            }
+            let hour: u32 = parts[0].parse().map_err(|_| invalid(value))?;
+            let minute: u32 = parts[1].parse().map_err(|_| invalid(value))?;
+            let second: u32 = parts[2].parse().map_err(|_| invalid(value))?;
+            if hour > 23 || minute > 59 || second > 59 {
+                return Err(invalid(value));
+            }
+            time.to_string()
+        }
+    };
+    Ok(format!("{date}T{time}"))
 }
 
 /// Validate a value that goes into a single-quoted XPath string
@@ -2681,15 +2784,16 @@ impl<'a> ObsClient<'a> {
 
     /// Read one request's history (`GET /request/:id` with
     /// `withhistory=1`, returning only the history entries): the
-    /// creation entry first, then each state change in order, with
-    /// who made it, when, and what it was. An agent reads the log to
-    /// audit what happened to a request — who declined it and why,
-    /// when it was superseded — without pulling the whole request.
-    /// Requires credentials; without them the call fails loudly
-    /// before any request. The history the server sends with
-    /// `withhistory` is the request history (creation plus state
-    /// changes); review history is not included, by the server's own
-    /// choice.
+    /// creation entry first, then each request history element in
+    /// order — state changes, review additions, priority changes,
+    /// supersedes — with who made it, when, and what it was. An
+    /// agent reads the log to audit what happened to a request —
+    /// who declined it and why, when it was superseded — without
+    /// pulling the whole request. Requires credentials; without
+    /// them the call fails loudly before any request. The history
+    /// the server sends with `withhistory` is the request history;
+    /// the reviews' own history is not included, by the server's
+    /// own choice.
     pub fn request_log(&self, id: &str) -> Result<Vec<RequestHistory>, GeectlError> {
         Ok(self.fetch_request(id)?.history)
     }
@@ -5910,6 +6014,94 @@ description</description>
         let requests = obs.search_requests(&search).expect("full history parses");
         assert!(requests.is_empty());
         assert_eq!(http.get_calls()[0].0, url);
+    }
+
+    #[test]
+    fn xpath_ge_renders_a_comparison() {
+        assert_eq!(
+            XpathQuery::Ge("@when".to_string(), "2026-10-01T00:00:00".to_string()).to_string(),
+            "@when>='2026-10-01T00:00:00'"
+        );
+        assert_eq!(
+            XpathQuery::Pred(
+                "history".to_string(),
+                Box::new(XpathQuery::Ge(
+                    "@when".to_string(),
+                    "2026-10-01T00:00:00".to_string()
+                )),
+            )
+            .to_string(),
+            "history[@when>='2026-10-01T00:00:00']"
+        );
+    }
+
+    #[test]
+    fn parse_since_date_accepts_a_date_and_a_datetime() {
+        assert_eq!(
+            parse_since_date("2026-10-01").unwrap(),
+            "2026-10-01T00:00:00"
+        );
+        assert_eq!(
+            parse_since_date("2026-10-01T14:30:00").unwrap(),
+            "2026-10-01T14:30:00"
+        );
+        assert_eq!(
+            parse_since_date("2024-02-29").unwrap(),
+            "2024-02-29T00:00:00"
+        );
+    }
+
+    #[test]
+    fn parse_since_date_refuses_bad_dates() {
+        for bad in [
+            "",
+            "garbage",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-02-29",
+            "2026-10-01T25:00:00",
+            "2026-10-01T10:60:00",
+            "2026-10-01T10:00:60",
+            "2026-10-01Z",
+            "2026-10-01T10:00:00Z",
+            "2026-1-1",
+            "2026-10-01 10:00:00",
+            "0000-01-01",
+            "0000-02-29",
+        ] {
+            let err = parse_since_date(bad).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn match_expr_since_adds_a_history_clause() {
+        let expr = RequestSearch::new()
+            .since("2026-10-01".to_string())
+            .match_expr()
+            .expect("a valid since builds");
+        assert!(
+            expr.contains("history[@when>='2026-10-01T00:00:00']"),
+            "since clause present: {expr}"
+        );
+        let expr = RequestSearch::new()
+            .states(vec![RequestState::Declined])
+            .since("2026-10-01T10:00:00".to_string())
+            .match_expr()
+            .expect("since with a state builds");
+        assert_eq!(
+            expr,
+            "state[@name='declined'] and history[@when>='2026-10-01T10:00:00']"
+        );
+    }
+
+    #[test]
+    fn match_expr_since_refuses_an_invalid_date() {
+        let err = RequestSearch::new()
+            .since("garbage".to_string())
+            .match_expr()
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]

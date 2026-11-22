@@ -2429,6 +2429,39 @@ fn live_search_requests_finds_the_filed_request() {
     );
 }
 
+/// The `since` bound is evaluated server-side on the request
+/// history: a date after the filing hides the filed request, a date
+/// before it keeps it (the creation entry is a history entry).
+#[test]
+fn live_search_requests_since_bounds_by_history_date() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _package) = file_live_request(&client, "2.0");
+    let request_id: u64 = id.parse().expect("the filed request id is a number");
+    let future = client
+        .search_requests(
+            &RequestSearch::new()
+                .request_ids(vec![request_id])
+                .since("2999-01-01".to_string()),
+        )
+        .expect("a future since search runs on the live instance");
+    assert!(
+        future.is_empty(),
+        "a since date after the filing must hide the filed request"
+    );
+    let past = client
+        .search_requests(
+            &RequestSearch::new()
+                .request_ids(vec![request_id])
+                .since("2000-01-01".to_string()),
+        )
+        .expect("a past since search runs on the live instance");
+    assert_eq!(past.len(), 1, "a past since must keep the filed request");
+    assert_eq!(past[0].id, request_id);
+}
+
 /// The lenient state change on a request the server refuses to move:
 /// accepting an accepted request reports `false` instead of failing,
 /// so a batch triaging many requests does not stop here.
