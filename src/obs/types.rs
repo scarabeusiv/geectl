@@ -433,6 +433,43 @@ impl RoleGrant {
     }
 }
 
+/// A download-on-demand source of a repository (`<download>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryDownload {
+    /// Architecture the download applies to, when set.
+    pub arch: Option<String>,
+    /// Download URL.
+    pub url: String,
+    /// Repository type, when set.
+    pub repotype: Option<String>,
+    /// Architecture filter, when set.
+    pub archfilter: Option<String>,
+    /// The download's public key, when set.
+    pub pubkey: Option<String>,
+    /// The download master, when the download names one.
+    pub master: Option<DownloadMaster>,
+}
+
+/// The master of a download (`<master>` child of `<download>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadMaster {
+    /// Master URL.
+    pub url: String,
+    /// SSL fingerprint of the master, when set.
+    pub sslfingerprint: Option<String>,
+}
+
+/// A release target of a repository (`<releasetarget>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseTarget {
+    /// Target project.
+    pub project: String,
+    /// Target repository, when set.
+    pub repository: Option<String>,
+    /// Release trigger, when set.
+    pub trigger: Option<String>,
+}
+
 /// A repository in a project meta.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
@@ -442,6 +479,18 @@ pub struct Repository {
     pub arch: Vec<String>,
     /// Rebuild sources: `(project, repository)` pairs.
     pub paths: Vec<(String, String)>,
+    /// Rebuild mode (`rebuild` attribute), when set.
+    pub rebuild: Option<String>,
+    /// Block mode (`block` attribute), when set.
+    pub block: Option<String>,
+    /// Linked-build mode (`linkedbuild` attribute), when set.
+    pub linkedbuild: Option<String>,
+    /// Download-on-demand sources.
+    pub downloads: Vec<RepositoryDownload>,
+    /// Release targets.
+    pub release_targets: Vec<ReleaseTarget>,
+    /// Host systems (`<hostsystem>`).
+    pub hostsystem: Vec<(String, String)>,
 }
 
 /// A project meta (`<project>`).

@@ -1049,7 +1049,12 @@ mod tests {
             name: "openSUSE_Leap_15.6".to_string(),
             arch: vec!["x86_64".to_string()],
             paths: vec![("openSUSE:Leap:15.6".to_string(), "standard".to_string())],
-        }];
+            rebuild: None,
+            block: None,
+            linkedbuild: None,
+            downloads: vec![],
+            release_targets: vec![],
+            hostsystem: vec![],        }];
         let err = client
             .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
             .unwrap_err();
@@ -1077,8 +1082,7 @@ mod tests {
         let puts = http.put_calls();
         assert_eq!(puts.len(), 1);
         assert!(puts[0].1.contains("rebuild=\"local\""));
-        assert!(puts[0].1.contains("<download"));
-    }
+        assert!(puts[0].1.contains("<download"));    }
 
     #[test]
     fn set_project_meta_accepts_a_repository_without_architectures_or_paths() {
@@ -1142,6 +1146,12 @@ mod tests {
             name: "openSUSE_Leap_15.6".to_string(),
             arch: vec!["x86_64".to_string()],
             paths: vec![("openSUSE:Leap:15.6".to_string(), "standard".to_string())],
+            rebuild: None,
+            block: None,
+            linkedbuild: None,
+            downloads: vec![],
+            release_targets: vec![],
+            hostsystem: vec![],
         }];
         assert!(client
             .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))

@@ -5857,6 +5857,12 @@ fn live_add_repository_round_trips() {
             (target_one.clone(), "standard".to_string()),
             (target_two.clone(), "standard".to_string()),
         ],
+        rebuild: None,
+        block: None,
+        linkedbuild: None,
+        downloads: vec![],
+        release_targets: vec![],
+        hostsystem: vec![],
     };
     assert!(
         authed
@@ -5893,6 +5899,12 @@ fn live_remove_repository_round_trips() {
         name: "standard".to_string(),
         arch: vec!["x86_64".to_string()],
         paths: vec![(path_target, "standard".to_string())],
+        rebuild: None,
+        block: None,
+        linkedbuild: None,
+        downloads: vec![],
+        release_targets: vec![],
+        hostsystem: vec![],
     };
     assert!(
         authed

@@ -1072,6 +1072,12 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
             name: xml_unescape(&repo_name),
             arch,
             paths,
+            rebuild: None,
+            block: None,
+            linkedbuild: None,
+            downloads: vec![],
+            release_targets: vec![],
+            hostsystem: None,
         });
     }
     let (persons, groups) = meta_roles(inner)?;
@@ -6819,11 +6825,23 @@ mod tests {
                         ("openSUSE:Factory:ARM".to_string(), "standard".to_string()),
                         ("openSUSE:Factory".to_string(), "snapshot".to_string()),
                     ],
+                    rebuild: None,
+                    block: None,
+                    linkedbuild: None,
+                    downloads: vec![],
+                    release_targets: vec![],
+                    hostsystem: vec![],
                 },
                 Repository {
                     name: "images".to_string(),
                     arch: vec!["x86_64".to_string()],
                     paths: vec![],
+                    rebuild: None,
+                    block: None,
+                    linkedbuild: None,
+                    downloads: vec![],
+                    release_targets: vec![],
+                    hostsystem: vec![],
                 },
             ]
         );

@@ -1671,7 +1671,17 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
                 paths.push((project, repository));
             }
         }
-        repositories.push(Repository { name, arch, paths });
+        repositories.push(Repository {
+            name,
+            arch,
+            paths,
+            rebuild: None,
+            block: None,
+            linkedbuild: None,
+            downloads: vec![],
+            release_targets: vec![],
+            hostsystem: None,
+        });
     }
     Ok(repositories)
 }
@@ -5488,6 +5498,12 @@ mod tests {
                 ("test:factory".to_string(), "standard".to_string()),
                 ("test:devel".to_string(), "standard".to_string()),
             ],
+            rebuild: None,
+            block: None,
+            linkedbuild: None,
+            downloads: vec![],
+            release_targets: vec![],
+            hostsystem: vec![],
         }
     }
 
@@ -5543,6 +5559,12 @@ mod tests {
             name: "standard".to_string(),
             arch: vec!["x86_64".to_string()],
             paths: vec![("test:factory".to_string(), "standard".to_string())],
+            rebuild: None,
+            block: None,
+            linkedbuild: None,
+            downloads: vec![],
+            release_targets: vec![],
+            hostsystem: vec![],
         };
         let err = client
             .add_repository("test:factory", &repo, false, &DryRun::new(false))
@@ -5818,6 +5840,12 @@ mod tests {
             name: "a&b".to_string(),
             arch: vec!["x86_64".to_string()],
             paths: vec![("p&q".to_string(), "r\"s".to_string())],
+            rebuild: None,
+            block: None,
+            linkedbuild: None,
+            downloads: vec![],
+            release_targets: vec![],
+            hostsystem: vec![],
         };
         assert_eq!(
             repository_element(&repo),

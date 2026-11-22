@@ -1078,6 +1078,12 @@ pub fn run_remote(
                 name: name.clone(),
                 arch: arch.clone(),
                 paths,
+                rebuild: None,
+                block: None,
+                linkedbuild: None,
+                downloads: vec![],
+                release_targets: vec![],
+                hostsystem: vec![],
             };
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
             let changed =
@@ -4739,6 +4745,12 @@ mod tests {
                 name: "standard".to_string(),
                 arch: vec!["x86_64".to_string(), "aarch64".to_string()],
                 paths: vec![("openSUSE:Factory".to_string(), "standard".to_string())],
+                rebuild: None,
+                block: None,
+                linkedbuild: None,
+                downloads: vec![],
+                release_targets: vec![],
+                hostsystem: vec![],
             }],
         }
     }

@@ -2545,6 +2545,12 @@ mod tests {
             name: "standard".to_string(),
             arch: vec!["x86_64".to_string(), "aarch64".to_string()],
             paths: vec![("openSUSE:Factory".to_string(), "standard".to_string())],
+            rebuild: None,
+            block: None,
+            linkedbuild: None,
+            downloads: vec![],
+            release_targets: vec![],
+            hostsystem: vec![],
         }];
         let text = render_repositories_text(&repos);
         assert!(text.contains("standard (x86_64, aarch64)"));
