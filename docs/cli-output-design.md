@@ -105,10 +105,9 @@ what "one coherent channel" means.
 
 - **No request or response bodies, no headers.** Bodies can be large
   (up to the 10 MiB cap) and headers carry the credentials. The
-  method + URL + status + duration + attempt is the diagnostic; a body
-  has never been needed to explain a geectl failure. Printing bodies
-  is a separate decision with a size cap and redaction — not a quiet
-  addition.
+  method + URL + status + duration + attempt is the diagnostic.
+  Printing bodies is a separate decision with a size cap and
+  redaction — not a quiet addition.
 - **No secrets, ever.** Credentials travel in headers, never in URLs,
   so the URL is safe to print as-is — but the rule is stated at the
   sink: the sink takes pre-formed lines, never a header map or a
