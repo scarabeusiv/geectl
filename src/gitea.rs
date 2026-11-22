@@ -45,6 +45,7 @@ use crate::obs::ObsClient;
 use crate::url::UrlBuilder;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashSet;
 
 /// A Gitea user: only the login is modelled (the fork target-owner
 /// resolution reads it from `GET /api/v1/user`).
@@ -604,16 +605,13 @@ impl<'a> GiteaClient<'a> {
                     &format!("repositories of organization {org}"),
                     "the list is bounded at 500 entries",
                 )?);
-                let mut seen: Vec<String> = Vec::new();
-                repos.retain(|repo| {
-                    let full = repo.full_name.to_lowercase();
-                    if seen.contains(&full) {
-                        false
-                    } else {
-                        seen.push(full);
-                        true
-                    }
-                });
+                // A set, not a linear scan: the two lists hold
+                // up to 500 entries each, and the Vec form was
+                // O(n^2) on the combined list. `insert` returns
+                // false for a duplicate, which is the retain
+                // predicate directly; order is unchanged.
+                let mut seen: HashSet<String> = HashSet::new();
+                repos.retain(|repo| seen.insert(repo.full_name.to_lowercase()));
             }
         }
         Ok(repos)
@@ -1862,6 +1860,31 @@ mod tests {
                 .map(|r| r.full_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["pool/systemd"]
+        );
+    }
+
+    #[test]
+    fn repo_list_both_form_dedupes_mixed_case_names() {
+        // The repo-identity rule is case-insensitive: the user
+        // list naming the account `Pool` and the org list naming
+        // it `pool` hold the same repo, so the both form returns
+        // it once, keeping the first (user) spelling.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/users/Pool/repos?page=1&limit=50",
+                &repo_list_json(&[repo_json("Pool", "systemd", None)]),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/orgs/pool/repos?page=1&limit=50",
+                &repo_list_json(&[repo_json("pool", "systemd", None)]),
+            );
+        let repos = client(&http).repo_list(Some("Pool"), Some("pool")).unwrap();
+        assert_eq!(
+            repos
+                .iter()
+                .map(|r| r.full_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Pool/systemd"]
         );
     }
 
