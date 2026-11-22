@@ -776,12 +776,20 @@ impl<'a> GiteaClient<'a> {
                 ],
             );
             let body = self.http.get_with(&url, &self.credentials)?;
-            let page_items: Vec<T> = serde_json::from_str(&body).map_err(|err| {
-                GeectlError::new(
-                    ErrorKind::ServerError,
-                    format!("unexpected Gitea {scope} response (page {page}): {err}"),
-                )
-            })?;
+            // Gitea answers a JSON `null` body for an empty list —
+            // verified live 2026-11-22 on the branches endpoint of
+            // an empty repo (`pool/systemd` before its first
+            // commit). Parse as an optional list so a null page is
+            // an empty page, not a server error. Any other shape
+            // still fails with the same message as before.
+            let page_items: Vec<T> = serde_json::from_str::<Option<Vec<T>>>(&body)
+                .map_err(|err| {
+                    GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!("unexpected Gitea {scope} response (page {page}): {err}"),
+                    )
+                })?
+                .unwrap_or_default();
             let full = page_items.len() == LIST_PAGE_SIZE as usize;
             items.extend(page_items);
             if !full {
@@ -804,12 +812,14 @@ impl<'a> GiteaClient<'a> {
             ],
         );
         let body = self.http.get_with(&url, &self.credentials)?;
-        let page_items: Vec<T> = serde_json::from_str(&body).map_err(|err| {
-            GeectlError::new(
-                ErrorKind::ServerError,
-                format!("unexpected Gitea {scope} response (page {page}): {err}"),
-            )
-        })?;
+        let page_items: Vec<T> = serde_json::from_str::<Option<Vec<T>>>(&body)
+            .map_err(|err| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("unexpected Gitea {scope} response (page {page}): {err}"),
+                )
+            })?
+            .unwrap_or_default();
         if page_items.is_empty() {
             return Ok(items);
         }
@@ -2149,6 +2159,20 @@ mod tests {
         assert_eq!(branches[0].commit.message, "OBS bridge sync");
         assert!(!branches[0].protected);
         assert!(branches[1].protected);
+    }
+
+    #[test]
+    fn branch_list_null_page_is_an_empty_list() {
+        // Gitea answers a JSON `null` body for an empty list —
+        // verified live on the branches endpoint of the empty
+        // `pool/systemd` fixture repo. The list is empty, not an
+        // error.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches?page=1&limit=50",
+            "null",
+        );
+        let branches = client(&http).branch_list("pool", "systemd").unwrap();
+        assert!(branches.is_empty());
     }
 
     #[test]
