@@ -1673,6 +1673,330 @@ fn remote_repo_remove_live_with_half_set_credentials_fails_with_config_error() {
     );
 }
 
+// --- remote mutation CLI pins (issue #129) ---
+//
+// The live-creds failure and the invalid-input rejections,
+// parametrized across the remote mutation leaves. Credentials resolve
+// before the command runs, and the input checks run before any
+// network, so none of these needs a server.
+
+/// A live remote mutation with half-set credentials fails fast with
+/// a config error (exit 9). The context names the half-set pair,
+/// which only the CLI-level fail-fast produces: the library's own
+/// credentials check reports a missing-credentials message instead.
+/// This pins the fail-fast layer, not just the code.
+fn remote_live_mutation_with_half_set_credentials_fails(args: &[String]) {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "remote"])
+        .args(args)
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9), "args: {args:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "args: {args:?}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("is set but no password source is"),
+        "context: {}",
+        value["error"]["context"]
+    );
+}
+
+#[test]
+fn remote_live_mutations_with_half_set_credentials_fail_with_config_error() {
+    // The create-project, repo-add and repo-remove leaves already
+    // have their own live-creds tests above; this loop pins the
+    // remaining live mutations the same way.
+    let dir = TempDir::new();
+    let from = dir.0.join("vim.spec");
+    std::fs::write(&from, "Name: vim\n").unwrap();
+    let from = from.to_string_lossy().into_owned();
+    let cases: Vec<Vec<String>> = vec![
+        vec![
+            "upload-file".into(),
+            "openSUSE:Factory".into(),
+            "vim".into(),
+            "vim.spec".into(),
+            "--from".into(),
+            from,
+        ],
+        vec![
+            "create-package".into(),
+            "home:alice".into(),
+            "vim".into(),
+            "--title".into(),
+            "Vi".into(),
+            "--description".into(),
+            "Vi IMproved".into(),
+        ],
+        vec![
+            "delete-package".into(),
+            "home:alice".into(),
+            "vim".into(),
+            "--force".into(),
+        ],
+        vec![
+            "delete-project".into(),
+            "home:alice".into(),
+            "--recursive".into(),
+            "--force".into(),
+            "--comment".into(),
+            "cleanup".into(),
+        ],
+        vec!["undelete-package".into(), "home:alice".into(), "vim".into()],
+        vec!["undelete-project".into(), "home:alice".into()],
+        vec![
+            "aggregate-package".into(),
+            "openSUSE:Factory".into(),
+            "vim".into(),
+            "home:alice".into(),
+            "vim".into(),
+            "--repository-map".into(),
+            "standard=standard".into(),
+            "--no-sources".into(),
+            "--disable-publish".into(),
+        ],
+        vec![
+            "release-package".into(),
+            "home:alice".into(),
+            "vim".into(),
+            "--repository".into(),
+            "standard".into(),
+            "--arch".into(),
+            "x86_64".into(),
+            "--target-project".into(),
+            "openSUSE:Factory".into(),
+            "--target-repository".into(),
+            "standard".into(),
+            "--set-release".into(),
+            "1.0".into(),
+            "--no-delay".into(),
+        ],
+        vec![
+            "release-project".into(),
+            "home:alice".into(),
+            "--repository".into(),
+            "standard".into(),
+            "--arch".into(),
+            "x86_64".into(),
+            "--target-project".into(),
+            "openSUSE:Factory".into(),
+            "--target-repository".into(),
+            "standard".into(),
+            "--set-release".into(),
+            "1.0".into(),
+            "--no-delay".into(),
+        ],
+    ];
+    for args in cases {
+        remote_live_mutation_with_half_set_credentials_fails(&args);
+    }
+}
+
+/// A remote mutation with invalid input fails fast (exit 2) with a
+/// structured `invalid_input` error on stderr and empty stdout.
+fn remote_mutation_invalid_input_fails(args: &[String], context: &str) {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "args: {args:?}");
+    assert_eq!(out.status.code(), Some(2), "args: {args:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "args: {args:?}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains(context),
+        "context: {}",
+        value["error"]["context"]
+    );
+}
+
+#[test]
+fn remote_upload_file_missing_from_fails_with_invalid_input() {
+    let dir = TempDir::new();
+    let missing = dir.0.join("missing.spec");
+    let context = format!(
+        "cannot read {}: No such file or directory (os error 2)",
+        missing.display()
+    );
+    remote_mutation_invalid_input_fails(
+        &[
+            "upload-file".to_string(),
+            "openSUSE:Factory".to_string(),
+            "vim".to_string(),
+            "vim.spec".to_string(),
+            "--from".to_string(),
+            missing.to_string_lossy().into_owned(),
+        ],
+        &context,
+    );
+}
+
+#[test]
+fn remote_upload_file_non_utf8_from_fails_with_invalid_input() {
+    let dir = TempDir::new();
+    let bad = dir.0.join("bad.spec");
+    std::fs::write(&bad, [0xff, 0xfe, b'b', b'a', b'd']).unwrap();
+    let context = format!(
+        "cannot read {}: stream did not contain valid UTF-8",
+        bad.display()
+    );
+    remote_mutation_invalid_input_fails(
+        &[
+            "upload-file".to_string(),
+            "openSUSE:Factory".to_string(),
+            "vim".to_string(),
+            "vim.spec".to_string(),
+            "--from".to_string(),
+            bad.to_string_lossy().into_owned(),
+        ],
+        &context,
+    );
+}
+
+#[test]
+fn remote_upload_file_non_utf8_from_binary_dry_run_succeeds() {
+    // The binary upload takes bytes, so the same file the text
+    // upload rejects uploads in dry-run.
+    let dir = TempDir::new();
+    let bad = dir.0.join("bad.spec");
+    std::fs::write(&bad, [0xff, 0xfe, b'b', b'a', b'd']).unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "upload-file",
+            "openSUSE:Factory",
+            "vim",
+            "vim.spec",
+            "--binary",
+            "--from",
+        ])
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["rev"], serde_json::Value::Null);
+}
+
+#[test]
+fn remote_repo_add_bad_path_fails_with_invalid_input() {
+    // `--path` is the `PROJECT/REPOSITORY` coordinate: a value with
+    // no `/`, or an empty side, is an input error naming the form.
+    for path in ["no-slash-here", "openSUSE:Factory/", "/standard"] {
+        let context = format!("invalid repository path {path:?}: expected PROJECT/REPOSITORY");
+        remote_mutation_invalid_input_fails(
+            &[
+                "repo-add".to_string(),
+                "openSUSE:Factory".to_string(),
+                "standard".to_string(),
+                "--arch".to_string(),
+                "x86_64".to_string(),
+                "--path".to_string(),
+                path.to_string(),
+            ],
+            &context,
+        );
+    }
+}
+
+#[test]
+fn remote_aggregate_package_bad_repository_map_fails_with_invalid_input() {
+    for mapping in ["no-equals", "=target", "source="] {
+        let context = format!("invalid repository mapping {mapping:?}: expected SOURCE=TARGET");
+        remote_mutation_invalid_input_fails(
+            &[
+                "aggregate-package".to_string(),
+                "openSUSE:Factory".to_string(),
+                "vim".to_string(),
+                "home:alice".to_string(),
+                "vim".to_string(),
+                "--repository-map".to_string(),
+                mapping.to_string(),
+            ],
+            &context,
+        );
+    }
+}
+
+#[test]
+fn remote_release_target_repository_without_target_project_fails_with_invalid_input() {
+    // Both release leaves validate the pair the same way.
+    let context = "releasing to a target repository needs a target project";
+    remote_mutation_invalid_input_fails(
+        &[
+            "release-package".to_string(),
+            "home:alice".to_string(),
+            "vim".to_string(),
+            "--target-repository".to_string(),
+            "standard".to_string(),
+        ],
+        context,
+    );
+    remote_mutation_invalid_input_fails(
+        &[
+            "release-project".to_string(),
+            "home:alice".to_string(),
+            "--target-repository".to_string(),
+            "standard".to_string(),
+        ],
+        context,
+    );
+    // The second branch of the same validation: a target project
+    // needs a repository and a target repository.
+    remote_mutation_invalid_input_fails(
+        &[
+            "release-package".to_string(),
+            "home:alice".to_string(),
+            "vim".to_string(),
+            "--target-project".to_string(),
+            "openSUSE:Factory".to_string(),
+        ],
+        "releasing to a target project needs a repository and a target repository",
+    );
+}
+
+#[test]
+fn remote_mutation_bad_project_name_fails_with_invalid_input() {
+    // The library validates names before the dry-run guard in every
+    // mutation leaf; aggregate-package pins it here.
+    remote_mutation_invalid_input_fails(
+        &[
+            "aggregate-package".to_string(),
+            "!!bad".to_string(),
+            "vim".to_string(),
+            "home:alice".to_string(),
+            "vim".to_string(),
+        ],
+        "invalid OBS project name: \"!!bad\"",
+    );
+}
+
 // --- branch/copy/link integration tests (isolated env, dry-run) ---
 //
 // The dry-run guard runs before the first HTTP call in all ten
