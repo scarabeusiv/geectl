@@ -71,9 +71,10 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff,
-    PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch, ProjectMeta, Repository,
-    RevisionPatch, RevisionRange, SourceFile, FACTORY_PROJECT, OBS_API_BASE,
+    CreatePackageOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient,
+    Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch,
+    ProjectMeta, Repository, RevisionPatch, RevisionRange, SourceFile, FACTORY_PROJECT,
+    OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -297,6 +298,31 @@ pub enum RemoteCommand {
         #[arg(long)]
         description: String,
     },
+    /// Create a package. A mutation: dry-run is the default (only
+    /// the plan is printed); `--live` performs the creation.
+    /// Without `--scmsync` and `--force` the package is created
+    /// directly; with either, the creation goes through the options
+    /// form, which refuses an existing package unless `--force` is
+    /// set and refuses a project managed in git.
+    CreatePackage {
+        /// The project to create the package in.
+        project: String,
+        /// The package to create.
+        package: String,
+        /// The package title.
+        #[arg(long)]
+        title: String,
+        /// The package description.
+        #[arg(long)]
+        description: String,
+        /// The git repository and branch the package syncs its
+        /// sources from, as `url#branch`.
+        #[arg(long)]
+        scmsync: Option<String>,
+        /// Overwrite the package when it already exists.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
@@ -330,6 +356,7 @@ pub fn run_remote(
         }
         RemoteCommand::UploadFile { .. } if !live => Credentials::None,
         RemoteCommand::CreateProject { .. } if !live => Credentials::None,
+        RemoteCommand::CreatePackage { .. } if !live => Credentials::None,
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -678,6 +705,46 @@ pub fn run_remote(
                 plan,
             ))
         }
+        RemoteCommand::CreatePackage {
+            project,
+            package,
+            title,
+            description,
+            scmsync,
+            force,
+        } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            let options = CreatePackageOptions {
+                scmsync: scmsync.clone(),
+                force,
+            };
+            if scmsync.is_some() || force {
+                client.create_package_with_options(
+                    &project,
+                    &package,
+                    &title,
+                    &description,
+                    &options,
+                    &dry_run,
+                )?;
+            } else {
+                client.create_package(&project, &package, &title, &description, &dry_run)?;
+            }
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(create_package_result(
+                &project,
+                &package,
+                &title,
+                &description,
+                &options,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
     }
 }
 
@@ -839,6 +906,45 @@ fn create_project_result(
     mutation_result(
         payload,
         format!("project: {project}"),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The `create-package` result: the payload carries the title,
+/// the description, the scmsync, and `force`; the text carries the
+/// title and the scmsync and leaves the description to the payload
+/// (long free text) and `force` to the dry-run plan (a boolean).
+fn create_package_result(
+    project: &str,
+    package: &str,
+    title: &str,
+    description: &str,
+    options: &CreatePackageOptions,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let payload = json!({
+        "project": project,
+        "package": package,
+        "title": title,
+        "description": description,
+        "scmsync": options.scmsync,
+        "force": options.force,
+    });
+    let definition = match &options.scmsync {
+        Some(scmsync) => format!(" (title: {title}; scmsync: {scmsync})"),
+        None => format!(" (title: {title})"),
+    };
+    let result_line = if dry_run {
+        format!("dry-run: would create package {package} in project {project}{definition}")
+    } else {
+        format!("created package {package} in project {project}{definition}")
+    };
+    mutation_result(
+        payload,
+        format!("project: {project} package: {package}"),
         result_line,
         dry_run,
         plan,
@@ -1836,6 +1942,98 @@ mod tests {
         assert_eq!(
             text,
             "project: home:alice\ndry_run: true\ndry-run: would create project home:alice (title: Alice)\n[dry-run] would: create project home:alice"
+        );
+    }
+
+    #[test]
+    fn create_package_parses_title_description_and_options() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "create-package",
+            "P",
+            "K",
+            "--title",
+            "Vi",
+            "--description",
+            "Vi IMproved",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::CreatePackage {
+                scmsync: None,
+                force: false,
+                ..
+            }
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "create-package",
+            "P",
+            "K",
+            "--title",
+            "Vi",
+            "--description",
+            "Vi IMproved",
+            "--scmsync",
+            "https://example.com/vim#main",
+            "--force",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::CreatePackage {
+                scmsync: Some(scmsync),
+                force: true,
+                ..
+            } if scmsync == "https://example.com/vim#main"
+        ));
+        assert!(Cli::try_parse_from(["geectl", "remote", "create-package", "P", "K"]).is_err());
+    }
+
+    #[test]
+    fn create_package_result_carries_scmsync_in_both_formats() {
+        let (payload, text) = create_package_result(
+            "P",
+            "K",
+            "Vi",
+            "A very long description",
+            &CreatePackageOptions {
+                scmsync: Some("https://example.com/vim#main".to_string()),
+                force: true,
+            },
+            false,
+            None,
+        );
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["package"], "K");
+        assert_eq!(payload["title"], "Vi");
+        assert_eq!(payload["description"], "A very long description");
+        assert_eq!(payload["scmsync"], "https://example.com/vim#main");
+        assert_eq!(payload["force"], true);
+        assert_eq!(payload["dry_run"], false);
+        assert!(!text.contains("A very long description"));
+        assert!(!text.contains("force"));
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: false\ncreated package K in project P (title: Vi; scmsync: https://example.com/vim#main)"
+        );
+        let (payload, text) = create_package_result(
+            "P",
+            "K",
+            "Vi",
+            "A very long description",
+            &CreatePackageOptions::default(),
+            true,
+            Some(vec!["[dry-run] would: create package P/K".to_string()]),
+        );
+        assert_eq!(payload["scmsync"], Value::Null);
+        assert_eq!(payload["force"], false);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(payload["plan"][0], "[dry-run] would: create package P/K");
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: true\ndry-run: would create package K in project P (title: Vi)\n[dry-run] would: create package P/K"
         );
     }
 

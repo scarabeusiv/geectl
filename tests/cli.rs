@@ -667,6 +667,7 @@ fn remote_help_lists_every_command() {
         "repo-remove",
         "upload-file",
         "create-project",
+        "create-package",
         "list-projects",
     ] {
         assert!(
@@ -1284,6 +1285,57 @@ fn remote_create_project_live_with_half_set_credentials_fails_with_config_error(
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
     assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_create_package_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all. Both
+    // creation forms are covered: the direct form and the options
+    // form (`--scmsync` selects it).
+    let dir = TempDir::new();
+    for args in [
+        vec![
+            "remote",
+            "create-package",
+            "home:alice",
+            "vim",
+            "--title",
+            "Vi",
+            "--description",
+            "Vi IMproved",
+        ],
+        vec![
+            "remote",
+            "create-package",
+            "home:alice",
+            "vim",
+            "--title",
+            "Vi",
+            "--description",
+            "Vi IMproved",
+            "--scmsync",
+            "https://example.com/vim#main",
+            "--force",
+        ],
+    ] {
+        let out = geectl_isolated(&dir)
+            .args(&args)
+            .env("GEECTL_OBS_USERNAME", "alice")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "args {args:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        assert_eq!(value["dry_run"], true);
+        assert_eq!(value["project"], "home:alice");
+        assert_eq!(value["package"], "vim");
+    }
 }
 
 #[test]
