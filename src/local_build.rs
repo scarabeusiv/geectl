@@ -2198,26 +2198,28 @@ fn run_engine(
             "cannot run the build engine: empty argv",
         ));
     }
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Its own process group: the timeout kill signals the group
-        // (`kill -- -$pgid`), not just the wrapper — the engine and
-        // its host-side children die with it. The container does
-        // not: it lives in its own pid namespace (see the doc above).
-        // `process_group` is safe std, no `unsafe`, so the crate's
-        // `unsafe` forbid still holds.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| {
-            GeectlError::new(
-                ErrorKind::NoBuildEngine,
-                format!("cannot run the build engine {}: {e}", argv[0]),
-            )
-        })?;
+    let mut child = spawn_with_retry(|| {
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Its own process group: the timeout kill signals the group
+            // (`kill -- -$pgid`), not just the wrapper — the engine and
+            // its host-side children die with it. The container does
+            // not: it lives in its own pid namespace (see the doc above).
+            // `process_group` is safe std, no `unsafe`, so the crate's
+            // `unsafe` forbid still holds.
+            .process_group(0)
+            .spawn()
+    })
+    .map_err(|e| {
+        GeectlError::new(
+            ErrorKind::NoBuildEngine,
+            format!("cannot run the build engine {}: {e}", argv[0]),
+        )
+    })?;
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let stdout_drain = spawn_drain(stdout.take());
@@ -2304,6 +2306,49 @@ fn kill_child(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// Spawn attempts, at most: a momentary fork failure clears in
+/// milliseconds, so a short backoff is enough.
+const SPAWN_RETRY_ATTEMPTS: u32 = 3;
+/// Pause between spawn retries.
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Whether an I/O error from spawning a child is transient and
+/// worth one more attempt: resource exhaustion (EAGAIN/ENOMEM)
+/// under parallel load, not a missing binary or a denied exec.
+fn is_transient_spawn_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::ResourceBusy
+            | std::io::ErrorKind::OutOfMemory
+    )
+}
+
+/// Spawn a child, retrying a transient fork failure instead of
+/// surfacing it: a momentary EAGAIN while the test suite runs in
+/// parallel must not fail a build whose podman is fine. Permanent
+/// failures return on the first attempt, and the original error is
+/// kept when the retries run out.
+fn spawn_with_retry(
+    mut spawn: impl FnMut() -> std::io::Result<std::process::Child>,
+) -> std::io::Result<std::process::Child> {
+    let mut attempts = 0;
+    let mut first_err: Option<std::io::Error> = None;
+    loop {
+        match spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) if is_transient_spawn_error(&e) && attempts + 1 < SPAWN_RETRY_ATTEMPTS => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                attempts += 1;
+                std::thread::sleep(SPAWN_RETRY_DELAY);
+            }
+            Err(e) => return Err(first_err.take().unwrap_or(e)),
+        }
+    }
+}
+
 /// Run a one-shot command with a deadline, capturing stdout/stderr
 /// (capped, as in [`run_engine`]). On expiry the child is killed
 /// and `TimedOut` is returned — a probe must never hang the caller.
@@ -2311,11 +2356,12 @@ fn kill_child(child: &mut std::process::Child) {
 /// is for the probes (`--version`, image inspect/listing/size,
 /// image remove, image pull).
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<std::process::Output> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = spawn_with_retry(|| {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })?;
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let stdout_drain = spawn_drain(stdout.take());
@@ -7123,6 +7169,63 @@ exit 0
             .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::BuildTimeout);
             assert!(started.elapsed() < Duration::from_secs(13));
+        }
+
+        #[test]
+        fn spawn_with_retry_retries_a_transient_spawn_failure() {
+            // A momentary fork failure (EAGAIN under parallel load)
+            // is retried, not surfaced: the third attempt spawns
+            // fine, so the caller never sees the transient error.
+            let attempts = std::cell::Cell::new(0);
+            let mut child = spawn_with_retry(|| {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                if n < 3 {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                } else {
+                    // /usr/bin/true, not /bin/true: the latter
+                    // does not exist on macOS.
+                    Command::new("/usr/bin/true").spawn()
+                }
+            })
+            .unwrap();
+            assert_eq!(attempts.get(), 3);
+            assert!(child.wait().unwrap().success());
+        }
+
+        #[test]
+        fn spawn_with_retry_gives_up_after_the_attempts() {
+            // A spawn failure that never clears returns the original
+            // error once the attempts run out: the first attempt's
+            // WouldBlock, not the later attempts' OutOfMemory — and
+            // not a success, and not an endless retry.
+            let attempts = std::cell::Cell::new(0);
+            let err = spawn_with_retry(|| {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                Err::<std::process::Child, _>(std::io::Error::from(if n == 1 {
+                    std::io::ErrorKind::WouldBlock
+                } else {
+                    std::io::ErrorKind::OutOfMemory
+                }))
+            })
+            .unwrap_err();
+            assert_eq!(attempts.get(), 3);
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        }
+
+        #[test]
+        fn spawn_with_retry_does_not_retry_a_permanent_failure() {
+            // A missing binary is permanent: one attempt, same error,
+            // no pointless retries.
+            let attempts = std::cell::Cell::new(0);
+            let err = spawn_with_retry(|| {
+                attempts.set(attempts.get() + 1);
+                Err::<std::process::Child, _>(std::io::Error::from(std::io::ErrorKind::NotFound))
+            })
+            .unwrap_err();
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         }
 
         #[test]
