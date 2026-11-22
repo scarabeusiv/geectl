@@ -9,6 +9,8 @@
 
 use serde_json::json;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,6 +78,104 @@ fn error_of(out: &std::process::Output) -> serde_json::Value {
         .expect("stderr is a JSON error")
 }
 
+/// One parseable request document for the stub-server test: the
+/// library's own fixture shape, so the stub answers what the real
+/// server sends.
+const REQUEST_STUB_XML: &str = r#"<request creator="creator" id="42">
+  <action type="submit">
+    <source package="bar" project="foo" rev="1" />
+    <target package="bar" project="foobar" />
+  </action>
+  <action type="delete">
+    <target project="deleteme" />
+  </action>
+  <state name="accepted" when="2010-12-27T01:36:29" who="user1" />
+  <history when="2010-12-13T13:02:03" who="creator">
+    <description>Create Request</description>
+    <comment>foobar</comment>
+  </history>
+  <title>title of the request</title>
+  <description>this is a
+very long
+description</description>
+</request>"#;
+
+/// A one-shot stub OBS server: accepts a single connection, records
+/// the request target, and answers with the given XML body.
+fn stub_obs_server(body: &str) -> (u16, std::sync::mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the stub server");
+    let port = listener.local_addr().expect("stub address").port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&request).to_string();
+        let target = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .to_string();
+        let _ = tx.send(target);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+    (port, rx)
+}
+
+/// Percent-decode a URL target (`%XX` and `+` as space).
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 #[test]
 fn request_help_lists_the_subcommands() {
     let dir = TempDir::new();
@@ -89,6 +189,7 @@ fn request_help_lists_the_subcommands() {
         "show",
         "log",
         "search",
+        "list",
         "diff",
         "list-comments",
         "accept",
@@ -131,6 +232,107 @@ fn request_search_without_credentials_fails_with_config_error() {
         .unwrap();
     assert_eq!(out.status.code(), Some(9));
     assert_eq!(error_of(&out)["error"]["code"], "config_error");
+}
+
+#[test]
+fn request_list_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    assert_eq!(error_of(&out)["error"]["code"], "config_error");
+}
+
+#[test]
+fn request_list_with_project_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "list", "--project", "openSUSE:Factory"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    assert_eq!(error_of(&out)["error"]["code"], "config_error");
+}
+
+#[test]
+fn request_list_with_package_without_project_fails_before_credentials() {
+    // `--package` names a package inside a project, so it is
+    // refused before any credential resolution.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "list", "--package", "foo"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn request_list_with_invalid_since_fails_before_credentials() {
+    // The date is validated while the search is built, before any
+    // credential resolution, so a bad date fails as InvalidInput
+    // even with no credentials configured.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "list", "--since", "garbage"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn request_list_with_zero_limit_fails_before_credentials() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "list", "--limit", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn request_list_against_a_stub_server_lists_with_the_open_states() {
+    // The leaf runs the search end to end: the stub records the
+    // match the leaf sent, so the test pins the default states
+    // (new, review) in the request itself, not only in the helper.
+    // The stub returns its canned collection without filtering, so
+    // the payload assertions pin the shape (id, count), while the
+    // state assertion reads the sent match.
+    let collection = format!("<collection matches=\"1\">\n{REQUEST_STUB_XML}\n</collection>");
+    let (port, target_rx) = stub_obs_server(&collection);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_OBS_URL", format!("http://127.0.0.1:{port}"))
+        .env("GEECTL_OBS_USERNAME", "tester")
+        .env("GEECTL_OBS_PASSWORD", "secret")
+        .args(["request", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("stdout is JSON");
+    assert_eq!(payload["count"], 1);
+    assert_eq!(payload["requests"][0]["id"], 42);
+    let target = target_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stub saw the search request");
+    let query = percent_decode(&target);
+    assert!(
+        query.contains("state[@name='new' or @name='review']"),
+        "list sends the open states: {query}"
+    );
+    assert!(
+        !query.contains("declined"),
+        "list does not send declined: {query}"
+    );
 }
 
 #[test]

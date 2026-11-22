@@ -2488,6 +2488,28 @@ fn live_search_requests_limit_bounds_the_result() {
     assert_eq!(multi.len(), 1, "limit 1 caps a multi-match search");
 }
 
+/// The search `request list` runs — open states only, capped by
+/// `--limit` — covers the filed request while it is new.
+#[test]
+fn live_request_list_defaults_cover_the_filed_request() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _package) = file_live_request(&client, "2.0");
+    let request_id: u64 = id.parse().expect("the filed request id is a number");
+    let listed = client
+        .search_requests(
+            &RequestSearch::new()
+                .states(vec![RequestState::New, RequestState::Review])
+                .request_ids(vec![request_id])
+                .limit(1),
+        )
+        .expect("the list search runs on the live instance");
+    assert_eq!(listed.len(), 1, "the filed request is listed");
+    assert_eq!(listed[0].id, request_id);
+}
+
 /// The lenient state change on a request the server refuses to move:
 /// accepting an accepted request reports `false` instead of failing,
 /// so a batch triaging many requests does not stop here.

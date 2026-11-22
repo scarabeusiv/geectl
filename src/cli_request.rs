@@ -141,6 +141,28 @@ pub enum RequestCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// List submit requests: the same search, with the states still
+    /// awaiting action (new, review) as the default. A thin wrapper
+    /// over the search operation: the flags select the same
+    /// server-side search.
+    List {
+        /// Requests touching this project.
+        #[arg(long)]
+        project: Vec<String>,
+        /// Requests touching this package; requires `--project`.
+        #[arg(long)]
+        package: Vec<String>,
+        /// Requests in this state; when empty, new and review.
+        #[arg(long)]
+        state: Vec<String>,
+        /// Only requests with a history entry at or after this
+        /// date, as `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`.
+        #[arg(long)]
+        since: Option<String>,
+        /// Ask the server for at most this many matches.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Show the diff of a submit request: the unified diff, or the
     /// request XML with the diff injected with `--xml`.
     Diff {
@@ -499,6 +521,55 @@ pub fn run(
                 Ok((payload, render_search_text(&coordinates, &requests)))
             })
         }
+        RequestCommand::List {
+            project,
+            package,
+            state,
+            since,
+            limit,
+        } => {
+            // `--package` names a package inside a project, so it
+            // is refused without `--project` before anything else,
+            // and the search is built and validated before any
+            // credential resolution, like the search arm.
+            validate_list_scope(&project, &package)?;
+            let since_values: Vec<String> = since.iter().cloned().collect();
+            let limit_values: Vec<String> = limit.iter().map(usize::to_string).collect();
+            let coordinates = search_coordinates(&[
+                ("project", &project),
+                ("package", &package),
+                ("state", &state),
+                ("since", &since_values),
+                ("limit", &limit_values),
+            ]);
+            let search = build_search(
+                vec![],
+                project,
+                package,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                list_default_states(state),
+                vec![],
+                vec![],
+                false,
+                false,
+                since,
+                limit,
+            )?;
+            search.match_expr()?;
+            with_client(debug, true, |client| {
+                let requests = client.search_requests(&search)?;
+                let payload = json!({
+                    "requests": requests.iter().map(request_json).collect::<Vec<_>>(),
+                    "count": requests.len(),
+                });
+                Ok((payload, render_list_text(&coordinates, &requests)))
+            })
+        }
         RequestCommand::Diff { id, xml } => with_client(debug, true, |client| {
             let diff = client.request_diff(&id, xml)?;
             // A content command: the payload is the diff, and the
@@ -829,6 +900,28 @@ fn parse_state(value: &str) -> Result<RequestState, GeectlError> {
             format!("invalid request state: {value:?}"),
         )
     })
+}
+
+/// The states `request list` searches when none were named: the
+/// states still awaiting action, new and review.
+fn list_default_states(state: Vec<String>) -> Vec<String> {
+    if state.is_empty() {
+        vec!["new".to_string(), "review".to_string()]
+    } else {
+        state
+    }
+}
+
+/// `--package` names a package inside a project, so `request list`
+/// refuses it without `--project`.
+fn validate_list_scope(project: &[String], package: &[String]) -> Result<(), GeectlError> {
+    if !package.is_empty() && project.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "request list --package requires --project",
+        ));
+    }
+    Ok(())
 }
 
 /// Build the `RequestSearch` from the `search` flags. The flags
@@ -1810,7 +1903,27 @@ fn search_header(coordinates: &str, count: usize) -> String {
 /// history, even with `--with-history`: that flag enriches the JSON
 /// payload only.
 fn render_search_text(coordinates: &str, requests: &[Request]) -> String {
-    let header = search_header(coordinates, requests.len());
+    render_request_list(&search_header(coordinates, requests.len()), requests)
+}
+
+/// The list text: the same narrow table as the search text, under a
+/// `list` header echoing the coordinates. The list leaf is a thin
+/// wrapper over the search operation, so the table is shared, not
+/// re-implemented.
+fn render_list_text(coordinates: &str, requests: &[Request]) -> String {
+    render_request_list(
+        &format!(
+            "list{coordinates} ({} request{})",
+            requests.len(),
+            if requests.len() == 1 { "" } else { "s" }
+        ),
+        requests,
+    )
+}
+
+/// A header line plus the narrow request table (id, state, creator,
+/// actions) — or `no requests` under the header when nothing matched.
+fn render_request_list(header: &str, requests: &[Request]) -> String {
     if requests.is_empty() {
         return format!("{header}\nno requests");
     }
@@ -2720,6 +2833,44 @@ mod tests {
                 ("limit", &["3".to_string()]),
             ]),
             " since=2026-10-01 limit=3"
+        );
+    }
+
+    #[test]
+    fn list_default_states_defaults_to_new_and_review() {
+        assert_eq!(
+            list_default_states(vec![]),
+            vec!["new".to_string(), "review".to_string()]
+        );
+        assert_eq!(
+            list_default_states(vec!["declined".to_string()]),
+            vec!["declined".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_list_scope_refuses_a_package_without_a_project() {
+        let err = validate_list_scope(&[], &["foo".to_string()]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(validate_list_scope(&["home:foo".to_string()], &["foo".to_string()]).is_ok());
+        assert!(validate_list_scope(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn list_text_matches_the_search_table() {
+        let request = parse_request(REQUEST_XML).expect("fixture parses");
+        let text = render_list_text("", &[request]);
+        let mut lines = text.lines();
+        assert_eq!(lines.next().unwrap(), "list (1 request)");
+        assert_eq!(lines.next().unwrap(), "ID   STATE   CREATOR  ACTIONS");
+        assert_eq!(
+            lines.next().unwrap(),
+            "123  review  creator  submit abc, add_role bar"
+        );
+        assert!(lines.next().is_none());
+        assert_eq!(
+            render_list_text(" project=foo", &[]),
+            "list project=foo (0 requests)\nno requests"
         );
     }
 
