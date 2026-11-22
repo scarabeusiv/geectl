@@ -71,10 +71,10 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    CreatePackageOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient,
-    Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch,
-    ProjectMeta, Repository, RevisionPatch, RevisionRange, SourceFile, FACTORY_PROJECT,
-    OBS_API_BASE,
+    CreatePackageOptions, DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry,
+    NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person,
+    ProjectMatch, ProjectMeta, Repository, RevisionPatch, RevisionRange, SourceFile,
+    FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -336,6 +336,22 @@ pub enum RemoteCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Delete a project. A mutation: dry-run is the default (only
+    /// the plan is printed); `--live` performs the deletion.
+    /// Without `--recursive` a project holding packages is refused.
+    DeleteProject {
+        /// The project to delete.
+        project: String,
+        /// Delete the project with all its packages.
+        #[arg(long)]
+        recursive: bool,
+        /// Ignore other projects depending on this one.
+        #[arg(long)]
+        force: bool,
+        /// A comment recorded on the delete.
+        #[arg(long)]
+        comment: Option<String>,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
@@ -371,6 +387,7 @@ pub fn run_remote(
         RemoteCommand::CreateProject { .. } if !live => Credentials::None,
         RemoteCommand::CreatePackage { .. } if !live => Credentials::None,
         RemoteCommand::DeletePackage { .. } if !live => Credentials::None,
+        RemoteCommand::DeleteProject { .. } if !live => Credentials::None,
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -779,6 +796,31 @@ pub fn run_remote(
                 plan,
             ))
         }
+        RemoteCommand::DeleteProject {
+            project,
+            recursive,
+            force,
+            comment,
+        } => {
+            let options = DeleteProjectOptions {
+                recursive,
+                force,
+                comment: comment.clone(),
+            };
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.delete_project(&project, &options, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(delete_project_result(
+                &project,
+                &options,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
     }
 }
 
@@ -1009,6 +1051,47 @@ fn delete_package_result(
     mutation_result(
         payload,
         format!("project: {project} package: {package}"),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The `delete-project` result: the payload carries the options
+/// and the comment; the text carries the options and leaves the
+/// comment to the payload (a message, not an identifier).
+fn delete_project_result(
+    project: &str,
+    options: &DeleteProjectOptions,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let payload = json!({
+        "project": project,
+        "recursive": options.recursive,
+        "force": options.force,
+        "comment": options.comment,
+    });
+    let mut parts: Vec<&str> = Vec::new();
+    if options.recursive {
+        parts.push("recursive");
+    }
+    if options.force {
+        parts.push("force");
+    }
+    let suffix = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    };
+    let result_line = if dry_run {
+        format!("dry-run: would delete project {project}{suffix}")
+    } else {
+        format!("deleted project {project}{suffix}")
+    };
+    mutation_result(
+        payload,
+        format!("project: {project}"),
         result_line,
         dry_run,
         plan,
@@ -2139,6 +2222,78 @@ mod tests {
         assert_eq!(
             text,
             "project: P package: K\ndry_run: true\ndry-run: would delete package K from project P\n[dry-run] would: delete package P/K"
+        );
+    }
+
+    #[test]
+    fn delete_project_parses_options() {
+        let parsed = parse(&["geectl", "remote", "delete-project", "P"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::DeleteProject {
+                recursive: false,
+                force: false,
+                comment: None,
+                ..
+            }
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "delete-project",
+            "P",
+            "--recursive",
+            "--force",
+            "--comment",
+            "cleanup",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::DeleteProject {
+                recursive: true,
+                force: true,
+                comment: Some(comment),
+                ..
+            } if comment == "cleanup"
+        ));
+    }
+
+    #[test]
+    fn delete_project_result_carries_options_in_both_formats() {
+        let (payload, text) = delete_project_result(
+            "P",
+            &DeleteProjectOptions {
+                recursive: true,
+                force: true,
+                comment: Some("cleanup".to_string()),
+            },
+            false,
+            None,
+        );
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["recursive"], true);
+        assert_eq!(payload["force"], true);
+        assert_eq!(payload["comment"], "cleanup");
+        assert_eq!(payload["dry_run"], false);
+        assert!(!text.contains("cleanup"));
+        assert_eq!(
+            text,
+            "project: P\ndry_run: false\ndeleted project P (recursive, force)"
+        );
+        let (payload, text) = delete_project_result(
+            "P",
+            &DeleteProjectOptions::default(),
+            true,
+            Some(vec!["[dry-run] would: delete project P".to_string()]),
+        );
+        assert_eq!(payload["recursive"], false);
+        assert_eq!(payload["force"], false);
+        assert_eq!(payload["comment"], Value::Null);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(payload["plan"][0], "[dry-run] would: delete project P");
+        assert_eq!(
+            text,
+            "project: P\ndry_run: true\ndry-run: would delete project P\n[dry-run] would: delete project P"
         );
     }
 
