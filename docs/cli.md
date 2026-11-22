@@ -109,7 +109,7 @@ Usage: geectl [OPTIONS] [COMMAND]
 Commands:
   version      Print version information as the result payload
   config       Inspect or initialise the config file
-  remote       Remote reads and repository edits: inspect what the distribution holds
+  remote       Remote reads and mutations: inspect what the distribution holds, and change it
   request      Read and act on OBS submit requests, and file new ones
   branch       Branch, copy, and link packages
   build        Build-status commands: results, logs, histories, binaries
@@ -127,10 +127,10 @@ Options:
   -V, --version          Print version
 ```
 
-## `remote` — inspection, plus repository edits
+## `remote` — inspection and mutations
 
 ```
-Remote reads and repository edits: inspect what the distribution holds
+Remote reads and mutations: inspect what the distribution holds, and change it
 
 Usage: geectl remote [OPTIONS] <COMMAND>
 
@@ -155,6 +155,16 @@ Commands:
   devel-project      Show the devel project and devel package of a package on Factory, when it has one
   repo-add           Add a repository to a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the addition
   repo-remove        Remove a repository from a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the removal. A repository that is not there is not an error
+  upload-file        Upload a file into a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the upload. The local file is read from `--from`; `--binary` uploads bytes instead of text
+  create-project     Create a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the creation
+  create-package     Create a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the creation. Without `--scmsync` and `--force` the package is created directly; with either, the creation goes through the options form, which refuses an existing package unless `--force` is set and refuses a project managed in git
+  delete-package     Delete a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the deletion. Without `--force` a package with open submit requests is refused
+  delete-project     Delete a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the deletion. Without `--recursive` a project holding packages is refused
+  undelete-package   Restore a deleted package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the restore
+  undelete-project   Restore a deleted project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the restore
+  aggregate-package  Aggregate a package's binaries into another package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the aggregation. The target package is created from the source package's meta when it does not exist yet; an `_aggregate` file that already exists is refused
+  release-package    Release a package's sources and binaries. A mutation: dry-run is the default (only the plan is printed); `--live` performs the release. A release to a target project needs a repository and a target repository
+  release-project    Release a whole project's sources and binaries. A mutation: dry-run is the default (only the plan is printed); `--live` performs the release. A release to a target project needs a repository and a target repository
   help               Print this message or the help of the given subcommand(s)
 
 Options:

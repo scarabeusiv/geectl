@@ -87,8 +87,8 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Remote reads and repository edits: inspect what the
-    /// distribution holds.
+    /// Remote reads and mutations: inspect what the
+    /// distribution holds, and change it.
     Remote {
         #[command(subcommand)]
         command: cli_remote::RemoteCommand,
