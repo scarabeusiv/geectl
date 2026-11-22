@@ -1,11 +1,7 @@
 # Design choices
 
-This document records the design choices that shape geectl, and why each
-one was made. The rules here are load-bearing: they are what keep geectl
-usable by agents, and they were written down before the first feature so
-later work does not have to rediscover them. Several of them come from a
-survey of existing CLI implementations, where the failure mode was found
-in real code — the rule states what geectl does instead, and the
+The rules in this document are load-bearing: they keep geectl usable
+by agents. Each rule states what geectl does instead, and the
 rationale states the failure it prevents.
 
 ## Interaction model
@@ -67,7 +63,7 @@ drops the bound on the version that does not.
 
 ### Retry only idempotent methods
 
-Retry only GET, HEAD, PUT, DELETE. POST is never retried. If a POST must
+Retry only GET, HEAD, PUT. POST and DELETE are never retried. If a POST must
 be retried for some reason, it requires an explicit idempotency key sent
 with the request. The retry policy (methods, statuses, count, backoff)
 is a single documented constant, not per-call-site improvisation.
@@ -171,9 +167,9 @@ mounted secrets, not as interactive input. Failing at startup — with
 the variable named — turns a credential misconfiguration into a
 diagnosis, not a 401 halfway through a run.
 
-### Keyring is deferred
+### No keyring backend
 
-There is no keyring backend in this PR. A keyring needs a platform
+There is no keyring backend. A keyring needs a platform
 secret service (and a daemon on Linux), and it only serves
 interactive human use — an agent has no desktop session to unlock.
 Agents use environment variables or mounted secrets. The
@@ -193,7 +189,7 @@ Rationale: a consumer cannot rely on stdout being parseable if any
 command may print human text there, and verbosity changes the stdout
 content. A per-command opt-in never converges — three different
 machine-readable conventions mean each command is a separate parsing
-project. It has to be the default for all commands from the first one.
+project. It has to be the default for all commands.
 
 ### Sanitization is structural, not opt-in
 
@@ -237,7 +233,7 @@ everything else is already broken.
 
 ### Shared resources are locked or unique per invocation
 
-geectl does not run builds in v1, but any shared mutable resource it
+geectl does not run builds, but any shared mutable resource it
 does own (state files, caches, the queue) is either locked with `flock`
 for the duration of the operation or unique per invocation. A
 destructive operation (`clean`, `wipe`, `reset`) refuses when the
@@ -291,8 +287,7 @@ misconfiguration that looks like a server problem.
 
 ## Patterns adopted
 
-These are patterns from existing implementations that geectl adopts,
-not avoids:
+Patterns geectl adopts:
 
 - **Atomic rename for store writes** — write-temp-then-rename is the
   right shape; geectl keeps the shape and adds O_EXCL, fsync, and

@@ -45,7 +45,7 @@ instance is destroyed after the run, so the token never outlives it.
 
 ## Timing
 
-Measured cold on the Mac (2026-11-20):
+Measured cold on the Mac:
 
 - image pull (cold): ~7s
 - container start to `/api/healthz`: ~3s
@@ -54,7 +54,7 @@ Measured cold on the Mac (2026-11-20):
 
 Total provisioning + test is ~20s, which is why this runs in the
 per-PR gate (the `test` job) rather than on a schedule like the OBS
-live job. The OBS instance is slow on purpose (source checkout +
+live job. The OBS instance is slow (source checkout +
 frontend build, minutes); Gitea is a single prebuilt image.
 
 ## The harness
@@ -73,15 +73,15 @@ server state through geectl's own HTTP client, with geectl's own
   shows the creation)
 - `GET /api/v1/user/repos` lists it
 - a missing repository maps to geectl's `NotFound`
-- phase 2 (`repo_list`, `repo_create`, `branch_list`/`branch_get`/
-  `branch_head`) runs through the typed operations: the list forms
+- the typed operations (`repo_list`, `repo_create`,
+  `branch_list`/`branch_get`/`branch_head`) cover the list forms
   (org, user, both), the create round-trip and collision, and the
   branch reads against commits the contents API created — including
   a slashed branch name through the encoded segment
 
-Phase 2 adds no token scope: repo list and branch reads are
+The typed operations add no token scope: repo list and branch reads are
 `read:repository`, repo create is `write:repository` + `write:user`.
 
-The instance serves plain HTTP on localhost. That is the single
-sanctioned exception to geectl's https-only rule (see `tests/gitea.rs`):
+The instance serves plain HTTP on localhost. That is the
+exception to geectl's https-only rule (see `tests/gitea.rs`):
 loopback-only, ephemeral instance, ephemeral credentials.

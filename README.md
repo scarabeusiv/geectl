@@ -8,8 +8,7 @@
 geectl drives openSUSE packaging workflows from the command line, built for
 agents, not for interactive use. It talks to the OBS (Open Build Service) API
 directly (primary goal) and, as a secondary goal, to the src.opensuse.org git
-workflow (Gitea), hiding the backend choice — the routing is decided on our
-side.
+workflow (Gitea), hiding the backend choice.
 
 It is a pure agentic flow. Human flows already exist and are not disrupted.
 
@@ -25,8 +24,7 @@ See [docs/cli.md](docs/cli.md) for the command reference with real
 ## Scope gate
 
 Every feature or PR request must answer **"how does an agent use this
-functionality?"** No agent use case, no implementation. That is the standing
-rule that keeps the scope from ballooning — the full scope is not enumerated
+functionality?"** No agent use case, no implementation. The full scope is not enumerated
 upfront; the gate does the work. There is no 1:1 parity goal with anything:
 only the parts needed for management and processing as agents.
 
@@ -34,9 +32,7 @@ only the parts needed for management and processing as agents.
   the OBS API.
 - **Secondary goal: git flow, seamlessly.** Integrating the src.opensuse.org
   / Gitea workflow so the agent does not have to know whether it is talking
-  to OBS directly or via git. This is **not** initial work. If anyone opens
-  a PR for it, we review and support it if it bites us, but it is not on
-  the roadmap.
+  to OBS directly or via git. This is **not** initial work and not on the roadmap.
 
 ## How it differs from osc
 
@@ -64,9 +60,8 @@ mutations. The full list of deliberate deviations, with reasons, is
   plaintext fallback and no obfuscation option.
 - **No option to disable TLS verification.** Ever.
 
-See [docs/design-choices.md](docs/design-choices.md) for the design
-decisions behind these guarantees, including the risks found by reading
-another CLI's source and the rules geectl follows instead. See
+See [docs/design-choices.md](docs/design-choices.md) for the rationale
+behind these guarantees. See
 [docs/architecture.md](docs/architecture.md) for the crate layout.
 
 ## Authentication
@@ -107,7 +102,7 @@ The config file (`$XDG_CONFIG_HOME/geectl/config.toml`, default
 credential status (username only for Basic auth, never a secret value);
 `config init` writes the template and refuses to overwrite.
 
-A keyring backend is deferred: it needs a platform secret service and
+There is no keyring backend: it needs a platform secret service and
 only serves interactive human use, while agents use environment
 variables or mounted secrets. The `AuthProvider` trait is the seam a
 keyring provider would plug into.
@@ -134,9 +129,9 @@ cargo run -- --help
 
 ## Live tests
 
-Beyond the per-PR fixture tests, a scheduled `live` workflow runs
-live tests against a real (temporary) OBS instance, weekly on Mondays
-06:00 UTC and on demand. It spins up the instance from the OBS
+Beyond the per-PR fixture tests, a `live` workflow runs
+live tests against a real (temporary) OBS instance, on every pull
+request, weekly on Mondays 06:00 UTC and on demand. It spins up the instance from the OBS
 project's own development containers, runs the tests in
 `tests/live.rs` against it, and tears it down. The assertions are
 on server state — what geectl reads must reflect what the server
@@ -144,8 +139,7 @@ actually holds — which is what catches drift as OBS changes underneath
 us.
 
 The job is independent and does not gate PRs. The provisioning lives in
-`tests/live/` (see its README); the live-test assertions that need
-auth are wired up but skipped until the auth layer lands.
+`tests/live/` (see its README).
 
 ## Distribution
 

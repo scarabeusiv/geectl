@@ -84,8 +84,7 @@ fails clearly naming what to set — the alias variables when an
 alias matches, the `[instances]` entry to add when none does — and
 the configured instance's credentials are never forwarded.
 `branch copy-package --to-apiurl` resolves the target's
-credentials this way. (The API-key credential, when it lands, uses
-the same pattern: `GEECTL_OBS_APIKEY_<ALIAS>`.)
+credentials this way.
 
 A half-configured credential pair (a username with no password source,
 or the reverse) is handled per group: `request` swallows it in dry-run

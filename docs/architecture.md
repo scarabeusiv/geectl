@@ -10,7 +10,7 @@ geectl is one crate with a library and a binary:
 - `src/main.rs` — the binary. Argument parsing (clap), one exit path,
   stdout carries only the result payload.
 
-The library modules at scaffolding time:
+The library modules:
 
 | Module | Contents |
 | ------ | -------- |
@@ -19,10 +19,11 @@ The library modules at scaffolding time:
 | `http` | The HTTP client trait with a bounded timeout, plus a ureq implementation. |
 | `auth` | The credential types and resolution (see below). |
 | `config` | The XDG config file (URLs only) and the secure-write primitive. |
+| `gitea` | The Gitea operations (repo/branch reads and mutations, fork, repo create/delete). |
 | `obs` | The OBS operations (devel lookup, open-SR check, SR filing, superseding, branch cleanup, request read/act — see below). |
+| `debug` | The debug channel (one coherent `--debug` stream on stderr). |
+| `xml` | Minimal XML document editing for the small documents rewritten in place (`_meta`, `_link`). |
 
-Later modules (Gitea operations, XML→JSON mapping) plug into this
-shape; they do not change it.
 
 ## The error store (`src/error.rs`)
 
@@ -66,7 +67,7 @@ to encode.
 - Every request carries a bounded connect timeout (default 10s) and a
   bounded read timeout (default 30s), unconditional on library version.
   The timeout values are documented defaults, overridable by explicit
-  config, never by accident.
+  config.
 - Retry policy, as a single documented constant: only idempotent methods
   are retried (GET, HEAD, PUT), up to 3 times with doubling
   backoff. POST is never retried without an explicit idempotency key,
@@ -183,10 +184,8 @@ server-side cleanup never runs for it — and the delete refuses
 while requests in `new`, `review`, or `declined` state involve the
 package as a submit source or target.
 
-The supersede and delete semantics are validated against the OBS API
-server code, not copied from osc — osc's flow is a reference to check
-against, not ground truth. Where osc and the API disagree, the API
-wins:
+The supersede and delete semantics follow the OBS API server code.
+Where osc and the API disagree, the API wins:
 
 - `superseded_by` is required by the server (a supersede without it
   is refused); the library always sends it.
@@ -205,22 +204,19 @@ wins:
   server's weak-dependency guard (refuse when other packages use this
   one as their devel package) — osc's `force` semantics.
 - If superseding fails after the new request is filed, `refile`
-  returns an error naming the new id. That is a deliberate divergence
-  from osc, which supersedes with `can_fail=True` and only warns: a
-  half-done refile passing silently is a failed refile that reads as
-  a success.
+  returns an error naming the new id: a half-done refile passing
+  silently is a failed refile that reads as a success.
 
 Branch cleanup is the default: every payload carries
-`opt_sourceupdate="cleanup"` (what `osc sr --cleanup` sets), so OBS
+`opt_sourceupdate="cleanup"`, so OBS
 deletes the source branch when the request is accepted — and the
 source project with it, when that was its last package and it is not
 a top-level `home:<user>` project. The packaging guide requires it
 for filings from a `home:` subproject; pr-guard refuses the SR
-without it. The values and the accept behaviour are validated
-against the OBS API server code (`BsRequestAction` accepts only
-`update`, `noupdate`, `cleanup`; `BsRequestActionSubmit` deletes
-the source package on accept when the value is `cleanup`). The
-server also defaults to cleanup itself when no value is given and
+without it. The accepted values are `update`, `noupdate`, `cleanup`
+(`BsRequestAction`); `BsRequestActionSubmit` deletes the source
+package on accept when the value is `cleanup`. The
+server also defaults to cleanup when no value is given and
 the source is the filer's branch project for the target, but the
 library sends the value explicitly: the server default only covers
 branch projects, and the explicit value is what pr-guard checks.
@@ -289,7 +285,7 @@ is documented as a candidate fix for the server itself.
 
 Consumers never see XML: the operations take and return typed values
 only. The XML document editor (`src/xml.rs`) and the response
-parsers added here are `pub(crate)` — the boundary the typed surface is built
+parsers are `pub(crate)` — the boundary the typed surface is built
 on, not part of it.
 
 Remote reads: the read surface for inspecting what the distribution
@@ -400,13 +396,13 @@ file-first-then-supersede refile flow where one exists.
   DryRun-guarded like the other mutations. The server refuses a
   package whose sources live in scmsync ("Fork it instead"); that
   refusal surfaces as the server's error, and there is no unified
-  branch-or-fork operation yet.
+  branch-or-fork operation.
 - Refile exists for maintenance incidents only. A change-devel or
   delete request is filed fresh; superseding one is a manual step
   (`ObsClient::supersede_request`), not a library flow.
 
-The maintenance semantics are validated against the OBS API server
-code (`BsRequestActionMaintenanceIncident`,
+The maintenance semantics follow the OBS API server code
+(`BsRequestActionMaintenanceIncident`,
 `BsRequestActionChangeDevel`, `BsRequestActionDelete`,
 `BranchPackage` on open-build-service master).
 
@@ -422,7 +418,7 @@ whether a package built, what blocked it, and what came out:
   `wait_for_results` polls it until it settles — no cell dirty, no
   cell or package in a waiting state — with plain two-second polls
   and a timeout at the deadline (the caller then re-reads with
-  `results`). It deliberately does not pass `oldstate`: the server
+  `results`). It does not pass `oldstate`: the server
   long-polls on an unchanged state, up to five minutes, which
   outruns the transport's per-read timeout and fails the wait even
   when the caller's deadline is longer. A multibuild flavor travels
@@ -460,8 +456,7 @@ whether a package built, what blocked it, and what came out:
   `_constraints` document. It is a query, not a build: it creates
   or modifies nothing, so it takes no dry-run guard. None posts an
   empty body, which the server accepts. The constraints document is
-  passed through as authored — there is no typed constraints model
-  yet, so this is the one place a raw XML document crosses the
+  passed through as authored — there is no typed constraints model, so this is the one place a raw XML document crosses the
   public API.
 - `list_repositories` reads the project's repositories (names,
   architectures, the repositories they build against) from the
@@ -475,13 +470,10 @@ whether a package built, what blocked it, and what came out:
 
 All of the build reads are typed: no public method takes or returns
 raw XML — except `check_constraints`, whose constraints document is
-passed through as authored (no typed constraints model yet) — and
-the parsers are `pub(crate)`. The binary download needed a bytes
-path through the transport — `HttpClient` returned string bodies
-only, and a non-UTF-8 body failed the read — so the trait gains
-`get_bytes` with a refusing default implementation (existing
-implementors keep compiling) and `UreqClient` overrides it, sharing
-the GET retry loop with `get_with`. The download is capped at 10
+passed through as authored (no typed constraints model) — and
+the parsers are `pub(crate)`. The trait has `get_bytes` with a refusing default implementation
+(existing implementors keep compiling) and `UreqClient` overrides it,
+sharing the GET retry loop with `get_with`. The download is capped at 10
 MiB by the transport's body limit like every read.
 
 The 404 conventions follow the devel-project precedent: a missing
@@ -542,9 +534,7 @@ loopback.
   redacted, never with headers; binary bodies are never dumped.
   The channel never carries a secret value, and it never fails a
   run. The channel is library-complete and proven by fixture tests;
-  end-to-end lines via the CLI await the first OBS command (the
-  binary has only `version` + `config` today), which must pass the
-  Debug sink when it lands.
+  the binary wires it through the Debug sink.
 - JSON output means server text is data, never terminal input, so there
   is nothing to sanitize in machine output. Human-readable output is
   rendered from parsed data through one renderer that escapes by
@@ -568,7 +558,7 @@ loopback.
 
 ## Testing
 
-Three layers, by design:
+Three layers:
 
 1. **Fixtures per-PR (gating).** Fast, deterministic, recorded responses.
    Every PR runs them; they gate the merge.
@@ -590,10 +580,9 @@ Three layers, by design:
    It is an independent CI job: when it regresses, it is fixed
    independently; it does not block PRs. It exists to catch drift as
    the server changes underneath us, which fixtures alone cannot do.
-   The OBS instance is slow on purpose (source checkout + frontend
+   The OBS instance is slow (source checkout + frontend
    build, minutes); the frontend build reuses a BuildKit cache in CI,
-   but the job stays non-gating — a slow or flaky run must never
-   block a PR.
+   but the job stays non-gating — it never blocks a PR.
 
 ### The live layer in detail
 
@@ -611,14 +600,14 @@ dev:bootstrap` (which creates the database and seeds the Admin user),
 polls the public `/about` endpoint until the API answers, and probes
 the backend source server until it answers (`/about` needs only the
 frontend and the database; project writes go to the backend).
-`teardown.sh` removes the containers and volumes. The instance tracks OBS master on purpose:
-the job exists to catch drift, so it tracks the newest OBS, not a
+`teardown.sh` removes the containers and volumes. The instance tracks OBS master:
+the job catches drift as OBS changes, so it tracks the newest OBS, not a
 stable release.
 
 **Schedule.** The `live` workflow runs on every pull request,
 weekly (Mondays 06:00 UTC, the same slot as `freshness`) and on demand
 (`workflow_dispatch`), on a GitHub-hosted runner. It is not a required
-status check. It is slow on purpose (source checkout, frontend build,
+status check. It is slow (source checkout, frontend build,
 bootstrap); the timeout is 60 minutes. The frontend image build reuses
 BuildKit's GitHub Actions cache (`tests/live/docker-compose.cache.yml`,
 loaded only when `LIVE_CACHE` is set — the workflow sets it, local

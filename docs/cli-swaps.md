@@ -2,9 +2,7 @@
 
 Every deliberate deviation from osc's command/flag shape in the CLI
 rollout, with the consistency reason. Where geectl matches osc, there
-is no row. Sources: the osc gap map
-(`~/workspace/geectl-osc-gap-map.md`) and osc's `commandline.py`
-(verified live 2026-11-21). The scheme-level rows apply across all
+is no row. The scheme-level rows apply across all
 seven groups and are listed once; the per-group sections list only
 what is specific to that group.
 
@@ -12,10 +10,10 @@ what is specific to that group.
 
 | osc | geectl | Why |
 |---|---|---|
-| Positional `PROJECT`/`PACKAGE` args, often defaulting to the working copy | Explicit `--project`/`--package` (etc.) flags, always required; required coordinates that stay positional are the query itself | No positionals for options, no working-copy defaults (geectl has no working copy in v1, issue #17) |
+| Positional `PROJECT`/`PACKAGE` args, often defaulting to the working copy | Explicit `--project`/`--package` (etc.) flags, always required; required coordinates that stay positional are the query itself | No positionals for options, no working-copy defaults (geectl has no working copy, issue #17) |
 | Short flags (`-f`, `-r`, `-m`, `-e`, `-k`, `-d`, `-N`, `-M`, `-c`, `-R`, `-u`, `-t`, `-a`, `-l`, `-w`, `-s`, `-b`, `-V`, `-F`, `-o`) | Long forms only, no short flags | Agents type full names; one flag name per concept, no aliasing |
-| Command aliases (`r`, `bl`, `blt`, `buildhist`, `jobhist`, `rpmlint`, `lint`, `bco`, `branchco`, `getpac`, …) | No aliases | Full names only; aliases are osc's historical accretions |
-| Working-copy inference (project/package from the `.osc` checkout) | Explicit coordinates always | Geectl has no working copy yet (issue #17); every command names its project |
+| Command aliases (`r`, `bl`, `blt`, `buildhist`, `jobhist`, `rpmlint`, `lint`, `bco`, `branchco`, `getpac`, …) | No aliases | Full names only; no aliases |
+| Working-copy inference (project/package from the `.osc` checkout) | Explicit coordinates always | Geectl has no working copy (issue #17); every command names its project |
 | Per-command output formats (`--xml`, `--csv`, `--format` with named-field interpolation) and human text only | One global `--format json\|text` | One output switch for the whole CLI, per the #51/#52 design; every command returns `(payload, text)` |
 | `osc` mutates on invocation | Every mutation is dry-run by default; the global `--live` performs it | Geectl-wide rule (library `DryRun` default): an agent sees the plan before anything changes. The dry run prints the plan on stderr and returns `dry_run: true` |
 | `osc -m/--message` for several meanings | `--comment` for state-change, review, and branch messages; `--description` for a filing's description | One flag name per concept everywhere, instead of one flag carrying two meanings |
@@ -28,7 +26,7 @@ what is specific to that group.
 | `osc search` exact-name default | Substring matches on name, title, and description by default; `--exact` keeps only exact-name matches | The library has no exact search server-side; the filter runs in the CLI, and osc's default stays reachable via `--exact` |
 | `osc rdiff` (server-side diff) | `remote revision-patch` and `remote project-diff`, computed client-side from per-file reads | The library lists and cats the files itself; a large `project-diff` issues many requests and a differing binary file fails the call |
 | `osc rdiff` two-package form | `remote diff-packages` | Client-side diff of two packages from per-file reads (issue #74); a differing binary file fails the call |
-| `osc develproject` (prints devel project + package) | `remote devel-project <package>` | Factory-only by design; the library op returns the (project, package) pair (issue #77). `remote package-meta` shows the same pair as `devel: project/package`. |
+| `osc develproject` (prints devel project + package) | `remote devel-project <package>` | Factory-only; the library op returns the (project, package) pair (issue #77). `remote package-meta` shows the same pair as `devel: project/package`. |
 | `osc repo add` / `osc repo remove` (project admin writes) | `remote repo-add` / `remote repo-remove` | Grouped under `remote` with the other project reads; mutations take the global `--live` |
 | `osc ls /` | `remote list-projects` | Same listing, named as a leaf under `remote` |
 
@@ -47,7 +45,7 @@ what is specific to that group.
 | `osc request review add` | `request add-review --user/--group/--project/--package` | Verb-first leaf; the review target is named by flags |
 | `osc comment list/create request ID` (top-level `comment` command with a `request` target word) | `request list-comments`, `request add-comment [--parent …]` | Comments live under the request they belong to, not under a top-level `comment` command. (osc itself has no `request comment` subcommand — comments are API-only there.) |
 | `osc request list` | `request search` | The library op is a typed search (`RequestSearch`), and the name says what it does; filters are named flags (`--creator`, `--state`, `--project`, …). Default states new/review/declined when no `--state` is given |
-| (geectl's own rule, broken once) `request supersede` | `request supersede` acts immediately, no dry-run | The library's raw supersede has no dry-run; `request refile` is the dry-runnable supersede flow. Documented on the subcommand |
+| `request supersede` | `request supersede` acts immediately, no dry-run | The library's raw supersede has no dry-run; `request refile` is the dry-runnable supersede flow. Documented on the subcommand |
 
 Not swaps (kept as-is): `request show`, `request log`, `request
 accept`, `request decline`, `request revoke` keep osc's names.
@@ -67,7 +65,7 @@ no row.
 | Flat top-level commands (`branch`, `copypac`, `linkpac`, …) | `branch <subcommand>` group | Uniform grouping: one top-level noun per library module across all seven CLI groups; osc's flat list doesn't scale and collides (`branch` vs `mbranch`) |
 | `osc branch` | `branch branch-package` | Grouped + spelled-out operation name (kebab-case library name) |
 | `osc branch --nodevelproject` | `--no-devel-project` | Kebab-case flag names everywhere (osc concatenates) |
-| `osc branch -c/--checkout` | Dropped (aliases `bco`/`branchco`/`getpac` go with it) | Branches AND checks out a working copy; geectl has no working copy in v1 |
+| `osc branch -c/--checkout` | Dropped (aliases `bco`/`branchco`/`getpac` go with it) | Branches AND checks out a working copy; geectl has no working copy |
 | `osc branch --disable-build` | Dropped | No corresponding option on `BranchOptions`; branch meta build flags are out of the branch op's scope |
 | `osc copypac` | `branch copy-package` | Grouped + spelled-out (osc abbreviates to `copypac`) |
 | `osc copypac -c/--client-side-copy` | Dropped (same-instance form) | Client-side download/upload copy of a single package; the cross-instance form exists as `--to-apiurl`, but there is no same-instance client-side mode — the same-instance copy stays server-side |
@@ -111,9 +109,9 @@ with no osc counterpart.
 | `results -b/--brief, -V/--vertical, -F/--fail-on-error, --show-excluded` | Dropped | Presentation variants with no library equivalent; text rendering is fixed by #52 |
 | `results [PROJECT [PACKAGE]]` | `build results PROJECT` + `--package` flag | Positionals are required coordinates only; the optional package is a flag |
 | `prjresults [PROJECT]` | Dropped (`build results PROJECT`) | The same matrix without a package filter; one matrix command |
-| `buildlog` | `build build-log` | Kebab-case library name under the `build` group; the stutter is accepted so the mapping stays mechanical (group + kebab(library op)) |
+| `buildlog` | `build build-log` | Kebab-case library name under the `build` group; the mapping stays mechanical (group + kebab(library op)) |
 | `buildlog [REPOSITORY ARCH \| BUILDLOGURL]` | `build build-log PROJECT PACKAGE REPOSITORY ARCH` | Explicit coordinates; no URL form, no hostarch default |
-| `buildlog` tail via `blt` alias | Dropped | No follow/tail mode in v1; the library reads whole logs only |
+| `buildlog` tail via `blt` alias | Dropped | No follow/tail mode; the library reads whole logs only |
 | `buildlog --lastsucceeded` / `--last-succeeded` (two spellings) | `--lastsucceeded` | One spelling, the library field name |
 | `buildlog -o/--offset` | `build build-log --start` | Flag named after the library query field |
 | `buildlog -s/--strip-time` | Dropped | Logs are rendered verbatim; no post-processing of server text |
@@ -130,7 +128,7 @@ with no osc counterpart.
 No geectl equivalent (coverage gaps, not deviations): `osc rebuild` /
 `restartbuild` / `abortbuild` — build-control writes; the library
 has no rebuild operation, so no CLI for them. `osc build` / `chroot`
-/ `wipe` / `lbl` — local build; out of scope for v1 (issue #43,
+/ `wipe` / `lbl` — local build; out of scope (issue #43,
 podman vertical). `build build-status`, `build job-status`, `build
 fileinfo`, `build dependson`, `build check-constraints`, `build
 list-binaries` — new surface with no osc command (reachable in osc
@@ -142,7 +140,7 @@ only via `osc api`).
 |---|---|---|
 | `osc mbranch [SOURCEPACKAGE [TARGETPROJECT]]` (flat top-level command, positionals) | `maintenance maintenance-branch --package … [--target-project …]` | Grouped under the maintenance noun; package and target are named flags, no positionals anywhere in geectl |
 | `osc maintained` / `osc sm` (aliases of `mbranch`, list-only) | `maintenance maintained-instances --package …` | The list form is its own leaf, not an alias or a mode flag on the branch command. Semantics match for `sm`: both are the dry-run branch call that reports without branching. `osc maintained` additionally prints `[git] org/package:branch` lines from the Gitea cache, which geectl does not reproduce (Gitea scope, issue #20) |
-| `osc mbranch -c/--checkout` | Dropped | Branches AND checks out a working copy; geectl has no working copy in v1. (The `--checkout` help calls `osc bco` a shorthand for it, but `bco` is a separate branch/getpac command, not an mbranch alias.) |
+| `osc mbranch -c/--checkout` | Dropped | Branches AND checks out a working copy; geectl has no working copy. (The `--checkout` help calls `osc bco` a shorthand for it, but `bco` is a separate branch/getpac command, not an mbranch alias.) |
 | `osc mbranch --noaccess`, `--nodevelproject` | Dropped | No corresponding option on `MaintenanceBranchOptions` |
 | `osc mbranch --version` (print version of the maintained package) | Dropped | No geectl equivalent; the top-level `version` command reports geectl itself |
 
@@ -167,6 +165,6 @@ file-maintenance-incident`, issue #73).
 | (no osc command) | `gitea repo-get` / `gitea repo-list` / `gitea branch-list` / `gitea branch-get` / `gitea branch-head` | New surface: Gitea reads on the configured instance; osc has no Gitea reads |
 | (no osc command) | `gitea repo-create` | New surface: create a repository on the configured instance; mutations take the global `--live` |
 | `osc api -X DELETE /repos/...` | `gitea repo-delete` | The delete op under the `gitea` noun; mutations take the global `--live`, and the library refuses without `--force` |
-| `osc fork` | `gitea repo-fork` (Gitea half only) | `osc fork` is a composite: Gitea fork + OBS branch. `gitea repo-fork` is the Gitea half; the `branch` composite (Gitea fork + OBS `cmd=fork`) has no CLI command yet. `osc fork` is also scmsync-only, and it clones the fork locally and inits `.osc` — neither of which the Gitea half does |
+| `osc fork` | `gitea repo-fork` (Gitea half only) | `osc fork` is a composite: Gitea fork + OBS branch. `gitea repo-fork` is the Gitea half; the `branch` composite (Gitea fork + OBS `cmd=fork`) has no CLI command. `osc fork` is also scmsync-only, and it clones the fork locally and inits `.osc` — neither of which the Gitea half does |
 
 Scope note: the sibling `git-obs` entry point has `repo list` and `repo fork` (`osc/commands_git/repo_list.py`, `repo_fork.py`); they are `git-obs` commands, not `osc` commands, so they sit outside this table's stated scope — `git-obs repo list` requires `--org`/`--user` (no own-repos form).

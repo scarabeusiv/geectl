@@ -1,22 +1,19 @@
 # geectl ← osc test borrow map
 
-Audit date: 2026-11-20. osc source: `~/workspace/osc-source-analysis`
-(openSUSE/osc @ `89f6bdc`, 2026-11-16 — 4 days old, no re-fetch needed).
-Geectl side: gap map `~/workspace/geectl-osc-gap-map.md` (86 operations),
-implementation order 1 file upload → 2 request read/act → 3 remote read →
-4 branch/copy/link → 5 build status → 6 working-copy layer →
-7 maintenance requests → 8 services → 9 Gitea ops.
+Map of osc test cases to geectl tests: which osc cases pin behaviour
+geectl builds, adopted as unit or live tests; the rest written from
+scratch. The gap map covers 86 operations, in 9 batches: file upload,
+request read/act, remote read, branch/copy/link, build status,
+working-copy layer, maintenance requests, services, Gitea ops.
 
-Rule (Tom, 2026-11-20): **not parity**. Adopt the osc test cases that pin
-behaviour geectl is building, as unit tests or as live tests;
-write the rest from scratch. The point is not to miss cases osc already
-thought of.
+**Not parity**. Adopt the osc test cases that pin behaviour geectl is
+building, as unit tests or as live tests; write the rest from
+scratch. The point is not to miss cases osc covers.
 
 ## 0. What "their smoketest" is
 
-There is **no file named "smoketest" anywhere in the osc repo** (verified by
-grep over the whole checkout, including `.github/`). What Tom calls the
-smoketest is osc's **Behave suite**:
+There is **no file named "smoketest" anywhere in the osc repo**.
+The smoketest is osc's **Behave suite**:
 
 - `behave/features/*.feature` — **77 feature files, 272 scenarios**
   (scenarios start at column 0, `Scenario:`).
@@ -46,12 +43,12 @@ The skill's `contrib/harness/README.md` "Smoke test" section is unrelated
 - Fixture dirs sit next to the tests (`request_fixtures/`,
   `commit_fixtures/`, `results_fixtures/`, …).
 
-## 0c. Survey boundary (so the counts check out)
+## 0c. Survey boundary
 
 - Surveyed in detail: **62 behave files / 216 scenarios** and
   **369 unit tests**.
 - NOT surveyed in detail: `behave/features/git-*.feature` — 15 files /
-  56 scenarios (Gitea/git-obs side; belongs to batch 9, deferred) — and
+  56 scenarios (Gitea/git-obs side; batch 9) — and
   338 unit tests in 32 files: config/credentials (`test_conf.py` 102,
   `test_config_parser.py`, `test_credentials.py`), Gitea/git-SCM
   (`test_gitea_api_*.py` 10 files, `test_maintainership.py` 3,
@@ -68,7 +65,7 @@ The skill's `contrib/harness/README.md` "Smoke test" section is unrelated
 
 ---
 
-## Batch 1 — file upload (in flight, geectl PR #10)
+## Batch 1 — file upload
 
 **Direct adoptions: 0. Protocol spec: 1 (5 behaviours).**
 
@@ -149,7 +146,7 @@ construction rules geectl needs for typed list/search ops; mocked HTTP):
   OR target project/package.
 - `:34` `test_search_source_projects` / `:38` `test_search_source_packages`
   — source only (note: builds `source[@packages=…]`, plural attribute —
-  server-side quirk, keep as-is).
+  the server's form).
 - `:42` `test_search_target_projects` / `:46` `test_search_target_packages`
   — target only (same plural form).
 - `:50` `test_search_creators` — `@creator='foo' or @creator='bar'`.
@@ -178,23 +175,22 @@ regression, osc#2130):
 - `:853` `test_without_can_fail_raises` — without `can_fail`, the HTTPError
   propagates.
 
-### Behave — adopt as live precedent (already partly covered)
+### Behave — adopt as live precedent (partly covered)
 
 - `behave/features/submitrequest.feature:14` — file an SR, exit 0
-  (already covered by geectl `live_filed_request_shows_up_on_server`).
+  (covered by geectl `live_filed_request_shows_up_on_server`).
 - `behave/features/submitrequest.feature:25` — supersede flow: request 1
-  ends `<state name="superseded" superseded_by="2">` (already covered by
+  ends `<state name="superseded" superseded_by="2">` (covered by
   geectl `live_refile_supersedes_and_deletes_on_server`).
 - `behave/features/createrequest.feature:14` and `:25` — same two flows via
   the generic `createrequest -a submit` creator (the generic-create shape
   batch 7 reuses for other action types).
 - `behave/features/request-list.feature:4` — `request list -P test:factory`
-  exits 0 — weak, no stdout/state check; barely adoptable.
+  exits 0 — no stdout/state check.
 
 ### Gap — NO osc coverage, live tests written from scratch
 
-Verified by grep over all of `behave/features/` and `tests/`: zero
-scenarios/tests for `rq show`, `rq log`, accept, decline, revoke,
+No scenarios/tests for `rq show`, `rq log`, accept, decline, revoke,
 `review add`, comment list/create. Geectl's live tests for these
 (`rq show` read + parse state/history/reviews; `rq log`; accept/decline/
 revoke state transitions verified by re-read; review add; comment
@@ -265,7 +261,7 @@ classification + rdiff API params; exact CLI stdout text is osc-specific):
 - `behave/features/rdiff.feature:9` / `:14` / `:19` / `:24` — rdiff
   project/package vs project/package, vs project-only (same name implied),
   vs no target (defaults to devel/origin), `--change=1` single-revision
-  diff. All assert exit 0 only — weak; the semantics live in
+  diff. All assert exit 0 only; the semantics live in
   `test_prdiff.py` above.
 - `behave/features/develproject-project-package.feature:9` — `develproject
   test:factory test-pkgA` prints `test:devel/test-pkgA`; `:17` / `:26` —
@@ -279,7 +275,7 @@ classification + rdiff API params; exact CLI stdout text is osc-specific):
 
 ### Gap — NO osc coverage, written from scratch
 
-- `osc cat` — no `cat.feature`, no unit test mentions it (verified by grep).
+- `osc cat` — no `cat.feature`, no unit test mentions it.
   The operation is used implicitly in fixture setups only.
 - `meta pkg` / `meta prj` read — no `meta.feature`; only WC-local
   `get_meta_value` in `tests/test_store.py:214` (SKIP).
@@ -310,7 +306,7 @@ verify the resulting `_link` via `api /source/.../_link`):
   the inherited source (`test:leap:15.6`), not the `:update` project.
 - `:13` — `--nodevelproject` on the same case — NOTE: the command in the
   file contains no `--nodevelproject` flag; it is a byte-duplicate of `:5`.
-  Do not copy the quirk; test the flag for real.
+  The flag needs a real test.
 - `:21` — `--new-package` keeps the `:update` project as link source.
 - `:29` — branch a package with a devel project: link points at
   `test:devel`, not factory.
@@ -341,8 +337,7 @@ verify the resulting `_link` via `api /source/.../_link`):
 `behave/features/linktobranch.feature:11` and
 `behave/features/detachbranch.feature:11` — convert/detach a link; both
 assert exit 0 only, no state verification. Adopt the flows; geectl's
-live tests should assert the resulting link/branch state (stronger
-than osc).
+live tests assert the resulting link/branch state (stronger than osc).
 
 `behave/features/setlinkrev-project-package.feature` (4) and
 `behave/features/setlinkrev-project.feature` (3) — stdout-verified:
@@ -368,7 +363,7 @@ under batch 3 above; same scenarios serve the link-read side here.)
 
 `behave/features/rdelete.feature:4` — `rdelete -r -f test:factory -m
 'cleanup'` deletes a whole project; exit 0, no verification the project
-is gone (geectl should verify by re-read).
+is gone. Geectl's live tests verify by re-read.
 `behave/features/undelete.feature:10` / `:17` — undelete package, then
 undelete project (after `rdelete … -m 'why:delete'`).
 `behave/features/aggregatepac.feature:10` / `:16` / `:21` — aggregate
@@ -503,21 +498,21 @@ rules:
 
 - `/build/…/_status` (404 = no log) and `/build/…/_jobhistory` (verify a
   green build is from the current srcmd5, not a stale rebuild): **zero**
-  hits in `tests/` and `behave/features/` (verified by grep).
+  hits in `tests/` and `behave/features/`.
 - `whatdependson` (reverse build deps) and `view=fileinfo_ext` (RPM
   requires inspection): no coverage found in the surveyed files.
 - SKIP in this batch: `tests/test_build.py` (2 tests — local-build trust
   gate for untrusted projects; geectl does no local builds),
   `behave/features/build.feature` (3 scenarios — local buildroot/chroot;
-  out of scope v1 by design R15).
+  out of scope, issue #43).
 
 ## Batch 6 — working-copy layer
 
-**Direct adoptions: 0. Spec reference: 36 tests. Design decision pending.**
+**Direct adoptions: 0. Spec reference: 36 tests.**
 
 osc's WC tests are the only specification of the commit/update protocol;
-whether they transfer depends on the API-only-vs-`.osc`-compatible decision
-(gap map framing). Under API-only, only the protocol sequence transfers;
+whether they transfer depends on the API-only-vs-`.osc`-compatible decision,
+which is undecided. Under API-only, only the protocol sequence transfers;
 under `.osc`-compatible, the WC tests become directly relevant (large scope).
 
 - `tests/test_commit.py` (16) — commit protocol (see batch 1): validate →
@@ -556,7 +551,7 @@ under `.osc`-compatible, the WC tests become directly relevant (large scope).
 **Direct adoptions: 0 new (material already counted under batches 2/4).
 Gap: mr / maintained / mbranch filing flows.**
 
-- Already counted: `behave/features/createrequest.feature:14` / `:25`
+- Counted under batches 2/4: `behave/features/createrequest.feature:14` / `:25`
   (generic creator — `maintenance_incident` is just another action type
   through it; batch 2) and `tests/test_request.py:209` / `:225` / `:241`
   (delete project/package and change_devel action XML; batch 2).
@@ -601,7 +596,7 @@ handling, not the run operation).
 
 ## Batch 9 — Gitea operations (deferred)
 
-Not surveyed in detail; material exists for when the batch starts:
+Not surveyed in detail; material exists for the batch:
 
 - Behave: `behave/features/git-*.feature` — 15 files / 56 scenarios
   (`git-pr.feature` 15, `git-obs-staging-group.feature` 6,
@@ -612,7 +607,7 @@ Not surveyed in detail; material exists for when the batch starts:
   `git-pr-empty.feature` 2, `git-osc-precommit-hook.feature` 1,
   `git-pr-fork-to-fork.feature` 1, `git-repo-init-local.feature` 1,
   `git-repo-init-remote.feature` 1).
-- Already surveyed: `behave/features/fork.feature:11` / `:19` — Gitea fork
+- Surveyed: `behave/features/fork.feature:11` / `:19` — Gitea fork
   incl. cross-org re-fork refused (exit 1) and `--new-repo-name` retry;
   `behave/features/user.feature:5` — `ls` under a newly registered user
   whose password contains unicode (🚀🚀🚀) — adoptable as an
@@ -628,8 +623,7 @@ Not surveyed in detail; material exists for when the batch starts:
 
 ## Operations with NO osc coverage at all (write from scratch)
 
-Verified by grep over `tests/` and `behave/features/` plus the per-file
-surveys above. Batch in brackets:
+Batch in brackets:
 
 - `rq show`, `rq log`, accept, decline, revoke, `review add`, comment
   list/create [2] — only supersede is pinned anywhere.
@@ -652,12 +646,11 @@ surveys above. Batch in brackets:
   `test_deletefiles.py` (16), `test_revertfiles.py` (9),
   `test_init_package.py` (6), `test_init_project.py` (5), `test_vc.py` (4);
   Behave checkout/add/rm/mv/repairwc scenarios — geectl has no working copy
-  (batch 6 decision pending; see above).
+  (batch 6 decision undecided; see above).
 - CLI text/arity/formatting: `test_request.py` display tests (`:431`,
   `:449`, `:464`, `:500`), `test_commandline.py` arg-parsing class (18 of the
   slice — `TestPopProjectPackageRepositoryArchFromArgs` or
-  `TestPopProjectPackageTargetProjectTargetPackageFromArgs`; the audit
-  did not record which), `test_output.py` (28), results `--format`/`--csv` variants,
+  `TestPopProjectPackageTargetProjectTargetPackageFromArgs`), `test_output.py` (28), results `--format`/`--csv` variants,
   list/log stdout text, `addchannels`/`addcontainers`/`enablechannels`
   Behave scenarios (24 total — assert stdout strings only, no server-side
   effect verified).
@@ -665,14 +658,14 @@ surveys above. Batch in brackets:
 - osc-internal frameworks: `test_models.py` (29), `test_models_xmlmodel.py`
   (10), `test_core_package.py` (14), `test_core_request.py` ordering (4).
 - Local builds: `test_build.py` (2), `behave/features/build.feature` (3) —
-  out of scope v1 (R15).
+  out of scope (issue #43).
 - Git working-copy mode: `behave/features/osc-commands-unsupported-git.feature`
   (32 scenarios) — geectl has no osc-git hybrid to guard.
-- FORBIDDEN by the skill (coverage exists, adoption refused):
+- Not adopted (coverage exists, adoption refused):
   `osc token --create` — `behave/features/token.feature:12` covers
   create → list → trigger end-to-end, but agents must never handle the
   secret. Secret printers (`config --dump-full`, `config pass`) — no tests
-  found; forbidden regardless.
+  found; not adopted regardless.
 
 ## Counts (direct adoptions, de-duplicated)
 
@@ -692,9 +685,9 @@ surveys above. Batch in brackets:
 Surveyed base: 216 behave scenarios + 369 unit tests = 585 items;
 adoptable as written: 210 of them (107 behave scenarios, 103 unit tests),
 plus the batch 1/6 protocol specs. The rest is SKIP (osc-internal),
-stdout-only, or already covered by geectl's existing live tests.
+stdout-only, or covered by geectl's existing live tests.
 
-## Quirks found in osc's own tests (do not copy blindly)
+## Quirks in osc's own tests
 
 - `behave/features/branch.feature:13` — title claims `--nodevelproject`
   but the command omits the flag (byte-duplicate of `:5`).
@@ -705,8 +698,7 @@ stdout-only, or already covered by geectl's existing live tests.
   "project checkout", Background is a package checkout.
 - `behave/features/rmkpac.feature:59` — title has a stray trailing `'`.
 - `tests/test_obs_api_request.py:38` — `source_packages` builds
-  `source[@packages=…]` (plural attribute); presumably a server-side quirk,
-  keep as-is.
+  `source[@packages=…]` (plural attribute); a server-side quirk.
 - `tests/test_prdiff.py:108` — `only-in-new` counts as identical in the
   one-arg form.
 - `behave/features/getbinaries-*-project*` — multibuild `.src.rpm` listed

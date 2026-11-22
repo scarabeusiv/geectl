@@ -2,12 +2,11 @@
 
 Issues: https://github.com/scarabeusiv/geectl/issues/51 (debug channel),
 https://github.com/scarabeusiv/geectl/issues/52 (human-readable output)
-Status: decided (Tom, 2026-11-21). Debug channel implemented (PR #55; #51 closed); text rendering pending (#52), implementation on PR #83.
-Depends on: the OBS command surface in the CLI (only `version` + `config`
-exist today — the text renderers ride on that work, see §2); #23 (git vs
+Status: debug channel implemented (#51 closed); text rendering implemented (PR #83); #52 open.
+Depends on: the OBS command surface in the CLI (see §2); #23 (git vs
 OBS abstraction — the command tree must not split by backend).
 
-Verified against main `4c0cbf0` (2026-11-22): `src/main.rs` is a thin CLI
+Verified against main `4c0cbf0`: `src/main.rs` is a thin CLI
 over the library; global `--format` flag (json default, text alternative)
 plus the debug flags (`--debug`, `--debug-body`); text renderers exist
 only for `version` and `config show`/`config init`; the debug channel
@@ -75,8 +74,9 @@ what "one coherent channel" means.
   HTTP policy): each probe plus the remaining budget, e.g.
   `retry: create_package registration probe 1/30s: still not found`.
   (test `src/obs/remote.rs:7092`).
-  These are the retries that burned silently before this channel existed
-  — a retried `change_state` consuming its 60 s budget with no visible trace.
+  These are retries with no output elsewhere — a retried
+  `change_state` consuming its 60 s budget would otherwise leave no
+  visible trace.
 - **Library decision points** (the ones that change what happens
   next): dedup checks (`decision: open submit request(s) 1398492 already target foo; refusing
   to file`; test `src/obs/payload.rs:3155`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1026`),
@@ -90,10 +90,9 @@ what "one coherent channel" means.
   emit sites `src/obs/services.rs:277,281,307,314`).
 - **Startup line**: `geectl 0.2.1 request show 1398977` — the invoked
   command line, so a pasted debug transcript is self-describing.
-  There are no secret-valued flags today, so nothing to redact; the
-  rule is recorded at the call site: any future secret-valued flag
-  must be masked here by construction, never printed and filtered
-  later.
+  There are no secret-valued flags, so nothing to redact; any
+  secret-valued flag must be masked here by construction, never
+  printed and filtered later.
 - **Config line at startup**: the effective OBS/Gitea base *hosts*
   and the auth *kind* (`basic`/`bearer`/`ssh`/`none`/`error`) — never a
   username, never a value. (`config show` already reports the
@@ -105,9 +104,9 @@ what "one coherent channel" means.
 - **No request or response bodies, no headers.** Bodies can be large
   (up to the 10 MiB cap) and headers carry the credentials. The
   method + URL + status + duration + attempt is the diagnostic; a body
-  has never been needed to explain a geectl failure yet, and if one
-  ever is, printing bodies is a new decision with a size cap and
-  redaction — not a quiet addition.
+  has never been needed to explain a geectl failure. Printing bodies
+  is a separate decision with a size cap and redaction — not a quiet
+  addition.
 - **No secrets, ever.** Credentials travel in headers, never in URLs,
   so the URL is safe to print as-is — but the rule is stated at the
   sink: the sink takes pre-formed lines, never a header map or a
@@ -118,7 +117,7 @@ what "one coherent channel" means.
   clock adds noise and makes transcripts harder to diff. Correlation
   with server logs is the server's job, not the client's.
 
-### Scrub scope (Tom, 2026-11-21)
+### Scrub scope
 
 Bodies behind `--debug-body` are scrubbed for credentials only, by
 a simple name-based scan (`redact_body` in `src/debug.rs`): a value
@@ -159,15 +158,12 @@ never changes stdout" — this design implements that line).
 ### Granularity: one `--debug`, no `-v` ladder
 
 One level that prints everything the channel carries. Leveled
-verbosity (`-v`, `-vv`) is preemptive complexity: there is no
-evidence today that any command's debug output is too noisy to read
-whole, and a ladder would split the event catalog across levels with
-no rule for which event belongs where. If a command's debug output
-ever gets too noisy, that is a new decision with the noisy command as
-evidence — not a ladder built in advance. (Same ruling as the
-`--compiler-cache` arg in the local-build design: an option that
-exists only to be refused, or a level that exists only to be tuned,
-is preemptive.)
+verbosity (`-v`, `-vv`) is preemptive complexity: no command has
+produced debug output too noisy to read whole, and a ladder would split
+the event
+catalog across levels with no rule for which event belongs where. If
+a command's debug output gets too noisy, that is a new decision with
+the noisy command as evidence — not a ladder built in advance.
 
 ### Where it lives: the `log` facade with a bespoke backend
 
@@ -187,7 +183,7 @@ is preemptive.)
   formatting; the library decision-point sites format one small string
   each, dropped inside `emit()` when the channel is off. The sink
   takes pre-formed lines, so the check is one bool per event.
-- **The two existing prints.** `try_change_state` already emits a
+- **The two existing prints.** `try_change_state` emits a
   `decision:` line on the channel when it declines an accept
   (`src/obs/request.rs:3010`): the refused-change path (`:3030`)
   propagates the error, so the reason reaches the JSON error
@@ -196,11 +192,10 @@ is preemptive.)
   nothing is lost. The re-issue `decision:` lines
   emit live in `post_changestate_with_retry` (`:2747`, emits
   `:2787-2813`). The `[dry-run]` plan echo
-  (`src/obs/types.rs`, `DryRun::note`) stays as unconditional stderr
+  (`src/obs/types.rs`, `DryRun::note`) is unconditional stderr
   narration: it is the dry-run feature's output, not a debug print —
-  a dry run's whole point is showing what would happen — and the plan
-  is already data (`DryRun::plan`). The plan echo is documented where
-  it lives, so the next reader does not mistake it for an ad-hoc print.
+  a dry run shows what would happen — and the plan is data
+  (`DryRun::plan`). It is documented where it lives.
 
 ### Composition with `--format`
 
@@ -225,8 +220,7 @@ Consequences:
 
 - **Text renderers ship in the same PR as the command.** A command
   PR that adds a subcommand without its renderer is uncompilable, so
-  the "text comes later" drift that left `version`/`config` as the
-  only rendered commands cannot recur.
+  a command without a renderer cannot land.
 - **The renderer lives in the binary (`src/main.rs`), not the
   library.** The library returns typed data; rendering is a
   presentation concern of the CLI. The library stays
@@ -245,7 +239,7 @@ Consequences:
    omissions below. A summary may omit long free text (a
    description, a comment body); it never silently omits an id, a
    name, a revision, or a state.
-   - **Coordinate header (decided 2026-11-21, Tom):** text starts
+   - **Coordinate header:** text starts
      with one header line echoing the query coordinates — the
      required positionals, in the order project, package,
      repository, arch (as applicable), plus `package:`
@@ -259,23 +253,23 @@ Consequences:
      in the JSON payload. The exemption covers the content itself;
      a synthetic empty-content line (e.g. `no log`) still carries
      the header.
-   Ruling (Tom, 2026-11-21 21:22 UTC): every text rendering opens
+   Every text rendering opens
    with one header line echoing the query coordinates
    (project/package/repository/arch as applicable), except content
    commands (rule 4), whose text is the content verbatim; tables
    stay as designed; every other omission stands as a DOCUMENTED
    per-renderer omission, not a fix — recorded at the renderer
-   (comment + module docs) so a later review reads it as decided,
-   never by expanding the table to echo the full payload.
+   (comment + module docs), never by expanding the table to echo the
+   full payload.
 2. **Single objects render as `key: value` lines**, one fact per
    line — the `config show` precedent. Nested objects flatten with a
    prefix (`action 1: submit ...`); nested lists get one line per
    item.
 3. **Lists render as tables**: a header row, space-aligned columns,
    no borders, no box-drawing. Column width is the widest value in
-   the printed set. No truncation in v1: a long value makes a wide
+   the printed set. No truncation: a long value makes a wide
    line, and the JSON payload remains the complete record — text never
-   silently drops an identifier. (Truncation is a later decision if a
+   silently drops an identifier. (Truncation is a separate decision if a
    real command's output proves unreadable.) A table cell may still
    summarize a nested object in compact form (the `request search`
    actions column shows `submit foo`); the full fields stay in the
@@ -293,9 +287,9 @@ Consequences:
 7. **No reformatting of values.** Timestamps print as the server gave
    them (ISO); never relative ("2h ago" — relative times rot in
    transcripts). Numbers print as the server gave them.
-8. **No color, no paging, no spinners in v1.** Non-interactive output
-   must stay clean in pipes and logs. Color, if it ever comes, is a
-   separate decision (opt-in, tty-gated) — not this one.
+8. **No color, no paging, no spinners.** Non-interactive output
+   must stay clean in pipes and logs. Color is a separate decision
+   (opt-in, tty-gated) — not this one.
 9. **One renderer, escapes by construction** (`docs/architecture.md`):
    text is rendered from parsed data, never a raw print of server
    text — except content commands (§2 rule 4), where the content is
@@ -304,7 +298,7 @@ Consequences:
 ### Worked examples (shape, not an exhaustive field list)
 
 Per-command fields are the command author's decision, following the
-shape rules above. Three examples pin the shape:
+shape rules above. Five examples pin the shape:
 
 - **`request show <id>`** (single object, `key: value`):
   `id: 1398977`, `state: new`, `creator: ...`, `created: ...`,
@@ -315,7 +309,7 @@ shape rules above. Three examples pin the shape:
   header `ID STATE CREATOR ACTIONS`, one row per request, the actions
   column a compact inline form (`submit foo`).
 - **`list_files`** (list, table): header `NAME SIZE MTIME`, one row
-  per file. The md5 is JSON-only in v1: it is a verification value,
+  per file. The md5 is JSON-only: it is a verification value,
   not a human identifier, and a 32-hex column would dominate every
   row. (If a human need for the md5 in text is proven, it is a new
   decision.)
@@ -325,7 +319,7 @@ shape rules above. Three examples pin the shape:
   a summary line (`1 failed, 3 succeeded`, terms alphabetical) —
   the summary is derived from the same data, not a new fact.
 
-### Decided: opt-in via `--format text` everywhere
+### Opt-in via `--format text` everywhere
 
 **Opt-in via `--format text` everywhere — no terminal sniffing.**
 (Decision 1.)
@@ -344,7 +338,7 @@ shape rules above. Three examples pin the shape:
 - **Humans opt in once.** `--format text` is explicit and cheap;
   shell users who want text always alias it
   (`alias geectl='geectl --format text'`). The docs show the alias.
-- **The architecture doc already decides it in spirit:** "JSON by
+- **The architecture doc already states it:** "JSON by
   default, one uniform `--format` across every command"
   (`docs/architecture.md`) — tty-sniffing would violate "uniform".
 - The alternative (text on a tty, JSON otherwise) is what many CLIs
@@ -355,8 +349,7 @@ shape rules above. Three examples pin the shape:
 ### Persistent opt-in without sniffing: config + env
 
 A human who always wants text should not have to type the flag every
-time — but the answer is persistence, not detection. **Decided:
-`format` becomes a config-file key and a `GEECTL_FORMAT`
+time — but the answer is persistence, not detection. **`format` becomes a config-file key and a `GEECTL_FORMAT`
 environment variable**, under the existing precedence (flag > env >
 config file > built-in default). (Decision 2.)
 
@@ -371,7 +364,7 @@ config file > built-in default). (Decision 2.)
   `--format json` explicitly** (the skill's invocations do), and the
   flag beats the config. `config show` makes a stray `text` default
   diagnosable.
-- The config/env default is decided; if it is ever revoked, the design still stands:
+- The config/env default stands; if it is ever revoked, the design still stands:
   `--format text` per invocation is the whole mechanism, and the
   alias is the persistent form.
 
@@ -380,7 +373,7 @@ config file > built-in default). (Decision 2.)
 Errors go to stderr as a JSON payload today, in both formats. A
 human running `--format text` who hits an error currently gets JSON
 on stderr — the annoying experience this issue is about.
-**Decided: render the error in the selected format too** — text
+**Render the error in the selected format too** — text
 mode prints `error: <message>` plus `remediation: <...>` lines on
 stderr; JSON mode keeps the JSON payload. The error kind and the
 exit code are unchanged; only the rendering varies, in one place
@@ -389,29 +382,26 @@ exit code are unchanged; only the rendering varies, in one place
 error shape), but it leaves the human-facing half of this issue
 unsolved: every failed text-mode run still ends in JSON.
 
-### Dependency: the OBS command surface does not exist yet
+### Dependency: the OBS command surface
 
-Only `version` + `config` exist in the binary; the library already
-has the operations (`show_request`, `search_requests`, `cat`,
-`list_files`, `list_packages`, `package_log`, `request_diff`,
-`change_state`, `branch_package`, `build` reads, … — 191 public
-functions across `src/obs/`, of which the command surface will expose
-a thin subset). The text renderers ride on that work:
+The OBS command surface exists in the binary (PR #83): `remote`,
+`request`, `branch`, `build`, `maintenance`, `service`, `gitea`.
+The library operations behind it (`show_request`,
+`search_requests`, `cat`, `list_files`, `list_packages`,
+`package_log`, `request_diff`, `change_state`, `branch_package`,
+`build` reads, … — 193 public functions across `src/obs/`, of which
+the command surface exposes a thin subset). The text renderers ride
+on that work:
 
-- **Assumption: one subcommand per operation (or per operation
-  group), thin over the library.** The command tree's exact shape
-  (grouping, naming — `request show` vs `rq show`, `package cat`
-  vs `cat`) is decided when the OBS commands land, in their own
-  batch — this design constrains it only in that every leaf command
-  returns `(payload, text)`.
-- **Assumption: the (payload, text) pair is the command handler's
-  return type from the first OBS command on.** Retrofitting a
-  renderer onto an existing command is the drift this design exists
-  to prevent; the first OBS command PR sets the pattern.
-- **Assumption: text never drives new library API.** A renderer
-  that needs a field the library does not return is a library gap,
-  filed as such — the renderer does not reach around the library
-  into raw XML or a second HTTP call.
+- **One subcommand per operation (or per operation group), thin
+  over the library.** Every leaf command returns `(payload, text)`.
+- **The (payload, text) pair is the command handler's return
+  type.** Retrofitting a renderer onto an existing command is the
+  drift this design prevents.
+- **Text never drives new library API.** A renderer that needs a
+  field the library does not return is a library gap, filed as
+  such — the renderer does not reach around the library into raw
+  XML or a second HTTP call.
 
 ## Errors (shared)
 
@@ -449,15 +439,13 @@ a thin subset). The text renderers ride on that work:
     formats; the identifying-fields agreement test (every id/name/
     revision in the JSON appears in the text); empty-list renders
     the explicit `no <things>` line; `cat` renders verbatim.
-  - Error rendering (decision 3, decided): text mode renders
+  - Error rendering (decision 3): text mode renders
     `error:` + `remediation:` lines; JSON mode keeps the payload;
     exit code identical in both.
 - **Live (non-gating):** the live suite already proves the
   operations against a real server; debug adds nothing to it
   except that a red live run can be re-run with `--debug` to
-  produce the transcript — that is the channel's purpose, and the
-  first real use should be reproducing a retried accept against
-  its 60 s budget.
+  produce the transcript — that is the channel's purpose.
 - **No new scheduled job.** Debug and text are PR-level features;
   the live suite is unchanged.
 
@@ -466,18 +454,16 @@ a thin subset). The text renderers ride on that work:
 - **Debug lines pasted with secrets.** Mitigated by construction:
   the sink takes pre-formed lines, never headers or bodies, and
   the redaction test asserts a fake credential never appears.
-  Residual: a future URL carrying a credential as a query parameter
+  Residual: a URL carrying a credential as a query parameter
   — the transport guard already forbids credentials over cleartext
   and credentials never go in URLs; a URL with a secret in it
-  would be a new bug, and the debug line would surface it. That is
-  arguably a feature (it makes the leak visible), not a risk to
-  design around.
+  would be a new bug, and the debug line would surface it.
 - **Debug noise drowning the signal.** One level prints
   everything; a chatty command (a search fanning out per-file GETs,
   the `revision_patch` / `project_diff` fan-outs) produces many lines. Mitigated by the one-line-per-event
   shape and by the channel being off by default — it is only read
   when someone asks for it. If a specific command's output proves
-  unreadable, that is the evidence for a granularity decision then.
+  unreadable, that is the evidence for a granularity decision.
 - **Text renderers drifting from JSON.** A field added to the
   payload but not the renderer (or vice versa) makes the two
   disagree. Mitigated by the identifying-fields agreement test and
@@ -494,9 +480,9 @@ a thin subset). The text renderers ride on that work:
 - **Scope creep into a logging framework.** The channel is
   deliberately not leveled, not timestamped, not JSON — one level
   on stderr, through the `log` facade to the minimal bespoke
-  backend. Each of those is a later decision with its own
+  backend. Each of those is a separate decision with its own
   justification if a real need appears; this design names them as
-  out, so a well-meaning PR does not quietly add one.
+  out, so none is added quietly.
 
 ## What stays out
 
@@ -512,41 +498,35 @@ a thin subset). The text renderers ride on that work:
   calls, it does not change them; the text renderers present
   payloads, they do not add fields.
 
-## Decisions (decided by Tom, 2026-11-21)
+## Decisions
 
 ### #51 — debug channel
 
-1. **Flag + env, or flag only?** DECIDED (Tom, 2026-11-21): both —
+1. **Flag + env, or flag only?** Both —
    `--debug` plus `GEECTL_DEBUG=1`, flag wins. The env var is for scripts and CI
    where editing every invocation is friction; precedence follows
    the existing flag > env rule.
-2. **Human lines or JSON lines on stderr?** DECIDED (Tom, 2026-11-21):
-   human lines — the consumer is a human diagnosing a run, and the
+2. **Human lines or JSON lines on stderr?** Human lines — the consumer is a human diagnosing a run, and the
    machine-readable verdict already exists (JSON error payload +
    exit code).
-3. **One `--debug` or leveled `-v`?** DECIDED (Tom, 2026-11-21): one
-   level — no evidence any command is too noisy to read whole.
-4. **Hand-rolled sink or the `log` crate?** DECIDED (Tom, 2026-11-21):
-   use the `log` crate — static linking makes the dependency
+3. **One `--debug` or leveled `-v`?** One level — no evidence any command is too noisy to read whole.
+4. **Hand-rolled sink or the `log` crate?** Use the `log` crate — static linking makes the dependency
    acceptable. The channel contract still holds: stderr, human
    lines, one level, off by default.
-5. **Request/response bodies in debug output?** DECIDED (Tom, 2026-11-21):
-   bodies behind a separate flag (e.g. `--debug-body`), size-capped
+5. **Request/response bodies in debug output?** Bodies behind a separate flag (e.g. `--debug-body`), size-capped
    and redacted — default debug output never prints bodies, so no
    secrets land in the log by default.
 
 ### #52 — human-readable output
 
 1. **Text default on a terminal, or opt-in everywhere?**
-   DECIDED (Tom, 2026-11-21): opt-in via `--format text` everywhere,
+   Opt-in via `--format text` everywhere,
    no terminal sniffing — the same invocation produces the same
    bytes in every context, and the agent is the primary consumer.
 2. **Persistent opt-in via config file + env (`format` in
-   `config.toml`, `GEECTL_FORMAT`)?** DECIDED (Tom, 2026-11-21):
-   yes — persistence without detection, under the existing
+   `config.toml`, `GEECTL_FORMAT`)?** Yes — persistence without detection, under the existing
    precedence (flag > env > config > default); agent invocations
    pass `--format json` explicitly.
 3. **Errors in text mode: render as text, or keep JSON errors
-   always?** DECIDED (Tom, 2026-11-21): render in the selected
-   format — text mode: `error:` + `remediation:` lines on stderr;
+   always?** Render in the selected format — text mode: `error:` + `remediation:` lines on stderr;
    JSON mode unchanged.

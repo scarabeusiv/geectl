@@ -16,14 +16,14 @@ A throwaway OBS built from the OBS project's own development containers:
 - `frontend` — the OBS API, built from the OBS source (`src/api`) on top
   of the published `frontend-features` image
 
-There is no published prebuilt frontend server image — the OBS project
-builds it from source, and so do we. The build worker is omitted: no
+There is no published prebuilt frontend server image; the frontend
+is built from source. The build worker is omitted: no
 test builds a package, and the worker needs a privileged container.
 
-The instance tracks OBS master (`obs/server/unstable`). That is
-deliberate: the live job exists to catch drift as OBS changes, so it
-tracks the newest OBS, not a stable release. The job is independent and
-non-gating, so a master breakage blocks nothing — it just needs fixing.
+The instance tracks OBS master (`obs/server/unstable`): the live job
+catches drift as OBS changes, so it tracks the newest OBS, not a
+stable release. The job is independent and non-gating: a master
+breakage blocks nothing.
 
 In CI the frontend build reuses a BuildKit GitHub Actions cache
 (`docker-compose.cache.yml`, loaded only when `LIVE_CACHE` is
@@ -84,8 +84,8 @@ live server state through geectl's own HTTP client:
 - a missing project maps to geectl's `NotFound`
 - the project list at `GET /source` returns a `<directory>` of `<entry>` elements
 
-The instance serves plain HTTP on localhost. That is the single
-sanctioned exception to geectl's https-only rule (see `tests/live.rs`):
+The instance serves plain HTTP on localhost. That is the
+exception to geectl's https-only rule (see `tests/live.rs`):
 loopback-only, ephemeral instance, ephemeral credentials, and the
 bootstrap admin credentials only for the mutation tests. The mutation
 assertion (create a project through geectl, read it back) runs live
