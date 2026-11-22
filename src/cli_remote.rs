@@ -71,10 +71,10 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    CreatePackageOptions, DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry,
-    NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person,
-    ProjectMatch, ProjectMeta, Repository, RevisionPatch, RevisionRange, SourceFile,
-    FACTORY_PROJECT, OBS_API_BASE,
+    AggregateOptions, CreatePackageOptions, DeleteProjectOptions, DryRun, FilePatch,
+    FilePatchStatus, HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus,
+    PackageMatch, PackageMeta, Person, ProjectMatch, ProjectMeta, Repository, RevisionPatch,
+    RevisionRange, SourceFile, FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -368,6 +368,31 @@ pub enum RemoteCommand {
         /// The project to restore.
         project: String,
     },
+    /// Aggregate a package's binaries into another package. A
+    /// mutation: dry-run is the default (only the plan is printed);
+    /// `--live` performs the aggregation. The target package is
+    /// created from the source package's meta when it does not exist
+    /// yet; an `_aggregate` file that already exists is refused.
+    AggregatePackage {
+        /// The project the source package lives in.
+        source_project: String,
+        /// The source package.
+        source_package: String,
+        /// The project the target package lives in.
+        target_project: String,
+        /// The target package.
+        target_package: String,
+        /// Map a source repository to a target repository, as
+        /// `SOURCE=TARGET` (repeatable).
+        #[arg(long)]
+        repository_map: Vec<String>,
+        /// Aggregate binaries only, not the sources.
+        #[arg(long)]
+        no_sources: bool,
+        /// Disable publishing of the aggregate package.
+        #[arg(long)]
+        disable_publish: bool,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
@@ -406,6 +431,7 @@ pub fn run_remote(
         RemoteCommand::DeleteProject { .. } if !live => Credentials::None,
         RemoteCommand::UndeletePackage { .. } if !live => Credentials::None,
         RemoteCommand::UndeleteProject { .. } if !live => Credentials::None,
+        RemoteCommand::AggregatePackage { .. } if !live => Credentials::None,
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -864,6 +890,45 @@ pub fn run_remote(
             };
             Ok(undelete_project_result(&project, dry_run.enabled(), plan))
         }
+        RemoteCommand::AggregatePackage {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+            repository_map,
+            no_sources,
+            disable_publish,
+        } => {
+            let mappings = parse_repository_map(&repository_map)?;
+            let options = AggregateOptions {
+                repository_map: mappings,
+                no_sources,
+                disable_publish,
+            };
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.aggregate_package(
+                &source_project,
+                &source_package,
+                &target_project,
+                &target_package,
+                &options,
+                &dry_run,
+            )?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(aggregate_package_result(
+                &source_project,
+                &source_package,
+                &target_project,
+                &target_package,
+                &options,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
     }
 }
 
@@ -1186,6 +1251,102 @@ fn undelete_project_result(
     mutation_result(
         payload,
         format!("project: {project}"),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// Parse `--repository-map SOURCE=TARGET` values into
+/// `(source, target)` pairs: the two sides split on the first `=`.
+/// A value with no `=`, or an empty side, is an input error naming
+/// the expected form.
+fn parse_repository_map(mappings: &[String]) -> Result<Vec<(String, String)>, GeectlError> {
+    mappings
+        .iter()
+        .map(|mapping| match mapping.split_once('=') {
+            Some((source, target)) if !source.is_empty() && !target.is_empty() => {
+                Ok((source.to_string(), target.to_string()))
+            }
+            _ => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid repository mapping {mapping:?}: expected SOURCE=TARGET"),
+            )),
+        })
+        .collect()
+}
+
+/// The option suffix for an aggregate result line: the set options
+/// (the dry-run plan carries the same suffix).
+fn aggregate_options_suffix(options: &AggregateOptions) -> String {
+    let mut flags: Vec<String> = Vec::new();
+    if options.no_sources {
+        flags.push("no sources".to_string());
+    }
+    if options.disable_publish {
+        flags.push("publish disabled".to_string());
+    }
+    if !options.repository_map.is_empty() {
+        flags.push(format!(
+            "{} repository mapping{}",
+            options.repository_map.len(),
+            if options.repository_map.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", flags.join(", "))
+    }
+}
+
+/// The `aggregate-package` result: the payload carries the source,
+/// the target, and the options; the text carries them too, in the
+/// header and the result line.
+fn aggregate_package_result(
+    source_project: &str,
+    source_package: &str,
+    target_project: &str,
+    target_package: &str,
+    options: &AggregateOptions,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let payload = json!({
+        "source_project": source_project,
+        "source_package": source_package,
+        "target_project": target_project,
+        "target_package": target_package,
+        "repository_map": options
+            .repository_map
+            .iter()
+            .map(|(source, target)| json!({
+                "source": source,
+                "target": target,
+            }))
+            .collect::<Vec<_>>(),
+        "no_sources": options.no_sources,
+        "disable_publish": options.disable_publish,
+    });
+    let suffix = aggregate_options_suffix(options);
+    let result_line = if dry_run {
+        format!(
+            "dry-run: would aggregate package {source_project}/{source_package} into {target_project}/{target_package}{suffix}"
+        )
+    } else {
+        format!(
+            "aggregated package {source_project}/{source_package} into {target_project}/{target_package}{suffix}"
+        )
+    };
+    mutation_result(
+        payload,
+        format!(
+            "source: {source_project}/{source_package} target: {target_project}/{target_package}"
+        ),
         result_line,
         dry_run,
         plan,
@@ -2460,6 +2621,104 @@ mod tests {
         assert_eq!(
             text,
             "project: P\ndry_run: true\ndry-run: would restore deleted project P\n[dry-run] would: restore deleted project P"
+        );
+    }
+
+    #[test]
+    fn aggregate_package_parses_source_target_and_options() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "aggregate-package",
+            "SP",
+            "SK",
+            "TP",
+            "TK",
+            "--repository-map",
+            "standard=standard",
+            "--repository-map",
+            "ports=ports",
+            "--no-sources",
+            "--disable-publish",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::AggregatePackage {
+                repository_map,
+                no_sources: true,
+                disable_publish: true,
+                ..
+            } if repository_map == vec!["standard=standard", "ports=ports"]
+        ));
+        assert!(matches!(
+            parse(&["geectl", "remote", "aggregate-package", "SP", "SK", "TP", "TK"]),
+            RemoteCommand::AggregatePackage {
+                repository_map,
+                no_sources: false,
+                disable_publish: false,
+                ..
+            } if repository_map.is_empty()
+        ));
+    }
+
+    #[test]
+    fn repository_map_splits_on_the_first_equals() {
+        assert_eq!(
+            parse_repository_map(&["standard=standard".to_string()]).unwrap(),
+            vec![("standard".to_string(), "standard".to_string())]
+        );
+        assert!(parse_repository_map(&["no-equals".to_string()]).is_err());
+        assert!(parse_repository_map(&["=standard".to_string()]).is_err());
+        assert!(parse_repository_map(&["standard=".to_string()]).is_err());
+    }
+
+    #[test]
+    fn aggregate_package_result_carries_options_in_both_formats() {
+        let options = AggregateOptions {
+            repository_map: vec![
+                ("standard".to_string(), "standard".to_string()),
+                ("ports".to_string(), "ports".to_string()),
+            ],
+            no_sources: true,
+            disable_publish: true,
+        };
+        let (payload, text) =
+            aggregate_package_result("SP", "SK", "TP", "TK", &options, false, None);
+        assert_eq!(payload["source_project"], "SP");
+        assert_eq!(payload["source_package"], "SK");
+        assert_eq!(payload["target_project"], "TP");
+        assert_eq!(payload["target_package"], "TK");
+        assert_eq!(payload["repository_map"][0]["source"], "standard");
+        assert_eq!(payload["repository_map"][1]["target"], "ports");
+        assert_eq!(payload["no_sources"], true);
+        assert_eq!(payload["disable_publish"], true);
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "source: SP/SK target: TP/TK\ndry_run: false\naggregated package SP/SK into TP/TK (no sources, publish disabled, 2 repository mappings)"
+        );
+        let (payload, text) = aggregate_package_result(
+            "SP",
+            "SK",
+            "TP",
+            "TK",
+            &AggregateOptions::default(),
+            true,
+            Some(vec![
+                "[dry-run] would: aggregate package SP/SK into TP/TK".to_string()
+            ]),
+        );
+        assert_eq!(payload["repository_map"], json!([]));
+        assert_eq!(payload["no_sources"], false);
+        assert_eq!(payload["disable_publish"], false);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: aggregate package SP/SK into TP/TK"
+        );
+        assert_eq!(
+            text,
+            "source: SP/SK target: TP/TK\ndry_run: true\ndry-run: would aggregate package SP/SK into TP/TK\n[dry-run] would: aggregate package SP/SK into TP/TK"
         );
     }
 

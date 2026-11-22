@@ -35,6 +35,7 @@ what is specific to that group.
 | `osc rdelete [-r] [-f] [-m TEXT] PROJECT` | `remote delete-project` | One command per library operation; `-r` is `--recursive`, `-f` is `--force`, `-m` is `--comment` |
 | `osc undelete [-m TEXT] PROJECT PACKAGE` | `remote undelete-package` | One command per library operation, one package per invocation; osc's `-m` is dropped — the library sends no comment |
 | `osc undelete [-m TEXT] PROJECT` | `remote undelete-project` | One command per library operation; osc's `-m` is dropped — the library sends no comment |
+| `osc aggregatepac SOURCEPRJ SOURCEPAC DESTPRJ [DESTPAC]` | `remote aggregate-package SOURCE-PROJECT SOURCE-PACKAGE TARGET-PROJECT TARGET-PACKAGE` | Grouped + spelled-out; the target package is required (osc defaults it to the source name). `-m SRC=TARGET` is repeatable `--repository-map SOURCE=TARGET`; `--nosources` is `--no-sources`, `-d` is `--disable-publish` |
 | `osc ls /` | `remote list-projects` | Same listing, named as a leaf under `remote` |
 
 ## `request` — submit requests (issue #73)
