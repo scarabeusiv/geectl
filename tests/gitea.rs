@@ -1904,7 +1904,6 @@ fn gitea_team_create_defaults_to_read() {
     assert_eq!(deleted, "geectl.live_team");
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

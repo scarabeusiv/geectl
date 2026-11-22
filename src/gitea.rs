@@ -2377,7 +2377,6 @@ pub(crate) fn validate_gitea_name(name: &str, label: &str) -> Result<(), GeectlE
     Ok(())
 }
 
-
 /// Split an `owner/repo` coordinate into its parts, validating
 /// both names. Anything else is an invalid input naming the
 /// coordinate.
@@ -2403,7 +2402,6 @@ fn validate_pr_number(number: u64) -> Result<(), GeectlError> {
     }
     Ok(())
 }
-
 
 /// A Gitea team id: a positive integer. Zero and negatives name
 /// no team.
@@ -2435,7 +2433,6 @@ fn validate_gitea_team_name(name: &str) -> Result<(), GeectlError> {
     }
     Ok(())
 }
-
 
 /// A git branch name for the explicit fork branch — and for the
 /// resolved branch before it is embedded in a fork's scmsync URL.
