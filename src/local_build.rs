@@ -4601,7 +4601,9 @@ impl<'a> LocalBuild<'a> {
 /// killed client: it exits on its own when the budget lapses. The
 /// container carries the runner version as `OSC_VERSION` (the
 /// value is the geectl version); the `OBS_SERVICE_*` variables
-/// stay unset — a local run carries no project context.
+/// stay unset — a local run carries no project context. The
+/// `--mount` form splits on `,`, so a `,` in the source path
+/// misparses the mount.
 struct ServiceContainer {
     podman: PathBuf,
     name: String,
@@ -4637,8 +4639,8 @@ impl ServiceContainer {
             &name,
             "-e",
             &osc_version,
-            "-v",
-            &format!("{}:/work", source_dir.display()),
+            "--mount",
+            &format!("type=bind,src={},target=/work", source_dir.display()),
             "-w",
             "/work",
             image,
@@ -8697,6 +8699,53 @@ exit 0
             assert!(
                 log.contains(&format!("OSC_VERSION={}", env!("CARGO_PKG_VERSION"))),
                 "container carries no runner version: {log}"
+            );
+        }
+
+        #[test]
+        fn service_container_mount_survives_a_colon_in_the_source_path() {
+            // The `--mount` form carries the path as one value, so
+            // a `:` in the source path cannot split the mount.
+            let dir = TempDir::new();
+            let src = dir.path().join("so:urce");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.ran.len(), 1);
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            assert!(
+                run_line.contains(&format!(
+                    "--mount type=bind,src={},target=/work",
+                    src.display()
+                )),
+                "run line carries no --mount form: {run_line}"
+            );
+            assert!(
+                !run_line.contains(" -v "),
+                "run line still uses the -v string form: {run_line}"
+            );
+            let mount_pos = run_line
+                .find("--mount")
+                .expect("run line carries no --mount");
+            let image_pos = run_line
+                .find(DEFAULT_IMAGE)
+                .expect("run line carries no image");
+            assert!(
+                mount_pos < image_pos,
+                "mount flag follows the image name: {run_line}"
             );
         }
 
