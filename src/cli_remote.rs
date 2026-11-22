@@ -73,8 +73,8 @@ use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
     AggregateOptions, CreatePackageOptions, DeleteProjectOptions, DryRun, FilePatch,
     FilePatchStatus, HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus,
-    PackageMatch, PackageMeta, Person, ProjectMatch, ProjectMeta, Repository, RevisionPatch,
-    RevisionRange, SourceFile, FACTORY_PROJECT, OBS_API_BASE,
+    PackageMatch, PackageMeta, Person, ProjectMatch, ProjectMeta, ReleaseOptions, Repository,
+    RevisionPatch, RevisionRange, SourceFile, FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -393,6 +393,34 @@ pub enum RemoteCommand {
         #[arg(long)]
         disable_publish: bool,
     },
+    /// Release a package's sources and binaries. A mutation:
+    /// dry-run is the default (only the plan is printed); `--live`
+    /// performs the release. A release to a target project needs a
+    /// repository and a target repository.
+    ReleasePackage {
+        /// The project the package lives in.
+        project: String,
+        /// The package to release.
+        package: String,
+        /// Release only binaries from this repository.
+        #[arg(long)]
+        repository: Option<String>,
+        /// Release only binaries for this architecture.
+        #[arg(long)]
+        arch: Option<String>,
+        /// Release only to this project.
+        #[arg(long)]
+        target_project: Option<String>,
+        /// Release only to this repository in the target project.
+        #[arg(long)]
+        target_repository: Option<String>,
+        /// Rename binaries during the release using this release tag.
+        #[arg(long)]
+        set_release: Option<String>,
+        /// Run the release immediately instead of queueing it as a job.
+        #[arg(long)]
+        no_delay: bool,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
@@ -432,6 +460,7 @@ pub fn run_remote(
         RemoteCommand::UndeletePackage { .. } if !live => Credentials::None,
         RemoteCommand::UndeleteProject { .. } if !live => Credentials::None,
         RemoteCommand::AggregatePackage { .. } if !live => Credentials::None,
+        RemoteCommand::ReleasePackage { .. } if !live => Credentials::None,
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -929,6 +958,39 @@ pub fn run_remote(
                 plan,
             ))
         }
+        RemoteCommand::ReleasePackage {
+            project,
+            package,
+            repository,
+            arch,
+            target_project,
+            target_repository,
+            set_release,
+            no_delay,
+        } => {
+            let options = ReleaseOptions {
+                repository,
+                architecture: arch,
+                target_project,
+                target_repository,
+                set_release,
+                no_delay,
+            };
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.release_package(&project, &package, &options, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(release_package_result(
+                &project,
+                &package,
+                &options,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
     }
 }
 
@@ -1347,6 +1409,71 @@ fn aggregate_package_result(
         format!(
             "source: {source_project}/{source_package} target: {target_project}/{target_package}"
         ),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The option suffix for a release result line: the set options
+/// (the dry-run plan carries the same suffix).
+fn release_options_suffix(options: &ReleaseOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(repository) = &options.repository {
+        parts.push(format!("repository {repository}"));
+    }
+    if let Some(architecture) = &options.architecture {
+        parts.push(format!("architecture {architecture}"));
+    }
+    if let Some(target_project) = &options.target_project {
+        match &options.target_repository {
+            Some(target_repository) => {
+                parts.push(format!("to {target_project}/{target_repository}"));
+            }
+            None => parts.push(format!("to {target_project}")),
+        }
+    }
+    if let Some(set_release) = &options.set_release {
+        parts.push(format!("release tag {set_release}"));
+    }
+    if options.no_delay {
+        parts.push("no delay".to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// The `release-package` result: the payload carries the options;
+/// the text carries them too, in the result line.
+fn release_package_result(
+    project: &str,
+    package: &str,
+    options: &ReleaseOptions,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let payload = json!({
+        "project": project,
+        "package": package,
+        "repository": options.repository,
+        "architecture": options.architecture,
+        "target_project": options.target_project,
+        "target_repository": options.target_repository,
+        "set_release": options.set_release,
+        "no_delay": options.no_delay,
+    });
+    let suffix = release_options_suffix(options);
+    let result_line = if dry_run {
+        format!("dry-run: would release package {package} in project {project}{suffix}")
+    } else {
+        format!("released package {package} in project {project}{suffix}")
+    };
+    mutation_result(
+        payload,
+        format!("project: {project} package: {package}"),
         result_line,
         dry_run,
         plan,
@@ -2719,6 +2846,102 @@ mod tests {
         assert_eq!(
             text,
             "source: SP/SK target: TP/TK\ndry_run: true\ndry-run: would aggregate package SP/SK into TP/TK\n[dry-run] would: aggregate package SP/SK into TP/TK"
+        );
+    }
+
+    #[test]
+    fn release_package_parses_all_options() {
+        let parsed = parse(&["geectl", "remote", "release-package", "P", "K"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::ReleasePackage {
+                repository: None,
+                arch: None,
+                target_project: None,
+                target_repository: None,
+                set_release: None,
+                no_delay: false,
+                ..
+            }
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "release-package",
+            "P",
+            "K",
+            "--repository",
+            "standard",
+            "--arch",
+            "x86_64",
+            "--target-project",
+            "TP",
+            "--target-repository",
+            "TR",
+            "--set-release",
+            "1.0",
+            "--no-delay",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::ReleasePackage {
+                repository: Some(repository),
+                arch: Some(arch),
+                target_project: Some(target_project),
+                target_repository: Some(target_repository),
+                set_release: Some(set_release),
+                no_delay: true,
+                ..
+            } if repository == "standard"
+                && arch == "x86_64"
+                && target_project == "TP"
+                && target_repository == "TR"
+                && set_release == "1.0"
+        ));
+    }
+
+    #[test]
+    fn release_package_result_carries_options_in_both_formats() {
+        let options = ReleaseOptions {
+            repository: Some("standard".to_string()),
+            architecture: Some("x86_64".to_string()),
+            target_project: Some("TP".to_string()),
+            target_repository: Some("TR".to_string()),
+            set_release: Some("1.0".to_string()),
+            no_delay: true,
+        };
+        let (payload, text) = release_package_result("P", "K", &options, false, None);
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["package"], "K");
+        assert_eq!(payload["repository"], "standard");
+        assert_eq!(payload["architecture"], "x86_64");
+        assert_eq!(payload["target_project"], "TP");
+        assert_eq!(payload["target_repository"], "TR");
+        assert_eq!(payload["set_release"], "1.0");
+        assert_eq!(payload["no_delay"], true);
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: false\nreleased package K in project P (repository standard, architecture x86_64, to TP/TR, release tag 1.0, no delay)"
+        );
+        let (payload, text) = release_package_result(
+            "P",
+            "K",
+            &ReleaseOptions::default(),
+            true,
+            Some(vec!["[dry-run] would: release package P/K".to_string()]),
+        );
+        assert_eq!(payload["repository"], Value::Null);
+        assert_eq!(payload["architecture"], Value::Null);
+        assert_eq!(payload["target_project"], Value::Null);
+        assert_eq!(payload["target_repository"], Value::Null);
+        assert_eq!(payload["set_release"], Value::Null);
+        assert_eq!(payload["no_delay"], false);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(payload["plan"][0], "[dry-run] would: release package P/K");
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: true\ndry-run: would release package K in project P\n[dry-run] would: release package P/K"
         );
     }
 
