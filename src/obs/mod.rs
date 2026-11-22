@@ -116,6 +116,7 @@ pub(crate) mod payload;
 pub(crate) mod remote;
 pub(crate) mod request;
 pub(crate) mod services;
+pub(crate) mod staging;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod types;
@@ -200,6 +201,9 @@ pub use self::request::ReviewTarget;
 pub use self::request::XpathQuery;
 pub use self::services::ServiceDef;
 pub use self::services::ServiceParam;
+pub use self::staging::StagedRequest;
+pub use self::staging::StagingProject;
+pub use self::staging::StagingReadOptions;
 pub use self::types::changelog_names_cve;
 pub(crate) use self::types::ActionShape;
 pub(crate) use self::types::ActionTarget;
