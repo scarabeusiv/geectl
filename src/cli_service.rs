@@ -334,4 +334,71 @@ mod tests {
         assert_eq!(payload["lsrcmd5"], Value::Null);
         assert_eq!(render_service_state(&None), "no service state");
     }
+
+    /// The agreement test: every identifying field the JSON payload
+    /// carries — service name, mode, and `name=value` parameters;
+    /// state code, md5s, and error — appears in the text rendering.
+    /// The expected fields come from the payload itself, not from
+    /// literals repeated from the rendering tests, so a payload field
+    /// the text drops fails here.
+    #[test]
+    fn text_carries_every_identifying_field() {
+        let services = sample_services();
+        let payload: Vec<Value> = services.iter().map(service_json).collect();
+        let text = render_services(&Some(services));
+        for service in &payload {
+            let name = service["name"].as_str().expect("name is a string");
+            assert!(text.contains(name), "list text misses name {name}:\n{text}");
+            // An empty mode renders as `-`, not as an empty field:
+            // only a non-empty mode is an identifying field the text
+            // must carry, so the contains-check skips it; the `-`
+            // itself is pinned by the exact-row asserts below.
+            let mode = service["mode"].as_str().expect("mode is a string");
+            if !mode.is_empty() {
+                assert!(text.contains(mode), "list text misses mode {mode}:\n{text}");
+            }
+            for param in service["params"].as_array().expect("params is an array") {
+                let pair = format!(
+                    "{}={}",
+                    param["name"].as_str().expect("param name is a string"),
+                    param["value"].as_str().expect("param value is a string")
+                );
+                assert!(
+                    text.contains(&pair),
+                    "list text misses param {pair}:\n{text}"
+                );
+            }
+        }
+        // Empty mode and empty params render as `-`: the rows pin it
+        // exactly, so a renderer dropping the placeholder fails here.
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            rows[1],
+            "download_url -      url=https://example.com/foo-1.0.tar.gz"
+        );
+        assert_eq!(rows[2], "set_version  manual -");
+
+        let state = ServiceState {
+            code: ServiceCode::Failed,
+            xsrcmd5: Some("abcd1234".to_string()),
+            lsrcmd5: Some("efgh5678".to_string()),
+            error: Some("download failed".to_string()),
+        };
+        let payload = service_state_json(&state);
+        let text = render_service_state(&Some(state));
+        assert!(
+            text.contains(&format!(
+                "code: {}",
+                payload["code"].as_str().expect("code is a string")
+            )),
+            "state text misses code:\n{text}"
+        );
+        for field in ["xsrcmd5", "lsrcmd5", "error"] {
+            let value = payload[field].as_str().expect("field is a string");
+            assert!(
+                text.contains(&format!("{field}: {value}")),
+                "state text misses {field}: {value}:\n{text}"
+            );
+        }
+    }
 }
