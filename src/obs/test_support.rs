@@ -23,6 +23,7 @@ pub(crate) struct FakeHttp {
     puts: RefCell<HashMap<String, String>>,
     put_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     get_calls: RefCell<Vec<(String, bool)>>,
+    get_bearer_tokens: RefCell<Vec<(String, Option<String>)>>,
     get_bytes: RefCell<HashMap<String, Vec<u8>>>,
     get_bytes_calls: RefCell<Vec<(String, bool)>>,
     post_calls: RefCell<Vec<(String, String, bool)>>,
@@ -45,6 +46,7 @@ impl FakeHttp {
             puts: RefCell::new(HashMap::new()),
             put_errors: RefCell::new(HashMap::new()),
             get_calls: RefCell::new(Vec::new()),
+            get_bearer_tokens: RefCell::new(Vec::new()),
             get_bytes: RefCell::new(HashMap::new()),
             get_bytes_calls: RefCell::new(Vec::new()),
             post_calls: RefCell::new(Vec::new()),
@@ -160,6 +162,15 @@ impl FakeHttp {
         self.get_calls.borrow().clone()
     }
 
+    /// The Bearer token each GET carried, in call order: (url,
+    /// token). The `bool` in `get_calls` only says whether any
+    /// auth was sent, so a test that two instances send different
+    /// tokens asserts here — `None` when the call carried no
+    /// Bearer token. Test-only fake values, never real secrets.
+    pub(crate) fn get_bearer_tokens(&self) -> Vec<(String, Option<String>)> {
+        self.get_bearer_tokens.borrow().clone()
+    }
+
     pub(crate) fn get_bytes_calls(&self) -> Vec<(String, bool)> {
         self.get_bytes_calls.borrow().clone()
     }
@@ -189,6 +200,13 @@ impl HttpClient for FakeHttp {
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
         let authed = !matches!(credentials, Credentials::None);
         self.get_calls.borrow_mut().push((url.to_string(), authed));
+        let bearer = match credentials {
+            Credentials::Bearer { token } => Some(token.clone()),
+            _ => None,
+        };
+        self.get_bearer_tokens
+            .borrow_mut()
+            .push((url.to_string(), bearer));
         if let Some(kind) = self
             .get_error_sequences
             .borrow_mut()

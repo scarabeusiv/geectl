@@ -77,7 +77,7 @@ only — never from a config file, never prompted, never logged.
 | Service | Credential | Variables |
 | ------- | ---------- | --------- |
 | OBS | username + password (Basic auth; OBS has no API key) | `GEECTL_OBS_USERNAME` + `GEECTL_OBS_PASSWORD`, or `GEECTL_OBS_PASSWORD_FILE` |
-| Gitea | API token (Bearer) | `GEECTL_GITEA_TOKEN`, or `GEECTL_GITEA_TOKEN_FILE` |
+| Gitea | API token (Bearer) | `GEECTL_GITEA_TOKEN`, or `GEECTL_GITEA_TOKEN_FILE` — per instance, `GEECTL_GITEA_TOKEN_<ALIAS>` (see below) |
 | Gitea | SSH private key (git operations) | `GEECTL_GITEA_SSH_KEY` |
 
 The `*_FILE` variables name a file whose whole content is the secret
@@ -85,6 +85,17 @@ The `*_FILE` variables name a file whose whole content is the secret
 a container secret) is used. Setting both a variable and its `_FILE`
 form is an error, as is a half-configured pair. A malformed value fails
 at startup as a config error naming the variable, never the value.
+
+Credentials are stored per API URL: a second instance gets one line in
+the config file's `[instances]` table (alias → URL) and its own
+variables, with the alias uppercased — e.g. `[instances]
+myinstance = "https://gitea.example.org"` takes
+`GEECTL_GITEA_TOKEN_MYINSTANCE` (or
+`GEECTL_GITEA_TOKEN_FILE_MYINSTANCE`). A call resolves its credentials
+by the URL it talks to, so the default instance's token is never
+forwarded to another instance; one configured URL keeps working
+exactly as before. The alias `file` is reserved — it would collide
+with the plain `GEECTL_GITEA_TOKEN_FILE` variable.
 
 The SSH key must be a PEM private key in a file mode 0600 or stricter;
 a group/world-readable key is a config error.

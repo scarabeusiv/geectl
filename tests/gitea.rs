@@ -36,7 +36,7 @@
 //! header. That is the point: the auth resolution, the transport guard,
 //! and the status mapping are all exercised against a real server.
 
-use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth};
+use geectl::auth::{resolve_gitea_bearer_for_url, AuthProvider, Credentials, EnvGiteaAuth};
 use geectl::debug::Debug;
 use geectl::error::ErrorKind;
 use geectl::gitea::{ForkRepoOptions, GiteaClient, RepoCreateOptions};
@@ -260,6 +260,49 @@ fn typed_client<'a>(http: &'a UreqClient, base: &str) -> GiteaClient<'a> {
         .credentials()
         .expect("reading the Gitea token from the environment");
     GiteaClient::with_base(http, base, credentials).expect("typed Gitea client construction")
+}
+
+/// The live URL named once in an in-memory `[instances]` table
+/// under the alias `live`, with the provisioned token injected as
+/// `GEECTL_GITEA_TOKEN_LIVE`: the alias resolution must feed a
+/// client that authenticates against the real server, not just the
+/// unit-tested resolver. The token is the ephemeral provisioned
+/// one, never a real credential, and it is never printed.
+#[test]
+fn live_gitea_client_resolves_credentials_by_alias() {
+    let Some(base) = gitea_url() else {
+        return;
+    };
+    let http = gitea_client();
+    let token = match EnvGiteaAuth
+        .credentials()
+        .expect("reading the Gitea token from the environment")
+    {
+        Credentials::Bearer { token } => token,
+        _ => panic!("the provisioned Gitea token must resolve to a Bearer"),
+    };
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("GEECTL_GITEA_TOKEN_LIVE".to_string(), token.clone());
+    let instances = vec![("live".to_string(), base.clone())];
+    let no_files =
+        |_: &std::path::Path| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no file"));
+    let lookup = |name: &str| vars.get(name).cloned();
+    // The resolver itself returns the provisioned token for the
+    // live URL under its alias. `default_url` is the live base
+    // itself — the effective configured URL — not the bare
+    // default constant.
+    let resolved = resolve_gitea_bearer_for_url(&base, &base, &instances, &lookup, &no_files)
+        .expect("alias resolution for the live URL");
+    assert!(matches!(resolved, Credentials::Bearer { token: ref t } if t == &token));
+    // And the client built from it reads the fixture repo on the
+    // real server.
+    let client =
+        GiteaClient::with_base_resolved(&http, &base, &base, &instances, &lookup, &no_files)
+            .expect("alias-resolved client construction");
+    let repo = client
+        .repo_get("pool", "systemd")
+        .expect("alias-resolved client reads the fixture repo");
+    assert_eq!(repo.full_name, "pool/systemd");
 }
 
 /// Fork through the typed operation in live mode (dry-run off)

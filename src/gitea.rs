@@ -26,11 +26,17 @@
 //! The credentials held here are the single source for every call
 //! the client makes: `get_with`, `post_json_with`, and `delete` all
 //! take them explicitly, so the client never consults the HTTP
-//! client's own auth provider — a per-instance client can later
-//! carry different credentials without rework, and no call can
+//! client's own auth provider. A client built with
+//! [`GiteaClient::with_base_resolved`] carries the credentials
+//! resolved for its own base URL (see
+//! [`crate::auth::resolve_gitea_bearer_for_url`]), so two clients
+//! for two instances carry different credentials, and no call can
 //! silently authenticate as someone else.
 
-use crate::auth::Credentials;
+use crate::auth::{
+    alias_for_url, gitea_alias_vars, resolve_gitea_bearer_for_url, same_api_url, Credentials,
+    FileReader, VarLookup, GITEA_TOKEN_FILE_VAR, GITEA_TOKEN_VAR,
+};
 use crate::config::DEFAULT_GITEA_URL;
 use crate::debug::Debug;
 use crate::error::ErrorKind;
@@ -294,6 +300,77 @@ impl<'a> GiteaClient<'a> {
             credentials,
             debug: Debug::disabled(),
         })
+    }
+
+    /// Build a client for `base` with the credentials resolved for
+    /// that URL: the matching alias's variables from the config
+    /// file's `[instances]` table, the plain variables for the
+    /// configured default URL, and a clear error otherwise (see
+    /// [`resolve_gitea_bearer_for_url`]). `default_url` is the
+    /// effective configured Gitea URL — environment, then config
+    /// file, then default — never the bare [`DEFAULT_GITEA_URL`]
+    /// constant when a custom URL is configured, or a custom
+    /// single URL with a plain token would fail resolution. An
+    /// unauthenticated client cannot be built: when nothing is
+    /// configured for this URL the error names what to set — the
+    /// alias variables when an alias matches (plus the plain
+    /// variables when the URL is also the default), the
+    /// `[instances]` entry when none does, the plain variables
+    /// for the default URL — instead of `with_base`'s plain-vars
+    /// message. The base is validated first, exactly as
+    /// [`with_base`] validates it, and the fail-closed
+    /// construction of [`with_base`] applies unchanged.
+    pub fn with_base_resolved(
+        http: &'a dyn HttpClient,
+        base: &str,
+        default_url: &str,
+        instances: &[(String, String)],
+        vars: VarLookup<'_>,
+        read_file: FileReader<'_>,
+    ) -> Result<Self, GeectlError> {
+        // Validate before resolving: an invalid base gets the
+        // base-validation error, not a credential error that
+        // misdirects the user to `[instances]` — and no secret
+        // file is read for a base the client would reject.
+        validate_gitea_base(base)?;
+        let credentials =
+            resolve_gitea_bearer_for_url(base, default_url, instances, vars, read_file)?;
+        if matches!(credentials, Credentials::None) {
+            // `with_base` rejects an unauthenticated client, and
+            // its error names the plain variables — the wrong
+            // guidance when the URL is an alias or an unknown
+            // instance, so name what to set here instead. The
+            // default URL falls through to `with_base`, whose
+            // plain-vars message is the right one there.
+            if let Some(alias) = alias_for_url(base, instances)? {
+                let (token_var, token_file_var) = gitea_alias_vars(alias);
+                // The URL can also be the configured default:
+                // then the plain variables would fix it too, so
+                // name both sets.
+                let default_suffix = if same_api_url(base, default_url)? {
+                    format!(
+                        " — or the plain {GITEA_TOKEN_VAR} (or {GITEA_TOKEN_FILE_VAR}), since this URL is also the configured default"
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!(
+                        "no credentials configured for {base}; instance alias '{alias}' matches this URL — set {token_var} (or {token_file_var}){default_suffix}"
+                    ),
+                ));
+            }
+            if !same_api_url(base, default_url)? {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!(
+                        "no credentials configured for {base}; no instance alias matches it — add an [instances] entry for it in the config file and set GEECTL_GITEA_TOKEN_<ALIAS> (or GEECTL_GITEA_TOKEN_FILE_<ALIAS>) for that alias"
+                    ),
+                ));
+            }
+        }
+        Self::with_base(http, base, credentials)
     }
 
     /// Report the channel's decision lines to `debug` instead of
@@ -1461,6 +1538,23 @@ mod tests {
         GiteaClient::with_base(http, BASE, bearer()).unwrap()
     }
 
+    fn test_vars(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn test_lookup(
+        map: &std::collections::HashMap<String, String>,
+    ) -> impl Fn(&str) -> Option<String> + '_ {
+        move |name| map.get(name).cloned()
+    }
+
+    fn no_secret_files() -> impl Fn(&std::path::Path) -> std::io::Result<String> {
+        |_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no file"))
+    }
+
     fn obs_client<'a>(http: &'a dyn HttpClient) -> ObsClient<'a> {
         ObsClient::with_credentials(http, basic_credentials()).unwrap()
     }
@@ -1652,6 +1746,225 @@ mod tests {
             match GiteaClient::with_base(&http, BASE, credentials) {
                 Ok(_) => panic!("construction without a Bearer token must fail"),
                 Err(err) => assert_eq!(err.kind(), ErrorKind::ConfigError),
+            }
+        }
+    }
+
+    #[test]
+    fn with_base_resolved_uses_the_alias_token_for_its_url() {
+        // Two instances, two tokens: each client is built from the
+        // credentials resolved for its own base URL, and each sends
+        // them (the FakeHttp records an authed call). Which token
+        // resolves for which URL is proven at the auth layer; this
+        // test proves the constructor wires the resolution through.
+        let vars = test_vars(&[
+            ("GEECTL_GITEA_TOKEN", "plain-token"),
+            ("GEECTL_GITEA_TOKEN_EXAMPLE", "alias-token"),
+        ]);
+        let instances = vec![(
+            "example".to_string(),
+            "https://gitea.example.org".to_string(),
+        )];
+        let http = FakeHttp::new().with_get(
+            "https://gitea.example.org/api/v1/repos/pool/systemd",
+            &repo_json("pool", "systemd", None),
+        );
+        let client = GiteaClient::with_base_resolved(
+            &http,
+            "https://gitea.example.org",
+            BASE,
+            &instances,
+            &test_lookup(&vars),
+            &no_secret_files(),
+        )
+        .unwrap();
+        let repo = client.repo_get("pool", "systemd").unwrap();
+        assert_eq!(repo.full_name, "pool/systemd");
+        // The recorded bearer token proves the alias token went to
+        // the alias URL — the `authed` flag alone cannot tell the
+        // alias token from the plain one.
+        assert_eq!(
+            http.get_bearer_tokens(),
+            vec![(
+                "https://gitea.example.org/api/v1/repos/pool/systemd".to_string(),
+                Some("alias-token".to_string())
+            )]
+        );
+        // The default URL takes the plain variables, even with an
+        // alias defined for another instance.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json("pool", "systemd", None),
+        );
+        let client = GiteaClient::with_base_resolved(
+            &http,
+            BASE,
+            BASE,
+            &instances,
+            &test_lookup(&vars),
+            &no_secret_files(),
+        )
+        .unwrap();
+        client.repo_get("pool", "systemd").unwrap();
+        assert_eq!(
+            http.get_bearer_tokens(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd".to_string(),
+                Some("plain-token".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn with_base_resolved_fails_clear_for_an_unmatched_url() {
+        let vars = test_vars(&[("GEECTL_GITEA_TOKEN", "plain-token")]);
+        let instances = vec![(
+            "example".to_string(),
+            "https://gitea.example.org".to_string(),
+        )];
+        // The default's token is configured, but the URL is another
+        // instance with no alias: the error names the [instances]
+        // entry, and the token never leaks into it.
+        // No `unwrap_err` here: `GiteaClient` carries `&dyn
+        // HttpClient`, so it has no `Debug` (like the construction
+        // test above).
+        let http = FakeHttp::new();
+        // The lookup and the file reader are bound first: a
+        // temporary closure passed inline would live to the end of
+        // the `match` scrutinee, past the `vars` it borrows.
+        let lookup = test_lookup(&vars);
+        let files = no_secret_files();
+        match GiteaClient::with_base_resolved(
+            &http,
+            "https://other.example.org",
+            BASE,
+            &instances,
+            &lookup,
+            &files,
+        ) {
+            Ok(_) => panic!("construction for an unmatched URL must fail"),
+            Err(err) => {
+                assert_eq!(err.kind(), ErrorKind::ConfigError);
+                assert!(err.context.contains("[instances]"));
+                assert!(!err.context.contains("plain-token"));
+            }
+        }
+        // Nothing configured anywhere: construction still fails
+        // closed, with no token to send — and the error names the
+        // `[instances]` entry, not the plain variables.
+        let vars = test_vars(&[]);
+        let lookup = test_lookup(&vars);
+        match GiteaClient::with_base_resolved(
+            &http,
+            "https://other.example.org",
+            BASE,
+            &[],
+            &lookup,
+            &files,
+        ) {
+            Ok(_) => panic!("construction without any token must fail"),
+            Err(err) => {
+                assert_eq!(err.kind(), ErrorKind::ConfigError);
+                assert!(err.context.contains("[instances]"));
+            }
+        }
+    }
+
+    #[test]
+    fn with_base_resolved_validates_the_base_first() {
+        // An invalid base gets the base-validation error, not a
+        // credential error: resolution must not run first and
+        // misdirect the user to `[instances]`.
+        let vars = test_vars(&[("GEECTL_GITEA_TOKEN", "plain-token")]);
+        let http = FakeHttp::new();
+        let lookup = test_lookup(&vars);
+        let files = no_secret_files();
+        match GiteaClient::with_base_resolved(
+            &http,
+            "http://example.com",
+            BASE,
+            &[],
+            &lookup,
+            &files,
+        ) {
+            Ok(_) => panic!("construction with a non-loopback http base must fail"),
+            Err(err) => {
+                assert_eq!(err.kind(), ErrorKind::InvalidInput);
+                assert!(err.context.contains("loopback"));
+                assert!(!err.context.contains("[instances]"));
+            }
+        }
+    }
+
+    #[test]
+    fn with_base_resolved_names_the_alias_vars_when_the_alias_is_unset() {
+        // An alias matches the URL but its variables are unset and
+        // nothing else is configured: the error names the alias
+        // variables, not the plain ones — those belong to the
+        // default instance.
+        let vars = test_vars(&[]);
+        let instances = vec![(
+            "example".to_string(),
+            "https://gitea.example.org".to_string(),
+        )];
+        let http = FakeHttp::new();
+        let lookup = test_lookup(&vars);
+        let files = no_secret_files();
+        match GiteaClient::with_base_resolved(
+            &http,
+            "https://gitea.example.org",
+            BASE,
+            &instances,
+            &lookup,
+            &files,
+        ) {
+            Ok(_) => panic!("construction without any token must fail"),
+            Err(err) => {
+                assert_eq!(err.kind(), ErrorKind::ConfigError);
+                assert!(err.context.contains("GEECTL_GITEA_TOKEN_EXAMPLE"));
+            }
+        }
+    }
+
+    #[test]
+    fn with_base_resolved_names_the_plain_vars_for_the_default_url() {
+        // Nothing configured for the default URL: the error is
+        // `with_base`'s plain-vars message — assert it exactly,
+        // since the alias and unmatched messages also contain
+        // the `GEECTL_GITEA_TOKEN` substring.
+        let vars = test_vars(&[]);
+        let http = FakeHttp::new();
+        let lookup = test_lookup(&vars);
+        let files = no_secret_files();
+        match GiteaClient::with_base_resolved(&http, BASE, BASE, &[], &lookup, &files) {
+            Ok(_) => panic!("construction without any token must fail"),
+            Err(err) => {
+                assert_eq!(err.kind(), ErrorKind::ConfigError);
+                assert!(err.context.contains(
+                    "no Gitea token configured (GEECTL_GITEA_TOKEN or GEECTL_GITEA_TOKEN_FILE)"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn with_base_resolved_names_both_var_sets_when_the_alias_is_the_default_url() {
+        // The URL is both the configured default and an aliased
+        // instance, and nothing is set anywhere: either variable
+        // set would fix it, so the error names both.
+        let vars = test_vars(&[]);
+        let instances = vec![("myinstance".to_string(), BASE.to_string())];
+        let http = FakeHttp::new();
+        let lookup = test_lookup(&vars);
+        let files = no_secret_files();
+        match GiteaClient::with_base_resolved(&http, BASE, BASE, &instances, &lookup, &files) {
+            Ok(_) => panic!("construction without any token must fail"),
+            Err(err) => {
+                assert_eq!(err.kind(), ErrorKind::ConfigError);
+                assert!(err.context.contains("GEECTL_GITEA_TOKEN_MYINSTANCE"));
+                assert!(err
+                    .context
+                    .contains("the plain GEECTL_GITEA_TOKEN (or GEECTL_GITEA_TOKEN_FILE)"));
             }
         }
     }
