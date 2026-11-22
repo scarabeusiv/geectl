@@ -45,6 +45,7 @@ use crate::obs::ObsClient;
 use crate::url::UrlBuilder;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashSet;
 
 /// A Gitea user: only the login is modelled (the fork target-owner
 /// resolution reads it from `GET /api/v1/user`).
@@ -186,8 +187,10 @@ pub struct GiteaBranch {
     pub name: String,
     /// The head commit.
     pub commit: GiteaBranchCommit,
-    /// Whether the branch is protected.
-    #[serde(default)]
+    /// Whether the branch is protected. Required, not
+    /// defaulted: the server always emits it, and a response
+    /// that omits it must fail the parse rather than read the
+    /// branch as unprotected.
     pub protected: bool,
 }
 
@@ -602,16 +605,13 @@ impl<'a> GiteaClient<'a> {
                     &format!("repositories of organization {org}"),
                     "the list is bounded at 500 entries",
                 )?);
-                let mut seen: Vec<String> = Vec::new();
-                repos.retain(|repo| {
-                    let full = repo.full_name.to_lowercase();
-                    if seen.contains(&full) {
-                        false
-                    } else {
-                        seen.push(full);
-                        true
-                    }
-                });
+                // A set, not a linear scan: the two lists hold
+                // up to 500 entries each, and the Vec form was
+                // O(n^2) on the combined list. `insert` returns
+                // false for a duplicate, which is the retain
+                // predicate directly; order is unchanged.
+                let mut seen: HashSet<String> = HashSet::new();
+                repos.retain(|repo| seen.insert(repo.full_name.to_lowercase()));
             }
         }
         Ok(repos)
@@ -657,7 +657,12 @@ impl<'a> GiteaClient<'a> {
         let response = self.http.post_json_with(&url, &body, &self.credentials)?;
         let created =
             parse_repository_body(&response, &format!("for the created repository {name}"))?;
-        if created.name != name {
+        // The same rule as the read path (`parse_repository`):
+        // Gitea logins are case-insensitive, so the created name
+        // is compared case-insensitively too. A server that
+        // answers with the name in another case created the repo
+        // that was asked for; a different name is still an error.
+        if !created.name.eq_ignore_ascii_case(name) {
             return Err(GeectlError::new(
                 ErrorKind::ServerError,
                 format!(
@@ -776,12 +781,20 @@ impl<'a> GiteaClient<'a> {
                 ],
             );
             let body = self.http.get_with(&url, &self.credentials)?;
-            let page_items: Vec<T> = serde_json::from_str(&body).map_err(|err| {
-                GeectlError::new(
-                    ErrorKind::ServerError,
-                    format!("unexpected Gitea {scope} response (page {page}): {err}"),
-                )
-            })?;
+            // Gitea answers a JSON `null` body for an empty list —
+            // verified live 2026-11-22 on the branches endpoint of
+            // an empty repo (`pool/systemd` before its first
+            // commit). Parse as an optional list so a null page is
+            // an empty page, not a server error. Any other shape
+            // still fails with the same message as before.
+            let page_items: Vec<T> = serde_json::from_str::<Option<Vec<T>>>(&body)
+                .map_err(|err| {
+                    GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!("unexpected Gitea {scope} response (page {page}): {err}"),
+                    )
+                })?
+                .unwrap_or_default();
             let full = page_items.len() == LIST_PAGE_SIZE as usize;
             items.extend(page_items);
             if !full {
@@ -804,12 +817,14 @@ impl<'a> GiteaClient<'a> {
             ],
         );
         let body = self.http.get_with(&url, &self.credentials)?;
-        let page_items: Vec<T> = serde_json::from_str(&body).map_err(|err| {
-            GeectlError::new(
-                ErrorKind::ServerError,
-                format!("unexpected Gitea {scope} response (page {page}): {err}"),
-            )
-        })?;
+        let page_items: Vec<T> = serde_json::from_str::<Option<Vec<T>>>(&body)
+            .map_err(|err| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("unexpected Gitea {scope} response (page {page}): {err}"),
+                )
+            })?
+            .unwrap_or_default();
         if page_items.is_empty() {
             return Ok(items);
         }
@@ -1854,6 +1869,31 @@ mod tests {
     }
 
     #[test]
+    fn repo_list_both_form_dedupes_mixed_case_names() {
+        // The repo-identity rule is case-insensitive: the user
+        // list naming the account `Pool` and the org list naming
+        // it `pool` hold the same repo, so the both form returns
+        // it once, keeping the first (user) spelling.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/users/Pool/repos?page=1&limit=50",
+                &repo_list_json(&[repo_json("Pool", "systemd", None)]),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/orgs/pool/repos?page=1&limit=50",
+                &repo_list_json(&[repo_json("pool", "systemd", None)]),
+            );
+        let repos = client(&http).repo_list(Some("Pool"), Some("pool")).unwrap();
+        assert_eq!(
+            repos
+                .iter()
+                .map(|r| r.full_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Pool/systemd"]
+        );
+    }
+
+    #[test]
     fn repo_list_bound_fails_instead_of_truncating() {
         // Ten full pages (500 repos) and page 11 still has one
         // more: the call fails naming the scope, instead
@@ -2105,6 +2145,27 @@ mod tests {
     }
 
     #[test]
+    fn repo_create_accepts_the_name_in_a_different_case() {
+        // The server preserves the requested name's case in
+        // practice, but the read path compares case-insensitively
+        // and the create check must match it: an answer for
+        // `New-Package` is the `new-package` that was asked for.
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/user/repos",
+            &repo_json("geectl", "New-Package", None),
+        );
+        let created = client(&http)
+            .repo_create(
+                "new-package",
+                &RepoCreateOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run create returns the repo");
+        assert_eq!(created.name, "New-Package");
+    }
+
+    #[test]
     fn repo_create_validates_names_before_any_call() {
         let http = FakeHttp::new();
         let err = client(&http)
@@ -2149,6 +2210,20 @@ mod tests {
         assert_eq!(branches[0].commit.message, "OBS bridge sync");
         assert!(!branches[0].protected);
         assert!(branches[1].protected);
+    }
+
+    #[test]
+    fn branch_list_null_page_is_an_empty_list() {
+        // Gitea answers a JSON `null` body for an empty list —
+        // verified live on the branches endpoint of the empty
+        // `pool/systemd` fixture repo. The list is empty, not an
+        // error.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches?page=1&limit=50",
+            "null",
+        );
+        let branches = client(&http).branch_list("pool", "systemd").unwrap();
+        assert!(branches.is_empty());
     }
 
     #[test]
@@ -2251,6 +2326,22 @@ mod tests {
                 "https://src.opensuse.org/api/v1/repos/pool/systemd/branches/factory".to_string(),
                 true
             )]
+        );
+    }
+
+    #[test]
+    fn branch_without_protected_fails_to_parse() {
+        // `protected` is required: a server that omits it must
+        // fail the parse instead of reading the branch as
+        // unprotected. Unknown fields stay tolerated. The failure
+        // must name the missing field, so a different parse
+        // breakage in the fixture cannot pass this test.
+        let body = r#"{"name": "factory", "commit": {"id": "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa", "message": "OBS bridge sync"}, "future_field": "tolerated"}"#;
+        let err = serde_json::from_str::<GiteaBranch>(body)
+            .expect_err("a branch without `protected` must fail to parse");
+        assert!(
+            err.to_string().contains("protected"),
+            "the parse failure must name the missing `protected` field; got {err}"
         );
     }
 

@@ -28,6 +28,8 @@ pub(crate) struct FakeHttp {
     post_calls: RefCell<Vec<(String, String, bool)>>,
     delete_calls: RefCell<Vec<(String, bool)>>,
     put_calls: RefCell<Vec<(String, String, bool)>>,
+    put_bytes: RefCell<HashMap<String, String>>,
+    put_bytes_calls: RefCell<Vec<(String, Vec<u8>, bool)>>,
 }
 
 impl FakeHttp {
@@ -48,6 +50,8 @@ impl FakeHttp {
             post_calls: RefCell::new(Vec::new()),
             delete_calls: RefCell::new(Vec::new()),
             put_calls: RefCell::new(Vec::new()),
+            put_bytes: RefCell::new(HashMap::new()),
+            put_bytes_calls: RefCell::new(Vec::new()),
         }
     }
 
@@ -136,6 +140,15 @@ impl FakeHttp {
     /// once the queue is empty the canned `puts` body answers.
     /// Lets a test model a backend that is not ready yet and then
     /// catches up, instead of a single static answer.
+    /// Answer a byte PUT of `url` with `body` (the revision
+    /// document the server returns after storing the file).
+    pub(crate) fn with_put_bytes(self, url: &str, body: &str) -> Self {
+        self.put_bytes
+            .borrow_mut()
+            .insert(url.to_string(), body.to_string());
+        self
+    }
+
     pub(crate) fn with_put_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
         self.put_errors
             .borrow_mut()
@@ -161,6 +174,10 @@ impl FakeHttp {
 
     pub(crate) fn put_calls(&self) -> Vec<(String, String, bool)> {
         self.put_calls.borrow().clone()
+    }
+
+    pub(crate) fn put_bytes_calls(&self) -> Vec<(String, Vec<u8>, bool)> {
+        self.put_bytes_calls.borrow().clone()
     }
 }
 
@@ -333,6 +350,41 @@ impl HttpClient for FakeHttp {
         // Fixtures do not distinguish content types: the transport
         // tests in `http.rs` assert the header each method sends.
         self.put(url, body, credentials)
+    }
+
+    fn put_bytes(
+        &self,
+        url: &str,
+        body: &[u8],
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // Fixtures do not distinguish content types: the transport
+        // tests in `http.rs` assert the header each method sends.
+        // The body IS recorded as bytes, so a test can assert the
+        // exact bytes a binary upload carried.
+        let authed = !matches!(credentials, Credentials::None);
+        self.put_bytes_calls
+            .borrow_mut()
+            .push((url.to_string(), body.to_vec(), authed));
+        // A byte PUT is a PUT: the same canned error sequence
+        // applies as for a text PUT.
+        if let Some(kind) = self
+            .put_errors
+            .borrow_mut()
+            .get_mut(url)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Err(GeectlError::new(
+                kind,
+                format!("canned PUT error for {url}"),
+            ));
+        }
+        self.put_bytes.borrow().get(url).cloned().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::NetworkError,
+                format!("no canned PUT bytes response for {url}"),
+            )
+        })
     }
 }
 

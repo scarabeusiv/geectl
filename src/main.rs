@@ -6,11 +6,20 @@
 //! every diagnostic, warning, and error goes to stderr. There is exactly
 //! one exit path: the error kind's exit code.
 
+mod cli_branch;
+mod cli_build;
+mod cli_gitea;
+mod cli_remote;
+mod cli_request;
+mod cli_service;
+mod maintenance;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
 use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
+use geectl::obs::OBS_API_BASE;
 use serde_json::json;
 use std::io::Write;
 use std::process::ExitCode;
@@ -23,6 +32,17 @@ enum Format {
     Text,
 }
 
+impl Format {
+    /// The config-file / environment spelling of this format
+    /// (`"json"` / `"text"`).
+    fn as_str(self) -> &'static str {
+        match self {
+            Format::Json => "json",
+            Format::Text => "text",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "geectl",
@@ -32,8 +52,10 @@ enum Format {
 )]
 struct Cli {
     /// Output format for the result payload. Applies to every command.
-    #[arg(long, global = true, value_enum, default_value = "json")]
-    format: Format,
+    /// Default: the `GEECTL_FORMAT` environment variable, else the
+    /// `format` key in the config file, else `json`.
+    #[arg(long, global = true, value_enum)]
+    format: Option<Format>,
 
     /// Enable the debug channel: human-readable diagnostic lines on
     /// stderr (HTTP attempts, retries, library decisions). Off by
@@ -46,6 +68,11 @@ struct Cli {
     /// `--debug`.
     #[arg(long, global = true)]
     debug_body: bool,
+
+    /// Actually perform mutations. Without it, only the plan is
+    /// printed: dry-run is the default for mutations.
+    #[arg(long, global = true)]
+    live: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -60,6 +87,46 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Remote reads and repository edits: inspect what the
+    /// distribution holds.
+    Remote {
+        #[command(subcommand)]
+        command: cli_remote::RemoteCommand,
+    },
+    /// Read and act on OBS submit requests, and file new ones.
+    Request {
+        #[command(subcommand)]
+        command: Box<cli_request::RequestCommand>,
+    },
+    /// Branch, copy, and link packages.
+    Branch {
+        #[command(subcommand)]
+        // Boxed: the ten branch subcommands make BranchCommand far
+        // larger than the other variants (clippy::large_enum_variant).
+        command: Box<cli_branch::BranchCommand>,
+    },
+    /// Build-status commands: results, logs, histories, binaries.
+    Build {
+        #[command(subcommand)]
+        command: cli_build::BuildCommand,
+    },
+    /// Maintenance operations: maintained-instances listing and
+    /// maintenance branching.
+    Maintenance {
+        #[command(subcommand)]
+        command: maintenance::MaintenanceCommand,
+    },
+    /// Service reads: list a package's services and their run state.
+    Service {
+        #[command(subcommand)]
+        command: cli_service::ServiceCommand,
+    },
+    /// Gitea operations: repository and branch reads and mutations
+    /// on the configured instance.
+    Gitea {
+        #[command(subcommand)]
+        command: cli_gitea::GiteaCommand,
+    },
 }
 
 /// The `config` subcommands.
@@ -73,7 +140,12 @@ enum ConfigCommand {
     Init,
 }
 
-fn run(cli: Cli) -> Result<String, GeectlError> {
+fn run(
+    cli: Cli,
+    debug: &Debug,
+    format: Format,
+    format_source: &'static str,
+) -> Result<String, GeectlError> {
     let (payload, text) = match cli.command {
         Some(Command::Version) | None => {
             let payload = json!({
@@ -83,9 +155,11 @@ fn run(cli: Cli) -> Result<String, GeectlError> {
             let text = format!("geectl {}", env!("CARGO_PKG_VERSION"));
             (payload, text)
         }
+        Some(Command::Request { command }) => cli_request::run(*command, debug, cli.live)?,
+        Some(Command::Build { command }) => cli_build::run_build(debug, command)?,
         Some(Command::Config { command }) => match command {
             ConfigCommand::Show => {
-                let payload = config_show_payload()?;
+                let payload = config_show_payload(format, format_source)?;
                 let text = render_config_show_text(&payload);
                 (payload, text)
             }
@@ -95,11 +169,45 @@ fn run(cli: Cli) -> Result<String, GeectlError> {
                 (payload, text)
             }
         },
+        Some(Command::Remote { command }) => cli_remote::run_remote(command, debug, cli.live)?,
+        Some(Command::Branch { command }) => cli_branch::run_branch(*command, debug, cli.live)?,
+        Some(Command::Maintenance { command }) => {
+            let (payload, text) = maintenance::run(command, debug, cli.live)?;
+            (payload, text)
+        }
+        Some(Command::Service { command }) => cli_service::run_service(command, debug)?,
+        Some(Command::Gitea { command }) => cli_gitea::run_gitea(command, debug, cli.live)?,
     };
-    Ok(match cli.format {
+    Ok(match format {
         Format::Json => payload.to_string(),
         Format::Text => text,
     })
+}
+
+/// Resolve the output format: the `--format` flag wins, then the
+/// `GEECTL_FORMAT` environment variable, then the config file's
+/// `format` key, then `json`. Returns the format and where it came
+/// from (`"flag"` / `"environment"` / `"config"` / `"default"`) for
+/// `config show`. Resolving loads the config file, so a malformed
+/// config or an invalid `GEECTL_FORMAT` fails even `version` —
+/// fail-fast on misconfiguration, by design — unless the flag is
+/// given, which returns before the config is read.
+fn resolve_format(flag: Option<Format>) -> Result<(Format, &'static str), GeectlError> {
+    if let Some(format) = flag {
+        return Ok((format, "flag"));
+    }
+    let path = config::config_path()?;
+    let file_config = config::load_config_at(&path)?;
+    let effective = config::effective_config(&file_config)?;
+    // effective_config validates the value, so this match is
+    // exhaustive by construction; the fallback is only for the type,
+    // never expected to fire.
+    let format = match effective.config.format.as_deref() {
+        Some("json") => Format::Json,
+        Some("text") => Format::Text,
+        _ => Format::Json,
+    };
+    Ok((format, effective.format_source))
 }
 
 /// Resolve the debug channel from the `--debug` / `--debug-body`
@@ -130,12 +238,15 @@ fn startup_line(argv: &[String]) -> String {
     parts.join(" ")
 }
 
-/// The kind of credentials a provider yields, for the debug config
-/// line: `basic`, `bearer`, `ssh`, `none`, or `error`. Never a
-/// username, never a value — the channel is stricter than `config
-/// show`.
-fn auth_kind(provider: &dyn AuthProvider) -> &'static str {
-    match provider.credentials() {
+/// The OBS auth kind for the debug config line: the per-URL
+/// resolution (alias, else plain for the default) — the plain-only
+/// provider would report `none` for an alias-only setup while every
+/// command authenticates fine, the same staleness
+/// [`obs_auth_status`] fixes for `config show`. `basic`, `bearer`,
+/// `ssh`, `none`, or `error`. Never a username, never a value — the
+/// channel is stricter than `config show`.
+fn obs_auth_kind(url: &str, instances: &[(String, String)]) -> &'static str {
+    match EnvObsAuth::credentials_for_url(url, url, instances) {
         Ok(Credentials::None) => "none",
         Ok(Credentials::Basic { .. }) => "basic",
         Ok(Credentials::Bearer { .. }) => "bearer",
@@ -178,18 +289,23 @@ fn debug_config_line() -> Option<String> {
     Some(format!(
         "config: obs {} (auth: {}), gitea {} (auth: {})",
         geectl::debug::url_host(obs_url),
-        auth_kind(&EnvObsAuth),
+        obs_auth_kind(obs_url, &file_config.instances),
         geectl::debug::url_host(gitea_url),
         gitea_auth_kind()
     ))
 }
 
 /// The `config show` payload: the effective endpoint URLs with the
-/// source of each value (environment / config / default), and the
-/// credential status for each provider. A status is never a secret:
-/// Basic auth shows the username only, Bearer shows "configured"
-/// only, and an SSH key shows its path.
-fn config_show_payload() -> Result<serde_json::Value, GeectlError> {
+/// source of each value (environment / config / default), the
+/// effective output format with its source (flag / environment /
+/// config / default), the named-instance table, and the credential
+/// status for each provider. A
+/// status is never a secret: Basic auth shows the username only,
+/// Bearer shows "configured" only, and an SSH key shows its path.
+fn config_show_payload(
+    format: Format,
+    format_source: &'static str,
+) -> Result<serde_json::Value, GeectlError> {
     // The config path is resolved once and passed to the load: a
     // second `config_path()` call here could diverge from the one
     // inside `load_config()` if the environment changed in between.
@@ -199,16 +315,34 @@ fn config_show_payload() -> Result<serde_json::Value, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
     let effective = config::effective_config(&file_config)?;
+    let obs_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
+    let mut instances_json = serde_json::Map::new();
+    for (alias, url) in &effective.config.instances {
+        instances_json.insert(alias.clone(), json!(url));
+    }
     Ok(json!({
         "config_file": path.to_string_lossy(),
         "obs_url": effective.config.obs_url,
         "obs_url_source": effective.obs_url_source,
         "gitea_url": effective.config.gitea_url,
         "gitea_url_source": effective.gitea_url_source,
-        "obs_auth": auth_status(&EnvObsAuth),
+        "format": format.as_str(),
+        "format_source": format_source,
+        "instances": instances_json,
+        "obs_auth": obs_auth_status(obs_url, &effective.config.instances),
         "gitea_auth": auth_status(&EnvGiteaAuth),
         "gitea_ssh_key": auth_status(&GiteaSshKey),
     }))
+}
+
+/// The OBS credential status for one URL: the matching instance
+/// alias's variables win, else the plain variables when it is the
+/// configured default — so `config show` reports what the commands
+/// would actually use, instead of the plain variables only (an
+/// alias-only setup used to report `not_configured` while every
+/// command authenticated fine).
+fn obs_auth_status(url: &str, instances: &[(String, String)]) -> serde_json::Value {
+    credentials_status(EnvObsAuth::credentials_for_url(url, url, instances))
 }
 
 /// The credential status as JSON: `{"status": "configured"}` plus,
@@ -216,7 +350,11 @@ fn config_show_payload() -> Result<serde_json::Value, GeectlError> {
 /// the path; for a misconfiguration, `{"status": "error", "message":
 /// ...}` naming the variable, never the value.
 fn auth_status(provider: &dyn AuthProvider) -> serde_json::Value {
-    match provider.credentials() {
+    credentials_status(provider.credentials())
+}
+
+fn credentials_status(result: Result<Credentials, GeectlError>) -> serde_json::Value {
+    match result {
         Ok(Credentials::None) => json!({"status": "not_configured"}),
         Ok(Credentials::Basic { username, .. }) => {
             json!({"status": "configured", "username": username})
@@ -262,6 +400,15 @@ fn render_config_show_text(payload: &serde_json::Value) -> String {
             payload["gitea_url"].as_str().unwrap_or(""),
             payload["gitea_url_source"].as_str().unwrap_or("")
         ),
+        format!(
+            "format: {} ({})",
+            payload["format"].as_str().unwrap_or(""),
+            payload["format_source"].as_str().unwrap_or("")
+        ),
+        format!(
+            "instances: {}",
+            render_instances_text(&payload["instances"])
+        ),
         format!("obs_auth: {}", render_auth_text(&payload["obs_auth"])),
         format!("gitea_auth: {}", render_auth_text(&payload["gitea_auth"])),
         format!(
@@ -270,6 +417,19 @@ fn render_config_show_text(payload: &serde_json::Value) -> String {
         ),
     ]
     .join("\n")
+}
+
+/// The `[instances]` table as text: `alias -> url` pairs sorted by
+/// alias, or `none` when the table is empty.
+fn render_instances_text(instances: &serde_json::Value) -> String {
+    match instances.as_object() {
+        Some(map) if !map.is_empty() => map
+            .iter()
+            .map(|(alias, url)| format!("{alias} -> {}", url.as_str().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "none".to_string(),
+    }
 }
 
 fn render_auth_text(auth: &serde_json::Value) -> String {
@@ -292,55 +452,104 @@ fn render_config_init_text(payload: &serde_json::Value) -> String {
     format!("created {}", payload["config_file"].as_str().unwrap_or(""))
 }
 
-/// Write a payload to stdout. A closed pipe (`BrokenPipe`, e.g. the
-/// output piped to `head`) is not an error — the consumer just stopped
-/// reading. Any other write failure is an internal error. `println!`
-/// would panic on either; this is the single stdout writer.
+/// Write a payload to stdout, terminated with a trailing newline
+/// (an empty payload writes nothing).
+/// A closed pipe (`BrokenPipe`, e.g. the output piped to `head`) is
+/// not an error — the consumer just stopped reading. Any other write
+/// failure is an internal error. `println!` would panic on either;
+/// this is the single stdout writer.
 fn write_payload(payload: &str) -> Result<(), GeectlError> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    match writeln!(handle, "{payload}") {
+    match write!(handle, "{}", terminated(payload)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         Err(e) => Err(GeectlError::new(ErrorKind::InternalError, e.to_string())),
     }
 }
 
-/// Write a JSON error payload to stderr. A failure to write to stderr
-/// is ignored: there is nowhere else to report it, and panicking while
-/// already handling an error helps no one.
-fn write_error(err: &GeectlError) {
+/// Terminate a payload with a trailing newline: a payload that does
+/// not end with one gains one; an already-terminated payload is
+/// returned untouched (so a `cat` file ending in two newlines keeps
+/// both — verbatim wins over tidiness). JSON payloads never end with
+/// a newline. An empty payload stays empty, so `remote cat` of an
+/// empty file prints zero bytes instead of one newline.
+fn terminated(payload: &str) -> String {
+    if payload.is_empty() || payload.ends_with('\n') {
+        payload.to_string()
+    } else {
+        format!("{payload}\n")
+    }
+}
+
+/// Write an error to stderr, in the selected format: the JSON error
+/// payload by default, `error:` + `remediation:` lines in text mode.
+/// A failure to write to stderr is ignored: there is nowhere else to
+/// report it, and panicking while already handling an error helps no
+/// one.
+fn write_error(err: &GeectlError, format: Format) {
     let stderr = std::io::stderr();
     let mut handle = stderr.lock();
-    let _ = writeln!(handle, "{}", err.to_json());
+    let rendered = match format {
+        Format::Json => err.to_json().to_string(),
+        Format::Text => render_error_text(err),
+    };
+    let _ = writeln!(handle, "{rendered}");
+}
+
+/// The text rendering of an error: `error: <message>` plus
+/// `remediation: <...>` lines. The message is the error's context
+/// when it names the failure, else the kind's one-sentence message.
+/// The exit code is unchanged.
+fn render_error_text(err: &GeectlError) -> String {
+    let message = if err.context.is_empty() {
+        err.kind.message().to_string()
+    } else {
+        err.context.clone()
+    };
+    format!(
+        "error: {message}
+remediation: {}",
+        err.kind.remediation()
+    )
 }
 
 fn main() -> ExitCode {
-    // Parse errors go through the single JSON error path, not clap's
+    // Parse errors go through the single error path, not clap's
     // default (usage on stderr, exit 2, no JSON). Help and version are
     // the exception: they print clap's text to stdout and exit 0.
-    let cli = match Cli::try_parse() {
+    // The argv is collected once, lossily, for the debug startup line
+    // below. Parsing itself uses the raw `OsString` argv, so a
+    // non-UTF-8 argument still gets clap's invalid-UTF-8 error instead
+    // of being silently replaced by U+FFFD and sent on as a value.
+    let argv = lossy_argv(std::env::args_os());
+    let cli = match Cli::try_parse_from(std::env::args_os()) {
         Ok(cli) => cli,
         Err(e) => {
             use clap::error::ErrorKind as ClapErrorKind;
             match e.kind() {
                 ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion => {
                     // Help/version text is the payload here. It already
-                    // ends with a newline, so trim it before writeln!
-                    // adds exactly one. A write failure is handled like
-                    // the normal path (InternalError + its exit code),
-                    // not swallowed: ENOSPC/EIO must not exit 0.
+                    // ends with a newline, so trim it before
+                    // write_payload adds exactly one. A write failure
+                    // is handled like the normal path (InternalError +
+                    // its exit code), not swallowed: ENOSPC/EIO must
+                    // not exit 0.
                     match write_payload(e.render().to_string().trim_end()) {
                         Ok(()) => return ExitCode::from(0),
                         Err(err) => {
-                            write_error(&err);
+                            // No parsed CLI here, so no selected format:
+                            // parse-time errors are always JSON.
+                            write_error(&err, Format::Json);
                             return ExitCode::from(err.exit_code() as u8);
                         }
                     }
                 }
                 _ => {
+                    // No `cli` exists yet — the format flag itself may
+                    // be the parse failure — so this stays JSON.
                     let err = GeectlError::new(ErrorKind::InvalidInput, e.to_string());
-                    write_error(&err);
+                    write_error(&err, Format::Json);
                     return ExitCode::from(err.exit_code() as u8);
                 }
             }
@@ -365,21 +574,32 @@ fn main() -> ExitCode {
     }
     let debug = Debug::new(debug_enabled, debug_bodies);
     if debug.enabled() {
-        debug.emit(&startup_line(&lossy_argv(std::env::args_os())));
+        debug.emit(&startup_line(&argv));
         if let Some(line) = debug_config_line() {
             debug.emit(&line);
         }
     }
-    match run(cli) {
+    // The format is resolved before `run` moves `cli`: the error
+    // path needs it to render in the selected format. A resolution
+    // failure (malformed config, invalid GEECTL_FORMAT) is a JSON
+    // error — no format was selected yet.
+    let (format, format_source) = match resolve_format(cli.format) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            write_error(&err, Format::Json);
+            return ExitCode::from(err.exit_code() as u8);
+        }
+    };
+    match run(cli, &debug, format, format_source) {
         Ok(payload) => match write_payload(&payload) {
             Ok(()) => ExitCode::from(0),
             Err(err) => {
-                write_error(&err);
+                write_error(&err, format);
                 ExitCode::from(err.exit_code() as u8)
             }
         },
         Err(err) => {
-            write_error(&err);
+            write_error(&err, format);
             ExitCode::from(err.exit_code() as u8)
         }
     }
@@ -392,7 +612,7 @@ mod tests {
     #[test]
     fn version_payload_is_json_with_name_and_version() {
         let cli = Cli::parse_from(["geectl", "version"]);
-        let payload = run(cli).unwrap();
+        let payload = run(cli, &Debug::disabled(), Format::Json, "default").unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["name"], "geectl");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
@@ -401,7 +621,93 @@ mod tests {
     #[test]
     fn no_subcommand_prints_version_payload() {
         let cli = Cli::parse_from(["geectl"]);
-        assert!(run(cli).is_ok());
+        assert!(run(cli, &Debug::disabled(), Format::Json, "default").is_ok());
+    }
+
+    #[test]
+    fn resolve_format_flag_wins_without_config() {
+        // The flag short-circuits: no config file is read at all.
+        let (format, source) = resolve_format(Some(Format::Text)).unwrap();
+        assert_eq!(format, Format::Text);
+        assert_eq!(source, "flag");
+    }
+
+    #[test]
+    fn config_show_payload_reports_format_and_source() {
+        let payload = config_show_payload(Format::Text, "config").unwrap();
+        assert_eq!(payload["format"], "text");
+        assert_eq!(payload["format_source"], "config");
+        let text = render_config_show_text(&payload);
+        assert!(text.contains("format: text (config)"), "{text}");
+    }
+
+    #[test]
+    fn text_error_renders_message_context_and_remediation() {
+        // Unified rendering (the request group owns write_error):
+        // the context names the failure when present, else the kind's
+        // message; there is no separate `context:` line.
+        let err = GeectlError::new(ErrorKind::InvalidInput, "bad name".to_string());
+        let text = render_error_text(&err);
+        assert!(text.starts_with("error: bad name"));
+        assert!(text.contains("remediation: fix the input and retry"));
+    }
+
+    #[test]
+    fn text_error_omits_empty_context() {
+        let err = GeectlError::new(ErrorKind::NotFound, String::new());
+        let text = render_error_text(&err);
+        assert!(!text.contains("context:"));
+        assert!(text.contains("error: the requested resource does not exist"));
+    }
+
+    #[test]
+    fn terminated_ensures_a_trailing_newline() {
+        assert_eq!(terminated("abc"), "abc\n");
+        assert_eq!(terminated("abc\n"), "abc\n");
+        // Already-terminated payloads are untouched, even with more
+        // than one trailing newline: verbatim wins over tidiness.
+        assert_eq!(terminated("abc\n\n"), "abc\n\n");
+        assert_eq!(terminated(""), "");
+    }
+
+    #[test]
+    fn error_text_uses_context_when_present() {
+        let with_context = GeectlError::new(ErrorKind::ConfigError, "missing credentials");
+        let text = render_error_text(&with_context);
+        assert!(text.starts_with("error: missing credentials"), "{text}");
+        assert!(text.contains("remediation: "), "{text}");
+        let bare = GeectlError::new(ErrorKind::ConfigError, "");
+        assert_eq!(
+            render_error_text(&bare),
+            "error: the configuration is invalid\nremediation: check the configuration (flag, environment variable, or config file) and retry"
+        );
+    }
+
+    #[test]
+    fn build_subcommand_parses() {
+        let cli = Cli::parse_from([
+            "geectl",
+            "build",
+            "results",
+            "openSUSE:Factory",
+            "--code",
+            "failed",
+        ]);
+        assert!(matches!(cli.command, Some(Command::Build { .. })));
+    }
+
+    #[test]
+    fn error_text_renders_code_message_and_remediation() {
+        // Unified rendering (the request group owns write_error):
+        // the context names the failure in the `error:` line itself.
+        let err = GeectlError::new(
+            ErrorKind::ConfigError,
+            "build reads need GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD",
+        );
+        let text = render_error_text(&err);
+        assert!(text.starts_with("error: build reads need "));
+        assert!(text.contains("GEECTL_OBS_USERNAME"));
+        assert!(text.contains("remediation: check the configuration"));
     }
 
     #[test]
