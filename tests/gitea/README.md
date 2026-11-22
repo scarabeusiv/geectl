@@ -45,7 +45,7 @@ instance is destroyed after the run, so the token never outlives it.
 
 ## Timing
 
-Measured cold on the Mac:
+Measured cold:
 
 - image pull (cold): ~7s
 - container start to `/api/healthz`: ~3s
