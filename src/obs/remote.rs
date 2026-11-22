@@ -1976,7 +1976,9 @@ impl<'a> ObsClient<'a> {
     /// The per-file diff of revision `rev` of package `package` in
     /// project `project` against the previous revision: the files
     /// added, modified, or deleted, each with a unified diff.
-    /// Revision 1 has no previous revision, so its patch is empty.
+    /// Revision 1 of an existing package has no previous revision, so
+    /// its patch is empty; revision 1 of a package that does not
+    /// exist is an error, not an empty patch.
     /// File contents are read as text; a binary file that differs
     /// fails the call (its contents cannot be rendered as a text
     /// diff). Added and deleted files always appear; a modified file
@@ -2012,6 +2014,11 @@ impl<'a> ObsClient<'a> {
             ));
         }
         if rev == 1 {
+            // Revision 1 has no previous revision, so its patch is
+            // empty — but only once the package is known to exist: a
+            // bare short-circuit would also report an empty patch
+            // for a package that is not there at all.
+            self.list_files_rev(project, package, Some(1))?;
             return Ok(RevisionPatch {
                 rev,
                 files: Vec::new(),
@@ -6100,12 +6107,37 @@ mod tests {
 
     #[test]
     fn revision_patch_rev1_is_empty() {
-        let http = FakeHttp::new();
+        // Revision 1 of an existing package is an empty patch — but
+        // the package is read first, so the call still reaches the
+        // server.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo?rev=1",
+            "<directory><entry name=\"foo.spec\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/></directory>",
+        );
         let client = ObsClient::new(&http);
         let patch = client.revision_patch("openSUSE:Factory", "foo", 1).unwrap();
         assert_eq!(patch.rev, 1);
         assert!(patch.files.is_empty());
-        assert!(http.get_calls().is_empty());
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo?rev=1".to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn revision_patch_rev1_missing_package_is_error() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo?rev=1",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::new(&http);
+        let err = client
+            .revision_patch("openSUSE:Factory", "foo", 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
     #[test]

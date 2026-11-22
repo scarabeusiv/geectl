@@ -40,6 +40,7 @@
 //! `live_list_files_and_packages_read_back`,
 //! `live_package_log_newest_first_and_range`,
 //! `live_revision_patch_diffs_revisions`,
+//! `live_revision_patch_rev1_missing_package_errors`,
 //! `live_meta_reads_back`,
 //! `live_search_finds_package_and_project`,
 //! `live_owners_call_succeeds`, `live_whois_reads_admin`,
@@ -1306,6 +1307,23 @@ fn live_revision_patch_diffs_revisions() {
         first.files.is_empty(),
         "revision 1 has nothing to diff against"
     );
+}
+
+/// Revision 1 of a package that does not exist is an error, not an
+/// empty patch.
+#[test]
+fn live_revision_patch_rev1_missing_package_errors() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let public = live_client(&base);
+    let err = public
+        .revision_patch(&source_project, "geectl-live-no-such-package", 1)
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
 }
 
 /// The project and package meta read back what creation put there.
