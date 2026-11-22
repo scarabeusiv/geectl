@@ -290,8 +290,8 @@ fn live_package() -> String {
 /// separate processes, and the API replies to the project creation
 /// before the backend has the project registered — the immediately
 /// following package creation can then 404 on the just-created
-/// project (seen on run 44876734097). The retry lives in the library
-/// so sequential consumers get it too; the harness no longer retries
+/// project. The retry lives in the library
+/// so sequential consumers get it too; the harness does not retry
 /// around the call.
 fn create_source_branch(client: &ObsClient<'_>, package: &str) -> String {
     let source_project = format!("geectl-tmp-src-{}", unique_suffix());
@@ -2147,8 +2147,7 @@ fn live_copy_self_with_keep_link_and_revision() {
     let client = live_client_authed(&base);
     let (source_project, package, _filename, _content) = setup_copy_source(&client);
     // A link package pointing at the source package, made by writing
-    // the _link directly (test setup, like set_project_link): the
-    // library link operation lands in a later commit.
+    // the _link directly (test setup, like set_project_link).
     let link_package = format!("{package}-link");
     client
         .create_package(
@@ -3802,8 +3801,8 @@ mod tests {
     #[test]
     fn unique_suffix_is_distinct_across_parallel_calls() {
         // The live tests run in parallel in one process, and two calls
-        // in the same clock tick used to return the same suffix,
-        // tripping the dedup guard (issue #39). Hammer the generator
+        // in the same clock tick returning the same suffix would trip
+        // the dedup guard (issue #39). Hammer the generator
         // from several threads and require every returned suffix
         // distinct.
         use std::collections::HashSet;

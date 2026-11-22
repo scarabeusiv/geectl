@@ -1225,8 +1225,8 @@ fn gitea_pool_systemd_layout_mirrored() {
     };
     let http = gitea_client();
     // The real layout, mirrored exactly: org `pool`, repo
-    // `systemd`, default branch `factory` — fetched live
-    // 2026-11-21 from https://src.opensuse.org (see the layout
+    // `systemd`, default branch `factory` — fetched
+    // from https://src.opensuse.org (see the layout
     // note in src/gitea.rs) and populated by
     // tests/gitea/populate-fixtures.sh, which runs as its own
     // step after provisioning. The fork owner is the disposable

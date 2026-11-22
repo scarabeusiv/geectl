@@ -1561,7 +1561,7 @@ fn build_unknown_subcommand_fails_with_parse_error() {
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
 }
 
-// --- PR #83 fix-round tests: docs golden test, alias credentials,
+// --- Docs golden test, alias credentials,
 // supersede guard, whole-project guard, output-format default ---
 
 /// Extract the `--help` blocks from docs/cli.md: each ``` fence
