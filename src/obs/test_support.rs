@@ -40,6 +40,7 @@ pub(crate) struct FakeHttp {
     delete_calls: RefCell<Vec<(String, bool)>>,
     delete_json_calls: RefCell<Vec<(String, String, bool)>>,
     patch_calls: RefCell<Vec<(String, String, bool)>>,
+    mutation_calls: RefCell<Vec<(String, String)>>,
     put_calls: RefCell<Vec<(String, String, bool)>>,
     put_bytes: RefCell<HashMap<String, String>>,
     put_bytes_calls: RefCell<Vec<(String, Vec<u8>, bool)>>,
@@ -74,6 +75,7 @@ impl FakeHttp {
             delete_calls: RefCell::new(Vec::new()),
             delete_json_calls: RefCell::new(Vec::new()),
             patch_calls: RefCell::new(Vec::new()),
+            mutation_calls: RefCell::new(Vec::new()),
             put_calls: RefCell::new(Vec::new()),
             put_bytes: RefCell::new(HashMap::new()),
             put_bytes_calls: RefCell::new(Vec::new()),
@@ -302,6 +304,14 @@ impl FakeHttp {
         self.patch_calls.borrow().clone()
     }
 
+    /// The mutation calls in order (method, url): POST, PATCH,
+    /// PUT and DELETE all record here, so a test can assert one
+    /// mutation happened before another - the decline comment
+    /// before the close PATCH, for instance.
+    pub(crate) fn mutation_calls(&self) -> Vec<(String, String)> {
+        self.mutation_calls.borrow().clone()
+    }
+
     pub(crate) fn put_calls(&self) -> Vec<(String, String, bool)> {
         self.put_calls.borrow().clone()
     }
@@ -322,6 +332,9 @@ impl FakeHttp {
         self.patch_calls
             .borrow_mut()
             .push((url.to_string(), body.to_string(), authed));
+        self.mutation_calls
+            .borrow_mut()
+            .push(("PATCH".to_string(), url.to_string()));
         if let Some(kind) = self
             .patch_errors
             .borrow_mut()
@@ -540,6 +553,9 @@ impl HttpClient for FakeHttp {
         self.post_calls
             .borrow_mut()
             .push((url.to_string(), body.to_string(), authed));
+        self.mutation_calls
+            .borrow_mut()
+            .push(("POST".to_string(), url.to_string()));
         if let Some(kind) = self
             .post_errors
             .borrow_mut()
@@ -622,6 +638,9 @@ impl HttpClient for FakeHttp {
         self.delete_calls
             .borrow_mut()
             .push((url.to_string(), authed));
+        self.mutation_calls
+            .borrow_mut()
+            .push(("DELETE".to_string(), url.to_string()));
         self.deletes.borrow().get(url).cloned().ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::NetworkError,
@@ -658,6 +677,9 @@ impl HttpClient for FakeHttp {
         self.put_calls
             .borrow_mut()
             .push((url.to_string(), body.to_string(), authed));
+        self.mutation_calls
+            .borrow_mut()
+            .push(("PUT".to_string(), url.to_string()));
         if let Some(kind) = self
             .put_errors
             .borrow_mut()

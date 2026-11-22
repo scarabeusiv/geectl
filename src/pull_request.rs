@@ -8,7 +8,7 @@
 
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
-    validate_gitea_name, GiteaClient, GiteaComment, GiteaIssue, GiteaPullRequest,
+    validate_gitea_name, GiteaClient, GiteaComment, GiteaIssue, GiteaMergeMethod, GiteaPullRequest,
     GiteaPullRequestRef, GiteaPullRequestState, GiteaReview, GiteaReviewEvent,
 };
 use crate::obs::request::{
@@ -1034,6 +1034,175 @@ impl<'a> PullRequestClient<'a> {
                 gitea.pr_review_cancel_request(owner, repo, *number, &users, &teams, dry_run)
             }
         }
+    }
+
+    /// Merge a pull request. On OBS this accepts the submit
+    /// request; on Gitea it merges the pull request. `comment` is
+    /// the message left with the accept on OBS and the merge commit
+    /// message on Gitea. `method` selects the Gitea merge style
+    /// and is refused on an OBS ref: OBS has no merge style.
+    /// `force` accepts past open reviews on OBS and is refused on
+    /// a Gitea ref: the merge API takes no force flag. Returns the
+    /// unified status after the merge, or `None` in dry-run.
+    pub fn merge(
+        &self,
+        reference: &PullRequestRef,
+        comment: Option<&str>,
+        method: Option<GiteaMergeMethod>,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<Option<PullRequestStatus>, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => {
+                if let Some(method) = method {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "--method {} does not apply to an OBS submit request: OBS has no merge style",
+                            method.as_str()
+                        ),
+                    ));
+                }
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                obs.accept_request(&id.to_string(), comment.unwrap_or_default(), force, dry_run)?;
+                self.status_after_act(reference, dry_run)
+            }
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                if force {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "--force does not apply to a Gitea pull request: the merge API takes no force flag",
+                    ));
+                }
+                let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+                gitea.pr_merge(owner, repo, *number, method, comment, dry_run)?;
+                self.status_after_act(reference, dry_run)
+            }
+        }
+    }
+
+    /// Decline a pull request. On OBS this changes the request
+    /// state to declined; on Gitea it closes the pull request —
+    /// Gitea has no declined state, so the close is the whole act
+    /// and the reason is posted as an issue comment first, when
+    /// one was given, so it stays visible. Returns the unified
+    /// status after the decline, or `None` in dry-run.
+    pub fn decline(
+        &self,
+        reference: &PullRequestRef,
+        comment: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<Option<PullRequestStatus>, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => {
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                obs.decline_request(&id.to_string(), comment.unwrap_or_default(), dry_run)?;
+                self.status_after_act(reference, dry_run)
+            }
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                self.close_gitea(owner, repo, *number, comment, dry_run)?;
+                self.status_after_act(reference, dry_run)
+            }
+        }
+    }
+
+    /// Withdraw a pull request. On OBS this revokes the request —
+    /// the creator's withdrawal; on Gitea it closes the pull
+    /// request, like `decline`: Gitea has no withdrawn state, so
+    /// the close is the whole act and the reason is posted as an
+    /// issue comment first, when one was given. Returns the
+    /// unified status after the withdrawal, or `None` in dry-run.
+    pub fn withdraw(
+        &self,
+        reference: &PullRequestRef,
+        comment: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<Option<PullRequestStatus>, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => {
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                obs.revoke_request(&id.to_string(), comment.unwrap_or_default(), dry_run)?;
+                self.status_after_act(reference, dry_run)
+            }
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                self.close_gitea(owner, repo, *number, comment, dry_run)?;
+                self.status_after_act(reference, dry_run)
+            }
+        }
+    }
+
+    /// Reopen a pull request. On OBS this changes a declined
+    /// request back to `new`; on Gitea it reopens the closed pull
+    /// request. The live test pins the creator path: the creator
+    /// declines, then reopens. Returns the unified status after
+    /// the reopen, or `None` in dry-run.
+    pub fn reopen(
+        &self,
+        reference: &PullRequestRef,
+        dry_run: &DryRun,
+    ) -> Result<Option<PullRequestStatus>, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => {
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                obs.change_state(&id.to_string(), RequestState::New, "", false, dry_run)?;
+                self.status_after_act(reference, dry_run)
+            }
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+                gitea.pr_reopen(owner, repo, *number, dry_run)?;
+                self.status_after_act(reference, dry_run)
+            }
+        }
+    }
+
+    /// The unified status after an act: the act answers only a
+    /// status (OBS) or an empty body (Gitea merge), so the record
+    /// is re-read, like `comment` re-reads the posted comment.
+    /// `None` in dry-run: nothing changed, so there is nothing
+    /// to re-read.
+    fn status_after_act(
+        &self,
+        reference: &PullRequestRef,
+        dry_run: &DryRun,
+    ) -> Result<Option<PullRequestStatus>, GeectlError> {
+        if dry_run.enabled() {
+            return Ok(None);
+        }
+        Ok(Some(self.show(reference)?.status))
+    }
+
+    /// Close a Gitea pull request, posting `comment` as an issue
+    /// comment first when one was given: the close carries no
+    /// reason of its own.
+    fn close_gitea(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        comment: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaIssue>, GeectlError> {
+        let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+        if let Some(comment) = comment.filter(|comment| !comment.is_empty()) {
+            gitea.pr_comment_add(owner, repo, number, comment, dry_run)?;
+        }
+        gitea.pr_close(owner, repo, number, dry_run)
     }
 
     /// Act on the review asked of `target` with `state`: the OBS
@@ -2745,5 +2914,500 @@ mod tests {
             http.delete_json_calls()[0].1,
             r#"{"reviewers":["bob"],"team_reviewers":[]}"#
         );
+    }
+
+    // --- Pull-request-level act tests ---
+
+    /// REQUEST_XML with the state element's name replaced: the
+    /// re-read after a level act answers the state the act moved
+    /// the request to.
+    fn request_xml_with_state(state: &str) -> String {
+        REQUEST_XML.replace("name=\"review\"", &format!("name=\"{state}\""))
+    }
+
+    /// PR_JSON with the state and merged flag replaced: the
+    /// re-read after a level act answers the state the act moved
+    /// the pull request to.
+    fn pr_json_with_state(state: &str, merged: bool) -> String {
+        PR_JSON
+            .replace("\"state\": \"open\"", &format!("\"state\": \"{state}\""))
+            .replace("\"merged\": false", &format!("\"merged\": {merged}"))
+    }
+
+    #[test]
+    fn merge_obs_accepts_and_re_reads_merged() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/request/1398977?cmd=changestate&newstate=accepted",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/1398977?withhistory=1",
+                &request_xml_with_state("accepted"),
+            );
+        let obs = obs_client(&http);
+        let status = act_client(Some(&obs), None)
+            .merge(
+                &obs_ref(),
+                Some("Merging."),
+                None,
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Merged);
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "Merging.");
+        assert!(calls[0].2);
+        assert_eq!(
+            http.get_calls()
+                .iter()
+                .map(|(url, _)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://api.opensuse.org/request/1398977?withhistory=1"]
+        );
+    }
+
+    #[test]
+    fn merge_obs_with_force_posts_force() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/request/1398977?cmd=changestate&newstate=accepted&force=1",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/1398977?withhistory=1",
+                &request_xml_with_state("accepted"),
+            );
+        let obs = obs_client(&http);
+        let status = act_client(Some(&obs), None)
+            .merge(&obs_ref(), None, None, true, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Merged);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn merge_obs_with_a_method_is_refused() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let err = act_client(Some(&obs), None)
+            .merge(
+                &obs_ref(),
+                None,
+                Some(GiteaMergeMethod::Squash),
+                false,
+                &DryRun::new(false),
+            )
+            .expect_err("a merge method on an OBS ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--method squash"));
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_obs_dry_run_posts_nothing() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/1398977?cmd=changestate&newstate=accepted",
+            "<status code=\"ok\" />",
+        );
+        let obs = obs_client(&http);
+        let dry = DryRun::new(true);
+        let status = act_client(Some(&obs), None)
+            .merge(&obs_ref(), Some("Merging."), None, false, &dry)
+            .unwrap();
+        assert!(status.is_none());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(dry.plan().len(), 1);
+        assert!(dry.plan()[0].contains("to accepted"));
+    }
+
+    #[test]
+    fn merge_gitea_posts_the_method_and_re_reads_merged() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/merge",
+                "",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json_with_state("closed", true),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let status = act_client(None, Some(&gitea))
+            .merge(
+                &gitea_ref(),
+                Some("Merging."),
+                Some(GiteaMergeMethod::Squash),
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Merged);
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            r#"{"Do":"squash","MergeMessageField":"Merging."}"#
+        );
+        assert!(calls[0].2);
+        assert_eq!(
+            http.get_calls()
+                .iter()
+                .map(|(url, _)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_gitea_with_force_is_refused() {
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .merge(&gitea_ref(), None, None, true, &DryRun::new(false))
+            .expect_err("force on a Gitea ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--force"));
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_gitea_dry_run_posts_nothing() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/merge",
+            "",
+        );
+        let gitea = gitea_client(&http);
+        let dry = DryRun::new(true);
+        let status = act_client(None, Some(&gitea))
+            .merge(&gitea_ref(), None, None, false, &dry)
+            .unwrap();
+        assert!(status.is_none());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(dry.plan().len(), 1);
+        assert!(dry.plan()[0].contains("merge pull request openSUSE/geectl#122"));
+    }
+
+    #[test]
+    fn decline_obs_declines_and_re_reads_declined() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/request/1398977?cmd=changestate&newstate=declined",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/1398977?withhistory=1",
+                &request_xml_with_state("declined"),
+            );
+        let obs = obs_client(&http);
+        let status = act_client(Some(&obs), None)
+            .decline(&obs_ref(), Some("Not now."), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Declined);
+        assert_eq!(http.post_calls()[0].1, "Not now.");
+        assert_eq!(
+            http.get_calls()
+                .iter()
+                .map(|(url, _)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://api.opensuse.org/request/1398977?withhistory=1"]
+        );
+    }
+
+    #[test]
+    fn decline_gitea_comments_then_closes_and_re_reads_closed() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
+            )
+            .with_patch(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+                &issue_json(122, "closed", false, "scarabeusiv"),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json_with_state("closed", false),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let status = act_client(None, Some(&gitea))
+            .decline(&gitea_ref(), Some("Not now."), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Closed);
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, r#"{"body":"Not now."}"#);
+        let patches = http.patch_calls();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].1, r#"{"state":"closed"}"#);
+        assert!(patches[0].2);
+        assert_eq!(
+            http.mutation_calls(),
+            vec![
+                (
+                    "POST".to_string(),
+                    "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments"
+                        .to_string()
+                ),
+                (
+                    "PATCH".to_string(),
+                    "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            http.get_calls()
+                .iter()
+                .map(|(url, _)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+            ]
+        );
+    }
+
+    #[test]
+    fn decline_gitea_without_a_comment_only_closes() {
+        let http = FakeHttp::new()
+            .with_patch(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+                &issue_json(122, "closed", false, "scarabeusiv"),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json_with_state("closed", false),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let status = act_client(None, Some(&gitea))
+            .decline(&gitea_ref(), None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Closed);
+        assert!(http.post_calls().is_empty());
+        assert_eq!(http.patch_calls().len(), 1);
+    }
+
+    #[test]
+    fn decline_gitea_dry_run_posts_and_patches_nothing() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
+            )
+            .with_patch(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+                &issue_json(122, "closed", false, "scarabeusiv"),
+            );
+        let gitea = gitea_client(&http);
+        let dry = DryRun::new(true);
+        let status = act_client(None, Some(&gitea))
+            .decline(&gitea_ref(), Some("Not now."), &dry)
+            .unwrap();
+        assert!(status.is_none());
+        assert!(http.post_calls().is_empty());
+        assert!(http.patch_calls().is_empty());
+        assert_eq!(dry.plan().len(), 2);
+        assert!(dry.plan()[0].contains("comment on pull request openSUSE/geectl#122"));
+        assert!(dry.plan()[1].contains("close pull request openSUSE/geectl#122"));
+    }
+
+    #[test]
+    fn withdraw_obs_revokes_and_re_reads_withdrawn() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/request/1398977?cmd=changestate&newstate=revoked",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/1398977?withhistory=1",
+                &request_xml_with_state("revoked"),
+            );
+        let obs = obs_client(&http);
+        let status = act_client(Some(&obs), None)
+            .withdraw(&obs_ref(), Some("Withdrawing."), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Withdrawn);
+        assert_eq!(http.post_calls()[0].1, "Withdrawing.");
+        assert_eq!(
+            http.get_calls()
+                .iter()
+                .map(|(url, _)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://api.opensuse.org/request/1398977?withhistory=1"]
+        );
+    }
+
+    #[test]
+    fn withdraw_gitea_closes_and_re_reads_closed() {
+        let http = FakeHttp::new()
+            .with_patch(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+                &issue_json(122, "closed", false, "scarabeusiv"),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                &pr_json_with_state("closed", false),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let status = act_client(None, Some(&gitea))
+            .withdraw(&gitea_ref(), None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Closed);
+        assert!(http.post_calls().is_empty());
+        assert_eq!(http.patch_calls().len(), 1);
+        assert_eq!(
+            http.get_calls()
+                .iter()
+                .map(|(url, _)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+            ]
+        );
+    }
+
+    #[test]
+    fn reopen_obs_changes_state_to_new_and_re_reads_open() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/request/1398977?cmd=changestate&newstate=new",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/request/1398977?withhistory=1",
+                &request_xml_with_state("new"),
+            );
+        let obs = obs_client(&http);
+        let status = act_client(Some(&obs), None)
+            .reopen(&obs_ref(), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Open);
+        assert_eq!(http.post_calls()[0].1, "");
+        assert_eq!(
+            http.get_calls()
+                .iter()
+                .map(|(url, _)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://api.opensuse.org/request/1398977?withhistory=1"]
+        );
+    }
+
+    #[test]
+    fn reopen_gitea_patches_open_and_re_reads_open() {
+        let http = FakeHttp::new()
+            .with_patch(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+                &issue_json(122, "open", false, "scarabeusiv"),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                PR_JSON,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                REVIEWS_JSON,
+            );
+        let gitea = gitea_client(&http);
+        let status = act_client(None, Some(&gitea))
+            .reopen(&gitea_ref(), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, PullRequestStatus::Open);
+        let patches = http.patch_calls();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].1, r#"{"state":"open"}"#);
+        assert_eq!(
+            http.get_calls()
+                .iter()
+                .map(|(url, _)| url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+            ]
+        );
+    }
+
+    #[test]
+    fn decline_gitea_comment_failure_skips_the_close() {
+        let http = FakeHttp::new()
+            .with_post_error(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+                ErrorKind::ServerError,
+            )
+            .with_patch(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+                &issue_json(122, "closed", false, "scarabeusiv"),
+            );
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .decline(&gitea_ref(), Some("Not now."), &DryRun::new(false))
+            .expect_err("a failing decline comment must fail the decline");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.patch_calls().is_empty());
+    }
+
+    #[test]
+    fn decline_gitea_close_failure_leaves_the_comment() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+                r#"{"id": 7, "user": {"login": "plusky"}, "body": "Not now.", "created_at": "2026-11-22T19:52:58Z"}"#,
+            )
+            .with_patch_error(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+                ErrorKind::ServerError,
+            );
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .decline(&gitea_ref(), Some("Not now."), &DryRun::new(false))
+            .expect_err("a failing close must fail the decline");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn merge_gitea_post_error_propagates() {
+        let http = FakeHttp::new().with_post_error(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/merge",
+            ErrorKind::ServerError,
+        );
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .merge(&gitea_ref(), None, None, false, &DryRun::new(false))
+            .expect_err("a failing merge POST must fail the merge");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.get_calls().is_empty());
     }
 }
