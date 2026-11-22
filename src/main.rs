@@ -136,8 +136,8 @@ enum Command {
         #[command(subcommand)]
         command: cli_gitea::GiteaCommand,
     },
-    /// Read pull requests: OBS submit requests and Gitea pull
-    /// requests as one surface.
+    /// Read and act on pull requests: OBS submit requests and
+    /// Gitea pull requests as one surface.
     PullRequest {
         #[command(subcommand)]
         command: cli_pull_request::PullRequestCommand,
@@ -196,7 +196,7 @@ fn run(
         Some(Command::Service { command }) => cli_service::run_service(command, debug)?,
         Some(Command::Gitea { command }) => cli_gitea::run_gitea(command, debug, cli.live)?,
         Some(Command::PullRequest { command }) => {
-            cli_pull_request::run_pull_request(command, debug)?
+            cli_pull_request::run_pull_request(command, debug, cli.live)?
         }
     };
     Ok(match format {

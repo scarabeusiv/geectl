@@ -6,14 +6,24 @@
 //! payload carries the typed values, and the text renderer prints
 //! the same values in a human-readable form.
 //!
-//! Reads are always live: there are no mutations in this group, so
-//! no `--live` applies. A read on an arm needs that arm's
+//! Reads are always live; the act leaves (`approve`,
+//! `request-changes`, `comment`, `cancel-review-request`) are
+//! dry-run by default and mutate only with the global `--live`.
+//! A read or a live act on an arm needs that arm's
 //! credentials — OBS Basic credentials for `obs:` handles, the
 //! Gitea Bearer token for `gitea:` handles — and fails closed
 //! naming them when they are missing. `search` with no `--backend`
 //! runs both arms, OBS first then Gitea, so it needs both sets of
 //! credentials; scope with `--backend` when only one is configured. `--repo` needs
 //! `--backend gitea`.
+//!
+//! In dry-run the OBS client builds without credentials (the plan
+//! prints without them), like the request group; the Gitea client
+//! still needs its credential to be built, so a dry-run Gitea act
+//! without one fails closed naming it, like the gitea group. A
+//! dry-run approve on OBS without OBS credentials also fails
+//! closed: the plan names the acting user, and without credentials
+//! there is no actor to name.
 //!
 //! Coordinate header (design rule 1): every text rendering opens
 //! with one header line echoing the query coordinates — the
@@ -29,16 +39,16 @@
 //! `show` call away.
 
 use clap::{Args, Subcommand};
-use geectl::auth::{AuthProvider, EnvGiteaAuth, EnvObsAuth};
+use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth};
 use geectl::config::{self, DEFAULT_GITEA_URL};
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::gitea::{parse_gitea_repo, GiteaClient};
 use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{ObsClient, OBS_API_BASE};
+use geectl::obs::{DryRun, ObsClient, ReviewTarget, OBS_API_BASE};
 use geectl::pull_request::{
     PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint, PullRequestRef,
-    PullRequestSearch, PullRequestStatus, PullRequestSummary,
+    PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewComment, ReviewOpinion,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -58,6 +68,90 @@ pub enum PullRequestCommand {
     /// requests as one list, OBS first then Gitea. With no
     /// `--backend` both arms run; `--backend` scopes to one.
     Search(SearchArgs),
+    /// Approve a pull request as the review asked of the target:
+    /// with no target flag, as the review asked of the acting
+    /// user (OBS) or the token owner (Gitea). Dry-run by default;
+    /// mutates only with `--live`.
+    Approve(ReviewActArgs),
+    /// Ask for changes on a pull request, as `approve` but with
+    /// the review declined instead of accepted. Dry-run by
+    /// default; mutates only with `--live`.
+    RequestChanges(ReviewActArgs),
+    /// Comment on a pull request. Dry-run by default; mutates
+    /// only with `--live`.
+    Comment(CommentArgs),
+    /// List the comments on a pull request, oldest first. A read,
+    /// always live.
+    Comments {
+        /// The pull-request handle: `obs:<id>` or
+        /// `gitea:<owner>/<repo>#<number>`.
+        reference: String,
+    },
+    /// Cancel pending review requests on a pull request. Dry-run
+    /// by default; mutates only with `--live`. On OBS the cancel
+    /// fails closed: OBS has no request call that removes a
+    /// reviewer.
+    CancelReviewRequest(CancelArgs),
+}
+
+/// Arguments shared by `pull-request approve` and `pull-request
+/// request-changes`.
+#[derive(Debug, Args)]
+pub struct ReviewActArgs {
+    /// The pull-request handle: `obs:<id>` or
+    /// `gitea:<owner>/<repo>#<number>`.
+    reference: String,
+    /// The message left with the review. Values starting with `-`
+    /// are taken literally: a message may open with a `- ` bullet.
+    #[arg(long, allow_hyphen_values = true)]
+    message: Option<String>,
+    /// Act on the review asked of this user (OBS only).
+    #[arg(long)]
+    user: Option<String>,
+    /// Act on the review asked of this group (OBS only).
+    #[arg(long)]
+    group: Option<String>,
+    /// Act on the review asked of this project (OBS only).
+    #[arg(long)]
+    project: Option<String>,
+    /// Act on the review asked of this package (OBS only; needs
+    /// its project).
+    #[arg(long)]
+    package: Option<String>,
+}
+
+/// Arguments for `pull-request comment`.
+#[derive(Debug, Args)]
+pub struct CommentArgs {
+    /// The pull-request handle: `obs:<id>` or
+    /// `gitea:<owner>/<repo>#<number>`.
+    reference: String,
+    /// The comment text. Values starting with `-` are taken
+    /// literally: the body may open with a `- ` bullet.
+    #[arg(long, allow_hyphen_values = true)]
+    body: String,
+    /// The comment being replied to, when this is a reply (OBS
+    /// only; refused on a Gitea ref).
+    #[arg(long)]
+    parent: Option<String>,
+}
+
+/// Arguments for `pull-request cancel-review-request`.
+#[derive(Debug, Args)]
+pub struct CancelArgs {
+    /// The pull-request handle: `obs:<id>` or
+    /// `gitea:<owner>/<repo>#<number>`.
+    reference: String,
+    /// The reviewers to cancel, repeatable; `@team` names a team.
+    #[arg(long)]
+    reviewer: Vec<String>,
+    /// Cancel every pending review request.
+    #[arg(long)]
+    all: bool,
+    /// With `--all`, leave these reviewers out; `@team` names a
+    /// team.
+    #[arg(long)]
+    exclude: Vec<String>,
 }
 
 /// Arguments for `pull-request search`.
@@ -88,6 +182,7 @@ pub struct SearchArgs {
 pub fn run_pull_request(
     command: PullRequestCommand,
     debug: &Debug,
+    live: bool,
 ) -> Result<(Value, String), GeectlError> {
     match command {
         PullRequestCommand::Show { reference } => {
@@ -98,11 +193,110 @@ pub fn run_pull_request(
             // its filters this way).
             let reference: PullRequestRef = reference.parse()?;
             match &reference {
-                PullRequestRef::Obs(_) => with_obs(debug, |obs| {
+                PullRequestRef::Obs(_) => with_obs(debug, true, |obs| {
                     show_with(&PullRequestClient::new(Some(obs), None), &reference)
                 }),
                 PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
                     show_with(&PullRequestClient::new(None, Some(gitea)), &reference)
+                }),
+            }
+        }
+        PullRequestCommand::Approve(args) => review_act_with(
+            args,
+            debug,
+            live,
+            "approve",
+            "approved",
+            |client, reference, target, message, dry_run| {
+                client.approve(reference, target, message, dry_run)
+            },
+        ),
+        PullRequestCommand::RequestChanges(args) => review_act_with(
+            args,
+            debug,
+            live,
+            "request changes on",
+            "requested changes on",
+            |client, reference, target, message, dry_run| {
+                client.request_changes(reference, target, message, dry_run)
+            },
+        ),
+        PullRequestCommand::Comment(args) => {
+            let reference: PullRequestRef = args.reference.parse()?;
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            match &reference {
+                PullRequestRef::Obs(_) => with_obs(debug, live, |obs| {
+                    let client = PullRequestClient::new(Some(obs), None);
+                    let comment =
+                        client.comment(&reference, &args.body, args.parent.as_deref(), &dry_run)?;
+                    Ok((
+                        comment_payload(&reference, &comment, &dry_run)?,
+                        comment_text(&reference, &comment, &args.body, &dry_run),
+                    ))
+                }),
+                PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+                    let client = PullRequestClient::new(None, Some(gitea));
+                    let comment =
+                        client.comment(&reference, &args.body, args.parent.as_deref(), &dry_run)?;
+                    Ok((
+                        comment_payload(&reference, &comment, &dry_run)?,
+                        comment_text(&reference, &comment, &args.body, &dry_run),
+                    ))
+                }),
+            }
+        }
+        PullRequestCommand::Comments { reference } => {
+            let reference: PullRequestRef = reference.parse()?;
+            match &reference {
+                PullRequestRef::Obs(_) => with_obs(debug, true, |obs| {
+                    let client = PullRequestClient::new(Some(obs), None);
+                    let comments = client.comments(&reference)?;
+                    Ok((
+                        comments_payload(&reference, &comments)?,
+                        comments_text(&reference, &comments),
+                    ))
+                }),
+                PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+                    let client = PullRequestClient::new(None, Some(gitea));
+                    let comments = client.comments(&reference)?;
+                    Ok((
+                        comments_payload(&reference, &comments)?,
+                        comments_text(&reference, &comments),
+                    ))
+                }),
+            }
+        }
+        PullRequestCommand::CancelReviewRequest(args) => {
+            let reference: PullRequestRef = args.reference.parse()?;
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            match &reference {
+                PullRequestRef::Obs(_) => with_obs(debug, live, |obs| {
+                    let client = PullRequestClient::new(Some(obs), None);
+                    let cancelled = client.cancel_review_request(
+                        &reference,
+                        &args.reviewer,
+                        args.all,
+                        &args.exclude,
+                        &dry_run,
+                    )?;
+                    Ok((
+                        cancel_payload(&reference, &cancelled, &dry_run)?,
+                        cancel_text(&reference, &args.reviewer, args.all, &cancelled, &dry_run),
+                    ))
+                }),
+                PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+                    let client = PullRequestClient::new(None, Some(gitea));
+                    let cancelled = client.cancel_review_request(
+                        &reference,
+                        &args.reviewer,
+                        args.all,
+                        &args.exclude,
+                        &dry_run,
+                    )?;
+                    Ok((
+                        cancel_payload(&reference, &cancelled, &dry_run)?,
+                        cancel_text(&reference, &args.reviewer, args.all, &cancelled, &dry_run),
+                    ))
                 }),
             }
         }
@@ -138,7 +332,7 @@ pub fn run_pull_request(
                 ("repo", &repo_values),
             ]);
             match query.backend {
-                Some(PullRequestBackend::Obs) => with_obs(debug, |obs| {
+                Some(PullRequestBackend::Obs) => with_obs(debug, true, |obs| {
                     search_with(
                         &PullRequestClient::new(Some(obs), None),
                         &query,
@@ -152,7 +346,7 @@ pub fn run_pull_request(
                         &coordinates,
                     )
                 }),
-                None => with_obs(debug, |obs| {
+                None => with_obs(debug, true, |obs| {
                     with_gitea(debug, |gitea| {
                         search_with(
                             &PullRequestClient::new(Some(obs), Some(gitea)),
@@ -171,12 +365,14 @@ pub fn run_pull_request(
 /// for the URL from its instance alias — see
 /// `auth::resolve_obs_basic_for_url`), wiring the debug sink
 /// through. The client borrows the transport, so both live in this
-/// scope and the caller runs inside it. Reads are always live, so
-/// a credential resolution error fails fast with the precise error
-/// (unlike the request group's dry-run leniency, which exists for
-/// dry-run mutations only).
+/// scope and the caller runs inside it. Reads pass `live` as true
+/// and fail fast on a credential resolution error; an act in
+/// dry-run takes the request group's leniency instead — the plan
+/// prints without credentials, with the failure on the debug
+/// channel and as a stderr warning.
 fn with_obs<T>(
     debug: &Debug,
+    live: bool,
     f: impl FnOnce(&ObsClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
@@ -184,7 +380,21 @@ fn with_obs<T>(
     let file_config = config::load_config_at(&path)?;
     let effective = config::effective_config(&file_config)?;
     let base = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
-    let credentials = EnvObsAuth::credentials_for_url(base, base, &file_config.instances)?;
+    let credentials = match EnvObsAuth::credentials_for_url(base, base, &file_config.instances) {
+        Ok(credentials) => credentials,
+        Err(err) if !live => {
+            // The dry run prints the plan without credentials, but
+            // the failure must not be silent: the same credentials
+            // would fail a `--live` run, so the error goes on the
+            // debug channel and as a stderr warning.
+            debug.emit(&format!(
+                "ignoring credential resolution error in dry-run mode: {err}"
+            ));
+            eprintln!("warning: ignoring credential resolution error in dry-run mode: {err}");
+            Credentials::None
+        }
+        Err(err) => return Err(err),
+    };
     let client =
         ObsClient::with_base_and_credentials(&http, base, credentials)?.with_debug(debug.clone());
     f(&client)
@@ -225,6 +435,293 @@ fn with_gitea<T>(
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let client = gitea_client(&http, debug)?;
     f(&client)
+}
+
+/// The review target for an act: `None` when no target flag
+/// was given (the review asked of the acting user), else the
+/// target the flags name. Built before any credential
+/// resolution, so an invalid flag fails as InvalidInput whether
+/// or not credentials are configured.
+fn review_target(
+    user: Option<&str>,
+    group: Option<&str>,
+    project: Option<&str>,
+    package: Option<&str>,
+) -> Result<Option<ReviewTarget>, GeectlError> {
+    match (user, group, project, package) {
+        (None, None, None, None) => Ok(None),
+        _ => Ok(Some(ReviewTarget::new(user, group, project, package)?)),
+    }
+}
+
+/// One review act (`approve` / `request-changes`) through the
+/// uniform client: the handle and the target are validated before
+/// any credential resolution, like `show`.
+#[allow(clippy::too_many_arguments)]
+fn review_act_with(
+    args: ReviewActArgs,
+    debug: &Debug,
+    live: bool,
+    present: &str,
+    past: &str,
+    act: impl FnOnce(
+        &PullRequestClient,
+        &PullRequestRef,
+        Option<&ReviewTarget>,
+        Option<&str>,
+        &DryRun,
+    ) -> Result<Option<ReviewOpinion>, GeectlError>,
+) -> Result<(Value, String), GeectlError> {
+    let reference: PullRequestRef = args.reference.parse()?;
+    let target = review_target(
+        args.user.as_deref(),
+        args.group.as_deref(),
+        args.project.as_deref(),
+        args.package.as_deref(),
+    )?;
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    match &reference {
+        PullRequestRef::Obs(_) => with_obs(debug, live, |obs| {
+            let client = PullRequestClient::new(Some(obs), None);
+            let opinion = act(
+                &client,
+                &reference,
+                target.as_ref(),
+                args.message.as_deref(),
+                &dry_run,
+            )?;
+            Ok((
+                review_act_payload(&reference, &opinion, &dry_run)?,
+                review_act_text(
+                    present,
+                    past,
+                    &reference,
+                    &opinion,
+                    args.message.as_deref(),
+                    &dry_run,
+                ),
+            ))
+        }),
+        PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+            let client = PullRequestClient::new(None, Some(gitea));
+            let opinion = act(
+                &client,
+                &reference,
+                target.as_ref(),
+                args.message.as_deref(),
+                &dry_run,
+            )?;
+            Ok((
+                review_act_payload(&reference, &opinion, &dry_run)?,
+                review_act_text(
+                    present,
+                    past,
+                    &reference,
+                    &opinion,
+                    args.message.as_deref(),
+                    &dry_run,
+                ),
+            ))
+        }),
+    }
+}
+
+/// The payload for a review act: the reference, the recorded
+/// opinion (`null` in dry-run), and `dry_run`, plus the plan in
+/// dry-run, like the request group's act payloads.
+fn review_act_payload(
+    reference: &PullRequestRef,
+    opinion: &Option<ReviewOpinion>,
+    dry_run: &DryRun,
+) -> Result<Value, GeectlError> {
+    let mut payload = json!({
+        "reference": reference.to_string(),
+        "review": match opinion {
+            Some(opinion) => payload_json(opinion)?,
+            None => Value::Null,
+        },
+        "dry_run": dry_run.enabled(),
+    });
+    add_plan(&mut payload, dry_run);
+    Ok(payload)
+}
+
+/// The text for a review act: the reference first (the coordinate
+/// echo), then the recorded reviewer in live mode, the message
+/// when one was given.
+fn review_act_text(
+    present: &str,
+    past: &str,
+    reference: &PullRequestRef,
+    opinion: &Option<ReviewOpinion>,
+    message: Option<&str>,
+    dry_run: &DryRun,
+) -> String {
+    let mut text = match (dry_run.enabled(), opinion) {
+        (true, _) => format!("dry-run: would {present} {reference}"),
+        (false, Some(opinion)) => format!("{past} {reference} as {}", opinion.reviewer),
+        (false, None) => format!("{past} {reference}"),
+    };
+    if let Some(message) = message {
+        if !message.is_empty() {
+            text.push_str(&format!(" — {message}"));
+        }
+    }
+    text
+}
+
+/// The payload for a comment: the reference, the created comment
+/// (`null` in dry-run), and `dry_run`, plus the plan in dry-run.
+fn comment_payload(
+    reference: &PullRequestRef,
+    comment: &Option<ReviewComment>,
+    dry_run: &DryRun,
+) -> Result<Value, GeectlError> {
+    let mut payload = json!({
+        "reference": reference.to_string(),
+        "comment": match comment {
+            Some(comment) => payload_json(comment)?,
+            None => Value::Null,
+        },
+        "dry_run": dry_run.enabled(),
+    });
+    add_plan(&mut payload, dry_run);
+    Ok(payload)
+}
+
+/// The text for a comment: the reference first, then the created
+/// comment's id and body in live mode.
+fn comment_text(
+    reference: &PullRequestRef,
+    comment: &Option<ReviewComment>,
+    body: &str,
+    dry_run: &DryRun,
+) -> String {
+    if dry_run.enabled() {
+        format!("dry-run: would comment on {reference}: {body}")
+    } else {
+        match comment {
+            Some(comment) => format!(
+                "commented on {reference} (comment {} by {}): {}",
+                comment.id, comment.author, comment.body
+            ),
+            None => format!("commented on {reference}: {body}"),
+        }
+    }
+}
+
+/// The payload for a comment list: the reference, the comments,
+/// and the count.
+fn comments_payload(
+    reference: &PullRequestRef,
+    comments: &[ReviewComment],
+) -> Result<Value, GeectlError> {
+    let mut items = Vec::new();
+    for comment in comments {
+        items.push(payload_json(comment)?);
+    }
+    Ok(json!({
+        "reference": reference.to_string(),
+        "comments": items,
+        "count": comments.len(),
+    }))
+}
+
+/// The text for a comment list: one header line echoing the
+/// reference and the count, then one line per comment — id,
+/// author, time when recorded, body, and the parent when it is a
+/// reply — or `no comments` under the header when empty.
+fn comments_text(reference: &PullRequestRef, comments: &[ReviewComment]) -> String {
+    let header = format!(
+        "comments for {reference} ({} comment{})",
+        comments.len(),
+        if comments.len() == 1 { "" } else { "s" }
+    );
+    if comments.is_empty() {
+        return format!("{header}\nno comments");
+    }
+    let mut lines = vec![header];
+    for comment in comments {
+        let mut line = format!("comment {} by {}", comment.id, comment.author);
+        if !comment.created.is_empty() {
+            line.push_str(&format!(" at {}", comment.created));
+        }
+        line.push_str(&format!(": {}", comment.body));
+        if let Some(parent) = comment.parent_id {
+            line.push_str(&format!(" (reply to {parent})"));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// The payload for a cancel: the reference, the cancelled names
+/// (`null` in dry-run), and `dry_run`, plus the plan in dry-run.
+fn cancel_payload(
+    reference: &PullRequestRef,
+    cancelled: &Option<Vec<String>>,
+    dry_run: &DryRun,
+) -> Result<Value, GeectlError> {
+    let mut payload = json!({
+        "reference": reference.to_string(),
+        "cancelled": match cancelled {
+            Some(cancelled) => Value::Array(
+                cancelled.iter().map(|name| Value::String(name.clone())).collect(),
+            ),
+            None => Value::Null,
+        },
+        "dry_run": dry_run.enabled(),
+    });
+    add_plan(&mut payload, dry_run);
+    Ok(payload)
+}
+
+/// The text for a cancel: the reference first, then the cancelled
+/// names in live mode, or the requested names in dry-run.
+fn cancel_text(
+    reference: &PullRequestRef,
+    reviewers: &[String],
+    all: bool,
+    cancelled: &Option<Vec<String>>,
+    dry_run: &DryRun,
+) -> String {
+    if dry_run.enabled() {
+        if matches!(cancelled, Some(cancelled) if cancelled.is_empty()) {
+            format!("no pending review requests to cancel on {reference}")
+        } else if all {
+            format!("dry-run: would cancel all pending review requests on {reference}")
+        } else {
+            format!(
+                "dry-run: would cancel the review request of {} on {reference}",
+                reviewers.join(", ")
+            )
+        }
+    } else {
+        match cancelled {
+            Some(cancelled) if cancelled.is_empty() => {
+                format!("no pending review requests to cancel on {reference}")
+            }
+            Some(cancelled) => format!(
+                "cancelled review requests on {reference}: {}",
+                cancelled.join(", ")
+            ),
+            None => format!("cancelled review requests on {reference}"),
+        }
+    }
+}
+
+/// Insert the recorded dry-run plan into a payload, in dry-run
+/// only: a live run's plan is empty by construction, so the field
+/// is omitted there. Mirrors the request group's `add_plan`.
+fn add_plan(payload: &mut Value, dry_run: &DryRun) {
+    if dry_run.enabled() {
+        if let Value::Object(map) = payload {
+            map.insert(
+                "plan".to_string(),
+                Value::Array(dry_run.plan().into_iter().map(Value::String).collect()),
+            );
+        }
+    }
 }
 
 /// Show one pull request through the uniform client: the JSON
@@ -683,6 +1180,198 @@ mod tests {
         assert_eq!(
             search_header(" backend=gitea state=open", 2),
             "search backend=gitea state=open (2 pull requests)"
+        );
+    }
+
+    fn fixture_opinion() -> ReviewOpinion {
+        ReviewOpinion {
+            reviewer: "plusky".to_string(),
+            state: geectl::pull_request::OpinionState::Approved,
+            comment: "Looks good.".to_string(),
+            when: Some("2026-11-22T19:52:58Z".to_string()),
+        }
+    }
+
+    fn fixture_comment() -> ReviewComment {
+        ReviewComment {
+            id: 7,
+            author: "plusky".to_string(),
+            created: "2026-11-22T19:52:58Z".to_string(),
+            body: "One nit.".to_string(),
+            parent_id: None,
+        }
+    }
+
+    fn gitea_reference() -> PullRequestRef {
+        PullRequestRef::Gitea {
+            owner: "openSUSE".to_string(),
+            repo: "geectl".to_string(),
+            number: 122,
+        }
+    }
+
+    #[test]
+    fn approve_json_and_text_agree() {
+        let reference = gitea_reference();
+        let opinion = Some(fixture_opinion());
+        let dry_run = DryRun::new(false);
+        let payload = review_act_payload(&reference, &opinion, &dry_run).unwrap();
+        assert_eq!(payload["reference"], "gitea:openSUSE/geectl#122");
+        assert_eq!(payload["review"]["reviewer"], "plusky");
+        assert_eq!(payload["review"]["state"], "approved");
+        assert_eq!(payload["review"]["comment"], "Looks good.");
+        assert_eq!(payload["review"]["when"], "2026-11-22T19:52:58Z");
+        assert_eq!(payload["dry_run"], false);
+        assert!(payload.get("plan").is_none());
+
+        let text = review_act_text(
+            "approve",
+            "approved",
+            &reference,
+            &opinion,
+            Some("Looks good."),
+            &dry_run,
+        );
+        for expected in [
+            "gitea:openSUSE/geectl#122",
+            "approved",
+            "plusky",
+            "Looks good.",
+        ] {
+            assert!(
+                text.contains(expected),
+                "text missing {expected:?}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_act_dry_run_reports_no_opinion_and_carries_the_plan() {
+        let reference = gitea_reference();
+        let dry_run = DryRun::new(true);
+        dry_run.allow("approve pull request openSUSE/geectl#122");
+        let payload = review_act_payload(&reference, &None, &dry_run).unwrap();
+        assert_eq!(payload["review"], serde_json::Value::Null);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: approve pull request openSUSE/geectl#122"
+        );
+
+        let text = review_act_text(
+            "approve",
+            "approved",
+            &reference,
+            &None,
+            Some("Looks good."),
+            &dry_run,
+        );
+        assert_eq!(
+            text,
+            "dry-run: would approve gitea:openSUSE/geectl#122 — Looks good."
+        );
+    }
+
+    #[test]
+    fn comment_json_and_text_agree() {
+        let reference = gitea_reference();
+        let comment = Some(fixture_comment());
+        let dry_run = DryRun::new(false);
+        let payload = comment_payload(&reference, &comment, &dry_run).unwrap();
+        assert_eq!(payload["reference"], "gitea:openSUSE/geectl#122");
+        assert_eq!(payload["comment"]["id"], 7);
+        assert_eq!(payload["comment"]["author"], "plusky");
+        assert_eq!(payload["comment"]["body"], "One nit.");
+        assert_eq!(payload["dry_run"], false);
+
+        let text = comment_text(&reference, &comment, "One nit.", &dry_run);
+        for expected in [
+            "gitea:openSUSE/geectl#122",
+            "comment 7",
+            "plusky",
+            "One nit.",
+        ] {
+            assert!(
+                text.contains(expected),
+                "text missing {expected:?}:\n{text}"
+            );
+        }
+
+        let dry_run = DryRun::new(true);
+        let text = comment_text(&reference, &None, "One nit.", &dry_run);
+        assert_eq!(
+            text,
+            "dry-run: would comment on gitea:openSUSE/geectl#122: One nit."
+        );
+    }
+
+    #[test]
+    fn comments_json_and_text_agree() {
+        let reference = gitea_reference();
+        let mut reply = fixture_comment();
+        reply.id = 8;
+        reply.parent_id = Some(7);
+        reply.body = "Fixed.".to_string();
+        let comments = vec![fixture_comment(), reply];
+        let payload = comments_payload(&reference, &comments).unwrap();
+        assert_eq!(payload["reference"], "gitea:openSUSE/geectl#122");
+        assert_eq!(payload["count"], 2);
+        assert_eq!(payload["comments"][1]["parent_id"], 8 - 1);
+
+        let text = comments_text(&reference, &comments);
+        for expected in [
+            "comments for gitea:openSUSE/geectl#122 (2 comments)",
+            "comment 7 by plusky at 2026-11-22T19:52:58Z: One nit.",
+            "comment 8 by plusky at 2026-11-22T19:52:58Z: Fixed. (reply to 7)",
+        ] {
+            assert!(
+                text.contains(expected),
+                "text missing {expected:?}:\n{text}"
+            );
+        }
+        assert_eq!(
+            comments_text(&reference, &[]),
+            "comments for gitea:openSUSE/geectl#122 (0 comments)\nno comments"
+        );
+    }
+
+    #[test]
+    fn cancel_json_and_text_agree() {
+        let reference = gitea_reference();
+        let cancelled = Some(vec!["bob".to_string(), "@probe-team".to_string()]);
+        let dry_run = DryRun::new(false);
+        let payload = cancel_payload(&reference, &cancelled, &dry_run).unwrap();
+        assert_eq!(payload["reference"], "gitea:openSUSE/geectl#122");
+        assert_eq!(payload["cancelled"][0], "bob");
+        assert_eq!(payload["cancelled"][1], "@probe-team");
+        assert_eq!(payload["dry_run"], false);
+
+        let text = cancel_text(&reference, &[], false, &cancelled, &dry_run);
+        assert_eq!(
+            text,
+            "cancelled review requests on gitea:openSUSE/geectl#122: bob, @probe-team"
+        );
+        let text = cancel_text(&reference, &[], false, &Some(Vec::new()), &dry_run);
+        assert_eq!(
+            text,
+            "no pending review requests to cancel on gitea:openSUSE/geectl#122"
+        );
+
+        let dry_run = DryRun::new(true);
+        let text = cancel_text(&reference, &["bob".to_string()], false, &None, &dry_run);
+        assert_eq!(
+            text,
+            "dry-run: would cancel the review request of bob on gitea:openSUSE/geectl#122"
+        );
+        let text = cancel_text(&reference, &[], true, &None, &dry_run);
+        assert_eq!(
+            text,
+            "dry-run: would cancel all pending review requests on gitea:openSUSE/geectl#122"
+        );
+        let text = cancel_text(&reference, &[], true, &Some(Vec::new()), &dry_run);
+        assert_eq!(
+            text,
+            "no pending review requests to cancel on gitea:openSUSE/geectl#122"
         );
     }
 }

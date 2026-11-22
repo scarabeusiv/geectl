@@ -117,7 +117,7 @@ Commands:
   maintenance   Maintenance operations: maintained-instances listing and maintenance branching
   service       Service reads: list a package's services and their run state
   gitea         Gitea operations: repository and branch reads and mutations on the configured instance
-  pull-request  Read pull requests: OBS submit requests and Gitea pull requests as one surface
+  pull-request  Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface
   help          Print this message or the help of the given subcommand(s)
 
 Options:
@@ -564,17 +564,22 @@ Options:
           Print help
 ```
 
-## `pull-request` — unified pull-request reads
+## `pull-request` — unified pull-request read and act
 
 ```
-Read pull requests: OBS submit requests and Gitea pull requests as one surface
+Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface
 
 Usage: geectl pull-request [OPTIONS] <COMMAND>
 
 Commands:
-  show    Show one pull request: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
-  search  Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no `--backend` both arms run; `--backend` scopes to one
-  help    Print this message or the help of the given subcommand(s)
+  show                   Show one pull request: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+  search                 Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no `--backend` both arms run; `--backend` scopes to one
+  approve                Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry-run by default; mutates only with `--live`
+  request-changes        Ask for changes on a pull request, as `approve` but with the review declined instead of accepted. Dry-run by default; mutates only with `--live`
+  comment                Comment on a pull request. Dry-run by default; mutates only with `--live`
+  comments               List the comments on a pull request, oldest first. A read, always live
+  cancel-review-request  Cancel pending review requests on a pull request. Dry-run by default; mutates only with `--live`. On OBS the cancel fails closed: OBS has no request call that removes a reviewer
+  help                   Print this message or the help of the given subcommand(s)
 
 Options:
       --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
