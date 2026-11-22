@@ -657,7 +657,12 @@ impl<'a> GiteaClient<'a> {
         let response = self.http.post_json_with(&url, &body, &self.credentials)?;
         let created =
             parse_repository_body(&response, &format!("for the created repository {name}"))?;
-        if created.name != name {
+        // The same rule as the read path (`parse_repository`):
+        // Gitea logins are case-insensitive, so the created name
+        // is compared case-insensitively too. A server that
+        // answers with the name in another case created the repo
+        // that was asked for; a different name is still an error.
+        if !created.name.eq_ignore_ascii_case(name) {
             return Err(GeectlError::new(
                 ErrorKind::ServerError,
                 format!(
@@ -2137,6 +2142,27 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn repo_create_accepts_the_name_in_a_different_case() {
+        // The server preserves the requested name's case in
+        // practice, but the read path compares case-insensitively
+        // and the create check must match it: an answer for
+        // `New-Package` is the `new-package` that was asked for.
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/user/repos",
+            &repo_json("geectl", "New-Package", None),
+        );
+        let created = client(&http)
+            .repo_create(
+                "new-package",
+                &RepoCreateOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run create returns the repo");
+        assert_eq!(created.name, "New-Package");
     }
 
     #[test]
