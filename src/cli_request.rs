@@ -51,8 +51,11 @@
 //! in the JSON payload. `--with-history` enriches the JSON payload
 //! only; the table never renders history. Action texts are one-line
 //! summaries naming the id and the outcome; the full result is the
-//! JSON payload. These omissions are not gaps: do not
-//! expand the tables to echo the full payload.
+//! JSON payload. The `file` / `refile` filing texts carry the CVE
+//! ids (identifiers) but not the description or the `.changes` entry
+//! (long free text); the other filing texts carry no CVE ids.
+//! These omissions are decided, not gaps: do not expand the tables
+//! to echo the full payload.
 
 use clap::{Args, Subcommand};
 use geectl::auth::{Credentials, EnvObsAuth};
@@ -695,14 +698,13 @@ pub fn run(
                         "description": description,
                     })
                 });
-                let text = match &id {
-                    Some(id) => format!(
-                        "filed change-devel request {id} for {source_project}/{source_package} to {target_project}/{target_package}"
-                    ),
-                    None => format!(
-                        "dry-run: would file change-devel request for {source_project}/{source_package} to {target_project}/{target_package}"
-                    ),
-                };
+                let text = file_change_devel_text(
+                    id.as_deref(),
+                    &source_project,
+                    &source_package,
+                    &target_project,
+                    &target_package,
+                );
                 Ok((filed, text))
             })
         }
@@ -758,21 +760,45 @@ pub fn run(
                         "accept_in_hours": accept_in_hours,
                     })
                 });
-                let accept_text = match accept_in_hours {
-                    Some(hours) => format!(" (auto-accept in {hours}h)"),
-                    None => String::new(),
-                };
-                let text = match &id {
-                    Some(id) => {
-                        format!("filed delete request {id} for {target_text}{accept_text}")
-                    }
-                    None => {
-                        format!("dry-run: would file delete request for {target_text}{accept_text}")
-                    }
-                };
+                let text = file_delete_text(id.as_deref(), &target_text, accept_in_hours);
                 Ok((filed, text))
             })
         }
+    }
+}
+
+/// The filing text for `file-change-devel`: the filed (or
+/// would-file) request id and the source and target coordinates.
+/// The description is long free text and stays JSON-only.
+fn file_change_devel_text(
+    id: Option<&str>,
+    source_project: &str,
+    source_package: &str,
+    target_project: &str,
+    target_package: &str,
+) -> String {
+    match id {
+        Some(id) => format!(
+            "filed change-devel request {id} for {source_project}/{source_package} to {target_project}/{target_package}"
+        ),
+        None => format!(
+            "dry-run: would file change-devel request for {source_project}/{source_package} to {target_project}/{target_package}"
+        ),
+    }
+}
+
+/// The filing text for `file-delete`: the filed (or would-file)
+/// request id, the deletion target, and the auto-accept delay when
+/// one was given. The description is long free text and stays
+/// JSON-only.
+fn file_delete_text(id: Option<&str>, target: &str, accept_in_hours: Option<u64>) -> String {
+    let accept_text = match accept_in_hours {
+        Some(hours) => format!(" (auto-accept in {hours}h)"),
+        None => String::new(),
+    };
+    match id {
+        Some(id) => format!("filed delete request {id} for {target}{accept_text}"),
+        None => format!("dry-run: would file delete request for {target}{accept_text}"),
     }
 }
 
@@ -870,39 +896,71 @@ fn file_request(
             Some(old_id) => filing.refile(&payload, old_id)?,
             None => filing.file(&payload)?,
         };
-        let filed = filed_payload(&id, &dry_run, |id| {
-            json!({
-                "id": id.map(request_id_json).unwrap_or(Value::Null),
-                "source_project": file.source_project,
-                "source_package": file.source_package,
-                "target_project": file.target_project,
-                "target_package": file.target_package,
-                "description": file.description,
-                "changes_entry": file.changes_entry,
-                "cve": file.cve,
-                "without_cleanup": file.without_cleanup,
-            })
-        });
-        let text = match (&id, supersede) {
-            (Some(id), Some(old_id)) => format!(
-                "filed request {id} for {}/{} to {}/{}, superseded {old_id}",
-                file.source_project, file.source_package, file.target_project, file.target_package
-            ),
-            (Some(id), None) => format!(
-                "filed request {id} for {}/{} to {}/{}",
-                file.source_project, file.source_package, file.target_project, file.target_package
-            ),
-            (None, Some(old_id)) => format!(
-                "dry-run: would file request for {}/{} to {}/{} and supersede {old_id}",
-                file.source_project, file.source_package, file.target_project, file.target_package
-            ),
-            (None, None) => format!(
-                "dry-run: would file request for {}/{} to {}/{}",
-                file.source_project, file.source_package, file.target_project, file.target_package
-            ),
-        };
+        // The filed JSON and the text both carry the parsed CVE ids:
+        // the raw `--cve` strings stay only in the CLI args.
+        let filed = filed_payload(&id, &dry_run, |id| file_request_json(id, file, &cves));
+        let text = file_request_text(id.as_deref(), supersede, file, &cves);
         Ok((filed, text))
     })
+}
+
+/// The filed JSON for `file` / `refile`: the filed (or would-file)
+/// request id, the source and target coordinates, the parsed CVE ids,
+/// and the cleanup choice. The CVEs are the parsed ids, never the raw
+/// `--cve` strings.
+fn file_request_json(id: Option<&str>, file: &FileArgs, cves: &[CveId]) -> Value {
+    let cve_strings: Vec<&str> = cves.iter().map(CveId::as_str).collect();
+    json!({
+        "id": id.map(request_id_json).unwrap_or(Value::Null),
+        "source_project": file.source_project,
+        "source_package": file.source_package,
+        "target_project": file.target_project,
+        "target_package": file.target_package,
+        "description": file.description,
+        "changes_entry": file.changes_entry,
+        "cve": cve_strings,
+        "without_cleanup": file.without_cleanup,
+    })
+}
+
+/// The filing text for `file` / `refile`: the filed (or
+/// would-file) request id, the source and target coordinates, the
+/// CVE ids when any were claimed, and the superseded id when
+/// refiling. The CVEs belong to the new request, so they ride the
+/// coordinates, before the superseded id. CVE ids are identifiers
+/// (design rule 1), so they ride the text; the description and the
+/// `.changes` entry are long free text and stay JSON-only.
+fn file_request_text(
+    id: Option<&str>,
+    supersede: Option<&str>,
+    file: &FileArgs,
+    cves: &[CveId],
+) -> String {
+    let cves = if cves.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({})",
+            cves.iter()
+                .map(CveId::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let coords = format!(
+        "{}/{} to {}/{}",
+        file.source_project, file.source_package, file.target_project, file.target_package
+    );
+    match (id, supersede) {
+        (Some(id), Some(old_id)) => {
+            format!("filed request {id} for {coords}{cves}, superseded {old_id}")
+        }
+        (Some(id), None) => format!("filed request {id} for {coords}{cves}"),
+        (None, Some(old_id)) => {
+            format!("dry-run: would file request for {coords}{cves} and supersede {old_id}")
+        }
+        (None, None) => format!("dry-run: would file request for {coords}{cves}"),
+    }
 }
 
 /// File a maintenance incident request, or refile one when
@@ -946,31 +1004,44 @@ fn file_maintenance_incident(
                 "with_cleanup": incident.with_cleanup,
             })
         });
-        let packages = incident.source_package.join(", ");
-        let release = match &incident.release_project {
-            Some(release) => format!(", releasing into {release}"),
-            None => String::new(),
-        };
-        let text = match (&id, supersede) {
-            (Some(id), Some(old_id)) => format!(
-                "filed maintenance incident request {id} for {packages} from {} to {}{release}, superseded {old_id}",
-                incident.source_project, incident.target_project
-            ),
-            (Some(id), None) => format!(
-                "filed maintenance incident request {id} for {packages} from {} to {}{release}",
-                incident.source_project, incident.target_project
-            ),
-            (None, Some(old_id)) => format!(
-                "dry-run: would file maintenance incident request for {packages} from {} to {}{release} and supersede {old_id}",
-                incident.source_project, incident.target_project
-            ),
-            (None, None) => format!(
-                "dry-run: would file maintenance incident request for {packages} from {} to {}{release}",
-                incident.source_project, incident.target_project
-            ),
-        };
+        let text = file_maintenance_incident_text(id.as_deref(), supersede, incident);
         Ok((filed, text))
     })
+}
+
+/// The filing text for `file-maintenance-incident` /
+/// `refile-maintenance-incident`: the filed (or would-file) request
+/// id, every source package, the source and target projects, the
+/// release project when given, and the superseded id when refiling.
+/// The description is long free text and stays JSON-only.
+fn file_maintenance_incident_text(
+    id: Option<&str>,
+    supersede: Option<&str>,
+    incident: &MaintenanceIncidentArgs,
+) -> String {
+    let packages = incident.source_package.join(", ");
+    let release = match &incident.release_project {
+        Some(release) => format!(", releasing into {release}"),
+        None => String::new(),
+    };
+    let coords = format!(
+        "{packages} from {} to {}{release}",
+        incident.source_project, incident.target_project
+    );
+    match (id, supersede) {
+        (Some(id), Some(old_id)) => {
+            format!("filed maintenance incident request {id} for {coords}, superseded {old_id}")
+        }
+        (Some(id), None) => {
+            format!("filed maintenance incident request {id} for {coords}")
+        }
+        (None, Some(old_id)) => format!(
+            "dry-run: would file maintenance incident request for {coords} and supersede {old_id}"
+        ),
+        (None, None) => {
+            format!("dry-run: would file maintenance incident request for {coords}")
+        }
+    }
 }
 
 /// Add the dry-run `plan` to a mutation payload, like the other
@@ -1378,13 +1449,16 @@ fn action_text(action: &RequestAction) -> String {
             makeoriginolder,
             acceptinfo,
         } => {
-            let mut line = format!(
-                "submit {source_project}/{source_package} -> {}",
-                target_text(target_project.as_deref(), target_package.as_deref())
-            );
+            let mut line = format!("submit {source_project}/{source_package}");
+            // The revision qualifies the source: `submit SRC rev N ->
+            // TARGET`, as the design doc's worked example pins it.
             if let Some(rev) = source_rev {
                 line.push_str(&format!(" rev {rev}"));
             }
+            line.push_str(&format!(
+                " -> {}",
+                target_text(target_project.as_deref(), target_package.as_deref())
+            ));
             if let Some(update) = sourceupdate {
                 line.push_str(&format!(" ({})", update.as_str()));
             }
@@ -2250,5 +2324,227 @@ mod tests {
         assert_eq!(payload["id"], Value::Null);
         let plan = payload["plan"].as_array().expect("plan is present");
         assert_eq!(plan.len(), 1);
+    }
+
+    fn sample_file_args() -> FileArgs {
+        FileArgs {
+            source_project: "home:alice:branches:test".to_string(),
+            source_package: "foo".to_string(),
+            target_project: "devel:languages:python".to_string(),
+            target_package: "foo".to_string(),
+            description: "Fix a bug".to_string(),
+            changes_entry: "- Fix a bug (CVE-2026-1234)".to_string(),
+            cve: vec!["CVE-2026-1234".to_string()],
+            without_cleanup: false,
+        }
+    }
+
+    #[test]
+    fn file_request_text_carries_cves_in_all_four_arms() {
+        let file = sample_file_args();
+        let cves = parse_cves(&file);
+        assert_eq!(
+            file_request_text(Some("123"), None, &file, &cves),
+            "filed request 123 for home:alice:branches:test/foo to devel:languages:python/foo (CVE-2026-1234)"
+        );
+        assert_eq!(
+            file_request_text(Some("123"), Some("122"), &file, &cves),
+            "filed request 123 for home:alice:branches:test/foo to devel:languages:python/foo (CVE-2026-1234), superseded 122"
+        );
+        assert_eq!(
+            file_request_text(None, None, &file, &cves),
+            "dry-run: would file request for home:alice:branches:test/foo to devel:languages:python/foo (CVE-2026-1234)"
+        );
+        assert_eq!(
+            file_request_text(None, Some("122"), &file, &cves),
+            "dry-run: would file request for home:alice:branches:test/foo to devel:languages:python/foo (CVE-2026-1234) and supersede 122"
+        );
+        // The CVE ids belong to the new request: the parenthetical
+        // rides the coordinates, before the superseded id — it must
+        // never read as qualifying the superseded id.
+        let refiled = file_request_text(Some("123"), Some("122"), &file, &cves);
+        assert!(
+            refiled.find("(CVE-2026-1234)").expect("CVE suffix present")
+                < refiled
+                    .find("superseded 122")
+                    .expect("superseded id present"),
+            "{refiled}"
+        );
+        // Lowercase input normalizes to uppercase in the text,
+        // matching the filed request.
+        let lower = FileArgs {
+            cve: vec!["cve-2026-1234".to_string()],
+            ..sample_file_args()
+        };
+        let lower_cves = parse_cves(&lower);
+        assert!(
+            file_request_text(Some("123"), None, &lower, &lower_cves).contains("(CVE-2026-1234)"),
+            "lowercase CVE must render normalized"
+        );
+        // No CVE claimed: no suffix — the description and the
+        // `.changes` entry stay JSON-only (long free text).
+        let plain = FileArgs {
+            cve: vec![],
+            ..sample_file_args()
+        };
+        assert_eq!(
+            file_request_text(Some("123"), None, &plain, &[]),
+            "filed request 123 for home:alice:branches:test/foo to devel:languages:python/foo"
+        );
+        let two = FileArgs {
+            cve: vec!["CVE-2026-1234".to_string(), "CVE-2026-5678".to_string()],
+            ..sample_file_args()
+        };
+        let two_cves = parse_cves(&two);
+        assert!(
+            file_request_text(Some("123"), None, &two, &two_cves)
+                .ends_with("(CVE-2026-1234, CVE-2026-5678)"),
+            "{}",
+            file_request_text(Some("123"), None, &two, &two_cves)
+        );
+    }
+
+    #[test]
+    fn file_request_json_carries_normalized_cves() {
+        let file = sample_file_args();
+        let cves = parse_cves(&file);
+        let value = file_request_json(Some("123"), &file, &cves);
+        assert_eq!(value["id"], json!(123));
+        assert_eq!(value["source_project"], "home:alice:branches:test");
+        assert_eq!(value["target_project"], "devel:languages:python");
+        assert_eq!(value["cve"], json!(["CVE-2026-1234"]));
+        assert_eq!(value["without_cleanup"], false);
+        // Lowercase input normalizes to uppercase in the JSON,
+        // matching the text.
+        let lower = FileArgs {
+            cve: vec!["cve-2026-1234".to_string()],
+            ..sample_file_args()
+        };
+        let lower_cves = parse_cves(&lower);
+        assert_eq!(
+            file_request_json(Some("123"), &lower, &lower_cves)["cve"],
+            json!(["CVE-2026-1234"])
+        );
+        // No CVE claimed: an empty list.
+        let plain = FileArgs {
+            cve: vec![],
+            ..sample_file_args()
+        };
+        assert_eq!(
+            file_request_json(Some("123"), &plain, &[])["cve"],
+            json!([])
+        );
+        // A dry-run id of None reads as null.
+        assert_eq!(
+            file_request_json(None, &file, &cves)["id"],
+            serde_json::Value::Null
+        );
+    }
+
+    fn parse_cves(file: &FileArgs) -> Vec<CveId> {
+        file.cve
+            .iter()
+            .map(|cve| CveId::parse(cve).expect("sample CVE parses"))
+            .collect()
+    }
+
+    #[test]
+    fn filing_texts_carry_every_coordinate() {
+        assert_eq!(
+            file_change_devel_text(
+                Some("123"),
+                "home:alice:branches:test",
+                "foo",
+                "devel:languages:python",
+                "foo"
+            ),
+            "filed change-devel request 123 for home:alice:branches:test/foo to devel:languages:python/foo"
+        );
+        assert_eq!(
+            file_change_devel_text(
+                None,
+                "home:alice:branches:test",
+                "foo",
+                "devel:languages:python",
+                "foo"
+            ),
+            "dry-run: would file change-devel request for home:alice:branches:test/foo to devel:languages:python/foo"
+        );
+        assert_eq!(
+            file_delete_text(Some("123"), "openSUSE:Factory/foo", None),
+            "filed delete request 123 for openSUSE:Factory/foo"
+        );
+        assert_eq!(
+            file_delete_text(
+                Some("123"),
+                "openSUSE:Factory (repository standard)",
+                Some(48)
+            ),
+            "filed delete request 123 for openSUSE:Factory (repository standard) (auto-accept in 48h)"
+        );
+        assert_eq!(
+            file_delete_text(None, "openSUSE:Factory", Some(0)),
+            "dry-run: would file delete request for openSUSE:Factory (auto-accept in 0h)"
+        );
+        let incident = MaintenanceIncidentArgs {
+            source_project: "home:alice:branches:test".to_string(),
+            source_package: vec!["foo".to_string(), "bar".to_string()],
+            target_project: "openSUSE:Maintenance:1234".to_string(),
+            release_project: Some("openSUSE:Leap:15.6:Update".to_string()),
+            description: "Fix things".to_string(),
+            with_cleanup: false,
+        };
+        assert_eq!(
+            file_maintenance_incident_text(Some("123"), None, &incident),
+            "filed maintenance incident request 123 for foo, bar from home:alice:branches:test to openSUSE:Maintenance:1234, releasing into openSUSE:Leap:15.6:Update"
+        );
+        assert_eq!(
+            file_maintenance_incident_text(None, Some("122"), &incident),
+            "dry-run: would file maintenance incident request for foo, bar from home:alice:branches:test to openSUSE:Maintenance:1234, releasing into openSUSE:Leap:15.6:Update and supersede 122"
+        );
+    }
+
+    /// The design doc's worked example for `request show`, pinned
+    /// literally: id 1398977, state new, the submit action with rev
+    /// 42, the factory-staging review.
+    const DESIGN_SHOW_XML: &str = r#"<request creator="alice" id="1398977">
+  <action type="submit">
+    <source package="foo" project="openSUSE:Factory" rev="42" />
+    <target project="openSUSE:Factory" />
+  </action>
+  <state name="new" who="alice" when="2026-11-21T10:00:00" created="2026-11-21T09:00:00" />
+  <review by_group="factory-staging" state="accepted" />
+</request>"#;
+
+    #[test]
+    fn show_text_matches_the_design_example() {
+        let request = parse_request(DESIGN_SHOW_XML).expect("design example parses");
+        let text = render_request_text(&request);
+        for expected in [
+            "id: 1398977",
+            "state: new",
+            "state by: alice",
+            "state at: 2026-11-21T10:00:00",
+            "created: 2026-11-21T09:00:00",
+            "creator: alice",
+            "action 1: submit openSUSE:Factory/foo rev 42 -> openSUSE:Factory",
+            "review 1: by group:factory-staging state accepted",
+        ] {
+            assert!(
+                text.contains(expected),
+                "text missing {expected:?}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_text_matches_the_design_example() {
+        let request = parse_request(DESIGN_SHOW_XML).expect("design example parses");
+        let text = render_search_text("", &[request]);
+        let mut lines = text.lines();
+        assert_eq!(lines.next().unwrap(), "search (1 request)");
+        assert_eq!(lines.next().unwrap(), "ID       STATE  CREATOR  ACTIONS");
+        assert_eq!(lines.next().unwrap(), "1398977  new    alice    submit foo");
+        assert!(lines.next().is_none());
     }
 }
