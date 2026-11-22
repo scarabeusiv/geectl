@@ -11,8 +11,9 @@
 #
 # The build runs against a local OBS instance, not api.opensuse.org:
 # the job provisions the same temporary instance the live job uses
-# (`tests/live/provision.sh`), starts the download-on-demand daemon
-# the development backend leaves out, creates the fixture project
+# (`tests/live/provision.sh`), enables download-on-demand in the
+# backend config and starts the download-on-demand daemon the
+# development backend leaves out, creates the fixture project
 # (`tests/local_build_e2e/provision-fixture.sh` — a
 # download-on-demand repository backed by the Tumbleweed OSS
 # repository, so the scheduler can resolve the base-system dep set),
@@ -110,6 +111,11 @@ jobs:
           # image build (see tests/live/docker-compose.cache.yml).
           # Local runs leave it unset and build uncached, as before.
           LIVE_CACHE: "1"
+          # Enables download-on-demand in the development backend
+          # (see tests/live/provision.sh): without it the scheduler
+          # never writes a doddata entry and the fixture repository
+          # never resolves.
+          LIVE_ENABLE_DOD: "1"
         run: bash tests/live/provision.sh
       # The development backend does not start the download-on-demand
       # daemon, and the fixture project's repository is

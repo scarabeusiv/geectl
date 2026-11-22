@@ -143,6 +143,31 @@ else
     echo "OBS source HEAD: (not a git checkout)"
 fi
 
+# Download-on-demand is off in the development backend: the backend
+# config template sets no `enable_download_on_demand`, so the
+# scheduler never writes a doddata entry for a download-on-demand
+# repository and the download-on-demand daemon has nothing to fetch.
+# Jobs that need a repository resolved opt in with LIVE_ENABLE_DOD,
+# which writes the flag into the backend config before the backend
+# starts. The backend start script copies the template only when
+# BSConfig.pm is missing, so creating it here is safe; the write is
+# idempotent for a reused checkout.
+if [ -n "${LIVE_ENABLE_DOD:-}" ]; then
+    bsconfig="$OBS_SOURCE_DIR/src/backend/BSConfig.pm"
+    if [ ! -f "$bsconfig" ]; then
+        cp "$OBS_SOURCE_DIR/src/backend/BSConfig.pm.template" "$bsconfig"
+    fi
+    if ! grep -q '^our \$enable_download_on_demand = 1;' "$bsconfig"; then
+        if grep -q '^our \$enable_download_on_demand' "$bsconfig"; then
+            echo "conflicting enable_download_on_demand setting in $bsconfig:" >&2
+            grep '^our \$enable_download_on_demand' "$bsconfig" >&2
+            exit 1
+        fi
+        printf '%s\n' 'our $enable_download_on_demand = 1;' >> "$bsconfig"
+    fi
+    echo "Download-on-demand enabled in the backend config."
+fi
+
 export OBS_SOURCE_DIR
 export CONTAINER_USERID="$(id -u)"
 export FRONTEND_PORT
