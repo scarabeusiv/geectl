@@ -1,10 +1,9 @@
 # geectl ← osc test borrow map
 
-Map of osc test cases to geectl tests: which osc cases pin behaviour
-geectl builds, adopted as unit or live tests; the rest written from
-scratch. The gap map covers 86 operations, in 9 batches: file upload,
-request read/act, remote read, branch/copy/link, build status,
-working-copy layer, maintenance requests, services, Gitea ops.
+osc source: openSUSE/osc @ `89f6bdc`.
+Geectl side: gap map (86 operations), implementation order 1 file upload →
+2 request read/act → 3 remote read → 4 branch/copy/link → 5 build status →
+6 working-copy layer → 7 maintenance requests → 8 services → 9 Gitea ops.
 
 **Not parity**. Adopt the osc test cases that pin behaviour geectl is
 building, as unit tests or as live tests; write the rest from
