@@ -418,14 +418,15 @@ fn resolve_obs_basic_with(
 /// scheme and host lowercased, the port the explicit one when the URL
 /// carries one. `http` and `https` only; a missing scheme, a missing
 /// host, userinfo (`@` in the authority — a credential in the URL),
-/// and a malformed port are `InvalidInput` naming the URL. IPv6 hosts
+/// and a malformed port are `InvalidInput`. The URL itself is never
+/// echoed in the error: it could carry userinfo. IPv6 hosts
 /// arrive without their brackets.
 fn split_api_url(url: &str) -> Result<(String, String, Option<u16>), GeectlError> {
+    // The URL itself is never echoed: it could carry userinfo
+    // (`ftp://user:secret@host` fails the scheme check before
+    // the `@` check), and an error must never carry a credential.
     let invalid = |what: &str| {
-        GeectlError::new(
-            ErrorKind::InvalidInput,
-            format!("invalid API URL {url:?}: {what}"),
-        )
+        GeectlError::new(ErrorKind::InvalidInput, format!("invalid API URL: {what}"))
     };
     let (scheme, rest) = url
         .split_once("://")
@@ -508,7 +509,7 @@ pub fn same_api_url(a: &str, b: &str) -> Result<bool, GeectlError> {
 /// [`same_api_url`] — the first match in alias order — or `None`
 /// when no alias names this URL. The alias is returned as written
 /// in the config; the env-var names derive from its uppercased
-/// form (see [`obs_alias_vars`]).
+/// form (see [`obs_alias_vars`] and [`gitea_alias_vars`]).
 pub fn alias_for_url<'a>(
     url: &str,
     instances: &'a [(String, String)],
@@ -984,6 +985,77 @@ mod tests {
     }
 
     #[test]
+    fn same_api_url_matches_spelling_variants() {
+        // The spelling does not matter: the default port and the
+        // case of the host are the same instance.
+        assert!(same_api_url("https://api.example.org", "https://api.example.org:443").unwrap());
+        assert!(same_api_url("https://API.EXAMPLE.ORG", "https://api.example.org").unwrap());
+        // A different scheme is a different instance even on the
+        // same host and port: http and https never share credentials.
+        assert!(!same_api_url("http://api.example.org", "https://api.example.org").unwrap());
+        assert!(!same_api_url("http://api.example.org:443", "https://api.example.org").unwrap());
+        // A different host or a different effective port is a
+        // different instance.
+        assert!(!same_api_url("https://build.example.org", "https://api.example.org").unwrap());
+        assert!(!same_api_url("https://api.example.org:8443", "https://api.example.org").unwrap());
+        assert!(!same_api_url("http://127.0.0.1:3001", "http://127.0.0.1:80").unwrap());
+        // IPv6 hosts compare without their brackets.
+        assert!(same_api_url("https://[::1]", "https://[::1]:443").unwrap());
+        assert!(!same_api_url("https://[::1]", "https://[::2]").unwrap());
+    }
+
+    #[test]
+    fn same_api_url_rejects_malformed_urls() {
+        for bad in [
+            "notaurl",
+            "ftp://api.opensuse.org",
+            "ftp://user:secret@api.opensuse.org",
+            "https://",
+            "https://user:secret@api.opensuse.org",
+            "https://api.opensuse.org:0",
+            "https://api.opensuse.org:notaport",
+            "https://[::1",
+        ] {
+            let err = same_api_url(bad, "https://api.opensuse.org").unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{bad}");
+            assert!(!err.context.contains("secret"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn alias_for_url_matches_under_same_api_url() {
+        let table = instances(&[("example", "https://api.example.org")]);
+        // The spelling does not matter: the default port and the
+        // case of the host are the same instance.
+        assert_eq!(
+            alias_for_url("https://api.example.org:443", &table).unwrap(),
+            Some("example")
+        );
+        assert_eq!(
+            alias_for_url("https://API.EXAMPLE.ORG", &table).unwrap(),
+            Some("example")
+        );
+        // A different scheme or host is a different instance.
+        assert_eq!(
+            alias_for_url("http://api.example.org", &table).unwrap(),
+            None
+        );
+        assert_eq!(
+            alias_for_url("https://build.opensuse.org", &table).unwrap(),
+            None
+        );
+        // Two aliases for one URL: the first in alias order wins.
+        let table = instances(&[
+            ("alpha", "https://api.example.org"),
+            ("beta", "https://api.example.org"),
+        ]);
+        assert_eq!(
+            alias_for_url("https://api.example.org", &table).unwrap(),
+            Some("alpha")
+        );
+    }
+
+    #[test]
     fn obs_basic_resolves_from_env() {
         let map = vars(&[(OBS_USERNAME_VAR, "alice"), (OBS_PASSWORD_VAR, "s3cr3t")]);
         let creds = resolve_obs_basic(&lookup(&map), &reader(&empty_files())).unwrap();
@@ -1390,56 +1462,6 @@ mod tests {
         let err = open_secret_file_production(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn same_api_url_rejects_malformed_urls() {
-        for bad in [
-            "notaurl",
-            "ftp://api.opensuse.org",
-            "https://",
-            "https://user:secret@api.opensuse.org",
-            "https://api.opensuse.org:0",
-            "https://api.opensuse.org:notaport",
-            "https://[::1",
-        ] {
-            let err = same_api_url(bad, "https://api.opensuse.org").unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{bad}");
-            assert!(!err.context.contains("secret"), "{bad}");
-        }
-    }
-
-    #[test]
-    fn alias_for_url_matches_under_same_api_url() {
-        let table = instances(&[("example", "https://api.example.org")]);
-        // The spelling does not matter: the default port and the
-        // case of the host are the same instance.
-        assert_eq!(
-            alias_for_url("https://api.example.org:443", &table).unwrap(),
-            Some("example")
-        );
-        assert_eq!(
-            alias_for_url("https://API.EXAMPLE.ORG", &table).unwrap(),
-            Some("example")
-        );
-        // A different scheme or host is a different instance.
-        assert_eq!(
-            alias_for_url("http://api.example.org", &table).unwrap(),
-            None
-        );
-        assert_eq!(
-            alias_for_url("https://build.opensuse.org", &table).unwrap(),
-            None
-        );
-        // Two aliases for one URL: the first in alias order wins.
-        let table = instances(&[
-            ("alpha", "https://api.example.org"),
-            ("beta", "https://api.example.org"),
-        ]);
-        assert_eq!(
-            alias_for_url("https://api.example.org", &table).unwrap(),
-            Some("alpha")
-        );
     }
 
     #[test]
