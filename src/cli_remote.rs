@@ -51,9 +51,7 @@
 //! carries no md5 (a verification value, not an identifier);
 //! `package-log` text carries no comment or srcmd5 (long free text
 //! and a verification value); search tables carry no description
-//! (long free text — titles stay); `repo-add` text carries no
-//! `disable_publish` (a boolean; the dry-run plan names it when
-//! set); `revision-patch`,
+//! (long free text — titles stay); `revision-patch`,
 //! `project-diff`, and `diff-packages` diffs are the server text
 //! itself, not re-rendered.
 //! The JSON payload remains the complete record in every case.
@@ -546,8 +544,14 @@ pub fn run_remote(
                 "disable_publish": disable_publish,
                 "changed": changed,
             });
-            let result_line =
-                repo_add_result_line(&name, &project, &arch, &repository.paths, dry_run.enabled());
+            let result_line = repo_add_result_line(
+                &name,
+                &project,
+                &arch,
+                &repository.paths,
+                disable_publish,
+                dry_run.enabled(),
+            );
             let plan = if dry_run.enabled() {
                 Some(dry_run.plan())
             } else {
@@ -620,30 +624,49 @@ fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
 /// The `repo-add` result line: the repository and project, plus the
 /// arch list and the rebuild-source paths — the repository's
 /// definition, so the text carries the definition from the payload.
-/// `disable_publish` is a boolean, not an identifier: the dry-run
-/// plan names it when set, and the JSON payload carries it. `changed`
-/// needs no line: a live add always changes the meta, and dry-run
-/// always reads "would add".
+/// An empty arch or paths segment is omitted; with both empty the
+/// definition parenthetical is omitted. The CLI requires a non-empty
+/// arch and paths, so the omission is defensive rendering.
+/// `disable_publish` is a
+/// boolean, not an identifier: it reads as `(publish disabled)` on
+/// the live line when set, the dry-run plan names it when set, and
+/// the JSON payload carries it. `changed` needs no line: a live add
+/// always changes the meta, and dry-run always reads "would add".
 fn repo_add_result_line(
     name: &str,
     project: &str,
     arch: &[String],
     paths: &[(String, String)],
+    disable_publish: bool,
     dry_run: bool,
 ) -> String {
-    let definition = format!(
-        " (arch: {}; paths: {})",
-        arch.join(", "),
-        paths
-            .iter()
-            .map(|(project, repository)| format!("{project}/{repository}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    let mut segments = Vec::new();
+    let arch = arch.join(", ");
+    if !arch.is_empty() {
+        segments.push(format!("arch: {arch}"));
+    }
+    let paths = paths
+        .iter()
+        .map(|(project, repository)| format!("{project}/{repository}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !paths.is_empty() {
+        segments.push(format!("paths: {paths}"));
+    }
+    let definition = if segments.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", segments.join("; "))
+    };
+    let suffix = if disable_publish && !dry_run {
+        " (publish disabled)"
+    } else {
+        ""
+    };
     if dry_run {
         format!("dry-run: would add repository {name} to project {project}{definition}")
     } else {
-        format!("added repository {name} to project {project}{definition}")
+        format!("added repository {name} to project {project}{definition}{suffix}")
     }
 }
 
@@ -2085,12 +2108,51 @@ mod tests {
         let arch = vec!["x86_64".to_string(), "aarch64".to_string()];
         let paths = vec![("openSUSE:Factory".to_string(), "standard".to_string())];
         assert_eq!(
-            repo_add_result_line("standard", "P", &arch, &paths, true),
+            repo_add_result_line("standard", "P", &arch, &paths, false, true),
             "dry-run: would add repository standard to project P (arch: x86_64, aarch64; paths: openSUSE:Factory/standard)"
         );
         assert_eq!(
-            repo_add_result_line("standard", "P", &arch, &paths, false),
+            repo_add_result_line("standard", "P", &arch, &paths, false, false),
             "added repository standard to project P (arch: x86_64, aarch64; paths: openSUSE:Factory/standard)"
+        );
+    }
+
+    #[test]
+    fn repo_add_result_line_marks_publish_disabled_on_live_line_only() {
+        let arch = vec!["x86_64".to_string()];
+        let paths = vec![("openSUSE:Factory".to_string(), "standard".to_string())];
+        assert_eq!(
+            repo_add_result_line("standard", "P", &arch, &paths, true, false),
+            "added repository standard to project P (arch: x86_64; paths: openSUSE:Factory/standard) (publish disabled)"
+        );
+        // The dry-run result line carries no suffix: the plan names it.
+        assert_eq!(
+            repo_add_result_line("standard", "P", &arch, &paths, true, true),
+            "dry-run: would add repository standard to project P (arch: x86_64; paths: openSUSE:Factory/standard)"
+        );
+    }
+
+    #[test]
+    fn repo_add_result_line_omits_empty_segments() {
+        let no_arch: Vec<String> = Vec::new();
+        let paths = vec![("openSUSE:Factory".to_string(), "standard".to_string())];
+        assert_eq!(
+            repo_add_result_line("standard", "P", &no_arch, &paths, false, false),
+            "added repository standard to project P (paths: openSUSE:Factory/standard)"
+        );
+        let arch = vec!["x86_64".to_string()];
+        let no_paths: Vec<(String, String)> = Vec::new();
+        assert_eq!(
+            repo_add_result_line("standard", "P", &arch, &no_paths, false, false),
+            "added repository standard to project P (arch: x86_64)"
+        );
+        assert_eq!(
+            repo_add_result_line("standard", "P", &no_arch, &no_paths, false, false),
+            "added repository standard to project P"
+        );
+        assert_eq!(
+            repo_add_result_line("standard", "P", &no_arch, &no_paths, true, false),
+            "added repository standard to project P (publish disabled)"
         );
     }
 

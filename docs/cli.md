@@ -552,6 +552,10 @@ The `request file` flags above are illustrative — run
 for every leaf: the binary's `--help` is the authority, and this doc
 reproduces it verbatim where it quotes it.
 
+The `request file` JSON's `cve` field carries the `--cve` values
+parsed and normalized to uppercase `CVE-<year>-<number>` (year 1999
+or later, number at least 4 digits), never the raw strings.
+
 ## How it differs from osc
 
 geectl is not osc with a new name: one noun per operation family,
