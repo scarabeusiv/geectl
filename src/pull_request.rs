@@ -8,13 +8,14 @@
 
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
-    validate_gitea_name, GiteaClient, GiteaIssue, GiteaPullRequest, GiteaPullRequestRef,
-    GiteaPullRequestState, GiteaReview,
+    validate_gitea_name, GiteaClient, GiteaComment, GiteaIssue, GiteaPullRequest,
+    GiteaPullRequestRef, GiteaPullRequestState, GiteaReview, GiteaReviewEvent,
 };
 use crate::obs::request::{
     validate_request_id, Request, RequestAction, RequestSearch, RequestState, ReviewState,
     ReviewTarget,
 };
+use crate::obs::DryRun;
 use crate::obs::ObsClient;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -466,20 +467,7 @@ impl PullRequest {
     ) -> Result<Self, GeectlError> {
         let mut opinions = Vec::new();
         for review in reviews {
-            // A team review carries no user: its reviewer reads as
-            // @<team name>, the same name cancel-review-request
-            // --reviewer accepts.
-            let reviewer = match (&review.user, &review.team) {
-                (Some(user), _) => user.login.clone(),
-                (None, Some(team)) => format!("@{}", team.name),
-                (None, None) => String::new(),
-            };
-            opinions.push(ReviewOpinion {
-                reviewer,
-                state: OpinionState::from_gitea(&review.state, review.dismissed)?,
-                comment: review.body.clone().unwrap_or_default(),
-                when: review.submitted_at.clone(),
-            });
+            opinions.push(opinion_from_gitea_review(review)?);
         }
         Ok(PullRequest {
             reference: PullRequestRef::Gitea {
@@ -837,6 +825,467 @@ impl<'a> PullRequestClient<'a> {
         }
         Ok(summaries)
     }
+
+    /// Approve a pull request as the review asked of `target`:
+    /// `Some` target acts on that target, `None` acts on the
+    /// review asked of the acting user. A `Some` target on a
+    /// Gitea ref is refused: a Gitea review is always acted on as
+    /// the token owner. Returns the recorded opinion, or `None`
+    /// in dry-run.
+    pub fn approve(
+        &self,
+        reference: &PullRequestRef,
+        target: Option<&ReviewTarget>,
+        message: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<Option<ReviewOpinion>, GeectlError> {
+        self.set_review_state(reference, target, ReviewState::Accepted, message, dry_run)
+    }
+
+    /// Ask for changes on a pull request, as `approve` but with
+    /// the review declined instead of accepted.
+    pub fn request_changes(
+        &self,
+        reference: &PullRequestRef,
+        target: Option<&ReviewTarget>,
+        message: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<Option<ReviewOpinion>, GeectlError> {
+        self.set_review_state(reference, target, ReviewState::Declined, message, dry_run)
+    }
+
+    /// Comment on a pull request. `parent` threads the reply
+    /// under that comment on OBS and is refused on a Gitea ref:
+    /// issue comments do not thread. Returns the created comment,
+    /// or `None` in dry-run.
+    pub fn comment(
+        &self,
+        reference: &PullRequestRef,
+        body: &str,
+        parent: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<Option<ReviewComment>, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => {
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                obs.add_comment(&id.to_string(), body, parent, dry_run)?;
+                if dry_run.enabled() {
+                    return Ok(None);
+                }
+                // The POST answers only a status, no id: re-read
+                // the comments and take the newest one by the
+                // acting user with this text — the server appends
+                // in order, so the newest match is the one just
+                // posted. add_comment required Basic credentials,
+                // so the acting user is known here.
+                let author = obs.credentials().username().unwrap_or_default();
+                let comments = obs.list_comments(&id.to_string()).map_err(|err| {
+                    GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!(
+                            "re-read of the comments on submit request {id} after commenting failed: {err}"
+                        ),
+                    )
+                })?;
+                comments
+                    .iter()
+                    .rev()
+                    .find(|comment| comment.body == body && comment.who == author)
+                    .map(|comment| ReviewComment {
+                        id: comment.id,
+                        author: comment.who.clone(),
+                        created: comment.when.clone(),
+                        body: comment.body.clone(),
+                        parent_id: comment.parent_id,
+                    })
+                    .ok_or_else(|| {
+                        GeectlError::new(
+                            ErrorKind::ServerError,
+                            format!(
+                                "re-read of the comments on submit request {id} after commenting found no comment by {author} with the posted text"
+                            ),
+                        )
+                    })
+                    .map(Some)
+            }
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                if let Some(parent) = parent {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "--parent {parent} does not apply to a Gitea pull request: issue comments do not thread"
+                        ),
+                    ));
+                }
+                let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+                let comment = gitea.pr_comment_add(owner, repo, *number, body, dry_run)?;
+                Ok(comment.map(|comment| ReviewComment {
+                    id: comment.id,
+                    author: comment.user.map(|user| user.login).unwrap_or_default(),
+                    created: comment.created_at.unwrap_or_default(),
+                    body: comment.body,
+                    parent_id: None,
+                }))
+            }
+        }
+    }
+
+    /// List the comments on a pull request, oldest first.
+    pub fn comments(&self, reference: &PullRequestRef) -> Result<Vec<ReviewComment>, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => {
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                let comments = obs.list_comments(&id.to_string())?;
+                Ok(comments
+                    .iter()
+                    .map(|comment| ReviewComment {
+                        id: comment.id,
+                        author: comment.who.clone(),
+                        created: comment.when.clone(),
+                        body: comment.body.clone(),
+                        parent_id: comment.parent_id,
+                    })
+                    .collect())
+            }
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+                let comments: Vec<GiteaComment> = gitea.pr_comments(owner, repo, *number)?;
+                Ok(comments
+                    .iter()
+                    .map(|comment| ReviewComment {
+                        id: comment.id,
+                        author: comment
+                            .user
+                            .as_ref()
+                            .map(|user| user.login.clone())
+                            .unwrap_or_default(),
+                        created: comment.created_at.clone().unwrap_or_default(),
+                        body: comment.body.clone(),
+                        parent_id: None,
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    /// Cancel pending review requests on a pull request.
+    /// `reviewers` names the reviewers to cancel (`@team` for a
+    /// team); `all` cancels every pending request, minus
+    /// `exclude`. `exclude` applies only with `all`, and `all`
+    /// with `reviewers` is refused. A named reviewer with no
+    /// pending request is an invalid input naming the reviewer:
+    /// the server answers 204 even for a reviewer with no pending
+    /// request, so the check runs client-side against the pending
+    /// set. `--all` with nothing pending cancels nothing and
+    /// returns an empty list. On an OBS ref the cancel fails
+    /// closed: OBS has no request call that removes a reviewer —
+    /// changereviewstate does not accept `obsoleted`, and a review
+    /// reaches `obsoleted` only when its reviewer is removed from
+    /// the project or package. Returns the cancelled names, or
+    /// `None` in dry-run.
+    pub fn cancel_review_request(
+        &self,
+        reference: &PullRequestRef,
+        reviewers: &[String],
+        all: bool,
+        exclude: &[String],
+        dry_run: &DryRun,
+    ) -> Result<Option<Vec<String>>, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot cancel a review request on submit request {id}: OBS has no request call that removes a reviewer"
+                ),
+            )),
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                if !exclude.is_empty() && !all {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "--exclude applies only with --all",
+                    ));
+                }
+                if all && !reviewers.is_empty() {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "--all and --reviewer cannot be combined",
+                    ));
+                }
+                let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+                let reviews = gitea.pr_reviews(owner, repo, *number)?;
+                let (users, teams) = resolve_cancel(
+                    reviewers, all, exclude, &reviews, owner, repo, *number,
+                )?;
+                if users.is_empty() && teams.is_empty() {
+                    return Ok(Some(Vec::new()));
+                }
+                gitea.pr_review_cancel_request(owner, repo, *number, &users, &teams, dry_run)
+            }
+        }
+    }
+
+    /// Act on the review asked of `target` with `state`: the OBS
+    /// arm changes the review state, the Gitea arm posts the
+    /// review event.
+    fn set_review_state(
+        &self,
+        reference: &PullRequestRef,
+        target: Option<&ReviewTarget>,
+        state: ReviewState,
+        message: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<Option<ReviewOpinion>, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => {
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                let target = self.resolve_obs_target(obs, target)?;
+                obs.change_review_state(
+                    &id.to_string(),
+                    state,
+                    &target,
+                    message.unwrap_or_default(),
+                    dry_run,
+                )?;
+                if dry_run.enabled() {
+                    return Ok(None);
+                }
+                Ok(Some(ReviewOpinion {
+                    reviewer: target.describe(),
+                    state: OpinionState::from(state),
+                    comment: message.unwrap_or_default().to_string(),
+                    when: None,
+                }))
+            }
+            PullRequestRef::Gitea {
+                owner,
+                repo,
+                number,
+            } => {
+                let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+                refuse_gitea_target(target)?;
+                let event = match state {
+                    ReviewState::Accepted => GiteaReviewEvent::Approve,
+                    ReviewState::Declined => GiteaReviewEvent::RequestChanges,
+                    _ => {
+                        return Err(GeectlError::new(
+                            ErrorKind::InvalidInput,
+                            "a review state change on a pull request is approve or request-changes",
+                        ));
+                    }
+                };
+                let review = gitea.pr_review(owner, repo, *number, event, message, dry_run)?;
+                review
+                    .map(|review| opinion_from_gitea_review(&review))
+                    .transpose()
+            }
+        }
+    }
+
+    /// The review target for an OBS act: the caller's target when
+    /// it names one, else the acting user from the OBS
+    /// credentials. No target and no usable credentials is a
+    /// configuration error naming the missing credentials, not a
+    /// review acted on as nobody.
+    fn resolve_obs_target(
+        &self,
+        obs: &ObsClient,
+        target: Option<&ReviewTarget>,
+    ) -> Result<ReviewTarget, GeectlError> {
+        if let Some(target) = target {
+            return Ok(target.clone());
+        }
+        match obs.credentials().username() {
+            Some(user) => ReviewTarget::new(Some(user), None, None, None),
+            None => Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot approve or request changes on a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            )),
+        }
+    }
+}
+
+/// A review target on a Gitea ref is refused: a Gitea review is
+/// always acted on as the token owner, so a --user/--group/
+/// --project/--package flag names a target the backend cannot
+/// act as. The error names the flag.
+fn refuse_gitea_target(target: Option<&ReviewTarget>) -> Result<(), GeectlError> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    if let Some(user) = &target.by_user {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "--user {user} does not apply to a Gitea pull request: a Gitea review is acted on as the token owner"
+            ),
+        ));
+    }
+    if let Some(group) = &target.by_group {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "--group {group} does not apply to a Gitea pull request: a Gitea review is acted on as the token owner"
+            ),
+        ));
+    }
+    if let Some(project) = &target.by_project {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "--project {project} does not apply to a Gitea pull request: a Gitea review is acted on as the token owner"
+            ),
+        ));
+    }
+    if let Some(package) = &target.by_package {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "--package {package} does not apply to a Gitea pull request: a Gitea review is acted on as the token owner"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// One Gitea review as the unified opinion: a user review reads
+/// as the reviewer login, a team review as @<team name>.
+fn opinion_from_gitea_review(review: &GiteaReview) -> Result<ReviewOpinion, GeectlError> {
+    let reviewer = match (&review.user, &review.team) {
+        (Some(user), _) => user.login.clone(),
+        (None, Some(team)) => format!("@{}", team.name),
+        (None, None) => String::new(),
+    };
+    Ok(ReviewOpinion {
+        reviewer,
+        state: OpinionState::from_gitea(&review.state, review.dismissed)?,
+        comment: review.body.clone().unwrap_or_default(),
+        when: review.submitted_at.clone(),
+    })
+}
+
+/// The pending review requests on a Gitea pull request: the users
+/// and teams with a `REQUEST_REVIEW` entry, in server order.
+fn pending_review_requests(reviews: &[GiteaReview]) -> (Vec<String>, Vec<String>) {
+    let mut users = Vec::new();
+    let mut teams = Vec::new();
+    for review in reviews {
+        if review.state != "REQUEST_REVIEW" {
+            continue;
+        }
+        if let Some(user) = &review.user {
+            users.push(user.login.clone());
+        }
+        if let Some(team) = &review.team {
+            teams.push(team.name.clone());
+        }
+    }
+    (users, teams)
+}
+
+/// Dedupe resolved names, preserving server order: a reviewer
+/// named twice (`--reviewer bob --reviewer BOB`) resolves to one
+/// entry, not two identical names in the DELETE body.
+fn dedup_cancel_names(names: Vec<String>) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    names
+        .into_iter()
+        .filter(|name| {
+            if seen.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+                false
+            } else {
+                seen.push(name.clone());
+                true
+            }
+        })
+        .collect()
+}
+
+/// Resolve a cancel against the pending set: `all` takes every
+/// pending request minus `exclude`, a named list takes exactly
+/// those reviewers. A name with `@` matches a team, a bare name
+/// a user; matching ignores case, and the result carries the
+/// server's spelling. A named reviewer with no pending request
+/// is an invalid input naming the reviewer.
+fn resolve_cancel(
+    reviewers: &[String],
+    all: bool,
+    exclude: &[String],
+    reviews: &[GiteaReview],
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<(Vec<String>, Vec<String>), GeectlError> {
+    let (pending_users, pending_teams) = pending_review_requests(reviews);
+    let excluded = |name: &str, is_team: bool| {
+        exclude.iter().any(|entry| {
+            if is_team {
+                entry
+                    .strip_prefix('@')
+                    .unwrap_or(entry)
+                    .eq_ignore_ascii_case(name)
+            } else {
+                !entry.starts_with('@') && entry.eq_ignore_ascii_case(name)
+            }
+        })
+    };
+    if all {
+        let users = pending_users
+            .into_iter()
+            .filter(|user| !excluded(user, false))
+            .collect();
+        let teams = pending_teams
+            .into_iter()
+            .filter(|team| !excluded(team, true))
+            .collect();
+        return Ok((dedup_cancel_names(users), dedup_cancel_names(teams)));
+    }
+    let mut users = Vec::new();
+    let mut teams = Vec::new();
+    for reviewer in reviewers {
+        match reviewer.strip_prefix('@') {
+            Some(team) => match pending_teams
+                .iter()
+                .find(|pending| pending.eq_ignore_ascii_case(team))
+            {
+                Some(pending) => teams.push(pending.clone()),
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "{reviewer} has no pending review request on {owner}/{repo}#{number}"
+                        ),
+                    ));
+                }
+            },
+            None => match pending_users
+                .iter()
+                .find(|pending| pending.eq_ignore_ascii_case(reviewer))
+            {
+                Some(pending) => users.push(pending.clone()),
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "{reviewer} has no pending review request on {owner}/{repo}#{number}"
+                        ),
+                    ));
+                }
+            },
+        }
+    }
+    Ok((dedup_cancel_names(users), dedup_cancel_names(teams)))
 }
 
 /// The OBS states a unified-state filter reads as: `Open` reads
@@ -1763,6 +2212,538 @@ mod tests {
         assert_eq!(
             gitea_state_for(&[PullRequestStatus::Open, PullRequestStatus::Closed]),
             GiteaPullRequestState::All
+        );
+    }
+
+    // --- Review-level act tests ---
+
+    fn act_client<'a>(
+        obs: Option<&'a ObsClient<'a>>,
+        gitea: Option<&'a GiteaClient<'a>>,
+    ) -> PullRequestClient<'a> {
+        PullRequestClient::new(obs, gitea)
+    }
+
+    fn obs_ref() -> PullRequestRef {
+        PullRequestRef::Obs(1398977)
+    }
+
+    fn gitea_ref() -> PullRequestRef {
+        PullRequestRef::Gitea {
+            owner: "openSUSE".to_string(),
+            repo: "geectl".to_string(),
+            number: 122,
+        }
+    }
+
+    fn review_json(login: &str, state: &str) -> String {
+        format!(
+            r#"{{"id": 1, "user": {{"login": "{login}"}}, "state": "{state}", "body": "", "dismissed": false, "submitted_at": "2026-11-22T19:52:58Z"}}"#
+        )
+    }
+
+    /// A reviews list with a pending user (bob), a pending team
+    /// (probe-team), and a decided review (plusky, APPROVED).
+    fn pending_reviews_json() -> String {
+        r#"[{"id": 1, "user": {"login": "bob"}, "state": "REQUEST_REVIEW", "body": "", "dismissed": false}, {"id": 2, "user": null, "team": {"id": 3, "name": "probe-team", "description": "", "permission": "none", "units": [], "units_map": {}, "includes_all_repositories": false, "can_create_org_repo": false}, "state": "REQUEST_REVIEW", "body": "", "dismissed": false}, {"id": 3, "user": {"login": "plusky"}, "state": "APPROVED", "body": "", "dismissed": false}]"#
+            .to_string()
+    }
+
+    fn comments_xml() -> String {
+        r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Looks good.</comment></comments>"#
+            .to_string()
+    }
+
+    #[test]
+    fn approve_obs_posts_changereviewstate_as_the_acting_user() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/1398977?cmd=changereviewstate&newstate=accepted&by_user=scarabeus_iv",
+            "<status code=\"ok\" />",
+        );
+        let obs = obs_client(&http);
+        let opinion = act_client(Some(&obs), None)
+            .approve(&obs_ref(), None, Some("Looks good."), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(opinion.reviewer, "user scarabeus_iv");
+        assert_eq!(opinion.state, OpinionState::Approved);
+        assert_eq!(opinion.comment, "Looks good.");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "Looks good.");
+        assert!(calls[0].2);
+    }
+
+    #[test]
+    fn approve_obs_dry_run_posts_nothing() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/1398977?cmd=changereviewstate&newstate=accepted&by_user=scarabeus_iv",
+            "<status code=\"ok\" />",
+        );
+        let obs = obs_client(&http);
+        let dry = DryRun::new(true);
+        let opinion = act_client(Some(&obs), None)
+            .approve(&obs_ref(), None, Some("Looks good."), &dry)
+            .unwrap();
+        assert!(opinion.is_none());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(dry.plan().len(), 1);
+        assert!(dry.plan()[0].contains("to accepted"));
+    }
+
+    #[test]
+    fn request_changes_obs_posts_declined() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/1398977?cmd=changereviewstate&newstate=declined&by_user=scarabeus_iv",
+            "<status code=\"ok\" />",
+        );
+        let obs = obs_client(&http);
+        let opinion = act_client(Some(&obs), None)
+            .request_changes(&obs_ref(), None, Some("Needs work."), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(opinion.state, OpinionState::ChangesRequested);
+        assert_eq!(opinion.comment, "Needs work.");
+    }
+
+    #[test]
+    fn approve_obs_with_an_explicit_target_uses_it() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/1398977?cmd=changereviewstate&newstate=accepted&by_user=Admin",
+            "<status code=\"ok\" />",
+        );
+        let obs = obs_client(&http);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        let opinion = act_client(Some(&obs), None)
+            .approve(&obs_ref(), Some(&target), None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(opinion.reviewer, "user Admin");
+        assert_eq!(opinion.comment, "");
+    }
+
+    #[test]
+    fn approve_gitea_posts_the_event() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews",
+            &review_json("plusky", "APPROVED"),
+        );
+        let gitea = gitea_client(&http);
+        let opinion = act_client(None, Some(&gitea))
+            .approve(&gitea_ref(), None, Some("Looks good."), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(opinion.reviewer, "plusky");
+        assert_eq!(opinion.state, OpinionState::Approved);
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, r#"{"event":"APPROVED","body":"Looks good."}"#);
+    }
+
+    #[test]
+    fn approve_gitea_refuses_a_target() {
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let target = ReviewTarget::new(Some("bob"), None, None, None).unwrap();
+        let err = act_client(None, Some(&gitea))
+            .approve(&gitea_ref(), Some(&target), None, &DryRun::new(false))
+            .expect_err("a target on a Gitea ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--user bob"));
+        let target = ReviewTarget::new(None, Some("reviewers"), None, None).unwrap();
+        let err = act_client(None, Some(&gitea))
+            .approve(&gitea_ref(), Some(&target), None, &DryRun::new(false))
+            .expect_err("a group target on a Gitea ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--group reviewers"));
+        let target = ReviewTarget::new(None, None, Some("openSUSE:Factory"), None).unwrap();
+        let err = act_client(None, Some(&gitea))
+            .approve(&gitea_ref(), Some(&target), None, &DryRun::new(false))
+            .expect_err("a project target on a Gitea ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--project openSUSE:Factory"));
+        // `ReviewTarget::new` refuses a package without its project,
+        // so a package-only target is built literally: the only way
+        // to reach the package branch of the refusal.
+        let target = ReviewTarget {
+            by_user: None,
+            by_group: None,
+            by_project: None,
+            by_package: Some("vim".to_string()),
+        };
+        let err = act_client(None, Some(&gitea))
+            .approve(&gitea_ref(), Some(&target), None, &DryRun::new(false))
+            .expect_err("a package target on a Gitea ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--package vim"));
+    }
+
+    #[test]
+    fn comment_obs_re_reads_the_posted_comment() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/comments/request/1398977",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/comments/request/1398977",
+                &comments_xml(),
+            );
+        let obs = obs_client(&http);
+        let comment = act_client(Some(&obs), None)
+            .comment(&obs_ref(), "Looks good.", None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(comment.id, 7);
+        assert_eq!(comment.author, "scarabeus_iv");
+        assert_eq!(comment.body, "Looks good.");
+        assert_eq!(comment.parent_id, None);
+    }
+
+    #[test]
+    fn comment_obs_re_read_without_a_match_is_a_server_error() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/comments/request/1398977",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/comments/request/1398977",
+                r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Something else.</comment></comments>"#,
+            );
+        let obs = obs_client(&http);
+        let err = act_client(Some(&obs), None)
+            .comment(&obs_ref(), "Looks good.", None, &DryRun::new(false))
+            .expect_err("a re-read with no matching comment must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err
+            .to_string()
+            .contains("found no comment by scarabeus_iv with the posted text"));
+    }
+
+    #[test]
+    fn comment_obs_re_read_with_a_duplicate_takes_the_newest() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/comments/request/1398977",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/comments/request/1398977",
+                r#"<comments><comment id="7" who="scarabeus_iv" when="2026-11-22T19:52:58Z">Looks good.</comment><comment id="9" who="scarabeus_iv" when="2026-11-22T19:53:58Z">Looks good.</comment></comments>"#,
+            );
+        let obs = obs_client(&http);
+        let comment = act_client(Some(&obs), None)
+            .comment(&obs_ref(), "Looks good.", None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(comment.id, 9);
+        assert_eq!(comment.author, "scarabeus_iv");
+        assert_eq!(comment.body, "Looks good.");
+    }
+
+    #[test]
+    fn comment_obs_dry_run_posts_nothing() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/comments/request/1398977",
+            "<status code=\"ok\" />",
+        );
+        let obs = obs_client(&http);
+        let comment = act_client(Some(&obs), None)
+            .comment(&obs_ref(), "Looks good.", None, &DryRun::new(true))
+            .unwrap();
+        assert!(comment.is_none());
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn comment_gitea_posts_to_the_issue_thread() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+            r#"{"id": 7, "user": {"login": "plusky"}, "body": "One nit.", "created_at": "2026-11-22T19:52:58Z"}"#,
+        );
+        let gitea = gitea_client(&http);
+        let comment = act_client(None, Some(&gitea))
+            .comment(&gitea_ref(), "One nit.", None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(comment.id, 7);
+        assert_eq!(comment.author, "plusky");
+        assert_eq!(comment.parent_id, None);
+        assert_eq!(http.post_calls()[0].1, r#"{"body":"One nit."}"#);
+    }
+
+    #[test]
+    fn comment_gitea_refuses_a_parent() {
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .comment(&gitea_ref(), "A reply.", Some("7"), &DryRun::new(false))
+            .expect_err("a parent on a Gitea ref must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--parent 7"));
+    }
+
+    #[test]
+    fn comments_obs_lists() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/comments/request/1398977",
+            &comments_xml(),
+        );
+        let obs = obs_client(&http);
+        let comments = act_client(Some(&obs), None).comments(&obs_ref()).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, 7);
+        assert_eq!(comments[0].author, "scarabeus_iv");
+    }
+
+    #[test]
+    fn comments_gitea_lists() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments?page=1&limit=50",
+            r#"[{"id": 7, "user": {"login": "plusky"}, "body": "One nit.", "created_at": "2026-11-22T19:52:58Z"}]"#,
+        );
+        let gitea = gitea_client(&http);
+        let comments = act_client(None, Some(&gitea))
+            .comments(&gitea_ref())
+            .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].author, "plusky");
+        assert_eq!(comments[0].body, "One nit.");
+    }
+
+    #[test]
+    fn cancel_obs_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let err = act_client(Some(&obs), None)
+            .cancel_review_request(
+                &obs_ref(),
+                &["bob".to_string()],
+                false,
+                &[],
+                &DryRun::new(false),
+            )
+            .expect_err("an OBS cancel must fail closed");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("no request call"));
+    }
+
+    #[test]
+    fn cancel_gitea_named_cancels_one() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                &pending_reviews_json(),
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/requested_reviewers",
+                "",
+            );
+        let gitea = gitea_client(&http);
+        let cancelled = act_client(None, Some(&gitea))
+            .cancel_review_request(
+                &gitea_ref(),
+                &["BOB".to_string()],
+                false,
+                &[],
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled, vec!["bob"]);
+        let calls = http.delete_json_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, r#"{"reviewers":["bob"],"team_reviewers":[]}"#);
+    }
+
+    #[test]
+    fn cancel_gitea_all_cancels_users_and_teams_minus_excludes() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                &pending_reviews_json(),
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/requested_reviewers",
+                "",
+            );
+        let gitea = gitea_client(&http);
+        let cancelled = act_client(None, Some(&gitea))
+            .cancel_review_request(
+                &gitea_ref(),
+                &[],
+                true,
+                &["@probe-team".to_string()],
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled, vec!["bob"]);
+        assert_eq!(
+            http.delete_json_calls()[0].1,
+            r#"{"reviewers":["bob"],"team_reviewers":[]}"#
+        );
+    }
+
+    #[test]
+    fn cancel_gitea_named_without_a_pending_request_errors() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+            &pending_reviews_json(),
+        );
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .cancel_review_request(
+                &gitea_ref(),
+                &["nobody".to_string()],
+                false,
+                &[],
+                &DryRun::new(false),
+            )
+            .expect_err("a reviewer with no pending request must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err
+            .to_string()
+            .contains("nobody has no pending review request"));
+        assert!(http.delete_json_calls().is_empty());
+    }
+
+    #[test]
+    fn cancel_gitea_all_with_nothing_pending_is_a_noop() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+            "[]",
+        );
+        let gitea = gitea_client(&http);
+        let cancelled = act_client(None, Some(&gitea))
+            .cancel_review_request(&gitea_ref(), &[], true, &[], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(cancelled.is_empty());
+        assert!(http.delete_json_calls().is_empty());
+    }
+
+    #[test]
+    fn cancel_gitea_dry_run_deletes_nothing() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                &pending_reviews_json(),
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/requested_reviewers",
+                "",
+            );
+        let gitea = gitea_client(&http);
+        let cancelled = act_client(None, Some(&gitea))
+            .cancel_review_request(
+                &gitea_ref(),
+                &["bob".to_string()],
+                false,
+                &[],
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert!(cancelled.is_none());
+        assert!(http.delete_json_calls().is_empty());
+    }
+
+    #[test]
+    fn approve_obs_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let err = act_client(Some(&obs), None)
+            .approve(&obs_ref(), None, Some("Looks good."), &DryRun::new(false))
+            .expect_err("an approve without credentials must fail closed");
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.to_string().contains("OBS credentials"));
+    }
+
+    #[test]
+    fn cancel_gitea_named_twice_dedupes() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                &pending_reviews_json(),
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/requested_reviewers",
+                "",
+            );
+        let gitea = gitea_client(&http);
+        let cancelled = act_client(None, Some(&gitea))
+            .cancel_review_request(
+                &gitea_ref(),
+                &["BOB".to_string(), "bob".to_string()],
+                false,
+                &[],
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled, vec!["bob"]);
+        let calls = http.delete_json_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, r#"{"reviewers":["bob"],"team_reviewers":[]}"#);
+    }
+
+    #[test]
+    fn cancel_gitea_all_exclude_is_case_insensitive_and_ignores_unknown() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                &pending_reviews_json(),
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/requested_reviewers",
+                "",
+            );
+        let gitea = gitea_client(&http);
+        let cancelled = act_client(None, Some(&gitea))
+            .cancel_review_request(
+                &gitea_ref(),
+                &[],
+                true,
+                &["BoB".to_string(), "unknown".to_string()],
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled, vec!["@probe-team"]);
+        assert_eq!(
+            http.delete_json_calls()[0].1,
+            r#"{"reviewers":[],"team_reviewers":["probe-team"]}"#
+        );
+    }
+
+    #[test]
+    fn cancel_gitea_all_exclude_bare_team_name_excludes_the_team() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+                &pending_reviews_json(),
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/requested_reviewers",
+                "",
+            );
+        let gitea = gitea_client(&http);
+        let cancelled = act_client(None, Some(&gitea))
+            .cancel_review_request(
+                &gitea_ref(),
+                &[],
+                true,
+                &["probe-team".to_string()],
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled, vec!["bob"]);
+        assert_eq!(
+            http.delete_json_calls()[0].1,
+            r#"{"reviewers":["bob"],"team_reviewers":[]}"#
         );
     }
 }
