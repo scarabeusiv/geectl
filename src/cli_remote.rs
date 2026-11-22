@@ -285,6 +285,18 @@ pub enum RemoteCommand {
         #[arg(long)]
         binary: bool,
     },
+    /// Create a project. A mutation: dry-run is the default (only
+    /// the plan is printed); `--live` performs the creation.
+    CreateProject {
+        /// The project to create.
+        project: String,
+        /// The project title.
+        #[arg(long)]
+        title: String,
+        /// The project description.
+        #[arg(long)]
+        description: String,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
@@ -317,6 +329,7 @@ pub fn run_remote(
             Credentials::None
         }
         RemoteCommand::UploadFile { .. } if !live => Credentials::None,
+        RemoteCommand::CreateProject { .. } if !live => Credentials::None,
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -645,6 +658,26 @@ pub fn run_remote(
                 plan,
             ))
         }
+        RemoteCommand::CreateProject {
+            project,
+            title,
+            description,
+        } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.create_project(&project, &title, &description, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(create_project_result(
+                &project,
+                &title,
+                &description,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
     }
 }
 
@@ -777,6 +810,35 @@ fn upload_file_result(
     mutation_result(
         payload,
         format!("project: {project} package: {package} file: {file}"),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The `create-project` result: the payload carries the title and
+/// the description; the text carries the title and leaves the
+/// description to the payload (long free text).
+fn create_project_result(
+    project: &str,
+    title: &str,
+    description: &str,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let payload = json!({
+        "project": project,
+        "title": title,
+        "description": description,
+    });
+    let result_line = if dry_run {
+        format!("dry-run: would create project {project} (title: {title})")
+    } else {
+        format!("created project {project} (title: {title})")
+    };
+    mutation_result(
+        payload,
+        format!("project: {project}"),
         result_line,
         dry_run,
         plan,
@@ -1704,6 +1766,76 @@ mod tests {
         assert_eq!(
             text,
             "project: P package: K file: vim.spec\ndry_run: true\ndry-run: would upload file vim.spec to project P package K\n[dry-run] would: upload file P/K/vim.spec"
+        );
+    }
+
+    #[test]
+    fn create_project_parses_title_and_description() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "create-project",
+            "home:alice",
+            "--title",
+            "Alice",
+            "--description",
+            "Alice's project",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::CreateProject {
+                title,
+                description,
+                ..
+            } if title == "Alice" && description == "Alice's project"
+        ));
+        assert!(Cli::try_parse_from(["geectl", "remote", "create-project", "home:alice"]).is_err());
+        assert!(Cli::try_parse_from([
+            "geectl",
+            "remote",
+            "create-project",
+            "home:alice",
+            "--title",
+            "Alice"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn create_project_result_carries_title_in_both_formats() {
+        let (payload, text) = create_project_result(
+            "home:alice",
+            "Alice",
+            "A very long description",
+            false,
+            None,
+        );
+        assert_eq!(payload["project"], "home:alice");
+        assert_eq!(payload["title"], "Alice");
+        assert_eq!(payload["description"], "A very long description");
+        assert_eq!(payload["dry_run"], false);
+        assert!(!text.contains("A very long description"));
+        assert_eq!(
+            text,
+            "project: home:alice\ndry_run: false\ncreated project home:alice (title: Alice)"
+        );
+        let (payload, text) = create_project_result(
+            "home:alice",
+            "Alice",
+            "A very long description",
+            true,
+            Some(vec![
+                "[dry-run] would: create project home:alice".to_string()
+            ]),
+        );
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: create project home:alice"
+        );
+        assert_eq!(
+            text,
+            "project: home:alice\ndry_run: true\ndry-run: would create project home:alice (title: Alice)\n[dry-run] would: create project home:alice"
         );
     }
 
