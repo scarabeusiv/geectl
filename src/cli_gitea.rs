@@ -27,8 +27,10 @@
 //!
 //! Documented omissions (not gaps): `repo-list` text
 //! carries no clone URLs (identifiers stay; the URLs are in the
-//! JSON payload); `branch-list` text carries the full head SHA (the
+//! JSON payload) and no fork parent (the parent is in the JSON
+//! payload); `branch-list` text carries the full head SHA (the
 //! sync-verification primitive) but no commit message (long free
+//! text); `repo-create` text carries no description (long free
 //! text). The JSON payload remains the complete record in every case.
 
 use clap::{Args, Subcommand};
@@ -193,12 +195,12 @@ pub fn run_gitea(
                 "default_branch": args.default_branch,
                 "repository": created.as_ref().map(gitea_repository_json),
             });
-            let result_line = match &created {
-                Some(repository) => {
-                    format!("created repository {}", repository.full_name)
-                }
-                None => format!("dry-run: would create repository {}", args.name),
-            };
+            let result_line = repo_create_result_line(
+                created.as_ref(),
+                &args.name,
+                args.private,
+                &args.default_branch,
+            );
             let plan = if dry_run.enabled() {
                 Some(dry_run.plan())
             } else {
@@ -250,16 +252,7 @@ pub fn run_gitea(
                 "organization": args.organization,
                 "repository": forked.as_ref().map(gitea_repository_json),
             });
-            let result_line = match &forked {
-                Some(repository) => format!(
-                    "forked repository {}/{} to {}",
-                    args.owner, args.repo, repository.full_name
-                ),
-                None => format!(
-                    "dry-run: would fork repository {}/{}",
-                    args.owner, args.repo
-                ),
-            };
+            let result_line = repo_fork_result_line(forked.as_ref(), &args.owner, &args.repo);
             let plan = if dry_run.enabled() {
                 Some(dry_run.plan())
             } else {
@@ -342,6 +335,48 @@ fn gitea_client<'a>(
         .unwrap_or(DEFAULT_GITEA_URL);
     let credentials = EnvGiteaAuth.credentials()?;
     GiteaClient::with_base(http, base, credentials).map(|client| client.with_debug(debug.clone()))
+}
+
+/// The `repo-create` result line: the created repository's full
+/// name when live, the requested name in dry-run — plus `(private)`
+/// when the `--private` flag is passed and the default branch when
+/// given. The description is long free text and stays JSON-only.
+fn repo_create_result_line(
+    created: Option<&GiteaRepository>,
+    name: &str,
+    private: bool,
+    default_branch: &Option<String>,
+) -> String {
+    let mut options = Vec::new();
+    if private {
+        options.push("private".to_string());
+    }
+    if let Some(branch) = default_branch {
+        options.push(format!("default branch {branch}"));
+    }
+    let suffix = if options.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", options.join(", "))
+    };
+    match created {
+        Some(repository) => format!("created repository {}{suffix}", repository.full_name),
+        None => format!("dry-run: would create repository {name}{suffix}"),
+    }
+}
+
+/// The `repo-fork` result line: the forked repository's full name
+/// when live — which carries the new name and the organization —
+/// the source coordinates in dry-run (the plan names the fork
+/// target).
+fn repo_fork_result_line(forked: Option<&GiteaRepository>, owner: &str, repo: &str) -> String {
+    match forked {
+        Some(repository) => format!(
+            "forked repository {owner}/{repo} to {}",
+            repository.full_name
+        ),
+        None => format!("dry-run: would fork repository {owner}/{repo}"),
+    }
 }
 
 /// Prepend the one-line coordinate header to a text rendering
@@ -740,6 +775,17 @@ mod tests {
         assert!(text.contains("alice/systemd"));
         assert!(!text.contains("src.opensuse.org"));
         assert_eq!(render_repositories(&[]), "no repositories");
+        // The fork parent is JSON-only: a fork-only list carries the
+        // fork's own name and the PRIVATE column, never the parent.
+        let fork_only = render_repositories(&[sample_fork()]);
+        assert!(fork_only.contains("alice/systemd"));
+        assert!(!fork_only.contains("pool/systemd"));
+        assert!(fork_only.contains("PRIVATE"));
+        let row = fork_only
+            .lines()
+            .find(|line| line.contains("alice/systemd"))
+            .expect("fork row present");
+        assert!(row.ends_with("no"), "{row}");
     }
 
     #[test]
@@ -775,5 +821,82 @@ mod tests {
         assert_eq!(lines[1], "dry_run: true");
         assert!(lines[2].starts_with("dry-run: would delete"));
         assert_eq!(lines[3], "delete repository pool/systemd");
+    }
+
+    #[test]
+    fn repo_create_result_line_carries_privacy_and_default_branch() {
+        let fork = sample_fork();
+        assert_eq!(
+            repo_create_result_line(Some(&fork), "systemd", false, &None),
+            "created repository alice/systemd"
+        );
+        assert_eq!(
+            repo_create_result_line(Some(&fork), "systemd", true, &Some("factory".to_string())),
+            "created repository alice/systemd (private, default branch factory)"
+        );
+        assert_eq!(
+            repo_create_result_line(None, "systemd", false, &None),
+            "dry-run: would create repository systemd"
+        );
+        assert_eq!(
+            repo_create_result_line(None, "systemd", true, &Some("main".to_string())),
+            "dry-run: would create repository systemd (private, default branch main)"
+        );
+    }
+
+    #[test]
+    fn repo_fork_result_line_carries_the_fork_target() {
+        let fork = sample_fork();
+        assert_eq!(
+            repo_fork_result_line(Some(&fork), "pool", "systemd"),
+            "forked repository pool/systemd to alice/systemd"
+        );
+        assert_eq!(
+            repo_fork_result_line(None, "pool", "systemd"),
+            "dry-run: would fork repository pool/systemd"
+        );
+    }
+
+    /// The agreement test: every id, name, and revision the JSON
+    /// payload carries appears in the text rendering, except the
+    /// documented omissions (clone URLs in `repo-list`, commit
+    /// messages in `branch-list`).
+    #[test]
+    fn text_carries_every_identifying_field() {
+        let repo = sample_fork();
+        let text = render_repository(&repo);
+        for field in [
+            "alice/systemd",
+            "pool/systemd",
+            "factory",
+            "https://src.opensuse.org/pool/systemd.git",
+            "git@src.opensuse.org:pool/systemd.git",
+        ] {
+            assert!(text.contains(field), "repo text misses {field}:\n{text}");
+        }
+        let text = render_repositories(&[sample_repository(), sample_fork()]);
+        for field in ["pool/systemd", "alice/systemd", "factory"] {
+            assert!(
+                text.contains(field),
+                "repo list text misses {field}:\n{text}"
+            );
+        }
+        assert!(!text.contains("src.opensuse.org"));
+
+        let branch = sample_branch();
+        let text = render_branches(std::slice::from_ref(&branch));
+        assert!(text.contains("factory"));
+        assert!(text.contains("0123456789abcdef0123456789abcdef01234567"));
+        assert!(text.contains("yes"));
+        assert!(!text.contains("Update systemd"));
+        let text = render_branch(&branch);
+        for field in [
+            "factory",
+            "0123456789abcdef0123456789abcdef01234567",
+            "Update systemd",
+            "protected: yes",
+        ] {
+            assert!(text.contains(field), "branch text misses {field}:\n{text}");
+        }
     }
 }
