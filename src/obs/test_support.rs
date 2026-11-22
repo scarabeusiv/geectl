@@ -1,0 +1,323 @@
+use super::RequestSearch;
+use super::SrPayload;
+use crate::auth::Credentials;
+use crate::error::ErrorKind;
+use crate::error::GeectlError;
+use crate::http::HttpClient;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::VecDeque;
+/// A fake HTTP client with canned responses, for fixtures. GET,
+/// POST, and DELETE are keyed separately by URL; a URL with no
+/// canned response is a transport error. Calls are recorded so
+/// tests can assert on the method, the URL, whether auth was
+/// sent, and (for POST) the body.
+pub(crate) struct FakeHttp {
+    gets: RefCell<HashMap<String, String>>,
+    get_sequences: RefCell<HashMap<String, VecDeque<String>>>,
+    get_errors: RefCell<HashMap<String, ErrorKind>>,
+    posts: RefCell<HashMap<String, String>>,
+    post_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
+    deletes: RefCell<HashMap<String, String>>,
+    puts: RefCell<HashMap<String, String>>,
+    put_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
+    get_calls: RefCell<Vec<(String, bool)>>,
+    get_bytes: RefCell<HashMap<String, Vec<u8>>>,
+    get_bytes_calls: RefCell<Vec<(String, bool)>>,
+    post_calls: RefCell<Vec<(String, String, bool)>>,
+    delete_calls: RefCell<Vec<(String, bool)>>,
+    put_calls: RefCell<Vec<(String, String, bool)>>,
+}
+
+impl FakeHttp {
+    pub(crate) fn new() -> Self {
+        FakeHttp {
+            gets: RefCell::new(HashMap::new()),
+            get_sequences: RefCell::new(HashMap::new()),
+            get_errors: RefCell::new(HashMap::new()),
+            posts: RefCell::new(HashMap::new()),
+            post_errors: RefCell::new(HashMap::new()),
+            deletes: RefCell::new(HashMap::new()),
+            puts: RefCell::new(HashMap::new()),
+            put_errors: RefCell::new(HashMap::new()),
+            get_calls: RefCell::new(Vec::new()),
+            get_bytes: RefCell::new(HashMap::new()),
+            get_bytes_calls: RefCell::new(Vec::new()),
+            post_calls: RefCell::new(Vec::new()),
+            delete_calls: RefCell::new(Vec::new()),
+            put_calls: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn with_get(self, url: &str, body: &str) -> Self {
+        self.gets
+            .borrow_mut()
+            .insert(url.to_string(), body.to_string());
+        self
+    }
+
+    /// Answer successive GETs of `url` with `bodies` in order;
+    /// once the queue is empty, the plain canned response (if
+    /// any) answers.
+    pub(crate) fn with_get_sequence(self, url: &str, bodies: &[&str]) -> Self {
+        self.get_sequences.borrow_mut().insert(
+            url.to_string(),
+            bodies.iter().map(|body| body.to_string()).collect(),
+        );
+        self
+    }
+
+    pub(crate) fn with_get_bytes(self, url: &str, body: &[u8]) -> Self {
+        self.get_bytes
+            .borrow_mut()
+            .insert(url.to_string(), body.to_vec());
+        self
+    }
+
+    pub(crate) fn with_get_error(self, url: &str, kind: ErrorKind) -> Self {
+        self.get_errors.borrow_mut().insert(url.to_string(), kind);
+        self
+    }
+
+    pub(crate) fn with_post_error(self, url: &str, kind: ErrorKind) -> Self {
+        self.post_errors
+            .borrow_mut()
+            .insert(url.to_string(), VecDeque::from([kind]));
+        self
+    }
+
+    /// Answer the next POSTs to `url` with these errors, in order;
+    /// once the queue is empty the canned `posts` body answers.
+    /// The POST twin of `with_put_error_sequence`: lets a test
+    /// model a backend that is not ready yet and then catches up.
+    pub(crate) fn with_post_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
+        self.post_errors
+            .borrow_mut()
+            .insert(url.to_string(), kinds.iter().copied().collect());
+        self
+    }
+
+    pub(crate) fn with_post(self, url: &str, body: &str) -> Self {
+        self.posts
+            .borrow_mut()
+            .insert(url.to_string(), body.to_string());
+        self
+    }
+
+    pub(crate) fn with_delete(self, url: &str, body: &str) -> Self {
+        self.deletes
+            .borrow_mut()
+            .insert(url.to_string(), body.to_string());
+        self
+    }
+
+    pub(crate) fn with_put(self, url: &str, body: &str) -> Self {
+        self.puts
+            .borrow_mut()
+            .insert(url.to_string(), body.to_string());
+        self
+    }
+
+    /// Answer the next PUTs to `url` with these errors, in order;
+    /// once the queue is empty the canned `puts` body answers.
+    /// Lets a test model a backend that is not ready yet and then
+    /// catches up, instead of a single static answer.
+    pub(crate) fn with_put_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
+        self.put_errors
+            .borrow_mut()
+            .insert(url.to_string(), kinds.iter().copied().collect());
+        self
+    }
+
+    pub(crate) fn get_calls(&self) -> Vec<(String, bool)> {
+        self.get_calls.borrow().clone()
+    }
+
+    pub(crate) fn get_bytes_calls(&self) -> Vec<(String, bool)> {
+        self.get_bytes_calls.borrow().clone()
+    }
+
+    pub(crate) fn post_calls(&self) -> Vec<(String, String, bool)> {
+        self.post_calls.borrow().clone()
+    }
+
+    pub(crate) fn delete_calls(&self) -> Vec<(String, bool)> {
+        self.delete_calls.borrow().clone()
+    }
+
+    pub(crate) fn put_calls(&self) -> Vec<(String, String, bool)> {
+        self.put_calls.borrow().clone()
+    }
+}
+
+impl HttpClient for FakeHttp {
+    fn get(&self, url: &str) -> Result<String, GeectlError> {
+        self.get_with(url, &Credentials::None)
+    }
+
+    fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
+        let authed = !matches!(credentials, Credentials::None);
+        self.get_calls.borrow_mut().push((url.to_string(), authed));
+        if let Some(kind) = self.get_errors.borrow().get(url).cloned() {
+            return Err(GeectlError::new(
+                kind,
+                format!("canned GET error for {url}"),
+            ));
+        }
+        if let Some(body) = self
+            .get_sequences
+            .borrow_mut()
+            .get_mut(url)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Ok(body);
+        }
+        self.gets.borrow().get(url).cloned().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::NetworkError,
+                format!("no canned GET response for {url}"),
+            )
+        })
+    }
+
+    fn get_bytes(&self, url: &str, credentials: &Credentials) -> Result<Vec<u8>, GeectlError> {
+        let authed = !matches!(credentials, Credentials::None);
+        self.get_bytes_calls
+            .borrow_mut()
+            .push((url.to_string(), authed));
+        if let Some(kind) = self.get_errors.borrow().get(url).cloned() {
+            return Err(GeectlError::new(
+                kind,
+                format!("canned GET error for {url}"),
+            ));
+        }
+        self.get_bytes.borrow().get(url).cloned().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::NetworkError,
+                format!("no canned GET bytes response for {url}"),
+            )
+        })
+    }
+
+    fn post(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        let authed = !matches!(credentials, Credentials::None);
+        self.post_calls
+            .borrow_mut()
+            .push((url.to_string(), body.to_string(), authed));
+        if let Some(kind) = self
+            .post_errors
+            .borrow_mut()
+            .get_mut(url)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Err(GeectlError::new(
+                kind,
+                format!("canned POST error for {url}"),
+            ));
+        }
+        self.posts.borrow().get(url).cloned().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::NetworkError,
+                format!("no canned POST response for {url}"),
+            )
+        })
+    }
+
+    fn post_json(&self, url: &str, body: &str) -> Result<String, GeectlError> {
+        // The fake has no auth seam, so post_json resolves to no
+        // credentials — the same delegation as post_text. Fixtures
+        // do not distinguish content types: the transport tests in
+        // `http.rs` assert the header each method sends.
+        self.post(url, body, &Credentials::None)
+    }
+
+    fn post_text(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // Fixtures do not distinguish content types: the transport
+        // tests in `http.rs` assert the header each method sends.
+        self.post(url, body, credentials)
+    }
+
+    fn delete(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
+        let authed = !matches!(credentials, Credentials::None);
+        self.delete_calls
+            .borrow_mut()
+            .push((url.to_string(), authed));
+        self.deletes.borrow().get(url).cloned().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::NetworkError,
+                format!("no canned DELETE response for {url}"),
+            )
+        })
+    }
+
+    fn put(&self, url: &str, body: &str, credentials: &Credentials) -> Result<String, GeectlError> {
+        // Fixtures do not distinguish content types: the transport
+        // tests in `http.rs` assert the header PUT sends.
+        let authed = !matches!(credentials, Credentials::None);
+        self.put_calls
+            .borrow_mut()
+            .push((url.to_string(), body.to_string(), authed));
+        if let Some(kind) = self
+            .put_errors
+            .borrow_mut()
+            .get_mut(url)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Err(GeectlError::new(
+                kind,
+                format!("canned PUT error for {url}"),
+            ));
+        }
+        self.puts.borrow().get(url).cloned().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::NetworkError,
+                format!("no canned PUT response for {url}"),
+            )
+        })
+    }
+
+    fn put_file(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // Fixtures do not distinguish content types: the transport
+        // tests in `http.rs` assert the header each method sends.
+        self.put(url, body, credentials)
+    }
+}
+
+pub(crate) fn basic_credentials() -> Credentials {
+    Credentials::Basic {
+        username: "scarabeus_iv".to_string(),
+        password: "secret".to_string(),
+    }
+}
+
+pub(crate) fn payload() -> SrPayload {
+    SrPayload::new(
+            "home:scarabeus_iv",
+            "foo",
+            "devel:languages:python",
+            "foo",
+            "Update foo to 2.0",
+            "-------------------------------------------------------------------\nFri Nov 20 07:00:00 UTC 2026 - Tomáš Chvátal <tomas.chvatal@gmail.com>\n\n- Update to version 2.0.\n",
+            &[],
+        )
+        .unwrap()
+}
+
+pub(crate) fn search_without_states() -> RequestSearch {
+    RequestSearch::new().states(Vec::new())
+}

@@ -20,7 +20,7 @@
 //! - [`debug`]: the debug channel — one coherent `--debug` stream of
 //!   human-readable lines on stderr (HTTP attempts, retries, library
 //!   decision points), with bodies only behind `--debug-body`.
-//! - [`obs`]: the OBS operations a tool uses to move a package update
+//! - [`obs`]: the OBS operations (one module per cluster, `src/obs/`) a tool uses to move a package update
 //!   through the distribution — devel-project lookup, devel version,
 //!   open-submit-request check, submit-request filing, superseding,
 //!   branch cleanup, branch-project and branch-package creation,
