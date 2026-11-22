@@ -732,6 +732,44 @@ fn request_add_comment_dry_run_text_echoes_the_body() {
 }
 
 #[test]
+fn request_search_with_invalid_since_fails_before_credentials() {
+    // The date is validated while the search is built, before any
+    // credential resolution, so a bad date fails as InvalidInput
+    // even with no credentials configured.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "search", "--since", "garbage"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn request_search_with_zero_limit_fails_before_credentials() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "search", "--limit", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn request_search_with_since_and_limit_without_credentials_fails_with_config_error() {
+    // Valid filters pass validation, so the run reaches credential
+    // resolution and fails there, with a ConfigError (exit 9).
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "search", "--since", "2026-10-01", "--limit", "5"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    assert_eq!(error_of(&out)["error"]["code"], "config_error");
+}
+
+#[test]
 fn request_search_with_unknown_type_fails_before_credentials() {
     // The search is built and validated before any credential
     // resolution, so an invalid filter fails as InvalidInput even

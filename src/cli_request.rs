@@ -133,6 +133,13 @@ pub enum RequestCommand {
         /// Include the full history of each request.
         #[arg(long)]
         with_full_history: bool,
+        /// Only requests with a history entry at or after this
+        /// date, as `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`.
+        #[arg(long)]
+        since: Option<String>,
+        /// Ask the server for at most this many matches.
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Show the diff of a submit request: the unified diff, or the
     /// request XML with the diff injected with `--xml`.
@@ -436,6 +443,8 @@ pub fn run(
             exclude_target_project,
             with_history,
             with_full_history,
+            since,
+            limit,
         } => {
             // The coordinates are read before `build_search` moves
             // the filter values, and the search is built and
@@ -444,6 +453,8 @@ pub fn run(
             // credentials are configured (the file arms already
             // validate their payloads this way).
             let ids: Vec<String> = request_ids.iter().map(u64::to_string).collect();
+            let since_values: Vec<String> = since.iter().cloned().collect();
+            let limit_values: Vec<String> = limit.iter().map(usize::to_string).collect();
             let coordinates = search_coordinates(&[
                 ("request-id", &ids),
                 ("project", &project),
@@ -457,6 +468,8 @@ pub fn run(
                 ("state", &state),
                 ("type", &types),
                 ("exclude-target-project", &exclude_target_project),
+                ("since", &since_values),
+                ("limit", &limit_values),
             ]);
             let search = build_search(
                 request_ids,
@@ -473,6 +486,8 @@ pub fn run(
                 exclude_target_project,
                 with_history,
                 with_full_history,
+                since,
+                limit,
             )?;
             search.match_expr()?;
             with_client(debug, true, |client| {
@@ -839,7 +854,17 @@ fn build_search(
     exclude_target_project: Vec<String>,
     with_history: bool,
     with_full_history: bool,
+    since: Option<String>,
+    limit: Option<usize>,
 ) -> Result<RequestSearch, GeectlError> {
+    if let Some(limit) = limit {
+        if limit == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a request search limit must be at least 1",
+            ));
+        }
+    }
     let mut states = Vec::new();
     for value in &state {
         states.push(parse_state(value)?);
@@ -860,6 +885,12 @@ fn build_search(
         .with_full_history(with_full_history);
     if !states.is_empty() {
         search = search.states(states);
+    }
+    if let Some(since) = since {
+        search = search.since(since);
+    }
+    if let Some(limit) = limit {
+        search = search.limit(limit);
     }
     Ok(search)
 }
@@ -2241,6 +2272,8 @@ mod tests {
             Vec::new(),
             false,
             false,
+            None,
+            None,
         )
         .expect("an empty search builds");
         let expr = search.match_expr().expect("a match builds");
@@ -2262,6 +2295,8 @@ mod tests {
             Vec::new(),
             false,
             false,
+            None,
+            None,
         )
         .expect("a state search builds");
         let expr = search.match_expr().expect("a match builds");
@@ -2620,6 +2655,72 @@ mod tests {
                 "text missing {expected:?}:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn build_search_passes_since_and_limit_through() {
+        let search = build_search(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            false,
+            false,
+            Some("2026-10-01".to_string()),
+            Some(3),
+        )
+        .expect("a valid since and limit build");
+        assert_eq!(search.limit_value(), Some(3));
+        assert!(
+            search
+                .match_expr()
+                .expect("the built search builds")
+                .contains("history[@when>='2026-10-01T00:00:00']"),
+            "since clause present"
+        );
+    }
+
+    #[test]
+    fn build_search_refuses_a_zero_limit() {
+        let err = build_search(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            false,
+            false,
+            None,
+            Some(0),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn search_coordinates_echo_since_and_limit() {
+        assert_eq!(
+            search_coordinates(&[
+                ("since", &["2026-10-01".to_string()]),
+                ("limit", &["3".to_string()]),
+            ]),
+            " since=2026-10-01 limit=3"
+        );
     }
 
     #[test]
