@@ -511,8 +511,8 @@ rules:
 **Direct adoptions: 0. Spec reference: 36 tests.**
 
 osc's WC tests are the only specification of the commit/update protocol;
-whether they transfer depends on the API-only-vs-`.osc`-compatible decision,
-which is undecided. Under API-only, only the protocol sequence transfers;
+whether they transfer depends on the API-only-vs-`.osc`-compatible decision.
+Under API-only, only the protocol sequence transfers;
 under `.osc`-compatible, the WC tests become directly relevant (large scope).
 
 - `tests/test_commit.py` (16) — commit protocol (see batch 1): validate →
@@ -645,8 +645,7 @@ Batch in brackets:
   `test_project_status.py` (17), `test_addfiles.py` (6),
   `test_deletefiles.py` (16), `test_revertfiles.py` (9),
   `test_init_package.py` (6), `test_init_project.py` (5), `test_vc.py` (4);
-  Behave checkout/add/rm/mv/repairwc scenarios — geectl has no working copy
-  (batch 6 decision undecided; see above).
+  Behave checkout/add/rm/mv/repairwc scenarios — geectl has no working copy.
 - CLI text/arity/formatting: `test_request.py` display tests (`:431`,
   `:449`, `:464`, `:500`), `test_commandline.py` arg-parsing class (18 of the
   slice — `TestPopProjectPackageRepositoryArchFromArgs` or
