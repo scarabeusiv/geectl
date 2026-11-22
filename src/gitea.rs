@@ -1717,6 +1717,127 @@ impl<'a> GiteaClient<'a> {
         Ok(Some(existing.login))
     }
 
+    /// List a team's repositories (`GET /api/v1/teams/{id}/repos`).
+    /// Paginates internally and is bounded like `repo_list`.
+    pub fn team_list_repos(&self, id: i64) -> Result<Vec<GiteaRepository>, GeectlError> {
+        validate_team_id(id)?;
+        let id_str = id.to_string();
+        self.list_paged::<GiteaRepository>(
+            &["api", "v1", "teams", &id_str, "repos"],
+            &[],
+            &format!("repositories of team {id}"),
+            "the list is bounded at 500 entries",
+        )
+    }
+
+    /// Read one team repository (`GET
+    /// /api/v1/teams/{id}/repos/{org}/{repo}`): the repo entry.
+    /// A repo the team cannot access answers 404, which reads as
+    /// `NotFound` naming the repo — the same read the remove
+    /// pre-check and the add verification use.
+    pub fn team_repo_get(
+        &self,
+        id: i64,
+        org: &str,
+        repo: &str,
+    ) -> Result<GiteaRepository, GeectlError> {
+        validate_team_id(id)?;
+        validate_gitea_name(org, "organization")?;
+        validate_gitea_name(repo, "repo")?;
+        let id_str = id.to_string();
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "teams", &id_str, "repos", org, repo],
+            &[],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_repository(&body, org, repo)
+    }
+
+    /// Add a repository to a team (`PUT
+    /// /api/v1/teams/{id}/repos/{org}/{repo}`) and return the repo
+    /// entry read back. The PUT answers 204 with no body, so the
+    /// add is verified by re-reading the repo entry. DryRun-guarded
+    /// like `repo_create`: the guard runs before any server read,
+    /// and the result is `None` in dry-run. `force` is the
+    /// confirmation: without it the add is refused client-side
+    /// (`InvalidInput` naming force) before any server read —
+    /// the team's level is not known without a read, so every
+    /// add confirms. A dry-run plan needs no force.
+    pub fn team_add_repo(
+        &self,
+        id: i64,
+        org: &str,
+        repo: &str,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaRepository>, GeectlError> {
+        validate_team_id(id)?;
+        validate_gitea_name(org, "organization")?;
+        validate_gitea_name(repo, "repo")?;
+        if !dry_run.allow(&format!("add repository {org}/{repo} to team {id}")) {
+            return Ok(None);
+        }
+        if !force {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to add repository {org}/{repo} to team {id} without force: adding a repository grants the team's access; pass force to confirm"
+                ),
+            ));
+        }
+        let id_str = id.to_string();
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "teams", &id_str, "repos", org, repo],
+            &[],
+        );
+        self.http.put_json_with(&url, "{}", &self.credentials)?;
+        Ok(Some(self.team_repo_get(id, org, repo)?))
+    }
+
+    /// Remove a repository from a team (`DELETE
+    /// /api/v1/teams/{id}/repos/{org}/{repo}`) and return the
+    /// removed repo's full name. The repo entry is read first: a
+    /// repo the team cannot access answers 404 there, so the
+    /// remove refuses with `NotFound` naming the repo before any
+    /// delete runs. `force` is the confirmation: without it the
+    /// remove is refused client-side (`InvalidInput` naming
+    /// force) before any server read. A dry-run plan needs no
+    /// force.
+    pub fn team_remove_repo(
+        &self,
+        id: i64,
+        org: &str,
+        repo: &str,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<Option<String>, GeectlError> {
+        validate_team_id(id)?;
+        validate_gitea_name(org, "organization")?;
+        validate_gitea_name(repo, "repo")?;
+        if !dry_run.allow(&format!("remove repository {org}/{repo} from team {id}")) {
+            return Ok(None);
+        }
+        if !force {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to remove repository {org}/{repo} from team {id} without force: removing repo access is destructive; pass force to confirm"
+                ),
+            ));
+        }
+        let existing = self.team_repo_get(id, org, repo)?;
+        let id_str = id.to_string();
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "teams", &id_str, "repos", org, repo],
+            &[],
+        );
+        self.http.delete(&url, &self.credentials)?;
+        Ok(Some(existing.full_name))
+    }
+
     /// List a repository's branches (`GET
     /// /api/v1/repos/{owner}/{repo}/branches`): the names and head
     /// commits of what a fork carries. Paginates internally and is
@@ -6478,6 +6599,199 @@ mod tests {
             vec!["[dry-run] would: remove member fbui from team 7".to_string()]
         );
         assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn team_list_repos_returns_the_repos() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/teams/7/repos?page=1&limit=50",
+            &repo_list_json(&[
+                repo_json("pool", "systemd", None),
+                repo_json("pool", "libstrophe", None),
+            ]),
+        );
+        let repos = client(&http).team_list_repos(7).unwrap();
+        assert_eq!(
+            repos
+                .iter()
+                .map(|r| r.full_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pool/systemd", "pool/libstrophe"]
+        );
+    }
+
+    #[test]
+    fn team_list_repos_empty_list_is_empty() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/teams/7/repos?page=1&limit=50",
+            "null",
+        );
+        let repos = client(&http).team_list_repos(7).unwrap();
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn team_repo_get_parses_the_repo() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd",
+            &repo_json("pool", "systemd", None),
+        );
+        let repo = client(&http).team_repo_get(7, "pool", "systemd").unwrap();
+        assert_eq!(repo.full_name, "pool/systemd");
+    }
+
+    #[test]
+    fn team_repo_get_for_another_repo_is_a_server_error() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd",
+            &repo_json("pool", "libstrophe", None),
+        );
+        let err = client(&http)
+            .team_repo_get(7, "pool", "systemd")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn team_add_repo_puts_and_verifies() {
+        let http = FakeHttp::new()
+            .with_put(
+                "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd",
+                "",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd",
+                &repo_json("pool", "systemd", None),
+            );
+        let repo = client(&http)
+            .team_add_repo(7, "pool", "systemd", true, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run add returns the repo");
+        assert_eq!(repo.full_name, "pool/systemd");
+        assert_eq!(
+            http.put_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd".to_string(),
+                "{}".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn team_add_repo_unrecorded_is_a_server_error() {
+        let http = FakeHttp::new()
+            .with_put(
+                "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd",
+                "",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd",
+                &repo_json("pool", "libstrophe", None),
+            );
+        let err = client(&http)
+            .team_add_repo(7, "pool", "systemd", true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn team_add_repo_dry_run_plans_and_puts_nothing() {
+        let http = FakeHttp::new();
+        let planned = client(&http)
+            .team_add_repo(7, "pool", "systemd", false, &DryRun::new(true))
+            .unwrap();
+        assert!(planned.is_none());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn team_add_repo_refuses_without_force() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_add_repo(7, "pool", "systemd", false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn team_add_repo_refuses_an_invalid_repo_name() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_add_repo(7, "pool", "has space", true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn team_remove_repo_reads_then_deletes() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd",
+                &repo_json("pool", "systemd", None),
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd",
+                "",
+            );
+        let removed = client(&http)
+            .team_remove_repo(7, "pool", "systemd", true, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run remove returns the full name");
+        assert_eq!(removed, "pool/systemd");
+        assert_eq!(
+            http.delete_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn team_remove_repo_refuses_without_force() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_remove_repo(7, "pool", "systemd", false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.delete_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn team_remove_repo_dry_run_plans_and_deletes_nothing() {
+        let http = FakeHttp::new();
+        let dry_run = DryRun::new(true);
+        // Planning a remove needs no force: the refusal guards the
+        // live remove, not the plan.
+        let result = client(&http)
+            .team_remove_repo(7, "pool", "systemd", false, &dry_run)
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: remove repository pool/systemd from team 7".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn team_remove_repo_missing_repo_is_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/teams/7/repos/pool/systemd",
+            ErrorKind::NotFound,
+        );
+        let err = client(&http)
+            .team_remove_repo(7, "pool", "systemd", true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
         assert!(http.delete_calls().is_empty());
     }
 }
