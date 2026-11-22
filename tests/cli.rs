@@ -790,17 +790,21 @@ fn remote_unreachable_server_fails_with_network_error() {
 /// its success path offline. The thread is deliberately not joined:
 /// if the binary never connects, the test fails on its own assertion
 /// and the blocked thread dies with the test process.
-fn serve_once(body: &str) -> std::net::SocketAddr {
+/// A one-shot HTTP fixture serving an explicit status line: the
+/// same single-connection shape as `serve_once`, for the failure
+/// paths (a credentialed read answered 401).
+fn serve_once_status(status: u16, reason: &str, body: &str) -> std::net::SocketAddr {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let body = body.to_string();
+    let reason = reason.to_string();
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 4096];
         let _ = stream.read(&mut buf);
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
@@ -808,6 +812,10 @@ fn serve_once(body: &str) -> std::net::SocketAddr {
         let _ = stream.flush();
     });
     addr
+}
+
+fn serve_once(body: &str) -> std::net::SocketAddr {
+    serve_once_status(200, "OK", body)
 }
 
 /// A many-shot HTTP fixture: serves the same canned response to
@@ -1119,6 +1127,40 @@ fn remote_list_projects_with_half_set_credentials_fails_with_config_error() {
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
     assert_eq!(value["error"]["code"], "config_error");
+}
+
+// --- unconfigured credentialed read (issue #108) ---
+//
+// With nothing configured the credentialed read goes out without
+// credentials: the server answers 401 and the CLI reports the auth
+// failure structurally. The half-set case fails fast with a config
+// error; the unconfigured case reaches the server and fails on its
+// 401 — both fail closed, never an empty result.
+
+#[test]
+fn remote_list_projects_without_credentials_fails_with_auth_error() {
+    // `list-projects` has no public route, so with no credentials
+    // configured the read goes out unauthenticated and the server
+    // 401s. The CLI reports the auth failure (exit 4), never an
+    // empty project list.
+    let addr = serve_once_status(
+        401,
+        "Unauthorized",
+        "<status code=\"401\"><summary>Unauthorized</summary></status>",
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "list-projects"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "auth_failed");
+    assert!(value["error"]["message"].is_string());
+    assert!(value["error"]["remediation"].is_string());
 }
 
 #[test]
