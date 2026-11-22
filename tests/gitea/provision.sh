@@ -131,7 +131,9 @@ echo "Gitea is up."
 # an organization, and the token names the scope the server demands
 # (403 otherwise). Phase 2 adds no scope: repo list and branch reads
 # are `read:repository`, repo create is `write:repository` +
-# `write:user`. Scopes are recorded per phase here — do not widen
+# `write:user`. The global pull-request search reads the issues
+# search endpoint, which the server gates on `read:issue` (403
+# without it). Scopes are recorded per phase here — do not widen
 # them silently.
 echo "Creating the test user and token ..."
 $CONTAINER exec -u git "$CONTAINER_NAME" \
@@ -144,7 +146,7 @@ TOKEN_OUTPUT="$($CONTAINER exec -u git "$CONTAINER_NAME" \
     gitea admin user generate-access-token \
     --username "$GITEA_USER" \
     --token-name geectl-live \
-    --scopes read:user,read:repository,write:repository,write:user,write:organization)"
+    --scopes read:user,read:repository,read:issue,write:repository,write:user,write:organization)"
 TOKEN="$(printf '%s' "$TOKEN_OUTPUT" | sed -n 's/^Access token was successfully created: //p')"
 if [ -z "$TOKEN" ]; then
     # The raw output is withheld on purpose: it may contain the

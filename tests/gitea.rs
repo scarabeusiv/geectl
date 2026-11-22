@@ -39,7 +39,7 @@
 use geectl::auth::{resolve_gitea_bearer_for_url, AuthProvider, Credentials, EnvGiteaAuth};
 use geectl::debug::Debug;
 use geectl::error::ErrorKind;
-use geectl::gitea::{ForkRepoOptions, GiteaClient, RepoCreateOptions};
+use geectl::gitea::{ForkRepoOptions, GiteaClient, GiteaPullRequestState, RepoCreateOptions};
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::DryRun;
 
@@ -1296,6 +1296,221 @@ fn gitea_missing_repo_is_not_found() {
         ErrorKind::NotFound,
         "a missing repository must map to NotFound; got {err:?}"
     );
+}
+
+/// Create a pull request through the raw API and return its number.
+/// Pull-request creation goes through the raw API; the assertions
+/// then go through the typed read operations.
+fn create_pull_request_raw(
+    http: &UreqClient,
+    at: &RepoAddr,
+    title: &str,
+    body: &str,
+    head: &str,
+    base: &str,
+) -> u64 {
+    let payload = serde_json::json!({
+        "title": title,
+        "body": body,
+        "head": head,
+        "base": base,
+    })
+    .to_string();
+    let created = http
+        .post_json(
+            &format!("{}/api/v1/repos/{}/{}/pulls", at.base, at.owner, at.repo),
+            &payload,
+        )
+        .expect("POST /api/v1/repos/{owner}/{repo}/pulls on the Gitea instance");
+    let created: serde_json::Value =
+        serde_json::from_str(&created).expect("POST the pulls API returns valid JSON");
+    created["number"]
+        .as_u64()
+        .expect("the pulls API returns the PR number")
+}
+
+/// Post a review through the raw API. The review author is the
+/// provisioned user, who also authored the PR — Gitea refuses an
+/// APPROVE or REQUEST_CHANGES on one's own pull (422), so the live
+/// review is a COMMENT; the APPROVED mapping is covered by the
+/// unit tests with canned server JSON.
+fn create_review_raw(http: &UreqClient, at: &RepoAddr, number: u64, event: &str, body: &str) {
+    let payload = serde_json::json!({
+        "event": event,
+        "body": body,
+    })
+    .to_string();
+    http.post_json(
+        &format!(
+            "{}/api/v1/repos/{}/{}/pulls/{number}/reviews",
+            at.base, at.owner, at.repo
+        ),
+        &payload,
+    )
+    .expect("POST the reviews API on the Gitea instance");
+}
+
+/// Set up one repo with a main branch, a feature branch, and an
+/// open PR from feature to main; return the main SHA, the feature
+/// SHA, and the PR number. The caller owns the `LiveRepo` guard:
+/// it must exist before the setup runs, so a failed setup still
+/// deletes the repo.
+fn setup_pull_request(
+    http: &UreqClient,
+    client: &GiteaClient,
+    base: &str,
+    repo: &str,
+) -> (String, String, u64) {
+    create_repo_typed(client, repo, "main");
+    let user = gitea_user();
+    let at = RepoAddr {
+        base,
+        owner: &user,
+        repo,
+    };
+    let main_sha = create_commit_raw(http, &at, "README.md", "live test\n", "main", None);
+    let feature_sha = create_commit_raw(
+        http,
+        &at,
+        "FEATURE.md",
+        "live test\n",
+        "main",
+        Some("feature"),
+    );
+    let number = create_pull_request_raw(
+        http,
+        &at,
+        "Add feature",
+        "The feature body.",
+        "feature",
+        "main",
+    );
+    (main_sha, feature_sha, number)
+}
+
+#[test]
+fn gitea_pull_request_read_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let repo_guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (main_sha, feature_sha, number) = setup_pull_request(&http, &client, &base, &repo);
+    let user = gitea_user();
+    // pr_get reads the PR back with its head and base endpoints.
+    let pr = client
+        .pr_get(&user, &repo, number)
+        .expect("typed pr_get reads the PR");
+    assert_eq!(pr.number, number);
+    assert_eq!(pr.title, "Add feature");
+    assert_eq!(pr.body.as_deref(), Some("The feature body."));
+    assert_eq!(pr.state, "open");
+    assert!(!pr.draft);
+    assert!(!pr.merged);
+    assert_eq!(pr.user.login, user);
+    assert_eq!(pr.head.branch, "feature");
+    assert_eq!(pr.head.sha, feature_sha);
+    assert_eq!(
+        pr.head.repo.as_ref().map(|r| r.full_name.as_str()),
+        Some(format!("{user}/{repo}").as_str())
+    );
+    assert_eq!(pr.base.branch, "main");
+    assert_eq!(pr.base.sha, main_sha);
+    assert_eq!(
+        pr.base.repo.as_ref().map(|r| r.full_name.as_str()),
+        Some(format!("{user}/{repo}").as_str())
+    );
+    // pr_list carries it under open, not under closed.
+    let open = client
+        .pr_list(&user, &repo, GiteaPullRequestState::Open)
+        .expect("typed pr_list lists the open PRs");
+    assert!(
+        open.iter().any(|pr| pr.number == number),
+        "the open list must carry the new PR"
+    );
+    let closed = client
+        .pr_list(&user, &repo, GiteaPullRequestState::Closed)
+        .expect("typed pr_list lists the closed PRs");
+    assert!(
+        !closed.iter().any(|pr| pr.number == number),
+        "the closed list must not carry the open PR"
+    );
+    // No reviews yet; one COMMENT review lands as a COMMENT.
+    let reviews = client
+        .pr_reviews(&user, &repo, number)
+        .expect("typed pr_reviews lists the reviews");
+    assert!(reviews.is_empty(), "a fresh PR has no reviews");
+    create_review_raw(
+        &http,
+        &RepoAddr {
+            base: &base,
+            owner: &user,
+            repo: &repo,
+        },
+        number,
+        "COMMENT",
+        "Looks good to me.",
+    );
+    let reviews = client
+        .pr_reviews(&user, &repo, number)
+        .expect("typed pr_reviews lists the reviews");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].user.login, user);
+    assert_eq!(reviews[0].state, "COMMENT");
+    assert_eq!(reviews[0].body.as_deref(), Some("Looks good to me."));
+    assert!(!reviews[0].dismissed);
+    // A PR that was never created maps to NotFound, like a missing
+    // repo: the status→error mapping is exercised against a real
+    // server, not a fixture.
+    let err = client
+        .pr_get(&user, &repo, number + 1)
+        .expect_err("a missing PR must not return 200");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "a missing PR must map to NotFound; got {err:?}"
+    );
+    let _ = repo_guard.delete();
+}
+
+#[test]
+fn gitea_pull_request_search_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let repo_guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (_main_sha, _feature_sha, number) = setup_pull_request(&http, &client, &base, &repo);
+    let full_name = format!("{}/{}", gitea_user(), repo);
+    // The search is global — other tests' PRs may be listed too —
+    // so the assertions are containment, not exact counts.
+    let open = client
+        .pr_search(GiteaPullRequestState::Open)
+        .expect("typed pr_search lists the open PRs");
+    let found = open
+        .iter()
+        .find(|item| item.number == number && item.repository.full_name == full_name);
+    let item = found.expect("the open search must list the new PR");
+    assert_eq!(item.title, "Add feature");
+    assert_eq!(item.state, "open");
+    assert_eq!(item.user.login, gitea_user());
+    assert_eq!(item.pull_request.as_ref().map(|pr| pr.merged), Some(false));
+    let closed = client
+        .pr_search(GiteaPullRequestState::Closed)
+        .expect("typed pr_search lists the closed PRs");
+    assert!(
+        !closed
+            .iter()
+            .any(|item| item.number == number && item.repository.full_name == full_name),
+        "the closed search must not list the open PR"
+    );
+    let _ = repo_guard.delete();
 }
 
 #[cfg(test)]
