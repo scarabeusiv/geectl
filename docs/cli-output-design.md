@@ -6,14 +6,16 @@ Status: debug channel implemented (#51 closed); text rendering implemented (PR #
 Depends on: the OBS command surface in the CLI (see §2); #23 (git vs
 OBS abstraction — the command tree must not split by backend).
 
-Verified against main `4c0cbf0`: `src/main.rs` is a thin CLI
+Verified against main `afdf6f6`: `src/main.rs` is a thin CLI
 over the library; global `--format` flag (json default, text alternative)
 plus the debug flags (`--debug`, `--debug-body`); text renderers exist
-only for `version` and `config show`/`config init`; the debug channel
-exists (global flags, `GEECTL_DEBUG=1`, `log` crate facade with a bespoke
-backend in `src/debug.rs`); errors go to stderr as a JSON payload; the
-only print in the library is one `eprintln!` call in `src/obs/types.rs`
-(the `[dry-run]` plan echo).
+for every command; the debug channel exists (global flags,
+`GEECTL_DEBUG=1`, `log` crate facade with a bespoke backend in
+`src/debug.rs`); errors go to stderr in the selected format (JSON
+payload by default, `error:`/`remediation:` lines in text mode); the
+library prints only two `eprintln!` calls, both dry-run warnings (the
+`[dry-run]` plan echo in `src/obs/types.rs`, the credential warning in
+`src/cli_request.rs`).
 
 ## The decision, up front
 
@@ -67,21 +69,21 @@ what "one coherent channel" means.
   `http: GET /source/openSUSE:Factory/geectl -> 200 in 123ms (attempt 1/4)`
   On a retryable failure the line carries the reason and the backoff:
   `http: GET /source/... -> 500 in 210ms (attempt 2/4, retry in 2s: transient status 500)`
-  (test `src/http.rs:3045`).
+  (test `src/http.rs:3250`).
   On exhaustion: `http: GET /source/... failed after 4 attempts (last: 500)`.
-  (test `src/http.rs:3050`).
+  (test `src/http.rs:3255`).
 - **Read-after-write retries** (the library's bounded retries, not the
   HTTP policy): each probe plus the remaining budget, e.g.
   `retry: create_package registration probe 1/30s: still not found`.
-  (test `src/obs/remote.rs:7092`).
+  (test `src/obs/remote.rs:7174`).
   These are retries with no output elsewhere — a retried
   `change_state` consuming its 60 s budget would otherwise leave no
   visible trace.
 - **Library decision points** (the ones that change what happens
   next): dedup checks (`decision: open submit request(s) 1398492 already target foo; refusing
-  to file`; test `src/obs/payload.rs:3155`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1026`),
-  endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:2991` vs
-  `decision: read via /source (authenticated)`; test `src/http.rs:3074`), and the accept-state check
+  to file`; test `src/obs/payload.rs:3155`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1050`),
+  endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:3196` vs
+  `decision: read via /source (authenticated)`; test `src/http.rs:3279`), and the accept-state check
   before a retried `change_state` (`decision: request 1398977 still new, re-issuing
   accepted`; test `src/obs/request.rs:5652`).
 - **Service status lines**: `service_state <project>/<package>: <code>` and
