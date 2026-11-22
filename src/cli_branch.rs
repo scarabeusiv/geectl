@@ -492,8 +492,7 @@ fn with_api_url(header: String, api_url: &Option<String>) -> String {
 }
 
 /// A `revision:` line for a result that carries one, or nothing when
-/// the revision is null (dry-run, or a live op that set none): a null
-/// revision has no line, by decision at each call site.
+/// the revision is null (dry-run, or a live op that set none).
 fn revision_line<T: std::fmt::Display>(revision: &Option<T>) -> Vec<String> {
     match revision {
         Some(revision) => vec![format!("revision: {revision}")],
