@@ -1358,6 +1358,33 @@ fn top_help_lists_the_service_group() {
 }
 
 #[test]
+fn gitea_help_lists_all_eight_subcommands() {
+    let out = geectl().args(["gitea", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    for name in [
+        "repo-get",
+        "repo-list",
+        "repo-create",
+        "repo-delete",
+        "repo-fork",
+        "branch-list",
+        "branch-get",
+        "branch-head",
+    ] {
+        assert!(text.contains(name), "gitea --help misses {name}");
+    }
+}
+
+#[test]
+fn top_help_lists_the_gitea_group() {
+    let out = geectl().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("gitea"), "top --help misses the gitea group");
+}
+
+#[test]
 fn build_results_without_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
@@ -1522,7 +1549,7 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 13 blocks (top level, 6 groups, 6 leaves) — a
+    // The docs carry 15 blocks (top level, 7 groups, 7 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
     // groups and one leaf each — and the count assertion guards the
@@ -1532,8 +1559,8 @@ fn docs_help_blocks_match_the_binary() {
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-        13,
-        "docs/cli.md should carry 13 --help blocks (top level, 6 groups, 6 leaves);          update this count when a block is deliberately added or removed"
+        15,
+        "docs/cli.md should carry 15 --help blocks (top level, 7 groups, 7 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();

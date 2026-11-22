@@ -2,7 +2,8 @@
 
 The command reference for the geectl binary: one subcommand per
 operation, grouped under a top-level noun (`remote`, `request`,
-`branch`, `build`, `maintenance`, `service`), plus `version` and `config`.
+`branch`, `build`, `maintenance`, `service`, `gitea`), plus `version`
+and `config`.
 Every `--help` block below is the real output of the built binary
 (`geectl 0.2.1`); run `geectl --help` or `geectl <group> --help` for
 the same text live.
@@ -105,6 +106,7 @@ Commands:
   build        Build-status commands: results, logs, histories, binaries
   maintenance  Maintenance operations: maintained-instances listing and maintenance branching
   service      Service reads: list a package's services and their run state
+  gitea        Gitea operations: repository and branch reads and mutations on the configured instance
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -443,6 +445,59 @@ Options:
       --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
       --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
   -h, --help             Print help
+```
+
+## `gitea` — Gitea operations
+
+```
+Gitea operations: repository and branch reads and mutations on the configured instance
+
+Usage: geectl gitea [OPTIONS] <COMMAND>
+
+Commands:
+  repo-get     Show a repository: owner, default branch, privacy, clone URLs
+  repo-list    List repositories: the token owner's own repos, one user's repos with `--owner`, one organization's with `--org`, or both (the user's first, then the organization's)
+  repo-create  Create a repository under the token owner's account. A mutation: dry-run is the default (only the plan is printed); `--live` performs the creation
+  repo-delete  Delete a repository. A mutation: dry-run is the default (only the plan is printed); `--live` performs the deletion. The library refuses without `--force`, even live
+  repo-fork    Fork a repository into the token owner's account (or an organization with `--organization`). A mutation: dry-run is the default (only the plan is printed); `--live` performs the fork
+  branch-list  List the branches of a repository
+  branch-get   Show one branch: name, head commit, protection
+  branch-head  Print the head commit SHA of a branch. Content command: the text IS the SHA, with no header
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Create a repository under the token owner's account. A mutation: dry-run is the default (only the plan is printed); `--live` performs the creation
+
+Usage: geectl gitea repo-create [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  The repository name
+
+Options:
+      --format <FORMAT>
+          Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --private
+          Create a private repository; public by default
+      --debug
+          Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --description <DESCRIPTION>
+          A short description
+      --debug-body
+          Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --default-branch <DEFAULT_BRANCH>
+          The default branch; the server default when unset
+      --live
+          Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help
+          Print help
 ```
 
 ## Common tasks

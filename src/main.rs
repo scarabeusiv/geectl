@@ -8,6 +8,7 @@
 
 mod cli_branch;
 mod cli_build;
+mod cli_gitea;
 mod cli_remote;
 mod cli_request;
 mod cli_service;
@@ -120,6 +121,12 @@ enum Command {
         #[command(subcommand)]
         command: cli_service::ServiceCommand,
     },
+    /// Gitea operations: repository and branch reads and mutations
+    /// on the configured instance.
+    Gitea {
+        #[command(subcommand)]
+        command: cli_gitea::GiteaCommand,
+    },
 }
 
 /// The `config` subcommands.
@@ -169,6 +176,7 @@ fn run(
             (payload, text)
         }
         Some(Command::Service { command }) => cli_service::run_service(command, debug)?,
+        Some(Command::Gitea { command }) => cli_gitea::run_gitea(command, debug, cli.live)?,
     };
     Ok(match format {
         Format::Json => payload.to_string(),
