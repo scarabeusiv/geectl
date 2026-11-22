@@ -201,7 +201,7 @@ Arguments:
 
 Options:
       --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
-      --rev <REV>        Print the file as of this revision (default: latest)
+      --rev <REV>        Print the file as of this revision (default: latest): a revision number or a srcmd5
       --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
       --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
       --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations

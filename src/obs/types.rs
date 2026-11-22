@@ -1089,6 +1089,10 @@ mod tests {
     fn revision_spec_renders_as_the_rev_query_value() {
         assert_eq!(RevisionSpec::Rev(2).to_string(), "2");
         assert_eq!(
+            RevisionSpec::Md5("0123456789abcdef0123456789abcdef".to_string()).to_string(),
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
             RevisionSpec::parse("AABBCCDDAABBCCDDAABBCCDDAABBCCDD")
                 .unwrap()
                 .to_string(),

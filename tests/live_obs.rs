@@ -1207,15 +1207,46 @@ fn live_cat_reads_back_uploaded_file() {
     );
     assert_eq!(
         public
-            .cat(&source_project, &package, "geectl-live-pkg.spec", Some(1))
+            .cat(
+                &source_project,
+                &package,
+                "geectl-live-pkg.spec",
+                Some(RevisionSpec::Rev(1))
+            )
             .expect("cat revision 1 on the live instance"),
         v1
     );
     assert_eq!(
         public
-            .cat(&source_project, &package, "geectl-live-pkg.spec", Some(2))
+            .cat(
+                &source_project,
+                &package,
+                "geectl-live-pkg.spec",
+                Some(RevisionSpec::Rev(2))
+            )
             .expect("cat revision 2 on the live instance"),
         v2
+    );
+    // The same revision by its srcmd5: `request show` reports the
+    // source revision as a hash, and `cat --rev` accepts it.
+    let log = authed
+        .package_log(&source_project, &package, None)
+        .expect("history on the live instance");
+    let rev1 = log
+        .iter()
+        .find(|entry| entry.rev == 1)
+        .expect("revision 1 in the history");
+    let srcmd5 = rev1.srcmd5.clone().expect("revision 1 carries a srcmd5");
+    assert_eq!(
+        public
+            .cat(
+                &source_project,
+                &package,
+                "geectl-live-pkg.spec",
+                Some(RevisionSpec::Md5(srcmd5))
+            )
+            .expect("cat revision 1 by srcmd5 on the live instance"),
+        v1
     );
 }
 

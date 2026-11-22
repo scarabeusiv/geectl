@@ -1841,15 +1841,16 @@ impl<'a> ObsClient<'a> {
 
     /// Read file `file` of package `package` in project `project`
     /// (`GET /public/source/<project>/<package>/<file>`), optionally
-    /// at revision `rev` (`?rev=N`, which the backend forwards to the
-    /// file at that revision). A public read: no credentials. A
-    /// missing file is an error, never an empty string.
+    /// at revision `rev` (`?rev=N` for a number, `?rev=<srcmd5>` for
+    /// the revision carrying that hash — the backend resolves the
+    /// hash). A public read: no credentials. A missing file is an
+    /// error, never an empty string.
     pub fn cat(
         &self,
         project: &str,
         package: &str,
         file: &str,
-        rev: Option<u64>,
+        rev: Option<RevisionSpec>,
     ) -> Result<String, GeectlError> {
         for (label, value) in [("project", project), ("package", package)] {
             if !valid_obs_name(value) {
@@ -1865,7 +1866,7 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS filename: {file:?}"),
             ));
         }
-        if let Some(0) = rev {
+        if let Some(RevisionSpec::Rev(0)) = rev {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 "invalid revision: 0",
@@ -2148,7 +2149,8 @@ impl<'a> ObsClient<'a> {
             match old_files.iter().find(|old| old.name == new.name) {
                 None => {
                     // Added: the whole file is new.
-                    let content = self.cat(project, package, &new.name, Some(rev))?;
+                    let content =
+                        self.cat(project, package, &new.name, Some(RevisionSpec::Rev(rev)))?;
                     patches.push(FilePatch {
                         filename: new.name.clone(),
                         status: FilePatchStatus::Added,
@@ -2156,8 +2158,14 @@ impl<'a> ObsClient<'a> {
                     });
                 }
                 Some(old) if old.md5 != new.md5 => {
-                    let old_content = self.cat(project, package, &new.name, Some(rev - 1))?;
-                    let new_content = self.cat(project, package, &new.name, Some(rev))?;
+                    let old_content = self.cat(
+                        project,
+                        package,
+                        &new.name,
+                        Some(RevisionSpec::Rev(rev - 1)),
+                    )?;
+                    let new_content =
+                        self.cat(project, package, &new.name, Some(RevisionSpec::Rev(rev)))?;
                     let diff = unified_diff(
                         &format!("a/{}", new.name),
                         &old_content,
@@ -2180,7 +2188,12 @@ impl<'a> ObsClient<'a> {
         }
         for old in &old_files {
             if !new_files.iter().any(|new| new.name == old.name) {
-                let content = self.cat(project, package, &old.name, Some(rev - 1))?;
+                let content = self.cat(
+                    project,
+                    package,
+                    &old.name,
+                    Some(RevisionSpec::Rev(rev - 1)),
+                )?;
                 patches.push(FilePatch {
                     filename: old.name.clone(),
                     status: FilePatchStatus::Deleted,
@@ -5989,9 +6002,44 @@ mod tests {
         let client = ObsClient::new(&http);
         assert_eq!(
             client
-                .cat("openSUSE:Factory", "foo", "foo.spec", Some(2))
+                .cat(
+                    "openSUSE:Factory",
+                    "foo",
+                    "foo.spec",
+                    Some(RevisionSpec::Rev(2))
+                )
                 .unwrap(),
             "Name: foo\nVersion: 1.0\n"
+        );
+    }
+
+    #[test]
+    fn cat_at_srcmd5_passes_the_hash_as_rev() {
+        let hash = "0123456789abcdef0123456789abcdef";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec?rev={hash}"
+            ),
+            "Name: foo\nVersion: 1.0\n",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .cat(
+                    "openSUSE:Factory",
+                    "foo",
+                    "foo.spec",
+                    Some(RevisionSpec::Md5(hash.to_string()))
+                )
+                .unwrap(),
+            "Name: foo\nVersion: 1.0\n"
+        );
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                format!("https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec?rev={hash}"),
+                false
+            )]
         );
     }
 
@@ -6007,7 +6055,12 @@ mod tests {
             .is_err());
         assert!(client.cat("openSUSE:Factory", "foo", "a/b", None).is_err());
         assert!(client
-            .cat("openSUSE:Factory", "foo", "foo.spec", Some(0))
+            .cat(
+                "openSUSE:Factory",
+                "foo",
+                "foo.spec",
+                Some(RevisionSpec::Rev(0))
+            )
             .is_err());
         assert!(http.get_calls().is_empty());
     }

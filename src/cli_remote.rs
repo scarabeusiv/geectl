@@ -98,9 +98,10 @@ pub enum RemoteCommand {
         package: String,
         /// The file to print.
         file: String,
-        /// Print the file as of this revision (default: latest).
+        /// Print the file as of this revision (default: latest):
+        /// a revision number or a srcmd5.
         #[arg(long)]
-        rev: Option<u64>,
+        rev: Option<String>,
     },
     /// Download a source file to a local path. The binary counterpart
     /// of `cat`: the library streams the file to disk instead of
@@ -645,7 +646,8 @@ pub fn run_remote(
             file,
             rev,
         } => {
-            let content = client.cat(&project, &package, &file, rev)?;
+            let rev = rev.as_deref().map(RevisionSpec::parse).transpose()?;
+            let content = client.cat(&project, &package, &file, rev.clone())?;
             // Content commands render verbatim: the text IS the file.
             // The writer terminates the payload with a trailing newline
             // (an already-terminated payload is untouched — see
@@ -1482,14 +1484,18 @@ fn cat_result(
     project: &str,
     package: &str,
     file: &str,
-    rev: Option<u64>,
+    rev: Option<RevisionSpec>,
     content: String,
 ) -> (Value, String) {
     let payload = json!({
         "project": project,
         "package": package,
         "file": file,
-        "rev": rev,
+        "rev": match &rev {
+            None => Value::Null,
+            Some(RevisionSpec::Rev(n)) => json!(n),
+            Some(RevisionSpec::Md5(md5)) => json!(md5),
+        },
         "content": content.clone(),
     });
     // Content commands render verbatim: the text IS the file.
@@ -3081,7 +3087,20 @@ mod tests {
             "--rev",
             "12",
         ]);
-        assert!(matches!(parsed, RemoteCommand::Cat { rev: Some(12), .. }));
+        assert!(matches!(parsed, RemoteCommand::Cat { rev: Some(ref r), .. } if r == "12"));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "cat",
+            "openSUSE:Factory",
+            "vim",
+            "vim.spec",
+            "--rev",
+            "0123456789abcdef0123456789abcdef",
+        ]);
+        assert!(
+            matches!(parsed, RemoteCommand::Cat { rev: Some(ref r), .. } if r == "0123456789abcdef0123456789abcdef")
+        );
     }
 
     #[test]
@@ -4805,10 +4824,21 @@ mod tests {
             "openSUSE:Factory",
             "vim",
             "vim.spec",
-            Some(12),
+            Some(RevisionSpec::Rev(12)),
             "Name: vim\n".to_string(),
         );
         assert_eq!(payload["rev"], 12);
+        assert_eq!(text, "Name: vim\n");
+        let (payload, text) = cat_result(
+            "openSUSE:Factory",
+            "vim",
+            "vim.spec",
+            Some(RevisionSpec::Md5(
+                "0123456789abcdef0123456789abcdef".to_string(),
+            )),
+            "Name: vim\n".to_string(),
+        );
+        assert_eq!(payload["rev"], "0123456789abcdef0123456789abcdef");
         assert_eq!(text, "Name: vim\n");
     }
 
