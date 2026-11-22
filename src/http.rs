@@ -194,7 +194,8 @@ fn body_read_error(e: std::io::Error) -> GeectlError {
 /// a `post_json` here would silently fork as whoever the HTTP
 /// client's seam resolves, not as the Gitea client's token).
 /// The mutation methods (`post`, `post_text`, `post_json`,
-/// `post_json_with`, `put`, `put_json_with`, `put_file`, `delete`) all ask for
+/// `post_json_with`, `put`, `put_json_with`, `put_file`, `delete`,
+/// `patch_json_with`) all ask for
 /// `application/xml` (`Accept` header): a path that exists in both
 /// the API and WebUI route sets serves the WebUI HTML page unless
 /// the request asks for XML.
@@ -290,6 +291,21 @@ pub trait HttpClient {
     /// member stores the same state — so a transient failure
     /// retries like GET.
     fn put_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError>;
+    /// PATCH a JSON body with explicit credentials. The
+    /// `post_json_with` counterpart for a partial update: the same
+    /// `application/json` body and the credentials from the caller
+    /// instead of the client's auth seam — so a client that holds
+    /// its own credentials (the Gitea client) never authenticates
+    /// a mutation as someone else. Like POST, PATCH is never
+    /// retried: a retried mutation can apply twice, so every
+    /// non-2xx status (and every transport failure) is returned
+    /// immediately.
+    fn patch_json_with(
         &self,
         url: &str,
         body: &str,
@@ -937,6 +953,98 @@ impl UreqClient {
             }
             Err(e) => {
                 self.debug_single_attempt("POST", url, "server error", started.elapsed());
+                Err(GeectlError::new(ErrorKind::ServerError, e.to_string()))
+            }
+        }
+    }
+
+    /// One PATCH attempt with the given content type. PATCH is never
+    /// retried, like POST: a retried partial update can apply twice
+    /// (e.g. a second close of an already-closed pull request).
+    /// A transient failure (429, 5xx) is returned as an error
+    /// immediately, not retried. This is a single attempt, end to
+    /// end. A redirect is refused, like POST: automatic redirects
+    /// are disabled, so a 3xx is an error, not a body.
+    fn patch_with_content_type(
+        &self,
+        url: &str,
+        body: &str,
+        content_type: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        require_credentials_transport(url, credentials)?;
+        debug_assert!(
+            !is_retryable_method("PATCH"),
+            "PATCH must stay non-retryable; a retried mutation can apply twice"
+        );
+        // Ask for XML, the same defence as POST: a dual-routed path
+        // serves the WebUI HTML page unless the request asks for XML.
+        let request = self
+            .agent
+            .patch(url)
+            .header("Content-Type", content_type)
+            .header("Accept", "application/xml");
+        let request = self.apply_auth(request, credentials)?;
+        // A single attempt: PATCH is never retried.
+        let started = std::time::Instant::now();
+        self.debug_body("request", "PATCH", url, body);
+        match request.send(body) {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if resp.status().is_redirection() {
+                    let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
+                    self.debug_single_attempt("PATCH", url, &status.to_string(), started.elapsed());
+                    return Err(redirect_error(status, location));
+                }
+                // Attempt line first (see read_response_body).
+                self.debug_single_attempt("PATCH", url, &status.to_string(), started.elapsed());
+                let body = self.read_response_body(resp.into_body().into_reader(), "PATCH", url)?;
+                self.debug_body("response", "PATCH", url, &body);
+                Ok(body)
+            }
+            Err(ureq::Error::StatusCode(code)) => {
+                let safe_url = sanitize_url_for_error(url);
+                self.debug_single_attempt("PATCH", url, &code.to_string(), started.elapsed());
+                match status_action(code, &safe_url) {
+                    // No retry for PATCH: a Retry action is returned
+                    // as the error, immediately.
+                    StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
+                }
+            }
+            Err(ureq::Error::Tls(msg)) => {
+                self.debug_single_attempt("PATCH", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {msg}"),
+                ))
+            }
+            Err(ureq::Error::Rustls(e)) => {
+                self.debug_single_attempt("PATCH", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {e}"),
+                ))
+            }
+            Err(ureq::Error::Pem(e)) => {
+                self.debug_single_attempt("PATCH", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {e}"),
+                ))
+            }
+            Err(ureq::Error::Timeout(_)) => {
+                self.debug_single_attempt("PATCH", url, "timeout", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::Timeout,
+                    format!("request to {} timed out", sanitize_url_for_error(url)),
+                ))
+            }
+            Err(ureq::Error::Io(e)) => {
+                self.debug_single_attempt("PATCH", url, "network error", started.elapsed());
+                Err(GeectlError::new(ErrorKind::NetworkError, e.to_string()))
+            }
+            Err(e) => {
+                self.debug_single_attempt("PATCH", url, "server error", started.elapsed());
                 Err(GeectlError::new(ErrorKind::ServerError, e.to_string()))
             }
         }
@@ -1674,6 +1782,18 @@ impl HttpClient for UreqClient {
         // credentials, but PUT semantics — retried, because the
         // collaborator and team PUTs are idempotent.
         self.put_with_content_type(url, body, "application/json", credentials)
+    }
+
+    fn patch_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // The JSON PATCH twin of post_json_with: the same explicit
+        // credentials, but PATCH semantics — single-attempt, like
+        // POST, because a retried partial update can apply twice.
+        self.patch_with_content_type(url, body, "application/json", credentials)
     }
 
     fn post(
@@ -3814,6 +3934,57 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/repos/geectl/probe/pulls/1/requested_reviewers");
         let err = client
             .delete_json_with(&url, "{}", &Credentials::None)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        handle.join().expect("server thread");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn patch_json_with_sends_json_body_and_auth() {
+        let server = RequestCapture::serve("");
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = server.url_for("/repos/openSUSE/geectl/issues/122");
+        assert_eq!(
+            client
+                .patch_json_with(
+                    &url,
+                    "{\"state\":\"closed\"}",
+                    &Credentials::Bearer {
+                        token: "patch-test-token".to_string(),
+                    },
+                )
+                .unwrap(),
+            ""
+        );
+        let (method, content_type, auth, received_body) = server.captured();
+        assert_eq!(method, "PATCH");
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        // captured() carries the raw header, unlike
+        // server.authorization() which redacts the token.
+        assert_eq!(auth.as_deref(), Some("Bearer patch-test-token"));
+        assert_eq!(received_body, "{\"state\":\"closed\"}");
+    }
+
+    #[test]
+    fn patch_json_with_maps_404_to_not_found() {
+        let server = LoopbackServer::serve_status("no such issue", 404);
+        let client = UreqClient::with_auth(Timeout::default(), None).unwrap();
+        let err = client
+            .patch_json_with(&server.url(), "{}", &Credentials::None)
+            .expect_err("a 404 PATCH must fail");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn patch_json_with_is_never_retried() {
+        // The same single-attempt rule as POST and DELETE: a 500
+        // must come back as a ServerError after exactly ONE attempt.
+        let (port, count, handle) = serve_counting_500();
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/repos/openSUSE/geectl/issues/122");
+        let err = client
+            .patch_json_with(&url, "{}", &Credentials::None)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
         handle.join().expect("server thread");

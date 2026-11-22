@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 /// A fake HTTP client with canned responses, for fixtures. GET,
-/// POST, and DELETE are keyed separately by URL; a URL with no
-/// canned response is a transport error. Calls are recorded so
+/// POST, PATCH, and DELETE are keyed separately by URL; a URL with
+/// no canned response is a transport error. Calls are recorded so
 /// tests can assert on the method, the URL, whether auth was
-/// sent, and (for POST) the body.
+/// sent, and (for POST and PATCH) the body.
 pub(crate) struct FakeHttp {
     gets: RefCell<HashMap<String, String>>,
     get_sequences: RefCell<HashMap<String, VecDeque<String>>>,
@@ -20,6 +20,8 @@ pub(crate) struct FakeHttp {
     get_error_sequences: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     posts: RefCell<HashMap<String, String>>,
     post_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
+    patches: RefCell<HashMap<String, String>>,
+    patch_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     deletes: RefCell<HashMap<String, String>>,
     puts: RefCell<HashMap<String, String>>,
     put_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
@@ -37,6 +39,7 @@ pub(crate) struct FakeHttp {
     post_calls: RefCell<Vec<(String, String, bool)>>,
     delete_calls: RefCell<Vec<(String, bool)>>,
     delete_json_calls: RefCell<Vec<(String, String, bool)>>,
+    patch_calls: RefCell<Vec<(String, String, bool)>>,
     put_calls: RefCell<Vec<(String, String, bool)>>,
     put_bytes: RefCell<HashMap<String, String>>,
     put_bytes_calls: RefCell<Vec<(String, Vec<u8>, bool)>>,
@@ -51,6 +54,8 @@ impl FakeHttp {
             get_error_sequences: RefCell::new(HashMap::new()),
             posts: RefCell::new(HashMap::new()),
             post_errors: RefCell::new(HashMap::new()),
+            patches: RefCell::new(HashMap::new()),
+            patch_errors: RefCell::new(HashMap::new()),
             deletes: RefCell::new(HashMap::new()),
             puts: RefCell::new(HashMap::new()),
             put_errors: RefCell::new(HashMap::new()),
@@ -68,6 +73,7 @@ impl FakeHttp {
             post_calls: RefCell::new(Vec::new()),
             delete_calls: RefCell::new(Vec::new()),
             delete_json_calls: RefCell::new(Vec::new()),
+            patch_calls: RefCell::new(Vec::new()),
             put_calls: RefCell::new(Vec::new()),
             put_bytes: RefCell::new(HashMap::new()),
             put_bytes_calls: RefCell::new(Vec::new()),
@@ -211,6 +217,20 @@ impl FakeHttp {
         self
     }
 
+    pub(crate) fn with_patch(self, url: &str, body: &str) -> Self {
+        self.patches
+            .borrow_mut()
+            .insert(url.to_string(), body.to_string());
+        self
+    }
+
+    pub(crate) fn with_patch_error(self, url: &str, kind: ErrorKind) -> Self {
+        self.patch_errors
+            .borrow_mut()
+            .insert(url.to_string(), VecDeque::from([kind]));
+        self
+    }
+
     pub(crate) fn with_delete(self, url: &str, body: &str) -> Self {
         self.deletes
             .borrow_mut()
@@ -278,12 +298,47 @@ impl FakeHttp {
         self.delete_json_calls.borrow().clone()
     }
 
+    pub(crate) fn patch_calls(&self) -> Vec<(String, String, bool)> {
+        self.patch_calls.borrow().clone()
+    }
+
     pub(crate) fn put_calls(&self) -> Vec<(String, String, bool)> {
         self.put_calls.borrow().clone()
     }
 
     pub(crate) fn put_bytes_calls(&self) -> Vec<(String, Vec<u8>, bool)> {
         self.put_bytes_calls.borrow().clone()
+    }
+
+    fn patch(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // Fixtures do not distinguish content types: the transport
+        // tests in `http.rs` assert the header PATCH sends.
+        let authed = !matches!(credentials, Credentials::None);
+        self.patch_calls
+            .borrow_mut()
+            .push((url.to_string(), body.to_string(), authed));
+        if let Some(kind) = self
+            .patch_errors
+            .borrow_mut()
+            .get_mut(url)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Err(GeectlError::new(
+                kind,
+                format!("canned PATCH error for {url}"),
+            ));
+        }
+        self.patches.borrow().get(url).cloned().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::NetworkError,
+                format!("no canned PATCH response for {url}"),
+            )
+        })
     }
 }
 
@@ -536,6 +591,19 @@ impl HttpClient for FakeHttp {
         // The recorded PUT call carries the body, so a test can
         // assert the collaborator PUT carried the permission.
         self.put(url, body, credentials)
+    }
+
+    fn patch_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // Fixtures do not distinguish content types: the transport
+        // tests in `http.rs` assert the header each method sends.
+        // The recorded PATCH call carries the body, so a test can
+        // assert the close PATCH carried the state.
+        self.patch(url, body, credentials)
     }
 
     fn post_text(
