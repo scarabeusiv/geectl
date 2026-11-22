@@ -1982,6 +1982,24 @@ impl<'a> ObsClient<'a> {
             .collect())
     }
 
+    /// List the top-level projects (`GET /source`): the names of
+    /// every project on the server, sorted. The top-level listing
+    /// has no public route, so the read uses the client's
+    /// credentials (whatever they are — no fail-closed pre-check: a
+    /// client without credentials gets the server's 401 as an error,
+    /// like any other authenticated read).
+    pub fn list_projects(&self) -> Result<Vec<String>, GeectlError> {
+        let url = build_url(&self.base, &["source"], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        let mut names: Vec<String> = parse_directory(&body)?
+            .entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
     /// List the files of a package at a revision (`GET
     /// /public/source/<project>/<package>?rev=N`): the `rev`-carrying
     /// form of [`ObsClient::list_files`], for diffing two revisions.
@@ -5814,6 +5832,51 @@ mod tests {
                 "multibuild-pkg:flavor2".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn list_projects_returns_sorted_names() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source",
+            "<directory><entry name=\"home:Bob\"/><entry name=\"openSUSE:Factory\"/><entry name=\"devel:languages:python\"/></directory>",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client.list_projects().unwrap(),
+            vec![
+                "devel:languages:python".to_string(),
+                "home:Bob".to_string(),
+                "openSUSE:Factory".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_projects_uses_credentials() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source",
+            "<directory><entry name=\"openSUSE:Factory\"/></directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client.list_projects().unwrap(),
+            vec!["openSUSE:Factory".to_string()]
+        );
+        assert_eq!(
+            http.get_calls(),
+            vec![("https://api.opensuse.org/source".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn list_projects_malformed_body_is_error_not_empty() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source",
+            "<collection></collection>",
+        );
+        let client = ObsClient::new(&http);
+        let err = client.list_projects().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]

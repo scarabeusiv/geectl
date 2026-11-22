@@ -45,7 +45,8 @@
 //! `live_owners_call_succeeds`, `live_whois_reads_admin`,
 //! `live_link_target_reads_linkinfo`, and
 //! `live_project_diff_classifies`,
-//! `live_diff_packages_diffs_two_packages`) exercise the read operations
+//! `live_diff_packages_diffs_two_packages`, and
+//! `live_list_projects_lists_top_level_projects`) exercise the read operations
 //! the same way: create through geectl's own write operations, then
 //! read back through the new operations and assert on server state.
 //! The log and link-target tests poll for up to a minute: the history
@@ -1087,6 +1088,28 @@ fn live_list_files_and_packages_read_back() {
         packages.contains(&package),
         "the project listing must hold the created package {package}; got {packages:?}"
     );
+}
+
+/// The top-level project listing holds a project created on the
+/// instance, and comes back sorted.
+#[test]
+fn live_list_projects_lists_top_level_projects() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let projects = authed
+        .list_projects()
+        .expect("list the top-level projects on the live instance");
+    assert!(
+        projects.contains(&source_project),
+        "the top-level listing must hold the created project {source_project}; got {projects:?}"
+    );
+    let mut sorted = projects.clone();
+    sorted.sort();
+    assert_eq!(projects, sorted, "the top-level listing must be sorted");
 }
 
 /// The package log comes back newest-first, and a revision range
