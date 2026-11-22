@@ -1,0 +1,31 @@
+---
+name: docs-conformance
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  docs-conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The design doc's literal examples must match the code: the
+      # check extracts them from docs/cli-output-design.md and
+      # verifies each against its cited pinning test, so a doc/code
+      # divergence fails the gate instead of surfacing in review.
+      # Pure stdlib Python; no toolchain, no dependencies, seconds.
+      - name: Check CLI-output design examples
+        run: python3 scripts/check-docs-conformance.py
+      - name: Self-test the conformance check
+        run: python3 scripts/test-check-docs-conformance.py
