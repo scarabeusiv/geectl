@@ -1604,6 +1604,119 @@ impl<'a> GiteaClient<'a> {
         Ok(Some(existing.name))
     }
 
+    /// List a team's members (`GET /api/v1/teams/{id}/members`).
+    /// Paginates internally and is bounded like `repo_list`.
+    pub fn team_list_members(&self, id: i64) -> Result<Vec<GiteaOwner>, GeectlError> {
+        validate_team_id(id)?;
+        let id_str = id.to_string();
+        self.list_paged::<GiteaOwner>(
+            &["api", "v1", "teams", &id_str, "members"],
+            &[],
+            &format!("members of team {id}"),
+            "the list is bounded at 500 entries",
+        )
+    }
+
+    /// Read one team member (`GET
+    /// /api/v1/teams/{id}/members/{user}`): the member's login.
+    /// A user who is not a member answers 404, which reads as
+    /// `NotFound` naming the user — the same read the remove
+    /// pre-check and the add verification use.
+    pub fn team_member_get(&self, id: i64, user: &str) -> Result<GiteaOwner, GeectlError> {
+        validate_team_id(id)?;
+        validate_gitea_name(user, "member")?;
+        let id_str = id.to_string();
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "teams", &id_str, "members", user],
+            &[],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_team_member(&body, id, user)
+    }
+
+    /// Add a member to a team (`PUT
+    /// /api/v1/teams/{id}/members/{user}`) and return the member
+    /// read back. The PUT answers 204 with no body, so the add
+    /// is verified by re-reading the member — like the
+    /// collaborator add re-reads the permission. A server that
+    /// answers the add without recording it fails here instead
+    /// of reporting success. DryRun-guarded like `repo_create`:
+    /// the guard runs before any server read, and the result is
+    /// `None` in dry-run. `force` is the confirmation: without
+    /// it the add is refused client-side (`InvalidInput` naming
+    /// force) before any server read — the team's level is not
+    /// known without a read, so every add confirms. A dry-run
+    /// plan needs no force.
+    pub fn team_add_member(
+        &self,
+        id: i64,
+        user: &str,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaOwner>, GeectlError> {
+        validate_team_id(id)?;
+        validate_gitea_name(user, "member")?;
+        if !dry_run.allow(&format!("add member {user} to team {id}")) {
+            return Ok(None);
+        }
+        if !force {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to add member {user} to team {id} without force: adding a member grants the team's access; pass force to confirm"
+                ),
+            ));
+        }
+        let id_str = id.to_string();
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "teams", &id_str, "members", user],
+            &[],
+        );
+        self.http.put_json_with(&url, "{}", &self.credentials)?;
+        Ok(Some(self.team_member_get(id, user)?))
+    }
+
+    /// Remove a member from a team (`DELETE
+    /// /api/v1/teams/{id}/members/{user}`) and return the removed
+    /// login. The member is read first: a user who is not a
+    /// member answers 404 there, so the remove refuses with
+    /// `NotFound` naming the user before any delete runs.
+    /// `force` is the confirmation: without it the remove is
+    /// refused client-side (`InvalidInput` naming force) before
+    /// any server read. A dry-run plan needs no force.
+    pub fn team_remove_member(
+        &self,
+        id: i64,
+        user: &str,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<Option<String>, GeectlError> {
+        validate_team_id(id)?;
+        validate_gitea_name(user, "member")?;
+        if !dry_run.allow(&format!("remove member {user} from team {id}")) {
+            return Ok(None);
+        }
+        if !force {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to remove member {user} from team {id} without force: removing a member is destructive; pass force to confirm"
+                ),
+            ));
+        }
+        let existing = self.team_member_get(id, user)?;
+        let id_str = id.to_string();
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "teams", &id_str, "members", user],
+            &[],
+        );
+        self.http.delete(&url, &self.credentials)?;
+        Ok(Some(existing.login))
+    }
+
     /// List a repository's branches (`GET
     /// /api/v1/repos/{owner}/{repo}/branches`): the names and head
     /// commits of what a fork carries. Paginates internally and is
@@ -2379,6 +2492,31 @@ fn parse_team_body(body: &str, context: &str) -> Result<GiteaTeam, GeectlError> 
             format!("unexpected Gitea team response {context}: {err}"),
         )
     })
+}
+
+/// Parse a team member out of a response body. A body that is not
+/// a user is a server error naming the team and the user, never a
+/// silent empty value. A body that names another user is a server
+/// error too, for the same reason as
+/// `parse_collaborator_permission`: the callers treat the read as
+/// the requested user.
+fn parse_team_member(body: &str, id: i64, user: &str) -> Result<GiteaOwner, GeectlError> {
+    let parsed: GiteaOwner = serde_json::from_str(body).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected Gitea team member response for {user} in team {id}: {err}"),
+        )
+    })?;
+    if !parsed.login.eq_ignore_ascii_case(user) {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected Gitea team member response for {user} in team {id}: the server answered for {}",
+                parsed.login
+            ),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Parse a Gitea branch out of a response body. A body that is not
@@ -6163,6 +6301,182 @@ mod tests {
             .team_delete(-1, true, &DryRun::new(false))
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn team_list_members_returns_the_members() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/teams/7/members?page=1&limit=50",
+            &collaborator_list_json(&["fbui", "lbsobolewski"]),
+        );
+        let members = client(&http).team_list_members(7).unwrap();
+        assert_eq!(
+            members.iter().map(|u| u.login.as_str()).collect::<Vec<_>>(),
+            vec!["fbui", "lbsobolewski"]
+        );
+    }
+
+    #[test]
+    fn team_list_members_empty_list_is_empty() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/teams/7/members?page=1&limit=50",
+            "null",
+        );
+        let members = client(&http).team_list_members(7).unwrap();
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn team_member_get_parses_the_member() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/teams/7/members/fbui",
+            r#"{"login": "fbui", "future_field": 1}"#,
+        );
+        let member = client(&http).team_member_get(7, "fbui").unwrap();
+        assert_eq!(member.login, "fbui");
+    }
+
+    #[test]
+    fn team_member_get_for_another_user_is_a_server_error() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/teams/7/members/fbui",
+            r#"{"login": "lbsobolewski", "future_field": 1}"#,
+        );
+        let err = client(&http).team_member_get(7, "fbui").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn team_add_member_puts_and_verifies() {
+        let http = FakeHttp::new()
+            .with_put("https://src.opensuse.org/api/v1/teams/7/members/fbui", "")
+            .with_get(
+                "https://src.opensuse.org/api/v1/teams/7/members/fbui",
+                r#"{"login": "fbui", "future_field": 1}"#,
+            );
+        let member = client(&http)
+            .team_add_member(7, "fbui", true, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run add returns the member");
+        assert_eq!(member.login, "fbui");
+        assert_eq!(
+            http.put_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/teams/7/members/fbui".to_string(),
+                "{}".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn team_add_member_unrecorded_is_a_server_error() {
+        let http = FakeHttp::new()
+            .with_put("https://src.opensuse.org/api/v1/teams/7/members/fbui", "")
+            .with_get(
+                "https://src.opensuse.org/api/v1/teams/7/members/fbui",
+                r#"{"login": "lbsobolewski", "future_field": 1}"#,
+            );
+        let err = client(&http)
+            .team_add_member(7, "fbui", true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn team_add_member_dry_run_plans_and_puts_nothing() {
+        let http = FakeHttp::new();
+        let planned = client(&http)
+            .team_add_member(7, "fbui", false, &DryRun::new(true))
+            .unwrap();
+        assert!(planned.is_none());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn team_add_member_refuses_without_force() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_add_member(7, "fbui", false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn team_add_member_refuses_an_invalid_id() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_add_member(0, "fbui", true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn team_remove_member_reads_then_deletes() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/teams/7/members/fbui",
+                r#"{"login": "fbui", "future_field": 1}"#,
+            )
+            .with_delete("https://src.opensuse.org/api/v1/teams/7/members/fbui", "");
+        let removed = client(&http)
+            .team_remove_member(7, "fbui", true, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run remove returns the login");
+        assert_eq!(removed, "fbui");
+        assert_eq!(
+            http.delete_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/teams/7/members/fbui".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn team_remove_member_refuses_without_force() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_remove_member(7, "fbui", false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.delete_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn team_remove_member_missing_member_is_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/teams/7/members/fbui",
+            ErrorKind::NotFound,
+        );
+        let err = client(&http)
+            .team_remove_member(7, "fbui", true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn team_remove_member_dry_run_plans_and_deletes_nothing() {
+        let http = FakeHttp::new();
+        let dry_run = DryRun::new(true);
+        // Planning a remove needs no force: the refusal guards the
+        // live remove, not the plan.
+        let result = client(&http)
+            .team_remove_member(7, "fbui", false, &dry_run)
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: remove member fbui from team 7".to_string()]
+        );
         assert!(http.get_calls().is_empty());
         assert!(http.delete_calls().is_empty());
     }
