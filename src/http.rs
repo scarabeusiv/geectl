@@ -2563,8 +2563,8 @@ mod tests {
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
                         // Read until the full request head has
-                        // arrived: one read can return a partial head
-                        // (or, before this fix, nothing at all).
+                        // arrived: one read can return a partial head,
+                        // or nothing at all.
                         // read_request loops until the header/body
                         // boundary, plus any Content-Length body; a
                         // GET has no body, so this is exactly the head.
