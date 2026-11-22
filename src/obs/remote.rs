@@ -2247,6 +2247,43 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// Search projects a person is involved in (`GET
+    /// /search/project?match=person/@userid='...'`): every project
+    /// whose meta names `userid` in a role. Requires credentials;
+    /// an unexpected response is an error, never an empty list. The
+    /// user id is validated like a search term — it goes into a
+    /// single-quoted XPath string literal, where a quote would break
+    /// out of the literal (XPath has no string escape).
+    ///
+    /// An agent searches by person to find the projects a maintainer
+    /// owns or watches, for example when routing a submission to the
+    /// right devel project.
+    pub fn search_projects_by_person(
+        &self,
+        userid: &str,
+    ) -> Result<Vec<ProjectMatch>, GeectlError> {
+        let userid = validate_search_term(userid)?;
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching projects by person requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let match_expr = format!("person/@userid='{userid}'");
+        let url = build_url(
+            &self.base,
+            &["search", "project"],
+            &[("match", &match_expr)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_project_search(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS project search response for person {userid:?}"),
+            )
+        })
+    }
+
     /// The owners of package `package` in project `project` (`GET
     /// /search/owner?project=...&package=...`). Requires credentials;
     /// without them the search fails loudly before any request. An
@@ -6655,6 +6692,35 @@ mod tests {
         let matches = client.search_projects("python").unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].name, "devel:languages:python");
+    }
+
+    #[test]
+    fn search_projects_by_person_sends_the_person_match_authed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project?match=person%2F%40userid%3D%27scarabeus_iv%27",
+            PROJECT_SEARCH_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let matches = client.search_projects_by_person("scarabeus_iv").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "devel:languages:python");
+    }
+
+    #[test]
+    fn search_projects_by_person_rejects_a_quoted_userid_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.search_projects_by_person("").is_err());
+        assert!(client.search_projects_by_person("x' or '1'='1").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn search_projects_by_person_requires_credentials() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.search_projects_by_person("scarabeus_iv").is_err());
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]
