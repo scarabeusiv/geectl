@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Create the local-build e2e fixture on the provisioned local OBS instance.
+#
+# What it does:
+#   1. Creates the `geectl:e2e` project with a `standard` repository
+#      backed by a download-on-demand repository (the Tumbleweed OSS
+#      repository), so the scheduler can resolve the base-system dep
+#      set for the fixture package.
+#   2. Creates the `hello` package: a file upload into a package
+#      that has no `_meta` yet answers 404, so the package is
+#      created before its sources are uploaded.
+#   3. Uploads the Tumbleweed build configuration as the project's
+#      `_config`: without it the scheduler reports "bad build
+#      configuration, no build type defined or detected", because the
+#      build type is guessed from the config's `Preinstall: rpm`.
+#      The config also defines the base-system dependency closure.
+#   4. Uploads the fixture spec as the `hello` package's source.
+#   5. Polls the buildinfo until the scheduler resolves it (no
+#      `<error>`, at least one `<bdep>`): the first resolution waits
+#      on the download-on-demand daemon fetching the repository
+#      metadata and the base RPMs.
+#
+# The instance's bootstrap admin credentials (the OBS development
+# defaults, ephemeral, never a real credential) authenticate the
+# calls. Usage:
+#   GEECTL_LIVE_URL=http://127.0.0.1:3000 bash tests/local_build_e2e/provision-fixture.sh
+set -euo pipefail
+
+: "${GEECTL_LIVE_URL:?GEECTL_LIVE_URL must be set to the local OBS instance base URL}"
+BASE_URL="$GEECTL_LIVE_URL"
+ADMIN_USER="${GEECTL_LIVE_OBS_USERNAME:-Admin}"
+ADMIN_PASS="${GEECTL_LIVE_OBS_PASSWORD:-opensuse}"
+PROJECT="geectl:e2e"
+REPO="standard"
+PACKAGE="hello"
+# The fixture repository covers the runner's arch: the test builds for
+# the host arch, so the two agree by construction.
+ARCH="${FIXTURE_ARCH:-$(uname -m)}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# The download-on-demand daemon retries a failed repository fetch
+# after 600s, so the poll outlasts one failed fetch plus its retry.
+POLL_TIMEOUT_SECONDS="${FIXTURE_POLL_TIMEOUT_SECONDS:-900}"
+
+auth=(-u "$ADMIN_USER:$ADMIN_PASS")
+
+echo "Creating fixture project $PROJECT on $BASE_URL ..."
+curl --fail-with-body -sS "${auth[@]}" -X PUT -H 'Content-Type: application/xml' \
+    --data-binary @- "$BASE_URL/source/$PROJECT/_meta" <<XML
+<project name="geectl:e2e">
+  <title>geectl local-build e2e fixture</title>
+  <description>Fixture project for the local-build end-to-end job: a download-on-demand repository backed by the Tumbleweed OSS repository, so the scheduler can resolve the base-system dep set for the fixture package without any real OBS credential.</description>
+  <repository name="standard">
+    <download arch="$ARCH" url="https://download.opensuse.org/tumbleweed/repo/oss/" repotype="rpmmd"/>
+    <arch>$ARCH</arch>
+  </repository>
+</project>
+XML
+
+echo "Creating fixture package $PACKAGE ..."
+curl --fail-with-body -sS "${auth[@]}" -X PUT -H 'Content-Type: application/xml' \
+    --data-binary @- "$BASE_URL/source/$PROJECT/$PACKAGE/_meta" <<XML
+<package name="$PACKAGE" project="$PROJECT"><title>geectl local-build e2e fixture package</title><description>Fixture package for the local-build end-to-end job.</description></package>
+XML
+
+echo "Uploading fixture project config ..."
+curl --fail-with-body -sS "${auth[@]}" -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$SCRIPT_DIR/tumbleweed.conf" \
+    "$BASE_URL/source/$PROJECT/_config"
+
+echo "Uploading fixture spec as package $PACKAGE ..."
+# application/octet-stream: without an explicit content type curl
+# sends application/x-www-form-urlencoded, and Rack then parses the
+# spec body as a form and rejects its `%` macros as invalid
+# %-encoding before the controller reads the file.
+curl --fail-with-body -sS "${auth[@]}" -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$SCRIPT_DIR/hello.spec" \
+    "$BASE_URL/source/$PROJECT/$PACKAGE/hello.spec"
+
+echo "Waiting for the buildinfo to resolve ..."
+buildinfo_url="$BASE_URL/build/$PROJECT/$REPO/$ARCH/$PACKAGE/_buildinfo"
+deadline=$((SECONDS + POLL_TIMEOUT_SECONDS))
+body_file="$(mktemp)"
+trap 'rm -f "$body_file"' EXIT
+attempt=0
+while true; do
+    attempt=$((attempt + 1))
+    # A 404 means the scheduler has not registered the package yet:
+    # keep waiting. Auth and server errors fail fast instead of
+    # burning the whole timeout.
+    http_code="$(curl -sS -o "$body_file" -w '%{http_code}' "${auth[@]}" "$buildinfo_url" || true)"
+    case "$http_code" in
+        200|404) ;;
+        *)
+            echo "buildinfo request failed with HTTP $http_code:" >&2
+            cat "$body_file" >&2
+            exit 1
+            ;;
+    esac
+    last_body="$(cat "$body_file")"
+    if [ -n "$last_body" ] && ! printf '%s' "$last_body" | grep -q '<error>' \
+        && printf '%s' "$last_body" | grep -q '<bdep'; then
+        echo "Buildinfo resolved after $attempt poll(s): $(printf '%s' "$last_body" | grep -o '<bdep' | wc -l) deps."
+        break
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "buildinfo did not resolve within ${POLL_TIMEOUT_SECONDS}s" >&2
+        echo "last buildinfo body:" >&2
+        printf '%s\n' "$last_body" >&2
+        # The failure is in the instance, not the fixture: show what
+        # the download-on-demand daemon did, so the next run does not
+        # have to guess. Never let the diagnostics mask the failure.
+        compose_file="$REPO_ROOT/tests/live/docker-compose.yml"
+        if [ -f "$compose_file" ]; then
+            echo "--- fixture diagnostics (backend container) ---" >&2
+            docker compose -f "$compose_file" exec -T backend sh -c 'ps aux | grep "[b]s_dodup" || echo "dodup process not running"' >&2 || true
+            docker compose -f "$compose_file" exec -T backend sh -c 'ls -la /srv/obs/dods/ 2>&1' >&2 || true
+            docker compose -f "$compose_file" exec -T backend sh -c "ls /srv/obs/build/$PROJECT/$REPO/$ARCH/:full/ 2>&1 | head -20" >&2 || true
+            docker compose -f "$compose_file" exec -T backend sh -c 'tail -40 /srv/obs/log/bs_dodup.log 2>&1' >&2 || true
+        fi
+        exit 1
+    fi
+    if [ $((attempt % 6)) -eq 0 ]; then
+        echo "still waiting for the buildinfo ($attempt polls) ..."
+    fi
+    sleep 10
+done
+
+echo "Checking the buildconfig ..."
+curl --fail-with-body -sS "${auth[@]}" "$BASE_URL/build/$PROJECT/$REPO/_buildconfig" -o /dev/null
+echo "Fixture project $PROJECT is ready."

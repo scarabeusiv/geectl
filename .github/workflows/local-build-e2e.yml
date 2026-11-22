@@ -1,0 +1,159 @@
+# End-to-end local build: a real podman build of a small fixture package
+# against a local OBS instance.
+#
+# This is the live proof for the local-build vertical (see
+# docs/local-build-design.md): the per-PR suite proves the logic with a
+# stub engine, this job proves the real engine, image, and cache end to
+# end. It is INDEPENDENT and does NOT gate PRs: it is not a required
+# status check. When it regresses, it is fixed independently. It runs
+# on every pull request, weekly (Mondays 06:00 UTC, the same slot as
+# the freshness workflow and the live job), and on demand.
+#
+# The build runs against a local OBS instance, not api.opensuse.org:
+# the job provisions the same temporary instance the live job uses
+# (`tests/live/provision.sh`), starts the download-on-demand daemon
+# the development backend leaves out, creates the fixture project
+# (`tests/local_build_e2e/provision-fixture.sh` — a
+# download-on-demand repository backed by the Tumbleweed OSS
+# repository, so the scheduler can resolve the base-system dep set),
+# and runs the `local_build_e2e` integration test against it. The
+# instance's bootstrap admin credentials authenticate the test — no
+# real OBS credential is used anywhere.
+#
+# The job installs podman and the `build` engine (`obs-build`, the
+# Debian name for the openSUSE build script) and runs the
+# `local_build_e2e` integration test, which skips unless
+# `GEECTL_LOCAL_BUILD_E2E` is `1`.
+
+name: local-build-e2e
+
+on:
+  pull_request:
+  schedule:
+    # Weekly, Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel a superseded run of the same workflow on the same ref, but only
+# for pull requests: a push to main must never cancel a running main
+# build. Matches test.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  local-build-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # Pinned to the v7 tag's commit so the action cannot move under us;
+      # Dependabot tracks SHA pins and proposes updates.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned to the v1 tag's commit so the action cannot move under us
+      # and the SHA cannot be garbage-collected; Dependabot tracks SHA
+      # pins and proposes updates. The toolchain is pinned to 1.99.1
+      # (matching rust-toolchain.toml): the action requires an
+      # explicit toolchain and does not read rust-toolchain.toml,
+      # so CI and local developers use the same compiler.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.99.1
+      # Pinned to the v2 tag's commit; Dependabot tracks SHA pins and
+      # proposes updates. Plain cache (no OS-release scoping): geectl
+      # is pure Rust with no bindgen or system libraries, so the cache
+      # is not tied to a distro release the way rpmcrab's is.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: . -> target
+      # Buildx with a docker-container builder, so the frontend image
+      # build can export its layers to the GitHub Actions cache (the
+      # gha cache exporter needs a builder that supports it, and this
+      # also guarantees a current Buildx/BuildKit — the v2 cache API
+      # needs Buildx >= 0.21 / BuildKit >= 0.20). Pinned to the v3
+      # tag's commit; Dependabot tracks SHA pins and proposes updates.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      # Expose the GitHub Actions runtime (ACTIONS_CACHE_URL /
+      # ACTIONS_RUNTIME_TOKEN) to the following steps: BuildKit's
+      # `type=gha` cache backend reads them from the environment, and
+      # a plain `run:` step does not provide them — without this step
+      # the frontend build silently skips both the cache import and
+      # the cache export (no error, no cache). Pinned to the v4 tag's
+      # commit; Dependabot tracks SHA pins and proposes updates.
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4
+      # Podman plus the `build` engine. The engine ships as `obs-build`
+      # (the Debian name for the openSUSE build script) in the
+      # openSUSE:Tools repository; the repo path follows the runner's
+      # Ubuntu release so a runner upgrade does not silently point at
+      # a missing directory.
+      - name: Install podman and the build engine
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y podman
+          ubuntu_version="$(lsb_release -rs)"
+          echo "deb https://download.opensuse.org/repositories/openSUSE:/Tools/xUbuntu_${ubuntu_version}/ /" | sudo tee /etc/apt/sources.list.d/obs-tools.list > /dev/null
+          curl -fsSL "https://download.opensuse.org/repositories/openSUSE:/Tools/xUbuntu_${ubuntu_version}/Release.key" | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/obs-tools.gpg
+          sudo apt-get update
+          sudo apt-get install -y obs-build
+          # The build script answers no --version: its version is the
+          # package version. The query fails when the package is absent.
+          dpkg-query -W -f='${Version}\n' obs-build
+          podman --version
+      - name: Provision live OBS instance
+        env:
+          # Enables the BuildKit GitHub Actions cache for the frontend
+          # image build (see tests/live/docker-compose.cache.yml).
+          # Local runs leave it unset and build uncached, as before.
+          LIVE_CACHE: "1"
+        run: bash tests/live/provision.sh
+      # The development backend does not start the download-on-demand
+      # daemon, and the fixture project's repository is
+      # download-on-demand: without it the scheduler never fetches the
+      # repository metadata or the base RPMs, and the buildinfo never
+      # resolves. `exec -d` detaches the exec session; the daemon
+      # itself runs in the foreground.
+      - name: Start the download-on-demand daemon
+        run: docker compose -f tests/live/docker-compose.yml exec -d backend /obs/src/backend/bs_dodup --logfile /srv/obs/log/bs_dodup.log
+      # Fail fast when the daemon did not start: `exec -d` returns 0
+      # once the process is spawned, so a daemon that dies at once
+      # (bad flag, unwritable log, already running) would otherwise
+      # surface only as a buildinfo timeout minutes later. The lock
+      # file exists only once the daemon passed option parsing, the
+      # log open, and lock acquisition — but it also survives a dead
+      # daemon, so the process itself is checked too.
+      - name: Check the download-on-demand daemon is running
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if docker compose -f tests/live/docker-compose.yml exec -T backend sh -c 'test -f /srv/obs/run/bs_dodup.lock && ps aux | grep -q "[b]s_dodup"'; then
+              echo "bs_dodup is running (lock file present, process alive)."
+              exit 0
+            fi
+            echo "waiting for bs_dodup (attempt $attempt/6)..."
+            sleep 5
+          done
+          echo "bs_dodup did not start: no lock file and live process after 30s" >&2
+          docker compose -f tests/live/docker-compose.yml logs backend | tail -30 >&2
+          exit 1
+      - name: Provision local-build fixture project
+        env:
+          GEECTL_LIVE_URL: http://127.0.0.1:3000
+        run: bash tests/local_build_e2e/provision-fixture.sh
+      - name: Run the local-build end-to-end test
+        env:
+          # The test skips without this marker: a missing marker here
+          # would silently pass the job with no build run, so the
+          # marker is the job's own proof it ran.
+          GEECTL_LOCAL_BUILD_E2E: "1"
+          # The test builds against the provisioned local instance:
+          # a missing URL with the marker set fails the test instead
+          # of silently skipping, so a broken fixture is visible.
+          GEECTL_LIVE_URL: http://127.0.0.1:3000
+        run: cargo test --locked --test local_build_e2e
+      - name: Tear down live OBS instance
+        if: always()
+        run: bash tests/live/teardown.sh

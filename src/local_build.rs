@@ -109,6 +109,11 @@ const PROBE_TIMEOUT_SECS: u64 = 60;
 /// delay the timeout error. The bound matches the 10s `stop`
 /// passes to the container.
 const KILL_TIMEOUT_SECS: u64 = 10;
+/// How long one package-owner version probe may take (seconds):
+/// the query answers in ms on a healthy host; the budget only
+/// bounds a hung package manager. At most three run in sequence,
+/// after `--version`, so the chain stays bounded.
+const PACKAGE_PROBE_TIMEOUT_SECS: u64 = 10;
 /// How long the caller waits for a drain thread to finish after
 /// the child exits (seconds): the drain only has to read what is
 /// already in the pipe, so this is generous — but a descendant
@@ -327,7 +332,8 @@ pub struct BuildRecord {
     pub checks: Option<CheckSummary>,
     /// The resolved image digest, when podman answered.
     pub image_digest: Option<String>,
-    /// The engine version, when the engine answered `--version`.
+    /// The engine version, when the engine reports one: its `--version`
+    /// answer, else the version of the package owning the engine binary.
     pub engine_version: Option<String>,
     pub root_path: PathBuf,
     /// True when the build reused an existing root.
@@ -1288,9 +1294,13 @@ impl<'a> LocalBuild<'a> {
         Ok(())
     }
 
-    /// The engine version, from `<engine> --version` (first line).
-    /// A version the engine will not report reads as unknown rather
-    /// than failing the build — the record carries it when known.
+    /// The engine version, when the engine reports one: the engine's
+    /// own `--version` answer (first line), else the version of the
+    /// package owning the engine binary. The build script answers no
+    /// `--version`, so the package version is the version it reports.
+    /// An engine that reports no version either way reads as unknown
+    /// rather than failing the build — the record carries it when
+    /// known.
     fn engine_version(&self) -> Result<Option<String>, GeectlError> {
         let engine = which(&self.engine).ok_or_else(|| {
             GeectlError::new(
@@ -1304,18 +1314,21 @@ impl<'a> LocalBuild<'a> {
         let mut cmd = Command::new(&engine);
         cmd.arg("--version");
         let output = run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS));
-        match output {
-            Ok(output) if output.status.success() => {
+        if let Ok(output) = output {
+            if output.status.success() {
                 let text = String::from_utf8_lossy(&output.stdout);
                 let first = text.lines().next().map(|l| l.trim().to_string());
-                Ok(first.filter(|l| !l.is_empty()))
-            }
-            _ => {
-                self.debug
-                    .emit("local-build: engine did not answer --version; recording unknown");
-                Ok(None)
+                if let Some(first) = first.filter(|l| !l.is_empty()) {
+                    return Ok(Some(first));
+                }
             }
         }
+        if let Some(version) = engine_package_version(&engine) {
+            return Ok(Some(version));
+        }
+        self.debug
+            .emit("local-build: engine reported no version; recording unknown");
+        Ok(None)
     }
 
     /// Create the root marker on first build, or refresh the
@@ -2358,8 +2371,8 @@ fn spawn_with_retry(
 /// (capped, as in [`run_engine`]). On expiry the child is killed
 /// and `TimedOut` is returned — a probe must never hang the caller.
 /// The engine run has its own deadline loop ([`run_engine`]); this
-/// is for the probes (`--version`, image inspect/listing/size,
-/// image remove, image pull).
+/// is for the probes (`--version` and package-owner version,
+/// image inspect/listing/size, image remove, image pull).
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<std::process::Output> {
     let mut child = spawn_with_retry(|| {
         cmd.stdin(Stdio::null())
@@ -2463,6 +2476,60 @@ fn drain_into(stream: Option<impl Read + Send + 'static>, buf: &Arc<Mutex<Vec<u8
             }
             Err(_) => break,
         }
+    }
+}
+
+/// The version of the package owning `engine`, when the host package
+/// manager can tell: `rpm -qf` on rpm systems, `dpkg-query` on
+/// Debian systems. `None` when neither answers — the engine is not
+/// installed from a package, or no package manager is present.
+fn engine_package_version(engine: &Path) -> Option<String> {
+    let engine = engine.to_str()?;
+    let mut cmd = Command::new("rpm");
+    cmd.args(["-qf", "--queryformat", "%{VERSION}-%{RELEASE}", engine]);
+    if let Ok(output) = run_with_timeout(&mut cmd, Duration::from_secs(PACKAGE_PROBE_TIMEOUT_SECS))
+    {
+        if output.status.success() {
+            let version = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !version.is_empty() {
+                return Some(version);
+            }
+        }
+    }
+    let mut cmd = Command::new("dpkg-query");
+    cmd.args(["-S", engine]);
+    let owner = run_with_timeout(&mut cmd, Duration::from_secs(PACKAGE_PROBE_TIMEOUT_SECS)).ok()?;
+    if !owner.status.success() {
+        return None;
+    }
+    // The owner line is `package: <path>` (or `package:arch: <path>`);
+    // a diverted path also prints `local diversion ...` lines naming
+    // the same path, so select the line whose package field has no
+    // whitespace — a package name never does.
+    let stdout = String::from_utf8_lossy(&owner.stdout);
+    let package = stdout
+        .lines()
+        .filter(|line| line.ends_with(&format!(": {engine}")))
+        .filter_map(|line| line.split(':').next().map(str::trim))
+        .find(|package| !package.is_empty() && !package.contains(char::is_whitespace));
+    let package = package?;
+    let mut cmd = Command::new("dpkg-query");
+    cmd.args(["-W", "-f", "${Version}", package]);
+    let output =
+        run_with_timeout(&mut cmd, Duration::from_secs(PACKAGE_PROBE_TIMEOUT_SECS)).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
     }
 }
 
@@ -7040,6 +7107,124 @@ exit 0
             assert_eq!(record.verdict, "dry-run");
             assert_eq!(record.engine_version, None);
             assert!(record.plan.is_some());
+        }
+
+        /// Serializes the tests that read or mutate PATH for the
+        /// package-manager probes: a stub manager on PATH must not
+        /// leak into a test expecting the real ones.
+        static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// Prepends `dir` to PATH, restoring it on drop.
+        struct RestorePath(Option<std::ffi::OsString>);
+
+        impl RestorePath {
+            fn prepend(dir: &Path) -> Self {
+                let old = std::env::var_os("PATH");
+                let mut paths =
+                    std::env::split_paths(&old.clone().unwrap_or_default()).collect::<Vec<_>>();
+                paths.insert(0, dir.to_path_buf());
+                std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+                RestorePath(old)
+            }
+        }
+
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(old) => std::env::set_var("PATH", old),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+
+        #[test]
+        fn engine_version_falls_back_to_the_package_version() {
+            // A --version-refusing engine plus a stub rpm answering
+            // -qf: the record carries the package version.
+            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = TempDir::new();
+            let engine = dir.path().join("silent-engine");
+            write_script(&engine, "#!/bin/sh\nexit 1\n");
+            write_script(
+                &dir.path().join("rpm"),
+                "#!/bin/sh\nif [ \"$1\" = \"-qf\" ]; then echo \"9.9-9\"; exit 0; fi\nexit 1\n",
+            );
+            let _restore = RestorePath::prepend(dir.path());
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = LocalBuild::new(&client, dir.path().join("cache"))
+                .with_engine(engine)
+                .with_podman(PathBuf::from("podman"));
+            assert_eq!(vertical.engine_version().unwrap().as_deref(), Some("9.9-9"));
+        }
+
+        #[test]
+        fn engine_version_falls_back_to_dpkg_when_rpm_refuses() {
+            // rpm refuses and dpkg-query answers -S and -W: the record
+            // carries the dpkg version. The rpm stub masks a real rpm
+            // on PATH so the dpkg branch is the one that runs.
+            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = TempDir::new();
+            let engine = dir.path().join("silent-engine");
+            write_script(&engine, "#!/bin/sh\nexit 1\n");
+            write_script(&dir.path().join("rpm"), "#!/bin/sh\nexit 1\n");
+            write_script(
+                &dir.path().join("dpkg-query"),
+                "#!/bin/sh\nif [ \"$1\" = \"-S\" ]; then echo \"obs-build: $2\"; exit 0; fi\nif [ \"$1\" = \"-W\" ]; then echo \"8.8-8\"; exit 0; fi\nexit 1\n",
+            );
+            let _restore = RestorePath::prepend(dir.path());
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = LocalBuild::new(&client, dir.path().join("cache"))
+                .with_engine(engine)
+                .with_podman(PathBuf::from("podman"));
+            assert_eq!(vertical.engine_version().unwrap().as_deref(), Some("8.8-8"));
+        }
+
+        #[test]
+        fn engine_package_version_reads_the_owning_package() {
+            // The package-manager probes read PATH: hold the lock so a
+            // PATH-mutating probe test cannot swap the managers under
+            // this one.
+            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // The package manager on the host answers for a binary it
+            // owns: rpm on rpm systems, dpkg-query on Debian systems.
+            // The test skips when neither is on PATH (the case on a
+            // stock macOS host).
+            let rpm = which(Path::new("rpm"));
+            let dpkg = which(Path::new("dpkg-query"));
+            let (manager, binary) = match (rpm, dpkg) {
+                (Some(path), _) => ("rpm", path),
+                (None, Some(path)) => ("dpkg-query", path),
+                (None, None) => {
+                    eprintln!("skipping: no rpm or dpkg-query on PATH");
+                    return;
+                }
+            };
+            let version = engine_package_version(&binary);
+            assert!(
+                version.as_deref().is_some_and(|v| !v.is_empty()),
+                "{manager} answered no version for {}",
+                binary.display()
+            );
+        }
+
+        #[test]
+        fn engine_version_is_unknown_when_nothing_answers() {
+            // Hold the lock: the fallback reads PATH, and a
+            // PATH-mutating probe test must not swap the managers.
+            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // A stub engine that refuses --version and is owned by no
+            // package records an unknown version instead of failing.
+            let dir = TempDir::new();
+            let script = dir.path().join("silent-stub");
+            write_script(&script, "#!/bin/sh\nexit 1\n");
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = LocalBuild::new(&client, dir.path().join("cache"))
+                .with_engine(script)
+                .with_podman(PathBuf::from("podman"));
+            assert_eq!(vertical.engine_version().unwrap(), None);
         }
 
         #[test]

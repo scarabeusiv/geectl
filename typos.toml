@@ -5,3 +5,7 @@
 # only when it is a real word the dictionary does not know (a project
 # name, an API term), never to silence a genuine typo.
 [default.extend-words]
+
+# Verbatim upstream files are excluded: their text is not ours to fix.
+[files]
+extend-exclude = ["tests/local_build_e2e/tumbleweed.conf"]
