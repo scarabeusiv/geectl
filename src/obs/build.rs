@@ -7,6 +7,7 @@ use crate::auth::Credentials;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::xml::find_tag_end;
+use crate::xml::skip_xml_prolog;
 use crate::xml::xml_child_elements;
 use crate::xml::xml_elements;
 use crate::xml::xml_unescape;
@@ -141,13 +142,35 @@ fn results_settled(results: &BuildResults, package: Option<&str>) -> bool {
 /// missing a required attribute — is a server error, never an empty
 /// matrix: a failed lookup must not read as "nothing is building".
 pub(crate) fn parse_build_results(body: &str) -> Result<BuildResults, GeectlError> {
+    let body = body.trim();
+    // A malformed build results response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <resultlist> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS build results response: not a <resultlist> document",
+            format!(
+                "unexpected OBS build results response: not a <resultlist> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <resultlist> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <resultlist>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<resultlist") else {
         return Err(malformed());
     };
@@ -294,13 +317,35 @@ pub struct JobStatus {
 /// `workerid`, `hostarch`, `uri`, `arch`, `job`, `jobid`, `attempt`)
 /// are child elements.
 pub(crate) fn parse_job_status(body: &str) -> Result<Option<JobStatus>, GeectlError> {
+    let body = body.trim();
+    // A malformed job status response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <jobstatus> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS job status response: not a <jobstatus> document",
+            format!(
+                "unexpected OBS job status response: not a <jobstatus> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <jobstatus> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <jobstatus>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     // The document must start with the root element: a `<jobstatus>`
     // found later in the body is not a jobstatus document.
     let Some(after_tag) = body.strip_prefix("<jobstatus") else {
@@ -375,13 +420,35 @@ pub(crate) fn parse_job_status(body: &str) -> Result<Option<JobStatus>, GeectlEr
 /// attribute is a server error, never "no status": no status reads
 /// as `code="unknown"` on the call, not as an empty document.
 pub(crate) fn parse_build_status(body: &str) -> Result<String, GeectlError> {
+    let body = body.trim();
+    // A malformed build status response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <status> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS build status response: not a <status> document",
+            format!(
+                "unexpected OBS build status response: not a <status> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <status> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <status>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     // The document must start with the root element: a `<status>`
     // found later in the body is not a status document, and nothing
     // but whitespace may follow the root element.
@@ -489,13 +556,35 @@ pub struct JobHistoryEntry {
 /// document that is not a buildinfo — or a `<bdep>` without a name —
 /// is a server error, never an empty buildinfo.
 pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
+    let body = body.trim();
+    // A malformed buildinfo response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <buildinfo> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS buildinfo response: not a <buildinfo> document",
+            format!(
+                "unexpected OBS buildinfo response: not a <buildinfo> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <buildinfo> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <buildinfo>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<buildinfo") else {
         return Err(malformed());
     };
@@ -546,13 +635,35 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
 /// `<entry>` missing a required attribute or carrying a non-numeric
 /// one — is a server error, never an empty history.
 pub(crate) fn parse_build_history(body: &str) -> Result<Vec<BuildHistoryEntry>, GeectlError> {
+    let body = body.trim();
+    // A malformed build history response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <buildhistory> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS build history response: not a <buildhistory> document",
+            format!(
+                "unexpected OBS build history response: not a <buildhistory> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <buildhistory> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <buildhistory>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<buildhistory") else {
         return Err(malformed());
     };
@@ -610,13 +721,35 @@ pub(crate) fn parse_build_history(body: &str) -> Result<Vec<BuildHistoryEntry>, 
 /// `<jobhist>` missing its package or code, or carrying a non-numeric
 /// number — is a server error, never an empty history.
 pub(crate) fn parse_job_history(body: &str) -> Result<Vec<JobHistoryEntry>, GeectlError> {
+    let body = body.trim();
+    // A malformed job history response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <jobhistlist> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS job history response: not a <jobhistlist> document",
+            format!(
+                "unexpected OBS job history response: not a <jobhistlist> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <jobhistlist> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <jobhistlist>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<jobhistlist") else {
         return Err(malformed());
     };
@@ -791,13 +924,35 @@ pub struct ProvidedBy {
 /// without a filename, or with a non-numeric size/mtime — is a server
 /// error, never an empty list.
 pub(crate) fn parse_binary_list(body: &str) -> Result<Vec<BinaryFile>, GeectlError> {
+    let body = body.trim();
+    // A malformed binary list response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <binarylist> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS binary list response: not a <binarylist> document",
+            format!(
+                "unexpected OBS binary list response: not a <binarylist> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <binarylist> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <binarylist>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<binarylist") else {
         return Err(malformed());
     };
@@ -908,13 +1063,35 @@ fn parse_ext_dependency(element: &str, name: &str) -> Result<ExtDependency, Geec
 /// with `withfilelist`, which geectl never requests, so it is not
 /// read.
 pub(crate) fn parse_fileinfo(body: &str) -> Result<FileInfo, GeectlError> {
+    let body = body.trim();
+    // A malformed fileinfo response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <fileinfo> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS fileinfo response: not a <fileinfo> document",
+            format!(
+                "unexpected OBS fileinfo response: not a <fileinfo> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <fileinfo> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <fileinfo>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<fileinfo") else {
         return Err(malformed());
     };
@@ -1063,13 +1240,35 @@ pub struct PackageDeps {
 /// `<package>` without a name — is a server error, never an empty
 /// list.
 pub(crate) fn parse_builddepinfo(body: &str) -> Result<Vec<PackageDeps>, GeectlError> {
+    let body = body.trim();
+    // A malformed builddepinfo response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <builddepinfo> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS builddepinfo response: not a <builddepinfo> document",
+            format!(
+                "unexpected OBS builddepinfo response: not a <builddepinfo> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <builddepinfo> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <builddepinfo>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<builddepinfo") else {
         return Err(malformed());
     };
@@ -1135,13 +1334,35 @@ pub(crate) fn parse_builddepinfo(body: &str) -> Result<Vec<PackageDeps>, GeectlE
 /// `<repository>` without a name, or a `<path>` without a project —
 /// is a server error, never an empty list.
 pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlError> {
+    let body = body.trim();
+    // A malformed project meta response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <project> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS project meta response: not a <project> document",
+            format!(
+                "unexpected OBS project meta response: not a <project> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <project> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <project>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<project") else {
         return Err(malformed());
     };
@@ -2238,6 +2459,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_build_results_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <resultlist>
+        // element; the result is the same as without one.
+        let plain = "<resultlist/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_build_results(&prolog).unwrap(),
+            parse_build_results(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_build_results(&format!("<?xml?>{plain}")).unwrap(),
+            parse_build_results(plain).unwrap()
+        );
+        assert_eq!(
+            parse_build_results(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_build_results(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <resultlist>.
+        assert!(parse_build_results("<?xml version=\"1.0\" <resultlist></resultlist>").is_err());
+        assert!(parse_build_results("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(
+            parse_build_results("<?xmlfoo version=\"1.0\"?><resultlist></resultlist>").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_build_results_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_build_results("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_build_results(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_build_results("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
+    }
+
+    #[test]
     fn results_settled_requires_no_dirty_and_no_waiting_code() {
         let settled = BuildResults {
             state: None,
@@ -2627,6 +2894,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_job_status_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <jobstatus>
+        // element; the result is the same as without one.
+        let plain = "<jobstatus/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_job_status(&prolog).unwrap(),
+            parse_job_status(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_job_status(&format!("<?xml?>{plain}")).unwrap(),
+            parse_job_status(plain).unwrap()
+        );
+        assert_eq!(
+            parse_job_status(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_job_status(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <jobstatus>.
+        assert!(parse_job_status("<?xml version=\"1.0\" <jobstatus></jobstatus>").is_err());
+        assert!(parse_job_status("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_job_status("<?xmlfoo version=\"1.0\"?><jobstatus></jobstatus>").is_err());
+    }
+
+    #[test]
+    fn parse_job_status_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_job_status("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_job_status(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_job_status("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
+    }
+
+    #[test]
     fn parse_build_status_reads_the_code() {
         assert_eq!(
             parse_build_status("<status package=\"foo\" code=\"failed\"/>").unwrap(),
@@ -2647,6 +2958,50 @@ mod tests {
         assert!(parse_build_status("junk<status code=\"failed\"/>").is_err());
         assert!(parse_build_status("<status code=\"failed\"/>junk").is_err());
         assert!(parse_build_status("<statusx code=\"failed\"/>").is_err());
+    }
+
+    #[test]
+    fn parse_build_status_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <status>
+        // element; the result is the same as without one.
+        let plain = "<status package=\"foo\" code=\"failed\"/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_build_status(&prolog).unwrap(),
+            parse_build_status(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_build_status(&format!("<?xml?>{plain}")).unwrap(),
+            parse_build_status(plain).unwrap()
+        );
+        assert_eq!(
+            parse_build_status(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_build_status(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <status>.
+        assert!(parse_build_status("<?xml version=\"1.0\" <status></status>").is_err());
+        assert!(parse_build_status("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_build_status("<?xmlfoo version=\"1.0\"?><status></status>").is_err());
+    }
+
+    #[test]
+    fn parse_build_status_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_build_status("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_build_status(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_build_status("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
@@ -2850,6 +3205,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_buildinfo_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <buildinfo>
+        // element; the result is the same as without one.
+        let plain = "<buildinfo project=\"p\"/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_buildinfo(&prolog).unwrap(),
+            parse_buildinfo(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_buildinfo(&format!("<?xml?>{plain}")).unwrap(),
+            parse_buildinfo(plain).unwrap()
+        );
+        assert_eq!(
+            parse_buildinfo(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_buildinfo(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <buildinfo>.
+        assert!(parse_buildinfo("<?xml version=\"1.0\" <buildinfo></buildinfo>").is_err());
+        assert!(parse_buildinfo("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_buildinfo("<?xmlfoo version=\"1.0\"?><buildinfo></buildinfo>").is_err());
+    }
+
+    #[test]
+    fn parse_buildinfo_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_buildinfo("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_buildinfo(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_buildinfo("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
+    }
+
+    #[test]
     fn parse_build_history_reads_entries() {
         let parsed = parse_build_history(
             "<buildhistory><entry rev=\"2\" srcmd5=\"def\" versrel=\"1.0-1\" bcnt=\"1\" time=\"1699900000\"/><entry rev=\"3\" srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\" duration=\"120\"/></buildhistory>",
@@ -2893,6 +3292,54 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parse_build_history_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <buildhistory>
+        // element; the result is the same as without one.
+        let plain = "<buildhistory/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_build_history(&prolog).unwrap(),
+            parse_build_history(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_build_history(&format!("<?xml?>{plain}")).unwrap(),
+            parse_build_history(plain).unwrap()
+        );
+        assert_eq!(
+            parse_build_history(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_build_history(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <buildhistory>.
+        assert!(
+            parse_build_history("<?xml version=\"1.0\" <buildhistory></buildhistory>").is_err()
+        );
+        assert!(parse_build_history("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(
+            parse_build_history("<?xmlfoo version=\"1.0\"?><buildhistory></buildhistory>").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_build_history_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_build_history("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_build_history(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_build_history("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
@@ -2952,6 +3399,52 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parse_job_history_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <jobhistlist>
+        // element; the result is the same as without one.
+        let plain = "<jobhistlist/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_job_history(&prolog).unwrap(),
+            parse_job_history(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_job_history(&format!("<?xml?>{plain}")).unwrap(),
+            parse_job_history(plain).unwrap()
+        );
+        assert_eq!(
+            parse_job_history(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_job_history(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <jobhistlist>.
+        assert!(parse_job_history("<?xml version=\"1.0\" <jobhistlist></jobhistlist>").is_err());
+        assert!(parse_job_history("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(
+            parse_job_history("<?xmlfoo version=\"1.0\"?><jobhistlist></jobhistlist>").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_job_history_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_job_history("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_job_history(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_job_history("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
@@ -3123,6 +3616,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_binary_list_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <binarylist>
+        // element; the result is the same as without one.
+        let plain = "<binarylist/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_binary_list(&prolog).unwrap(),
+            parse_binary_list(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_binary_list(&format!("<?xml?>{plain}")).unwrap(),
+            parse_binary_list(plain).unwrap()
+        );
+        assert_eq!(
+            parse_binary_list(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_binary_list(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <binarylist>.
+        assert!(parse_binary_list("<?xml version=\"1.0\" <binarylist></binarylist>").is_err());
+        assert!(parse_binary_list("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_binary_list("<?xmlfoo version=\"1.0\"?><binarylist></binarylist>").is_err());
+    }
+
+    #[test]
+    fn parse_binary_list_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_binary_list("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_binary_list(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_binary_list("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
+    }
+
+    #[test]
     fn parse_fileinfo_reads_the_plain_view() {
         let parsed = parse_fileinfo(
             "<fileinfo filename=\"foo-1.0-1.x86_64.rpm\"><name>foo</name><epoch>1</epoch><version>1.0</version><release>1</release><arch>x86_64</arch><summary>Foo tool</summary><description>Does foo.</description><disturl>obs://build.opensuse.org/openSUSE:Factory/standard/abc-foo-1.0-1.x86_64.rpm</disturl><size>58352</size><mtime>1617270174</mtime><provides>foo = 1.0-1</provides><provides>libc.so.6()(64bit)</provides><requires>libc.so.6()(64bit)</requires><prerequires>/bin/sh</prerequires><conflicts>oldfoo</conflicts><obsoletes>oldfoo</obsoletes><recommends>foo-doc</recommends><supplements>foo</supplements><suggests>foo-extra</suggests><enhances>foo-base</enhances></fileinfo>",
@@ -3196,6 +3733,50 @@ mod tests {
                 .is_err()
         );
         assert!(parse_fileinfo("<fileinfo filename=\"x\"><size>big</size></fileinfo>").is_err());
+    }
+
+    #[test]
+    fn parse_fileinfo_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <fileinfo>
+        // element; the result is the same as without one.
+        let plain = "<fileinfo filename=\"foo-1.0-1.x86_64.rpm\"/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_fileinfo(&prolog).unwrap(),
+            parse_fileinfo(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_fileinfo(&format!("<?xml?>{plain}")).unwrap(),
+            parse_fileinfo(plain).unwrap()
+        );
+        assert_eq!(
+            parse_fileinfo(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_fileinfo(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <fileinfo>.
+        assert!(parse_fileinfo("<?xml version=\"1.0\" <fileinfo></fileinfo>").is_err());
+        assert!(parse_fileinfo("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_fileinfo("<?xmlfoo version=\"1.0\"?><fileinfo></fileinfo>").is_err());
+    }
+
+    #[test]
+    fn parse_fileinfo_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_fileinfo("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_fileinfo(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_fileinfo("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
@@ -3421,6 +4002,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_builddepinfo_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <builddepinfo>
+        // element; the result is the same as without one.
+        let plain = "<builddepinfo/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_builddepinfo(&prolog).unwrap(),
+            parse_builddepinfo(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_builddepinfo(&format!("<?xml?>{plain}")).unwrap(),
+            parse_builddepinfo(plain).unwrap()
+        );
+        assert_eq!(
+            parse_builddepinfo(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_builddepinfo(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <builddepinfo>.
+        assert!(parse_builddepinfo("<?xml version=\"1.0\" <builddepinfo></builddepinfo>").is_err());
+        assert!(parse_builddepinfo("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(
+            parse_builddepinfo("<?xmlfoo version=\"1.0\"?><builddepinfo></builddepinfo>").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_builddepinfo_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_builddepinfo("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_builddepinfo(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_builddepinfo("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
+    }
+
+    #[test]
     fn parse_repositories_reads_repos_arches_and_paths() {
         let parsed = parse_repositories(
             "<project name=\"testproject\"><title>t</title><repository name=\"standard\"><arch>x86_64</arch><arch>i586</arch><path project=\"openSUSE.org:openSUSE:Tumbleweed\" repository=\"standard\"/></repository><repository name=\"ports\"><arch>aarch64</arch><path project=\"openSUSE.org:openSUSE:Tumbleweed\" repository=\"ports\"/></repository></project>",
@@ -3476,6 +4103,50 @@ mod tests {
             "<project name=\"p\"><repository name=\"r\"><path project=\"q\" repository=\"s\"/></project>"
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_repositories_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <project>
+        // element; the result is the same as without one.
+        let plain = "<project name=\"testproject\"/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_repositories(&prolog).unwrap(),
+            parse_repositories(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_repositories(&format!("<?xml?>{plain}")).unwrap(),
+            parse_repositories(plain).unwrap()
+        );
+        assert_eq!(
+            parse_repositories(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_repositories(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <project>.
+        assert!(parse_repositories("<?xml version=\"1.0\" <project></project>").is_err());
+        assert!(parse_repositories("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_repositories("<?xmlfoo version=\"1.0\"?><project></project>").is_err());
+    }
+
+    #[test]
+    fn parse_repositories_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_repositories("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_repositories(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_repositories("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]

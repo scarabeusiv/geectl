@@ -41,6 +41,7 @@ use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::xml::find_attr;
 use crate::xml::scan_tag;
+use crate::xml::skip_xml_prolog;
 use crate::xml::xml_escape;
 use crate::xml::xml_unescape;
 use crate::xml::XmlDoc;
@@ -295,13 +296,35 @@ pub(crate) struct LinkInfo {
 /// attributes are read from the open tag only, so a linkinfo with
 /// `<linked>` children still parses.
 pub(crate) fn parse_linkinfo(body: &str) -> Result<Option<LinkInfo>, GeectlError> {
+    let body = body.trim();
+    // A malformed linkinfo response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <directory> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS directory response: not a <directory> document",
+            format!(
+                "unexpected OBS directory response: not a <directory> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <directory> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <directory>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<directory") else {
         return Err(malformed());
     };
@@ -727,13 +750,35 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
 /// malformed history. The entries come back in server order (oldest
 /// first); the parser preserves it.
 pub(crate) fn parse_history(body: &str) -> Result<Vec<HistoryEntry>, GeectlError> {
+    let body = body.trim();
+    // A malformed history response still fails closed, but the error
+    // carries a bounded preview of what was received, so the failure
+    // is diagnosable instead of a bare "not a <revisionlist> document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
     let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
         GeectlError::new(
             ErrorKind::ServerError,
-            "unexpected OBS history response: not a <revisionlist> document",
+            format!(
+                "unexpected OBS history response: not a <revisionlist> document; received: {received}"
+            ),
         )
     };
-    let body = body.trim();
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <revisionlist> element; skip it. The prolog must terminate
+    // (`?>`) — an unterminated prolog is malformed, not a missing
+    // <revisionlist>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
     let Some(after_open) = body.strip_prefix("<revisionlist") else {
         return Err(malformed());
     };
@@ -3325,6 +3370,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_linkinfo_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <directory>
+        // element; the result is the same as without one.
+        let plain = "<directory name=\"test:factory/test-pkgA\"/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_linkinfo(&prolog).unwrap(),
+            parse_linkinfo(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_linkinfo(&format!("<?xml?>{plain}")).unwrap(),
+            parse_linkinfo(plain).unwrap()
+        );
+        assert_eq!(
+            parse_linkinfo(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_linkinfo(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <directory>.
+        assert!(parse_linkinfo("<?xml version=\"1.0\" <directory></directory>").is_err());
+        assert!(parse_linkinfo("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_linkinfo("<?xmlfoo version=\"1.0\"?><directory></directory>").is_err());
+    }
+
+    #[test]
+    fn parse_linkinfo_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_linkinfo("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_linkinfo(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_linkinfo("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
+    }
+
+    #[test]
     fn parse_directory_rev_reads_rev_and_vrev() {
         let body = "<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"ffffffffffffffffffffffffffffffff\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>";
         assert_eq!(
@@ -5640,6 +5729,50 @@ mod tests {
             parse_history("<revisionlist><revision rev=\"1\" vrev=\"1\"></revisionlist>").is_err()
         );
         assert!(parse_history("<revisionlist/>").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_history_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the <revisionlist>
+        // element; the result is the same as without one.
+        let plain = "<revisionlist/>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_history(&prolog).unwrap(),
+            parse_history(plain).unwrap()
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(
+            parse_history(&format!("<?xml?>{plain}")).unwrap(),
+            parse_history(plain).unwrap()
+        );
+        assert_eq!(
+            parse_history(&format!("<?xml version=\"1.0\"?>\n{plain}")).unwrap(),
+            parse_history(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing <revisionlist>.
+        assert!(parse_history("<?xml version=\"1.0\" <revisionlist></revisionlist>").is_err());
+        assert!(parse_history("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
+        // malformed rather than skipping a prefix that is not one.
+        assert!(parse_history("<?xmlfoo version=\"1.0\"?><revisionlist></revisionlist>").is_err());
+    }
+
+    #[test]
+    fn parse_history_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_history("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_history(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_history("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
     }
 
     #[test]
