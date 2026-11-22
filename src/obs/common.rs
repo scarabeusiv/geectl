@@ -437,24 +437,40 @@ pub(crate) fn parse_request_ids(body: &str) -> Option<Vec<String>> {
 /// non-submit reads as an empty list, not an error: that is the
 /// answer "no open submit request".
 pub(crate) fn parse_submit_request_ids(body: &str) -> Option<Vec<String>> {
-    parse_request_ids_for_action(body, "submit", ActionShape::Any)
+    parse_request_ids_for_action(body, "submit", ActionShape::Any, None)
+}
+
+/// The ids of the submit requests in a search-response collection
+/// created by `creator`: the creator-filtered form of
+/// [`parse_submit_request_ids`]. A request carrying no `creator`
+/// attribute cannot be attributed to anyone, so it is not a match —
+/// the caller never supersedes a request it cannot attribute to the
+/// authenticated user.
+pub(crate) fn parse_submit_request_ids_for_creator(
+    body: &str,
+    creator: &str,
+) -> Option<Vec<String>> {
+    parse_request_ids_for_action(body, "submit", ActionShape::Any, Some(creator))
 }
 
 /// The ids of the requests in a search-response collection whose
 /// action is of type `action_type` (state is whatever the search
 /// matched) and matches `shape`. The search already filters on the
 /// type server-side; the parser re-checks it here, so a misshapen
-/// response cannot let a wrong-type id through the dedup — and it
-/// applies the shape where the search cannot. None when the body is
-/// not a collection at all, or when the count says there are
-/// requests but none parsed at all — the server changed shape
-/// underneath us, and an empty list there would let a filing dedup
-/// pass. A collection of only other action types reads as an empty
+/// response cannot let a wrong-type id through to the caller — and it
+/// applies the shape where the search cannot. A `creator` filter
+/// narrows to requests created by that user, read from the request
+/// tag's `creator` attribute; None keeps every creator. None when
+/// the body is not a collection at all, or when the count says there
+/// are requests but none parsed at all — the server changed shape
+/// underneath us, and an empty list there would read as no request
+/// blocking the filing. A collection of only other action types reads as an empty
 /// list, not None.
 pub(crate) fn parse_request_ids_for_action(
     body: &str,
     action_type: &str,
     shape: ActionShape<'_>,
+    creator: Option<&str>,
 ) -> Option<Vec<String>> {
     if !body.contains("<collection") {
         return None;
@@ -488,7 +504,13 @@ pub(crate) fn parse_request_ids_for_action(
         // A truncated action block is a malformed response, not a
         // match: the parse fails so the caller reports a server
         // error instead of treating the request as blocking.
-        if request_block_matches_action(&inner[..close], action_type, shape)? {
+        // A creator filter narrows to requests created by that user:
+        // the attribute is read from the request tag itself, so a
+        // request carrying no creator cannot be attributed and never
+        // matches.
+        let creator_matches =
+            creator.is_none_or(|creator| tag_attr(tag, "creator").as_deref() == Some(creator));
+        if creator_matches && request_block_matches_action(&inner[..close], action_type, shape)? {
             ids.push(id);
         }
         rest = &inner[close + "</request>".len()..];
@@ -1165,6 +1187,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_submit_request_ids_for_creator_keeps_only_own_requests() {
+        // The creator filter reads the request tag's creator: a
+        // submit action from the named creator counts, a submit
+        // action from anyone else does not, and a request carrying
+        // no creator cannot be attributed to anyone.
+        let body = "<collection matches=\"4\"><request id=\"1\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"a\" package=\"foo\" /><target project=\"b\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"2\" creator=\"someone_else\"><action type=\"submit\"><source project=\"a\" package=\"foo\" /><target project=\"b\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"3\"><action type=\"submit\"><source project=\"a\" package=\"foo\" /><target project=\"b\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"4\" creator=\"scarabeus_iv\"><action type=\"delete\"><target project=\"b\" package=\"foo\" /></action><state name=\"new\" /></request></collection>";
+        assert_eq!(
+            parse_submit_request_ids_for_creator(body, "scarabeus_iv"),
+            Some(vec!["1".to_string()])
+        );
+        // Only other creators still parses: the answer is an empty
+        // list, not an error — that is "no open submit request from
+        // this user".
+        assert_eq!(
+            parse_submit_request_ids_for_creator(body, "nobody_here"),
+            Some(vec![])
+        );
+        // A malformed body is still an error, never an empty list.
+        assert_eq!(
+            parse_submit_request_ids_for_creator("not a collection", "scarabeus_iv"),
+            None
+        );
+    }
+
+    #[test]
     fn parse_submit_request_ids_truncated_action_is_malformed() {
         // A type-matching action with no close tag is a malformed
         // response, not a block: the parse fails so filing reports a
@@ -1335,15 +1382,16 @@ mod tests {
     fn parse_request_ids_for_action_filters_by_type() {
         let body = mixed_action_collection();
         assert_eq!(
-            parse_request_ids_for_action(body, "maintenance_incident", ActionShape::Any).unwrap(),
+            parse_request_ids_for_action(body, "maintenance_incident", ActionShape::Any, None)
+                .unwrap(),
             vec!["2".to_string()]
         );
         assert_eq!(
-            parse_request_ids_for_action(body, "change_devel", ActionShape::Any).unwrap(),
+            parse_request_ids_for_action(body, "change_devel", ActionShape::Any, None).unwrap(),
             vec!["3".to_string()]
         );
         assert_eq!(
-            parse_request_ids_for_action(body, "delete", ActionShape::Any).unwrap(),
+            parse_request_ids_for_action(body, "delete", ActionShape::Any, None).unwrap(),
             vec!["4".to_string()]
         );
         // The submit path delegates to the same parser.
@@ -1365,7 +1413,8 @@ mod tests {
                 ActionShape::DeleteTarget {
                     package: Some("foo"),
                     repository: None,
-                }
+                },
+                None
             )
             .unwrap(),
             vec!["1".to_string(), "4".to_string()]
@@ -1378,7 +1427,8 @@ mod tests {
                 ActionShape::DeleteTarget {
                     package: None,
                     repository: Some("standard"),
-                }
+                },
+                None
             )
             .unwrap(),
             vec!["3".to_string(), "4".to_string()]
@@ -1393,7 +1443,8 @@ mod tests {
                 ActionShape::DeleteTarget {
                     package: None,
                     repository: None,
-                }
+                },
+                None
             )
             .unwrap(),
             vec!["3".to_string(), "4".to_string()]
@@ -1412,7 +1463,8 @@ mod tests {
             parse_request_ids_for_action(
                 body,
                 "maintenance_incident",
-                ActionShape::ReleaseProject(Some("openSUSE:Leap:15.6:Update"))
+                ActionShape::ReleaseProject(Some("openSUSE:Leap:15.6:Update")),
+                None
             )
             .unwrap(),
             vec!["1".to_string()]
@@ -1421,7 +1473,8 @@ mod tests {
             parse_request_ids_for_action(
                 body,
                 "maintenance_incident",
-                ActionShape::ReleaseProject(None)
+                ActionShape::ReleaseProject(None),
+                None
             )
             .unwrap(),
             vec!["1".to_string(), "2".to_string()]
@@ -1437,7 +1490,8 @@ mod tests {
             parse_request_ids_for_action(
                 body,
                 "maintenance_incident",
-                ActionShape::ReleaseProject(Some("openSUSE:Leap:15.6:Update"))
+                ActionShape::ReleaseProject(Some("openSUSE:Leap:15.6:Update")),
+                None
             )
             .unwrap(),
             vec!["7".to_string()]
@@ -1451,7 +1505,7 @@ mod tests {
         // as a duplicate — the caller reports an unexpected response,
         // not "already targets".
         let body = "<collection matches=\"1\"><request id=\"7\" creator=\"alice\"><action type=\"delete\"><target project=\"openSUSE:Factory\" package=\"foo\" /></request></collection>";
-        assert!(parse_request_ids_for_action(body, "delete", ActionShape::Any).is_none());
+        assert!(parse_request_ids_for_action(body, "delete", ActionShape::Any, None).is_none());
     }
 
     #[test]
@@ -1459,7 +1513,7 @@ mod tests {
         // An action tag with no closing `>` is truncated: malformed,
         // not a match.
         let body = "<collection matches=\"1\"><request id=\"7\" creator=\"alice\"><action type=\"delete\"</request></collection>";
-        assert!(parse_request_ids_for_action(body, "delete", ActionShape::Any).is_none());
+        assert!(parse_request_ids_for_action(body, "delete", ActionShape::Any, None).is_none());
     }
 
     #[test]
@@ -1467,28 +1521,32 @@ mod tests {
         // The request ends with a bare `<action`: truncated —
         // malformed, not a match.
         let body = "<collection matches=\"1\"><request id=\"7\" creator=\"alice\"><action</request></collection>";
-        assert!(parse_request_ids_for_action(body, "delete", ActionShape::Any).is_none());
+        assert!(parse_request_ids_for_action(body, "delete", ActionShape::Any, None).is_none());
     }
 
     #[test]
     fn parse_request_ids_for_action_empty_when_no_match() {
         let body = "<collection matches=\"1\"><request id=\"1\" creator=\"alice\"><action type=\"submit\"><source project=\"home:alice\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>";
         assert_eq!(
-            parse_request_ids_for_action(body, "maintenance_incident", ActionShape::Any).unwrap(),
+            parse_request_ids_for_action(body, "maintenance_incident", ActionShape::Any, None)
+                .unwrap(),
             Vec::<String>::new()
         );
     }
 
     #[test]
     fn parse_request_ids_for_action_rejects_malformed() {
-        assert!(parse_request_ids_for_action("not xml", "submit", ActionShape::Any).is_none());
+        assert!(
+            parse_request_ids_for_action("not xml", "submit", ActionShape::Any, None).is_none()
+        );
         // The count says there are requests but none parsed: the
         // server changed shape, and an empty list would let a filing
         // dedup pass.
         assert!(parse_request_ids_for_action(
             "<collection matches=\"1\"><request /></collection>",
             "submit",
-            ActionShape::Any
+            ActionShape::Any,
+            None
         )
         .is_none());
     }

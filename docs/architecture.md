@@ -156,9 +156,11 @@ Behaviour rules (from the openSUSE packaging guide):
 - A submit request targets the DEVEL project, never Factory directly.
   A payload naming `openSUSE:Factory` as its target is refused at
   build time.
-- An open submit request for the package must be checked before filing
-  (dedup). `SrFiling::file` performs that check itself in live mode
-  and refuses to file a duplicate; the check is also available on its
+- Filing supersedes every open submit request for the package from
+  the authenticated user. `SrFiling::file` files the new request
+  first, then supersedes each open one with it; the supersede is
+  unconditional — a second filing at the same head files and
+  supersedes again. The open-request check is also available on its
   own as `ObsClient::has_open_sr`.
 - The SR description follows the guide's message format: one headline
   of at most 160 characters of prose, then `- ` lines for staging,

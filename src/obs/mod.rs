@@ -16,10 +16,11 @@
 //! - A submit request targets the DEVEL project, never Factory
 //!   directly. A payload naming `openSUSE:Factory` as its target is
 //!   refused at build time.
-//! - An open submit request for the package must be checked before
-//!   filing (dedup). [`SrFiling::file`] performs that check itself in
-//!   live mode and refuses to file a duplicate; the check is also
-//!   available on its own as [`ObsClient::has_open_sr`].
+//! - Filing supersedes every open submit request for the package from
+//!   the authenticated user. [`SrFiling::file`] files the new request
+//!   first, then supersedes each open one with it; the supersede is
+//!   unconditional. The open-request check is also available on its
+//!   own as [`ObsClient::has_open_sr`].
 //! - The SR description follows the guide's message format: one
 //!   headline (at most 160 characters of prose), then `- ` lines for
 //!   staging, needs, and rebuilds. The library validates the
@@ -153,6 +154,7 @@ pub(crate) use self::common::parse_search_matches;
 pub(crate) use self::common::parse_status_invoked;
 pub(crate) use self::common::parse_status_ok;
 pub(crate) use self::common::parse_submit_request_ids;
+pub(crate) use self::common::parse_submit_request_ids_for_creator;
 pub(crate) use self::common::request_block_matches_action;
 pub use self::common::split_slash_segments;
 pub(crate) use self::common::status_data;
@@ -166,6 +168,7 @@ pub use self::common::OBS_API_BASE;
 pub use self::payload::ChangeDevelPayload;
 pub use self::payload::DeletePayload;
 pub use self::payload::DeleteTarget;
+pub use self::payload::FiledRequest;
 pub use self::payload::MaintainedInstance;
 pub use self::payload::MaintenanceBranchOptions;
 pub use self::payload::MaintenanceBranchResult;

@@ -64,7 +64,7 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    AcceptInfo, ChangeDevelPayload, CveId, DeletePayload, DeleteTarget, DryRun,
+    AcceptInfo, ChangeDevelPayload, CveId, DeletePayload, DeleteTarget, DryRun, FiledRequest,
     MaintenanceIncidentPayload, ObsClient, Request, RequestAction, RequestComment, RequestHistory,
     RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewTarget, SrFiling,
     SrPayload, OBS_API_BASE,
@@ -239,14 +239,15 @@ pub enum RequestCommand {
         #[arg(long)]
         parent: Option<String>,
     },
-    /// File a submit request: source package to a devel project.
+    /// File a submit request: source package to a devel project, superseding every open submit request for the package from the same user.
     File {
         #[command(flatten)]
         file: FileArgs,
     },
-    /// File a submit request and supersede an old one with it: the
-    /// new request is filed first, and only then is the old one
-    /// superseded pointing at it.
+    /// File a submit request and supersede an old one with it, plus
+    /// every other open submit request for the package from the same
+    /// user: the new request is filed first, and only then is each
+    /// open one superseded pointing at it.
     Refile {
         #[command(flatten)]
         file: FileArgs,
@@ -892,26 +893,57 @@ fn file_request(
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     with_client(debug, live, |client| {
         let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
-        let id = match supersede {
+        let filed_request = match supersede {
             Some(old_id) => filing.refile(&payload, old_id)?,
             None => filing.file(&payload)?,
         };
         // The filed JSON and the text both carry the parsed CVE ids:
-        // the raw `--cve` strings stay only in the CLI args.
-        let filed = filed_payload(&id, &dry_run, |id| file_request_json(id, file, &cves));
-        let text = file_request_text(id.as_deref(), supersede, file, &cves);
+        // the raw `--cve` strings stay only in the CLI args. Both
+        // also carry the superseded ids: a filing that supersedes
+        // other requests says so, instead of reporting only the new
+        // id.
+        let id = filed_request.as_ref().map(|filed| filed.id.clone());
+        let filed = filed_payload(&id, &dry_run, |id| {
+            file_request_json(id, filed_request.as_ref(), file, &cves)
+        });
+        let text = file_request_text(
+            id.as_deref(),
+            supersede,
+            filed_request
+                .as_ref()
+                .map(|filed| filed.superseded.as_slice()),
+            file,
+            &cves,
+        );
         Ok((filed, text))
     })
 }
 
 /// The filed JSON for `file` / `refile`: the filed (or would-file)
-/// request id, the source and target coordinates, the parsed CVE ids,
-/// and the cleanup choice. The CVEs are the parsed ids, never the raw
-/// `--cve` strings.
-fn file_request_json(id: Option<&str>, file: &FileArgs, cves: &[CveId]) -> Value {
+/// request id, the ids it superseded, the source and target
+/// coordinates, the parsed CVE ids, and the cleanup choice. The CVEs
+/// are the parsed ids, never the raw `--cve` strings. The superseded
+/// ids are null in dry-run — the open requests are unknown there —
+/// and an array in live mode, empty when nothing was open.
+fn file_request_json(
+    id: Option<&str>,
+    filed: Option<&FiledRequest>,
+    file: &FileArgs,
+    cves: &[CveId],
+) -> Value {
     let cve_strings: Vec<&str> = cves.iter().map(CveId::as_str).collect();
+    let superseded = filed.map_or(Value::Null, |filed| {
+        Value::Array(
+            filed
+                .superseded
+                .iter()
+                .map(|id| request_id_json(id))
+                .collect(),
+        )
+    });
     json!({
         "id": id.map(request_id_json).unwrap_or(Value::Null),
+        "superseded": superseded,
         "source_project": file.source_project,
         "source_package": file.source_package,
         "target_project": file.target_project,
@@ -925,14 +957,16 @@ fn file_request_json(id: Option<&str>, file: &FileArgs, cves: &[CveId]) -> Value
 
 /// The filing text for `file` / `refile`: the filed (or
 /// would-file) request id, the source and target coordinates, the
-/// CVE ids when any were claimed, and the superseded id when
-/// refiling. The CVEs belong to the new request, so they ride the
-/// coordinates, before the superseded id. CVE ids are identifiers
-/// (design rule 1), so they ride the text; the description and the
-/// `.changes` entry are long free text and stay JSON-only.
+/// CVE ids when any were claimed, and the superseded ids when any
+/// were superseded. The CVEs belong to the new request, so they ride
+/// the coordinates, before the superseded ids. CVE ids are
+/// identifiers (design rule 1), so they ride the text; the
+/// description and the `.changes` entry are long free text and stay
+/// JSON-only.
 fn file_request_text(
     id: Option<&str>,
     supersede: Option<&str>,
+    superseded: Option<&[String]>,
     file: &FileArgs,
     cves: &[CveId],
 ) -> String {
@@ -951,11 +985,15 @@ fn file_request_text(
         "{}/{} to {}/{}",
         file.source_project, file.source_package, file.target_project, file.target_package
     );
+    let superseded = match superseded {
+        Some(ids) if !ids.is_empty() => format!(", superseded {}", ids.join(", ")),
+        _ => String::new(),
+    };
     match (id, supersede) {
-        (Some(id), Some(old_id)) => {
-            format!("filed request {id} for {coords}{cves}, superseded {old_id}")
+        (Some(id), Some(_old_id)) => {
+            format!("filed request {id} for {coords}{cves}{superseded}")
         }
-        (Some(id), None) => format!("filed request {id} for {coords}{cves}"),
+        (Some(id), None) => format!("filed request {id} for {coords}{cves}{superseded}"),
         (None, Some(old_id)) => {
             format!("dry-run: would file request for {coords}{cves} and supersede {old_id}")
         }
@@ -2344,25 +2382,50 @@ mod tests {
         let file = sample_file_args();
         let cves = parse_cves(&file);
         assert_eq!(
-            file_request_text(Some("123"), None, &file, &cves),
+            file_request_text(Some("123"), None, None, &file, &cves),
             "filed request 123 for home:alice:branches:test/foo to devel:languages:python/foo (CVE-2026-1234)"
         );
         assert_eq!(
-            file_request_text(Some("123"), Some("122"), &file, &cves),
+            file_request_text(
+                Some("123"),
+                Some("122"),
+                Some(&["122".to_string()]),
+                &file,
+                &cves
+            ),
             "filed request 123 for home:alice:branches:test/foo to devel:languages:python/foo (CVE-2026-1234), superseded 122"
         );
+        // A filing that supersedes several requests names them all,
+        // in supersede order — including a plain file, not only a
+        // refile.
         assert_eq!(
-            file_request_text(None, None, &file, &cves),
+            file_request_text(
+                Some("123"),
+                None,
+                Some(&["122".to_string(), "121".to_string()]),
+                &file,
+                &cves
+            ),
+            "filed request 123 for home:alice:branches:test/foo to devel:languages:python/foo (CVE-2026-1234), superseded 122, 121"
+        );
+        assert_eq!(
+            file_request_text(None, None, None, &file, &cves),
             "dry-run: would file request for home:alice:branches:test/foo to devel:languages:python/foo (CVE-2026-1234)"
         );
         assert_eq!(
-            file_request_text(None, Some("122"), &file, &cves),
+            file_request_text(None, Some("122"), None, &file, &cves),
             "dry-run: would file request for home:alice:branches:test/foo to devel:languages:python/foo (CVE-2026-1234) and supersede 122"
         );
         // The CVE ids belong to the new request: the parenthetical
         // rides the coordinates, before the superseded id — it must
         // never read as qualifying the superseded id.
-        let refiled = file_request_text(Some("123"), Some("122"), &file, &cves);
+        let refiled = file_request_text(
+            Some("123"),
+            Some("122"),
+            Some(&["122".to_string()]),
+            &file,
+            &cves,
+        );
         assert!(
             refiled.find("(CVE-2026-1234)").expect("CVE suffix present")
                 < refiled
@@ -2378,7 +2441,8 @@ mod tests {
         };
         let lower_cves = parse_cves(&lower);
         assert!(
-            file_request_text(Some("123"), None, &lower, &lower_cves).contains("(CVE-2026-1234)"),
+            file_request_text(Some("123"), None, None, &lower, &lower_cves)
+                .contains("(CVE-2026-1234)"),
             "lowercase CVE must render normalized"
         );
         // No CVE claimed: no suffix — the description and the
@@ -2388,7 +2452,7 @@ mod tests {
             ..sample_file_args()
         };
         assert_eq!(
-            file_request_text(Some("123"), None, &plain, &[]),
+            file_request_text(Some("123"), None, None, &plain, &[]),
             "filed request 123 for home:alice:branches:test/foo to devel:languages:python/foo"
         );
         let two = FileArgs {
@@ -2397,10 +2461,10 @@ mod tests {
         };
         let two_cves = parse_cves(&two);
         assert!(
-            file_request_text(Some("123"), None, &two, &two_cves)
+            file_request_text(Some("123"), None, None, &two, &two_cves)
                 .ends_with("(CVE-2026-1234, CVE-2026-5678)"),
             "{}",
-            file_request_text(Some("123"), None, &two, &two_cves)
+            file_request_text(Some("123"), None, None, &two, &two_cves)
         );
     }
 
@@ -2408,8 +2472,29 @@ mod tests {
     fn file_request_json_carries_normalized_cves() {
         let file = sample_file_args();
         let cves = parse_cves(&file);
-        let value = file_request_json(Some("123"), &file, &cves);
+        let filed = FiledRequest {
+            id: "123".to_string(),
+            superseded: vec!["122".to_string()],
+        };
+        let value = file_request_json(Some("123"), Some(&filed), &file, &cves);
         assert_eq!(value["id"], json!(123));
+        assert_eq!(value["superseded"], json!([122]));
+        // No superseded requests: an empty array, not null — the
+        // open requests were read and there were none.
+        let empty = FiledRequest {
+            id: "123".to_string(),
+            superseded: vec![],
+        };
+        assert_eq!(
+            file_request_json(Some("123"), Some(&empty), &file, &cves)["superseded"],
+            json!([])
+        );
+        // A dry-run id of None reads as null, and so do the
+        // superseded ids — the open requests are unknown there.
+        assert_eq!(
+            file_request_json(None, None, &file, &cves)["superseded"],
+            serde_json::Value::Null
+        );
         assert_eq!(value["source_project"], "home:alice:branches:test");
         assert_eq!(value["target_project"], "devel:languages:python");
         assert_eq!(value["cve"], json!(["CVE-2026-1234"]));
@@ -2422,7 +2507,7 @@ mod tests {
         };
         let lower_cves = parse_cves(&lower);
         assert_eq!(
-            file_request_json(Some("123"), &lower, &lower_cves)["cve"],
+            file_request_json(Some("123"), Some(&filed), &lower, &lower_cves)["cve"],
             json!(["CVE-2026-1234"])
         );
         // No CVE claimed: an empty list.
@@ -2431,12 +2516,12 @@ mod tests {
             ..sample_file_args()
         };
         assert_eq!(
-            file_request_json(Some("123"), &plain, &[])["cve"],
+            file_request_json(Some("123"), Some(&filed), &plain, &[])["cve"],
             json!([])
         );
         // A dry-run id of None reads as null.
         assert_eq!(
-            file_request_json(None, &file, &cves)["id"],
+            file_request_json(None, None, &file, &cves)["id"],
             serde_json::Value::Null
         );
     }

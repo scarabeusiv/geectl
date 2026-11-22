@@ -80,12 +80,11 @@ what "one coherent channel" means.
   `change_state` consuming its 60 s budget would otherwise leave no
   visible trace.
 - **Library decision points** (the ones that change what happens
-  next): dedup checks (`decision: open submit request(s) 1398492 already target foo; refusing
-  to file`; test `src/obs/payload.rs:3155`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1050`),
+  next): the supersede-all filing decision (`decision: filing for foo; superseding open submit request(s) 1398492 with the new request`; test `src/obs/payload.rs:3346`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1050`),
   endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:3196` vs
   `decision: read via /source (authenticated)`; test `src/http.rs:3279`), and the accept-state check
   before a retried `change_state` (`decision: request 1398977 still new, re-issuing
-  accepted`; test `src/obs/request.rs:5901`).
+  accepted`; test `src/obs/request.rs:5985`).
 - **Service status lines**: `service_state <project>/<package>: <code>` and
   `list_services <project>/<package>: <n> service(s)` — emitted by the services
   reads, unprefixed (the verb names the operation, as with the startup line;
@@ -151,7 +150,7 @@ consumer of `--debug` is a human (or an agent reading a failure
 report) diagnosing a run — JSON lines would need parsing to read, and
 the machine-readable verdict already exists (the JSON error payload
 plus the exit code). Forcing heterogeneous events (an HTTP attempt, a
-dedup decision, a DryRun guard) into one JSON schema is schema work
+filing decision, a DryRun guard) into one JSON schema is schema work
 with no consumer. The payload contract is untouched: debug never
 changes stdout (`docs/architecture.md` already states "Verbosity
 never changes stdout" — this design implements that line).

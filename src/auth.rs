@@ -62,6 +62,19 @@ impl fmt::Debug for Credentials {
     }
 }
 
+impl Credentials {
+    /// The Basic username, when these credentials carry one: the OBS
+    /// login the server records as a request's creator. None for
+    /// `None`, Bearer, and SSH credentials — the credential value itself
+    /// carries no username.
+    pub fn username(&self) -> Option<&str> {
+        match self {
+            Credentials::Basic { username, .. } => Some(username),
+            Credentials::None | Credentials::Bearer { .. } | Credentials::SshKey { .. } => None,
+        }
+    }
+}
+
 /// Supplies credentials to the HTTP client. Implementations read from
 /// environment variables or mounted secret files only — never from a
 /// config file, never from a prompt, never from `/dev/tty`.

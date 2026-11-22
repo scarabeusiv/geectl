@@ -217,8 +217,8 @@ Commands:
   try-change-state             Best-effort state change: try it, and report whether it happened instead of failing when the request cannot move
   add-review                   Ask a user, group, project, or package to review a submit request
   add-comment                  Comment on a submit request, optionally as a reply to another comment
-  file                         File a submit request: source package to a devel project
-  refile                       File a submit request and supersede an old one with it: the new request is filed first, and only then is the old one superseded pointing at it
+  file                         File a submit request: source package to a devel project, superseding every open submit request for the package from the same user
+  refile                       File a submit request and supersede an old one with it, plus every other open submit request for the package from the same user: the new request is filed first, and only then is each open one superseded pointing at it
   supersede                    Supersede one request with another existing one. A mutation that needs `--live`: the library's raw supersede has no dry-run, so without `--live` this command refuses — use `request refile --supersede` for the dry-runnable flow
   file-change-devel            File a change-devel request: change a package's devel project
   file-delete                  File a delete request: delete a package, a repository, or a whole project

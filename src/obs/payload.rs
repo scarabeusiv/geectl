@@ -1325,15 +1325,29 @@ const SUBMIT_REQUIRED_PATHS: &[&str] = &[
 ///
 /// The only filing path. In dry-run, [`SrFiling::file`] logs exactly
 /// what would be filed and verifies the payload, and files nothing. In
-/// live mode it first checks no open submit request already targets
-/// the package (dedup — an open SR is refused, not filed over), then
-/// POSTs the payload XML and returns the new request id.
-/// [`SrFiling::refile`] extends that path: it files the new request
-/// and supersedes the old one with it, in that order.
+/// live mode it POSTs the payload XML, then supersedes every open
+/// submit request for the package from the authenticated user with
+/// the new request id. [`SrFiling::refile`] extends that path: it
+/// files the new request and supersedes the named old one with it,
+/// plus every other open submit request for the package — the new
+/// request is filed first, and only then are the old ones superseded
+/// pointing at it, in that order.
 pub struct SrFiling<'a> {
     obs: &'a ObsClient<'a>,
     dry_run: &'a DryRun,
     debug: Debug,
+}
+
+/// The result of filing a submit request: the new request id, and
+/// the open submit requests it superseded — every open submit
+/// request for the package from the authenticated user, in the order
+/// they were superseded. Empty when nothing was open.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FiledRequest {
+    /// The new submit request id.
+    pub id: String,
+    /// The ids superseded with the new request, in supersede order.
+    pub superseded: Vec<String>,
 }
 
 impl<'a> SrFiling<'a> {
@@ -1345,7 +1359,7 @@ impl<'a> SrFiling<'a> {
         }
     }
 
-    /// Report the channel's dedup decision lines to `debug`
+    /// Report the channel's filing decision lines to `debug`
     /// instead of dropping them. The sink is off by default; the
     /// caller that owns the debug channel passes its sink here.
     pub fn with_debug(mut self, debug: Debug) -> Self {
@@ -1353,31 +1367,86 @@ impl<'a> SrFiling<'a> {
         self
     }
 
-    /// File `payload`. Returns the new OBS request id in live mode, or
+    /// File `payload`. Returns the filed request in live mode, or
     /// None in dry-run (nothing was filed). The payload is validated
-    /// before either path is taken. In live mode an open submit
-    /// request already targeting the package is refused (dedup). The
-    /// payload carries `opt_sourceupdate="cleanup"` by default, so
-    /// OBS deletes the source branch when the request is accepted;
-    /// see [`SrPayload::without_cleanup`] for the opt-out.
-    pub fn file(&self, payload: &SrPayload) -> Result<Option<String>, GeectlError> {
-        self.file_with_except(payload, None)
+    /// before either path is taken. In live mode the filing
+    /// supersedes every open submit request for the package from the
+    /// authenticated user: the new request is filed first, and only
+    /// then is each open one superseded pointing at it, so
+    /// `superseded_by` always names a request that exists. A second
+    /// filing at the same head files and supersedes again — the
+    /// supersede is unconditional. The payload carries
+    /// `opt_sourceupdate="cleanup"` by default, so OBS deletes the
+    /// source branch when the request is accepted; see
+    /// [`SrPayload::without_cleanup`] for the opt-out.
+    pub fn file(&self, payload: &SrPayload) -> Result<Option<FiledRequest>, GeectlError> {
+        let supersede_note = format!(
+            "would: supersede all open submit requests targeting {} with the new request",
+            payload.target_package
+        );
+        self.file_with_supersede(payload, &[], &[supersede_note])
     }
 
-    /// File `payload`, exempting `except` from the dedup check: an
-    /// open submit request with that id targeting the package does
-    /// not block the filing. [`SrFiling::refile`] passes the request
-    /// it is about to supersede, because that request is open by
-    /// definition — without the exemption a refile could never file.
-    /// Any OTHER open request targeting the package still blocks the
-    /// filing, and is named in the error. A caller that passes an id
-    /// that is not actually open gains nothing: the exemption only
-    /// skips a request that is there.
-    fn file_with_except(
+    /// File `payload` as a new submit request and supersede `old_id`
+    /// with it, plus every other open submit request for the package
+    /// from the authenticated user: the full refile flow. Returns the
+    /// filed request in live mode, or None in dry-run (nothing was
+    /// filed or superseded).
+    ///
+    /// Branch deletion of the OLD branch is NOT part of this method:
+    /// the old branch stays until the caller deletes it explicitly
+    /// with [`ObsClient::delete_package`], once the new request is
+    /// resolved (or the old branch is otherwise safe to drop). A
+    /// superseded request never reaches accept, so the server-side
+    /// cleanup never runs for the old branch — only the NEW branch
+    /// dies on accept, by the payload's default cleanup. The full
+    /// sequence is: file -> supersede -> delete old branch.
+    pub fn refile(
         &self,
         payload: &SrPayload,
-        except: Option<u64>,
-    ) -> Result<Option<String>, GeectlError> {
+        old_id: &str,
+    ) -> Result<Option<FiledRequest>, GeectlError> {
+        // Validate the old id before filing anything: a malformed id
+        // must not leave a filed-but-unlinked new request behind.
+        let old = validate_request_id(old_id)?;
+        let supersede_notes = vec![
+            format!("would: supersede submit request {old} with the new request"),
+            format!(
+                "would: supersede all other open submit requests targeting {} with the new request",
+                payload.target_package
+            ),
+        ];
+        self.file_with_supersede(payload, &[old_id.to_string()], &supersede_notes)
+    }
+
+    /// File `payload` and supersede every open submit request for
+    /// the package from the authenticated user, plus `extra` (the
+    /// named request a refile supersedes, which may be declined and
+    /// so absent from the open list), the named request first.
+    /// Returns the filed request in live mode, or None in dry-run.
+    /// In dry-run nothing is read or filed: the plan records the
+    /// supersede as `dry_run_supersede` lines against the package,
+    /// not as ids. In live mode the order is the guarantee: the new
+    /// request is filed FIRST, and only then is each open one
+    /// superseded pointing at it, so `superseded_by` always names a
+    /// request that exists. (The API does not verify the replacement
+    /// exists — it only checks the number is positive — so filing
+    /// first is what makes the link real. osc files first too, in
+    /// `submitreq --supersede`.)
+    ///
+    /// If superseding fails after the new request is filed, the error
+    /// names the new id: the requests not yet superseded are still
+    /// open and the new one unlinked, and the caller finishes the
+    /// supersede manually. That is a deliberate divergence from osc,
+    /// which supersedes with `can_fail=True` and only warns — a
+    /// half-done refile passing silently is a failed refile that
+    /// reads as a success.
+    fn file_with_supersede(
+        &self,
+        payload: &SrPayload,
+        extra: &[String],
+        dry_run_supersede: &[String],
+    ) -> Result<Option<FiledRequest>, GeectlError> {
         // The payload is validated on the filing path, not only at
         // construction: the semantic checks run here as well as the
         // XML check, so a payload that reaches filing is a valid
@@ -1393,128 +1462,85 @@ impl<'a> SrFiling<'a> {
             // (The `allow` call above already recorded the would-do
             // line in the plan.) The detail lines go through `note`,
             // not `eprintln`, so the plan carries them too.
-            self.dry_run
-                .note("--- would-be submit request (dry-run) ---");
-            self.dry_run.note(&format!(
-                "source: {}/{}",
-                payload.source_project, payload.source_package
-            ));
-            self.dry_run.note(&format!(
-                "target: {}/{}",
-                payload.target_project, payload.target_package
-            ));
-            self.dry_run
-                .note(&format!("description: {}", payload.description));
-            self.dry_run
-                .note(&format!("changes entry: {}", payload.changes_entry));
-            self.dry_run.note(&payload.to_xml());
-            self.dry_run.note("--- end of would-be submit request ---");
+            self.log_would_be_submit_request(payload);
+            for note in dry_run_supersede {
+                self.dry_run.note(note);
+            }
             return Ok(None);
         }
-        // Live: the dedup check is part of filing. An open submit
-        // request for the package must be checked before filing, so a
-        // duplicate is refused here instead of filed. (The check
-        // itself is also available as `ObsClient::has_open_sr`.)
-        let open = self.obs.open_target_request_ids(&payload.target_package)?;
-        let blocking: Vec<&String> = open
-            .iter()
-            .filter(|id| match except {
-                None => true,
-                // An id that does not parse cannot be the exempted
-                // one: it blocks, rather than being skipped on a
-                // failed comparison.
-                Some(n) => id.parse::<u64>() != Ok(n),
-            })
-            .collect();
-        if !blocking.is_empty() {
-            let blocking = blocking
-                .iter()
-                .map(|id| id.as_str())
-                .collect::<Vec<&str>>()
-                .join(", ");
+        let open = self
+            .obs
+            .open_own_target_request_ids(&payload.target_package)?;
+        let mut supersede: Vec<String> = extra.to_vec();
+        for id in open {
+            if !supersede.contains(&id) {
+                supersede.push(id);
+            }
+        }
+        if supersede.is_empty() {
             self.debug.emit(&format!(
-                "decision: open submit request(s) {blocking} already target {}; refusing to file",
+                "decision: no open submit request targets {}; filing",
                 payload.target_package
             ));
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "an open submit request already targets {} ({blocking}); not filing a duplicate",
-                    payload.target_package
-                ),
+        } else {
+            self.debug.emit(&format!(
+                "decision: filing for {}; superseding open submit request(s) {} with the new request",
+                payload.target_package,
+                supersede.join(", ")
             ));
         }
-        self.debug.emit(&format!(
-            "decision: no open submit request targets {}; filing",
-            payload.target_package
-        ));
-
         let id = self.obs.create_request(payload)?;
-        Ok(Some(id))
+        let superseded = self.supersede_all(&supersede, &id)?;
+        Ok(Some(FiledRequest { id, superseded }))
     }
 
-    /// File `payload` as a new submit request and supersede `old_id`
-    /// with it: the full refile flow. Returns the new request id in
-    /// live mode, or None in dry-run (nothing was filed or
-    /// superseded).
-    ///
-    /// The order is the guarantee: the new request is filed FIRST,
-    /// and only then is the old one superseded pointing at it, so
-    /// `superseded_by` always names a request that exists. (The API
-    /// does not verify the replacement exists — it only checks the
-    /// number is positive — so filing first is what makes the link
-    /// real. osc files first too, in `submitreq --supersede`.)
-    ///
-    /// The filing step exempts the old request from the dedup check:
-    /// the old request is open by definition, and without the
-    /// exemption a refile could never file. Any OTHER open request
-    /// targeting the package still blocks the filing.
-    ///
-    /// If superseding fails after the new request is filed, the error
-    /// names the new id: the old request is still open and the new one
-    /// unlinked, and the caller finishes the supersede manually. That
-    /// is a deliberate divergence from osc, which supersedes with
-    /// `can_fail=True` and only warns — a half-done refile passing
-    /// silently is a failed refile that reads as a success.
-    ///
-    /// Branch deletion of the OLD branch is NOT part of this method:
-    /// the old branch stays until the caller deletes it explicitly
-    /// with [`ObsClient::delete_package`], once the new request is
-    /// resolved (or the old branch is otherwise safe to drop). A
-    /// superseded request never reaches accept, so the server-side
-    /// cleanup never runs for the old branch — only the NEW branch
-    /// dies on accept, by the payload's default cleanup. The full
-    /// sequence is: file -> supersede -> delete old branch.
-    pub fn refile(&self, payload: &SrPayload, old_id: &str) -> Result<Option<String>, GeectlError> {
-        // Validate the old id before filing anything: a malformed id
-        // must not leave a filed-but-unlinked new request behind.
-        let old = validate_request_id(old_id)?;
-        let new_id = self.file_with_except(payload, Some(old))?;
-        let Some(new_id) = new_id else {
-            if !self.dry_run.enabled() {
-                return Err(GeectlError::new(
-                    ErrorKind::InternalError,
-                    "filing in live mode returned no request id",
-                ));
+    /// Log the would-be submit request in full, for the dry-run
+    /// plan: source, target, description, `.changes` entry, and the
+    /// payload XML. The `allow` call already recorded the would-do
+    /// line; these are the detail lines.
+    fn log_would_be_submit_request(&self, payload: &SrPayload) {
+        self.dry_run
+            .note("--- would-be submit request (dry-run) ---");
+        self.dry_run.note(&format!(
+            "source: {}/{}",
+            payload.source_project, payload.source_package
+        ));
+        self.dry_run.note(&format!(
+            "target: {}/{}",
+            payload.target_project, payload.target_package
+        ));
+        self.dry_run
+            .note(&format!("description: {}", payload.description));
+        self.dry_run
+            .note(&format!("changes entry: {}", payload.changes_entry));
+        self.dry_run.note(&payload.to_xml());
+        self.dry_run.note("--- end of would-be submit request ---");
+    }
+
+    /// Supersede each id in `ids` with `new_id`, in order, returning
+    /// the superseded ids. On the first failure the error names the
+    /// new id, the id that failed, and every id still open (the
+    /// failed one plus the ones not yet attempted), so the caller
+    /// finishes the supersede manually.
+    fn supersede_all(&self, ids: &[String], new_id: &str) -> Result<Vec<String>, GeectlError> {
+        let mut done = Vec::new();
+        for (index, old_id) in ids.iter().enumerate() {
+            match self.obs.supersede_request(old_id, new_id) {
+                Ok(()) => done.push(old_id.clone()),
+                Err(err) => {
+                    let remaining: Vec<&str> = ids[index..].iter().map(String::as_str).collect();
+                    return Err(GeectlError::new(
+                        err.kind(),
+                        format!(
+                            "filed submit request {new_id} but could not supersede {old_id}: {}; submit requests {} are still open — supersede them manually with the new id",
+                            err.context,
+                            remaining.join(", ")
+                        ),
+                    ));
+                }
             }
-            // Dry-run: `file` logged the would-file and returned
-            // None. Record the would-supersede against the request
-            // that would be filed, and file nothing.
-            self.dry_run.note(&format!(
-                "would: supersede submit request {old} with the new request"
-            ));
-            return Ok(None);
-        };
-        match self.obs.supersede_request(old_id, &new_id) {
-            Ok(()) => Ok(Some(new_id)),
-            Err(err) => Err(GeectlError::new(
-                err.kind(),
-                format!(
-                    "filed submit request {new_id} but could not supersede {old}: {}; the old request is still open — supersede it manually with the new id",
-                    err.context
-                ),
-            )),
         }
+        Ok(done)
     }
 
     /// File `payload` as a maintenance incident request. Returns the
@@ -2371,7 +2397,7 @@ mod tests {
         let filing = SrFiling::new(&obs, &dry);
         let payload = payload();
         assert_eq!(filing.file(&payload).unwrap(), None);
-        // Nothing was read or filed: no GET (dedup) and no POST.
+        // Nothing was read or filed: no GET (open-request search) and no POST.
         assert!(http.get_calls().is_empty());
         assert!(http.post_calls().is_empty());
         // The would-do line plus the full would-be request, recorded
@@ -2388,6 +2414,8 @@ mod tests {
                 format!("[dry-run] changes entry: {}", payload.changes_entry()),
                 format!("[dry-run] {}", payload.to_xml()),
                 "[dry-run] --- end of would-be submit request ---".to_string(),
+                "[dry-run] would: supersede all open submit requests targeting foo with the new request"
+                    .to_string(),
             ]
         );
     }
@@ -2408,37 +2436,144 @@ mod tests {
         let filing = SrFiling::new(&obs, &dry);
         assert_eq!(
             filing.file(&payload()).unwrap(),
-            Some("1400001".to_string())
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
         );
-        // The dedup search ran first, then the filing POST.
+        // The open-request search ran first, then the filing POST.
         assert_eq!(http.get_calls().len(), 1);
         assert_eq!(http.post_calls().len(), 1);
     }
 
     #[test]
-    fn file_live_refuses_when_open_sr_exists() {
-        // Dedup: an open SR already targets the package, so filing is
-        // refused and no POST is made.
+    fn file_live_supersedes_open_own_sr() {
+        // Supersede-all: an open SR from the same user already
+        // targets the package, so filing files the new request and
+        // supersedes the open one with it — no refusal, no POST
+        // skipped.
         let http = FakeHttp::new();
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let search_url = obs.search_url("foo").unwrap();
-        let http = FakeHttp::new().with_get(
-            &search_url,
-            "<collection matches=\"1\"><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+        let http = FakeHttp::new()
+            .with_get(
+                &search_url,
+                "<collection matches=\"1\"><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/1398492?cmd=changestate&newstate=superseded&superseded_by=1400001",
+                "<status code=\"ok\" />",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing.file(&payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec!["1398492".to_string()],
+            })
         );
+        // The open-request search ran first, then the filing POST,
+        // then the supersede POST — file before supersede, so
+        // superseded_by always names a request that exists.
+        assert_eq!(http.get_calls().len(), 1);
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 2);
+        assert_eq!(posted[0].0, "https://api.opensuse.org/request?cmd=create");
+        assert_eq!(
+            posted[1].0,
+            "https://api.opensuse.org/request/1398492?cmd=changestate&newstate=superseded&superseded_by=1400001"
+        );
+        assert_eq!(posted[1].1, "superseded by 1400001");
+    }
+
+    #[test]
+    fn file_live_skips_other_users_open_sr() {
+        // The supersede set is the filer's own requests only: an
+        // open SR from another user targeting the package stays
+        // open, and no supersede POST is made for it.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = obs.search_url("foo").unwrap();
+        let http = FakeHttp::new()
+            .with_get(
+                &search_url,
+                "<collection matches=\"1\"><request id=\"1398492\" creator=\"someone_else\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing.file(&payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
+        );
+        // Only the filing POST: nothing was superseded.
+        assert_eq!(http.post_calls().len(), 1);
+        assert_eq!(
+            http.post_calls()[0].0,
+            "https://api.opensuse.org/request?cmd=create"
+        );
+    }
+
+    #[test]
+    fn file_live_supersede_failure_names_new_id_and_remaining() {
+        // Two open own SRs; the first supersede succeeds and the
+        // second fails: the error names the new id, the failed id,
+        // and the ids still open.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = obs.search_url("foo").unwrap();
+        let http = FakeHttp::new()
+            .with_get(
+                &search_url,
+                "<collection matches=\"2\"><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"1398493\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/1398492?cmd=changestate&newstate=superseded&superseded_by=1400001",
+                "<status code=\"ok\" />",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/1398493?cmd=changestate&newstate=superseded&superseded_by=1400001",
+                "<status code=\"not_found\" />",
+            );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dry = DryRun::new(false);
         let filing = SrFiling::new(&obs, &dry);
         let err = filing.file(&payload()).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(http.post_calls().is_empty());
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("1400001"), "error names the new id");
+        assert!(err.context.contains("1398493"), "error names the failed id");
+        assert!(
+            !err.context.contains("1398492"),
+            "already-superseded id is not still open"
+        );
+        // All three POSTs were attempted: the filing plus both
+        // supersedes, in order.
+        assert_eq!(http.post_calls().len(), 3);
     }
 
     #[test]
     fn file_live_transport_failure_is_error() {
-        // Live mode, credentials present, dedup passes, but the POST
-        // itself fails (no canned response = transport error): filing
-        // returns Err, it does not silently report a filed id.
+        // Live mode, credentials present, the open-request search is
+        // empty, but the POST itself fails (no canned response =
+        // transport error): filing returns Err, it does not silently
+        // report a filed id.
         let http = FakeHttp::new();
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let search_url = obs.search_url("foo").unwrap();
@@ -2450,9 +2585,9 @@ mod tests {
     }
 
     fn refile_http() -> FakeHttp {
-        // The canned responses for a live refile: the dedup search is
-        // empty, filing creates 1400001, superseding 1397357 with it
-        // succeeds.
+        // The canned responses for a live refile: the open-request
+        // search is empty, filing creates 1400001, superseding
+        // 1397357 with it succeeds.
         let probe_http = FakeHttp::new();
         let obs_probe = ObsClient::with_credentials(&probe_http, basic_credentials()).unwrap();
         let search_url = obs_probe.search_url("foo").unwrap();
@@ -2476,9 +2611,12 @@ mod tests {
         let filing = SrFiling::new(&obs, &dry);
         assert_eq!(
             filing.refile(&payload(), "1397357").unwrap(),
-            Some("1400001".to_string())
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec!["1397357".to_string()],
+            })
         );
-        // Dedup search first, then the filing POST, then the
+        // Open-request search first, then the filing POST, then the
         // supersede POST — file before supersede, so superseded_by
         // always names a request that exists.
         assert_eq!(http.get_calls().len(), 1);
@@ -2494,10 +2632,10 @@ mod tests {
 
     #[test]
     fn refile_live_files_when_old_is_the_only_open_sr() {
-        // The dedup exemption: the old request is open for the same
-        // package, and a refile must still file. Without the
-        // exemption the dedup check would refuse the filing, and a
-        // refile over an open request could never happen.
+        // The old request is open for the same package, so it is in
+        // the open list and the refile supersedes it along with any
+        // others — a refile over an open request files first, then
+        // supersedes.
         let probe_http = FakeHttp::new();
         let obs_probe = ObsClient::with_credentials(&probe_http, basic_credentials()).unwrap();
         let search_url = obs_probe.search_url("foo").unwrap();
@@ -2519,30 +2657,64 @@ mod tests {
         let filing = SrFiling::new(&obs, &dry);
         assert_eq!(
             filing.refile(&payload(), "1397357").unwrap(),
-            Some("1400001".to_string())
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec!["1397357".to_string()],
+            })
         );
         assert_eq!(http.post_calls().len(), 2);
     }
 
     #[test]
-    fn refile_live_refuses_when_another_open_sr_exists() {
-        // The exemption covers only the request being superseded: a
-        // second open request for the package still blocks the filing,
-        // and no POST is made.
+    fn refile_live_supersedes_all_open_srs() {
+        // Supersede-all: a second open request for the package no
+        // longer blocks the filing — the refile files the new
+        // request and supersedes the named old one plus the other
+        // open one, the named one first.
         let probe_http = FakeHttp::new();
         let obs_probe = ObsClient::with_credentials(&probe_http, basic_credentials()).unwrap();
         let search_url = obs_probe.search_url("foo").unwrap();
-        let http = FakeHttp::new().with_get(
-            &search_url,
-            "<collection matches=\"2\"><request id=\"1397357\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
-        );
+        let http = FakeHttp::new()
+            .with_get(
+                &search_url,
+                "<collection matches=\"2\"><request id=\"1397357\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/1397357?cmd=changestate&newstate=superseded&superseded_by=1400001",
+                "<status code=\"ok\" />",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/1398492?cmd=changestate&newstate=superseded&superseded_by=1400001",
+                "<status code=\"ok\" />",
+            );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dry = DryRun::new(false);
         let filing = SrFiling::new(&obs, &dry);
-        let err = filing.refile(&payload(), "1397357").unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(err.context.contains("1398492"));
-        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            filing.refile(&payload(), "1397357").unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec!["1397357".to_string(), "1398492".to_string()],
+            })
+        );
+        // Filing POST first, then both supersedes in order — file
+        // before supersede, so superseded_by always names a request
+        // that exists.
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 3);
+        assert_eq!(posted[0].0, "https://api.opensuse.org/request?cmd=create");
+        assert_eq!(
+            posted[1].0,
+            "https://api.opensuse.org/request/1397357?cmd=changestate&newstate=superseded&superseded_by=1400001"
+        );
+        assert_eq!(
+            posted[2].0,
+            "https://api.opensuse.org/request/1398492?cmd=changestate&newstate=superseded&superseded_by=1400001"
+        );
     }
 
     #[test]
@@ -2568,6 +2740,8 @@ mod tests {
                 format!("[dry-run] {}", payload.to_xml()),
                 "[dry-run] --- end of would-be submit request ---".to_string(),
                 "[dry-run] would: supersede submit request 1397357 with the new request"
+                    .to_string(),
+                "[dry-run] would: supersede all other open submit requests targeting foo with the new request"
                     .to_string(),
             ]
         );
@@ -3108,7 +3282,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_file_reports_the_dedup_decision() {
+    fn debug_file_reports_the_filing_decision() {
         let (debug, lines) = Debug::captured(true, false);
         let http = FakeHttp::new();
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -3124,7 +3298,10 @@ mod tests {
         let filing = SrFiling::new(&obs, &dry).with_debug(debug);
         assert_eq!(
             filing.file(&payload()).unwrap(),
-            Some("1400001".to_string())
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
         );
         let got: Vec<String> = lines.lock().unwrap().clone();
         assert_eq!(
@@ -3134,25 +3311,39 @@ mod tests {
     }
 
     #[test]
-    fn debug_file_reports_the_dedup_refusal() {
+    fn debug_file_reports_the_supersede_decision() {
         let (debug, lines) = Debug::captured(true, false);
         let http = FakeHttp::new();
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let search_url = obs.search_url("foo").unwrap();
-        let http = FakeHttp::new().with_get(
-            &search_url,
-            "<collection matches=\"1\"><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
-        );
+        let http = FakeHttp::new()
+            .with_get(
+                &search_url,
+                "<collection matches=\"1\"><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/1398492?cmd=changestate&newstate=superseded&superseded_by=1400001",
+                "<status code=\"ok\" />",
+            );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dry = DryRun::new(false);
         let filing = SrFiling::new(&obs, &dry).with_debug(debug);
-        let err = filing.file(&payload()).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            filing.file(&payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec!["1398492".to_string()],
+            })
+        );
         let got: Vec<String> = lines.lock().unwrap().clone();
         assert_eq!(
             got,
             [
-                "decision: open submit request(s) 1398492 already target foo; refusing to file"
+                "decision: filing for foo; superseding open submit request(s) 1398492 with the new request"
                     .to_string()
             ]
         );
@@ -3175,7 +3366,10 @@ mod tests {
         let filing = SrFiling::new(&obs, &dry).with_debug(debug);
         assert_eq!(
             filing.file(&payload()).unwrap(),
-            Some("1400001".to_string())
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
         );
         assert!(lines.lock().unwrap().is_empty());
     }

@@ -5,6 +5,7 @@ use super::parse_request_ids_for_action;
 use super::parse_search_matches;
 use super::parse_status_ok;
 use super::parse_submit_request_ids;
+use super::parse_submit_request_ids_for_creator;
 use super::valid_obs_name;
 use super::ActionShape;
 use super::ActionTarget;
@@ -2309,6 +2310,35 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// The ids of the open submit requests targeting `package` (state
+    /// `new` or `review`) created by the authenticated user: the
+    /// supersede-all set for filing. The server lets anyone with
+    /// write permission in the target or the source project supersede
+    /// a request, so the creator filter is what keeps a filing from
+    /// superseding another user's request — the match is on the
+    /// request tag's `creator` attribute, and a request carrying no
+    /// creator is never attributed to anyone. Requires credentials; an
+    /// unexpected response is an error, never an empty list.
+    pub(crate) fn open_own_target_request_ids(
+        &self,
+        package: &str,
+    ) -> Result<Vec<String>, GeectlError> {
+        let Some(username) = self.credentials.username() else {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "checking for open submit requests requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        };
+        let url = self.search_url(package)?;
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_submit_request_ids_for_creator(&body, username).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS search response for package {package:?}"),
+            )
+        })
+    }
+
     /// The ids of the open requests (`new` or `review` state) whose
     /// single action matches `target` exactly. The search filters on
     /// source/target, state, and action type (`action/@type`); the
@@ -2406,15 +2436,17 @@ impl<'a> ObsClient<'a> {
             ));
         }
         let body = self.http.get_with(&url, &self.credentials)?;
-        parse_request_ids_for_action(&body, target.action_type, target.shape).ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::ServerError,
-                format!(
-                    "unexpected OBS search response for {} requests",
-                    target.action_type
-                ),
-            )
-        })
+        parse_request_ids_for_action(&body, target.action_type, target.shape, None).ok_or_else(
+            || {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected OBS search response for {} requests",
+                        target.action_type
+                    ),
+                )
+            },
+        )
     }
 
     /// File `payload` as a submit request: render it and POST it to
@@ -2424,9 +2456,10 @@ impl<'a> ObsClient<'a> {
     ///
     /// Private: [`SrFiling`] is the only caller. Filing goes through
     /// the guarded workflow there (payload validation, dry-run, and
-    /// the dedup check) — a direct call would bypass all three, so
-    /// there is no direct call to bypass them with. The request XML
-    /// is rendered here from the typed payload; no caller passes XML.
+    /// the open-request supersede) — a direct call would bypass all
+    /// three, so there is no direct call to bypass them with. The
+    /// request XML is rendered here from the typed payload; no caller
+    /// passes XML.
     pub(crate) fn create_request(&self, payload: &SrPayload) -> Result<String, GeectlError> {
         self.create_request_with_query(&payload.to_xml(), &[("cmd", "create")], "submit")
     }
@@ -3691,6 +3724,57 @@ mod tests {
         let err = client
             .open_requests_for_package("home:scarabeus_iv", "foo")
             .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn open_own_target_request_ids_keeps_only_own_requests() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let url = client.search_url("foo").unwrap();
+        let http = FakeHttp::new().with_get(
+            &url,
+            "<collection matches=\"2\"><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"1398493\" creator=\"someone_else\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client.open_own_target_request_ids("foo").unwrap(),
+            vec!["1398492".to_string()]
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.get_calls()[0].1);
+    }
+
+    #[test]
+    fn open_own_target_request_ids_empty_is_empty() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let url = client.search_url("foo").unwrap();
+        let http = FakeHttp::new().with_get(&url, "<collection matches=\"0\"></collection>");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .open_own_target_request_ids("foo")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn open_own_target_request_ids_unexpected_response_is_error() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let url = client.search_url("foo").unwrap();
+        let http = FakeHttp::new().with_get(&url, "<request id=\"1398492\" />");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client.open_own_target_request_ids("foo").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn open_own_target_request_ids_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client.open_own_target_request_ids("foo").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(http.get_calls().is_empty());
     }

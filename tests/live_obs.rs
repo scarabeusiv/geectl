@@ -399,7 +399,8 @@ fn file_live_request(client: &ObsClient<'_>, version: &str) -> (String, String) 
     let id = filing
         .file(&payload)
         .expect("file a submit request on the live instance")
-        .expect("live filing returns a request id");
+        .expect("live filing returns a request id")
+        .id;
     (id, package)
 }
 
@@ -424,7 +425,8 @@ fn file_live_request_with_file(
     let id = filing
         .file(&payload)
         .expect("file a submit request on the live instance")
-        .expect("live filing returns a request id");
+        .expect("live filing returns a request id")
+        .id;
     (id, package)
 }
 
@@ -694,7 +696,8 @@ fn live_filed_request_shows_up_on_server() {
     let id = filing
         .file(&payload)
         .expect("file a submit request on the live instance")
-        .expect("live filing returns a request id");
+        .expect("live filing returns a request id")
+        .id;
     let request = client
         .show_request(&id)
         .expect("read the filed request back from the server");
@@ -752,17 +755,24 @@ fn live_refile_supersedes_and_deletes_on_server() {
     let id1 = filing
         .file(&live_payload(&source_a, &package, &target_project, "2.0"))
         .expect("file the first submit request on the live instance")
-        .expect("live filing returns a request id");
+        .expect("live filing returns a request id")
+        .id;
     // The refile comes from a second branch, same target.
     let source_b = create_source_branch(&client, &package);
-    let id2 = filing
+    let filed2 = filing
         .refile(
             &live_payload(&source_b, &package, &target_project, "2.1"),
             &id1,
         )
         .expect("refile on the live instance")
         .expect("live refile returns a request id");
+    let id2 = filed2.id;
     assert_ne!(id1, id2, "refile must return a new request id");
+    assert_eq!(
+        filed2.superseded,
+        vec![id1.clone()],
+        "the refile must supersede the first request"
+    );
     let old = client
         .show_request(&id1)
         .expect("read the old request back from the server");
@@ -802,6 +812,74 @@ fn live_refile_supersedes_and_deletes_on_server() {
     );
 }
 
+/// Filing a second submit request for the same package supersedes
+/// the first one: the supersede-all filing leaves one live request.
+#[test]
+fn live_file_supersedes_all_open_srs_on_server() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_a, target_project, package) = setup_branch(&client);
+    let dry = DryRun::new(false);
+    let filing = SrFiling::new(&client, &dry);
+    let id1 = filing
+        .file(&live_payload(&source_a, &package, &target_project, "2.0"))
+        .expect("file the first submit request on the live instance")
+        .expect("live filing returns a request id")
+        .id;
+    // The second filing comes from a second branch, same target.
+    let source_b = create_source_branch(&client, &package);
+    let filed2 = filing
+        .file(&live_payload(&source_b, &package, &target_project, "2.1"))
+        .expect("file the second submit request on the live instance")
+        .expect("live filing returns a request id");
+    let id2 = filed2.id;
+    assert_ne!(id1, id2, "the second filing must return a new request id");
+    assert_eq!(
+        filed2.superseded,
+        vec![id1.clone()],
+        "the second filing must supersede the first request"
+    );
+    let old = client
+        .show_request(&id1)
+        .expect("read the first request back from the server");
+    assert_eq!(
+        old.state.name,
+        RequestState::Superseded,
+        "the first request {id1} must be superseded"
+    );
+    assert_eq!(
+        old.state.superseded_by,
+        Some(id2.parse().expect("the new request id is a number")),
+        "the first request {id1} must point at the new one"
+    );
+    let new = client
+        .show_request(&id2)
+        .expect("read the second request back from the server");
+    assert_eq!(
+        new.state.name,
+        RequestState::New,
+        "the second request {id2} must be new"
+    );
+    // The old branch deletes now that its request is closed...
+    client
+        .delete_package(&source_a, &package, false, &dry)
+        .expect("delete the superseded branch");
+    assert!(
+        !public_path_exists(&base, &format!("{source_a}/{package}")),
+        "the superseded branch {source_a}/{package} must be gone"
+    );
+    // ...but the new branch is still guarded while its request is open.
+    let err = client
+        .delete_package(&source_b, &package, false, &dry)
+        .expect_err("deleting a branch with an open request must be refused");
+    assert!(
+        format!("{err}").contains(&id2),
+        "the refusal must name the blocking request {id2}; got {err}"
+    );
+}
+
 /// Accept-time cleanup: a request filed with the default cleanup
 /// deletes its source branch when it lands. The accept goes through
 /// the library, which retries transient failures for a bounded 60 s
@@ -820,7 +898,8 @@ fn live_accept_deletes_source_branch_on_server() {
     let id = filing
         .file(&payload)
         .expect("file a submit request on the live instance")
-        .expect("live filing returns a request id");
+        .expect("live filing returns a request id")
+        .id;
     let filed = request_xml(&base, &id);
     assert!(
         filed.contains("<sourceupdate>cleanup</sourceupdate>"),
