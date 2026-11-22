@@ -584,6 +584,26 @@ pub(crate) fn find_tag_end(s: &str) -> Option<usize> {
     }
     None
 }
+/// Skip a leading XML prolog (`<?xml ...?>`) in `body`, if present.
+/// The input is expected to be already trimmed: a prolog is only
+/// recognised at the very start, and anything after it is trimmed of
+/// leading whitespace. Without a prolog the input is returned
+/// unchanged. The prolog must terminate (`?>`) — an unterminated
+/// prolog is an error, not a missing document — and `<?xmlfoo` is not
+/// a prolog at all, so it is an error too.
+pub(crate) fn skip_xml_prolog(body: &str) -> Result<&str, ()> {
+    let Some(after) = body.strip_prefix("<?xml") else {
+        return Ok(body);
+    };
+    let first = after.chars().next();
+    if !matches!(first, Some(c) if c.is_whitespace() || c == '?') {
+        return Err(());
+    }
+    let Some(end) = after.find("?>") else {
+        return Err(());
+    };
+    Ok(after[end + 2..].trim_start())
+}
 
 /// Each occurrence of element `name` in `body`, as its full text
 /// including the tags. The tag name must end at whitespace, `/`, or
@@ -1148,5 +1168,27 @@ mod tests {
         assert!(xml_child_elements("</package>", "package").is_err());
         assert!(xml_child_elements("<></>", "package").is_err());
         assert!(xml_child_elements("<package name=\"a\"/><></>", "package").is_err());
+    }
+
+    #[test]
+    fn skip_xml_prolog_skips_a_prolog_and_nothing_else() {
+        assert_eq!(skip_xml_prolog("<a/>").unwrap(), "<a/>");
+        assert_eq!(
+            skip_xml_prolog("<?xml version=\"1.0\" encoding=\"UTF-8\"?><a/>").unwrap(),
+            "<a/>"
+        );
+        // Bare prolog, and whitespace/newline between prolog and element.
+        assert_eq!(skip_xml_prolog("<?xml?><a/>").unwrap(), "<a/>");
+        assert_eq!(
+            skip_xml_prolog("<?xml version=\"1.0\"?>\n<a/>").unwrap(),
+            "<a/>"
+        );
+        // A prolog that never terminates is an error, not a missing document.
+        assert!(skip_xml_prolog("<?xml version=\"1.0\" <a/>").is_err());
+        assert!(skip_xml_prolog("<?xml version=\"1.0\"").is_err());
+        // `<?xmlfoo` is not a prolog at all.
+        assert!(skip_xml_prolog("<?xmlfoo version=\"1.0\"?><a/>").is_err());
+        // Leading whitespace is the caller's job: the input is expected trimmed.
+        assert_eq!(skip_xml_prolog("  <a/>").unwrap(), "  <a/>");
     }
 }
