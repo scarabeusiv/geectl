@@ -2658,6 +2658,45 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// Delete the `_link` of package `package` in project `project`
+    /// on OBS (`DELETE /source/<project>/<package>/_link`).
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. In dry-run the delete is recorded in the
+    /// plan and nothing is deleted — the guard runs before the
+    /// credentials check, like `create_package`.
+    ///
+    /// An agent deletes a link to unlink a package from its source:
+    /// the package keeps its files and meta, but stops tracking the
+    /// source. A link that is not there is refused by the server.
+    ///
+    /// Success is the `<status code="ok"/>` body; any other body is
+    /// a server error, never success.
+    pub fn delete_link(
+        &self,
+        project: &str,
+        package: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !dry_run.allow(&format!("delete link of {project}/{package}")) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot delete the link of a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        self.delete_file(project, package, "_link")
+    }
+
     /// Delete project `project` on OBS (`DELETE /source/<project>`).
     /// Requires credentials; without them the call fails loudly
     /// before any request. In dry-run the delete is recorded in the
@@ -5485,6 +5524,56 @@ mod tests {
             "https://api.opensuse.org/source/home:scarabeus_iv/foo"
         );
         assert!(deleted[0].1);
+    }
+
+    #[test]
+    fn delete_link_deletes_the_link_file() {
+        let http = FakeHttp::new().with_delete(
+            "https://api.opensuse.org/source/test:factory/test-pkgA/_link?comment=removed%20_link",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(obs
+            .delete_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .is_ok());
+        let deleted = http.delete_calls();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(
+            deleted[0].0,
+            "https://api.opensuse.org/source/test:factory/test-pkgA/_link?comment=removed%20_link"
+        );
+        assert!(deleted[0].1);
+    }
+
+    #[test]
+    fn delete_link_dry_run_records_the_delete_and_sends_nothing() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        assert!(obs.delete_link("test:factory", "test-pkgA", &dry).is_ok());
+        assert!(http.delete_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: delete link of test:factory/test-pkgA".to_string()]
+        );
+    }
+
+    #[test]
+    fn delete_link_rejects_invalid_names_and_missing_credentials_without_http() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = obs
+            .delete_link("bad/project", "test-pkgA", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.delete_calls().is_empty());
+        use crate::auth::Credentials;
+        let obs = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let err = obs
+            .delete_link("test:factory", "test-pkgA", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.delete_calls().is_empty());
     }
 
     #[test]
