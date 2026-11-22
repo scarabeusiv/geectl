@@ -24,9 +24,8 @@
 //! vice versa) before any work, in dry-run too — a dry run that cannot
 //! be performed live is not a useful preview. An unconfigured pair
 //! resolves to `None` and the operations fail closed themselves when
-//! they need credentials. The request group differs deliberately: it
-//! swallows a half-configured pair in dry-run (see `cli_request`), so
-//! a request preview never needs credentials at all.
+//! they need credentials. How the other groups handle a half-configured
+//! pair is stated in `docs/cli.md`.
 
 use clap::{Args, Subcommand};
 use geectl::auth::{same_api_url, EnvObsAuth};

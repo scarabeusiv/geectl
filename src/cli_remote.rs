@@ -262,13 +262,34 @@ pub enum RemoteCommand {
 /// Run a `remote` command, returning the JSON payload and its text
 /// rendering. `live` performs the group's two mutations
 /// (`repo-add`, `repo-remove`); the reads ignore it.
+///
+/// Credentials resolve per command (see `docs/cli.md`).
 pub fn run_remote(
     command: RemoteCommand,
     debug: &Debug,
     live: bool,
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let (base, credentials) = obs_endpoint()?;
+    let (base, instances) = obs_endpoint()?;
+    // Credentials resolve per command (see `docs/cli.md`).
+    let credentials = match &command {
+        RemoteCommand::Cat { .. }
+        | RemoteCommand::ListFiles { .. }
+        | RemoteCommand::ListPackages { .. }
+        | RemoteCommand::ProjectMeta { .. }
+        | RemoteCommand::PackageMeta { .. }
+        | RemoteCommand::LinkTarget { .. }
+        | RemoteCommand::DevelProject { .. }
+        | RemoteCommand::RevisionPatch { .. }
+        | RemoteCommand::DiffPackages { .. } => Credentials::None,
+        RemoteCommand::ProjectDiff {
+            annotate_requests, ..
+        } if !*annotate_requests => Credentials::None,
+        RemoteCommand::RepoAdd { .. } | RemoteCommand::RepoRemove { .. } if !live => {
+            Credentials::None
+        }
+        _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
+    };
     let client =
         ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
     match command {
@@ -572,33 +593,24 @@ pub fn run_remote(
     }
 }
 
-/// The OBS base URL and credentials for a remote call, from the
-/// resolved config (file, environment, then the default) and the
-/// environment auth provider.
-///
-/// Credentials resolve up front for every remote command, even
-/// though several remote reads are public and need none in the
-/// library (`cat`, `list-files`, `list-packages`, `project-meta`,
-/// `package-meta`, `link-target`, `devel-project`, `revision-patch`,
-/// and `project-diff` — the last only without `--annotate-requests` —
-/// all read via `Credentials::None`):
-/// failing fast on a half-set credential env is a deliberate
-/// choice — a genuine misconfiguration fails early, at startup,
-/// rather than halfway through a run. Per-command lazy resolution
-/// is follow-up work. This group differs from `request` deliberately:
-/// remote commands are reads, so a half-set pair is a misconfiguration
-/// to surface at startup; `request` swallows it in dry-run because a
-/// request preview never needs credentials at all.
-fn obs_endpoint() -> Result<(String, Credentials), GeectlError> {
+/// The OBS base URL and the config file's `[instances]` table, for
+/// credential resolution (see [`auth::resolve_obs_basic_for_url`]).
+/// Credentials are NOT resolved here: they resolve per command in
+/// `run_remote` (see `docs/cli.md` for which commands those are).
+/// Here the dry-run mutations need none either, but the library proves
+/// it (its dry-run guard runs before the credentials check), so nothing
+/// is swallowed.
+fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
     let effective = config::effective_config(&file_config)?;
-    let base = effective
-        .config
-        .obs_url
-        .unwrap_or_else(|| OBS_API_BASE.to_string());
-    let credentials = EnvObsAuth::credentials_for_url(&base, &base, &file_config.instances)?;
-    Ok((base, credentials))
+    Ok((
+        effective
+            .config
+            .obs_url
+            .unwrap_or_else(|| OBS_API_BASE.to_string()),
+        file_config.instances,
+    ))
 }
 
 // ---------------------------------------------------------------------

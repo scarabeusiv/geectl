@@ -810,6 +810,37 @@ fn serve_once(body: &str) -> std::net::SocketAddr {
     addr
 }
 
+/// A many-shot HTTP fixture: serves the same canned response to
+/// every connection, until the test process ends. For commands that
+/// fan out (a diff lists both sides, then reads files), where one
+/// canned body answers every request. The thread is deliberately
+/// not joined, like `serve_once`: if the binary never connects, the
+/// test fails on its own assertion and the thread dies with the
+/// test process.
+fn serve_many(body: &str) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    addr
+}
+
 #[test]
 fn remote_list_packages_text_mode_renders_the_table() {
     let addr = serve_once("<directory><entry name=\"curl\"/><entry name=\"vim\"/></directory>");
@@ -903,6 +934,322 @@ fn remote_unknown_command_in_text_mode_stays_json() {
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
     assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+// --- remote lazy credential resolution (issue #82) ---
+//
+// The public reads never resolve credentials, so a half-set env
+// (username without password) must not break them; the credentialed
+// reads and a live mutation fail fast with a config error. The
+// fixture-backed tests prove the public read actually runs, offline:
+// a half-set env would fail before the first request.
+
+#[test]
+fn remote_list_packages_ignores_half_set_credentials() {
+    let addr = serve_once("<directory><entry name=\"curl\"/><entry name=\"vim\"/></directory>");
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "list-packages", "openSUSE:Factory"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["packages"], serde_json::json!(["curl", "vim"]));
+}
+
+#[test]
+fn remote_list_packages_needs_no_credentials() {
+    // With nothing configured the public read runs with no
+    // credentials at all — this guards the no-credential read
+    // path, not the resolution timing.
+    let addr = serve_once("<directory><entry name=\"curl\"/><entry name=\"vim\"/></directory>");
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "list-packages", "openSUSE:Factory"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["packages"], serde_json::json!(["curl", "vim"]));
+}
+
+#[test]
+fn remote_cat_ignores_half_set_credentials() {
+    let addr = serve_once("hello from the fixture");
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "cat", "openSUSE:Factory", "vim", "vim.spec"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["content"], "hello from the fixture");
+}
+
+#[test]
+fn remote_public_reads_ignore_half_set_credentials() {
+    // Every remaining public read, one case each: a half-set env must
+    // not fail it, and the fixture body lets the command succeed, so
+    // success proves the read ran past credential resolution. The
+    // fan-out commands (`diff-packages`, `project-diff`) get the
+    // many-shot fixture — one canned body answers every request —
+    // and an empty listing on both sides diffs to nothing.
+    let cases: &[(&[&str], &str, bool)] = &[
+        (
+            &["remote", "list-files", "openSUSE:Factory", "vim"],
+            "<directory><entry name=\"vim.spec\" size=\"1234\" mtime=\"1700000000\" md5=\"deadbeef\"/></directory>",
+            false,
+        ),
+        (
+            &["remote", "project-meta", "openSUSE:Factory"],
+            "<project name=\"openSUSE:Factory\"><title>T</title><description>D</description></project>",
+            false,
+        ),
+        (
+            &["remote", "package-meta", "openSUSE:Factory", "vim"],
+            "<package name=\"vim\" project=\"openSUSE:Factory\"><title>T</title><description>D</description></package>",
+            false,
+        ),
+        (
+            &["remote", "link-target", "openSUSE:Factory", "vim"],
+            "<directory><linkinfo project=\"openSUSE:Factory\" package=\"vim\"/></directory>",
+            false,
+        ),
+        (
+            &["remote", "devel-project", "foo"],
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"python-foo\"/></package>",
+            false,
+        ),
+        (
+            &["remote", "revision-patch", "openSUSE:Factory", "vim", "1"],
+            "<directory/>",
+            false,
+        ),
+        (
+            &[
+                "remote",
+                "diff-packages",
+                "openSUSE:Factory",
+                "vim",
+                "openSUSE:Factory",
+                "vim",
+            ],
+            "<directory/>",
+            true,
+        ),
+        (
+            &["remote", "project-diff", "openSUSE:Factory", "openSUSE:Factory"],
+            "<directory/>",
+            true,
+        ),
+    ];
+    for (args, body, many) in cases {
+        let addr = if *many {
+            serve_many(body)
+        } else {
+            serve_once(body)
+        };
+        let dir = TempDir::new();
+        let out = geectl_isolated(&dir)
+            .args(*args)
+            .env("GEECTL_OBS_URL", format!("http://{addr}"))
+            .env("GEECTL_OBS_USERNAME", "alice")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "args {args:?} failed: stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The payload parses: the command ran to completion.
+        let _: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+                .unwrap_or_else(|_| panic!("args {args:?}: stdout is not JSON"));
+    }
+}
+
+#[test]
+fn remote_search_packages_with_half_set_credentials_fails_with_config_error() {
+    // The credentialed reads still resolve up front and fail fast on
+    // a half-set env — the asymmetry with the public reads is
+    // intended.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "search-packages", "vim"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_list_projects_with_half_set_credentials_fails_with_config_error() {
+    // `list-projects` has no public route: it reads with the
+    // client's credentials, so it fails fast like the searches.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "list-projects"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_project_diff_annotate_requests_with_half_set_credentials_fails_with_config_error() {
+    // The diff itself is public, but `--annotate-requests` needs
+    // credentials for the open-request search, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "project-diff",
+            "openSUSE:Factory",
+            "openSUSE:Factory",
+            "--annotate-requests",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_repo_add_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "repo-add",
+            "openSUSE:Factory",
+            "standard",
+            "--arch",
+            "x86_64",
+            "--path",
+            "openSUSE:Factory/standard",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+}
+
+#[test]
+fn remote_repo_remove_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "repo-remove", "openSUSE:Factory", "standard"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+}
+
+#[test]
+fn remote_repo_add_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "repo-add",
+            "openSUSE:Factory",
+            "standard",
+            "--arch",
+            "x86_64",
+            "--path",
+            "openSUSE:Factory/standard",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_repo_remove_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "repo-remove",
+            "openSUSE:Factory",
+            "standard",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    // The context names the half-set pair, which only the
+    // CLI-level fail-fast produces: the library's own
+    // credentials check reports a missing-credentials message
+    // instead. This pins the fail-fast layer, not just the code.
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("is set but no password source is"),
+        "context: {}",
+        value["error"]["context"]
+    );
 }
 
 // --- branch/copy/link integration tests (isolated env, dry-run) ---

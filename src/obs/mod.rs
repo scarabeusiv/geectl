@@ -84,9 +84,9 @@
 //!
 //! Credentials come from geectl's auth surface (`EnvObsAuth`, OBS
 //! Basic via `GEECTL_OBS_USERNAME` + `GEECTL_OBS_PASSWORD` or
-//! `GEECTL_OBS_PASSWORD_FILE`). The public reads (devel project,
-//! devel version) need no credentials. The open-SR search and the
-//! filing POST need them and fail loudly without them. No credential
+//! `GEECTL_OBS_PASSWORD_FILE`). The public reads need no credentials
+//! (see Credentials in `docs/architecture.md`). The open-SR search and
+//! the filing POST need them and fail loudly without them. No credential
 //! is stored here, and no request carries one over cleartext http
 //! except to a loopback host (the transport guard in `http.rs`).
 //!

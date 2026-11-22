@@ -312,9 +312,8 @@ impl ResultsQueryArgs {
 /// Credentials resolve per command: `list-repositories` is a public
 /// read and never touches them (a half-set credential env must not
 /// break it); every other read fails fast on a half-set pair up
-/// front. That differs from `request` deliberately, which swallows
-/// a half-configured pair in dry-run so a preview never needs
-/// credentials at all.
+/// front. How the other groups handle a half-configured pair is
+/// stated in `docs/cli.md`.
 pub fn run_build(debug: &Debug, command: BuildCommand) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     // Credentials resolve lazily for `list-repositories`: the read is

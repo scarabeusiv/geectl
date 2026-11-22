@@ -24,8 +24,7 @@
 //! every case.
 //!
 //! Credentials in dry-run: there is no dry-run here — both commands
-//! are reads — but credentials resolve up front like `remote`:
-//! failing fast on a half-set credential env is a deliberate choice.
+//! are reads — but credentials resolve up front (see `docs/cli.md`).
 
 use clap::Subcommand;
 use geectl::auth::EnvObsAuth;

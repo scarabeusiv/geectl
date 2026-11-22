@@ -16,13 +16,12 @@
 //! <package>`) already names the package, so it carries the
 //! coordinate itself and gains no second line.
 //!
-//! Credentials in dry-run: like `branch`, this group fails fast on a
-//! half-configured credential pair before any work, in dry-run too.
-//! An unconfigured pair resolves to `None` and the operations fail
-//! closed themselves when they need credentials. The request group
-//! differs deliberately: it swallows a half-configured pair in
-//! dry-run (see `cli_request`), so a request preview never needs
-//! credentials at all.
+//! Credentials in dry-run: this group fails fast on a half-configured
+//! credential pair before any work, in dry-run too — a dry run that
+//! cannot be performed live is not a useful preview. An unconfigured
+//! pair resolves to `None` and the operations fail closed themselves
+//! when they need credentials. How the other groups handle a
+//! half-configured pair is stated in `docs/cli.md`.
 
 use clap::{Args, Subcommand};
 use geectl::auth::EnvObsAuth;
