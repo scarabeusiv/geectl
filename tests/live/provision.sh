@@ -31,7 +31,8 @@
 #   OBS_SOURCE_DIR=/path/to/open-build-service bash tests/live/provision.sh
 #   (defaults to <repo>/tests/live/obs; cloned if missing)
 #   COMPOSE="podman compose" bash tests/live/provision.sh
-#   (defaults to `docker compose`)
+#   (overrides the default: `podman compose` when podman and a
+#   compose provider are present, else `docker compose`)
 #   LIVE_CACHE=1 bash tests/live/provision.sh
 #   (loads docker-compose.cache.yml, the CI-only BuildKit cache for
 #   the frontend image build; local runs leave it unset)
@@ -59,7 +60,23 @@ case "$OBS_SOURCE_DIR" in
     *) OBS_SOURCE_DIR="$PWD/$OBS_SOURCE_DIR" ;;
 esac
 OBS_REPO="https://github.com/openSUSE/open-build-service.git"
-COMPOSE="${COMPOSE:-docker compose}"
+# Compose command resolution: an explicit COMPOSE wins; otherwise
+# prefer `podman compose` when podman is present, else fall back to
+# `docker compose`. `podman compose` itself needs a provider binary
+# (`docker-compose` or `podman-compose`) to parse the file, so
+# podman alone is not enough: without a provider, fall back to
+# `docker compose` and let the check below fail loudly if that is
+# absent too. CI pins `docker compose` in live.yml, so it never
+# depends on the runner image's toolset.
+if [ -z "${COMPOSE:-}" ]; then
+    COMPOSE="docker compose"
+    if command -v podman >/dev/null 2>&1; then
+        if command -v docker-compose >/dev/null 2>&1 \
+            || command -v podman-compose >/dev/null 2>&1; then
+            COMPOSE="podman compose"
+        fi
+    fi
+fi
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 # CI-only frontend build cache (see docker-compose.cache.yml): when
 # LIVE_CACHE is set, the cache override file is added to every

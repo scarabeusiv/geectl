@@ -44,8 +44,9 @@ bash tests/live/teardown.sh    # removes containers and volumes
 `provision.sh` clones the OBS source to `tests/live/obs` by
 default (override with `OBS_SOURCE_DIR`). The first run is slow: the
 OBS checkout plus the frontend image build take several minutes. Later
-runs reuse both. Set `COMPOSE="podman compose"` if you use podman
-instead of docker.
+runs reuse both. The compose command is picked automatically:
+`podman compose` when podman and a compose provider are present,
+else `docker compose` (override with `COMPOSE=...`).
 
 ## Two instances (cross-instance copy)
 

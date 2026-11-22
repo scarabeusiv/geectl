@@ -52,6 +52,12 @@ jobs:
   live:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Pin the compose command: the fixture prefers `podman compose`
+      # when present, and the runner image ships Podman but no
+      # standalone compose-provider binary — pin here rather than
+      # depending on the runner image's toolset.
+      COMPOSE: "docker compose"
     steps:
       # Pinned to the v4 tag's commit so the action cannot move under us;
       # Dependabot tracks SHA pins and proposes updates.

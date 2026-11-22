@@ -27,7 +27,24 @@ case "$OBS_SOURCE_DIR" in
     /*) ;;
     *) OBS_SOURCE_DIR="$PWD/$OBS_SOURCE_DIR" ;;
 esac
-COMPOSE="${COMPOSE:-docker compose}"
+# Compose command resolution (same as provision.sh): an explicit
+# COMPOSE wins; otherwise prefer `podman compose` when podman is
+# present, else fall back to `docker compose`. `podman compose`
+# itself needs a provider binary (`docker-compose` or
+# `podman-compose`) to parse the file, so podman alone is not
+# enough: without a provider, fall back to `docker compose` and let
+# the invocation fail loudly if that is absent too. CI pins
+# `docker compose` in live.yml, so it never depends on the runner
+# image's toolset.
+if [ -z "${COMPOSE:-}" ]; then
+    COMPOSE="docker compose"
+    if command -v podman >/dev/null 2>&1; then
+        if command -v docker-compose >/dev/null 2>&1 \
+            || command -v podman-compose >/dev/null 2>&1; then
+            COMPOSE="podman compose"
+        fi
+    fi
+fi
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 
 export OBS_SOURCE_DIR

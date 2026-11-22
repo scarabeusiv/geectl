@@ -19,7 +19,8 @@
 #
 # `OBS_SOURCE_DIR` is the OBS source checkout (cloned by `provision.sh`).
 # It defaults to `./obs` next to this file, so a manual
-# `docker compose up` works after cloning the OBS repo there.
+# `podman compose up` (or `docker compose up`) works after cloning
+# the OBS repo there.
 # The backend runs the development start script from the mounted source,
 # and the frontend is built from it — the checkout must be present.
 #
