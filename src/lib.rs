@@ -24,8 +24,9 @@
 //!   through the distribution — devel-project lookup, devel version,
 //!   open-submit-request check, submit-request filing, superseding,
 //!   branch cleanup, branch-project and branch-package creation,
-//!   file upload, and reading and acting on requests (show, log,
-//!   search, accept/decline/revoke, reviews, comments), with dry-run
+//!   file upload, reading service state and service definitions,
+//!   and reading and acting on requests (show, log, search,
+//!   accept/decline/revoke, reviews, comments), with dry-run
 //!   as the default for mutations.
 //! - [`xml`]: the minimal XML document editor for the small documents
 //!   geectl rewrites in place (a package `_meta`, a `_link`) —

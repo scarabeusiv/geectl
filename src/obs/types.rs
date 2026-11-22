@@ -270,6 +270,49 @@ pub(crate) struct DirectoryListing {
     /// `(project, package)` from `<linkinfo project package/>`, when
     /// the listing carries one.
     pub linkinfo: Option<(String, String)>,
+    /// The service run state from `<serviceinfo>`, when the listing
+    /// carries one (a run is in progress, failed, or finished).
+    pub serviceinfo: Option<ServiceState>,
+}
+
+/// A service run's state, from `<serviceinfo>` in the directory
+/// listing (`BSXML.pm` `$serviceinfo`): the run's code, the source
+/// md5s, and the failure text, when the server carries them. Read by
+/// `ObsClient::service_state`; intended as the settlement read for the
+/// commit path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceCode {
+    /// A run is in progress.
+    Running,
+    /// A run finished with an error (see [`ServiceState::error`]).
+    Failed,
+    /// A run finished successfully.
+    Succeeded,
+}
+
+impl std::fmt::Display for ServiceCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ServiceCode::Running => "running",
+            ServiceCode::Failed => "failed",
+            ServiceCode::Succeeded => "succeeded",
+        })
+    }
+}
+
+/// A service run's state, from `<serviceinfo>` in the directory
+/// listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceState {
+    /// The run's code.
+    pub code: ServiceCode,
+    /// The expanded source md5, when the listing carries it.
+    pub xsrcmd5: Option<String>,
+    /// The linked source md5, when the listing carries it.
+    pub lsrcmd5: Option<String>,
+    /// The `<error>` text, on failure. Multi-line; verbatim from the
+    /// server.
+    pub error: Option<String>,
 }
 
 /// One entry in a package's history (`<revision>` in
