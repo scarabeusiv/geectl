@@ -17,9 +17,8 @@
 #
 # Plain container commands, not compose: Gitea is a single container,
 # so compose adds nothing — and `podman compose` on the Mac is only a
-# wrapper around an external provider (`docker-compose` /
-# `podman-compose`), neither of which is installed, so compose does not
-# work there at all. `CONTAINER` selects the runtime: `docker` by
+# wrapper around an external provider binary (`docker-compose`,
+# installed via Homebrew). `CONTAINER` selects the runtime: `docker` by
 # default (CI runners), `podman` on the Mac.
 #
 # The image is pinned to a stable release (1.24.7), bumped by hand

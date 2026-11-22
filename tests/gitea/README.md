@@ -30,10 +30,9 @@ CONTAINER=podman bash tests/gitea/teardown.sh    # removes the container, volume
 
 `CONTAINER` selects the runtime: `docker` by default (CI runners),
 `podman` on the Mac. Plain container commands are used, not compose:
-Gitea is a single container, so compose adds nothing — and
-`podman compose` on the Mac is only a wrapper around an external
-provider (`docker-compose` / `podman-compose`), neither of which is
-installed, so compose does not work there at all.
+Gitea is a single container, so compose adds nothing — and `podman
+compose` on the Mac is only a wrapper around an external provider
+binary (`docker-compose`, installed via Homebrew).
 
 `provision.sh` creates the test user (`geectl`, admin) and an API token
 with the minimal scopes the tests need
