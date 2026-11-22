@@ -4347,6 +4347,7 @@ impl<'a> LocalBuild<'a> {
             });
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        ServiceContainer::check_mount_source(&source_dir)?;
         let image = self.resolve_image(false, timeout_secs, deadline)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let container =
@@ -4479,7 +4480,14 @@ impl<'a> LocalBuild<'a> {
                 plan: None,
             });
         }
-        let image = self.resolve_image(false, req.timeout_secs, deadline)?;
+        ServiceContainer::check_mount_source(&source_dir).inspect_err(|_| {
+            remove_stash(&stash, &self.debug);
+        })?;
+        let image = self
+            .resolve_image(false, req.timeout_secs, deadline)
+            .inspect_err(|_| {
+                remove_stash(&stash, &self.debug);
+            })?;
         let result =
             self.service_run_inner(req, &source_dir, &selected, &outdirs, &image, deadline);
         remove_stash(&stash, &self.debug);
@@ -4612,6 +4620,7 @@ impl<'a> LocalBuild<'a> {
                 "precommit budget exhausted before pre_checkin.sh; the services ran, the script did not",
             ));
         }
+        ServiceContainer::check_mount_source(source_dir)?;
         let image = self.resolve_image(false, remaining.as_secs(), deadline)?;
         self.debug.emit(&format!(
             "precommit image: {} digest {}",
@@ -4673,9 +4682,9 @@ const SERVICE_CONTAINER_PIDS_LIMIT: &str = "1024";
 /// value is the geectl version); the `OBS_SERVICE_*` variables
 /// stay unset — a local run carries no project context. No CPU cap
 /// is set: the wall-clock timeout already bounds CPU time, and a
-/// fixed CPU count does not scale portably across hosts. The
-/// `--mount` form splits on `,`, so a `,` in the source path
-/// misparses the mount.
+/// fixed CPU count does not scale portably across hosts.
+/// A `,` in the source path is refused: the `--mount` form
+/// splits on `,` with no escape, so the mount cannot carry it.
 struct ServiceContainer {
     podman: PathBuf,
     name: String,
@@ -4684,12 +4693,33 @@ struct ServiceContainer {
 static SERVICE_CONTAINER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl ServiceContainer {
+    /// A source directory the `--mount` form can carry: it holds
+    /// no `,`, which splits the comma-separated value with no
+    /// escape — podman refuses the fragment as an invalid mount
+    /// option. Refusing here names the path instead of letting
+    /// the container fail to start.
+    fn check_mount_source(source_dir: &Path) -> Result<(), GeectlError> {
+        if source_dir.to_string_lossy().contains(',') {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "source directory {} contains a ','; the --mount form cannot carry a comma in the path",
+                    source_dir.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn start(
         vertical: &LocalBuild<'_>,
         source_dir: &Path,
         image: &str,
         timeout_secs: u64,
     ) -> Result<Self, GeectlError> {
+        // Checked at the entry points before any image work; kept
+        // here so a future caller cannot build the mount unchecked.
+        Self::check_mount_source(source_dir)?;
         let podman = which(&vertical.podman).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ImageUnavailable,
@@ -8903,6 +8933,77 @@ exit 0
         }
 
         #[test]
+        fn service_container_mount_refuses_a_comma_in_the_source_path() {
+            // The `--mount` value is comma-separated with no
+            // escape: a `,` in the source path splits the mount
+            // and podman refuses the fragment. The run is refused
+            // before any podman call, naming the path.
+            let dir = TempDir::new();
+            let src = dir.path().join("so,urce");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            fs::write(src.join("_service:alpha:old"), "stale").unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let err = vertical.service_run(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.context.contains(&src.display().to_string()),
+                "refusal names no path: {err}"
+            );
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            assert!(
+                !log.lines()
+                    .any(|l| l.starts_with("run ") || l.starts_with("image ")),
+                "podman ran before the refusal: {log}"
+            );
+            assert!(
+                !src.join(".geectl-service-old").exists(),
+                "refusal left the moved-aside stash behind"
+            );
+        }
+
+        #[test]
+        fn service_container_mount_survives_an_equals_in_the_source_path() {
+            // The run line carries the `=` in the source path
+            // as part of the mount value.
+            let dir = TempDir::new();
+            let src = dir.path().join("so=urce");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.ran.len(), 1);
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            assert!(
+                run_line.contains(&format!(
+                    "--mount type=bind,src={},target=/work",
+                    src.display()
+                )),
+                "run line carries no --mount form: {run_line}"
+            );
+        }
+
+        #[test]
         fn service_container_run_carries_hardening_flags() {
             // The container runs hardened: capabilities dropped
             // except the install set, no new privileges, memory
@@ -9120,6 +9221,32 @@ exit 0
         }
 
         #[test]
+        fn precheckin_refuses_a_comma_in_the_source_path() {
+            // The mount refusal fires before the image resolve:
+            // a comma path fails here, not in the container.
+            let dir = TempDir::new();
+            let src = dir.path().join("so,urce");
+            fs::create_dir_all(&src).unwrap();
+            write_script(&src.join("pre_checkin.sh"), "#!/bin/sh\nexit 0\n");
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let deadline = std::time::Instant::now() + Duration::from_secs(3600);
+            let err = vertical.run_precheckin(&src, deadline, false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.context.contains(&src.display().to_string()),
+                "refusal names no path: {err}"
+            );
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            assert!(
+                !log.lines().any(|l| l.starts_with("image ")),
+                "podman ran before the refusal: {log}"
+            );
+        }
+
+        #[test]
         fn precommit_failing_script_blocks_the_run() {
             let dir = TempDir::new();
             let src = dir.path().join("source");
@@ -9135,6 +9262,33 @@ exit 0
                 err.context.contains("pre_checkin.sh"),
                 "got: {}",
                 err.context
+            );
+        }
+
+        #[test]
+        fn spec_cleaner_refuses_a_comma_in_the_source_path() {
+            // The mount refusal fires before the image resolve:
+            // a comma path fails here, not in the container.
+            let dir = TempDir::new();
+            let src = dir.path().join("so,urce");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("foo.spec"), "Name: foo\n").unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let err = vertical
+                .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, false)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.context.contains(&src.display().to_string()),
+                "refusal names no path: {err}"
+            );
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            assert!(
+                !log.lines().any(|l| l.starts_with("image ")),
+                "podman ran before the refusal: {log}"
             );
         }
 
