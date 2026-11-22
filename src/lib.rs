@@ -28,6 +28,8 @@
 //!   and reading and acting on requests (show, log, search,
 //!   accept/decline/revoke, reviews, comments), with dry-run
 //!   as the default for mutations.
+//! - [`pull_request`]: the uniform pull-request surface — one handle and
+//!   one read shape for an OBS submit request and a Gitea pull request.
 //! - [`xml`]: the minimal XML document editor for the small documents
 //!   geectl rewrites in place (a package `_meta`, a `_link`) —
 //!   internal only, so XML never leaves the library.
@@ -51,6 +53,7 @@ pub mod gitea;
 pub mod http;
 pub mod local_build;
 pub mod obs;
+pub mod pull_request;
 pub mod url;
 
 pub(crate) mod xml;

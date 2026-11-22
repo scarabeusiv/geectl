@@ -1206,7 +1206,7 @@ fn valid_gitea_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-fn validate_gitea_name(name: &str, label: &str) -> Result<(), GeectlError> {
+pub(crate) fn validate_gitea_name(name: &str, label: &str) -> Result<(), GeectlError> {
     if !valid_gitea_name(name) {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
