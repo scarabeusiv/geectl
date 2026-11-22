@@ -16,6 +16,7 @@
 //! silent skip would hide a broken fixture.
 
 use geectl::auth::Credentials;
+use geectl::debug::Debug;
 use geectl::http::{is_loopback_url, sanitize_url_for_error, Timeout, UreqClient};
 use geectl::local_build::{BuildRequest, LocalBuild};
 use geectl::obs::ObsClient;
@@ -149,16 +150,25 @@ fn real_podman_build_of_fixture_package_succeeds() {
             "{binary} is not on PATH: the local-build-e2e workflow installs it"
         );
     }
+    // The debug channel is on in this test: the run talks to a
+    // live backend, and a failure without the channel is
+    // undiagnosable — the download-on-demand warm failure in
+    // `download_dep` reports only through it.
+    let debug = Debug::new(true, false);
     let http = Box::leak(Box::new(
-        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+        UreqClient::new(Timeout::default())
+            .expect("default timeout is valid")
+            .with_debug(debug.clone()),
     ));
     let base = live_base();
     let client = ObsClient::with_base_and_credentials(http, &base, live_credentials())
-        .expect("the live base is a loopback http URL");
+        .expect("the live base is a loopback http URL")
+        .with_debug(debug.clone());
     let cache = TempDir::new();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/local_build_e2e");
     let request = BuildRequest::new(source, "geectl:e2e", "standard", std::env::consts::ARCH);
     let record = LocalBuild::new(&client, cache.path().to_path_buf())
+        .with_debug(debug)
         .build(&request)
         .expect("local build succeeds");
     assert_eq!(record.verdict, "green");
