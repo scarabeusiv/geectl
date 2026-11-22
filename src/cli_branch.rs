@@ -481,6 +481,26 @@ fn header(command: &str, source: String, target: Option<String>) -> String {
     }
 }
 
+/// Append a cross-instance target to a header line: the target
+/// instance is a query coordinate too, so it rides the header after
+/// `@`, not a second line.
+fn with_api_url(header: String, api_url: &Option<String>) -> String {
+    match api_url {
+        Some(api_url) => format!("{header} @ {api_url}"),
+        None => header,
+    }
+}
+
+/// A `revision:` line for a result that carries one, or nothing when
+/// the revision is null (dry-run, or a live op that set none): a null
+/// revision has no line, by decision at each call site.
+fn revision_line<T: std::fmt::Display>(revision: &Option<T>) -> Vec<String> {
+    match revision {
+        Some(revision) => vec![format!("revision: {revision}")],
+        None => vec![],
+    }
+}
+
 /// Combine a payload and its text lines: `dry_run` joins the payload
 /// and goes right after the header line (the maintenance renderer's
 /// order); the plan, when present, joins the payload and follows the
@@ -635,16 +655,14 @@ fn copy_package(
         "target_project": args.target_project,
         "target_package": target_package,
     });
-    let mut lines = vec![header(
-        "copy-package",
-        coords(&args.source_project, &args.source_package),
-        Some(coords(&args.target_project, target_package)),
+    let lines = vec![with_api_url(
+        header(
+            "copy-package",
+            coords(&args.source_project, &args.source_package),
+            Some(coords(&args.target_project, target_package)),
+        ),
+        &args.to_apiurl,
     )];
-    // The target instance is a query coordinate too: it rides the
-    // header after `@`, not a second line.
-    if let Some(api_url) = &args.to_apiurl {
-        lines[0].push_str(&format!(" @ {api_url}"));
-    }
     match &args.to_apiurl {
         None => match client.copy_package(
             &args.source_project,
@@ -667,7 +685,7 @@ fn copy_package(
                 let mut payload = payload;
                 payload["revision"] = json!(revision);
                 let mut lines = lines;
-                lines.push(format!("revision: {revision}"));
+                lines.extend(revision_line(&Some(revision)));
                 Ok(finish(payload, lines, false, None))
             }
         },
@@ -699,9 +717,7 @@ fn copy_package(
                 payload["skipped_files"] = json!(result.skipped_files);
                 lines.push(format!("copied_files: {}", result.copied_files));
                 lines.push(format!("skipped_files: {}", result.skipped_files));
-                if let Some(revision) = result.revision {
-                    lines.push(format!("revision: {revision}"));
-                }
+                lines.extend(revision_line(&result.revision));
                 Ok(finish(payload, lines, false, None))
             } else {
                 let plan = dry_run.plan();
@@ -891,9 +907,7 @@ fn set_link_rev(
         coords(&args.project, &args.package),
         None,
     )];
-    if let Some(revision) = &set {
-        lines.push(format!("revision: {revision}"));
-    }
+    lines.extend(revision_line(&set));
     if live {
         Ok(finish(payload, lines, false, None))
     } else {
@@ -1011,9 +1025,7 @@ fn detach_branch(
         coords(&args.project, &args.package),
         None,
     )];
-    if let Some(revision) = detached {
-        lines.push(format!("revision: {revision}"));
-    }
+    lines.extend(revision_line(&detached));
     if live {
         Ok(finish(payload, lines, false, None))
     } else {
@@ -1563,5 +1575,105 @@ mod tests {
         assert!(text.contains("foo"));
         assert!(text.contains("bar"));
         assert!(text.contains('1'));
+    }
+
+    /// The `header` helper renders the header line echoing the query
+    /// coordinates (design rule 1): the ten branch headers, pinned
+    /// exactly, plus the cross-instance `@` suffix.
+    #[test]
+    fn every_branch_command_header_echoes_its_coordinates() {
+        assert_eq!(
+            header("branch-package", coords("test:factory", "foo"), None),
+            "branch-package test:factory/foo"
+        );
+        assert_eq!(
+            header(
+                "branch-package",
+                coords("test:factory", "foo"),
+                Some(coords("home:alice:branches:test:factory", "foo")),
+            ),
+            "branch-package test:factory/foo -> home:alice:branches:test:factory/foo"
+        );
+        assert_eq!(
+            header(
+                "copy-package",
+                coords("test:factory", "foo"),
+                Some(coords("test:target", "foo")),
+            ),
+            "copy-package test:factory/foo -> test:target/foo"
+        );
+        assert_eq!(
+            with_api_url(
+                header(
+                    "copy-package",
+                    coords("test:factory", "foo"),
+                    Some(coords("test:target", "foo")),
+                ),
+                &Some("https://api.other.example".to_string()),
+            ),
+            "copy-package test:factory/foo -> test:target/foo @ https://api.other.example"
+        );
+        assert_eq!(
+            header(
+                "copy-project",
+                "test:factory".to_string(),
+                Some("test:target".to_string()),
+            ),
+            "copy-project test:factory -> test:target"
+        );
+        assert_eq!(
+            header(
+                "set-devel-project",
+                coords("test:factory", "foo"),
+                Some(coords("editors", "vim")),
+            ),
+            "set-devel-project test:factory/foo -> editors/vim"
+        );
+        assert_eq!(
+            header("set-devel-project", coords("test:factory", "foo"), None),
+            "set-devel-project test:factory/foo"
+        );
+        assert_eq!(
+            header(
+                "link-package",
+                coords("test:factory", "foo"),
+                Some(coords("test:target", "foo")),
+            ),
+            "link-package test:factory/foo -> test:target/foo"
+        );
+        assert_eq!(
+            header("repair-link", coords("test:factory", "foo"), None),
+            "repair-link test:factory/foo"
+        );
+        assert_eq!(
+            header("set-link-rev", coords("test:factory", "foo"), None),
+            "set-link-rev test:factory/foo"
+        );
+        assert_eq!(
+            header("set-link-rev-project", "test:factory".to_string(), None),
+            "set-link-rev-project test:factory"
+        );
+        assert_eq!(
+            header("link-to-branch", coords("test:factory", "foo"), None),
+            "link-to-branch test:factory/foo"
+        );
+        assert_eq!(
+            header("detach-branch", coords("test:factory", "foo"), None),
+            "detach-branch test:factory/foo"
+        );
+    }
+
+    #[test]
+    fn revision_line_renders_only_when_present() {
+        assert_eq!(
+            revision_line(&Some(42_u64)),
+            vec!["revision: 42".to_string()]
+        );
+        assert_eq!(
+            revision_line(&Some("deadbeef".to_string())),
+            vec!["revision: deadbeef".to_string()]
+        );
+        assert!(revision_line::<u64>(&None).is_empty());
+        assert!(revision_line::<String>(&None).is_empty());
     }
 }
