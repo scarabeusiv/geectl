@@ -10,6 +10,7 @@ mod cli_branch;
 mod cli_build;
 mod cli_remote;
 mod cli_request;
+mod cli_service;
 mod maintenance;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -85,7 +86,8 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Remote reads: inspect what the distribution holds.
+    /// Remote reads and repository edits: inspect what the
+    /// distribution holds.
     Remote {
         #[command(subcommand)]
         command: cli_remote::RemoteCommand,
@@ -112,6 +114,11 @@ enum Command {
     Maintenance {
         #[command(subcommand)]
         command: maintenance::MaintenanceCommand,
+    },
+    /// Service reads: list a package's services and their run state.
+    Service {
+        #[command(subcommand)]
+        command: cli_service::ServiceCommand,
     },
 }
 
@@ -161,6 +168,7 @@ fn run(
             let (payload, text) = maintenance::run(command, debug, cli.live)?;
             (payload, text)
         }
+        Some(Command::Service { command }) => cli_service::run_service(command, debug)?,
     };
     Ok(match format {
         Format::Json => payload.to_string(),

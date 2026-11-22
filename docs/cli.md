@@ -2,7 +2,7 @@
 
 The command reference for the geectl binary: one subcommand per
 operation, grouped under a top-level noun (`remote`, `request`,
-`branch`, `build`, `maintenance`), plus `version` and `config`.
+`branch`, `build`, `maintenance`, `service`), plus `version` and `config`.
 Every `--help` block below is the real output of the built binary
 (`geectl 0.2.1`); run `geectl --help` or `geectl <group> --help` for
 the same text live.
@@ -99,11 +99,12 @@ Usage: geectl [OPTIONS] [COMMAND]
 Commands:
   version      Print version information as the result payload
   config       Inspect or initialise the config file
-  remote       Remote reads: inspect what the distribution holds
+  remote       Remote reads and repository edits: inspect what the distribution holds
   request      Read and act on OBS submit requests, and file new ones
   branch       Branch, copy, and link packages
   build        Build-status commands: results, logs, histories, binaries
   maintenance  Maintenance operations: maintained-instances listing and maintenance branching
+  service      Service reads: list a package's services and their run state
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -118,7 +119,7 @@ Options:
 ## `remote` — inspection, plus repository edits
 
 ```
-Remote reads: inspect what the distribution holds
+Remote reads and repository edits: inspect what the distribution holds
 
 Usage: geectl remote [OPTIONS] <COMMAND>
 
@@ -405,6 +406,43 @@ Options:
           Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
   -h, --help
           Print help
+```
+
+## `service` — service reads
+
+```
+Service reads: list a package's services and their run state
+
+Usage: geectl service [OPTIONS] <COMMAND>
+
+Commands:
+  list   List the services defined in a package's `_service` file
+  state  Show the last service run state of a package
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+List the services defined in a package's `_service` file
+
+Usage: geectl service list [OPTIONS] <PROJECT> <PACKAGE>
+
+Arguments:
+  <PROJECT>  The project the package lives in
+  <PACKAGE>  The package to list the services of
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
 ```
 
 ## Common tasks
