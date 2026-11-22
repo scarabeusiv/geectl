@@ -128,18 +128,34 @@ fn gitea_user() -> String {
         .unwrap_or_else(|| "geectl".to_string())
 }
 
+/// A process-wide counter, so two tests that read the clock in
+/// the same nanosecond still get different names: the timestamp
+/// alone collided under parallel runs (two `create_repo_raw` calls
+/// with one name, the second answering 409 — reproduced twice in
+/// the live loop, both times in `gitea_fork_round_trip`).
+fn unique_counter() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A repository name unique to this run, so the test can run twice
 /// against one instance (e.g. a local re-run without teardown) without
 /// colliding with its own previous creation. The timestamp is
 /// nanoseconds: two calls in the same process within a second do not
 /// collide (whole seconds did). The process id is included so two
-/// test processes do not collide either.
+/// test processes do not collide either. The counter is included so
+/// two calls in the same nanosecond do not collide either.
 fn unique_repo_name() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time is after the epoch")
         .as_nanos();
-    format!("geectl-live-{}-{}", std::process::id(), nanos)
+    format!(
+        "geectl-live-{}-{}-{}",
+        std::process::id(),
+        nanos,
+        unique_counter()
+    )
 }
 
 #[test]
@@ -358,13 +374,18 @@ fn create_commit_raw(
 
 /// An organization name unique to this run. Shorter than
 /// `unique_repo_name`: Gitea caps usernames at 39 characters, and
-/// `geectl-live-<pid>-<nanos>` can exceed it.
+/// `geectl-live-<pid>-<nanos>` can exceed it. The counter keeps
+/// two calls in the same second apart.
 fn unique_org_name() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time is after the epoch")
         .as_secs();
-    format!("geectl-org-{}-{secs}", std::process::id())
+    format!(
+        "geectl-org-{}-{secs}-{}",
+        std::process::id(),
+        unique_counter()
+    )
 }
 
 #[test]
@@ -1183,21 +1204,23 @@ mod tests {
     fn unique_repo_name_has_pid_and_timestamp_suffix() {
         let first = unique_repo_name();
         assert!(first.starts_with("geectl-live-"));
-        // The suffix is "<process-id>-<nanoseconds-since-epoch>":
-        // both numeric, so the name is deterministic within a
-        // process, and two processes still differ.
+        // The suffix is
+        // "<process-id>-<nanoseconds-since-epoch>-<counter>": all
+        // numeric, so the name is deterministic within a process,
+        // and two processes still differ.
         let suffix = &first["geectl-live-".len()..];
         let parts: Vec<&str> = suffix.split('-').collect();
-        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.len(), 3);
         assert!(parts[0].parse::<u32>().is_ok());
         assert!(parts[1].parse::<u128>().is_ok());
+        assert!(parts[2].parse::<u64>().is_ok());
     }
 
     #[test]
     fn unique_repo_name_differs_between_calls() {
-        // Nanosecond timestamps: two calls in the same process do
-        // not collide, so a re-run against one instance cannot
-        // clash with its own previous creation.
+        // The counter: two calls in the same process do not
+        // collide even in the same nanosecond, so a re-run against
+        // one instance cannot clash with its own previous creation.
         assert_ne!(unique_repo_name(), unique_repo_name());
     }
 }
