@@ -619,9 +619,11 @@ fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
 
 /// The `repo-add` result line: the repository and project, plus the
 /// arch list and the rebuild-source paths — the repository's
-/// definition, so the text carries what the JSON payload carries.
+/// definition, so the text carries the definition from the payload.
 /// `disable_publish` is a boolean, not an identifier: the dry-run
-/// plan names it when set, and the JSON payload carries it.
+/// plan names it when set, and the JSON payload carries it. `changed`
+/// needs no line: a live add always changes the meta, and dry-run
+/// always reads "would add".
 fn repo_add_result_line(
     name: &str,
     project: &str,
