@@ -172,7 +172,9 @@ regression, osc#2130):
   the generic `createrequest -a submit` creator (the generic-create shape
   batch 7 reuses for other action types).
 - `behave/features/request-list.feature:4` — `request list -P test:factory`
-  exits 0 — no stdout/state check.
+  exits 0 — no stdout/state check (covered by geectl `request list`, the
+  thin wrapper over the search operation; `request_list_*` binary tests
+  and `live_request_list_defaults_cover_the_filed_request`).
 
 ### Gap — NO osc coverage, live tests written from scratch
 

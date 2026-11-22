@@ -239,6 +239,7 @@ Commands:
   show                         Show one submit request: source/target/message, reviews, history
   log                          Show one submit request's history: creation, then each state change
   search                       List the submit requests matching the filters: a typed search, not a plain listing
+  list                         List submit requests: the same search, with the states still awaiting action (new, review) as the default. A thin wrapper over the search operation: the flags select the same server-side search
   diff                         Show the diff of a submit request: the unified diff, or the request XML with the diff injected with `--xml`
   list-comments                List the comments on a submit request, in id order
   accept                       Accept a submit request, with a comment as the message left with the accept

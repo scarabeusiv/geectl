@@ -189,13 +189,13 @@ the noisy command as evidence — not a ladder built in advance.
   takes pre-formed lines, so the check is one bool per event.
 - **The two existing prints.** `try_change_state` emits a
   `decision:` line on the channel when it declines an accept
-  (`src/obs/request.rs:3010`): the refused-change path (`:3030`)
+  (`src/obs/request.rs:3205`): the refused-change path (`:3208`)
   propagates the error, so the reason reaches the JSON error
-  payload, while the already-in-target-state path (`:3047`)
+  payload, while the already-in-target-state path (`:3225`)
   returns `Ok(false)` — the boolean outcome is in the payload, so
   nothing is lost. The re-issue `decision:` lines
-  emit live in `post_changestate_with_retry` (`:2747`, emits
-  `:2787-2813`). The `[dry-run]` plan echo
+  emit live in `post_changestate_with_retry` (`:2934`, emits
+  `:2962-3002`). The `[dry-run]` plan echo
   (`src/obs/types.rs`, `DryRun::note`) is unconditional stderr
   narration: it is the dry-run feature's output, not a debug print —
   a dry run shows what would happen — and the plan is data
@@ -311,7 +311,9 @@ shape rules above. Six examples pin the shape:
   group:factory-staging state accepted`).
 - **`request search` / `search_requests`** (list, table):
   header `ID STATE CREATOR ACTIONS`, one row per request, the actions
-  column a compact inline form (`submit foo`).
+  column a compact inline form (`submit foo`). `request list` renders
+  the same table under a `list` header; `--since` bounds by history or last-update
+  date, `--limit` caps the rows.
 - **`list_files`** (list, table): header `NAME SIZE MTIME`, one row
   per file. The md5 is JSON-only: it is a verification value,
   not a human identifier, and a 32-hex column would dominate every
