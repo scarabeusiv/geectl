@@ -7,8 +7,9 @@
 //! the same values in a human-readable form.
 //!
 //! Reads are always live; the act leaves (`approve`,
-//! `request-changes`, `comment`, `cancel-review-request`) are
-//! dry-run by default and mutate only with the global `--live`.
+//! `request-changes`, `comment`, `cancel-review-request`,
+//! `merge`, `decline`, `withdraw`, `reopen`) are dry-run by
+//! default and mutate only with the global `--live`.
 //! A read or a live act on an arm needs that arm's
 //! credentials — OBS Basic credentials for `obs:` handles, the
 //! Gitea Bearer token for `gitea:` handles — and fails closed
@@ -23,7 +24,9 @@
 //! without one fails closed naming it, like the gitea group. A
 //! dry-run approve on OBS without OBS credentials also fails
 //! closed: the plan names the acting user, and without credentials
-//! there is no actor to name.
+//! there is no actor to name. A dry-run merge, decline, withdraw
+//! or reopen on OBS prints without credentials: the plan names no
+//! acting user.
 //!
 //! Coordinate header (design rule 1): every text rendering opens
 //! with one header line echoing the query coordinates — the
@@ -43,7 +46,7 @@ use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth};
 use geectl::config::{self, DEFAULT_GITEA_URL};
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
-use geectl::gitea::{parse_gitea_repo, GiteaClient};
+use geectl::gitea::{parse_gitea_repo, GiteaClient, GiteaMergeMethod};
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::{DryRun, ObsClient, ReviewTarget, OBS_API_BASE};
 use geectl::pull_request::{
@@ -92,6 +95,26 @@ pub enum PullRequestCommand {
     /// fails closed: OBS has no request call that removes a
     /// reviewer.
     CancelReviewRequest(CancelArgs),
+    /// Merge a pull request. On OBS this accepts the submit
+    /// request; on Gitea it merges the pull request. Dry-run by
+    /// default; mutates only with `--live`.
+    Merge(MergeArgs),
+    /// Decline a pull request. On OBS this changes the request
+    /// state to declined; on Gitea it closes the pull request.
+    /// Dry-run by default; mutates only with `--live`.
+    Decline(LevelCommentArgs),
+    /// Withdraw a pull request. On OBS this revokes the request;
+    /// on Gitea it closes the pull request. Dry-run by default;
+    /// mutates only with `--live`.
+    Withdraw(LevelCommentArgs),
+    /// Reopen a pull request. On OBS this changes a declined
+    /// request back to `new`; on Gitea it reopens the closed pull
+    /// request. Dry-run by default; mutates only with `--live`.
+    Reopen {
+        /// The pull-request handle: `obs:<id>` or
+        /// `gitea:<owner>/<repo>#<number>`.
+        reference: String,
+    },
 }
 
 /// Arguments shared by `pull-request approve` and `pull-request
@@ -152,6 +175,38 @@ pub struct CancelArgs {
     /// team.
     #[arg(long)]
     exclude: Vec<String>,
+}
+
+/// Arguments for `pull-request merge`.
+#[derive(Debug, Args)]
+pub struct MergeArgs {
+    /// The pull-request handle: `obs:<id>` or
+    /// `gitea:<owner>/<repo>#<number>`.
+    reference: String,
+    /// The message left with the merge. Values starting with `-`
+    /// are taken literally: a message may open with a `- ` bullet.
+    #[arg(long, allow_hyphen_values = true)]
+    message: Option<String>,
+    /// The Gitea merge style (Gitea only; refused on an OBS ref).
+    #[arg(long, value_parser = ["merge", "rebase", "rebase-merge", "squash", "fast-forward-only"])]
+    method: Option<String>,
+    /// Accept past open reviews (OBS only; refused on a Gitea ref).
+    #[arg(long)]
+    force: bool,
+}
+
+/// Arguments shared by `pull-request decline` and `pull-request
+/// withdraw`.
+#[derive(Debug, Args)]
+pub struct LevelCommentArgs {
+    /// The pull-request handle: `obs:<id>` or
+    /// `gitea:<owner>/<repo>#<number>`.
+    reference: String,
+    /// The reason for the decline or withdrawal. Values starting
+    /// with `-` are taken literally: a message may open with a
+    /// `- ` bullet.
+    #[arg(long, allow_hyphen_values = true)]
+    message: Option<String>,
 }
 
 /// Arguments for `pull-request search`.
@@ -300,6 +355,83 @@ pub fn run_pull_request(
                 }),
             }
         }
+        PullRequestCommand::Merge(args) => {
+            let method = match &args.method {
+                Some(method) => Some(method.parse::<GiteaMergeMethod>()?),
+                None => None,
+            };
+            let message = args.message.as_deref();
+            // Backend-only options are refused before any
+            // credential resolution, so the refusal is reachable
+            // without credentials — the library refuses again, as
+            // enforcement. `review_target` validates the same way.
+            let reference: PullRequestRef = args.reference.parse()?;
+            match &reference {
+                PullRequestRef::Obs(_) => {
+                    if let Some(method) = method {
+                        return Err(GeectlError::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "--method {} does not apply to an OBS submit request: OBS has no merge style",
+                                method.as_str()
+                            ),
+                        ));
+                    }
+                }
+                PullRequestRef::Gitea { .. } => {
+                    if args.force {
+                        return Err(GeectlError::new(
+                            ErrorKind::InvalidInput,
+                            "--force does not apply to a Gitea pull request: the merge API takes no force flag",
+                        ));
+                    }
+                }
+            }
+            level_act_with(
+                args.reference,
+                debug,
+                live,
+                "merge",
+                "merged",
+                message,
+                |client, reference, dry_run| {
+                    client.merge(reference, message, method, args.force, dry_run)
+                },
+            )
+        }
+        PullRequestCommand::Decline(args) => {
+            let message = args.message.as_deref();
+            level_act_with(
+                args.reference,
+                debug,
+                live,
+                "decline",
+                "declined",
+                message,
+                |client, reference, dry_run| client.decline(reference, message, dry_run),
+            )
+        }
+        PullRequestCommand::Withdraw(args) => {
+            let message = args.message.as_deref();
+            level_act_with(
+                args.reference,
+                debug,
+                live,
+                "withdraw",
+                "withdrew",
+                message,
+                |client, reference, dry_run| client.withdraw(reference, message, dry_run),
+            )
+        }
+        PullRequestCommand::Reopen { reference } => level_act_with(
+            reference,
+            debug,
+            live,
+            "reopen",
+            "reopened",
+            None,
+            |client, reference, dry_run| client.reopen(reference, dry_run),
+        ),
         PullRequestCommand::Search(args) => {
             // The filters are parsed and validated before any
             // credential resolution, like the handle above.
@@ -560,6 +692,89 @@ fn review_act_text(
     let mut text = match (dry_run.enabled(), opinion) {
         (true, _) => format!("dry-run: would {present} {reference}"),
         (false, Some(opinion)) => format!("{past} {reference} as {}", opinion.reviewer),
+        (false, None) => format!("{past} {reference}"),
+    };
+    if let Some(message) = message {
+        if !message.is_empty() {
+            text.push_str(&format!(" — {message}"));
+        }
+    }
+    text
+}
+
+/// One pull-request-level act (`merge` / `decline` /
+/// `withdraw` / `reopen`) through the uniform client: the handle
+/// is validated before any credential resolution, like `show`.
+fn level_act_with(
+    reference: String,
+    debug: &Debug,
+    live: bool,
+    present: &str,
+    past: &str,
+    message: Option<&str>,
+    act: impl FnOnce(
+        &PullRequestClient,
+        &PullRequestRef,
+        &DryRun,
+    ) -> Result<Option<PullRequestStatus>, GeectlError>,
+) -> Result<(Value, String), GeectlError> {
+    let reference: PullRequestRef = reference.parse()?;
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    match &reference {
+        PullRequestRef::Obs(_) => with_obs(debug, live, |obs| {
+            let client = PullRequestClient::new(Some(obs), None);
+            let status = act(&client, &reference, &dry_run)?;
+            Ok((
+                level_act_payload(&reference, &status, &dry_run)?,
+                level_act_text(present, past, &reference, &status, message, &dry_run),
+            ))
+        }),
+        PullRequestRef::Gitea { .. } => with_gitea(debug, |gitea| {
+            let client = PullRequestClient::new(None, Some(gitea));
+            let status = act(&client, &reference, &dry_run)?;
+            Ok((
+                level_act_payload(&reference, &status, &dry_run)?,
+                level_act_text(present, past, &reference, &status, message, &dry_run),
+            ))
+        }),
+    }
+}
+
+/// The payload for a pull-request-level act: the reference, the
+/// unified status after the act (`null` in dry-run), and
+/// `dry_run`, plus the plan in dry-run, like the request group's
+/// act payloads.
+fn level_act_payload(
+    reference: &PullRequestRef,
+    status: &Option<PullRequestStatus>,
+    dry_run: &DryRun,
+) -> Result<Value, GeectlError> {
+    let mut payload = json!({
+        "reference": reference.to_string(),
+        "status": match status {
+            Some(status) => Value::String(status.as_str().to_string()),
+            None => Value::Null,
+        },
+        "dry_run": dry_run.enabled(),
+    });
+    add_plan(&mut payload, dry_run);
+    Ok(payload)
+}
+
+/// The text for a pull-request-level act: the reference first
+/// (the coordinate echo), then the status after the act in live
+/// mode, the message when one was given.
+fn level_act_text(
+    present: &str,
+    past: &str,
+    reference: &PullRequestRef,
+    status: &Option<PullRequestStatus>,
+    message: Option<&str>,
+    dry_run: &DryRun,
+) -> String {
+    let mut text = match (dry_run.enabled(), status) {
+        (true, _) => format!("dry-run: would {present} {reference}"),
+        (false, Some(status)) => format!("{past} {reference} (now {})", status.as_str()),
         (false, None) => format!("{past} {reference}"),
     };
     if let Some(message) = message {
@@ -1373,5 +1588,59 @@ mod tests {
             text,
             "no pending review requests to cancel on gitea:openSUSE/geectl#122"
         );
+    }
+
+    #[test]
+    fn level_act_json_and_text_agree() {
+        let reference = gitea_reference();
+        let status = Some(PullRequestStatus::Merged);
+        let dry_run = DryRun::new(false);
+        let payload = level_act_payload(&reference, &status, &dry_run).unwrap();
+        assert_eq!(payload["reference"], "gitea:openSUSE/geectl#122");
+        assert_eq!(payload["status"], "merged");
+        assert_eq!(payload["dry_run"], false);
+        assert!(payload.get("plan").is_none());
+
+        let text = level_act_text(
+            "merge",
+            "merged",
+            &reference,
+            &status,
+            Some("Merging."),
+            &dry_run,
+        );
+        assert_eq!(
+            text,
+            "merged gitea:openSUSE/geectl#122 (now merged) — Merging."
+        );
+    }
+
+    #[test]
+    fn level_act_dry_run_reports_no_status_and_carries_the_plan() {
+        let reference = gitea_reference();
+        let dry_run = DryRun::new(true);
+        dry_run.allow("merge pull request openSUSE/geectl#122");
+        let payload = level_act_payload(&reference, &None, &dry_run).unwrap();
+        assert_eq!(payload["status"], serde_json::Value::Null);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: merge pull request openSUSE/geectl#122"
+        );
+
+        let text = level_act_text(
+            "decline",
+            "declined",
+            &reference,
+            &None,
+            Some("Not now."),
+            &dry_run,
+        );
+        assert_eq!(
+            text,
+            "dry-run: would decline gitea:openSUSE/geectl#122 — Not now."
+        );
+        let text = level_act_text("reopen", "reopened", &reference, &None, None, &dry_run);
+        assert_eq!(text, "dry-run: would reopen gitea:openSUSE/geectl#122");
     }
 }

@@ -579,6 +579,10 @@ Commands:
   comment                Comment on a pull request. Dry-run by default; mutates only with `--live`
   comments               List the comments on a pull request, oldest first. A read, always live
   cancel-review-request  Cancel pending review requests on a pull request. Dry-run by default; mutates only with `--live`. On OBS the cancel fails closed: OBS has no request call that removes a reviewer
+  merge                  Merge a pull request. On OBS this accepts the submit request; on Gitea it merges the pull request. Dry-run by default; mutates only with `--live`
+  decline                Decline a pull request. On OBS this changes the request state to declined; on Gitea it closes the pull request. Dry-run by default; mutates only with `--live`
+  withdraw               Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with `--live`
+  reopen                 Reopen a pull request. On OBS this changes a declined request back to `new`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with `--live`
   help                   Print this message or the help of the given subcommand(s)
 
 Options:

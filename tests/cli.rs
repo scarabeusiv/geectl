@@ -2209,11 +2209,23 @@ fn top_help_lists_the_gitea_group() {
 }
 
 #[test]
-fn pull_request_help_lists_both_subcommands() {
+fn pull_request_help_lists_the_subcommands() {
     let out = geectl().args(["pull-request", "--help"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    for name in ["show", "search"] {
+    for name in [
+        "show",
+        "search",
+        "approve",
+        "request-changes",
+        "comment",
+        "comments",
+        "cancel-review-request",
+        "merge",
+        "decline",
+        "withdraw",
+        "reopen",
+    ] {
         assert!(text.contains(name), "pull-request --help misses {name}");
     }
 }
@@ -2227,6 +2239,122 @@ fn top_help_lists_the_pull_request_group() {
         text.contains("pull-request"),
         "top --help misses the pull-request group"
     );
+}
+
+#[test]
+fn pull_request_merge_obs_dry_run_without_credentials_prints_plan() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "merge", "obs:123"])
+        .output()
+        .unwrap();
+    // A dry-run level act on OBS prints without credentials: the
+    // plan names no acting user.
+    assert!(out.status.success());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], "obs:123");
+    assert_eq!(value["status"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: change state of submit request 123 to accepted"
+    );
+}
+
+#[test]
+fn pull_request_merge_obs_text_dry_run_without_credentials_prints_plan() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "pull-request", "merge", "obs:123"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would merge obs:123"
+    );
+}
+
+#[test]
+fn pull_request_merge_obs_live_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "pull-request", "merge", "obs:123"])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; a live merge needs OBS Basic
+    // credentials and fails loudly without them.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
+}
+
+#[test]
+fn pull_request_merge_gitea_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "merge", "gitea:openSUSE/geectl#122"])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; a Gitea act needs the Bearer <redacted>
+    // even in dry-run and fails loudly without it.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_GITEA_TOKEN"));
+}
+
+#[test]
+fn pull_request_merge_obs_with_a_method_is_invalid_input() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "merge", "obs:123", "--method", "squash"])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; --method does not apply to OBS.
+    // The refusal precedes credential resolution, so the dry-run
+    // credential warning never appears; the assertions are
+    // substrings, not a JSON parse.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--method squash"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_merge_gitea_with_force_is_invalid_input_without_credentials() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "merge",
+            "gitea:openSUSE/geectl#122",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; --force does not apply to Gitea, and
+    // the refusal precedes credential resolution, so it fires
+    // without a token where a plain merge would fail with
+    // ConfigError.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--force"), "stderr: {stderr}");
 }
 
 #[test]
