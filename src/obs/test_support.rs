@@ -36,6 +36,7 @@ pub(crate) struct FakeHttp {
     get_bytes_calls: RefCell<Vec<(String, bool)>>,
     post_calls: RefCell<Vec<(String, String, bool)>>,
     delete_calls: RefCell<Vec<(String, bool)>>,
+    delete_json_calls: RefCell<Vec<(String, String, bool)>>,
     put_calls: RefCell<Vec<(String, String, bool)>>,
     put_bytes: RefCell<HashMap<String, String>>,
     put_bytes_calls: RefCell<Vec<(String, Vec<u8>, bool)>>,
@@ -66,6 +67,7 @@ impl FakeHttp {
             get_bytes_calls: RefCell::new(Vec::new()),
             post_calls: RefCell::new(Vec::new()),
             delete_calls: RefCell::new(Vec::new()),
+            delete_json_calls: RefCell::new(Vec::new()),
             put_calls: RefCell::new(Vec::new()),
             put_bytes: RefCell::new(HashMap::new()),
             put_bytes_calls: RefCell::new(Vec::new()),
@@ -270,6 +272,10 @@ impl FakeHttp {
 
     pub(crate) fn delete_calls(&self) -> Vec<(String, bool)> {
         self.delete_calls.borrow().clone()
+    }
+
+    pub(crate) fn delete_json_calls(&self) -> Vec<(String, String, bool)> {
+        self.delete_json_calls.borrow().clone()
     }
 
     pub(crate) fn put_calls(&self) -> Vec<(String, String, bool)> {
@@ -548,6 +554,27 @@ impl HttpClient for FakeHttp {
         self.delete_calls
             .borrow_mut()
             .push((url.to_string(), authed));
+        self.deletes.borrow().get(url).cloned().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::NetworkError,
+                format!("no canned DELETE response for {url}"),
+            )
+        })
+    }
+
+    fn delete_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // The JSON-body twin of delete: the recorded call carries
+        // the body, so a test can assert the cancel DELETE carried
+        // the reviewer list.
+        let authed = !matches!(credentials, Credentials::None);
+        self.delete_json_calls
+            .borrow_mut()
+            .push((url.to_string(), body.to_string(), authed));
         self.deletes.borrow().get(url).cloned().ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::NetworkError,

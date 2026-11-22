@@ -341,6 +341,19 @@ pub trait HttpClient {
         ))
     }
     fn delete(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
+    /// DELETE with a JSON body and explicit credentials. The `delete`
+    /// counterpart of `post_json_with`: the same `application/json`
+    /// body and the credentials from the caller instead of the
+    /// client's auth seam — so a client that holds its own Bearer
+    /// (the Gitea client) never authenticates a mutation as someone
+    /// else. Like `delete` it is never retried: a retried delete
+    /// cannot tell a lost response from a delete that never ran.
+    fn delete_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError>;
 }
 
 /// A [`HttpClient`] backed by ureq, with bounded timeouts and the retry
@@ -1177,6 +1190,110 @@ impl UreqClient {
             }
         })
     }
+
+    fn delete_inner(
+        &self,
+        url: &str,
+        body: Option<&str>,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        require_credentials_transport(url, credentials)?;
+        // DELETE is single-attempt by design: gate on the retryable set like POST/PUT/GET.
+        debug_assert!(
+            !is_retryable_method("DELETE"),
+            "DELETE must stay non-retryable; a retried delete cannot tell a lost response from a delete that never ran"
+        );
+        // Ask for XML, the same defence as GET: the owner search proved
+        // a dual-routed path serves the WebUI HTML page unless the request
+        // asks for XML. Mutations ask for XML too, as a preventive
+        // measure.
+        let mut request = self.agent.delete(url).header("Accept", "application/xml");
+        if body.is_some() {
+            request = request.header("Content-Type", "application/json");
+        }
+        let request = self.apply_auth(request, credentials)?;
+        // A single attempt: DELETE is never retried.
+        let started = std::time::Instant::now();
+        // ureq types DELETE as bodyless, so a body-carrying
+        // DELETE goes through force_send_body, its escape hatch
+        // for exactly this shape.
+        let result = match body {
+            Some(body) => {
+                self.debug_body("request", "DELETE", url, body);
+                request.force_send_body().send(body)
+            }
+            None => request.call(),
+        };
+        match result {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if resp.status().is_redirection() {
+                    let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
+                    self.debug_single_attempt(
+                        "DELETE",
+                        url,
+                        &status.to_string(),
+                        started.elapsed(),
+                    );
+                    return Err(redirect_error(status, location));
+                }
+                // Attempt line first (see read_response_body).
+                self.debug_single_attempt("DELETE", url, &status.to_string(), started.elapsed());
+                let body =
+                    self.read_response_body(resp.into_body().into_reader(), "DELETE", url)?;
+                self.debug_body("response", "DELETE", url, &body);
+                Ok(body)
+            }
+            Err(ureq::Error::StatusCode(code)) => {
+                let safe_url = sanitize_url_for_error(url);
+                self.debug_single_attempt("DELETE", url, &code.to_string(), started.elapsed());
+                match status_action(code, &safe_url) {
+                    // No retry for DELETE: a Retry action is returned
+                    // as the error, immediately.
+                    StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
+                }
+            }
+            Err(ureq::Error::Tls(msg)) => {
+                self.debug_single_attempt("DELETE", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {msg}"),
+                ))
+            }
+            Err(ureq::Error::Rustls(e)) => {
+                self.debug_single_attempt("DELETE", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {e}"),
+                ))
+            }
+            Err(ureq::Error::Pem(e)) => {
+                self.debug_single_attempt("DELETE", url, "TLS error", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::TlsError,
+                    format!("TLS error: {e}"),
+                ))
+            }
+            Err(ureq::Error::Timeout(_)) => {
+                // A timeout means "unknown, check the server state",
+                // never a false failure. The caller re-issues the
+                // delete itself once it has checked.
+                self.debug_single_attempt("DELETE", url, "timeout", started.elapsed());
+                Err(GeectlError::new(
+                    ErrorKind::Timeout,
+                    format!("request to {} timed out", sanitize_url_for_error(url)),
+                ))
+            }
+            Err(ureq::Error::Io(e)) => {
+                self.debug_single_attempt("DELETE", url, "network error", started.elapsed());
+                Err(GeectlError::new(ErrorKind::NetworkError, e.to_string()))
+            }
+            Err(e) => {
+                self.debug_single_attempt("DELETE", url, "server error", started.elapsed());
+                Err(GeectlError::new(ErrorKind::ServerError, e.to_string()))
+            }
+        }
+    }
 }
 
 /// Strip any userinfo (`user:pass@`) from a URL before it is used in an
@@ -1611,86 +1728,19 @@ impl HttpClient for UreqClient {
         // outcome honest: a timeout means "unknown, check the server
         // state", never a false failure. The caller re-issues the
         // delete itself once it has checked.
-        require_credentials_transport(url, credentials)?;
-        // DELETE is single-attempt by design: gate on the retryable set like POST/PUT/GET.
-        debug_assert!(
-            !is_retryable_method("DELETE"),
-            "DELETE must stay non-retryable; a retried delete cannot tell a lost response from a delete that never ran"
-        );
-        // Ask for XML, the same defence as GET: the owner search proved
-        // a dual-routed path serves the WebUI HTML page unless the request
-        // asks for XML. Mutations ask for XML too, as a preventive
-        // measure.
-        let request = self.agent.delete(url).header("Accept", "application/xml");
-        let request = self.apply_auth(request, credentials)?;
-        // A single attempt: DELETE is never retried.
-        let started = std::time::Instant::now();
-        match request.call() {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                if resp.status().is_redirection() {
-                    let location = resp.headers().get("location").and_then(|v| v.to_str().ok());
-                    self.debug_single_attempt(
-                        "DELETE",
-                        url,
-                        &status.to_string(),
-                        started.elapsed(),
-                    );
-                    return Err(redirect_error(status, location));
-                }
-                // Attempt line first (see read_response_body).
-                self.debug_single_attempt("DELETE", url, &status.to_string(), started.elapsed());
-                let body =
-                    self.read_response_body(resp.into_body().into_reader(), "DELETE", url)?;
-                self.debug_body("response", "DELETE", url, &body);
-                Ok(body)
-            }
-            Err(ureq::Error::StatusCode(code)) => {
-                let safe_url = sanitize_url_for_error(url);
-                self.debug_single_attempt("DELETE", url, &code.to_string(), started.elapsed());
-                match status_action(code, &safe_url) {
-                    // No retry for DELETE: a Retry action is returned
-                    // as the error, immediately.
-                    StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
-                }
-            }
-            Err(ureq::Error::Tls(msg)) => {
-                self.debug_single_attempt("DELETE", url, "TLS error", started.elapsed());
-                Err(GeectlError::new(
-                    ErrorKind::TlsError,
-                    format!("TLS error: {msg}"),
-                ))
-            }
-            Err(ureq::Error::Rustls(e)) => {
-                self.debug_single_attempt("DELETE", url, "TLS error", started.elapsed());
-                Err(GeectlError::new(
-                    ErrorKind::TlsError,
-                    format!("TLS error: {e}"),
-                ))
-            }
-            Err(ureq::Error::Pem(e)) => {
-                self.debug_single_attempt("DELETE", url, "TLS error", started.elapsed());
-                Err(GeectlError::new(
-                    ErrorKind::TlsError,
-                    format!("TLS error: {e}"),
-                ))
-            }
-            Err(ureq::Error::Timeout(_)) => {
-                self.debug_single_attempt("DELETE", url, "timeout", started.elapsed());
-                Err(GeectlError::new(
-                    ErrorKind::Timeout,
-                    format!("request to {} timed out", sanitize_url_for_error(url)),
-                ))
-            }
-            Err(ureq::Error::Io(e)) => {
-                self.debug_single_attempt("DELETE", url, "network error", started.elapsed());
-                Err(GeectlError::new(ErrorKind::NetworkError, e.to_string()))
-            }
-            Err(e) => {
-                self.debug_single_attempt("DELETE", url, "server error", started.elapsed());
-                Err(GeectlError::new(ErrorKind::ServerError, e.to_string()))
-            }
-        }
+        self.delete_inner(url, None, credentials)
+    }
+
+    fn delete_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // The JSON-body twin of delete: same single attempt, same
+        // explicit credentials — the cancel of a Gitea review
+        // request carries the reviewer list in the body.
+        self.delete_inner(url, Some(body), credentials)
     }
 }
 
@@ -3721,6 +3771,50 @@ mod tests {
         let client = UreqClient::new(Timeout::default()).unwrap();
         let url = format!("http://127.0.0.1:{port}/source/home:scarabeus_iv/foo");
         let err = client.delete(&url, &Credentials::None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        handle.join().expect("server thread");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn delete_json_with_sends_json_body_and_auth() {
+        let server = RequestCapture::serve("");
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = server.url_for("/repos/geectl/probe/pulls/1/requested_reviewers");
+        assert_eq!(
+            client
+                .delete_json_with(
+                    &url,
+                    "{\"reviewers\":[\"bob\"],\"team_reviewers\":[]}",
+                    &Credentials::Bearer {
+                        token: "tok3n".to_string()
+                    },
+                )
+                .unwrap(),
+            ""
+        );
+        let (method, content_type, auth, received_body) = server.captured();
+        assert_eq!(method, "DELETE");
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        // captured() carries the raw header, unlike
+        // server.authorization() which redacts the token.
+        assert_eq!(auth.as_deref(), Some("Bearer tok3n"));
+        assert_eq!(
+            received_body,
+            "{\"reviewers\":[\"bob\"],\"team_reviewers\":[]}"
+        );
+    }
+
+    #[test]
+    fn delete_json_with_is_never_retried() {
+        // The same single-attempt rule as delete: a 500 must come
+        // back as a ServerError after exactly ONE attempt.
+        let (port, count, handle) = serve_counting_500();
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/repos/geectl/probe/pulls/1/requested_reviewers");
+        let err = client
+            .delete_json_with(&url, "{}", &Credentials::None)
+            .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
         handle.join().expect("server thread");
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
