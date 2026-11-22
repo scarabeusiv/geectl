@@ -2043,3 +2043,215 @@ fn config_show_reports_instances_table() {
         "{stdout}"
     );
 }
+
+#[test]
+fn config_show_reports_build_defaults_when_unset() {
+    let dir = TempDir::new();
+    // Pin XDG_CACHE_HOME: the default dir is derived from it (else
+    // $HOME/.cache), and the ambient environment must not leak in.
+    let out = geectl_isolated(&dir)
+        .env("XDG_CACHE_HOME", &dir.0)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        value["build_cache_dir"],
+        dir.0.join("geectl").to_str().unwrap()
+    );
+    assert_eq!(value["build_cache_dir_source"], "default");
+    assert_eq!(value["build_cache_cap_gib"], 20);
+    assert_eq!(value["build_cache_cap_gib_source"], "default");
+    // And in text form, each line states the default that applies.
+    let out = geectl_isolated(&dir)
+        .env("XDG_CACHE_HOME", &dir.0)
+        .args(["--format", "text", "config", "show"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "build_cache_dir: {} (default)",
+            dir.0.join("geectl").to_str().unwrap()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("build_cache_cap_gib: 20 GiB (default)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn config_show_reports_build_values_from_config_file() {
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[build]\ncache_dir = \"/srv/geectl-cache\"\ncache_cap_gib = 40\n",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["build_cache_dir"], "/srv/geectl-cache");
+    assert_eq!(value["build_cache_dir_source"], "config");
+    assert_eq!(value["build_cache_cap_gib"], 40);
+    assert_eq!(value["build_cache_cap_gib_source"], "config");
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "config", "show"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("build_cache_dir: /srv/geectl-cache (config)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("build_cache_cap_gib: 40 GiB (config)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn config_show_reports_build_cache_dir_from_config_file_when_cap_unset() {
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[build]\ncache_dir = \"relative/geectl-cache\"\n",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    // A relative configured dir is reported absolutized, the way
+    // the build resolves it, not verbatim.
+    let expected = std::env::current_dir()
+        .unwrap()
+        .join("relative/geectl-cache");
+    assert_eq!(value["build_cache_dir"], expected.to_str().unwrap());
+    assert_eq!(value["build_cache_dir_source"], "config");
+    assert_eq!(value["build_cache_cap_gib"], 20);
+    assert_eq!(value["build_cache_cap_gib_source"], "default");
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "config", "show"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "build_cache_dir: {} (config)",
+            expected.to_str().unwrap()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("build_cache_cap_gib: 20 GiB (default)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn config_show_reports_build_cap_from_config_file_when_dir_unset() {
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[build]\ncache_cap_gib = 40\n",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .env("XDG_CACHE_HOME", &dir.0)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        value["build_cache_dir"],
+        dir.0.join("geectl").to_str().unwrap()
+    );
+    assert_eq!(value["build_cache_dir_source"], "default");
+    assert_eq!(value["build_cache_cap_gib"], 40);
+    assert_eq!(value["build_cache_cap_gib_source"], "config");
+    let out = geectl_isolated(&dir)
+        .env("XDG_CACHE_HOME", &dir.0)
+        .args(["--format", "text", "config", "show"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "build_cache_dir: {} (default)",
+            dir.0.join("geectl").to_str().unwrap()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("build_cache_cap_gib: 40 GiB (config)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn config_show_reports_error_source_when_default_cache_dir_unresolvable() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .env_remove("XDG_CACHE_HOME")
+        .env("HOME", "")
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    // The command still succeeds: one unresolvable tunable must
+    // not fail the whole diagnostic.
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(value["build_cache_dir"].is_null());
+    assert_eq!(value["build_cache_dir_source"], "error");
+    assert_eq!(value["build_cache_cap_gib"], 20);
+    assert_eq!(value["build_cache_cap_gib_source"], "default");
+    let out = geectl_isolated(&dir)
+        .env_remove("XDG_CACHE_HOME")
+        .env("HOME", "")
+        .args(["--format", "text", "config", "show"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("build_cache_dir: - (error)"), "{stdout}");
+}

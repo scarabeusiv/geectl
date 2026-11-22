@@ -53,7 +53,9 @@ pub const DEFAULT_GITEA_URL: &str = "https://src.opensuse.org";
 /// The effective (non-secret) configuration: endpoint URLs and
 /// the output-format default. A field is `None` when neither the
 /// config file nor the environment set it; [`effective_config`]
-/// fills in the built-in defaults.
+/// fills in the built-in defaults. The `[build]` table carries
+/// the local-build vertical's tunables; both are `None` when the
+/// table is absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pub obs_url: Option<String>,
@@ -74,6 +76,13 @@ pub struct Config {
     /// for the same URL are refused at load (see
     /// [`as_instances_table`]).
     pub instances: Vec<(String, String)>,
+    /// The local-build cache directory (`$XDG_CACHE_HOME/geectl/`
+    /// by default). A relative path resolves against the current
+    /// directory at use time; an empty value is refused.
+    pub build_cache_dir: Option<String>,
+    /// The local-build cache cap in GiB (20 by default). Zero is
+    /// refused: a zero cap would evict everything at every build.
+    pub build_cache_cap_gib: Option<u64>,
 }
 
 /// The effective endpoints and output format, plus where each
@@ -208,6 +217,8 @@ pub fn effective_config(config: &Config) -> Result<EffectiveConfig, GeectlError>
             gitea_url: Some(gitea_url),
             format: Some(format),
             instances: config.instances.clone(),
+            build_cache_dir: None,
+            build_cache_cap_gib: None,
         },
         obs_url_source,
         gitea_url_source,
@@ -408,7 +419,12 @@ pub fn parse_config(text: &str, path: &Path) -> Result<Config, GeectlError> {
     })?;
     check_no_credentials(&table, path)?;
     for key in table.keys() {
-        if key != "obs_url" && key != "gitea_url" && key != "format" && key != "instances" {
+        if key != "obs_url"
+            && key != "gitea_url"
+            && key != "format"
+            && key != "instances"
+            && key != "build"
+        {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
                 format!("{}: unknown config key '{key}'", path.display()),
@@ -427,6 +443,59 @@ pub fn parse_config(text: &str, path: &Path) -> Result<Config, GeectlError> {
     }
     if let Some(value) = table.get("instances") {
         config.instances = as_instances_table(value, path)?;
+    }
+    if let Some(value) = table.get("build") {
+        let build = value.as_table().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("{}: 'build' must be a table", path.display()),
+            )
+        })?;
+        for key in build.keys() {
+            if key != "cache_dir" && key != "cache_cap_gib" {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!("{}: unknown config key 'build.{key}'", path.display()),
+                ));
+            }
+        }
+        if let Some(value) = build.get("cache_dir") {
+            let text = value.as_str().ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!("{}: 'build.cache_dir' must be a string", path.display()),
+                )
+            })?;
+            let text = text.trim();
+            if text.is_empty() {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!("{}: 'build.cache_dir' must not be empty", path.display()),
+                ));
+            }
+            config.build_cache_dir = Some(text.to_string());
+        }
+        if let Some(value) = build.get("cache_cap_gib") {
+            let cap = value.as_integer().ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!(
+                        "{}: 'build.cache_cap_gib' must be a positive integer",
+                        path.display()
+                    ),
+                )
+            })?;
+            if cap <= 0 {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!(
+                        "{}: 'build.cache_cap_gib' must be a positive integer",
+                        path.display()
+                    ),
+                ));
+            }
+            config.build_cache_cap_gib = Some(cap as u64);
+        }
     }
     Ok(config)
 }
@@ -744,6 +813,13 @@ gitea_url = "https://src.opensuse.org"
 # The output format default: "json" (default) or "text". The
 # --format flag wins over it, and GEECTL_FORMAT wins over this key.
 # format = "json"
+#
+# Local builds (one podman vertical) keep their cache under
+# $XDG_CACHE_HOME/geectl/ by default, capped at 20 GiB. Uncomment
+# to override:
+# [build]
+# cache_dir = "/srv/geectl-cache"
+# cache_cap_gib = 20
 "#;
 
 /// Write the template to `path`, refusing if the file already exists
@@ -1199,6 +1275,49 @@ mod tests {
     }
 
     #[test]
+    fn build_table_parses() {
+        let config = parse_config(
+            "[build]\ncache_dir = \"/srv/geectl-cache\"\ncache_cap_gib = 40\n",
+            &config_path(),
+        )
+        .unwrap();
+        assert_eq!(config.build_cache_dir.as_deref(), Some("/srv/geectl-cache"));
+        assert_eq!(config.build_cache_cap_gib, Some(40));
+        // Absent table reads as defaults, like the endpoints.
+        let config = parse_config("", &config_path()).unwrap();
+        assert_eq!(config.build_cache_dir, None);
+        assert_eq!(config.build_cache_cap_gib, None);
+    }
+
+    #[test]
+    fn build_table_rejects_bad_values() {
+        // Unknown key inside [build].
+        let err = parse_config("[build]\nccache = true\n", &config_path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("build.ccache"));
+        // Not a table.
+        let err = parse_config("build = \"/srv\"\n", &config_path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("'build' must be a table"));
+        // Empty cache dir.
+        let err = parse_config("[build]\ncache_dir = \"  \"\n", &config_path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("build.cache_dir"));
+        // Non-string cache dir.
+        let err = parse_config("[build]\ncache_dir = 42\n", &config_path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        // Zero cap: a cap that evicts everything is not a cap.
+        let err = parse_config("[build]\ncache_cap_gib = 0\n", &config_path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("build.cache_cap_gib"));
+        // Negative and non-integer caps.
+        let err = parse_config("[build]\ncache_cap_gib = -1\n", &config_path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        let err = parse_config("[build]\ncache_cap_gib = \"20\"\n", &config_path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+    }
+
+    #[test]
     fn non_string_url_is_an_error() {
         let err = parse_config("obs_url = 42\n", &config_path()).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
@@ -1447,6 +1566,8 @@ mod tests {
             gitea_url: None,
             format: None,
             instances: vec![],
+            build_cache_dir: None,
+            build_cache_cap_gib: None,
         };
         let err = effective_config(&config).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
@@ -1457,6 +1578,8 @@ mod tests {
             gitea_url: None,
             format: None,
             instances: vec![],
+            build_cache_dir: None,
+            build_cache_cap_gib: None,
         };
         let effective = effective_config(&config).unwrap();
         assert_eq!(
@@ -1574,6 +1697,8 @@ mod tests {
             gitea_url: None,
             format: Some("text".to_string()),
             instances: vec![],
+            build_cache_dir: None,
+            build_cache_cap_gib: None,
         };
         let effective = effective_config(&config).unwrap();
         assert_eq!(effective.config.format.as_deref(), Some("text"));
@@ -1589,6 +1714,8 @@ mod tests {
             gitea_url: None,
             format: Some("yaml".to_string()),
             instances: vec![],
+            build_cache_dir: None,
+            build_cache_cap_gib: None,
         };
         let err = effective_config(&config).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);

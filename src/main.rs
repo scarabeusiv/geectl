@@ -303,7 +303,10 @@ fn debug_config_line() -> Option<String> {
 /// source of each value (environment / config / default), the
 /// effective output format with its source (flag / environment /
 /// config / default), the named-instance table, and the credential
-/// status for each provider. A
+/// status for each provider. The `[build]` tunables ride along too,
+/// with their source (config / default / error): the effective values
+/// a local build would use, or `null` with source `error` when the
+/// dir cannot be resolved. A
 /// status is never a secret: Basic auth shows the username only,
 /// Bearer shows "configured" only, and an SSH key shows its path.
 fn config_show_payload(
@@ -319,6 +322,36 @@ fn config_show_payload(
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
     let effective = config::effective_config(&file_config)?;
+    // The `[build]` tunables come from the file config, NOT from
+    // `effective_config`: it hardcodes both to `None`, and a local
+    // build reads the file config plus the defaults instead. The
+    // payload carries the effective value either way, so `config
+    // show` reports what a build would actually use. A dir that
+    // cannot be resolved, or is not valid UTF-8, reports `null`
+    // with source `error` instead of failing the whole command.
+    // A configured relative dir is absolutized the same way the
+    // build absolutizes it.
+    let (build_cache_dir, build_cache_dir_source) = match &file_config.build_cache_dir {
+        Some(dir) => {
+            let absolute =
+                std::path::absolute(dir).unwrap_or_else(|_| std::path::PathBuf::from(dir));
+            match absolute.to_str() {
+                Some(dir) => (json!(dir), "config"),
+                None => (json!(null), "error"),
+            }
+        }
+        None => match geectl::local_build::default_cache_dir() {
+            Ok(dir) => match dir.to_str() {
+                Some(dir) => (json!(dir), "default"),
+                None => (json!(null), "error"),
+            },
+            Err(_) => (json!(null), "error"),
+        },
+    };
+    let (build_cache_cap_gib, build_cache_cap_gib_source) = match file_config.build_cache_cap_gib {
+        Some(cap) => (cap, "config"),
+        None => (geectl::local_build::DEFAULT_CACHE_CAP_GIB, "default"),
+    };
     let obs_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
     // The effective Gitea URL is the configured default for the
     // single configured URL, so `gitea_auth` reports the
@@ -345,6 +378,10 @@ fn config_show_payload(
         "gitea_url_source": effective.gitea_url_source,
         "format": format.as_str(),
         "format_source": format_source,
+        "build_cache_dir": build_cache_dir,
+        "build_cache_dir_source": build_cache_dir_source,
+        "build_cache_cap_gib": build_cache_cap_gib,
+        "build_cache_cap_gib_source": build_cache_cap_gib_source,
         "instances": instances_json,
         "obs_auth": obs_auth_status(obs_url, &effective.config.instances),
         "gitea_auth": gitea_auth,
@@ -424,6 +461,16 @@ fn render_config_show_text(payload: &serde_json::Value) -> String {
             "format: {} ({})",
             payload["format"].as_str().unwrap_or(""),
             payload["format_source"].as_str().unwrap_or("")
+        ),
+        format!(
+            "build_cache_dir: {} ({})",
+            payload["build_cache_dir"].as_str().unwrap_or("-"),
+            payload["build_cache_dir_source"].as_str().unwrap_or("")
+        ),
+        format!(
+            "build_cache_cap_gib: {} GiB ({})",
+            payload["build_cache_cap_gib"].as_u64().unwrap_or(0),
+            payload["build_cache_cap_gib_source"].as_str().unwrap_or("")
         ),
         format!(
             "instances: {}",

@@ -42,6 +42,28 @@ pub enum ErrorKind {
     ConfigError,
     /// An internal error (a bug). The last resort, never the default.
     InternalError,
+    /// A local build failed (non-zero engine exit).
+    BuildFailed,
+    /// A local build exceeded its bounded timeout.
+    BuildTimeout,
+    /// A build of the same package is already running.
+    BuildInProgress,
+    /// The build pulls dependencies from a foreign `home:` project.
+    UntrustedProject,
+    /// The package is multibuild and no flavor was given.
+    MultibuildFlavorRequired,
+    /// The requested architecture is not the host architecture.
+    UnsupportedArch,
+    /// The `build` engine binary is not installed.
+    NoBuildEngine,
+    /// The build image could not be pulled or resolved.
+    ImageUnavailable,
+    /// A cached package failed its hdrmd5 check after re-download.
+    CacheCorrupt,
+    /// A destructive operation was refused: the build root is in use.
+    BuildRootInUse,
+    /// The directory is not a geectl build root (no marker file).
+    NotAGeectlBuildRoot,
 }
 
 impl ErrorKind {
@@ -58,6 +80,17 @@ impl ErrorKind {
             ErrorKind::TlsError => "tls_error",
             ErrorKind::ConfigError => "config_error",
             ErrorKind::InternalError => "internal_error",
+            ErrorKind::BuildFailed => "build_failed",
+            ErrorKind::BuildTimeout => "build_timeout",
+            ErrorKind::BuildInProgress => "build_in_progress",
+            ErrorKind::UntrustedProject => "untrusted_project",
+            ErrorKind::MultibuildFlavorRequired => "multibuild_flavor_required",
+            ErrorKind::UnsupportedArch => "unsupported_arch",
+            ErrorKind::NoBuildEngine => "no_build_engine",
+            ErrorKind::ImageUnavailable => "image_unavailable",
+            ErrorKind::CacheCorrupt => "cache_corrupt",
+            ErrorKind::BuildRootInUse => "build_root_in_use",
+            ErrorKind::NotAGeectlBuildRoot => "not_a_geectl_build_root",
         }
     }
 
@@ -74,6 +107,19 @@ impl ErrorKind {
             ErrorKind::TlsError => "TLS verification failed",
             ErrorKind::ConfigError => "the configuration is invalid",
             ErrorKind::InternalError => "an internal error occurred",
+            ErrorKind::BuildFailed => "the local build failed",
+            ErrorKind::BuildTimeout => "the local build timed out",
+            ErrorKind::BuildInProgress => "a build of this package is already running",
+            ErrorKind::UntrustedProject => "the build pulls dependencies from an untrusted project",
+            ErrorKind::MultibuildFlavorRequired => {
+                "the package is multibuild and no flavor was given"
+            }
+            ErrorKind::UnsupportedArch => "the requested architecture is not the host architecture",
+            ErrorKind::NoBuildEngine => "the build engine is not installed",
+            ErrorKind::ImageUnavailable => "the build image could not be pulled or resolved",
+            ErrorKind::CacheCorrupt => "a cached package failed its hdrmd5 check",
+            ErrorKind::BuildRootInUse => "the build root is in use",
+            ErrorKind::NotAGeectlBuildRoot => "the directory is not a geectl build root",
         }
     }
 
@@ -98,6 +144,39 @@ impl ErrorKind {
                 "check the configuration (flag, environment variable, or config file) and retry"
             }
             ErrorKind::InternalError => "this is a bug; report it with the error code",
+            ErrorKind::BuildFailed => {
+                "read the build log at the recorded path; fix the failure and retry, passing --clean after a failure"
+            }
+            ErrorKind::BuildTimeout => {
+                "raise the timeout for big packages; the partial log is preserved at the recorded path"
+            }
+            ErrorKind::BuildInProgress => {
+                "wait for the running build to finish, then retry"
+            }
+            ErrorKind::UntrustedProject => {
+                "only the caller's own home: project and non-home: projects are trusted; a foreign home: project needs the user's decision"
+            }
+            ErrorKind::MultibuildFlavorRequired => {
+                "pass one flavor; one invocation builds one flavor"
+            }
+            ErrorKind::UnsupportedArch => {
+                "build locally only for the host architecture; other architectures go to the server"
+            }
+            ErrorKind::NoBuildEngine => {
+                "install the openSUSE build package (zypper install build) or put the build script on PATH"
+            }
+            ErrorKind::ImageUnavailable => {
+                "check the network and the image name, then retry"
+            }
+            ErrorKind::CacheCorrupt => {
+                "the file is re-downloaded once, then refused; delete the cache file and retry"
+            }
+            ErrorKind::BuildRootInUse => {
+                "wait for the running build, then retry the destructive operation"
+            }
+            ErrorKind::NotAGeectlBuildRoot => {
+                "pass a directory created by a geectl build (it carries the marker file)"
+            }
         }
     }
 
@@ -115,6 +194,17 @@ impl ErrorKind {
             ErrorKind::TlsError => 8,
             ErrorKind::ConfigError => 9,
             ErrorKind::AlreadyExists => 10,
+            ErrorKind::BuildFailed => 11,
+            ErrorKind::BuildTimeout => 12,
+            ErrorKind::BuildInProgress => 13,
+            ErrorKind::UntrustedProject => 14,
+            ErrorKind::MultibuildFlavorRequired => 15,
+            ErrorKind::UnsupportedArch => 16,
+            ErrorKind::NoBuildEngine => 17,
+            ErrorKind::ImageUnavailable => 18,
+            ErrorKind::CacheCorrupt => 19,
+            ErrorKind::BuildRootInUse => 20,
+            ErrorKind::NotAGeectlBuildRoot => 21,
         }
     }
 
@@ -131,6 +221,17 @@ impl ErrorKind {
             ErrorKind::TlsError,
             ErrorKind::ConfigError,
             ErrorKind::InternalError,
+            ErrorKind::BuildFailed,
+            ErrorKind::BuildTimeout,
+            ErrorKind::BuildInProgress,
+            ErrorKind::UntrustedProject,
+            ErrorKind::MultibuildFlavorRequired,
+            ErrorKind::UnsupportedArch,
+            ErrorKind::NoBuildEngine,
+            ErrorKind::ImageUnavailable,
+            ErrorKind::CacheCorrupt,
+            ErrorKind::BuildRootInUse,
+            ErrorKind::NotAGeectlBuildRoot,
         ]
     }
 }
