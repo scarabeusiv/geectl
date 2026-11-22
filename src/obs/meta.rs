@@ -410,8 +410,25 @@ impl<'a> ObsClient<'a> {
         }
         let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
         let body = self.http.get_with(&url, &self.credentials)?;
-        let current = parse_package_meta(&body)?;
-        let mut doc = XmlDoc::parse(&body)?;
+        self.write_package_meta(project, package, &body, meta)
+    }
+
+    /// Edit a fetched package meta document in place and PUT it back
+    /// when anything changed: the shared core of
+    /// `set_package_meta` and `update_package_meta_from_spec`.
+    fn write_package_meta(
+        &self,
+        project: &str,
+        package: &str,
+        body: &str,
+        meta: &PackageMeta,
+    ) -> Result<(), GeectlError> {
+        let current = parse_package_meta(body)?;
+        let mut doc = XmlDoc::parse(body)?;
+        // The document as fetched, for the no-change check below:
+        // comparing parsed documents (not rendered text) means a
+        // prolog in the fetched meta, or a reorder from an edit that
+        // changes nothing, does not read as a change.
         let before = doc.clone();
         if current.title != meta.title {
             set_text_element(&mut doc, "title", &meta.title)?;
@@ -448,14 +465,112 @@ impl<'a> ObsClient<'a> {
         if current.persons != meta.persons || current.groups != meta.groups {
             set_roles(&mut doc, &meta.persons, &meta.groups)?;
         }
+        // No change, no PUT: writing the meta that is already there
+        // writes nothing. The comparison is on the parsed documents,
+        // so a prolog in the fetched meta does not read as a change.
         if doc == before {
             return Ok(());
         }
+        let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
         self.put_meta_doc(
             &url,
             &doc.render(),
             &format!("package meta for package {project}/{package}"),
         )
+    }
+
+    /// Update the package meta of `package` in `project` from its
+    /// spec file (`updatepacmetafromspec`): the spec's `Summary`
+    /// becomes the title, its `Url` the URL, and its `%description`
+    /// section the description — like osc. The spec file is found by
+    /// listing the package files when exactly one `*.spec` exists;
+    /// otherwise the caller names it with `spec`. The listing and
+    /// the spec read go through the authenticated source endpoints,
+    /// so restricted projects and the `_project` pseudo-package
+    /// work: the public source routes cannot address them. The other meta
+    /// fields (release name, devel, persons, groups, scmsync) are
+    /// kept as they are, and nothing is PUT when nothing changed.
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. In dry-run the update is recorded in the
+    /// plan and nothing is written — the guard runs before the
+    /// credentials check, like `create_package`.
+    ///
+    /// An agent updates package meta from the spec after editing the
+    /// spec, so the meta shown on the server matches the package
+    /// without hand-editing XML.
+    pub fn update_package_meta_from_spec(
+        &self,
+        project: &str,
+        package: &str,
+        spec: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if let Some(spec) = spec {
+            if !valid_obs_filename(spec) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS file name: {spec:?}"),
+                ));
+            }
+        }
+        if !dry_run.allow(&format!(
+            "update package meta of {project}/{package} from spec"
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot update package meta from spec without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let spec = match spec {
+            Some(spec) => spec.to_string(),
+            None => self.discover_spec_file(project, package)?,
+        };
+        let text = self.authed_cat(project, package, &spec)?;
+        let parsed = parse_spec_meta(&text);
+        let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        let mut meta = parse_package_meta(&body)?;
+        meta.title = parsed.title;
+        meta.url = parsed.url;
+        meta.description = parsed.description;
+        self.write_package_meta(project, package, &body, &meta)
+    }
+
+    /// The single `*.spec` file of a package: the spec file is found
+    /// by listing the package files when exactly one exists.
+    fn discover_spec_file(&self, project: &str, package: &str) -> Result<String, GeectlError> {
+        let specs: Vec<String> = self
+            .authed_directory_listing(project, package)?
+            .entries
+            .into_iter()
+            .map(|file| file.name)
+            .filter(|name| name.ends_with(".spec"))
+            .collect();
+        match specs.len() {
+            1 => Ok(specs.into_iter().next().unwrap()),
+            0 => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("no spec file in {project}/{package}; name one"),
+            )),
+            _ => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "multiple spec files in {project}/{package}: {}; name one",
+                    specs.join(", ")
+                ),
+            )),
+        }
     }
 
     /// PUT a rendered meta document back to the server, and fail
@@ -786,5 +901,185 @@ mod tests {
             .set_package_meta("home:scarabeus_iv", "foo", &meta, &DryRun::new(false))
             .is_ok());
         assert!(http.put_calls().is_empty());
+    }
+
+    const SPEC: &str = "Name:           foo\nVersion:        1.0\nSummary:        A foo package\nLicense:        MIT\nUrl:            https://example.com/foo\n\n%description\nFoo does foo things.\n\nIt does them well.\n\n%package -n foo-devel\nSummary:        Development files for foo\n\n%description -n foo-devel\nDevelopment headers.\n\n%prep\n%autosetup\n";
+
+    const DIRECTORY_ONE_SPEC: &str = "<directory name=\"foo\"><entry name=\"foo.spec\" md5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" size=\"1234\" mtime=\"1700000000\"/><entry name=\"foo.changes\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"567\" mtime=\"1700000001\"/></directory>";
+
+    fn update_client(http: &FakeHttp) -> ObsClient<'_> {
+        ObsClient::with_credentials(http, basic_credentials()).unwrap()
+    }
+
+    fn update_stubs(http: FakeHttp, spec: &str) -> FakeHttp {
+        http.with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/foo",
+            DIRECTORY_ONE_SPEC,
+        )
+        .with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/foo/foo.spec",
+            spec,
+        )
+        .with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+            PACKAGE_META,
+        )
+        .with_put(
+            "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+            "<status code=\"ok\" />",
+        )
+    }
+
+    #[test]
+    fn parse_spec_meta_reads_the_first_summary_url_and_bare_description() {
+        let parsed = parse_spec_meta(SPEC);
+        assert_eq!(parsed.title.as_deref(), Some("A foo package"));
+        assert_eq!(parsed.url.as_deref(), Some("https://example.com/foo"));
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Foo does foo things.\n\nIt does them well.")
+        );
+    }
+
+    #[test]
+    fn parse_spec_meta_absent_or_empty_values_clear_the_field() {
+        let parsed = parse_spec_meta("Name: foo\nVersion: 1.0\n");
+        assert_eq!(parsed.title, None);
+        assert_eq!(parsed.url, None);
+        assert_eq!(parsed.description, None);
+        let parsed = parse_spec_meta("Summary:\nUrl:  \n%description\n");
+        assert_eq!(parsed.title, None);
+        assert_eq!(parsed.url, None);
+        assert_eq!(parsed.description, None);
+    }
+
+    #[test]
+    fn parse_spec_meta_tags_are_case_insensitive_and_allow_space_before_the_colon() {
+        let parsed = parse_spec_meta("summary:   lower case\nURL : https://example.com/x\n");
+        assert_eq!(parsed.title.as_deref(), Some("lower case"));
+        assert_eq!(parsed.url.as_deref(), Some("https://example.com/x"));
+    }
+
+    #[test]
+    fn parse_spec_meta_a_named_description_section_does_not_start_the_section() {
+        let parsed =
+            parse_spec_meta("%description -n foo\nNamed only.\n%description\nBare one.\n%prep\n");
+        assert_eq!(parsed.description.as_deref(), Some("Bare one."));
+    }
+
+    #[test]
+    fn update_package_meta_from_spec_discovers_the_spec_and_puts_the_spec_fields() {
+        let http = update_stubs(FakeHttp::new(), SPEC);
+        let client = update_client(&http);
+        assert!(client
+            .update_package_meta_from_spec("home:scarabeus_iv", "foo", None, &DryRun::new(false))
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        let rendered = &puts[0].1;
+        assert!(rendered.contains("<title>A foo package</title>"));
+        assert!(rendered.contains("<url>https://example.com/foo</url>"));
+        assert!(rendered
+            .contains("<description>Foo does foo things.\n\nIt does them well.</description>"));
+        assert!(rendered.contains("<releasename>foo</releasename>"));
+        assert!(rendered.contains("<devel project=\"devel:languages:python\"/>"));
+        assert!(rendered.contains("<person userid=\"alice\" role=\"maintainer\"/>"));
+        assert!(rendered.contains("<lock><enable/></lock>"));
+        assert!(rendered.contains("<scmsync>https://github.com/openSUSE/foo.git</scmsync>"));
+    }
+
+    #[test]
+    fn update_package_meta_from_spec_with_a_named_spec_skips_the_listing() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/other.spec",
+                SPEC,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                PACKAGE_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = update_client(&http);
+        assert!(client
+            .update_package_meta_from_spec(
+                "home:scarabeus_iv",
+                "foo",
+                Some("other.spec"),
+                &DryRun::new(false)
+            )
+            .is_ok());
+        assert_eq!(http.put_calls().len(), 1);
+        assert_eq!(http.get_calls().len(), 2);
+    }
+
+    #[test]
+    fn update_package_meta_from_spec_unchanged_writes_nothing() {
+        let spec =
+            "Summary: Old title\nUrl: https://example.com/old\n%description\nOld description\n";
+        let http = update_stubs(FakeHttp::new(), spec);
+        let client = update_client(&http);
+        assert!(client
+            .update_package_meta_from_spec("home:scarabeus_iv", "foo", None, &DryRun::new(false))
+            .is_ok());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn update_package_meta_from_spec_refuses_zero_or_many_specs() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/foo",
+            "<directory name=\"foo\"><entry name=\"foo.changes\"/></directory>",
+        );
+        let client = update_client(&http);
+        let err = client
+            .update_package_meta_from_spec("home:scarabeus_iv", "foo", None, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/foo",
+            "<directory name=\"foo\"><entry name=\"foo.spec\"/><entry name=\"bar.spec\"/></directory>",
+        );
+        let client = update_client(&http);
+        let err = client
+            .update_package_meta_from_spec("home:scarabeus_iv", "foo", None, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn update_package_meta_from_spec_dry_run_records_the_update_and_sends_nothing() {
+        let http = FakeHttp::new();
+        let client = update_client(&http);
+        let dry = DryRun::new(true);
+        assert!(client
+            .update_package_meta_from_spec("home:scarabeus_iv", "foo", None, &dry)
+            .is_ok());
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec![
+                "[dry-run] would: update package meta of home:scarabeus_iv/foo from spec"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn update_package_meta_from_spec_requires_credentials() {
+        let http = FakeHttp::new();
+        use crate::auth::Credentials;
+        let client = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let err = client
+            .update_package_meta_from_spec("home:scarabeus_iv", "foo", None, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
     }
 }
