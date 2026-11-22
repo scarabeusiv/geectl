@@ -47,7 +47,7 @@ use geectl::obs::{
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The `build` subcommands: one per build-status library operation.
@@ -502,10 +502,7 @@ pub fn run_build(debug: &Debug, command: BuildCommand) -> Result<(Value, String)
                 "path": output.to_string_lossy(),
                 "size_bytes": size,
             });
-            let text = format!(
-                "downloaded {filename} ({size} bytes) to {}",
-                output.display()
-            );
+            let text = download_text(&filename, size, &output);
             Ok((payload, with_header(&header, text)))
         }
         BuildCommand::Fileinfo {
@@ -704,6 +701,16 @@ fn coordinates_header(command: &BuildCommand) -> String {
 /// Prepend the coordinate header line to a renderer's text.
 fn with_header(header: &str, text: String) -> String {
     format!("{header}\n{text}")
+}
+
+/// The `download-binary` confirmation line: the file, its size, and
+/// where the bytes were written. The bytes themselves never ride the
+/// text rendering.
+fn download_text(filename: &str, size: usize, output: &Path) -> String {
+    format!(
+        "downloaded {filename} ({size} bytes) to {}",
+        output.display()
+    )
 }
 
 /// Write downloaded bytes to the `--output` path. A write failure is
@@ -1618,6 +1625,179 @@ mod tests {
             assert!(text.contains(package), "text misses {package}");
             assert!(text.contains(code), "text misses {code}");
         }
+    }
+
+    /// The design doc's worked example for `build results`, pinned
+    /// literally: the `project:` header, the `REPOSITORY ARCH
+    /// PACKAGE CODE` table, and the alphabetical summary line
+    /// (`1 failed, 3 succeeded`).
+    #[test]
+    fn results_text_matches_the_design_example() {
+        let results = BuildResults {
+            state: None,
+            results: vec![BuildResult {
+                project: "openSUSE:Factory".to_string(),
+                repository: "standard".to_string(),
+                arch: "x86_64".to_string(),
+                code: "published".to_string(),
+                state: "published".to_string(),
+                dirty: false,
+                details: None,
+                statuses: vec![
+                    PackageBuildStatus {
+                        package: "foo".to_string(),
+                        code: "succeeded".to_string(),
+                        details: None,
+                    },
+                    PackageBuildStatus {
+                        package: "bar".to_string(),
+                        code: "succeeded".to_string(),
+                        details: None,
+                    },
+                    PackageBuildStatus {
+                        package: "baz".to_string(),
+                        code: "succeeded".to_string(),
+                        details: None,
+                    },
+                    PackageBuildStatus {
+                        package: "qux".to_string(),
+                        code: "failed".to_string(),
+                        details: None,
+                    },
+                ],
+            }],
+        };
+        let text = with_header("project: openSUSE:Factory", render_results_text(&results));
+        assert_eq!(
+            text,
+            "project: openSUSE:Factory\nREPOSITORY  ARCH    PACKAGE  CODE\nstandard    x86_64  foo      succeeded\nstandard    x86_64  bar      succeeded\nstandard    x86_64  baz      succeeded\nstandard    x86_64  qux      failed\n1 failed, 3 succeeded"
+        );
+    }
+
+    #[test]
+    fn download_text_names_file_size_and_path() {
+        assert_eq!(
+            download_text("foo-1.0-1.x86_64.rpm", 1234, &PathBuf::from("/tmp/foo.rpm")),
+            "downloaded foo-1.0-1.x86_64.rpm (1234 bytes) to /tmp/foo.rpm"
+        );
+    }
+
+    /// The agreement test for the single-object renderers: every id,
+    /// name, and revision the JSON payload carries appears in the
+    /// text rendering.
+    #[test]
+    fn single_object_texts_carry_every_field() {
+        let job = Some(JobStatus {
+            code: "building".to_string(),
+            result: Some("succeeded".to_string()),
+            details: Some("compiling foo".to_string()),
+            starttime: Some(1_700_000_000),
+            endtime: Some(1_700_000_120),
+            lastduration: Some(42),
+            workerid: Some("worker:1".to_string()),
+            hostarch: Some("aarch64".to_string()),
+            uri: Some("https://api.example/build/jobs/1".to_string()),
+            arch: Some("x86_64".to_string()),
+            job: Some("job-1".to_string()),
+            jobid: Some("jobid-1".to_string()),
+            attempt: Some(1),
+        });
+        let text = render_job_status_text(&job);
+        // The expected lines come from the payload itself, not from
+        // literals repeated from the rendering code, so a payload
+        // field the text drops fails here. Host arch and arch differ,
+        // so a label swap fails too.
+        let job_payload = job_status_payload("p", "k", "r", "a", &job)["job"].clone();
+        for field in [
+            "code", "result", "details", "workerid", "hostarch", "uri", "arch", "job", "jobid",
+        ] {
+            let value = job_payload[field].as_str().expect("field is a string");
+            assert!(
+                text.contains(&format!("{field}: {value}")),
+                "job status text misses {field}: {value}:\n{text}"
+            );
+        }
+        for field in ["starttime", "endtime", "lastduration", "attempt"] {
+            let value = job_payload[field].as_u64().expect("field is a number");
+            assert!(
+                text.contains(&format!("{field}: {value}")),
+                "job status text misses {field}: {value}:\n{text}"
+            );
+        }
+
+        let info = BuildInfo {
+            error: Some("unresolvable: DOES-NOT-EXIST".to_string()),
+            bdeps: vec![
+                BuildDep {
+                    name: "gcc".to_string(),
+                    project: None,
+                    repository: None,
+                    package: None,
+                    binary: None,
+                    version: None,
+                    release: None,
+                    arch: None,
+                    epoch: None,
+                    hdrmd5: None,
+                    preinstall: false,
+                    vminstall: false,
+                    runscripts: false,
+                    noinstall: false,
+                    repoarch: None,
+                    installonly: false,
+                    sysroot: false,
+                },
+                BuildDep {
+                    name: "make".to_string(),
+                    project: None,
+                    repository: None,
+                    package: None,
+                    binary: None,
+                    version: None,
+                    release: None,
+                    arch: None,
+                    epoch: None,
+                    hdrmd5: None,
+                    preinstall: false,
+                    vminstall: false,
+                    runscripts: false,
+                    noinstall: false,
+                    repoarch: None,
+                    installonly: false,
+                    sysroot: false,
+                },
+            ],
+            preinstall_image: None,
+        };
+        let text = render_buildinfo_text(&info);
+        let info_payload = buildinfo_payload("p", "k", "r", "a", &info);
+        assert!(
+            text.contains(&format!(
+                "error: {}",
+                info_payload["error"].as_str().expect("error is a string")
+            )),
+            "buildinfo text misses the error:\n{text}"
+        );
+        for dep in info_payload["bdeps"].as_array().expect("bdeps is an array") {
+            let dep = dep.as_str().expect("dep is a string");
+            assert!(
+                text.contains(dep),
+                "buildinfo text misses dep {dep}:\n{text}"
+            );
+        }
+
+        let entries = vec![BuildHistoryEntry {
+            rev: "1".to_string(),
+            srcmd5: "deadbeef".to_string(),
+            versrel: "1.0-1".to_string(),
+            bcnt: 2,
+            time: 1_700_000_000,
+            duration: Some(120),
+        }];
+        assert_eq!(
+            render_build_history_text(&entries),
+            "REV  SRCMD5    VERSREL  BCNT  TIME        DURATION\n1    deadbeef  1.0-1    2     1700000000  120"
+        );
     }
 
     #[test]
