@@ -12,10 +12,10 @@
 //! The command surface follows osc's read commands where they exist
 //! (`cat`, `ls`, `log`, `meta`, `search`, `maintainer`, `whois`,
 //! `develproject`), with the deliberate deviations listed in the CLI
-//! swaps table (see `docs/cli-swaps.md` in the integrated PR): one
+//! swaps table (see `docs/cli-swaps.md`): one
 //! command per library operation instead of osc's overloaded commands,
 //! explicit project/package arguments everywhere (no working-copy
-//! context) — except `devel-project`, which is Factory-only by design
+//! context) — except `devel-project`, which is Factory-only
 //! and takes only the package — and one flag name per concept.
 //!
 //! Two diffs differ from osc by mechanism, not just by name. osc
@@ -26,7 +26,7 @@
 //! And osc `rdiff`'s two-package form has no counterpart here at all:
 //! the library has no public two-package diff op (see issue #74).
 //!
-//! Coordinate header (design rule 1, decided 2026-11-21, Tom):
+//! Coordinate header (design rule 1):
 //! every text rendering opens with one header line echoing the query
 //! coordinates — the required positionals, in the order project,
 //! package (`project: p package: k`), or the command's own coordinate
@@ -47,7 +47,7 @@
 //! them, and the text opens with the coordinate header, then
 //! `dry_run:`, then the result line and the plan.
 //!
-//! Documented omissions (decided, not gaps): `list-files` text
+//! Documented omissions (not gaps): `list-files` text
 //! carries no md5 (a verification value, not an identifier);
 //! `package-log` text carries no comment or srcmd5 (long free text
 //! and a verification value); search tables carry no description

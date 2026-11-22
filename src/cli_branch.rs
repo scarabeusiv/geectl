@@ -8,10 +8,10 @@
 //!
 //! All ten commands take explicit `--project`/`--package` (etc.)
 //! flags, always required: no positionals, no working-copy defaults
-//! (geectl has no working copy in v1). Mutations are dry-run by
+//! (geectl has no working copy). Mutations are dry-run by
 //! default; the global `--live` flag performs them.
 //!
-//! Text rendering (Tom, 2026-11-21): every command's text starts
+//! Text rendering: every command's text starts
 //! with one header line echoing its query coordinates
 //! (`<command> <project>/<package> [-> <target>]`), so the text
 //! always says what was asked. Tables stay narrow as designed
@@ -566,7 +566,7 @@ fn branch_package(
                 "target_project": args.target_project,
                 "target_package": args.target_package,
             });
-            // Text omission (decided): the target when the flags
+            // Text omission: the target when the flags
             // did not name it — null in the payload, the server
             // resolves it only when live. The header echoes only
             // the requested coordinates.
@@ -656,7 +656,7 @@ fn copy_package(
             &dry_run,
         )? {
             // Dry-run: the guard returned None and recorded the plan.
-            // Text omission (decided): the revision is null in the
+            // Text omission: the revision is null in the
             // payload — no line; the copy hasn't happened.
             None => {
                 let plan = dry_run.plan();
@@ -691,7 +691,7 @@ fn copy_package(
             payload["target_api_url"] = json!(api_url);
             payload["revision"] = json!(result.revision);
             let mut lines = lines;
-            // Text omission (decided): dry text never reports
+            // Text omission: dry text never reports
             // counts — the op returns 0/0 in dry-run and the
             // handler omits them; live with all files identical
             // reports no revision line (revision null).
@@ -776,7 +776,7 @@ fn set_devel_project(
         "devel_project": args.devel_project,
         "devel_package": args.devel_package,
     });
-    // Text omission (decided): a removal (no devel flags) has no
+    // Text omission: a removal (no devel flags) has no
     // devel line — the bare header IS the removal; the payload's
     // nulls are not echoed.
     let lines = vec![header(
@@ -884,7 +884,7 @@ fn set_link_rev(
         "package": args.package,
         "revision": set,
     });
-    // Text omission (decided): dry text does not echo the requested
+    // Text omission: dry text does not echo the requested
     // revision (the payload's revision is null); live-unset likewise
     // has no revision line — the link follows its target again.
     let mut lines = vec![header(
@@ -922,7 +922,7 @@ fn set_link_rev_project(
                 .collect::<Vec<_>>(),
             "dry_run": false,
         });
-        // Text omission (decided): the requested `--revision` value
+        // Text omission: the requested `--revision` value
         // is not repeated in the live text — the table shows the
         // resulting per-package revisions; the table stays narrow
         // (PACKAGE REVISION) and is not widened to echo the payload.
@@ -1005,7 +1005,7 @@ fn detach_branch(
         "package": args.package,
         "revision": detached,
     });
-    // Text omission (decided): a null revision (dry, or a live
+    // Text omission: a null revision (dry, or a live
     // detach that dropped the link) has no line.
     let mut lines = vec![header(
         "detach-branch",

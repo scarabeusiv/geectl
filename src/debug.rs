@@ -130,8 +130,8 @@ const DEBUG_TARGET: &str = module_path!();
 /// The bespoke `log` backend: writes each record's plain message to
 /// stderr, one line, ignoring write failures. No timestamps, no
 /// levels beyond the single channel; the only filter is the target
-/// ([`DEBUG_TARGET`]): the sink already decided what belongs in the
-/// channel, and the target check keeps other crates' records out.
+/// ([`DEBUG_TARGET`]): the sink takes pre-formed lines, and the
+/// target check keeps other crates' records out.
 struct StderrLogger;
 
 impl log::Log for StderrLogger {

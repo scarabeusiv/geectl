@@ -1,13 +1,13 @@
 //! `maintenance` — the maintenance command group: the maintained-instances
 //! listing and maintenance branching, thin over `ObsClient`.
 //!
-//! The group is the CLI surface for `src/obs/maintenance.rs` (batch 6).
+//! The group is the CLI surface for `src/obs/maintenance.rs`.
 //! Every leaf returns `(payload, text)` — the JSON payload and a human
 //! rendering of the same data — per the #51/#52 design: text stays
 //! opt-in via `--format text`, stdout carries only the result payload,
 //! and nothing here touches raw XML (typed values only).
 //!
-//! Coordinate header (design rule 1, decided 2026-11-21, Tom):
+//! Coordinate header (design rule 1):
 //! every text rendering opens with one header line echoing the query
 //! coordinates (`package: <package>`). The live branch result already
 //! opens with `package:`; the instances table gains it above the

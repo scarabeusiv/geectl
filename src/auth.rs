@@ -1580,7 +1580,7 @@ mod tests {
     fn basic_empty_password_is_rejected() {
         // An empty password is never a real credential: fail fast here
         // instead of sending "user:" and getting a 401 at the first
-        // request. (validate_basic previously accepted it.)
+        // request.
         assert!(validate_basic("user", "").is_err());
         assert!(validate_basic("user", "\n").is_err());
         assert!(validate_basic("user", "   ").is_err());

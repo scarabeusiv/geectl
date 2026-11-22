@@ -47,13 +47,13 @@
 //! rule 5). Tables stay narrow by design — the search table shows
 //! id, state, creator and actions only, and the actions column is a
 //! compact summary (`submit foo`): target names and `source_rev` are
-//! omitted there, by decision, and stay in the JSON payload and in
+//! omitted there, and stay in the JSON payload and in
 //! `request show <id>`. In `show`, the accepted revision renders but
 //! the acceptinfo hashes and origin project/package do not — they stay
 //! in the JSON payload. `--with-history` enriches the JSON payload
 //! only; the table never renders history. Action texts are one-line
 //! summaries naming the id and the outcome; the full result is the
-//! JSON payload. These omissions are decided, not gaps: do not
+//! JSON payload. These omissions are not gaps: do not
 //! expand the tables to echo the full payload.
 
 use clap::{Args, Subcommand};
@@ -1504,7 +1504,7 @@ fn target_text(project: Option<&str>, package: Option<&str>) -> String {
 
 /// The compact action summary for the `search` table: type plus the
 /// package it acts on. Deliberately narrow: target names and
-/// `source_rev` are omitted here, by decision (see the module docs),
+/// `source_rev` are omitted here (see the module docs),
 /// and stay in the JSON payload and in `request show`. A party-less
 /// `add_role` / `set_bugowner` (degenerate server data) renders
 /// `(unknown party)`, never a bare sentinel.
@@ -2038,9 +2038,8 @@ mod tests {
 
     #[test]
     fn clap_refuses_the_old_per_command_live_flag() {
-        // The leaf no longer defines `--live` (it is a global on the
-        // top-level `Cli` now); the move itself is proven by the
-        // integration tests against the real binary.
+        // The leaf defines no `--live` (it is a global on the
+        // top-level `Cli`).
         let err = TestCli::try_parse_from(["geectl", "accept", "42", "--live"])
             .expect_err("per-command --live must not parse");
         assert!(err.to_string().contains("unexpected argument"));
@@ -2217,7 +2216,7 @@ mod tests {
         let request = fixture_request();
         let text = render_request_text(&request);
         assert!(text.contains("accepted rev 5"));
-        // The acceptinfo hashes stay in the JSON payload by decision
+        // The acceptinfo hashes stay in the JSON payload
         // (see the module docs); only the revision renders.
         assert!(!text.contains("deadbeef"));
     }

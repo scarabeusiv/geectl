@@ -13,9 +13,9 @@
 //! the payload names the written file. `check-constraints` takes the
 //! constraints document inline (`--constraints`): the one place raw
 //! XML crosses the public API, because there is no typed constraints
-//! model yet.
+//! model.
 //!
-//! Coordinate header (design rule 1, decided 2026-11-21, Tom):
+//! Coordinate header (design rule 1):
 //! every command's text starts with one header line echoing the query
 //! coordinates — the required positionals, in the order project,
 //! package, repository, arch (`project: p package: k repository: r
@@ -26,7 +26,7 @@
 //! the coordinates live in the JSON payload, and the synthetic
 //! `no log` line does carry the header.
 //!
-//! Documented omissions (decided, not gaps — see the renderers):
+//! Documented omissions (not gaps — see the renderers):
 //! job-history text carries 11 of 16 fields (worker and verification
 //! detail is payload-only); `fileinfo` resolved sections drop
 //! epoch/arch/project/repository per package; a results cell with
@@ -327,7 +327,7 @@ pub fn run_build(debug: &Debug, command: BuildCommand) -> Result<(Value, String)
     };
     let client =
         ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
-    // The coordinate header (design rule 1, decided 2026-11-21) is
+    // The coordinate header (design rule 1) is
     // computed from the command before the match moves it. Every arm
     // prepends it — except the `BuildLog` content itself, whose text
     // is the log verbatim (rule 4); its synthetic `no log` line
@@ -581,8 +581,8 @@ pub fn run_build(debug: &Debug, command: BuildCommand) -> Result<(Value, String)
     }
 }
 
-/// One header line echoing the query coordinates (design rule 1 as
-/// decided 2026-11-21, Tom): the required positionals, in the order
+/// One header line echoing the query coordinates (design rule 1):
+/// the required positionals, in the order
 /// project, package, repository, arch — `project: p package: k
 /// repository: r arch: a` — plus `package:` when the query is
 /// package-scoped (results, wait-for-results, job-history,
@@ -807,7 +807,7 @@ fn results_payload(results: &BuildResults) -> Value {
 /// counting package codes, then one note line per cell carrying a
 /// server detail text, then the state hash for polling.
 ///
-/// Decided omission (2026-11-21, Tom): a cell with statuses shows no
+/// Documented omission: a cell with statuses shows no
 /// row for the cell-level code/state — the per-package rows carry the
 /// codes, and the cell detail rides a note line. The cell-level
 /// code/state stay in the JSON payload.
@@ -1057,7 +1057,7 @@ fn job_history_payload(
 /// the full revision identity (versrel, rev, srcmd5, bcnt) per design
 /// rule 1; the worker and verification detail (starttime, uri,
 /// workerid, hostarch, verifymd5) is payload-only — a documented
-/// omission decided 2026-11-21 (Tom), not a gap.
+/// omission, not a gap.
 fn render_job_history_text(entries: &[JobHistoryEntry]) -> String {
     if entries.is_empty() {
         return "no jobs".to_string();
@@ -1264,7 +1264,7 @@ fn render_dep_section(lines: &mut Vec<String>, label: &str, deps: &[String]) {
 /// resolved via `requiredby`, while its struct doc says `provided_by`
 /// — the text does not depend on which side the server populates.
 /// Epoch, arch, project, and repository are payload-only — a
-/// documented omission decided 2026-11-21 (Tom), not a gap.
+/// documented omission, not a gap.
 fn render_ext_section(lines: &mut Vec<String>, label: &str, deps: &[ExtDependency]) {
     if deps.is_empty() {
         return;
@@ -1454,7 +1454,7 @@ mod tests {
 
     #[test]
     fn coordinate_header_echoes_positionals_in_order() {
-        // Design rule 1, decided 2026-11-21 (Tom): one header line,
+        // Design rule 1: one header line,
         // the required positionals in the order project, package,
         // repository, arch, plus `package:` when the query is
         // package-scoped.
@@ -1576,7 +1576,7 @@ mod tests {
 
     #[test]
     fn results_cell_level_code_is_payload_only_with_statuses() {
-        // Decided omission (2026-11-21, Tom): a cell with statuses
+        // Documented omission: a cell with statuses
         // shows no row for the cell-level code/state — the fixture
         // cell's code/state are both `published`, and neither may
         // appear in the text.
@@ -1779,7 +1779,7 @@ mod tests {
         assert!(header.contains("REV"));
         assert!(header.contains("SRCMD5"));
         assert!(header.contains("BCNT"));
-        // Decided omission (2026-11-21, Tom): the worker and
+        // Documented omission: the worker and
         // verification detail is payload-only — the fixture entry
         // carries all five dropped fields.
         assert!(!text.contains("worker:1"));
@@ -1956,7 +1956,7 @@ mod tests {
         assert!(text.contains("foo = 1.0 (required by: bar 2.0)"));
         assert!(text.contains("libc.so.6()(64bit) (provided by: glibc)"));
         assert!(text.contains("foo-base (required by: bar 2.0-1)"));
-        // Decided omission (2026-11-21, Tom): a resolved package's
+        // Documented omission: a resolved package's
         // epoch, arch, project, and repository are payload-only —
         // the fixture's supplements_ext bar carries epoch 1, arch
         // aarch64, project home:alice, repository myrepo, and none

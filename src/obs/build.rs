@@ -4302,7 +4302,7 @@ mod tests {
     #[test]
     fn parse_builddepinfo_rejects_an_inner_unclosed_package() {
         // The package close is missing but the outer close is present:
-        // this used to read as an empty list instead of an error.
+        // a missing close is an error, not an empty list.
         assert!(parse_builddepinfo(
             "<builddepinfo><package name=\"a\"><pkgdep>x</pkgdep></builddepinfo>"
         )
@@ -4405,8 +4405,7 @@ mod tests {
     #[test]
     fn parse_repositories_rejects_an_inner_unclosed_repository() {
         // The repository close is missing but the outer close is
-        // present: this used to read as an empty list instead of an
-        // error.
+        // present: a missing close is an error, not an empty list.
         assert!(parse_repositories(
             "<project name=\"p\"><repository name=\"r\"><path project=\"q\" repository=\"s\"/></project>"
         )

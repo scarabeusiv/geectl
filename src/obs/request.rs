@@ -2689,7 +2689,7 @@ impl<'a> ObsClient<'a> {
 
     /// Format a retry budget for a probe line: whole seconds as
     /// `30s`, anything else in milliseconds (`1500ms`).
-    /// `Duration::as_secs` truncates, so a 1500 ms budget used to
+    /// `Duration::as_secs` truncates, so a 1500 ms budget would
     /// print as `1s`.
     pub(crate) fn format_budget(budget: std::time::Duration) -> String {
         let millis = budget.as_millis();
@@ -2705,9 +2705,9 @@ impl<'a> ObsClient<'a> {
     /// checking the request's state before any re-issue: the
     /// server's API replies before its backend has registered a
     /// just-filed request, so the changestate POST that follows a
-    /// filing can fail while the request is about to exist (seen on
-    /// live run 44880250442: the accept POST returned 500, while
-    /// the same accept passed on earlier runs). Only transient
+    /// filing can fail while the request is about to exist (the
+    /// accept POST can return 500 for a request the backend has
+    /// not registered yet). Only transient
     /// failures retry — a 5xx, a timeout, a network error, or a
     /// not-found (the just-filed request is not visible yet while
     /// the backend registers it, the same race as the package-create
@@ -2868,9 +2868,9 @@ impl<'a> ObsClient<'a> {
     ///   the server's API replies before its backend has
     ///   registered a just-filed request, so the changestate POST
     ///   that follows a filing can fail while the request is about
-    ///   to exist (seen on live run 44880250442: the accept
-    ///   POST returned 500, while the same accept passed on
-    ///   earlier runs). Before any re-issue the retry reads the
+    ///   to exist (the accept POST can return 500 for a request
+    ///   the backend has not registered yet). Before any re-issue
+    ///   the retry reads the
     ///   request back, so a change that already landed is never
     ///   posted again; a request that never changes state still
     ///   fails loudly once the budget runs out. Only transient
@@ -4854,7 +4854,7 @@ description</description>
         // The server's API replies before its backend has
         // registered a just-filed request, so the changestate POST
         // that follows a filing can 500 while the request is about
-        // to exist (live run 44880250442). The library retries
+        // to exist. The library retries
         // a transient failure; the second POST lands. The state
         // check between attempts reads the request back as still
         // new, so the retry goes ahead.

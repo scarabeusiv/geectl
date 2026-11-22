@@ -25,8 +25,8 @@
 //!   staging, needs, and rebuilds. The library validates the
 //!   description is non-empty; the headline shape is the caller's
 //!   responsibility (see [`SrPayload`]).
-//! - A security fix's `.changes` entry must name every CVE it fixes
-//!   (the changelog is the verification that the fix landed). When
+//! - A security fix's `.changes` entry must name every CVE it fixes.
+//!   When
 //!   the caller supplies CVE ids, [`SrPayload::new`] refuses a
 //!   `.changes` entry that does not name each of them.
 //! - A failed lookup must never read as good news: a lookup that

@@ -645,8 +645,8 @@ impl UreqClient {
 
     /// Read a response body for a `method` request to `url`. On
     /// success the caller still emits the `response body` line (after
-    /// the attempt line, as before). A body that is not valid UTF-8
-    /// still errors exactly as before (`ServerError`, same message);
+    /// the attempt line). A body that is not valid UTF-8
+    /// still errors (`ServerError`, same message);
     /// the binary marker line is emitted behind `--debug-body` only,
     /// so a non-UTF-8 response is visible in the transcript instead
     /// of vanishing at the `?`. The caller emits the attempt line
@@ -719,8 +719,8 @@ impl UreqClient {
         );
         // Ask for XML, the same defence as GET: the owner search proved
         // a dual-routed path serves the WebUI HTML page unless the request
-        // asks for XML. No mutation path has been seen doing it yet, so
-        // for mutations this is preventive.
+        // asks for XML. Mutations ask for XML too, as a preventive
+        // measure.
         let request = self
             .agent
             .post(url)
@@ -825,8 +825,8 @@ impl UreqClient {
             let started = std::time::Instant::now();
             // Ask for XML, the same defence as GET: the owner search proved
             // a dual-routed path serves the WebUI HTML page unless the request
-            // asks for XML. No mutation path has been seen doing it yet, so
-            // for mutations this is preventive.
+            // asks for XML. Mutations ask for XML too, as a preventive
+            // measure.
             let request = self
                 .agent
                 .put(url)
@@ -1377,8 +1377,8 @@ impl HttpClient for UreqClient {
         );
         // Ask for XML, the same defence as GET: the owner search proved
         // a dual-routed path serves the WebUI HTML page unless the request
-        // asks for XML. No mutation path has been seen doing it yet, so
-        // for mutations this is preventive.
+        // asks for XML. Mutations ask for XML too, as a preventive
+        // measure.
         let request = self.agent.delete(url).header("Accept", "application/xml");
         let request = self.apply_auth(request, credentials)?;
         // A single attempt: DELETE is never retried.
@@ -3017,8 +3017,8 @@ mod tests {
     fn mutations_request_xml_from_the_api() {
         // Every mutation asks for XML, the same defence as GET: the owner
         // search proved a dual-routed path serves the WebUI HTML page
-        // unless the request asks for XML. No mutation path has been seen
-        // doing it yet, so for mutations this is preventive.
+        // unless the request asks for XML. Mutations ask for XML too,
+        // as a preventive measure.
         let client = UreqClient::new(Timeout::default()).unwrap();
         let accept_of = |request: &str| {
             let headers = match request.split_once("\r\n\r\n") {
@@ -3391,11 +3391,11 @@ mod tests {
     #[test]
     fn debug_attempt_line_precedes_non_utf8_response_body_error() {
         // F-H probe: a 200 whose body is not valid UTF-8 errors
-        // exactly as before (ServerError), but the attempt line must
-        // come before the binary marker, so the transcript shows
-        // which attempt the marker belongs to. On the unfixed code
-        // the `?` on the body read returns before any attempt line
-        // is emitted, so the marker stands alone.
+        // (ServerError), but the attempt line must come before the
+        // binary marker, so the transcript shows which attempt the
+        // marker belongs to. The caller emits the attempt line
+        // before the body read: on a read error the marker is the
+        // only body line and follows its attempt line.
         let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
             .to_vec();
         response.extend_from_slice(&[0xFF; 4]);

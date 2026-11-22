@@ -1,5 +1,5 @@
 //! `gitea` — the Gitea command group: repository and branch reads
-//! plus the repo mutations from phases 1–2.
+//! plus the repo mutations.
 //!
 //! Thin over `GiteaClient` like the OBS groups are over `ObsClient`:
 //! the flags mirror the library parameters, the JSON payload carries
@@ -11,22 +11,21 @@
 //! `GEECTL_GITEA_TOKEN_FILE`), so a dry-run preview cannot be built
 //! without one. That is the library's rule, not a CLI shortcut.
 //! Per-instance Gitea credentials (one token per configured Gitea
-//! instance, on the alias model) are built on a parallel branch —
-//! this group takes the single configured instance until that lands
-//! (merge-order note, not a behaviour to invent here).
+//! instance, on the alias model) are not part of this group: it
+//! takes the single configured instance.
 //!
 //! The `branch` composite (Gitea fork + OBS `cmd=fork`, library
-//! `GiteaClient::branch`) has no CLI command yet: it composes the
+//! `GiteaClient::branch`) has no CLI command: it composes the
 //! two backends behind the uniform flow, and its CLI shape is a
 //! separate decision.
 //!
-//! Coordinate header (design rule 1, decided 2026-11-21, Tom):
+//! Coordinate header (design rule 1):
 //! every text rendering opens with one header line echoing the query
 //! coordinates (`owner: … repo: …`, `repo: owner/name`), except the
 //! content command `branch-head`, whose text IS the bare SHA.
 //! Tables stay as designed.
 //!
-//! Documented omissions (decided, not gaps): `repo-list` text
+//! Documented omissions (not gaps): `repo-list` text
 //! carries no clone URLs (identifiers stay; the URLs are in the
 //! JSON payload); `branch-list` text carries the full head SHA (the
 //! sync-verification primitive) but no commit message (long free

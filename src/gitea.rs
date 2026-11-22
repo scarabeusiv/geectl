@@ -79,8 +79,7 @@ pub struct GiteaParent {
     pub full_name: String,
 }
 
-/// A Gitea repository: only the fields the phase-1 and phase-2
-/// operations need are modelled — identity, parent, default
+/// A Gitea repository: only the fields the operations need are modelled — identity, parent, default
 /// branch, privacy, and the clone URLs the fork result returns. A
 /// field the operation does not need is not parsed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -183,7 +182,7 @@ pub struct GiteaBranchCommit {
     pub message: String,
 }
 
-/// A Gitea branch: only the fields the phase-2 operations need
+/// A Gitea branch: only the fields the operations need
 /// are modelled — the name, the head commit, and whether the
 /// branch is protected. A field the operation does not need is
 /// not parsed.
@@ -391,7 +390,7 @@ impl<'a> GiteaClient<'a> {
     }
 
     /// Read a repository (`GET /api/v1/repos/{owner}/{repo}`).
-    /// The read every later phase builds on: it resolves the
+    /// The read the other operations build on: it resolves the
     /// default branch and verifies a fork's parent by re-reading.
     pub fn repo_get(&self, owner: &str, repo: &str) -> Result<GiteaRepository, GeectlError> {
         validate_gitea_name(owner, "owner")?;
@@ -402,8 +401,7 @@ impl<'a> GiteaClient<'a> {
     }
 
     /// Read the token owner's login (`GET /api/v1/user`). A private
-    /// helper until `user_get` lands (phase 5): the fork target
-    /// owner defaults to this login.
+    /// helper: the fork target owner defaults to this login.
     fn current_user_login(&self) -> Result<String, GeectlError> {
         let url = build_url(&self.base, &["api", "v1", "user"], &[]);
         let body = self.http.get_with(&url, &self.credentials)?;
@@ -859,7 +857,7 @@ impl<'a> GiteaClient<'a> {
             );
             let body = self.http.get_with(&url, &self.credentials)?;
             // Gitea answers a JSON `null` body for an empty list —
-            // verified live 2026-11-22 on the branches endpoint of
+            // verified live on the branches endpoint of
             // an empty repo (`pool/systemd` before its first
             // commit). Parse as an optional list so a null page is
             // an empty page, not a server error. Any other shape
@@ -1460,7 +1458,7 @@ mod tests {
     /// Fixture layout: the real openSUSE Gitea instance and the
     /// real OBS metas that point at it.
     ///
-    /// Fetched live 2026-11-21 from https://src.opensuse.org
+    /// Fetched from https://src.opensuse.org
     /// (code.opensuse.org) and from the OBS API via osc — the
     /// instance `DEFAULT_GITEA_URL` points at — and mirrored here
     /// instead of invented repo/branch names. `FakeHttp` cans the
@@ -1513,8 +1511,7 @@ mod tests {
     /// - `openSUSE:Factory/libstrophe` carries neither
     ///   `<scmsync>` nor `<devel>` — its git management lives
     ///   only in project scmsync / `_scmsync.obsinfo`, which
-    ///   phase 1 does not read, so `branch` on it refuses (see
-    ///   the known limitation in the PR body).
+    ///   `branch` does not read, so `branch` on it refuses.
     ///
     /// Constructed cases (no live equivalent found): the renamed
     /// fork `systemd-slfo` (no renamed fork exists on the

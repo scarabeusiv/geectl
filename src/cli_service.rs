@@ -12,11 +12,11 @@
 //! vertical (issue #43). There is no osc command for either read;
 //! osc reaches the same data only via `osc api`.
 //!
-//! Coordinate header (design rule 1, decided 2026-11-21, Tom):
+//! Coordinate header (design rule 1):
 //! both text renderings open with one header line echoing the query
 //! coordinates (`project: … package: …`); tables follow as designed.
 //!
-//! Documented omissions (decided, not gaps): `list` text carries
+//! Documented omissions (not gaps): `list` text carries
 //! no parameter values beyond `name=value` pairs (the full values
 //! are in the JSON payload); `state` text carries the error verbatim
 //! (multi-line server text) but no md5s beyond the two the state

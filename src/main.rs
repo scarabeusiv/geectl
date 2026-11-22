@@ -355,9 +355,7 @@ fn config_show_payload(
 /// The OBS credential status for one URL: the matching instance
 /// alias's variables win, else the plain variables when it is the
 /// configured default — so `config show` reports what the commands
-/// would actually use, instead of the plain variables only (an
-/// alias-only setup used to report `not_configured` while every
-/// command authenticated fine).
+/// would actually use, instead of the plain variables only.
 fn obs_auth_status(url: &str, instances: &[(String, String)]) -> serde_json::Value {
     credentials_status(EnvObsAuth::credentials_for_url(url, url, instances))
 }
