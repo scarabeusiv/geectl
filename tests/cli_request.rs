@@ -321,6 +321,58 @@ fn request_file_delete_dry_run_names_the_target() {
 }
 
 #[test]
+fn request_file_delete_accept_in_hours_names_the_timer() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "file-delete",
+            "--target-project",
+            "foo",
+            "--package",
+            "bar",
+            "--description",
+            "Drop bar",
+            "--accept-in-hours",
+            "48",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["accept_in_hours"], 48);
+    assert_eq!(value["dry_run"], true);
+    assert_plan_non_empty(&value);
+    let text = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "request",
+            "file-delete",
+            "--target-project",
+            "foo",
+            "--package",
+            "bar",
+            "--description",
+            "Drop bar",
+            "--accept-in-hours",
+            "48",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains("auto-accept in 48h"),
+        "text names the timer: {text}"
+    );
+}
+
+#[test]
 fn request_file_change_devel_dry_run_names_the_description() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)

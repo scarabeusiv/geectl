@@ -306,6 +306,12 @@ pub enum RequestCommand {
         /// taken literally: a description may open with a `- ` bullet.
         #[arg(long, allow_hyphen_values = true)]
         description: String,
+        /// Auto-accept the request this many hours after filing
+        /// (the server accepts it on its own once the time passes),
+        /// as `osc deletereq --accept-in-hours` does. The timestamp
+        /// is computed at filing time; 0 means accept immediately.
+        #[arg(long)]
+        accept_in_hours: Option<u64>,
     },
     /// File a maintenance incident request: ask the maintenance team
     /// to start a maintenance incident from a maintenance update.
@@ -708,6 +714,7 @@ pub fn run(
             repository,
             whole_project,
             description,
+            accept_in_hours,
         } => {
             let target = match (package, repository) {
                 (Some(package), None) => DeleteTarget::Package(package),
@@ -737,7 +744,10 @@ pub fn run(
                 }
                 DeleteTarget::WholeProject => target_project.clone(),
             };
-            let payload = DeletePayload::new(&target_project, target, &description)?;
+            let mut payload = DeletePayload::new(&target_project, target, &description)?;
+            if let Some(hours) = accept_in_hours {
+                payload = payload.with_accept_at_in_hours(hours)?;
+            }
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
             with_client(debug, live, |client| {
                 let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
@@ -747,11 +757,20 @@ pub fn run(
                         "id": id.map(request_id_json).unwrap_or(Value::Null),
                         "target": target_text,
                         "description": description,
+                        "accept_in_hours": accept_in_hours,
                     })
                 });
+                let accept_text = match accept_in_hours {
+                    Some(hours) => format!(" (auto-accept in {hours}h)"),
+                    None => String::new(),
+                };
                 let text = match &id {
-                    Some(id) => format!("filed delete request {id} for {target_text}"),
-                    None => format!("dry-run: would file delete request for {target_text}"),
+                    Some(id) => {
+                        format!("filed delete request {id} for {target_text}{accept_text}")
+                    }
+                    None => {
+                        format!("dry-run: would file delete request for {target_text}{accept_text}")
+                    }
                 };
                 Ok((filed, text))
             })
