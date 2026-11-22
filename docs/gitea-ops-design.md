@@ -64,12 +64,13 @@ phase 1–2 operations (fork, repo read/list/create/delete, branch
 read/head, user, SSH keys, teams, collaborators) and the phase-3
 read operations (`pr_get`, `pr_list`, `pr_search`, `pr_reviews`)
 plus the review-level act operations (`pr_review`,
-`pr_comments`, `pr_comment_add`, `pr_review_cancel_request`).
+`pr_comments`, `pr_comment_add`, `pr_review_cancel_request`)
+and the pull-request-level act operations (`pr_merge`,
+`pr_close`, `pr_reopen`).
 The unified pull-request surface (`src/pull_request.rs`,
 `PullRequestClient`, `pull-request` CLI group) carries the read
-surface and the review-level act operations; pull-request-level
-act (`pr_merge`, `pr_close`, `pr_reopen`) and labels are not
-implemented yet. The OBS side has the typed `change_review_state`
+surface, the review-level act operations and the
+pull-request-level act operations; labels are not implemented yet. The OBS side has the typed `change_review_state`
 (`src/obs/request.rs`).
 
 - Config (`src/config.rs`): `gitea_url` (default
@@ -359,7 +360,8 @@ review is by the token owner, and there is nothing to address.
 
 `merge` takes `--method` (`merge` | `rebase` | `rebase-merge` |
 `squash` | `fast-forward-only`, sent as the Gitea `Do` field; unset
-sends no `Do` and the server applies its default) and `--force`
+sends `merge`, the server default style — Gitea requires `Do`, an
+empty body answers 422) and `--force`
 (OBS: accept overriding open reviews, as on `request accept`). A
 backend-only option on the other backend's ref fails closed with a
 structured error naming the option, never silently ignored.
@@ -395,6 +397,22 @@ Probed against a disposable Gitea 1.24.7 instance:
   minted through the user's own Basic auth.
 - Posting an issue comment needs `write:issue`: a token without it
   gets 403 naming the missing scope.
+
+#### Live probe findings (pull-request-level act)
+
+Probed against a disposable Gitea 1.24.7 instance, and the OBS
+transition against the server source:
+
+- Merging with an empty body answers 422 `[Do]: Required`: `Do`
+  is required, so an unset `--method` sends `merge`, the server
+  default style.
+- The provisioned Gitea token has no `write:issue` scope: closing
+  or reopening as it answers 403, so the close/reopen live tests
+  act as a collaborator with a minted token carrying `write:issue`.
+- A declined OBS request reopens to `new`: the creator and the
+  decliner can reopen it (server source,
+  `BsRequestPermissionCheck`), and the live test pins the creator
+  path.
 
 Labels have no OBS counterpart and no uniform CLI: the operations
 land in `GiteaClient` as primitives the staging flow uses later,
@@ -506,7 +524,16 @@ Each step is its own PR.
    `git-pr-review-request.feature`. Landed.
 5. Pull-request-level act: `pr_merge`/`pr_close`/`pr_reopen`,
    `PullRequestClient::merge`/`decline`/`withdraw`/`reopen`,
-   `pull-request merge`/`decline`/`withdraw`/`reopen`. Remaining.
+   `pull-request merge`/`decline`/`withdraw`/`reopen`. Landed.
+   Unset `--method` sends `Do: merge`, the server default style:
+   Gitea 1.24.7 requires `Do` — an empty body answers 422
+   `[Do]: Required`. Gitea has no declined or withdrawn state:
+   decline and withdraw both close, posting the reason as an
+   issue comment first. Reopening a declined OBS request is not
+   admin-only: the creator and the decliner can reopen it. Test
+   borrowing: none — osc has no unit tests for these acts, and
+   the behave close/reopen/merge steps sit in a commented-out
+   timeline scenario broken by a Gitea issue.
 6. Labels: `pr_labels_add`/`pr_labels_remove` (library only).
    Remaining. Filing is deferred until the working-copy layer lands:
    `pr_create` and the library `submit` returning
