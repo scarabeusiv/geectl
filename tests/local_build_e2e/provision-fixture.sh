@@ -18,7 +18,10 @@
 #   5. Polls the buildinfo until the scheduler resolves it (no
 #      `<error>`, at least one `<bdep>`): the first resolution waits
 #      on the download-on-demand daemon fetching the repository
-#      metadata and the base RPMs.
+#      metadata. The daemon fetches metadata only, never the base
+#      RPMs: at download time a binary whose direct download 404s
+#      is warmed by asking the server for its versions, which makes
+#      the server fetch it, and the download is retried once.
 #
 # The instance's bootstrap admin credentials (the OBS development
 # defaults, ephemeral, never a real credential) authenticate the

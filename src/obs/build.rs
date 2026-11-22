@@ -970,6 +970,27 @@ pub struct BinaryFile {
     pub mtime: Option<u64>,
 }
 
+/// One binary version in a `<binaryversionlist>` document: the
+/// server-reported name, the RPM header md5, and the size in KiB.
+/// The name is `<binary>.<suffix>` (e.g. `foo.rpm`); an error entry
+/// for a binary the repository does not carry carries the bare
+/// queried name instead. `error` carries the server's per-binary
+/// error (`not available` when the repository does not carry the
+/// binary); a version entry for a binary the server had to fetch
+/// carries the fetched file's hdrmd5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryVersion {
+    /// The server-reported name (`<binary>.<suffix>`, e.g. `foo.rpm`);
+    /// error entries carry the bare queried name.
+    pub name: String,
+    /// The RPM header md5, if the server reported it.
+    pub hdrmd5: Option<String>,
+    /// The file size in KiB, if the server reported it.
+    pub size_kb: Option<u64>,
+    /// The server's per-binary error, if any.
+    pub error: Option<String>,
+}
+
 /// The metadata of a built file: the RPM header fields (name,
 /// epoch, version, release, arch, source, summary, description,
 /// disturl, size, mtime) plus the dependency lists (plain view) and
@@ -1138,6 +1159,90 @@ pub(crate) fn parse_binary_list(body: &str) -> Result<Vec<BinaryFile>, GeectlErr
         });
     }
     Ok(files)
+}
+
+/// Parse a `<binaryversionlist>...</binaryversionlist>` document into
+/// the binary versions. A document that is not a binaryversionlist —
+/// or a `<binary>` without a name, or with a non-numeric sizek — is a
+/// server error, never an empty list.
+pub(crate) fn parse_binary_version_list(body: &str) -> Result<Vec<BinaryVersion>, GeectlError> {
+    let body = body.trim();
+    // A malformed binary version list response still fails closed,
+    // but the error carries a bounded preview of what was received,
+    // so the failure is diagnosable instead of a bare "not a
+    // <binaryversionlist> document". The preview is the debug
+    // channel's redacting preview: credential values are masked,
+    // binary bodies are never dumped, and the text is capped at
+    // DEBUG_BODY_CAP bytes.
+    let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected OBS binary version list response: not a <binaryversionlist> document; received: {received}"
+            ),
+        )
+    };
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the <binaryversionlist> element; skip it. The prolog
+    // must terminate (`?>`) — an unterminated prolog is malformed,
+    // not a missing <binaryversionlist>.
+    let body = match skip_xml_prolog(body) {
+        Ok(body) => body,
+        Err(()) => return Err(malformed()),
+    };
+    let Some(after_open) = body.strip_prefix("<binaryversionlist") else {
+        return Err(malformed());
+    };
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    let Some(end) = find_tag_end(after_open) else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<binaryversionlist/>`: no binaries.
+        return Ok(Vec::new());
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</binaryversionlist>") else {
+        return Err(malformed());
+    };
+    if !inner[close + "</binaryversionlist>".len()..]
+        .trim()
+        .is_empty()
+    {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut versions = Vec::new();
+    for element in xml_elements(inner, "binary")? {
+        let (tag, _) = xml_split_element(element, "binary");
+        let name = xml_attr(tag, "name")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS binary version list response: <binary> without name",
+                )
+            })?;
+        versions.push(BinaryVersion {
+            name,
+            hdrmd5: xml_attr(tag, "hdrmd5"),
+            size_kb: xml_attr_number(tag, "sizek")?,
+            error: xml_attr(tag, "error"),
+        });
+    }
+    Ok(versions)
 }
 
 /// Parse one `<provided_by>` / `<requiredby>` resolution element
@@ -2591,6 +2696,40 @@ impl<'a> ObsClient<'a> {
             &[],
         );
         self.http.get_bytes(&url, &self.credentials)
+    }
+
+    /// The versions of one binary in `repository`/`arch`: the
+    /// server-reported name (`<binary>.<suffix>`, e.g. `foo.rpm`),
+    /// the RPM header md5, and the size in KiB the server reports
+    /// for it. Asking for the versions of a binary on a
+    /// download-on-demand repository makes the server fetch the
+    /// binary into the repository (the request blocks until the
+    /// fetch completes) and reports the name it stored it under;
+    /// a direct file download of a binary nobody has asked for 404s.
+    /// A binary the repository does not carry is reported with an
+    /// `error`, not a 404. Requires OBS Basic credentials.
+    pub fn binary_versions(
+        &self,
+        project: &str,
+        repository: &str,
+        arch: &str,
+        binary: &str,
+    ) -> Result<Vec<BinaryVersion>, GeectlError> {
+        Self::validate_build_coordinates(project, None, repository, arch)?;
+        if !valid_obs_name(binary) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS binary name: {binary:?}"),
+            ));
+        }
+        self.require_build_credentials()?;
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, "_repository"],
+            &[("view", "binaryversions"), ("binary", binary)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_binary_version_list(&body)
     }
 
     /// The metadata of a built file (`filename`) for `package` in
@@ -4679,6 +4818,151 @@ mod tests {
             .download_binary("testproject", "foo", "standard", "x86_64", "../evil")
             .is_err());
         assert!(http.get_bytes_calls().is_empty());
+    }
+
+    #[test]
+    fn parse_binary_version_list_reads_entries() {
+        let parsed = parse_binary_version_list(
+            "<binaryversionlist><binary name=\"foo.rpm\" hdrmd5=\"abc123\" sizek=\"58352\"/><binary name=\"nosuch\" error=\"not available\"/></binaryversionlist>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "foo.rpm");
+        assert_eq!(parsed[0].hdrmd5.as_deref(), Some("abc123"));
+        assert_eq!(parsed[0].size_kb, Some(58352));
+        assert_eq!(parsed[0].error, None);
+        assert_eq!(parsed[1].name, "nosuch");
+        assert_eq!(parsed[1].error.as_deref(), Some("not available"));
+    }
+
+    #[test]
+    fn parse_binary_version_list_empty_is_an_empty_list() {
+        assert_eq!(
+            parse_binary_version_list("<binaryversionlist/>").unwrap(),
+            Vec::<BinaryVersion>::new()
+        );
+        assert_eq!(
+            parse_binary_version_list("<binaryversionlist></binaryversionlist>").unwrap(),
+            Vec::<BinaryVersion>::new()
+        );
+    }
+
+    #[test]
+    fn parse_binary_version_list_rejects_malformed_documents() {
+        assert!(parse_binary_version_list("").is_err());
+        assert!(parse_binary_version_list("<directory></directory>").is_err());
+        assert!(parse_binary_version_list("<binaryversionlist>").is_err());
+        assert!(
+            parse_binary_version_list("<binaryversionlist><binary/></binaryversionlist>").is_err()
+        );
+        assert!(parse_binary_version_list(
+            "<binaryversionlist><binary name=\"\"/></binaryversionlist>"
+        )
+        .is_err());
+        assert!(parse_binary_version_list(
+            "<binaryversionlist><binary name=\"foo.rpm\" sizek=\"big\"/></binaryversionlist>"
+        )
+        .is_err());
+        assert!(parse_binary_version_list(
+            "<binaryversionlist><binary name=\"foo.rpm\"/></binaryversionlist> trailing"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_binary_version_list_accepts_an_xml_prolog() {
+        // The server may emit an XML prolog before the
+        // <binaryversionlist> element; the result is the same as
+        // without one.
+        let plain = "<binaryversionlist><binary name=\"foo.rpm\"/></binaryversionlist>";
+        let prolog = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{plain}");
+        assert_eq!(
+            parse_binary_version_list(&prolog).unwrap(),
+            parse_binary_version_list(plain).unwrap()
+        );
+        // A prolog that never terminates is malformed, not a missing
+        // <binaryversionlist>.
+        assert!(parse_binary_version_list(
+            "<?xml version=\"1.0\" <binaryversionlist></binaryversionlist>"
+        )
+        .is_err());
+        assert!(parse_binary_version_list("<?xml version=\"1.0\"").is_err());
+    }
+
+    #[test]
+    fn parse_binary_version_list_malformed_error_carries_response_preview() {
+        // The failure stays fail-closed, but the error names what was
+        // received, so the caller can diagnose it.
+        let err = parse_binary_version_list("garbage").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("garbage"), "{}", err.context);
+        // A long body is capped: the preview carries the head, not the tail.
+        let long = format!("<collection>{}</collection>", "x".repeat(3000));
+        let err = parse_binary_version_list(&long).unwrap_err();
+        assert!(err.context.contains("... [truncated,"), "{}", err.context);
+        assert!(!err.context.contains(&"x".repeat(3000)), "{}", err.context);
+        // An empty body still fails closed, and says so.
+        let err = parse_binary_version_list("").unwrap_err();
+        assert!(err.context.contains("<empty response>"), "{}", err.context);
+    }
+
+    #[test]
+    fn binary_versions_reports_the_fetched_binary() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/_repository?view=binaryversions&binary=foo",
+            "<binaryversionlist><binary name=\"foo.rpm\" hdrmd5=\"abc123\" sizek=\"58352\"/></binaryversionlist>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let versions = client
+            .binary_versions("testproject", "standard", "x86_64", "foo")
+            .unwrap();
+        assert_eq!(
+            versions,
+            vec![BinaryVersion {
+                name: "foo.rpm".to_string(),
+                hdrmd5: Some("abc123".to_string()),
+                size_kb: Some(58352),
+                error: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn binary_versions_reports_an_unavailable_binary_as_an_error_entry() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/_repository?view=binaryversions&binary=nosuch",
+            "<binaryversionlist><binary name=\"nosuch\" error=\"not available\"/></binaryversionlist>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let versions = client
+            .binary_versions("testproject", "standard", "x86_64", "nosuch")
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].error.as_deref(), Some("not available"));
+    }
+
+    #[test]
+    fn binary_versions_404_is_an_error() {
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/_repository?view=binaryversions&binary=foo",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .binary_versions("testproject", "standard", "x86_64", "foo")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn binary_versions_rejects_an_empty_binary_name_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .binary_versions("testproject", "standard", "x86_64", "")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]

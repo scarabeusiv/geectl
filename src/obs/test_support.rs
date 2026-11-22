@@ -25,6 +25,7 @@ pub(crate) struct FakeHttp {
     get_calls: RefCell<Vec<(String, bool)>>,
     get_bearer_tokens: RefCell<Vec<(String, Option<String>)>>,
     get_bytes: RefCell<HashMap<String, Vec<u8>>>,
+    get_bytes_error_sequences: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     get_bytes_calls: RefCell<Vec<(String, bool)>>,
     post_calls: RefCell<Vec<(String, String, bool)>>,
     delete_calls: RefCell<Vec<(String, bool)>>,
@@ -48,6 +49,7 @@ impl FakeHttp {
             get_calls: RefCell::new(Vec::new()),
             get_bearer_tokens: RefCell::new(Vec::new()),
             get_bytes: RefCell::new(HashMap::new()),
+            get_bytes_error_sequences: RefCell::new(HashMap::new()),
             get_bytes_calls: RefCell::new(Vec::new()),
             post_calls: RefCell::new(Vec::new()),
             delete_calls: RefCell::new(Vec::new()),
@@ -94,6 +96,19 @@ impl FakeHttp {
     /// pre-check 404 followed by the re-read 200).
     pub(crate) fn with_get_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
         self.get_error_sequences
+            .borrow_mut()
+            .insert(url.to_string(), kinds.iter().copied().collect());
+        self
+    }
+
+    /// Answer the next byte GETs of `url` with these errors, in order;
+    /// once the queue is empty the canned `get_bytes` body answers.
+    /// The byte twin of `with_get_error_sequence`: lets a test model
+    /// a download that does not exist yet and then appears (a
+    /// download-on-demand binary fetched after the versions listing
+    /// warms it).
+    pub(crate) fn with_get_bytes_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
+        self.get_bytes_error_sequences
             .borrow_mut()
             .insert(url.to_string(), kinds.iter().copied().collect());
         self
@@ -245,6 +260,17 @@ impl HttpClient for FakeHttp {
         self.get_bytes_calls
             .borrow_mut()
             .push((url.to_string(), authed));
+        if let Some(kind) = self
+            .get_bytes_error_sequences
+            .borrow_mut()
+            .get_mut(url)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Err(GeectlError::new(
+                kind,
+                format!("canned GET error for {url}"),
+            ));
+        }
         if let Some(kind) = self.get_errors.borrow().get(url).cloned() {
             return Err(GeectlError::new(
                 kind,

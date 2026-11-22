@@ -137,6 +137,10 @@ const RPM_HEADER_PROBE_CHUNK_BYTES: usize = 64 * 1024;
 /// file whose header does not fit is not a well-formed RPM for
 /// this check.
 const RPM_HEADER_PROBE_CAP_BYTES: usize = 4 * 1024 * 1024;
+/// The hdrmd5 a download-on-demand binary carries in buildinfo in
+/// place of the real header digest: the file has not been fetched
+/// into the repository yet, so the pool has no real digest for it.
+const DOD_PLACEHOLDER_HDRMD5: &str = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0";
 /// The most the engine's captured stdout/stderr may hold (bytes);
 /// past it the capture is truncated, never unbounded.
 const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
@@ -1949,7 +1953,7 @@ impl<'a> LocalBuild<'a> {
         let _pkg_lock = self.acquire_pkg_lock(project, repo, arch)?;
         let path = dir.join(filename);
         if path.exists() {
-            match self.verify_hdrmd5(&path, dep.hdrmd5.as_deref()) {
+            match self.verify_hdrmd5(&path, Self::effective_hdrmd5(dep, None)) {
                 Ok(()) => {
                     stats.pkg_hits += 1;
                     touch(&path);
@@ -1967,14 +1971,14 @@ impl<'a> LocalBuild<'a> {
             }
         }
         stats.pkg_misses += 1;
-        let bytes = self.download_dep(req, dep, project, filename)?;
+        let (bytes, warmed_hdrmd5) = self.download_dep(req, dep, project, filename)?;
         write_atomic(&path, &bytes).map_err(|e| {
             GeectlError::new(
                 ErrorKind::InternalError,
                 format!("cannot write package cache {}: {e}", path.display()),
             )
         })?;
-        self.verify_hdrmd5(&path, dep.hdrmd5.as_deref())
+        self.verify_hdrmd5(&path, Self::effective_hdrmd5(dep, warmed_hdrmd5.as_deref()))
             .map_err(|e| {
                 let _ = fs::remove_file(&path);
                 GeectlError::new(
@@ -1996,30 +2000,103 @@ impl<'a> LocalBuild<'a> {
     /// The download URL keys on the dep's *source* package, never
     /// the binary name: a subpackage binary lives under its source
     /// package, and the binary name as the package segment 404s.
+    /// A 404 retries after warming the binary: on a
+    /// download-on-demand repository the daemon fetches repository
+    /// metadata only, so a binary nobody has asked for is not in
+    /// the repository yet and a direct file download 404s. Asking
+    /// the server for the binary's versions makes it fetch the
+    /// binary (the listing blocks until the fetch completes). The
+    /// retry downloads under the name the listing reports
+    /// (`<binary>.<suffix>`): the fetched file is stored under
+    /// that name. A package in a repodata module is stored under
+    /// the full EVRA filename instead, so the EVRA filename is the
+    /// second retry candidate. A warm failure keeps the original
+    /// 404; a retry failure is returned as-is. The retry runs even
+    /// when the warm reports the binary unavailable: the listing only
+    /// triggers the fetch, the download is the check. The
+    /// returned digest is the one the warm reported for the
+    /// binary, when the download went through the warm; it is
+    /// the digest to verify the downloaded file against.
     fn download_dep(
         &self,
         req: &BuildRequest,
         dep: &BuildDep,
         project: &str,
         filename: &str,
-    ) -> Result<Vec<u8>, GeectlError> {
+    ) -> Result<(Vec<u8>, Option<String>), GeectlError> {
         let package = dep.package.as_deref().unwrap_or("_repository");
-        match self.obs.download_binary(
-            project,
-            package,
-            Self::dep_repo(dep, req),
-            Self::dep_arch(dep, req),
-            filename,
-        ) {
-            Ok(bytes) => Ok(bytes),
-            Err(e) if is_transport_cap_error(&e) => Err(GeectlError::new(
-                ErrorKind::ServerError,
-                format!(
-                    "cannot download {filename} for dependency {}: the file exceeds the 10 MiB transport body limit; streaming downloads are not supported yet",
-                    dep.name
-                ),
-            )),
+        let repo = Self::dep_repo(dep, req);
+        let arch = Self::dep_arch(dep, req);
+        match self
+            .obs
+            .download_binary(project, package, repo, arch, filename)
+        {
+            Ok(bytes) => Ok((bytes, None)),
+            Err(e) if is_transport_cap_error(&e) => Err(download_cap_error(dep, filename)),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                match self.obs.binary_versions(project, repo, arch, &dep.name) {
+                    Ok(versions) => {
+                        // The listing reports the name the server
+                        // stored the fetched binary under
+                        // (`<binary>.<suffix>`): try that first. A
+                        // package in a repodata module is stored
+                        // under the full EVRA filename instead, so
+                        // the EVRA filename is the second candidate.
+                        // No usable name in the listing leaves only
+                        // the EVRA filename.
+                        let warmed = versions.iter().find(|version| version.error.is_none());
+                        let mut candidates = Vec::new();
+                        if let Some(reported) = warmed.map(|version| version.name.clone()) {
+                            candidates.push(reported);
+                        }
+                        if !candidates.iter().any(|name| name == filename) {
+                            candidates.push(filename.to_string());
+                        }
+                        let mut last_err = None;
+                        for name in &candidates {
+                            match self.obs.download_binary(project, package, repo, arch, name) {
+                                Ok(bytes) => {
+                                    return Ok((
+                                        bytes,
+                                        warmed.and_then(|version| version.hdrmd5.clone()),
+                                    ));
+                                }
+                                Err(err) if is_transport_cap_error(&err) => {
+                                    return Err(download_cap_error(dep, filename));
+                                }
+                                Err(err) => last_err = Some(err),
+                            }
+                        }
+                        match last_err {
+                            Some(err) => Err(err),
+                            None => Err(e),
+                        }
+                    }
+                    Err(warm) => {
+                        self.debug.emit(&format!(
+                            "local-build: warming dependency {} failed ({}); keeping the original 404",
+                            dep.name, warm
+                        ));
+                        Err(e)
+                    }
+                }
+            }
             Err(e) => Err(e),
+        }
+    }
+
+    /// The hdrmd5 to verify a downloaded dep against. The warmed
+    /// value wins when the download went through the warm: it is
+    /// computed from the file the server fetched. Otherwise the
+    /// buildinfo value. The download-on-demand placeholder is never
+    /// a real digest, so a dep carrying only it verifies as absent,
+    /// and a warmed placeholder never overrides a real buildinfo
+    /// digest.
+    fn effective_hdrmd5<'h>(dep: &'h BuildDep, warmed: Option<&'h str>) -> Option<&'h str> {
+        let warmed = warmed.filter(|value| !value.eq_ignore_ascii_case(DOD_PLACEHOLDER_HDRMD5));
+        match warmed.or(dep.hdrmd5.as_deref()) {
+            Some(value) if value.eq_ignore_ascii_case(DOD_PLACEHOLDER_HDRMD5) => None,
+            other => other,
         }
     }
 
@@ -2169,6 +2246,18 @@ impl<'a> LocalBuild<'a> {
         }
         Ok(record)
     }
+}
+
+/// The friendly over-cap error for a dep download: the file exceeds
+/// the 10 MiB transport body limit.
+fn download_cap_error(dep: &BuildDep, filename: &str) -> GeectlError {
+    GeectlError::new(
+        ErrorKind::ServerError,
+        format!(
+            "cannot download {filename} for dependency {}: the file exceeds the 10 MiB transport body limit; streaming downloads are not supported yet",
+            dep.name
+        ),
+    )
 }
 
 /// Whether `e` is the transport's over-cap rejection: the response
@@ -7782,6 +7871,672 @@ exit 0
                 .ensure_cached(&req, &dep, &filename, &mut stats)
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn ensure_cached_verifies_a_dod_binary_against_the_warmed_hdrmd5() {
+            // buildinfo carries the download-on-demand placeholder
+            // hdrmd5 for a binary nobody has fetched yet, not the
+            // real header digest: the direct download 404s, the warm
+            // fetches the file and reports its real hdrmd5, and the
+            // retry downloads it. The cached file is verified against
+            // the warmed digest — the placeholder would reject the
+            // real file as corrupt.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"bash payload");
+            let real_hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/bash-5.3.20-11.1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=bash"
+            );
+            let warmed_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/bash.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
+                .with_get_bytes(&warmed_url, &rpm)
+                .with_get(
+                    &warm_url,
+                    &format!(
+                        "<binaryversionlist><binary name=\"bash.rpm\" hdrmd5=\"{real_hdrmd5}\" sizek=\"10\"/></binaryversionlist>"
+                    ),
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "bash".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(DOD_PLACEHOLDER_HDRMD5.to_string()),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let mut stats = CacheStats::default();
+            let filename = format!("bash-5.3.20-11.1.{arch}.rpm");
+            let path = vertical
+                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), rpm);
+            assert_eq!(stats.pkg_misses, 1);
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warm_url)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &download_url)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warmed_url)
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn ensure_cached_does_not_reject_a_cached_dod_binary() {
+            // A download-on-demand binary verified at download time
+            // against the warmed hdrmd5: a later build finds it in
+            // the cache and must not reject it for carrying the
+            // placeholder hdrmd5 in buildinfo — there is no real
+            // digest to check it against, so the hit verifies as ok.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"bash payload");
+            let filename = format!("bash-5.3.20-11.1.{arch}.rpm");
+            let cached = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(arch)
+                .join(&filename);
+            fs::create_dir_all(cached.parent().unwrap()).unwrap();
+            fs::write(&cached, &rpm).unwrap();
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "bash".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(DOD_PLACEHOLDER_HDRMD5.to_string()),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let mut stats = CacheStats::default();
+            let path = vertical
+                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), rpm);
+            assert_eq!(stats.pkg_hits, 1);
+            assert!(http.get_bytes_calls().is_empty());
+        }
+
+        #[test]
+        fn ensure_cached_rejects_a_dod_binary_when_the_warmed_hdrmd5_mismatches() {
+            // The warm reports the digest of a different payload than
+            // the downloaded file: the warmed digest is the expected
+            // value, so the mismatch is a corrupt cache entry — the
+            // file is deleted and the build fails, not silently kept.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"bash payload");
+            let other = make_rpm(b"other payload");
+            let other_hdrmd5 = format!("{:x}", md5::compute(&other[112..]));
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/bash-5.3.20-11.1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=bash"
+            );
+            let warmed_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/bash.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
+                .with_get_bytes(&warmed_url, &rpm)
+                .with_get(
+                    &warm_url,
+                    &format!(
+                        "<binaryversionlist><binary name=\"bash.rpm\" hdrmd5=\"{other_hdrmd5}\" sizek=\"10\"/></binaryversionlist>"
+                    ),
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "bash".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(DOD_PLACEHOLDER_HDRMD5.to_string()),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let mut stats = CacheStats::default();
+            let filename = format!("bash-5.3.20-11.1.{arch}.rpm");
+            let err = vertical
+                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
+            let cached = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(arch)
+                .join(&filename);
+            assert!(!cached.exists());
+        }
+
+        #[test]
+        fn ensure_cached_prefers_the_warmed_hdrmd5_over_buildinfo() {
+            // The warmed digest is the authority: buildinfo agrees
+            // with the downloaded file, but the warm reports a
+            // different digest for the fetched file, so the file is
+            // not the one the server fetched and is rejected.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"bash payload");
+            let real_hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let other = make_rpm(b"other payload");
+            let other_hdrmd5 = format!("{:x}", md5::compute(&other[112..]));
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/bash-5.3.20-11.1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=bash"
+            );
+            let warmed_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/bash.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
+                .with_get_bytes(&warmed_url, &rpm)
+                .with_get(
+                    &warm_url,
+                    &format!(
+                        "<binaryversionlist><binary name=\"bash.rpm\" hdrmd5=\"{other_hdrmd5}\" sizek=\"10\"/></binaryversionlist>"
+                    ),
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "bash".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(real_hdrmd5),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let mut stats = CacheStats::default();
+            let filename = format!("bash-5.3.20-11.1.{arch}.rpm");
+            let err = vertical
+                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
+        }
+
+        #[test]
+        fn effective_hdrmd5_prefers_the_warmed_digest_and_ignores_the_placeholder() {
+            // The warmed digest wins over buildinfo, and the
+            // placeholder is never a digest: a warmed placeholder
+            // leaves a real buildinfo digest in place, and a dep
+            // carrying only the placeholder verifies as absent. The
+            // placeholder matches case-insensitively, like the digest
+            // comparison in `verify_hdrmd5`.
+            let mut dep = BuildDep {
+                name: "bash".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some("abc".to_string()),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            assert_eq!(LocalBuild::effective_hdrmd5(&dep, Some("def")), Some("def"));
+            assert_eq!(
+                LocalBuild::effective_hdrmd5(&dep, Some(DOD_PLACEHOLDER_HDRMD5)),
+                Some("abc")
+            );
+            assert_eq!(LocalBuild::effective_hdrmd5(&dep, None), Some("abc"));
+            dep.hdrmd5 = Some(DOD_PLACEHOLDER_HDRMD5.to_string());
+            assert_eq!(LocalBuild::effective_hdrmd5(&dep, None), None);
+            assert_eq!(LocalBuild::effective_hdrmd5(&dep, Some("def")), Some("def"));
+            assert_eq!(
+                LocalBuild::effective_hdrmd5(&dep, Some("D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0")),
+                None
+            );
+        }
+
+        #[test]
+        fn download_dep_404_warms_the_binary_and_retries_once() {
+            // A direct file download 404s for a download-on-demand
+            // binary nobody has asked for: the daemon fetches
+            // repository metadata only. The download asks the server
+            // for the binary's versions — that listing makes the
+            // server fetch it — and retries once, under the name the
+            // listing reports (`glibc.rpm`): the backend stores the
+            // fetched binary under that name, and a retry under the
+            // full EVRA filename 404s again. Without the retry the
+            // build fails on the first 404.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=glibc"
+            );
+            let warmed_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(
+                    &download_url,
+                    &[ErrorKind::NotFound, ErrorKind::NotFound],
+                )
+                .with_get_bytes(&warmed_url, b"fake glibc rpm")
+                .with_get(
+                    &warm_url,
+                    "<binaryversionlist><binary name=\"glibc.rpm\" hdrmd5=\"abc\" sizek=\"10\"/></binaryversionlist>",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let (bytes, warmed) = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                )
+                .unwrap();
+            assert_eq!(bytes, b"fake glibc rpm".to_vec());
+            assert_eq!(warmed.as_deref(), Some("abc"));
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warm_url)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &download_url)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warmed_url)
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn download_dep_warmed_name_404_falls_back_to_evra_filename() {
+            // The warm reports the stored name, but a package in a
+            // repodata module is stored under the full EVRA filename
+            // instead: the retry under the reported name 404s, and
+            // one final retry under the EVRA filename finds it.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let warmed_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=glibc"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
+                .with_get_bytes(&download_url, b"fake glibc rpm")
+                .with_get_bytes_error_sequence(&warmed_url, &[ErrorKind::NotFound])
+                .with_get(
+                    &warm_url,
+                    "<binaryversionlist><binary name=\"glibc.rpm\" hdrmd5=\"abc\" sizek=\"10\"/></binaryversionlist>",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let (bytes, warmed) = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                )
+                .unwrap();
+            assert_eq!(bytes, b"fake glibc rpm".to_vec());
+            assert_eq!(warmed.as_deref(), Some("abc"));
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warm_url)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &download_url)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warmed_url)
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn download_dep_404_twice_is_still_a_404_after_one_warm() {
+            // A binary the repository does not carry stays a 404:
+            // the warm listing reports it unavailable and the retry
+            // 404s again. Exactly one warm and one retry: no loop.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=glibc"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(
+                    &download_url,
+                    &[ErrorKind::NotFound, ErrorKind::NotFound],
+                )
+                .with_get(
+                    &warm_url,
+                    "<binaryversionlist><binary name=\"glibc\" error=\"not available\"/></binaryversionlist>",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let err = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotFound);
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warm_url)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &download_url)
+                    .count(),
+                2
+            );
+        }
+
+        #[test]
+        fn download_dep_warm_failure_keeps_the_original_404() {
+            // A warm that itself fails keeps the original 404: the
+            // caller sees the missing binary, not the warm failure.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=glibc"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
+                .with_get_error(&warm_url, ErrorKind::ServerError);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let err = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotFound);
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warm_url)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &download_url)
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn download_dep_other_errors_do_not_warm() {
+            // Only a 404 warms: a server error fails straight away
+            // with no listing request.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new().with_get_error(&download_url, ErrorKind::ServerError);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let err = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(http.get_calls().is_empty());
         }
 
         #[test]
