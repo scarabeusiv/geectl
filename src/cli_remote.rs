@@ -170,12 +170,81 @@ pub enum RemoteCommand {
         /// The project to show.
         project: String,
     },
+    /// Set fields of a project's meta. A mutation: dry-run is the
+    /// default (only the plan is printed); `--live` performs the
+    /// write. Only the given fields change; the rest of the meta is
+    /// kept as it is. There is no flag to clear a field.
+    SetProjectMeta {
+        /// The project whose meta is written.
+        project: String,
+        /// The new title.
+        #[arg(long)]
+        title: Option<String>,
+        /// The new description.
+        #[arg(long)]
+        description: Option<String>,
+        /// The new URL.
+        #[arg(long)]
+        url: Option<String>,
+        /// The new scmsync URL.
+        #[arg(long)]
+        scmsync: Option<String>,
+        /// The new devel project.
+        #[arg(long)]
+        devel_project: Option<String>,
+    },
     /// Show a package's meta (title, description, persons, devel project).
     PackageMeta {
         /// The project the package lives in.
         project: String,
         /// The package to show.
         package: String,
+    },
+    /// Set fields of a package's meta. A mutation: dry-run is the
+    /// default (only the plan is printed); `--live` performs the
+    /// write. Only the given fields change; the rest of the meta is
+    /// kept as it is. There is no flag to clear a field.
+    SetPackageMeta {
+        /// The project the package lives in.
+        project: String,
+        /// The package whose meta is written.
+        package: String,
+        /// The new title.
+        #[arg(long)]
+        title: Option<String>,
+        /// The new description.
+        #[arg(long)]
+        description: Option<String>,
+        /// The new URL.
+        #[arg(long)]
+        url: Option<String>,
+        /// The new scmsync URL.
+        #[arg(long)]
+        scmsync: Option<String>,
+        /// The new release name.
+        #[arg(long)]
+        releasename: Option<String>,
+        /// The new devel project.
+        #[arg(long)]
+        devel_project: Option<String>,
+        /// The new devel package. Needs `--devel-project` unless the
+        /// package already has a devel project.
+        #[arg(long)]
+        devel_package: Option<String>,
+    },
+    /// Update a package's meta from its spec file. A mutation:
+    /// dry-run is the default (only the plan is printed); `--live`
+    /// performs the update. The spec file is found by listing the
+    /// package files when exactly one `*.spec` exists; otherwise
+    /// name it with `--spec`.
+    UpdatePackageMetaFromSpec {
+        /// The project the package lives in.
+        project: String,
+        /// The package whose meta is updated.
+        package: String,
+        /// The spec file to read the meta from.
+        #[arg(long)]
+        spec: Option<String>,
     },
     /// Search packages by name. Substring matches on name, title, and
     /// description by default; `--exact` keeps only exact-name matches
@@ -532,6 +601,9 @@ pub fn run_remote(
         RemoteCommand::UploadFile { .. } if !live => Credentials::None,
         RemoteCommand::CreateProject { .. } if !live => Credentials::None,
         RemoteCommand::CreatePackage { .. } if !live => Credentials::None,
+        RemoteCommand::SetProjectMeta { .. } if !live => Credentials::None,
+        RemoteCommand::SetPackageMeta { .. } if !live => Credentials::None,
+        RemoteCommand::UpdatePackageMetaFromSpec { .. } if !live => Credentials::None,
         RemoteCommand::DeletePackage { .. } if !live => Credentials::None,
         RemoteCommand::DeleteLink { .. } if !live => Credentials::None,
         RemoteCommand::DeleteProject { .. } if !live => Credentials::None,
@@ -676,6 +748,103 @@ pub fn run_remote(
             let meta = client.package_meta(&project, &package)?;
             let payload = package_meta_json(&meta);
             Ok((payload, render_package_meta(&meta)))
+        }
+        RemoteCommand::SetProjectMeta {
+            project,
+            title,
+            description,
+            url,
+            scmsync,
+            devel_project,
+        } => {
+            let flags = ProjectMetaFlags {
+                title,
+                description,
+                url,
+                scmsync,
+                devel_project,
+            };
+            let fields = project_meta_fields(&flags)?;
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            let current = if live {
+                client.project_meta(&project)?
+            } else {
+                empty_project_meta(&project)
+            };
+            let merged = merge_project_meta(&current, &flags);
+            client.set_project_meta(&project, &merged, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(set_project_meta_result(
+                &merged,
+                &fields,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
+        RemoteCommand::SetPackageMeta {
+            project,
+            package,
+            title,
+            description,
+            url,
+            scmsync,
+            releasename,
+            devel_project,
+            devel_package,
+        } => {
+            let flags = PackageMetaFlags {
+                title,
+                description,
+                url,
+                scmsync,
+                releasename,
+                devel_project,
+                devel_package,
+            };
+            let fields = package_meta_fields(&flags)?;
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            let current = if live {
+                client.package_meta(&project, &package)?
+            } else {
+                empty_package_meta(&project, &package)
+            };
+            let merged = merge_package_meta(&current, &flags)?;
+            client.set_package_meta(&project, &package, &merged, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(set_package_meta_result(
+                &merged,
+                &fields,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
+        RemoteCommand::UpdatePackageMetaFromSpec {
+            project,
+            package,
+            spec,
+        } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.update_package_meta_from_spec(&project, &package, spec.as_deref(), &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(update_package_meta_from_spec_result(
+                &project,
+                &package,
+                &spec,
+                dry_run.enabled(),
+                plan,
+            ))
         }
         RemoteCommand::SearchPackages { term, exact } => {
             let matches = apply_exact(client.search_packages(&term)?, &term, exact, |match_| {
@@ -1458,6 +1627,320 @@ fn delete_link_result(
         format!("dry-run: would delete link of package {package} from project {project}")
     } else {
         format!("deleted link of package {package} from project {project}")
+    };
+    mutation_result(
+        payload,
+        format!("project: {project} package: {package}"),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// A project meta with only the name set: the base the flags
+/// merge onto in dry-run, where no server is read.
+fn empty_project_meta(project: &str) -> ProjectMeta {
+    ProjectMeta {
+        name: project.to_string(),
+        title: None,
+        description: None,
+        url: None,
+        scmsync: None,
+        devel: None,
+        persons: vec![],
+        groups: vec![],
+        repositories: vec![],
+    }
+}
+
+/// A package meta with only the name and project set: the base the
+/// flags merge onto in dry-run, where no server is read.
+fn empty_package_meta(project: &str, package: &str) -> PackageMeta {
+    PackageMeta {
+        name: package.to_string(),
+        project: project.to_string(),
+        title: None,
+        description: None,
+        url: None,
+        scmsync: None,
+        releasename: None,
+        devel: None,
+        persons: vec![],
+        groups: vec![],
+    }
+}
+
+/// The flags of a `set-project-meta` call: one optional value per
+/// writable field. Absent means keep the current value.
+struct ProjectMetaFlags {
+    title: Option<String>,
+    description: Option<String>,
+    url: Option<String>,
+    scmsync: Option<String>,
+    devel_project: Option<String>,
+}
+
+/// The flags of a `set-package-meta` call: one optional value per
+/// writable field. Absent means keep the current value.
+struct PackageMetaFlags {
+    title: Option<String>,
+    description: Option<String>,
+    url: Option<String>,
+    scmsync: Option<String>,
+    releasename: Option<String>,
+    devel_project: Option<String>,
+    devel_package: Option<String>,
+}
+
+/// Merge the given project-meta flags onto the current meta: a flag
+/// replaces its field, an absent flag keeps the current value.
+fn merge_project_meta(current: &ProjectMeta, flags: &ProjectMetaFlags) -> ProjectMeta {
+    let mut merged = current.clone();
+    if let Some(title) = &flags.title {
+        merged.title = Some(title.clone());
+    }
+    if let Some(description) = &flags.description {
+        merged.description = Some(description.clone());
+    }
+    if let Some(url) = &flags.url {
+        merged.url = Some(url.clone());
+    }
+    if let Some(scmsync) = &flags.scmsync {
+        merged.scmsync = Some(scmsync.clone());
+    }
+    if let Some(devel) = &flags.devel_project {
+        merged.devel = Some(devel.clone());
+    }
+    merged
+}
+
+/// Merge the given package-meta flags onto the current meta: a flag
+/// replaces its field, an absent flag keeps the current value. A
+/// `--devel-project` without `--devel-package` keeps the current
+/// devel package, or the package's own name when it has none. A
+/// `--devel-package` without `--devel-project` keeps the current
+/// devel project, and errors when the package has none — in dry-run
+/// the current meta is unread, so the pair is an error there too.
+fn merge_package_meta(
+    current: &PackageMeta,
+    flags: &PackageMetaFlags,
+) -> Result<PackageMeta, GeectlError> {
+    let mut merged = current.clone();
+    if let Some(title) = &flags.title {
+        merged.title = Some(title.clone());
+    }
+    if let Some(description) = &flags.description {
+        merged.description = Some(description.clone());
+    }
+    if let Some(url) = &flags.url {
+        merged.url = Some(url.clone());
+    }
+    if let Some(scmsync) = &flags.scmsync {
+        merged.scmsync = Some(scmsync.clone());
+    }
+    if let Some(releasename) = &flags.releasename {
+        merged.releasename = Some(releasename.clone());
+    }
+    match (&flags.devel_project, &flags.devel_package) {
+        (Some(project), package) => {
+            let package = match package {
+                Some(package) => package.clone(),
+                None => match &current.devel {
+                    Some((_, package)) => package.clone(),
+                    None => merged.name.clone(),
+                },
+            };
+            merged.devel = Some((project.clone(), package));
+        }
+        (None, Some(package)) => {
+            if let Some((project, _)) = &current.devel {
+                merged.devel = Some((project.clone(), package.clone()));
+            } else {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "--devel-package needs --devel-project or a devel project already set on the package",
+                ));
+            }
+        }
+        (None, None) => {}
+    }
+    Ok(merged)
+}
+
+/// The project-meta fields a `set-project-meta` call sets, as
+/// `name: value` entries for the result line. An empty flag set is
+/// an input error: a write with nothing to write is a no-op.
+fn project_meta_fields(flags: &ProjectMetaFlags) -> Result<Vec<String>, GeectlError> {
+    let mut fields = Vec::new();
+    if let Some(title) = &flags.title {
+        fields.push(format!("title: {title}"));
+    }
+    if let Some(description) = &flags.description {
+        fields.push(format!("description: {description}"));
+    }
+    if let Some(url) = &flags.url {
+        fields.push(format!("url: {url}"));
+    }
+    if let Some(scmsync) = &flags.scmsync {
+        fields.push(format!("scmsync: {scmsync}"));
+    }
+    if let Some(devel) = &flags.devel_project {
+        fields.push(format!("devel-project: {devel}"));
+    }
+    if fields.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "set-project-meta needs at least one of --title, --description, --url, --scmsync, --devel-project",
+        ));
+    }
+    Ok(fields)
+}
+
+/// The package-meta fields a `set-package-meta` call sets, as
+/// `name: value` entries for the result line. An empty flag set is
+/// an input error: a write with nothing to write is a no-op.
+fn package_meta_fields(flags: &PackageMetaFlags) -> Result<Vec<String>, GeectlError> {
+    let mut fields = Vec::new();
+    if let Some(title) = &flags.title {
+        fields.push(format!("title: {title}"));
+    }
+    if let Some(description) = &flags.description {
+        fields.push(format!("description: {description}"));
+    }
+    if let Some(url) = &flags.url {
+        fields.push(format!("url: {url}"));
+    }
+    if let Some(scmsync) = &flags.scmsync {
+        fields.push(format!("scmsync: {scmsync}"));
+    }
+    if let Some(releasename) = &flags.releasename {
+        fields.push(format!("releasename: {releasename}"));
+    }
+    if let Some(devel) = &flags.devel_project {
+        fields.push(format!("devel-project: {devel}"));
+    }
+    if let Some(devel) = &flags.devel_package {
+        fields.push(format!("devel-package: {devel}"));
+    }
+    if fields.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "set-package-meta needs at least one of --title, --description, --url, --scmsync, --releasename, --devel-project, --devel-package",
+        ));
+    }
+    Ok(fields)
+}
+
+/// Drop the null and empty-array keys from a meta payload: in dry-run
+/// the meta is flags-only, so a null or empty value means "not set by
+/// the flags", not "cleared" — the live meta keeps those fields.
+/// The dry-run payload carries only the fields the flags set.
+fn dry_run_meta_payload(mut payload: Value) -> Value {
+    if let Value::Object(map) = &mut payload {
+        map.retain(|_, value| {
+            !value.is_null() && !value.as_array().is_some_and(|items| items.is_empty())
+        });
+    }
+    payload
+}
+
+/// The `set-project-meta` result: the payload carries the meta as
+/// written; the text states the write, or the dry-run plan. In
+/// dry-run the payload drops null and empty-array keys; the
+/// flags-only shape holds because the dry-run merge starts from
+/// the empty meta.
+fn set_project_meta_result(
+    meta: &ProjectMeta,
+    fields: &[String],
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let result_line = if dry_run {
+        format!(
+            "dry-run: would set project meta of {} ({})",
+            meta.name,
+            fields.join("; ")
+        )
+    } else {
+        format!("set project meta of {} ({})", meta.name, fields.join("; "))
+    };
+    let payload = if dry_run {
+        dry_run_meta_payload(project_meta_json(meta))
+    } else {
+        project_meta_json(meta)
+    };
+    mutation_result(
+        payload,
+        format!("project: {}", meta.name),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The `set-package-meta` result: the payload carries the meta as
+/// written; the text states the write, or the dry-run plan. In
+/// dry-run the payload drops null and empty-array keys; the
+/// flags-only shape holds because the dry-run merge starts from
+/// the empty meta.
+fn set_package_meta_result(
+    meta: &PackageMeta,
+    fields: &[String],
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let result_line = if dry_run {
+        format!(
+            "dry-run: would set package meta of {}/{} ({})",
+            meta.project,
+            meta.name,
+            fields.join("; ")
+        )
+    } else {
+        format!(
+            "set package meta of {}/{} ({})",
+            meta.project,
+            meta.name,
+            fields.join("; ")
+        )
+    };
+    let payload = if dry_run {
+        dry_run_meta_payload(package_meta_json(meta))
+    } else {
+        package_meta_json(meta)
+    };
+    mutation_result(
+        payload,
+        format!("project: {} package: {}", meta.project, meta.name),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The `update-package-meta-from-spec` result: the payload carries
+/// the coordinates and the spec file, when named; the text states
+/// the update, or the dry-run plan.
+fn update_package_meta_from_spec_result(
+    project: &str,
+    package: &str,
+    spec: &Option<String>,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let payload = json!({
+        "project": project,
+        "package": package,
+        "spec": spec,
+    });
+    let source = match spec {
+        Some(spec) => format!("spec {spec}"),
+        None => "the spec file".to_string(),
+    };
+    let result_line = if dry_run {
+        format!("dry-run: would update package meta of {project}/{package} from {source}")
+    } else {
+        format!("updated package meta of {project}/{package} from {source}")
     };
     mutation_result(
         payload,
@@ -2963,6 +3446,303 @@ mod tests {
             text,
             "project: P package: K\ndry_run: true\ndry-run: would delete link of package K from project P\n[dry-run] would: delete link of P/K"
         );
+        let (payload, text) = delete_link_result("P", "K", false, None);
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: false\ndeleted link of package K from project P"
+        );
+    }
+
+    #[test]
+    fn set_project_meta_parses_field_flags() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--title",
+            "Alice",
+            "--url",
+            "https://example.org",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::SetProjectMeta {
+                project,
+                title: Some(title),
+                description: None,
+                url: Some(url),
+                scmsync: None,
+                devel_project: None,
+            } if project == "home:alice" && title == "Alice" && url == "https://example.org"
+        ));
+    }
+
+    #[test]
+    fn set_package_meta_parses_field_flags() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "set-package-meta",
+            "P",
+            "K",
+            "--releasename",
+            "vim",
+            "--devel-project",
+            "devel:languages:vim",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::SetPackageMeta {
+                project,
+                package,
+                releasename: Some(releasename),
+                devel_project: Some(devel),
+                ..
+            } if project == "P" && package == "K" && releasename == "vim" && devel == "devel:languages:vim"
+        ));
+    }
+
+    #[test]
+    fn update_package_meta_from_spec_parses_optional_spec() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "update-package-meta-from-spec",
+            "P",
+            "K",
+            "--spec",
+            "vim.spec",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::UpdatePackageMetaFromSpec {
+                project,
+                package,
+                spec: Some(spec),
+            } if project == "P" && package == "K" && spec == "vim.spec"
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "update-package-meta-from-spec",
+            "P",
+            "K",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::UpdatePackageMetaFromSpec { spec: None, .. }
+        ));
+    }
+
+    #[test]
+    fn merge_project_meta_keeps_unmentioned_fields() {
+        let current = sample_project_meta();
+        let flags = ProjectMetaFlags {
+            title: Some("New title".to_string()),
+            description: None,
+            url: None,
+            scmsync: Some("https://github.com/openSUSE/factory.git".to_string()),
+            devel_project: None,
+        };
+        let merged = merge_project_meta(&current, &flags);
+        assert_eq!(merged.title, Some("New title".to_string()));
+        assert_eq!(
+            merged.description,
+            Some("The rolling distribution".to_string())
+        );
+        assert_eq!(merged.url, Some("https://www.opensuse.org".to_string()));
+        assert_eq!(
+            merged.scmsync,
+            Some("https://github.com/openSUSE/factory.git".to_string())
+        );
+        assert_eq!(merged.devel, None);
+        assert_eq!(merged.persons, current.persons);
+        assert_eq!(merged.repositories, current.repositories);
+    }
+
+    #[test]
+    fn merge_package_meta_defaults_devel_package_to_the_package_name() {
+        let current = PackageMeta {
+            name: "vim".to_string(),
+            project: "P".to_string(),
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel: None,
+            persons: vec![],
+            groups: vec![],
+        };
+        let flags = PackageMetaFlags {
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel_project: Some("devel:languages:vim".to_string()),
+            devel_package: None,
+        };
+        let merged = merge_package_meta(&current, &flags).unwrap();
+        assert_eq!(
+            merged.devel,
+            Some(("devel:languages:vim".to_string(), "vim".to_string()))
+        );
+    }
+
+    #[test]
+    fn merge_package_meta_devel_package_alone_needs_a_devel_project() {
+        let current = PackageMeta {
+            name: "vim".to_string(),
+            project: "P".to_string(),
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel: None,
+            persons: vec![],
+            groups: vec![],
+        };
+        let flags = PackageMetaFlags {
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel_project: None,
+            devel_package: Some("other".to_string()),
+        };
+        // Both modes reject the pair: live reads the current meta and
+        // finds no devel project; dry-run never reads the current meta,
+        // so the pair is an error there too.
+        let err = merge_package_meta(&current, &flags).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // With a devel project already set on the package, the pair
+        // resolves against it.
+        let current = PackageMeta {
+            devel: Some(("devel:languages:vim".to_string(), "vim".to_string())),
+            ..current
+        };
+        let merged = merge_package_meta(&current, &flags).unwrap();
+        assert_eq!(
+            merged.devel,
+            Some(("devel:languages:vim".to_string(), "other".to_string()))
+        );
+    }
+
+    #[test]
+    fn meta_fields_rejects_an_empty_flag_set() {
+        let project_flags = ProjectMetaFlags {
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            devel_project: None,
+        };
+        assert!(project_meta_fields(&project_flags).is_err());
+        let package_flags = PackageMetaFlags {
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel_project: None,
+            devel_package: None,
+        };
+        assert!(package_meta_fields(&package_flags).is_err());
+    }
+
+    #[test]
+    fn set_project_meta_result_carries_meta_and_fields_in_both_formats() {
+        let meta = sample_project_meta();
+        let fields = vec!["title: Factory".to_string()];
+        let (payload, text) = set_project_meta_result(&meta, &fields, true, None);
+        assert_eq!(payload["name"], "openSUSE:Factory");
+        assert_eq!(payload["title"], "Factory");
+        assert_eq!(payload["dry_run"], true);
+        // The dry-run payload drops null and empty-array keys.
+        assert!(payload.get("scmsync").is_none());
+        assert!(payload.get("devel").is_none());
+        assert!(payload.get("groups").is_none());
+        let (payload, live_text) = set_project_meta_result(&meta, &fields, false, None);
+        assert_eq!(payload["scmsync"], serde_json::Value::Null);
+        assert_eq!(payload["groups"], json!([]));
+        assert_eq!(
+            live_text,
+            "project: openSUSE:Factory\ndry_run: false\nset project meta of openSUSE:Factory (title: Factory)"
+        );
+        assert_eq!(
+            text,
+            "project: openSUSE:Factory\ndry_run: true\ndry-run: would set project meta of openSUSE:Factory (title: Factory)"
+        );
+    }
+
+    #[test]
+    fn set_package_meta_result_carries_meta_and_fields_in_both_formats() {
+        let meta = PackageMeta {
+            name: "vim".to_string(),
+            project: "openSUSE:Factory".to_string(),
+            title: Some("Vi Improved".to_string()),
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel: None,
+            persons: vec![],
+            groups: vec![],
+        };
+        let fields = vec!["title: Vi Improved".to_string()];
+        let (payload, text) = set_package_meta_result(&meta, &fields, true, None);
+        assert_eq!(payload["project"], "openSUSE:Factory");
+        assert_eq!(payload["name"], "vim");
+        assert_eq!(payload["title"], "Vi Improved");
+        assert_eq!(payload["dry_run"], true);
+        // The dry-run payload drops null and empty-array keys.
+        assert!(payload.get("scmsync").is_none());
+        assert!(payload.get("devel").is_none());
+        assert!(payload.get("groups").is_none());
+        assert_eq!(
+            text,
+            "project: openSUSE:Factory package: vim\ndry_run: true\ndry-run: would set package meta of openSUSE:Factory/vim (title: Vi Improved)"
+        );
+        let (payload, live_text) = set_package_meta_result(&meta, &fields, false, None);
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(payload["scmsync"], serde_json::Value::Null);
+        assert_eq!(payload["groups"], json!([]));
+        assert_eq!(
+            live_text,
+            "project: openSUSE:Factory package: vim\ndry_run: false\nset package meta of openSUSE:Factory/vim (title: Vi Improved)"
+        );
+    }
+
+    #[test]
+    fn update_package_meta_from_spec_result_states_the_update_in_both_formats() {
+        let (payload, text) = update_package_meta_from_spec_result(
+            "P",
+            "vim",
+            &Some("vim.spec".to_string()),
+            true,
+            None,
+        );
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["package"], "vim");
+        assert_eq!(payload["spec"], "vim.spec");
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            text,
+            "project: P package: vim\ndry_run: true\ndry-run: would update package meta of P/vim from spec vim.spec"
+        );
+        let (payload, live_text) =
+            update_package_meta_from_spec_result("P", "vim", &None, false, None);
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(payload["spec"], serde_json::Value::Null);
+        assert_eq!(
+            live_text,
+            "project: P package: vim\ndry_run: false\nupdated package meta of P/vim from the spec file"
+        );
     }
 
     #[test]
@@ -3605,6 +4385,33 @@ mod tests {
     fn unknown_remote_command_fails_to_parse() {
         assert!(Cli::try_parse_from(["geectl", "remote", "frobnicate"]).is_err());
         assert!(Cli::try_parse_from(["geectl", "remote", "cat", "only-one"]).is_err());
+    }
+
+    #[test]
+    fn batch4_leaves_missing_positionals_fail_with_exit_code_2() {
+        // Usage errors exit 2. A semantic rejection (a flag pair the
+        // local merge refuses) is a runtime InvalidInput, not a
+        // usage error, so it is not pinned here.
+        for args in [
+            vec!["geectl", "remote", "delete-link", "P"],
+            vec!["geectl", "remote", "search-projects-by-person"],
+            vec!["geectl", "remote", "count-scmsync-projects"],
+            vec!["geectl", "build", "rebuild-package", "P"],
+            vec!["geectl", "build", "restart-build", "P"],
+            vec!["geectl", "build", "abort-build", "P"],
+            vec!["geectl", "remote", "list-staging-projects"],
+            vec!["geectl", "remote", "staging-project", "P"],
+            vec!["geectl", "remote", "set-project-meta"],
+            vec!["geectl", "remote", "set-package-meta", "P"],
+            vec!["geectl", "remote", "update-package-meta-from-spec", "P"],
+        ] {
+            let err = Cli::try_parse_from(args.clone()).unwrap_err();
+            assert_eq!(
+                err.exit_code(),
+                2,
+                "args {args:?} must fail as a usage error"
+            );
+        }
     }
 
     #[test]

@@ -1289,6 +1289,34 @@ fn remote_repo_add_dry_run_ignores_half_set_credentials() {
 }
 
 #[test]
+fn remote_set_package_meta_devel_package_alone_fails_in_dry_run() {
+    // `--devel-package` without `--devel-project` needs a devel
+    // project already set on the package; dry-run never reads the
+    // current meta, so the pair fails before any plan is printed.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-package-meta",
+            "P",
+            "K",
+            "--devel-package",
+            "other",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "--devel-package needs --devel-project or a devel project already set on the package"
+    );
+}
+
+#[test]
 fn remote_repo_remove_dry_run_ignores_half_set_credentials() {
     // A dry-run mutation preview needs no credentials — the
     // library's dry-run guard runs before its credentials check —
@@ -1507,6 +1535,178 @@ fn remote_delete_link_live_with_half_set_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["--live", "remote", "delete-link", "home:alice", "vim"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_set_project_meta_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--title",
+            "Alice",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["name"], "home:alice");
+    assert_eq!(value["title"], "Alice");
+    // Unmentioned fields are absent from the dry-run payload, not cleared.
+    assert!(value.get("description").is_none());
+    assert!(value.get("repositories").is_none());
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: set project meta of home:alice"
+    );
+}
+
+#[test]
+fn remote_set_project_meta_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--title",
+            "Alice",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_set_package_meta_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--title",
+            "Vim",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "home:alice");
+    assert_eq!(value["name"], "vim");
+    assert_eq!(value["title"], "Vim");
+    // Unmentioned fields are absent from the dry-run payload, not cleared.
+    assert!(value.get("description").is_none());
+    assert!(value.get("persons").is_none());
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: set package meta of home:alice/vim"
+    );
+}
+
+#[test]
+fn remote_set_package_meta_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--title",
+            "Vim",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_update_package_meta_from_spec_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "update-package-meta-from-spec",
+            "home:alice",
+            "vim",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "home:alice");
+    assert_eq!(value["package"], "vim");
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: update package meta of home:alice/vim from spec"
+    );
+}
+
+#[test]
+fn remote_update_package_meta_from_spec_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "update-package-meta-from-spec",
+            "home:alice",
+            "vim",
+        ])
         .env("GEECTL_OBS_USERNAME", "alice")
         .output()
         .unwrap();
