@@ -309,6 +309,19 @@ impl HttpClient for FakeHttp {
         self.post(url, body, credentials)
     }
 
+    fn put_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // Fixtures do not distinguish content types: the transport
+        // tests in `http.rs` assert the header each method sends.
+        // The recorded PUT call carries the body, so a test can
+        // assert the collaborator PUT carried the permission.
+        self.put(url, body, credentials)
+    }
+
     fn post_text(
         &self,
         url: &str,

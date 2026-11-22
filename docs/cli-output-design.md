@@ -69,9 +69,9 @@ what "one coherent channel" means.
   `http: GET /source/openSUSE:Factory/geectl -> 200 in 123ms (attempt 1/4)`
   On a retryable failure the line carries the reason and the backoff:
   `http: GET /source/... -> 500 in 210ms (attempt 2/4, retry in 2s: transient status 500)`
-  (test `src/http.rs:3250`).
+  (test `src/http.rs:3329`).
   On exhaustion: `http: GET /source/... failed after 4 attempts (last: 500)`.
-  (test `src/http.rs:3255`).
+  (test `src/http.rs:3334`).
 - **Read-after-write retries** (the library's bounded retries, not the
   HTTP policy): each probe plus the remaining budget, e.g.
   `retry: create_package registration probe 1/30s: still not found`.
@@ -81,8 +81,8 @@ what "one coherent channel" means.
   visible trace.
 - **Library decision points** (the ones that change what happens
   next): the supersede-all filing decision (`decision: filing for foo; superseding open submit request(s) 1398492 with the new request`; test `src/obs/payload.rs:3789`), dedup checks (`decision: open maintenance_incident request(s) 1399001 already target openSUSE:Maintenance for foo; refusing to file`; test `src/obs/payload.rs:3876`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1084`),
-  endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:3196` vs
-  `decision: read via /source (authenticated)`; test `src/http.rs:3279`), and the accept-state check
+  endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:3275` vs
+  `decision: read via /source (authenticated)`; test `src/http.rs:3358`), and the accept-state check
   before a retried `change_state` (`decision: request 1398977 still new, re-issuing
   accepted`; test `src/obs/request.rs:5985`).
 - **Service status lines**: `service_state <project>/<package>: <code>` and

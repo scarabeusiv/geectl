@@ -156,7 +156,7 @@ pub fn is_retryable_method(method: &str) -> bool {
 /// a `post_json` here would silently fork as whoever the HTTP
 /// client's seam resolves, not as the Gitea client's token).
 /// The mutation methods (`post`, `post_text`, `post_json`,
-/// `post_json_with`, `put`, `put_file`, `delete`) all ask for
+/// `post_json_with`, `put`, `put_json_with`, `put_file`, `delete`) all ask for
 /// `application/xml` (`Accept` header): a path that exists in both
 /// the API and WebUI route sets serves the WebUI HTML page unless
 /// the request asks for XML.
@@ -195,6 +195,21 @@ pub trait HttpClient {
     /// that holds its own credentials (the Gitea client) never
     /// authenticates a mutation as someone else.
     fn post_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError>;
+    /// PUT a JSON body with explicit credentials. The `put`
+    /// counterpart of [`HttpClient::post_json_with`]: the same
+    /// `application/json` body and the credentials from the caller
+    /// instead of the client's auth seam — so a client that holds
+    /// its own credentials (the Gitea client) never authenticates
+    /// a mutation as someone else. Unlike POST, PUT is retried:
+    /// it is idempotent — re-PUTting the same collaborator or team
+    /// member stores the same state — so a transient failure
+    /// retries like GET.
+    fn put_json_with(
         &self,
         url: &str,
         body: &str,
@@ -1315,6 +1330,18 @@ impl HttpClient for UreqClient {
         // mutation as itself even when the HTTP client was built
         // with a different provider — or with none at all.
         self.post_with_content_type(url, body, "application/json", credentials)
+    }
+
+    fn put_json_with(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &Credentials,
+    ) -> Result<String, GeectlError> {
+        // The JSON PUT twin of post_json_with: the same explicit
+        // credentials, but PUT semantics — retried, because the
+        // collaborator and team PUTs are idempotent.
+        self.put_with_content_type(url, body, "application/json", credentials)
     }
 
     fn post(
@@ -2803,6 +2830,58 @@ mod tests {
             .nth(1)
             .expect("request has a body");
         assert_eq!(sent_body, body);
+    }
+
+    #[test]
+    fn put_json_with_sends_json_body() {
+        let server = LoopbackServer::serve("");
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Bearer {
+                token: "seam-token".to_string(),
+            }))),
+        )
+        .unwrap();
+        let body = "{\"permission\":\"write\"}";
+        let explicit = Credentials::Bearer {
+            token: "explicit-token".to_string(),
+        };
+        assert_eq!(
+            client
+                .put_json_with(&server.url(), body, &explicit)
+                .unwrap(),
+            ""
+        );
+        let request = server.request().expect("server recorded the request");
+        // Method, content type, body, and auth — exactly what a
+        // Gitea collaborator PUT needs: the explicit Bearer, not
+        // the seam one.
+        assert!(
+            request.starts_with("PUT /test HTTP/1.1\r\n"),
+            "PUT method line wrong; request: {}",
+            redact_authorization(&request)
+        );
+        assert!(
+            request
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("content-type: application/json")),
+            "PUT must carry Content-Type: application/json; request: {}",
+            redact_authorization(&request)
+        );
+        let (_, sent_body) = request.split_once("\r\n\r\n").expect("request has a body");
+        assert_eq!(sent_body, body);
+        assert!(
+            request
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("authorization: Bearer explicit-token")),
+            "PUT must carry the explicit Bearer, not the seam one; request: {}",
+            redact_authorization(&request)
+        );
+        assert!(
+            !request.contains("seam-token"),
+            "the seam token must not reach the wire; request: {}",
+            redact_authorization(&request)
+        );
     }
 
     #[test]
