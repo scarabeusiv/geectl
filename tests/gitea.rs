@@ -45,6 +45,7 @@ use geectl::gitea::{
 };
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::DryRun;
+use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef};
 
 /// Whether `url` points at a loopback host over plain HTTP.
 ///
@@ -1516,6 +1517,323 @@ fn gitea_pull_request_search_round_trip() {
     let _ = repo_guard.delete();
 }
 
+#[test]
+fn gitea_pull_request_approve_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
+    let (reviewer, reviewer_client) = reviewer_client(&http, &base);
+    let user = gitea_user();
+    let reference = PullRequestRef::Gitea {
+        owner: user.clone(),
+        repo: repo.clone(),
+        number,
+    };
+    let opinion = PullRequestClient::new(None, Some(&reviewer_client))
+        .approve(&reference, None, Some("Looks good."), &DryRun::new(false))
+        .expect("typed approve approves the pull request")
+        .expect("a live approve returns the opinion");
+    assert_eq!(opinion.reviewer, reviewer);
+    assert_eq!(opinion.state, OpinionState::Approved);
+    assert_eq!(opinion.comment, "Looks good.");
+    // The review reads back on the owner's client, as an
+    // APPROVED review by the reviewer.
+    let reviews = client
+        .pr_reviews(&user, &repo, number)
+        .expect("typed pr_reviews reads the reviews");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].state, "APPROVED");
+    assert_eq!(
+        reviews[0]
+            .user
+            .as_ref()
+            .expect("an APPROVED review names its user")
+            .login,
+        reviewer
+    );
+}
+
+#[test]
+fn gitea_pull_request_request_changes_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
+    let (reviewer, reviewer_client) = reviewer_client(&http, &base);
+    let user = gitea_user();
+    let reference = PullRequestRef::Gitea {
+        owner: user.clone(),
+        repo: repo.clone(),
+        number,
+    };
+    let opinion = PullRequestClient::new(None, Some(&reviewer_client))
+        .request_changes(&reference, None, Some("Needs work."), &DryRun::new(false))
+        .expect("typed request_changes asks for changes on the pull request")
+        .expect("a live request-changes returns the opinion");
+    assert_eq!(opinion.reviewer, reviewer);
+    assert_eq!(opinion.state, OpinionState::ChangesRequested);
+    assert_eq!(opinion.comment, "Needs work.");
+    let reviews = client
+        .pr_reviews(&user, &repo, number)
+        .expect("typed pr_reviews reads the reviews");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].state, "REQUEST_CHANGES");
+    assert_eq!(
+        reviews[0]
+            .user
+            .as_ref()
+            .expect("a REQUEST_CHANGES review names its user")
+            .login,
+        reviewer
+    );
+}
+
+#[test]
+fn gitea_pull_request_comment_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
+    let (reviewer, reviewer_client) = reviewer_client(&http, &base);
+    let user = gitea_user();
+    let reference = PullRequestRef::Gitea {
+        owner: user.clone(),
+        repo: repo.clone(),
+        number,
+    };
+    let comment = PullRequestClient::new(None, Some(&reviewer_client))
+        .comment(&reference, "One nit.", None, &DryRun::new(false))
+        .expect("typed comment comments on the pull request")
+        .expect("a live comment returns the comment");
+    assert_eq!(comment.author, reviewer);
+    assert_eq!(comment.body, "One nit.");
+    let comments = PullRequestClient::new(None, Some(&client))
+        .comments(&reference)
+        .expect("typed comments lists the comments");
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].author, reviewer);
+    assert_eq!(comments[0].body, "One nit.");
+}
+
+#[test]
+fn gitea_pull_request_cancel_review_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
+    let user = gitea_user();
+    let reviewer = unique_user_name();
+    create_user_raw(&http, &base, &reviewer);
+    request_review_raw(
+        &http,
+        &RepoAddr {
+            base: &base,
+            owner: &user,
+            repo: &repo,
+        },
+        number,
+        &[&reviewer],
+        &[],
+    );
+    let reference = PullRequestRef::Gitea {
+        owner: user.clone(),
+        repo: repo.clone(),
+        number,
+    };
+    let pending = client
+        .pr_reviews(&user, &repo, number)
+        .expect("typed pr_reviews reads the reviews");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].state, "REQUEST_REVIEW");
+    assert_eq!(
+        pending[0]
+            .user
+            .as_ref()
+            .expect("a pending review names its user")
+            .login,
+        reviewer
+    );
+    let pr = PullRequestClient::new(None, Some(&client));
+    let cancelled = pr
+        .cancel_review_request(
+            &reference,
+            std::slice::from_ref(&reviewer),
+            false,
+            &[],
+            &DryRun::new(false),
+        )
+        .expect("typed cancel_review_request cancels the review")
+        .expect("a live cancel returns the cancelled names");
+    assert_eq!(cancelled, vec![reviewer.clone()]);
+    let after = client
+        .pr_reviews(&user, &repo, number)
+        .expect("typed pr_reviews reads the reviews");
+    assert!(after.is_empty(), "the cancelled review must be gone");
+    // A repeat cancel fails client-side: the server answers 204
+    // even with no pending request.
+    let err = pr
+        .cancel_review_request(
+            &reference,
+            std::slice::from_ref(&reviewer),
+            false,
+            &[],
+            &DryRun::new(false),
+        )
+        .expect_err("a repeat cancel must fail");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains(&reviewer),
+        "the repeat-cancel error must name the reviewer; got {err}"
+    );
+    // --all with nothing pending cancels nothing.
+    let empty = pr
+        .cancel_review_request(&reference, &[], true, &[], &DryRun::new(false))
+        .expect("cancel --all with nothing pending succeeds")
+        .expect("a live --all cancel returns the cancelled names");
+    assert!(empty.is_empty());
+    // --all with an exclude: ask again from two reviewers, then
+    // cancel all but one — the exclude match ignores case, and an
+    // unknown exclude is ignored.
+    let carol = unique_user_name();
+    create_user_raw(&http, &base, &carol);
+    request_review_raw(
+        &http,
+        &RepoAddr {
+            base: &base,
+            owner: &user,
+            repo: &repo,
+        },
+        number,
+        &[&reviewer, &carol],
+        &[],
+    );
+    let pending = client
+        .pr_reviews(&user, &repo, number)
+        .expect("typed pr_reviews reads the reviews");
+    assert_eq!(pending.len(), 2);
+    let excluded = reviewer.to_ascii_uppercase();
+    let cancelled = pr
+        .cancel_review_request(
+            &reference,
+            &[],
+            true,
+            &[excluded, "unknown".to_string()],
+            &DryRun::new(false),
+        )
+        .expect("typed cancel_review_request cancels all but the excluded review")
+        .expect("a live --all cancel returns the cancelled names");
+    assert_eq!(cancelled, vec![carol]);
+    let remaining = client
+        .pr_reviews(&user, &repo, number)
+        .expect("typed pr_reviews reads the reviews");
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only the excluded reviewer stays pending"
+    );
+    assert_eq!(remaining[0].user.as_ref().unwrap().login, reviewer);
+    assert_eq!(remaining[0].state, "REQUEST_REVIEW");
+}
+
+#[test]
+fn gitea_pull_request_cancel_team_review_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let org = create_org_raw(&http, &base);
+    let team = client
+        .team_create(
+            &org,
+            "geectl-live-team",
+            &TeamCreateOptions {
+                permission: Some(GiteaAccess::Write),
+                ..Default::default()
+            },
+            false,
+            &DryRun::new(false),
+        )
+        .expect("typed team_create creates the team")
+        .expect("a non-dry-run create returns the team");
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &org, &repo);
+    let number = setup_org_pull_request(&http, &base, &org, &repo);
+    let added = client
+        .team_add_repo(team.id, &org, &repo, true, &DryRun::new(false))
+        .expect("typed team_add_repo adds the repository")
+        .expect("a non-dry-run add returns the repo");
+    assert_eq!(added.full_name, format!("{org}/{repo}"));
+    request_review_raw(
+        &http,
+        &RepoAddr {
+            base: &base,
+            owner: &org,
+            repo: &repo,
+        },
+        number,
+        &[],
+        &["geectl-live-team"],
+    );
+    let reference = PullRequestRef::Gitea {
+        owner: org.clone(),
+        repo: repo.clone(),
+        number,
+    };
+    // The pending entry carries no user, only the team.
+    let pending = client
+        .pr_reviews(&org, &repo, number)
+        .expect("typed pr_reviews reads the reviews");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].state, "REQUEST_REVIEW");
+    assert!(pending[0].user.is_none());
+    assert_eq!(
+        pending[0]
+            .team
+            .as_ref()
+            .expect("a team review names its team")
+            .name,
+        "geectl-live-team"
+    );
+    let cancelled = PullRequestClient::new(None, Some(&client))
+        .cancel_review_request(
+            &reference,
+            &["@geectl-live-team".to_string()],
+            false,
+            &[],
+            &DryRun::new(false),
+        )
+        .expect("typed cancel_review_request cancels the team review")
+        .expect("a live cancel returns the cancelled names");
+    assert_eq!(cancelled, vec!["@geectl-live-team"]);
+    let after = client
+        .pr_reviews(&org, &repo, number)
+        .expect("typed pr_reviews reads the reviews");
+    assert!(after.is_empty(), "the cancelled team review must be gone");
+}
+
 /// A username unique to this run, for the second user the
 /// collaborator and team tests create. Shorter than
 /// `unique_repo_name`: Gitea caps usernames at 39 characters.
@@ -1531,12 +1849,11 @@ fn unique_user_name() -> String {
     )
 }
 
-/// Create a second user through the raw admin API and return its
-/// login. The token needs `write:admin` (provision.sh). The
-/// password is generated per user: the instance is disposable and
-/// destroyed with the run, so the credential dies with it.
-fn create_user_raw(http: &UreqClient, base: &str, name: &str) -> String {
-    let password = format!(
+/// A password for a live-test user, unique per process and call.
+/// create_user_raw builds one inline; the token mint below needs
+/// the same password, so the generation is shared.
+fn unique_password() -> String {
+    format!(
         "geectl-live-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -1544,7 +1861,27 @@ fn create_user_raw(http: &UreqClient, base: &str, name: &str) -> String {
             .expect("system time is after the epoch")
             .as_secs(),
         unique_counter()
-    );
+    )
+}
+
+/// Create a second user through the raw admin API and return its
+/// login. The token needs `write:admin` (provision.sh). The
+/// password is generated per user: the instance is disposable and
+/// destroyed with the run, so the credential dies with it.
+fn create_user_raw(http: &UreqClient, base: &str, name: &str) -> String {
+    create_user_with_password_raw(http, base, name, &unique_password())
+}
+
+/// Create a second user with a given password through the raw
+/// admin API and return its login. create_user_raw generates the
+/// password internally; this variant takes one, so the caller can
+/// mint the user's own token afterwards.
+fn create_user_with_password_raw(
+    http: &UreqClient,
+    base: &str,
+    name: &str,
+    password: &str,
+) -> String {
     let body = serde_json::json!({
         "username": name,
         "email": format!("{name}@test.invalid"),
@@ -1561,6 +1898,123 @@ fn create_user_raw(http: &UreqClient, base: &str, name: &str) -> String {
         .as_str()
         .expect("the created user has a login")
         .to_string()
+}
+
+/// Mint an API token for a user through the raw API, authenticated
+/// as the user themself: the admin token cannot touch another
+/// user's tokens endpoint (401), so the mint goes through the
+/// user's own Basic auth. Returns the token value. The scopes
+/// cover the review-act surface: approve and request-changes need
+/// `write:repository`, an issue comment needs `write:issue` — a
+/// token without it gets 403 naming the missing scope.
+fn create_token_raw(http: &UreqClient, base: &str, name: &str, password: &str) -> String {
+    let body = serde_json::json!({
+        "name": "geectl-live",
+        "scopes": [
+            "read:repository",
+            "write:repository",
+            "read:issue",
+            "write:issue",
+            "read:user",
+        ],
+    })
+    .to_string();
+    let minted = http
+        .post_json_with(
+            &format!("{base}/api/v1/users/{name}/tokens"),
+            &body,
+            &Credentials::Basic {
+                username: name.to_string(),
+                password: password.to_string(),
+            },
+        )
+        .expect("POST /api/v1/users/{name}/tokens on the Gitea instance");
+    let minted: serde_json::Value =
+        serde_json::from_str(&minted).expect("POST /api/v1/users/{name}/tokens returns valid JSON");
+    minted["sha1"]
+        .as_str()
+        .expect("the minted token has a sha1")
+        .to_string()
+}
+
+/// A typed Gitea client authenticated as the given Bearer token,
+/// for acting as a user other than the provisioned one.
+fn typed_client_with_token<'a>(http: &'a UreqClient, base: &str, token: &str) -> GiteaClient<'a> {
+    GiteaClient::with_base(
+        http,
+        base,
+        Credentials::Bearer {
+            token: token.to_string(),
+        },
+    )
+    .expect("a typed Gitea client for a Bearer token")
+}
+
+/// A second user with a minted token, and a typed client acting
+/// as them, for the review-act tests: the provisioned user
+/// authored the PR, so an APPROVE or REQUEST_CHANGES from them
+/// is refused (422).
+fn reviewer_client<'a>(http: &'a UreqClient, base: &str) -> (String, GiteaClient<'a>) {
+    let reviewer = unique_user_name();
+    let password = unique_password();
+    create_user_with_password_raw(http, base, &reviewer, &password);
+    let token = create_token_raw(http, base, &reviewer, &password);
+    (reviewer, typed_client_with_token(http, base, &token))
+}
+
+/// Request a review from users and teams through the raw API.
+/// There is no typed request-review operation, so the setup
+/// stays raw; the assertions go through the typed operations.
+fn request_review_raw(
+    http: &UreqClient,
+    at: &RepoAddr,
+    number: u64,
+    reviewers: &[&str],
+    team_reviewers: &[&str],
+) {
+    let body = serde_json::json!({
+        "reviewers": reviewers,
+        "team_reviewers": team_reviewers,
+    })
+    .to_string();
+    http.post_json(
+        &format!(
+            "{}/api/v1/repos/{}/{}/pulls/{number}/requested_reviewers",
+            at.base, at.owner, at.repo
+        ),
+        &body,
+    )
+    .expect("POST the requested_reviewers API on the Gitea instance");
+}
+
+/// Set up one PR in an organization-owned repo, as
+/// setup_pull_request for a user-owned repo; return the PR
+/// number. The caller owns the `LiveRepo` guard for the org
+/// repo.
+fn setup_org_pull_request(http: &UreqClient, base: &str, org: &str, repo: &str) -> u64 {
+    create_org_repo_raw(http, base, org, repo);
+    let at = RepoAddr {
+        base,
+        owner: org,
+        repo,
+    };
+    let _main_sha = create_commit_raw(http, &at, "README.md", "live test\n", "main", None);
+    let _feature_sha = create_commit_raw(
+        http,
+        &at,
+        "FEATURE.md",
+        "live test\n",
+        "main",
+        Some("feature"),
+    );
+    create_pull_request_raw(
+        http,
+        &at,
+        "Add feature",
+        "The feature body.",
+        "feature",
+        "main",
+    )
 }
 
 /// Create an organization through the raw API and return its name.

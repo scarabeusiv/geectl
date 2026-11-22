@@ -81,6 +81,7 @@ use geectl::obs::{
     ReviewState, ReviewTarget, RevisionRange, RoleGrant, SourceUpdate, SrFiling, SrPayload,
     StagingReadOptions,
 };
+use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef};
 
 /// Whether `url` points at a loopback host.
 ///
@@ -1908,6 +1909,138 @@ fn live_comment_create_and_list_round_trips() {
     assert_eq!(comments.len(), 2);
     assert_eq!(comments[1].body, "reply to the first");
     assert_eq!(comments[1].parent_id, Some(first_id));
+}
+
+/// Approve a live request through the unified pull-request
+/// surface: the opinion reads back on the request, with its
+/// history.
+#[test]
+fn live_pull_request_approve_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let target = ReviewTarget::new(Some("Admin"), None, None, None)
+        .expect("a review asked of a user is a valid target");
+    client
+        .add_review(&id, &target, "please review", &dry)
+        .expect("ask Admin to review the request on the live instance");
+    let reference = PullRequestRef::Obs(id.parse().expect("a filed request id is numeric"));
+    let opinion = PullRequestClient::new(Some(&client), None)
+        .approve(&reference, Some(&target), Some("Looks good."), &dry)
+        .expect("typed approve approves the request")
+        .expect("a live approve returns the opinion");
+    assert_eq!(opinion.reviewer, "user Admin");
+    assert_eq!(opinion.state, OpinionState::Approved);
+    assert_eq!(opinion.comment, "Looks good.");
+    let request = client
+        .show_request(&id)
+        .expect("read the reviewed request back from the server");
+    assert_eq!(request.reviews.len(), 1);
+    assert_eq!(request.reviews[0].state, ReviewState::Accepted);
+    assert_eq!(
+        request.reviews[0].history.len(),
+        1,
+        "an accepted review must carry its history entry"
+    );
+}
+
+/// Request changes on a live request through the unified
+/// pull-request surface: the opinion reads back declined.
+#[test]
+fn live_pull_request_request_changes_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let target = ReviewTarget::new(Some("Admin"), None, None, None)
+        .expect("a review asked of a user is a valid target");
+    client
+        .add_review(&id, &target, "please review", &dry)
+        .expect("ask Admin to review the request on the live instance");
+    let reference = PullRequestRef::Obs(id.parse().expect("a filed request id is numeric"));
+    let opinion = PullRequestClient::new(Some(&client), None)
+        .request_changes(&reference, Some(&target), Some("Needs work."), &dry)
+        .expect("typed request_changes asks for changes on the request")
+        .expect("a live request-changes returns the opinion");
+    assert_eq!(opinion.reviewer, "user Admin");
+    assert_eq!(opinion.state, OpinionState::ChangesRequested);
+    assert_eq!(opinion.comment, "Needs work.");
+    let request = client
+        .show_request(&id)
+        .expect("read the reviewed request back from the server");
+    assert_eq!(request.reviews.len(), 1);
+    assert_eq!(request.reviews[0].state, ReviewState::Declined);
+}
+
+/// Comment on a live request through the unified pull-request
+/// surface, then list the comments back: the comment and its
+/// threaded reply must be what was posted.
+#[test]
+fn live_pull_request_comment_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let reference = PullRequestRef::Obs(id.parse().expect("a filed request id is numeric"));
+    let pr = PullRequestClient::new(Some(&client), None);
+    let comment = pr
+        .comment(&reference, "first comment", None, &dry)
+        .expect("typed comment comments on the request")
+        .expect("a live comment returns the comment");
+    assert_eq!(comment.author, "Admin");
+    assert_eq!(comment.body, "first comment");
+    assert_eq!(comment.parent_id, None);
+    let first_id = comment.id.to_string();
+    let reply = pr
+        .comment(&reference, "reply to the first", Some(&first_id), &dry)
+        .expect("typed comment replies to the comment")
+        .expect("a live reply returns the comment");
+    assert_eq!(reply.body, "reply to the first");
+    assert_eq!(reply.parent_id, Some(comment.id));
+    let comments = pr
+        .comments(&reference)
+        .expect("typed comments lists the comments");
+    assert_eq!(comments.len(), 2);
+    assert_eq!(comments[0].body, "first comment");
+    assert_eq!(comments[1].body, "reply to the first");
+    assert_eq!(comments[1].parent_id, Some(comment.id));
+}
+
+/// changereviewstate does not accept `obsoleted`: the server
+/// raises InvalidStateError, which the API renders as 404. The
+/// library refuses `obsoleted` upfront, so the probe drives the
+/// raw call to pin what the server does.
+#[test]
+fn live_changereviewstate_obsoleted_is_not_found() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let target = ReviewTarget::new(Some("Admin"), None, None, None)
+        .expect("a review asked of a user is a valid target");
+    client
+        .add_review(&id, &target, "please review", &dry)
+        .expect("ask Admin to review the request on the live instance");
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let err = http
+        .post(
+            &format!("{base}/request/{id}?cmd=changereviewstate&newstate=obsoleted&by_user=Admin"),
+            "",
+            &live_credentials(),
+        )
+        .expect_err("changereviewstate with obsoleted must not return 200");
+    assert_eq!(err.kind(), ErrorKind::NotFound);
 }
 
 /// The diff of a filed request, plain and wrapped in the request
