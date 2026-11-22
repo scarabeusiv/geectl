@@ -2550,7 +2550,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_clone = std::sync::Arc::clone(&captured);
         let handle = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 match listener.accept() {
@@ -2562,9 +2562,14 @@ mod tests {
                         // server answers a request it never read.
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                        let mut buf = [0u8; 4096];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        // Read until the full request head has
+                        // arrived: one read can return a partial head
+                        // (or, before this fix, nothing at all).
+                        // read_request loops until the header/body
+                        // boundary, plus any Content-Length body; a
+                        // GET has no body, so this is exactly the head.
+                        let buf = read_request(&mut stream);
+                        let head = String::from_utf8_lossy(&buf).into_owned();
                         *captured_clone.lock().expect("capture lock") = Some(head);
                         let mut response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
