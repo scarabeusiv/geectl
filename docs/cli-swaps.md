@@ -134,10 +134,11 @@ with no osc counterpart.
 | `getbinaries` whole-package/all-arch forms | Single FILE positional | One file per invocation |
 | `rpmlintlog` | No dedicated command (use `build download-binary … rpmlint.log --output …`) | One generic download instead of per-artifact shortcuts |
 | `whatdependson REPOSITORY ARCH` | `build whatdependson PROJECT PACKAGE REPOSITORY ARCH` | Explicit coordinates; package is a required positional per the library signature |
+| `osc rebuild [PROJECT [PACKAGE]]` | `build rebuild-package PROJECT PACKAGE REPOSITORY ARCH` | One command per library operation, explicit coordinates; osc's project-wide and `--all` forms have no library op (per-package only) |
+| `osc restartbuild [PROJECT [PACKAGE]]` | `build restart-build PROJECT PACKAGE REPOSITORY ARCH` | Same mapping; per-package only, no project-wide form |
+| `osc abortbuild [PROJECT [PACKAGE]]` | `build abort-build PROJECT PACKAGE REPOSITORY ARCH` | Same mapping; per-package only, no project-wide form |
 
-No geectl equivalent (coverage gaps, not deviations): `osc rebuild` /
-`restartbuild` / `abortbuild` — build-control writes; the library
-has no rebuild operation, so no CLI for them. `chroot` / `wipe` /
+No geectl equivalent (coverage gaps, not deviations): `chroot` / `wipe` /
 `lbl` — local build; out of scope (issue #43, podman vertical).
 `build build-status`, `build job-status`, `build
 fileinfo`, `build dependson`, `build check-constraints`, `build

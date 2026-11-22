@@ -33,6 +33,11 @@
 //! statuses shows no row for the cell-level code/state (the
 //! per-package rows carry the codes, the cell detail rides a note
 //! line).
+//!
+//! Mutations (`rebuild-package`, `restart-build`, `abort-build`)
+//! follow the CLI-wide rule: dry-run by default, the global `--live`
+//! performs them, and the text opens with the coordinate header, then
+//! `dry_run:`, then the result line and the plan.
 
 use clap::{Args, Subcommand};
 use geectl::auth::{Credentials, EnvObsAuth};
@@ -41,9 +46,9 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    BinaryFile, BuildHistoryEntry, BuildInfo, BuildLogQuery, BuildResults, ExtDependency, FileInfo,
-    JobHistoryEntry, JobStatus, ObsClient, PackageDeps, ProvidedBy, Repository, ResultsQuery,
-    OBS_API_BASE,
+    BinaryFile, BuildHistoryEntry, BuildInfo, BuildLogQuery, BuildResults, DryRun, ExtDependency,
+    FileInfo, JobHistoryEntry, JobStatus, ObsClient, PackageDeps, ProvidedBy, Repository,
+    ResultsQuery, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -116,6 +121,45 @@ pub enum BuildCommand {
         /// The project the package is in.
         project: String,
         /// The package to read the job for.
+        package: String,
+        /// The repository the package builds in.
+        repository: String,
+        /// The architecture the package builds for.
+        arch: String,
+    },
+    /// Rebuild a package: rerun a build without touching the
+    /// sources. A mutation: dry-run is the default (only the plan
+    /// is printed); `--live` performs the rebuild.
+    RebuildPackage {
+        /// The project the package is in.
+        project: String,
+        /// The package to rebuild.
+        package: String,
+        /// The repository the package builds in.
+        repository: String,
+        /// The architecture the package builds for.
+        arch: String,
+    },
+    /// Restart the running build of a package, without touching
+    /// the sources. A mutation: dry-run is the default (only the
+    /// plan is printed); `--live` performs the restart.
+    RestartBuild {
+        /// The project the package is in.
+        project: String,
+        /// The package to restart the build for.
+        package: String,
+        /// The repository the package builds in.
+        repository: String,
+        /// The architecture the package builds for.
+        arch: String,
+    },
+    /// Abort the running build of a package. A mutation: dry-run
+    /// is the default (only the plan is printed); `--live`
+    /// performs the abort.
+    AbortBuild {
+        /// The project the package is in.
+        project: String,
+        /// The package to abort the build for.
         package: String,
         /// The repository the package builds in.
         repository: String,
@@ -306,15 +350,21 @@ impl ResultsQueryArgs {
 
 /// Run one `build` subcommand: build the OBS client from the
 /// effective config and credentials, call the library operation, and
-/// return the `(payload, text)` pair. Every build read except
+/// return the `(payload, text)` pair. Every build command except
 /// `list-repositories` requires OBS Basic credentials and fails
-/// loudly without them (the library's `require_build_credentials`).
+/// loudly without them (the library's `require_build_credentials`),
+/// except that the three control mutations resolve no credentials
+/// in dry-run, like the `remote` mutations.
 /// Credentials resolve per command: `list-repositories` is a public
 /// read and never touches them (a half-set credential env must not
-/// break it); every other read fails fast on a half-set pair up
-/// front. How the other groups handle a half-configured pair is
-/// stated in `docs/cli.md`.
-pub fn run_build(debug: &Debug, command: BuildCommand) -> Result<(Value, String), GeectlError> {
+/// break it); every other command fails fast on a half-set pair up
+/// front, unless it is a dry-run control preview. How the other
+/// groups handle a half-configured pair is stated in `docs/cli.md`.
+pub fn run_build(
+    debug: &Debug,
+    command: BuildCommand,
+    live: bool,
+) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     // Credentials resolve lazily for `list-repositories`: the read is
     // public and never touches them, so a half-set credential env
@@ -322,6 +372,13 @@ pub fn run_build(debug: &Debug, command: BuildCommand) -> Result<(Value, String)
     let (base, instances) = obs_endpoint()?;
     let credentials = match &command {
         BuildCommand::ListRepositories { .. } => Credentials::None,
+        BuildCommand::RebuildPackage { .. }
+        | BuildCommand::RestartBuild { .. }
+        | BuildCommand::AbortBuild { .. }
+            if !live =>
+        {
+            Credentials::None
+        }
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -421,6 +478,75 @@ pub fn run_build(debug: &Debug, command: BuildCommand) -> Result<(Value, String)
             Ok((
                 job_status_payload(&project, &package, &repository, &arch, &job),
                 with_header(&header, render_job_status_text(&job)),
+            ))
+        }
+        BuildCommand::RebuildPackage {
+            project,
+            package,
+            repository,
+            arch,
+        } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.rebuild_package(&project, &repository, &arch, &package, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(build_control_result(
+                BuildControlAction::Rebuild,
+                &project,
+                &package,
+                &repository,
+                &arch,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
+        BuildCommand::RestartBuild {
+            project,
+            package,
+            repository,
+            arch,
+        } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.restart_build(&project, &repository, &arch, &package, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(build_control_result(
+                BuildControlAction::Restart,
+                &project,
+                &package,
+                &repository,
+                &arch,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
+        BuildCommand::AbortBuild {
+            project,
+            package,
+            repository,
+            arch,
+        } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.abort_build(&project, &repository, &arch, &package, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(build_control_result(
+                BuildControlAction::Abort,
+                &project,
+                &package,
+                &repository,
+                &arch,
+                dry_run.enabled(),
+                plan,
             ))
         }
         BuildCommand::Buildinfo {
@@ -615,6 +741,24 @@ fn coordinates_header(command: &BuildCommand) -> String {
             repository,
             arch,
         }
+        | BuildCommand::RebuildPackage {
+            project,
+            package,
+            repository,
+            arch,
+        }
+        | BuildCommand::RestartBuild {
+            project,
+            package,
+            repository,
+            arch,
+        }
+        | BuildCommand::AbortBuild {
+            project,
+            package,
+            repository,
+            arch,
+        }
         | BuildCommand::Buildinfo {
             project,
             package,
@@ -701,6 +845,89 @@ fn coordinates_header(command: &BuildCommand) -> String {
 /// Prepend the coordinate header line to a renderer's text.
 fn with_header(header: &str, text: String) -> String {
     format!("{header}\n{text}")
+}
+
+/// The build-control action a `rebuild-package`, `restart-build` or
+/// `abort-build` call performs.
+#[derive(Debug, Clone, Copy)]
+enum BuildControlAction {
+    Rebuild,
+    Restart,
+    Abort,
+}
+
+/// The `rebuild-package` / `restart-build` / `abort-build` result:
+/// the payload carries the coordinates; the text states the performed
+/// action, or the dry-run plan.
+fn build_control_result(
+    action: BuildControlAction,
+    project: &str,
+    package: &str,
+    repository: &str,
+    arch: &str,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let header =
+        format!("project: {project} package: {package} repository: {repository} arch: {arch}");
+    let result_line = match action {
+        BuildControlAction::Rebuild => {
+            if dry_run {
+                format!("dry-run: would rebuild package {project}/{package} ({repository}/{arch})")
+            } else {
+                format!("rebuilt package {project}/{package} ({repository}/{arch})")
+            }
+        }
+        BuildControlAction::Restart => {
+            if dry_run {
+                format!(
+                    "dry-run: would restart the build of {project}/{package} ({repository}/{arch})"
+                )
+            } else {
+                format!("restarted the build of {project}/{package} ({repository}/{arch})")
+            }
+        }
+        BuildControlAction::Abort => {
+            if dry_run {
+                format!(
+                    "dry-run: would abort the build of {project}/{package} ({repository}/{arch})"
+                )
+            } else {
+                format!("aborted the build of {project}/{package} ({repository}/{arch})")
+            }
+        }
+    };
+    mutation_result(
+        json!({
+            "project": project,
+            "package": package,
+            "repository": repository,
+            "arch": arch,
+        }),
+        header,
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The mutation result: the payload gains `dry_run` (and the plan
+/// when dry-running), and the text opens with the coordinate header,
+/// then `dry_run:`, then the result line and the plan.
+fn mutation_result(
+    mut payload: Value,
+    header: String,
+    result_line: String,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    payload["dry_run"] = json!(dry_run);
+    let mut lines = vec![header, format!("dry_run: {dry_run}"), result_line];
+    if let Some(plan) = plan {
+        payload["plan"] = json!(plan);
+        lines.extend(plan);
+    }
+    (payload, lines.join("\n"))
 }
 
 /// The `download-binary` confirmation line: the file, its size, and
@@ -1437,6 +1664,60 @@ mod tests {
             vec!["xx".to_string(), "y".to_string()],
         ]);
         assert_eq!(text, "A   B\nxx  y");
+    }
+
+    #[test]
+    fn mutation_result_carries_dry_run_and_plan_in_order() {
+        let payload = json!({ "project": "P", "package": "k" });
+        let (payload, text) = mutation_result(
+            payload,
+            "project: P package: k repository: standard arch: x86_64".to_string(),
+            "dry-run: would rebuild package P/k (standard/x86_64)".to_string(),
+            true,
+            Some(vec![
+                "[dry-run] would: rebuild package P/k (standard/x86_64)".to_string(),
+            ]),
+        );
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: rebuild package P/k (standard/x86_64)"
+        );
+        assert_eq!(
+            text,
+            "project: P package: k repository: standard arch: x86_64\ndry_run: true\ndry-run: would rebuild package P/k (standard/x86_64)\n[dry-run] would: rebuild package P/k (standard/x86_64)"
+        );
+    }
+
+    #[test]
+    fn build_control_result_states_each_action_live_and_dry() {
+        let header = "project: P package: k repository: standard arch: x86_64";
+        for (action, live, planned) in [
+            (
+                BuildControlAction::Rebuild,
+                "rebuilt package P/k (standard/x86_64)",
+                "dry-run: would rebuild package P/k (standard/x86_64)",
+            ),
+            (
+                BuildControlAction::Restart,
+                "restarted the build of P/k (standard/x86_64)",
+                "dry-run: would restart the build of P/k (standard/x86_64)",
+            ),
+            (
+                BuildControlAction::Abort,
+                "aborted the build of P/k (standard/x86_64)",
+                "dry-run: would abort the build of P/k (standard/x86_64)",
+            ),
+        ] {
+            let (payload, text) =
+                build_control_result(action, "P", "k", "standard", "x86_64", false, None);
+            assert_eq!(payload["dry_run"], false);
+            assert_eq!(text, format!("{header}\ndry_run: false\n{live}"));
+            let (dry_payload, text) =
+                build_control_result(action, "P", "k", "standard", "x86_64", true, None);
+            assert_eq!(dry_payload["dry_run"], true);
+            assert_eq!(text, format!("{header}\ndry_run: true\n{planned}"));
+        }
     }
 
     #[test]

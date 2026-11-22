@@ -2306,6 +2306,123 @@ fn build_list_repositories_ignores_half_set_credentials() {
 }
 
 #[test]
+fn build_rebuild_restart_abort_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    for (leaf, plan) in [
+        (
+            "rebuild-package",
+            "[dry-run] would: rebuild package openSUSE:Factory/vim (standard/x86_64)",
+        ),
+        (
+            "restart-build",
+            "[dry-run] would: restart the build of openSUSE:Factory/vim (standard/x86_64)",
+        ),
+        (
+            "abort-build",
+            "[dry-run] would: abort the build of openSUSE:Factory/vim (standard/x86_64)",
+        ),
+    ] {
+        let out = geectl_isolated(&dir)
+            .args([
+                "build",
+                leaf,
+                "openSUSE:Factory",
+                "vim",
+                "standard",
+                "x86_64",
+            ])
+            .env("GEECTL_OBS_USERNAME", "alice")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "leaf {leaf} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        assert_eq!(value["dry_run"], true);
+        assert_eq!(value["project"], "openSUSE:Factory");
+        assert_eq!(value["package"], "vim");
+        assert_eq!(value["repository"], "standard");
+        assert_eq!(value["arch"], "x86_64");
+        assert_eq!(value["plan"][0], plan);
+    }
+}
+
+#[test]
+fn build_rebuild_package_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "build",
+            "rebuild-package",
+            "openSUSE:Factory",
+            "vim",
+            "standard",
+            "x86_64",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn build_restart_build_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "build",
+            "restart-build",
+            "openSUSE:Factory",
+            "vim",
+            "standard",
+            "x86_64",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn build_abort_build_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "build",
+            "abort-build",
+            "openSUSE:Factory",
+            "vim",
+            "standard",
+            "x86_64",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
 fn build_results_with_half_set_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)

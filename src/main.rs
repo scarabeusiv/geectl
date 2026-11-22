@@ -164,7 +164,7 @@ fn run(
             (payload, text)
         }
         Some(Command::Request { command }) => cli_request::run(*command, debug, cli.live)?,
-        Some(Command::Build { command }) => cli_build::run_build(debug, command)?,
+        Some(Command::Build { command }) => cli_build::run_build(debug, command, cli.live)?,
         Some(Command::LocalBuild { command }) => {
             cli_local_build::run_local_build(debug, command, cli.live)?
         }
