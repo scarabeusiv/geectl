@@ -228,6 +228,62 @@ fn config_show_reports_obs_username_but_never_the_password() {
 }
 
 #[test]
+fn config_show_reports_alias_token_for_the_configured_instance() {
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[instances]\nmyinstance = \"https://src.opensuse.org\"\n",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["config", "show"])
+        .env("GEECTL_GITEA_TOKEN_MYINSTANCE", "alias-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    // The default URL is named in [instances], so the alias token
+    // is the credential it uses — not "not_configured".
+    assert_eq!(value["gitea_auth"]["status"], "configured");
+    assert_eq!(value["instances"]["myinstance"], "https://src.opensuse.org");
+    // The token must not appear anywhere in the output.
+    assert!(!stdout.contains("alias-token"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("alias-token"));
+}
+
+#[test]
+fn config_show_text_format_renders_instances() {
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[instances]\nmyinstance = \"https://src.opensuse.org\"\n",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "config", "show"])
+        .env("GEECTL_GITEA_TOKEN_MYINSTANCE", "alias-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("instances: myinstance -> https://src.opensuse.org"));
+    assert!(stdout.contains("gitea_auth: configured"));
+}
+
+#[test]
 fn config_show_refuses_a_credential_in_the_config_file() {
     let dir = TempDir::new();
     let config_dir = dir.0.join("geectl");
