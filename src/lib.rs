@@ -38,6 +38,10 @@
 //!   (`branch`, `submit`, …) are what an agent calls. The module is
 //!   public so the live harness can exercise the typed operations;
 //!   the `Gitea*` types never appear in a uniform-flow signature.
+//! - [`local_build`]: the local-build vertical — one podman build for
+//!   quick debug, with the shared pkg cache, per-root sccache,
+//!   and the size-capped eviction policy. The server stays the source
+//!   of truth; local is for iterating fast.
 
 pub mod auth;
 pub mod config;
@@ -45,6 +49,7 @@ pub mod debug;
 pub mod error;
 pub mod gitea;
 pub mod http;
+pub mod local_build;
 pub mod obs;
 pub mod url;
 

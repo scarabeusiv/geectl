@@ -1,0 +1,6604 @@
+//! The local-build vertical: one podman build for quick debug.
+//!
+//! The skill needs a local build, and OBS supports too many build
+//! backends to mirror, so geectl grows exactly one: podman, native
+//! arch, for quick debug. The engine is the openSUSE `build` script,
+//! reused exactly as the existing tool uses it — geectl prepares the
+//! inputs (buildinfo, buildconfig, the resolved dep list, the rpmlist)
+//! and reads the result, it does not reimplement container mechanics,
+//! dependency installation, or RPM creation.
+//!
+//! The vertical owns service runs, tarball fetching, and spec-cleaner
+//! runs: all three happen inside the one podman container, before
+//! anything goes to the server. The server stays the source of truth
+//! for service results; local is for iterating fast.
+//!
+//! Layout (one geectl cache dir, `$XDG_CACHE_HOME/geectl/` by
+//! default, overridable by config `build.cache_dir`):
+//! - `pkg/<project>/<repo>/<arch>/` — the shared package cache, hdrmd5-verified
+//!   on every use, written via temp file + atomic rename.
+//! - `sccache/<project>/<package>/<repo>-<arch>[-<flavor>]/` — the
+//!   compiler cache, one store per build root (never shared across
+//!   roots, so two concurrent builds of the same package in
+//!   different roots never write one tar).
+//! - `build-roots/<project>/<package>/<repo>-<arch>[-<flavor>]/` — the
+//!   build root, with a `.geectl-build-root` marker file.
+//!
+//! Eviction is a size cap (default 20 GiB, low-water 80%) enforced at
+//! build start, LRU within class, pkg files first, then sccache
+//! stores, then roots, then superseded images. Locked roots, the most
+//! recent root per (project, package), the current build's dep set,
+//! anything used within 24 h, and the current image digest are never
+//! evicted.
+//!
+//! Test story: PR-level tests use a stub engine (a script that records
+//! its argv and emits a canned log with a `finished` line and fake
+//! RPMs) plus a stub podman — no real build runs in CI. The scheduled
+//! live run proves the real engine + image + cache end to end.
+//!
+//! Known limits, recorded here rather than hidden:
+//! - The library transport caps response bodies at 10 MiB, so a dep
+//!   RPM over the cap fails closed with a structured error: streaming
+//!   downloads are not supported yet. Small dep sets build end to end.
+
+use std::collections::HashMap;
+use std::fs;
+use std::fs::File;
+use std::io::Read;
+use std::io::Write;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
+use fs2::FileExt;
+use serde::Serialize;
+
+use crate::auth::Credentials;
+use crate::config::Config;
+use crate::debug::Debug;
+use crate::error::ErrorKind;
+use crate::error::GeectlError;
+use crate::obs::valid_obs_name;
+use crate::obs::BuildDep;
+use crate::obs::ObsClient;
+
+/// The default build image: Tumbleweed `latest`. One image, one
+/// target — a Leap pool build stays OBS-ONLY.
+pub const DEFAULT_IMAGE: &str = "registry.opensuse.org/opensuse/tumbleweed:latest";
+/// The repository the default image lives in: image eviction only
+/// ever touches digests of this repository, never the machine's
+/// other images.
+const IMAGE_REPOSITORY: &str = "registry.opensuse.org/opensuse/tumbleweed";
+/// The default cache cap in GiB (low-water is 80% of it).
+pub const DEFAULT_CACHE_CAP_GIB: u64 = 20;
+/// The low-water mark as a fraction of the cap.
+pub const LOW_WATER_NUM: u64 = 4;
+/// The low-water mark as a fraction of the cap (4/5 = 80%).
+pub const LOW_WATER_DEN: u64 = 5;
+/// An image older than this is refreshed (days).
+pub const IMAGE_REFRESH_DAYS: u64 = 7;
+/// The eviction grace period: anything used within this long is never
+/// evicted (seconds).
+pub const GRACE_PERIOD_SECS: u64 = 24 * 3600;
+/// The default build timeout (seconds).
+pub const DEFAULT_BUILD_TIMEOUT_SECS: u64 = 3600;
+/// How long the timeout kill waits after SIGTERM before SIGKILL.
+const KILL_GRACE_SECS: u64 = 5;
+/// How long a one-shot engine/podman probe may take (seconds):
+/// `--version`, image inspect, image listing, image size, image
+/// remove. A probe that cannot answer in this long is hung, not
+/// slow. The image pull is not a probe — it takes the build's own
+/// timeout (see `podman_pull`).
+const PROBE_TIMEOUT_SECS: u64 = 60;
+/// How long the caller waits for a drain thread to finish after
+/// the child exits (seconds): the drain only has to read what is
+/// already in the pipe, so this is generous — but a descendant
+/// that inherited the pipe and outlives the child holds EOF open
+/// forever, and the caller must not hang on it (see `take_drain`).
+const DRAIN_JOIN_TIMEOUT_SECS: u64 = 2;
+/// How much of a build log `finish_build` reads (bytes): the
+/// verdict, the rpmlint/check/sccache summaries and the `finished`
+/// line all live at the end of the log, so the tail is what the
+/// parsers need — a verbose build's whole log must never be read
+/// into memory twice over (see `read_log_tail`).
+const LOG_TAIL_CAP_BYTES: u64 = 4 * 1024 * 1024;
+/// How much of an RPM's head is read at a time to locate its
+/// header (bytes): the lead (96) plus both headers fit in one
+/// chunk for a normal RPM, but a real main header can be far
+/// larger (glibc's ends past 64 KiB) — so the probe grows a chunk
+/// at a time until the header is found, up to the cap below. A
+/// fixed-size probe rejects real RPMs; see `rpm_hdrmd5`.
+const RPM_HEADER_PROBE_CHUNK_BYTES: usize = 64 * 1024;
+/// The most of an RPM's head the header probe reads (bytes): a
+/// file whose header does not fit is not a well-formed RPM for
+/// this check.
+const RPM_HEADER_PROBE_CAP_BYTES: usize = 4 * 1024 * 1024;
+/// The most the engine's captured stdout/stderr may hold (bytes);
+/// past it the capture is truncated, never unbounded.
+const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
+/// The marker file that makes a directory a geectl build root.
+const ROOT_MARKER: &str = ".geectl-build-root";
+/// The flock file inside a build root.
+const ROOT_LOCK: &str = ".geectl-build.lock";
+/// The build log file inside a build root.
+const BUILD_LOG: &str = ".build.log";
+/// The rpmlist file the engine takes.
+const RPMLIST: &str = ".rpmlist";
+/// The buildconfig file the engine takes as `--dist`.
+const BUILDCONFIG: &str = ".buildconfig";
+/// The build record file inside a build root.
+const BUILD_RECORD: &str = ".geectl-build-record.json";
+/// The image sidecar in the cache dir (last refresh per image).
+const IMAGE_SIDECAR: &str = "image.json";
+/// The global eviction lock in the cache dir.
+const EVICTION_LOCK: &str = "eviction.lock";
+
+/// A build request: a source directory plus an explicit repo and
+/// arch. The project is explicit too: the buildinfo fetch needs it,
+/// and there is no working-copy layer yet to derive it from.
+#[derive(Debug, Clone)]
+pub struct BuildRequest {
+    /// The source directory (spec + sources).
+    pub source_dir: PathBuf,
+    /// The OBS project the package belongs to.
+    pub project: String,
+    /// The repository to build for (e.g. `standard`).
+    pub repo: String,
+    /// The architecture to build for; must equal the host arch.
+    pub arch: String,
+    /// The multibuild flavor; required when the source carries a
+    /// `_multibuild` file. One invocation builds one flavor.
+    pub flavor: Option<String>,
+    /// Wipe the root before building (a failed root is dirty and
+    /// reusing it masks the fix — the caller passes this explicitly).
+    pub clean: bool,
+    /// The release number, passed through to the engine (sets
+    /// `BUILD_RELEASE`, which removes the local-only
+    /// `python-bytecode-inconsistent-mtime` artifact).
+    pub release: Option<String>,
+    /// Accept the resolved dep set. Accepted for CLI parity with
+    /// the existing tool, and only after the trust check passes:
+    /// the flag cannot override a foreign-`home:` refusal — that
+    /// decision stays with the user — and it is read nowhere in
+    /// the refusal decision.
+    pub trust_all_projects: bool,
+    /// Force an image pull even when the local image is fresh.
+    pub refresh_image: bool,
+    /// The build timeout in seconds (default 3600): one budget for
+    /// the whole build op — the image pull and the engine share it,
+    /// so a slow pull leaves less time for the engine.
+    pub timeout_secs: u64,
+    /// Print the plan and touch nothing.
+    pub dry_run: bool,
+}
+
+impl BuildRequest {
+    /// A request with the defaults: no flavor, no clean, no release,
+    /// no trust flag, no refresh, the default timeout, a real build.
+    pub fn new(source_dir: PathBuf, project: &str, repo: &str, arch: &str) -> Self {
+        BuildRequest {
+            source_dir,
+            project: project.to_string(),
+            repo: repo.to_string(),
+            arch: arch.to_string(),
+            flavor: None,
+            clean: false,
+            release: None,
+            trust_all_projects: false,
+            refresh_image: false,
+            timeout_secs: DEFAULT_BUILD_TIMEOUT_SECS,
+            dry_run: false,
+        }
+    }
+}
+
+/// The rpmlint summary read from the end of the build log. The
+/// errors/warnings come from rpmlint's own summary line when the log
+/// carries one; the badness is best-effort (the sum of the `Badness:`
+/// annotations in the log, 0 when the log carries none).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct RpmlintSummary {
+    pub errors: u64,
+    pub warnings: u64,
+    pub badness: u64,
+}
+
+/// The `%check` summary, when the log carries a parseable one
+/// (ctest's `N% tests passed, M tests failed out of K`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct CheckSummary {
+    pub passed: u64,
+    pub failed: u64,
+    pub total: u64,
+}
+
+/// Cache statistics for one build: pkg cache hits/misses, and the
+/// sccache hit count when the log carries one (best-effort, None
+/// when the engine reported none).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct CacheStats {
+    pub pkg_hits: u64,
+    pub pkg_misses: u64,
+    pub sccache_hits: Option<u64>,
+}
+
+/// The cache usage: total bytes and per-area bytes, plus the cap and
+/// low-water mark the eviction enforces. The image size is the sum
+/// of every digest of this vertical's repository, from podman when
+/// it answers; when it does not, the images count as 0.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CacheUsage {
+    pub cap_bytes: u64,
+    pub low_water_bytes: u64,
+    pub pkg_bytes: u64,
+    pub sccache_bytes: u64,
+    pub roots_bytes: u64,
+    pub image_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// One evicted item: what was deleted, how big it was, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct EvictedItem {
+    /// `pkg`, `sccache`, `root`, or `image`.
+    pub kind: String,
+    /// The path that was deleted (an image digest for `image`).
+    pub path: String,
+    /// The bytes freed.
+    pub bytes: u64,
+    /// `lru` or `superseded-image`.
+    pub reason: String,
+}
+
+/// The eviction report attached to every build record (and to a
+/// `build-prune` run). `ran` is false when usage was already under
+/// the cap, or when another eviction held the lock and this run
+/// skipped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct EvictionReport {
+    pub ran: bool,
+    pub cap_bytes: u64,
+    pub low_water_bytes: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub freed_bytes: u64,
+    pub evicted: Vec<EvictedItem>,
+    /// Deletions that failed, each naming the item and the error.
+    /// A failure never blocks the build: the report carries it and
+    /// the eviction continues with the next candidate.
+    #[serde(default)]
+    pub failures: Vec<String>,
+    /// The bytes of items skipped because a protection rule applied
+    /// (locked, recent, current deps, current digest), capped at the
+    /// bytes above the low-water mark: the portion of the excess
+    /// that could not be evicted. 0 when nothing was skipped, or
+    /// when usage was already under the cap.
+    pub protected_bytes: u64,
+    /// The bytes still above the low-water mark after eviction (0
+    /// when the cap was met).
+    pub shortfall_bytes: u64,
+}
+
+/// The engine plan a dry run returns: the invocation as data, so the
+/// caller can inspect it without anything being touched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct EnginePlan {
+    pub image: String,
+    pub root: PathBuf,
+    pub repo: String,
+    pub arch: String,
+    pub flavor: Option<String>,
+    /// The engine argv, engine binary first, spec last.
+    pub argv: Vec<String>,
+}
+
+/// The build record: the typed result of one build. Written to
+/// `<root>/.geectl-build-record.json` on every build — success,
+/// failure, and timeout alike — so `build-log` can always report
+/// the verdict that was read.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct BuildRecord {
+    /// `green`, `failed`, or `dry-run`.
+    pub verdict: String,
+    pub exit_code: i32,
+    pub log_path: PathBuf,
+    /// The built RPMs (empty when the build failed).
+    pub rpms: Vec<PathBuf>,
+    pub rpmlint: RpmlintSummary,
+    pub checks: Option<CheckSummary>,
+    /// The resolved image digest, when podman answered.
+    pub image_digest: Option<String>,
+    /// The engine version, when the engine answered `--version`.
+    pub engine_version: Option<String>,
+    pub root_path: PathBuf,
+    /// True when the build reused an existing root.
+    pub root_reused: bool,
+    pub cache: CacheStats,
+    pub eviction: EvictionReport,
+    /// The preinstall image filename the server offered, if any.
+    /// Dropped for a rootless podman build, never installed.
+    pub preinstall_image: Option<String>,
+    /// True for a dry run: nothing was touched, `plan` holds the
+    /// invocation.
+    pub dry_run: bool,
+    pub plan: Option<EnginePlan>,
+}
+
+/// The result of `build-shell`: the command's exit code and its
+/// captured output as data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShellResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// The result of `build-log`: the log lines plus the verdict the
+/// build record holds, when a record exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuildLog {
+    pub log_path: PathBuf,
+    pub lines: Vec<String>,
+    /// The verdict from the build record (`green`, `failed`), when
+    /// the root carries one.
+    pub verdict: Option<String>,
+    pub exit_code: Option<i32>,
+}
+
+/// The root marker: the identity of a build root, written on first
+/// creation and updated after every build. The eviction policy
+/// orders roots by `last_build_unix` and protects the most recent
+/// root per key and any root whose last successful build used a
+/// digest an image eviction would remove.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct RootMarker {
+    pub project: String,
+    pub package: String,
+    pub repo: String,
+    pub arch: String,
+    pub flavor: Option<String>,
+    pub image_digest: Option<String>,
+    pub engine_version: Option<String>,
+    pub created_unix: u64,
+    pub last_build_unix: u64,
+    /// The digest of the last build that succeeded in this root, if
+    /// any. An image digest is superseded only once a newer digest
+    /// has a successful build behind it.
+    pub last_success_digest: Option<String>,
+}
+
+/// The image sidecar: when each image was last pulled, so the 7-day
+/// refresh does not need to parse podman's date formats.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+struct ImageSidecar {
+    #[serde(default)]
+    refreshed: HashMap<String, u64>,
+}
+
+/// A held build-root lock: the open file keeps the flock alive until
+/// this guard drops. The lock file lives inside the root, so wiping
+/// the root removes it with the root.
+struct BuildLock {
+    _file: File,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The local-build vertical: one podman build for quick debug.
+///
+/// The client holds the OBS client (buildinfo, buildconfig, dep
+/// downloads), the cache dir, and the engine/podman binaries (both
+/// overridable, so tests can point at stubs). The engine and podman
+/// paths default to the bare names, resolved via `PATH`.
+pub struct LocalBuild<'a> {
+    obs: &'a ObsClient<'a>,
+    cache_dir: PathBuf,
+    cache_cap_bytes: u64,
+    engine: PathBuf,
+    podman: PathBuf,
+    debug: Debug,
+}
+
+impl<'a> LocalBuild<'a> {
+    /// A vertical for `obs` with the cache at `cache_dir` and the
+    /// default 20 GiB cap. The cache dir is resolved to an absolute
+    /// path here: the engine runs with its cwd in the source dir,
+    /// so a relative cache dir would resolve inside the source tree
+    /// (and a relative root would point at the wrong place).
+    pub fn new(obs: &'a ObsClient<'a>, cache_dir: PathBuf) -> Self {
+        LocalBuild {
+            obs,
+            cache_dir: std::path::absolute(&cache_dir).unwrap_or(cache_dir),
+            cache_cap_bytes: DEFAULT_CACHE_CAP_GIB * 1024 * 1024 * 1024,
+            engine: PathBuf::from("build"),
+            podman: PathBuf::from("podman"),
+            debug: Debug::disabled(),
+        }
+    }
+
+    /// A vertical resolved from the config file: `build.cache_dir`
+    /// and `build.cache_cap_gib` when set, the XDG default and the
+    /// 20 GiB cap otherwise.
+    pub fn from_config(obs: &'a ObsClient<'a>, config: &Config) -> Result<Self, GeectlError> {
+        let cache_dir = match &config.build_cache_dir {
+            Some(dir) => PathBuf::from(dir),
+            None => default_cache_dir()?,
+        };
+        let mut vertical = LocalBuild::new(obs, cache_dir);
+        if let Some(cap_gib) = config.build_cache_cap_gib {
+            // Saturating: a huge cap clamps to u64::MAX instead of
+            // wrapping to a tiny cap and mass-evicting.
+            vertical.cache_cap_bytes = cap_gib
+                .saturating_mul(1024)
+                .saturating_mul(1024)
+                .saturating_mul(1024);
+        }
+        Ok(vertical)
+    }
+
+    /// The engine binary (`build` by default). Tests point it at a
+    /// stub script.
+    pub fn with_engine(mut self, engine: PathBuf) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    /// The podman binary (`podman` by default). Tests point it at a
+    /// stub script.
+    pub fn with_podman(mut self, podman: PathBuf) -> Self {
+        self.podman = podman;
+        self
+    }
+
+    /// The cache cap in bytes (default 20 GiB).
+    pub fn with_cache_cap_bytes(mut self, cap_bytes: u64) -> Self {
+        self.cache_cap_bytes = cap_bytes;
+        self
+    }
+
+    /// Report decision lines to `debug` instead of dropping them.
+    pub fn with_debug(mut self, debug: Debug) -> Self {
+        self.debug = debug;
+        self
+    }
+
+    /// The cache directory this vertical uses.
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// The cache cap in bytes.
+    pub fn cache_cap_bytes(&self) -> u64 {
+        self.cache_cap_bytes
+    }
+}
+
+/// The default cache directory: `$XDG_CACHE_HOME/geectl/`, or
+/// `~/.cache/geectl/` when `XDG_CACHE_HOME` is unset. No home is a
+/// configuration error, never a silent fallback.
+pub fn default_cache_dir() -> Result<PathBuf, GeectlError> {
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        let xdg = xdg.trim();
+        if !xdg.is_empty() {
+            return Ok(PathBuf::from(xdg).join("geectl"));
+        }
+    }
+    let home = std::env::var("HOME").map_err(|_| {
+        GeectlError::new(
+            ErrorKind::ConfigError,
+            "no HOME and no XDG_CACHE_HOME: cannot resolve the local-build cache directory",
+        )
+    })?;
+    if home.trim().is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            "no HOME and no XDG_CACHE_HOME: cannot resolve the local-build cache directory",
+        ));
+    }
+    Ok(PathBuf::from(home).join(".cache").join("geectl"))
+}
+
+/// The build flow: validate, fetch buildinfo + buildconfig, check
+/// trust, resolve the image, evict, prepare the deps, run the
+/// engine, read the verdict. A dry run stops after the plan is
+/// built and touches nothing.
+impl<'a> LocalBuild<'a> {
+    /// Build the package in `req.source_dir` for `req.repo` /
+    /// `req.arch`. On a non-zero engine exit this returns
+    /// [`ErrorKind::BuildFailed`] (exit code + log path + tail in
+    /// the context); on a timeout [`ErrorKind::BuildTimeout`]. A
+    /// zero exit with no `finished` line or no RPMs is a record with
+    /// verdict `failed`, not an error — the record states what was
+    /// read. The record is written to the root on every run.
+    pub fn build(&self, req: &BuildRequest) -> Result<BuildRecord, GeectlError> {
+        if !valid_obs_name(&req.project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {:?}", req.project),
+            ));
+        }
+        if !valid_obs_name(&req.repo) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS repository name: {:?}", req.repo),
+            ));
+        }
+        // The path components under the cache dir must be single
+        // components: `valid_obs_name` allows `.`, so `..` would
+        // pass it and escape the cache dir (a `build --clean` would
+        // then wipe an arbitrary directory). The package component
+        // is checked once it is known from the spec, below.
+        validate_cache_components(&req.project, &req.repo, &req.arch, &req.flavor)?;
+        if req.arch != std::env::consts::ARCH {
+            return Err(GeectlError::new(
+                ErrorKind::UnsupportedArch,
+                format!(
+                    "local build for {} on a {} host; other architectures go to the server (OBS-ONLY)",
+                    req.arch,
+                    std::env::consts::ARCH
+                ),
+            ));
+        }
+        // A zero timeout is an instant timeout, never a build.
+        if req.timeout_secs == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "build timeout must be greater than 0 seconds",
+            ));
+        }
+        // One budget for the whole build op: the image pull and the
+        // engine share it (see below) — a slow pull leaves less
+        // time for the engine, instead of each phase taking a fresh
+        // full timeout.
+        let deadline = std::time::Instant::now() + Duration::from_secs(req.timeout_secs);
+        // The source dir is resolved to an absolute path: the engine
+        // runs with its cwd in the source dir, so a relative source
+        // dir would make the spec path resolve to
+        // `<source_dir>/<source_dir>/foo.spec`.
+        let source_dir = std::path::absolute(&req.source_dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot resolve source directory {}: {e}",
+                    req.source_dir.display()
+                ),
+            )
+        })?;
+        let spec = find_spec(&source_dir)?;
+        let package = spec
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !valid_obs_name(&package) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "spec file name {:?} is not a valid package name",
+                    spec.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            ));
+        }
+        // The package is a cache-dir component too (see above).
+        validate_path_component("package", &package)?;
+        let flavors = multibuild_flavors(&source_dir)?;
+        if let Some(flavors) = &flavors {
+            match &req.flavor {
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::MultibuildFlavorRequired,
+                        format!(
+                            "package {package} is multibuild; pass one flavor ({})",
+                            flavors.join(", ")
+                        ),
+                    ));
+                }
+                Some(flavor) if !flavors.iter().any(|f| f == flavor) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "unknown multibuild flavor {flavor:?} for {package}; known flavors: {}",
+                            flavors.join(", ")
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        // A dry run prints the plan and touches nothing, so it does
+        // not need the engine installed: a missing engine records
+        // as an unknown version instead of failing the plan.
+        let engine_version = if req.dry_run {
+            self.engine_version().ok().flatten()
+        } else {
+            self.engine_version()?
+        };
+        let root = self.root_path(&req.project, &package, &req.repo, &req.arch, &req.flavor);
+        let log_path = root.join(BUILD_LOG);
+        let root_existed = root.join(ROOT_MARKER).exists();
+
+        // The dry run stops here: the plan is data, and nothing
+        // below it (no fetch, no root, no eviction) is touched.
+        if req.dry_run {
+            let argv = self.engine_argv(
+                &root,
+                &spec,
+                req,
+                &root.join(RPMLIST),
+                &root.join(BUILDCONFIG),
+                &self.sccache_uri(&req.project, &package, &req.repo, &req.arch, &req.flavor),
+            );
+            self.debug.emit(&format!(
+                "local-build dry-run: {} {} {}",
+                req.project, package, req.repo
+            ));
+            return Ok(BuildRecord {
+                verdict: "dry-run".to_string(),
+                exit_code: 0,
+                log_path,
+                rpms: Vec::new(),
+                rpmlint: RpmlintSummary::default(),
+                checks: None,
+                image_digest: None,
+                engine_version,
+                root_path: root.clone(),
+                root_reused: root_existed,
+                cache: CacheStats::default(),
+                eviction: EvictionReport {
+                    cap_bytes: self.cache_cap_bytes,
+                    low_water_bytes: self.low_water(),
+                    ..EvictionReport::default()
+                },
+                preinstall_image: None,
+                dry_run: true,
+                plan: Some(EnginePlan {
+                    image: DEFAULT_IMAGE.to_string(),
+                    root: root.clone(),
+                    repo: req.repo.clone(),
+                    arch: req.arch.clone(),
+                    flavor: req.flavor.clone(),
+                    argv,
+                }),
+            });
+        }
+
+        // The buildinfo fetch is the prerequisite: the dep set, the
+        // trust check, and the eviction's current-dep protection all
+        // come from it. A buildinfo error means the build cannot
+        // start — fail closed with the server's own text.
+        let info = self
+            .obs
+            .buildinfo(&req.project, &package, &req.repo, &req.arch)?;
+        if let Some(error) = &info.error {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("build cannot start: {error}"),
+            ));
+        }
+        self.check_trust(&req.project, &info)?;
+        let buildconfig = self.obs.buildconfig(&req.project, &req.repo)?;
+
+        // The image is resolved before eviction: the current digest
+        // is protected, and the record names the digest actually used.
+        let image = self.resolve_image(req, deadline)?;
+        self.debug.emit(&format!(
+            "local-build image: {} digest {}",
+            DEFAULT_IMAGE,
+            image.digest.as_deref().unwrap_or("<unknown>")
+        ));
+
+        // The root is created before eviction so the current build's
+        // root is never its own eviction candidate. The lock is taken
+        // before any wipe: a `--clean` build must never wipe a root
+        // another build holds.
+        fs::create_dir_all(&root).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot create build root {}: {e}", root.display()),
+            )
+        })?;
+        // The lock is held for the whole build: a second invocation
+        // for the same root refuses immediately with BuildInProgress.
+        let _lock = self.acquire_root_lock(&root, &package)?;
+        if req.clean {
+            self.wipe_root_contents(&root)?;
+        }
+        self.ensure_marker(&root, req, &package, &image, &engine_version)?;
+        let root_reused = root_existed && !req.clean;
+
+        // Eviction runs at build start, after the buildinfo fetch
+        // (the current dep set is known) and before any download.
+        // The dep set is protected twice: by file name (deps that
+        // carry a `binary` attribute) and by dep name (deps without
+        // one are resolved from the binary list only later, so their
+        // file names are not known yet — a name prefix protects them
+        // until then).
+        let current_dep_files: Vec<String> = info
+            .bdeps
+            .iter()
+            .filter_map(|dep| dep.binary.clone())
+            .collect();
+        let current_dep_names: Vec<String> =
+            info.bdeps.iter().map(|dep| dep.name.clone()).collect();
+        let eviction = self.evict(
+            &current_dep_files,
+            &current_dep_names,
+            image.digest.as_deref(),
+            Some(&self.sccache_dir(&req.project, &package, &req.repo, &req.arch, &req.flavor)),
+        )?;
+
+        // The deps go into the pkg cache, hdrmd5-verified on every
+        // use, then the rpmlist names them for the engine.
+        let (cache, rpmlist) = self.prepare_deps(req, &info)?;
+        let rpmlist_path = root.join(RPMLIST);
+        write_atomic(&rpmlist_path, rpmlist.as_bytes()).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot write rpmlist {}: {e}", rpmlist_path.display()),
+            )
+        })?;
+        let buildconfig_path = root.join(BUILDCONFIG);
+        write_atomic(&buildconfig_path, buildconfig.as_bytes()).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!(
+                    "cannot write buildconfig {}: {e}",
+                    buildconfig_path.display()
+                ),
+            )
+        })?;
+
+        // The sccache store is per root: repeat builds of the same
+        // root share compiled objects; different roots never do —
+        // two concurrent builds of the same package in different
+        // roots must not share a tar.
+        let sccache_dir =
+            self.sccache_dir(&req.project, &package, &req.repo, &req.arch, &req.flavor);
+        fs::create_dir_all(&sccache_dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot create sccache store {}: {e}", sccache_dir.display()),
+            )
+        })?;
+        let sccache_uri =
+            self.sccache_uri(&req.project, &package, &req.repo, &req.arch, &req.flavor);
+        let argv = self.engine_argv(
+            &root,
+            &spec,
+            req,
+            &rpmlist_path,
+            &buildconfig_path,
+            &sccache_uri,
+        );
+        self.debug
+            .emit(&format!("local-build engine: {}", argv.join(" ")));
+        let (outcome, _, _) = run_engine(
+            &argv,
+            &source_dir,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        )?;
+        let record = self.finish_build(
+            req,
+            &package,
+            &root,
+            &log_path,
+            &image,
+            &engine_version,
+            root_reused,
+            cache,
+            eviction,
+            info.preinstall_image
+                .as_ref()
+                .and_then(|i| i.filename.clone()),
+            outcome,
+        )?;
+        Ok(record)
+    }
+
+    /// The low-water mark in bytes (80% of the cap). Divide first:
+    /// `cap * 4` can overflow for a huge configured cap.
+    fn low_water(&self) -> u64 {
+        self.cache_cap_bytes / LOW_WATER_DEN * LOW_WATER_NUM
+    }
+
+    /// The root's name inside its project/package dirs:
+    /// `<repo>-<arch>` plus `-<flavor>` when the build carries one.
+    /// Shared by the build-root path and the sccache store path, so
+    /// a root and its store always name the same build.
+    fn root_name(repo: &str, arch: &str, flavor: &Option<String>) -> String {
+        let mut name = format!("{repo}-{arch}");
+        if let Some(flavor) = flavor {
+            name.push('-');
+            name.push_str(flavor);
+        }
+        name
+    }
+
+    /// The build root for a (project, package, repo, arch, flavor).
+    fn root_path(
+        &self,
+        project: &str,
+        package: &str,
+        repo: &str,
+        arch: &str,
+        flavor: &Option<String>,
+    ) -> PathBuf {
+        self.cache_dir
+            .join("build-roots")
+            .join(project)
+            .join(package)
+            .join(Self::root_name(repo, arch, flavor))
+    }
+
+    /// The sccache store directory for one build root: one store per
+    /// root, never shared across roots. Two concurrent builds of the
+    /// same package in different roots (different repos, arches or
+    /// flavors) hold different root locks, so a per-package tar
+    /// would be written by both at once and corrupt; a per-root tar
+    /// is guarded by its own root's flock, exactly like the root
+    /// itself. Repeat builds of the same root share compiled
+    /// objects; different roots never do.
+    fn sccache_dir(
+        &self,
+        project: &str,
+        package: &str,
+        repo: &str,
+        arch: &str,
+        flavor: &Option<String>,
+    ) -> PathBuf {
+        self.cache_dir
+            .join("sccache")
+            .join(project)
+            .join(package)
+            .join(Self::root_name(repo, arch, flavor))
+    }
+
+    /// The sccache URI passed to the engine: one tar per build root,
+    /// in the root's store. The engine owns the tar's contents;
+    /// geectl only provides the path and touches the store's mtime.
+    fn sccache_uri(
+        &self,
+        project: &str,
+        package: &str,
+        repo: &str,
+        arch: &str,
+        flavor: &Option<String>,
+    ) -> PathBuf {
+        self.sccache_dir(project, package, repo, arch, flavor)
+            .join("sccache.tar")
+    }
+
+    /// The (project, package) of a sccache store path, for the
+    /// locked-root check: the store layout is
+    /// `sccache/<project>/<package>/<repo>-<arch>[-<flavor>]/`, so
+    /// the last component is the root name, not the package. None
+    /// for a path of any other shape — an unrecognised store is
+    /// never attributed to the wrong package, so a locked-root
+    /// check on it cannot match the wrong (project, package) and
+    /// the caller protects it instead. Both the plan-time retain
+    /// and the apply-time re-probe use this one helper, so the two
+    /// parses cannot drift apart again.
+    fn store_project_package(&self, path: &Path) -> Option<(String, String)> {
+        let rel = path.strip_prefix(self.cache_dir.join("sccache")).ok()?;
+        let mut parts = rel.components();
+        let project = parts.next()?.as_os_str().to_string_lossy().to_string();
+        let package = parts.next()?.as_os_str().to_string_lossy().to_string();
+        let _root = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some((project, package))
+    }
+
+    /// The build root for a sccache store path: the store layout is
+    /// `sccache/<project>/<package>/<root-name>/`, and the root of
+    /// the same build is `build-roots/<project>/<package>/<root-name>/`.
+    /// None for a path of any other shape — the caller never deletes
+    /// a store it cannot attribute to a root.
+    fn store_root_path(&self, path: &Path) -> Option<PathBuf> {
+        let rel = path.strip_prefix(self.cache_dir.join("sccache")).ok()?;
+        let mut parts = rel.components();
+        let project = parts.next()?.as_os_str();
+        let package = parts.next()?.as_os_str();
+        let root_name = parts.next()?.as_os_str();
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(
+            self.cache_dir
+                .join("build-roots")
+                .join(project)
+                .join(package)
+                .join(root_name),
+        )
+    }
+
+    /// Delete a build root while its flock is held: the contents go
+    /// first (except the lock file), then the lock file, then the
+    /// root directory itself. The lock file goes last on purpose:
+    /// unlinking it first would let a concurrent build create a
+    /// fresh lock file (new inode) and run inside a root being
+    /// deleted. With the lock file last, a build that slips in
+    /// between the unlink and the rmdir makes the rmdir fail, so
+    /// the delete is reported as failed and the root survives with
+    /// the build in it, instead of being deleted under the build.
+    fn remove_root_dir(&self, root: &Path) -> std::io::Result<()> {
+        self.wipe_root_contents(root)
+            .map_err(|e| std::io::Error::other(format!("{e}")))?;
+        // The lock file may already be gone (a root that never had
+        // one, or one whose lock was never created): its absence is
+        // not a delete failure.
+        match fs::remove_file(root.join(ROOT_LOCK)) {
+            Ok(()) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        fs::remove_dir(root)
+    }
+
+    /// The engine argv for a build, in the shape the existing tool
+    /// uses: root, rpmlist, dist, arch, the podman VM options, the
+    /// build flags, the sccache URI, and the spec last.
+    // Six arguments: the engine invocation's inputs — root, spec,
+    // request, rpmlist, buildconfig, sccache URI. Grouping them
+    // would hide the argv shape.
+    #[allow(clippy::too_many_arguments)]
+    fn engine_argv(
+        &self,
+        root: &Path,
+        spec: &Path,
+        req: &BuildRequest,
+        rpmlist: &Path,
+        buildconfig: &Path,
+        sccache_uri: &Path,
+    ) -> Vec<String> {
+        let mut argv = vec![
+            self.engine.to_string_lossy().to_string(),
+            format!("--root={}", root.join(".mount").display()),
+            format!("--rpmlist={}", rpmlist.display()),
+            format!("--dist={}", buildconfig.display()),
+            format!("--arch={}", req.arch),
+            "--vm-type=podman".to_string(),
+            format!("--vm-disk={}", root.join("img").display()),
+            format!("--vm-swap={}", root.join("swap").display()),
+            format!("--logfile={}", root.join(BUILD_LOG).display()),
+            "--statistics".to_string(),
+            "--norootforbuild".to_string(),
+        ];
+        if req.clean {
+            argv.push("--clean".to_string());
+        }
+        // The engine passes `--changelog` by default (unless
+        // `--no-changelog`): without it the locally built RPMs lack
+        // `%changelog` and differ from server builds.
+        argv.push("--changelog".to_string());
+        if let Some(flavor) = &req.flavor {
+            argv.push(format!("--buildflavor={flavor}"));
+        }
+        if let Some(release) = &req.release {
+            argv.push("--release".to_string());
+            argv.push(release.clone());
+        }
+        argv.push(format!("--sccache-uri={}", sccache_uri.display()));
+        argv.push(spec.to_string_lossy().to_string());
+        argv
+    }
+
+    /// The trust check: the `<bdep project="…">` set must contain
+    /// only non-`home:` projects and the caller's own `home:`. The
+    /// build project itself is excluded from the set: a dep
+    /// resolving from the project being built is the build's own
+    /// output, not a foreign origin — the existing tool's
+    /// `check_trusted_projects` excludes it (`if not i == prj`),
+    /// exact match only, never a subproject. A foreign `home:`
+    /// project refuses with `UntrustedProject`
+    /// naming it; `--trust-all-projects` cannot override that
+    /// refusal — the flag is accepted only after this check passes,
+    /// and it is read nowhere in the refusal decision. A dep without
+    /// a `project` carries no origin to enumerate: it is a virtual
+    /// provide or a not-installed flag, not a package the build
+    /// would install, so it joins no trust set — the existing tool's
+    /// `check_trusted_projects` only considers deps that carry a
+    /// project, and a `noinstall` dep must not refuse a build.
+    fn check_trust(
+        &self,
+        build_project: &str,
+        info: &crate::obs::BuildInfo,
+    ) -> Result<(), GeectlError> {
+        let username = match self.obs.credentials() {
+            Credentials::Basic { username, .. } => Some(username.as_str()),
+            _ => None,
+        };
+        let own_home = username.map(|u| format!("home:{u}"));
+        let mut foreign: Vec<String> = Vec::new();
+        for dep in &info.bdeps {
+            let Some(project) = &dep.project else {
+                continue;
+            };
+            // The build project itself, exactly: a dep resolving
+            // from the project being built is trusted, whatever
+            // that project is — including a foreign `home:`.
+            // Exact match only, never a subproject: a foreign
+            // `home:foo:branches:…` dep is still judged on its own.
+            if project == build_project {
+                continue;
+            }
+            // The caller's own home includes its subtree
+            // (`home:{user}:branches:…`, where OBS branch work
+            // lives): an exact match or a `home:{user}:` prefix.
+            let is_own_home = own_home
+                .as_ref()
+                .is_some_and(|own| project == own || project.starts_with(&format!("{own}:")));
+            if project.starts_with("home:") && !is_own_home && !foreign.contains(project) {
+                foreign.push(project.clone());
+            }
+        }
+        if !foreign.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::UntrustedProject,
+                format!(
+                    "build pulls dependencies from foreign home: project(s): {}; only non-home: projects and the caller's own home: are trusted",
+                    foreign.join(", ")
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The engine version, from `<engine> --version` (first line).
+    /// A version the engine will not report reads as unknown rather
+    /// than failing the build — the record carries it when known.
+    fn engine_version(&self) -> Result<Option<String>, GeectlError> {
+        let engine = which(&self.engine).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::NoBuildEngine,
+                format!(
+                    "build engine {:?} not found on PATH; install the openSUSE build package (zypper install build) or put the build script on PATH",
+                    self.engine.to_string_lossy()
+                ),
+            )
+        })?;
+        let mut cmd = Command::new(&engine);
+        cmd.arg("--version");
+        let output = run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS));
+        match output {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let first = text.lines().next().map(|l| l.trim().to_string());
+                Ok(first.filter(|l| !l.is_empty()))
+            }
+            _ => {
+                self.debug
+                    .emit("local-build: engine did not answer --version; recording unknown");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Create the root marker on first build, or refresh the
+    /// last-build time on reuse. `--clean` wipes the root contents
+    /// first (the marker is rewritten), so a cleaned root reads as
+    /// new. A marker that exists but does not parse fails closed:
+    /// silently resetting it would drop `created_unix` and
+    /// `last_success_digest` — the root's most-recent and image
+    /// protections — and a root whose marker is corrupt is a cache
+    /// problem to fix (build-wipe), not to paper over.
+    fn ensure_marker(
+        &self,
+        root: &Path,
+        req: &BuildRequest,
+        package: &str,
+        image: &ImageInfo,
+        engine_version: &Option<String>,
+    ) -> Result<RootMarker, GeectlError> {
+        let path = root.join(ROOT_MARKER);
+        let now = now_unix();
+        let mut marker = match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str::<RootMarker>(&text).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::CacheCorrupt,
+                    format!("build root marker {} is corrupt ({}); wipe the root with build-wipe and rebuild", path.display(), e),
+                )
+            })?,
+            Err(_) => RootMarker {
+                project: req.project.clone(),
+                package: package.to_string(),
+                repo: req.repo.clone(),
+                arch: req.arch.clone(),
+                flavor: req.flavor.clone(),
+                image_digest: image.digest.clone(),
+                engine_version: engine_version.clone(),
+                created_unix: now,
+                last_build_unix: now,
+                last_success_digest: None,
+            },
+        };
+        marker.image_digest = image.digest.clone();
+        marker.engine_version = engine_version.clone();
+        marker.last_build_unix = now;
+        let text = serde_json::to_string(&marker).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize build root marker: {e}"),
+            )
+        })?;
+        write_atomic(&path, text.as_bytes()).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot write build root marker {}: {e}", path.display()),
+            )
+        })?;
+        Ok(marker)
+    }
+
+    /// Remove everything inside the root (for `--clean`), keeping
+    /// the root directory itself. The marker is rewritten by the
+    /// caller. The lock file is NOT removed: the caller holds its
+    /// flock for the whole build, and deleting the file would leave
+    /// the lock on an unlinked inode — a second build could then
+    /// create a fresh lock file and run in the same root.
+    fn wipe_root_contents(&self, root: &Path) -> Result<(), GeectlError> {
+        let entries = fs::read_dir(root).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot list build root {}: {e}", root.display()),
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot list build root {}: {e}", root.display()),
+                )
+            })?;
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == ROOT_LOCK) {
+                continue;
+            }
+            if path.is_dir() {
+                fs::remove_dir_all(&path).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot wipe {}: {e}", path.display()),
+                    )
+                })?;
+            } else {
+                fs::remove_file(&path).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot wipe {}: {e}", path.display()),
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the root's flock (non-blocking). A held lock refuses
+    /// with `BuildInProgress`, naming the holder from the lock file.
+    /// Lock a build root for a build, refusing while another build
+    /// holds it. A lock that frees within a few milliseconds is
+    /// retried, not refused: a `Command::spawn` in another thread
+    /// forks the process, and the forked child holds a reference
+    /// to the lock file's open file description until exec closes
+    /// it — so a flock dropped just before that fork still reads
+    /// as held for a few milliseconds (proven with a standalone
+    /// probe: `Command` reproduces it, raw `posix_spawnp` does
+    /// not). A real concurrent build holds the lock for the whole
+    /// build, far past this budget, so it still refuses promptly
+    /// with the holder named.
+    fn acquire_root_lock(&self, root: &Path, package: &str) -> Result<BuildLock, GeectlError> {
+        let path = root.join(ROOT_LOCK);
+        // No truncate: the holder line is rewritten after the lock
+        // is held (seek + write + set_len). Truncating on open
+        // would let a refused caller wipe the holder's line before
+        // reading it.
+        let open_lock = || {
+            File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+        };
+        // A just-released lock can read as held for a few
+        // milliseconds (see above): retry briefly, then refuse.
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        loop {
+            let file = match open_lock() {
+                Ok(file) => file,
+                // The root was deleted between the caller's create and
+                // this open (an eviction rmdir landing in between):
+                // recreate the root and open again, instead of failing
+                // a build that should start in a fresh root.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir_all(root).map_err(|e| {
+                        GeectlError::new(
+                            ErrorKind::InternalError,
+                            format!("cannot create build root {}: {e}", root.display()),
+                        )
+                    })?;
+                    open_lock().map_err(|e| {
+                        GeectlError::new(
+                            ErrorKind::InternalError,
+                            format!("cannot open build root lock {}: {e}", path.display()),
+                        )
+                    })?
+                }
+                Err(e) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot open build root lock {}: {e}", path.display()),
+                    ));
+                }
+            };
+            // Lock first, then write the holder line: writing before
+            // locking would let a refused caller overwrite the holder's
+            // line with its own pid and then name itself as the holder.
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    let holder = format!(
+                        "pid={} started={} package={}\n",
+                        std::process::id(),
+                        now_unix(),
+                        package
+                    );
+                    {
+                        use std::io::Seek;
+                        use std::io::SeekFrom;
+                        let mut file = &file;
+                        let _ = file.seek(SeekFrom::Start(0));
+                        let _ = file.write_all(holder.as_bytes());
+                        let _ = file.set_len(holder.len() as u64);
+                    }
+                    return Ok(BuildLock { _file: file });
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    drop(file);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let holder = fs::read_to_string(&path)
+                        .unwrap_or_default()
+                        .lines()
+                        .next()
+                        .unwrap_or("unknown holder")
+                        .to_string();
+                    return Err(GeectlError::new(
+                        ErrorKind::BuildInProgress,
+                        format!(
+                            "build root {} is locked ({holder}); a build of this package is already running",
+                            root.display()
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot lock build root {}: {e}", path.display()),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// The resolved image: the digest the build records, and whether
+/// this build pulled or refreshed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageInfo {
+    digest: Option<String>,
+}
+
+/// Image resolution and dep preparation.
+impl<'a> LocalBuild<'a> {
+    /// Resolve the build image: the local digest when present, a
+    /// pull when absent or older than 7 days, a forced pull with
+    /// `--refresh-image`. The digest is recorded in the build record,
+    /// so a build is reproducible from the record. Podman missing or
+    /// a pull failing is `ImageUnavailable` — the engine cannot run
+    /// without it. A pull refused because the build budget is
+    /// already exhausted is `BuildTimeout` instead — podman and the
+    /// image are fine, the build ran out of time before the pull.
+    /// A pull that starts and then times out is `BuildTimeout` too
+    /// (see `podman_pull`): the same kind as an engine timeout.
+    fn resolve_image(
+        &self,
+        req: &BuildRequest,
+        deadline: std::time::Instant,
+    ) -> Result<ImageInfo, GeectlError> {
+        let podman = which(&self.podman).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ImageUnavailable,
+                format!(
+                    "podman {:?} not found on PATH; install podman to run local builds",
+                    self.podman.to_string_lossy()
+                ),
+            )
+        })?;
+        let digest = self.podman_digest(&podman)?;
+        let sidecar = self.read_image_sidecar();
+        let refreshed = sidecar.refreshed.get(DEFAULT_IMAGE).copied().unwrap_or(0);
+        let stale =
+            refreshed == 0 || now_unix().saturating_sub(refreshed) > IMAGE_REFRESH_DAYS * 86400;
+        if digest.is_none() || req.refresh_image || stale {
+            // The pull gets the build's remaining budget — but a
+            // budget already exhausted fails as a timeout, not as
+            // an image failure: handing a 0s timeout to the pull
+            // reported its "command timed out after 0s" as
+            // `ImageUnavailable`, although podman and the image
+            // were fine. The refusal fires only when no budget
+            // remains at all: a pull due with time left runs with
+            // the remaining budget, however small — a floor above
+            // zero would refuse the pull on every build whose
+            // budget is that small (the pre-pull steps always
+            // consume some of it).
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(GeectlError::new(
+                    ErrorKind::BuildTimeout,
+                    format!(
+                        "image pull refused: build budget of {}s already exhausted ({}s remaining); podman and the image are fine, the build ran out of time before the pull",
+                        req_timeout(req),
+                        remaining.as_secs()
+                    ),
+                ));
+            }
+            self.debug.emit(&format!(
+                "local-build image pull: {} (absent={}, refresh={}, stale={})",
+                DEFAULT_IMAGE,
+                digest.is_none(),
+                req.refresh_image,
+                stale
+            ));
+            self.podman_pull(&podman, remaining)?;
+            let mut sidecar = self.read_image_sidecar();
+            sidecar
+                .refreshed
+                .insert(DEFAULT_IMAGE.to_string(), now_unix());
+            self.write_image_sidecar(&sidecar)?;
+            let digest = self.podman_digest(&podman)?.ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ImageUnavailable,
+                    format!(
+                        "image {DEFAULT_IMAGE} pulled but has no digest; refusing to build from an unidentified image"
+                    ),
+                )
+            })?;
+            return Ok(ImageInfo {
+                digest: Some(digest),
+            });
+        }
+        Ok(ImageInfo { digest })
+    }
+
+    /// The digest of the local image, or None when it is not pulled.
+    fn podman_digest(&self, podman: &Path) -> Result<Option<String>, GeectlError> {
+        let mut cmd = Command::new(podman);
+        cmd.args(["image", "inspect", "--format", "{{.Digest}}", DEFAULT_IMAGE]);
+        let output =
+            run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS)).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::ImageUnavailable,
+                    format!("cannot run podman image inspect: {e}"),
+                )
+            })?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let digest = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Podman prints `<none>` when the image has no digest: that
+        // is "absent", not a digest to record and protect — callers
+        // would otherwise treat it as a real digest and never pull.
+        if digest.is_empty() || digest == "<none>" {
+            return Ok(None);
+        }
+        Ok(Some(digest))
+    }
+
+    /// Pull the image. The command's stderr is bounded in the error:
+    /// a pull failure must say why, not dump a log. The timeout is
+    /// the build's remaining budget: a pull is part of the build,
+    /// and the pull and the engine share one budget — a pull that
+    /// outlasts the whole build budget is hung, not slow. A pull
+    /// that times out is `BuildTimeout`, not `ImageUnavailable`:
+    /// the engine and the image are fine, the build ran out of
+    /// time during the pull.
+    fn podman_pull(&self, podman: &Path, timeout: Duration) -> Result<(), GeectlError> {
+        let mut cmd = Command::new(podman);
+        cmd.args(["pull", DEFAULT_IMAGE]);
+        let output = run_with_timeout(&mut cmd, timeout).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                // A pull that times out is a timeout, not an image
+                // failure: podman and the image are fine, the build
+                // ran out of time during the pull — the same kind
+                // as an engine timeout, naming the budget it had.
+                GeectlError::new(
+                    ErrorKind::BuildTimeout,
+                    format!(
+                        "podman pull {DEFAULT_IMAGE} timed out after {timeout:?} of remaining build budget; podman and the image are fine, the build ran out of time during the pull"
+                    ),
+                )
+            } else {
+                GeectlError::new(
+                    ErrorKind::ImageUnavailable,
+                    format!("cannot run podman pull: {e}"),
+                )
+            }
+        })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr: String = stderr.chars().take(500).collect();
+        Err(GeectlError::new(
+            ErrorKind::ImageUnavailable,
+            format!("podman pull {DEFAULT_IMAGE} failed: {}", stderr.trim()),
+        ))
+    }
+
+    /// The image size in bytes for a digest, best-effort (None when
+    /// podman will not answer — the cap then counts filesystem bytes
+    /// only, and the record says so by omission).
+    fn podman_image_size(&self, digest: &str) -> Option<u64> {
+        let podman = which(&self.podman)?;
+        let mut cmd = Command::new(podman);
+        cmd.args(["image", "inspect", "--format", "{{.Size}}", digest]);
+        let output = run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS)).ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
+    }
+
+    fn read_image_sidecar(&self) -> ImageSidecar {
+        let path = self.cache_dir.join(IMAGE_SIDECAR);
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<ImageSidecar>(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn write_image_sidecar(&self, sidecar: &ImageSidecar) -> Result<(), GeectlError> {
+        let path = self.cache_dir.join(IMAGE_SIDECAR);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot create cache dir {}: {e}", parent.display()),
+                )
+            })?;
+        }
+        let text = serde_json::to_string(sidecar).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize image sidecar: {e}"),
+            )
+        })?;
+        write_atomic(&path, text.as_bytes()).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot write image sidecar {}: {e}", path.display()),
+            )
+        })
+    }
+
+    /// The repository a dep resolves from: its own, or the build
+    /// repo when the server did not say. The existing tool keys its
+    /// cache dir and its download URL by the dep's own
+    /// project/repository/repoarch, not the build's — a dep from a
+    /// linked or module repo must not be fetched from (or cached
+    /// under) the build repo: that would 404, or worse, install a
+    /// wrong-repo file into the build repo's cache dir.
+    fn dep_repo<'b>(dep: &'b BuildDep, req: &'b BuildRequest) -> &'b str {
+        dep.repository.as_deref().unwrap_or(req.repo.as_str())
+    }
+
+    /// The repository architecture a dep resolves for: its own, or
+    /// the build arch when the server did not say.
+    fn dep_arch<'b>(dep: &'b BuildDep, req: &'b BuildRequest) -> &'b str {
+        dep.repoarch.as_deref().unwrap_or(req.arch.as_str())
+    }
+
+    /// Prepare the resolved deps: each one lands in the pkg cache
+    /// (hdrmd5-verified on every use) and the rpmlist names it for
+    /// the engine. Returns the cache statistics and the rpmlist text.
+    /// A dep the server resolved without a binary name is resolved
+    /// from the binary list of its package; a dep with no installable
+    /// file refuses (fail closed, naming the dep). Every dep is
+    /// downloaded and listed, noinstall included: for a spec build
+    /// the existing tool lists every dep as `name path` (the
+    /// noinstall filter applies only to kiwi/docker/podman image
+    /// build types), and the rpmlist references the file, so it must
+    /// exist. The `noinstall:` and `installonly:` lines are emitted
+    /// only when non-empty, and a sysroot dep's line carries the
+    /// `sysroot: ` prefix.
+    fn prepare_deps(
+        &self,
+        req: &BuildRequest,
+        info: &crate::obs::BuildInfo,
+    ) -> Result<(CacheStats, String), GeectlError> {
+        let mut stats = CacheStats::default();
+        let mut lines: Vec<String> = Vec::new();
+        let mut preinstall: Vec<String> = Vec::new();
+        let mut vminstall: Vec<String> = Vec::new();
+        let mut runscripts: Vec<String> = Vec::new();
+        let mut noinstall: Vec<String> = Vec::new();
+        let mut installonly: Vec<String> = Vec::new();
+        for dep in &info.bdeps {
+            validate_dep(dep)?;
+            if dep.preinstall {
+                preinstall.push(dep.name.clone());
+            }
+            if dep.vminstall {
+                vminstall.push(dep.name.clone());
+            }
+            if dep.runscripts {
+                runscripts.push(dep.name.clone());
+            }
+            if dep.noinstall {
+                noinstall.push(dep.name.clone());
+            }
+            if dep.installonly {
+                installonly.push(dep.name.clone());
+            }
+            let filename = match &dep.binary {
+                Some(binary) => binary.clone(),
+                None => self.resolve_dep_filename(req, dep)?,
+            };
+            let cached = self.ensure_cached(req, dep, &filename, &mut stats)?;
+            if dep.sysroot {
+                lines.push(format!("sysroot: {} {}", dep.name, cached.display()));
+            } else {
+                lines.push(format!("{} {}", dep.name, cached.display()));
+            }
+        }
+        // The rpmlist shape: one `<name> <file>` line per dep, then
+        // the install lists. The preinstall image lines are absent
+        // on purpose: a rootless podman build drops the image,
+        // exactly as the existing tool does.
+        lines.push(format!("preinstall: {}", preinstall.join(" ")));
+        lines.push(format!("vminstall: {}", vminstall.join(" ")));
+        lines.push(format!("runscripts: {}", runscripts.join(" ")));
+        if !noinstall.is_empty() {
+            lines.push(format!("noinstall: {}", noinstall.join(" ")));
+        }
+        if !installonly.is_empty() {
+            lines.push(format!("installonly: {}", installonly.join(" ")));
+        }
+        Ok((stats, lines.join("\n") + "\n"))
+    }
+
+    /// Resolve a dep's binary file name. The scheduler's buildinfo
+    /// carries no `binary` attribute, so the file name is computed
+    /// locally (`name-version-release.arch.rpm`, the epoch is never
+    /// part of a file name) when the server sent version, release
+    /// and arch — the same shape the existing tool uses. Without
+    /// all three, the binary list of the dep's *source* package
+    /// resolves it: exactly one RPM whose parsed package name
+    /// equals the dep name must match — a `starts_with("{name}-")`
+    /// filter picks the wrong file for any package that builds
+    /// subpackages (`helper-devel-…` would match a `helper` dep).
+    /// The list is of the source package (`dep.package`), never
+    /// the binary name: a subpackage binary (`libz1`) lives under
+    /// its source package (`zlib`), and listing by the binary name
+    /// 404s (the binary name is not a package). Without a source package the
+    /// whole repository is listed (`_repository`) — the server did
+    /// not say where the binary comes from, so no package segment
+    /// can be assumed.
+    fn resolve_dep_filename(
+        &self,
+        req: &BuildRequest,
+        dep: &BuildDep,
+    ) -> Result<String, GeectlError> {
+        if let (Some(version), Some(release), Some(arch)) = (
+            dep.version.as_deref().filter(|v| !v.is_empty()),
+            dep.release.as_deref().filter(|v| !v.is_empty()),
+            dep.arch.as_deref().filter(|v| !v.is_empty()),
+        ) {
+            return Ok(format!("{}-{version}-{release}.{arch}.rpm", dep.name));
+        }
+        let project = dep.project.as_deref().unwrap_or(&req.project);
+        let package = dep.package.as_deref().unwrap_or("_repository");
+        let files = self.obs.list_binaries(
+            project,
+            Some(package),
+            Self::dep_repo(dep, req),
+            Self::dep_arch(dep, req),
+        )?;
+        let candidates: Vec<&str> = files
+            .iter()
+            .map(|f| f.name.as_str())
+            .filter(|name| rpm_package_name(name).as_deref() == Some(dep.name.as_str()))
+            .collect();
+        match candidates.len() {
+            1 => Ok(candidates[0].to_string()),
+            0 => Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "cannot resolve a binary file for dependency {} (project {project}, package {package}); the binary list carries no main RPM",
+                    dep.name
+                ),
+            )),
+            _ => Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "cannot resolve a binary file for dependency {} (project {project}, package {package}); ambiguous: {}",
+                    dep.name,
+                    candidates.join(", ")
+                ),
+            )),
+        }
+    }
+
+    /// Ensure one dep RPM is in the pkg cache, verified against the
+    /// buildinfo hdrmd5 when the server sent one. A cached file that
+    /// fails verification is re-downloaded once, then refused with
+    /// `CacheCorrupt`. Returns the cache path. Every use touches the
+    /// file (mtime = last use) for the eviction order.
+    fn ensure_cached(
+        &self,
+        req: &BuildRequest,
+        dep: &BuildDep,
+        filename: &str,
+        stats: &mut CacheStats,
+    ) -> Result<PathBuf, GeectlError> {
+        // The resolved file name is the one dep-derived path
+        // component `validate_dep` cannot see: it comes from the
+        // server's binary list, not from a dep field, so a `/` or
+        // `..` in it would escape the cache dir at the `dir.join`
+        // below (and the API path when it is downloaded). Fail
+        // closed here, before any path is built from it: this is
+        // the sink every file name reaches, whichever of the two
+        // sources (`dep.binary` or the list resolution) produced it.
+        validate_path_component("dependency binary", filename)?;
+        // The dep's own project/repository/repoarch, not the
+        // build's: the cache dir is one per project+repo+arch, so a
+        // dep from another project or repo can never be installed
+        // into this repo's root (or vice versa) — and the same repo
+        // name plus the same file name from two projects never
+        // collide in one dir, the way they would under a
+        // repo+arch-only key. The lock is the same
+        // project-repo-arch lock eviction takes while deleting that
+        // dir's pkg files.
+        let project = dep.project.as_deref().unwrap_or(&req.project);
+        let repo = Self::dep_repo(dep, req);
+        let arch = Self::dep_arch(dep, req);
+        let dir = self
+            .cache_dir
+            .join("pkg")
+            .join(project)
+            .join(repo)
+            .join(arch);
+        fs::create_dir_all(&dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot create package cache {}: {e}", dir.display()),
+            )
+        })?;
+        // The per-file download/write path takes the
+        // project-repo-arch lock (blocking, briefly): eviction
+        // takes the same lock while deleting that dir's pkg files,
+        // so a delete can never race a download's atomic rename.
+        // The lock is held for the whole ensure — check, download,
+        // write, verify — so a concurrent eviction cannot delete
+        // the file between the existence check and the verify.
+        let _pkg_lock = self.acquire_pkg_lock(project, repo, arch)?;
+        let path = dir.join(filename);
+        if path.exists() {
+            match self.verify_hdrmd5(&path, dep.hdrmd5.as_deref()) {
+                Ok(()) => {
+                    stats.pkg_hits += 1;
+                    touch(&path);
+                    return Ok(path);
+                }
+                Err(e) => {
+                    // A corrupt cached file is re-downloaded once;
+                    // the download path below verifies again.
+                    self.debug.emit(&format!(
+                        "local-build cache: {} failed verification ({}); re-downloading",
+                        filename, e
+                    ));
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        stats.pkg_misses += 1;
+        let bytes = self.download_dep(req, dep, project, filename)?;
+        write_atomic(&path, &bytes).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot write package cache {}: {e}", path.display()),
+            )
+        })?;
+        self.verify_hdrmd5(&path, dep.hdrmd5.as_deref())
+            .map_err(|e| {
+                let _ = fs::remove_file(&path);
+                GeectlError::new(
+                    ErrorKind::CacheCorrupt,
+                    format!(
+                        "cached package {filename} failed its hdrmd5 check after re-download ({}); deleted from the cache",
+                        e.context
+                    ),
+                )
+            })?;
+        touch(&path);
+        Ok(path)
+    }
+
+    /// Download one dep RPM. The transport caps bodies at 10 MiB: a
+    /// dep over the cap fails here with the cap named, not with a
+    /// truncated file. Streaming downloads are not supported yet;
+    /// this refuses rather than guessing.
+    /// The download URL keys on the dep's *source* package, never
+    /// the binary name: a subpackage binary lives under its source
+    /// package, and the binary name as the package segment 404s.
+    fn download_dep(
+        &self,
+        req: &BuildRequest,
+        dep: &BuildDep,
+        project: &str,
+        filename: &str,
+    ) -> Result<Vec<u8>, GeectlError> {
+        let package = dep.package.as_deref().unwrap_or("_repository");
+        match self.obs.download_binary(
+            project,
+            package,
+            Self::dep_repo(dep, req),
+            Self::dep_arch(dep, req),
+            filename,
+        ) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if is_transport_cap_error(&e) => Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "cannot download {filename} for dependency {}: the file exceeds the 10 MiB transport body limit; streaming downloads are not supported yet",
+                    dep.name
+                ),
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Verify a cached RPM against the expected hdrmd5. No expected
+    /// value (the server did not send one) verifies as ok — the
+    /// existing tool only verifies when the buildinfo carries one.
+    fn verify_hdrmd5(&self, path: &Path, expected: Option<&str>) -> Result<(), GeectlError> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let actual = rpm_hdrmd5(path).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::CacheCorrupt,
+                format!("cannot read hdrmd5 of {}: {e}", path.display()),
+            )
+        })?;
+        if actual.eq_ignore_ascii_case(expected) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::CacheCorrupt,
+                format!(
+                    "hdrmd5 mismatch for {}: expected {expected}, got {actual}",
+                    path.display()
+                ),
+            ))
+        }
+    }
+
+    /// Read the build log, parse the verdict, and write the build
+    /// record. A non-zero engine exit is `BuildFailed` (exit code +
+    /// log path + tail); a zero exit with no `finished` line or no
+    /// RPMs is a record with verdict `failed`.
+    // Eleven arguments: the build record's fields, assembled here
+    // from the build's inputs — there is no earlier record to pass.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_build(
+        &self,
+        req: &BuildRequest,
+        package: &str,
+        root: &Path,
+        log_path: &Path,
+        image: &ImageInfo,
+        engine_version: &Option<String>,
+        root_reused: bool,
+        cache: CacheStats,
+        eviction: EvictionReport,
+        preinstall_image: Option<String>,
+        outcome: EngineOutcome,
+    ) -> Result<BuildRecord, GeectlError> {
+        // Lossy on purpose: a non-UTF-8 log must still parse (a
+        // strict read would empty the log and fail a good build on
+        // its verdict). Only the tail is read (see `read_log_tail`).
+        let log_text = read_log_tail(log_path);
+        let rpms = collect_rpms(root);
+        let rpmlint = parse_rpmlint_summary(&log_text);
+        let checks = parse_check_summary(&log_text);
+        let sccache_hits = parse_sccache_hits(&log_text);
+        let cache = CacheStats {
+            sccache_hits,
+            ..cache
+        };
+        let finished = has_finished_line(&log_text, package);
+        let record = BuildRecord {
+            verdict: if outcome.exit_code == 0 && finished && !rpms.is_empty() {
+                "green".to_string()
+            } else {
+                "failed".to_string()
+            },
+            exit_code: outcome.exit_code,
+            log_path: log_path.to_path_buf(),
+            rpms,
+            rpmlint,
+            checks,
+            image_digest: image.digest.clone(),
+            engine_version: engine_version.clone(),
+            root_path: root.to_path_buf(),
+            root_reused,
+            cache,
+            eviction,
+            preinstall_image,
+            dry_run: false,
+            plan: None,
+        };
+        // The record is written even on failure: `build-log` reads
+        // the verdict from it, and the next build reuses the root. A
+        // failed write is debug output, not a build failure — the
+        // record is an audit trail, and losing it must not fail a
+        // build that already ran.
+        let record_path = root.join(BUILD_RECORD);
+        match serde_json::to_string_pretty(&record) {
+            Ok(text) => {
+                if let Err(e) = write_atomic(&record_path, text.as_bytes()) {
+                    self.debug.emit(&format!(
+                        "local-build: cannot write build record {}: {e}",
+                        record_path.display()
+                    ));
+                }
+            }
+            Err(e) => {
+                self.debug
+                    .emit(&format!("local-build: cannot serialize build record: {e}"));
+            }
+        }
+        // The marker records the last successful build's digest: an
+        // image digest is superseded only once a newer digest has a
+        // successful build behind it. The marker is re-read from
+        // disk here (it may have been refreshed since the build
+        // started) rather than trusting the in-memory copy.
+        if record.verdict == "green" {
+            if let Ok(text) = fs::read_to_string(root.join(ROOT_MARKER)) {
+                if let Ok(mut marker) = serde_json::from_str::<RootMarker>(&text) {
+                    marker.last_success_digest = image.digest.clone();
+                    marker.last_build_unix = now_unix();
+                    if let Ok(text) = serde_json::to_string(&marker) {
+                        let _ = write_atomic(&root.join(ROOT_MARKER), text.as_bytes());
+                    }
+                }
+            }
+        }
+        // Touch the sccache store: eviction orders stores by last
+        // use. This runs before the timeout/failure returns below:
+        // the store is used on every build, and a package that
+        // fails repeatedly must not lose its warm cache to eviction
+        // for aging while it is still being built.
+        touch(&self.sccache_dir(&req.project, package, &req.repo, &req.arch, &req.flavor));
+        if outcome.timed_out {
+            return Err(GeectlError::new(
+                ErrorKind::BuildTimeout,
+                format!(
+                    "build of {package} timed out after {}s; partial log at {}; the engine's process group was killed, but the container it started may still be running",
+                    req_timeout(req),
+                    log_path.display()
+                ),
+            ));
+        }
+        if outcome.exit_code != 0 {
+            let tail = last_lines(&log_text, 20).join("\n");
+            return Err(GeectlError::new(
+                ErrorKind::BuildFailed,
+                format!(
+                    "build of {package} failed with exit code {}; log at {}; tail:\n{tail}",
+                    outcome.exit_code,
+                    log_path.display()
+                ),
+            ));
+        }
+        Ok(record)
+    }
+}
+
+/// Whether `e` is the transport's over-cap rejection: the response
+/// body exceeded the 10 MiB read cap (`MAX_BODY_BYTES` in
+/// `src/http.rs`, whose message reads "response body exceeds the
+/// N-byte limit"). The match is on the message because the
+/// transport reports the cap as a plain `ServerError`; it is the
+/// full phrase, not the bare "exceeds the" — any other error
+/// containing those words must not be misreported as a cap refusal.
+fn is_transport_cap_error(e: &GeectlError) -> bool {
+    e.context.contains("response body exceeds the")
+}
+
+fn req_timeout(req: &BuildRequest) -> u64 {
+    req.timeout_secs
+}
+
+/// The engine's exit: code, and whether the timeout killed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EngineOutcome {
+    exit_code: i32,
+    timed_out: bool,
+}
+
+/// Run the engine with a bounded timeout, draining its stdout and
+/// stderr (capped) while waiting. Returns the exit, whether the
+/// timeout killed it, and the captured output (stdout, stderr).
+/// The engine spawns in its own process group (`process_group(0)`),
+/// so on timeout the kill reaches the engine and its children in
+/// the host process group — killing the wrapper alone would leave
+/// the engine running. The container the engine started is NOT
+/// stopped by that kill: it lives in its own pid namespace, and
+/// conmon keeps it running after podman dies — stopping it needs
+/// the container id, which the engine does not report (see the
+/// design doc's "Timeout and abort"). The child gets SIGTERM, then
+/// SIGKILL after a grace period (see [`kill_child`]).
+fn run_engine(
+    argv: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<(EngineOutcome, Vec<u8>, Vec<u8>), GeectlError> {
+    if argv.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InternalError,
+            "cannot run the build engine: empty argv",
+        ));
+    }
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Its own process group: the timeout kill signals the group
+        // (`kill -- -$pgid`), not just the wrapper — the engine and
+        // its host-side children die with it. The container does
+        // not: it lives in its own pid namespace (see the doc above).
+        // `process_group` is safe std, no `unsafe`, so the crate's
+        // `unsafe` forbid still holds.
+        .process_group(0)
+        .spawn()
+        .map_err(|e| {
+            GeectlError::new(
+                ErrorKind::NoBuildEngine,
+                format!("cannot run the build engine {}: {e}", argv[0]),
+            )
+        })?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let stdout_drain = spawn_drain(stdout.take());
+    let stderr_drain = spawn_drain(stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok((
+                    EngineOutcome {
+                        exit_code: status.code().unwrap_or(-1),
+                        timed_out: false,
+                    },
+                    take_drain(stdout_drain),
+                    take_drain(stderr_drain),
+                ));
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    kill_child(&mut child);
+                    let _ = child.wait();
+                    // The timeout path discards the captured output
+                    // (the log file is the record): detach the
+                    // drains instead of waiting out the join timeout.
+                    drop(stdout_drain);
+                    drop(stderr_drain);
+                    return Ok((
+                        EngineOutcome {
+                            exit_code: -1,
+                            timed_out: true,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot wait for the build engine: {e}"),
+                ));
+            }
+        }
+    }
+}
+
+/// SIGTERM the child's process group, then SIGKILL after a grace
+/// period. The engine runs in its own process group (see
+/// [`run_engine`]), so the signal reaches the engine and its
+/// host-side children — killing the wrapper alone would leave the
+/// engine running. It does NOT stop the container the engine
+/// started (own pid namespace; conmon keeps it running) — see
+/// [`run_engine`]. `kill` is the system binary (present on Linux
+/// and macOS); when it is missing the SIGKILL below is the whole
+/// kill, and only the direct child dies.
+fn kill_child(child: &mut std::process::Child) {
+    let pgid = child.id();
+    let _ = Command::new("kill")
+        .args(["-TERM", "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let deadline = std::time::Instant::now() + Duration::from_secs(KILL_GRACE_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+}
+
+/// Run a one-shot command with a deadline, capturing stdout/stderr
+/// (capped, as in [`run_engine`]). On expiry the child is killed
+/// and `TimedOut` is returned — a probe must never hang the caller.
+/// The engine run has its own deadline loop ([`run_engine`]); this
+/// is for the probes (`--version`, image inspect/listing/size,
+/// image remove, image pull).
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<std::process::Output> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let stdout_drain = spawn_drain(stdout.take());
+    let stderr_drain = spawn_drain(stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(std::process::Output {
+                    status,
+                    stdout: take_drain(stdout_drain),
+                    stderr: take_drain(stderr_drain),
+                });
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    drop(stdout_drain);
+                    drop(stderr_drain);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("command timed out after {}s", timeout.as_secs()),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// A drain in flight: the buffer the drain thread appends to, and
+/// a signal that it finished. The buffer is shared so the caller
+/// can take what was captured so far when the join times out — the
+/// child has already written it; only EOF is missing.
+struct Drain {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: mpsc::Receiver<()>,
+}
+
+/// Start draining a piped stream into a shared buffer (capped, as
+/// below): the thread reads until EOF and then signals completion.
+/// If a descendant inherited the pipe and outlives the child, EOF
+/// never comes — the thread is left detached and the caller takes
+/// the partial buffer after `DRAIN_JOIN_TIMEOUT_SECS` instead of
+/// hanging on the join.
+fn spawn_drain(stream: Option<impl Read + Send + 'static>) -> Drain {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done_rx) = mpsc::channel();
+    let shared = Arc::clone(&buf);
+    std::thread::spawn(move || {
+        drain_into(stream, &shared);
+        let _ = done_tx.send(());
+    });
+    Drain { buf, done: done_rx }
+}
+
+/// Take the drained output, waiting at most the join timeout for
+/// the drain to finish. On timeout the partial buffer is returned —
+/// the child already wrote it; only EOF is missing. Dropping a
+/// `Drain` without taking it detaches the thread: it finishes on
+/// its own when the pipe closes.
+fn take_drain(drain: Drain) -> Vec<u8> {
+    let _ = drain
+        .done
+        .recv_timeout(Duration::from_secs(DRAIN_JOIN_TIMEOUT_SECS));
+    drain
+        .buf
+        .lock()
+        .map(|mut buf| std::mem::take(&mut *buf))
+        .unwrap_or_default()
+}
+
+/// Drain a piped stream into a shared buffer, capped: past the cap
+/// the rest is read and discarded, never unbounded, and never left
+/// unread — stopping at the cap would let a verbose child block on
+/// a full pipe and be killed as a timeout for talking too much.
+fn drain_into(stream: Option<impl Read + Send + 'static>, buf: &Arc<Mutex<Vec<u8>>>) {
+    let Some(mut stream) = stream else {
+        return;
+    };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Ok(mut buf) = buf.lock() {
+                    let room = OUTPUT_CAP_BYTES.saturating_sub(buf.len());
+                    if room > 0 {
+                        buf.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Find the engine (or podman) binary: an absolute path as-is, a
+/// bare name resolved via `PATH`.
+fn which(path: &Path) -> Option<PathBuf> {
+    if path.components().count() > 1 {
+        return if path.exists() {
+            Some(path.to_path_buf())
+        } else {
+            None
+        };
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(path);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Write a file via temp file + atomic rename, so a half-written
+/// file is never visible (a reader either sees the old file or the
+/// new one). The temp file is removed on failure: no crust.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    fs::create_dir_all(parent)?;
+    // The temp name must be unique per call, not just per second:
+    // two writes in the same second would collide.
+    for n in 0..1000 {
+        let tmp = parent.join(format!(".geectl-tmp-{}-{n}", std::process::id()));
+        match File::options().write(true).create_new(true).open(&tmp) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(contents).and_then(|()| file.sync_all()) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e);
+                }
+                drop(file);
+                return match fs::rename(&tmp, path) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        let _ = fs::remove_file(&tmp);
+                        Err(e)
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "cannot allocate a temp file for atomic write",
+    ))
+}
+
+/// Touch a path (update its mtime to now) for the eviction order.
+/// A missing path is not an error: an absent sccache store starts
+/// empty. Opening for append does NOT update mtime on its own — the
+/// `FileTimes` set is what moves it.
+fn touch(path: &Path) {
+    if let Ok(file) = File::open(path) {
+        let _ = file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
+    }
+}
+
+/// One path component under the cache dir: a single name, never a
+/// traversal. `valid_obs_name` allows `.`, so `..` (and `/`, `\`,
+/// NUL, empty) needs this separate check — without it a flavor of
+/// `../../x` (or a `..` project/repo) would escape the cache dir,
+/// and a `build --clean` would wipe an arbitrary directory.
+fn validate_path_component(label: &str, value: &str) -> Result<(), GeectlError> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains('\0')
+    {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid {label} {value:?}: must be a single path component"),
+        ));
+    }
+    Ok(())
+}
+
+/// Every dep field that becomes a cache path component or an API
+/// URL segment: server data, so a `..` project (or a `/` in a file
+/// name) must fail closed here, not escape the cache dir or the API
+/// path when the dep is downloaded. The build's own components are
+/// validated in `build`; the dep's were not. An empty attribute is
+/// no attribute (see `resolve_dep_filename`), so empty values are
+/// skipped, not rejected.
+fn validate_dep(dep: &BuildDep) -> Result<(), GeectlError> {
+    validate_path_component("dependency name", &dep.name)?;
+    for (label, value) in [
+        ("dependency project", &dep.project),
+        ("dependency package", &dep.package),
+        ("dependency binary", &dep.binary),
+        ("dependency version", &dep.version),
+        ("dependency release", &dep.release),
+        ("dependency architecture", &dep.arch),
+        ("dependency repository", &dep.repository),
+        ("dependency repoarch", &dep.repoarch),
+    ] {
+        if let Some(value) = value.as_deref().filter(|v| !v.is_empty()) {
+            validate_path_component(label, value)?;
+        }
+    }
+    Ok(())
+}
+
+/// All five cache-dir components of a build root: project, repo,
+/// arch, and the flavor when present. The package is checked by the
+/// caller once it is known (from the spec in `build`, from the
+/// argument in `build_shell`/`build_wipe`/`build_log`).
+fn validate_cache_components(
+    project: &str,
+    repo: &str,
+    arch: &str,
+    flavor: &Option<String>,
+) -> Result<(), GeectlError> {
+    validate_path_component("project", project)?;
+    validate_path_component("repository", repo)?;
+    validate_path_component("architecture", arch)?;
+    if let Some(flavor) = flavor {
+        validate_path_component("flavor", flavor)?;
+    }
+    Ok(())
+}
+
+/// Find the single spec file in a source directory. Zero or several
+/// is invalid input, naming what was found.
+fn find_spec(source_dir: &Path) -> Result<PathBuf, GeectlError> {
+    let entries = fs::read_dir(source_dir).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot read source directory {}: {e}", source_dir.display()),
+        )
+    })?;
+    let mut specs: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot list source directory {}: {e}", source_dir.display()),
+            )
+        })?;
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|e| e == "spec") {
+            specs.push(path);
+        }
+    }
+    match specs.len() {
+        1 => Ok(specs.pop().unwrap()),
+        0 => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("no .spec file in source directory {}", source_dir.display()),
+        )),
+        _ => {
+            let names: Vec<String> = specs
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect();
+            Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "several .spec files in source directory {}: {}; pass a directory with one package",
+                    source_dir.display(),
+                    names.join(", ")
+                ),
+            ))
+        }
+    }
+}
+
+/// The multibuild flavors of a source directory, from `_multibuild`
+/// (`<multibuild><package>flavor</package>…</multibuild>`). None when
+/// the file is absent (not a multibuild package). A present but
+/// unreadable or empty file is invalid input, not an empty flavor
+/// list — a flavorless build of a multibuild package dies with a
+/// fake architecture error, which is exactly what this refuses to
+/// re-learn.
+fn multibuild_flavors(source_dir: &Path) -> Result<Option<Vec<String>>, GeectlError> {
+    let path = source_dir.join("_multibuild");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot read _multibuild file {}: {e}", path.display()),
+        )
+    })?;
+    let mut flavors: Vec<String> = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("<package") {
+        let Some(tag_end) = rest[start..].find('>') else {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("malformed _multibuild file {}", path.display()),
+            ));
+        };
+        let content_start = start + tag_end + 1;
+        let Some(end) = rest[content_start..].find("</package>") else {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("malformed _multibuild file {}", path.display()),
+            ));
+        };
+        let flavor = rest[content_start..content_start + end].trim().to_string();
+        if !flavor.is_empty() {
+            flavors.push(flavor);
+        }
+        rest = &rest[content_start + end + "</package>".len()..];
+    }
+    if flavors.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "_multibuild file {} carries no flavors; remove it or name one",
+                path.display()
+            ),
+        ));
+    }
+    Ok(Some(flavors))
+}
+
+/// The package name of an RPM filename (`name-version-release.arch.rpm`
+/// -> `name`): the version and release are split off from the right,
+/// and the arch after the last dot. A source RPM has no binary name
+/// to resolve, so it never matches. None when the filename is not a
+/// shaped RPM name at all.
+fn rpm_package_name(filename: &str) -> Option<String> {
+    if filename.ends_with(".src.rpm") {
+        return None;
+    }
+    let stem = filename.strip_suffix(".rpm")?;
+    let without_arch = stem.rsplit_once('.')?.0;
+    let without_release = without_arch.rsplit_once('-')?.0;
+    let name = without_release.rsplit_once('-')?.0;
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// The RPMs a build produced: `*.rpm` files under the root's
+/// `.mount/.build.packages`, recursing into `RPMS/` and `SRPMS/` —
+/// the engine puts its output there, not at the top level (the
+/// existing tool's `pacdir` is `<build_root>/.build.packages` where
+/// the build root already ends in `/.mount`). The top level is never
+/// scanned: a stale `.build.packages` there would have its RPMs
+/// reported as fresh outputs of every later build. A source RPM
+/// counts as a built RPM: it is output the build produced. The list
+/// is sorted for a stable record.
+fn collect_rpms(root: &Path) -> Vec<PathBuf> {
+    let mut rpms: Vec<PathBuf> = Vec::new();
+    collect_rpms_under(&root.join(".mount").join(".build.packages"), &mut rpms);
+    rpms.sort();
+    rpms
+}
+
+/// Recurse `dir` for `*.rpm` files, deduplicating by path.
+fn collect_rpms_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rpms_under(&path, out);
+        } else if path.is_file()
+            && path.extension().is_some_and(|e| e == "rpm")
+            && !out.contains(&path)
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// True when the log carries the engine's `finished "build <spec>"`
+/// line for this package: the success signal, alongside exit code 0
+/// and the RPMs present. The built target is the quoted name after
+/// `finished "build `, compared by file name exactly: a suffix of
+/// another spec name (`barfoo.spec` for package `foo`) must not
+/// match, while a path prefix (`/some/dir/foo.spec`) still does.
+fn has_finished_line(log: &str, package: &str) -> bool {
+    let spec = format!("{package}.spec");
+    log.lines().any(|line| {
+        let Some((_, rest)) = line.split_once("finished \"build ") else {
+            return false;
+        };
+        let Some(target) = rest.split('"').next() else {
+            return false;
+        };
+        Path::new(target)
+            .file_name()
+            .is_some_and(|name| name == spec.as_str())
+    })
+}
+
+/// The rpmlint summary from a build log: rpmlint's own summary line
+/// (`N packages and M specfiles checked; X errors, Y warnings.`)
+/// when present, else the count of `E:`/`W:` lines in the log.
+/// Badness is the sum of the `Badness:` annotations, 0 when the log
+/// carries none. The summary line is read from the whole log (its
+/// shape is distinctive); the fallback count and the badness sum
+/// cover only the rpmlint section — the lines after the last line
+/// that names rpmlint — so `%check` output cannot be miscounted as
+/// rpmlint findings. With no such line the whole log is the section.
+fn parse_rpmlint_summary(log: &str) -> RpmlintSummary {
+    let lines: Vec<&str> = log.lines().collect();
+    let mut summary = RpmlintSummary::default();
+    let mut saw_summary = false;
+    for line in &lines {
+        if let Some((errors, warnings)) = parse_rpmlint_summary_line(line) {
+            saw_summary = true;
+            summary.errors = errors;
+            summary.warnings = warnings;
+        }
+    }
+    // The rpmlint section starts after the last line naming rpmlint
+    // (its header or invocation, which precedes the findings). A log
+    // that never names rpmlint has no section to bound.
+    let section_start = lines
+        .iter()
+        .rposition(|l| l.to_ascii_lowercase().contains("rpmlint"))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    for line in &lines[section_start..] {
+        if let Some(badness) = parse_badness(line) {
+            summary.badness += badness;
+        }
+    }
+    if !saw_summary {
+        // No summary line: fall back to counting the finding lines.
+        // A finding reads `<pkg>: E: ...` (or a bare `E: ...` when
+        // the log carries no package prefix).
+        for line in &lines[section_start..] {
+            let trimmed = line.trim_start();
+            if line.contains(": E:") || trimmed.starts_with("E:") {
+                summary.errors += 1;
+            } else if line.contains(": W:") || trimmed.starts_with("W:") {
+                summary.warnings += 1;
+            }
+        }
+    }
+    summary
+}
+
+/// Parse `… checked; 3 errors, 2 warnings.` — rpmlint's summary
+/// line. Returns None when the line is not a summary line. The
+/// singular forms ("1 error, 1 warning") are accepted too.
+fn parse_rpmlint_summary_line(line: &str) -> Option<(u64, u64)> {
+    let (_, rest) = line.split_once("checked;")?;
+    let rest = rest.trim().trim_end_matches('.');
+    let (errors, rest) = rest
+        .split_once(" errors,")
+        .or_else(|| rest.split_once(" error,"))?;
+    let warnings = rest
+        .trim()
+        .strip_suffix(" warnings")
+        .or_else(|| rest.trim().strip_suffix(" warning"))?;
+    Some((
+        errors.trim().parse::<u64>().ok()?,
+        warnings.trim().parse::<u64>().ok()?,
+    ))
+}
+
+/// Parse a `Badness: N` annotation on a log line.
+fn parse_badness(line: &str) -> Option<u64> {
+    let (_, rest) = line.split_once("Badness:")?;
+    rest.trim()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|n| n.parse::<u64>().ok())
+}
+
+/// The `%check` summary from a build log: ctest's `N% tests passed,
+/// M tests failed out of K`. None when the log carries no such line.
+fn parse_check_summary(log: &str) -> Option<CheckSummary> {
+    for line in log.lines() {
+        if let Some(summary) = parse_ctest_line(line) {
+            return Some(summary);
+        }
+    }
+    None
+}
+
+fn parse_ctest_line(line: &str) -> Option<CheckSummary> {
+    let (_, rest) = line.split_once("% tests passed,")?;
+    let (failed, rest) = rest.trim().split_once(" tests failed out of ")?;
+    let total = rest.trim().parse::<u64>().ok()?;
+    let failed = failed.trim().parse::<u64>().ok()?;
+    // The percent is the pass share; derive passed from the total.
+    if total < failed {
+        return None;
+    }
+    Some(CheckSummary {
+        passed: total - failed,
+        failed,
+        total,
+    })
+}
+
+/// The sccache hit count from a build log, best-effort: the engine
+/// prints `sccache … <n> cache hits` in some versions, nothing in
+/// others. The count is the digit run immediately before
+/// "cache hits" — the first digit run on the line may be a version.
+fn parse_sccache_hits(log: &str) -> Option<u64> {
+    for line in log.lines() {
+        let lower = line.to_ascii_lowercase();
+        let Some(pos) = lower.find("cache hits") else {
+            continue;
+        };
+        if !lower[..pos].contains("sccache") {
+            continue;
+        }
+        let before = lower[..pos].trim_end();
+        let digits: String = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<char>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if let Ok(n) = digits.parse::<u64>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// The last `n` lines of a log, for the `BuildFailed` tail.
+/// Read the tail of a build log (at most `LOG_TAIL_CAP_BYTES`,
+/// lossy UTF-8): the verdict, the rpmlint/check/sccache summaries
+/// and the `finished` line all live at the end of the log, so the
+/// tail is what the parsers need. A missing or unreadable log
+/// reads as empty, as before — a strict read would fail a good
+/// build on its verdict. When the head was skipped, the tail
+/// starts at a line boundary: the partial first line is dropped —
+/// unless the window starts exactly on a line boundary, in which
+/// case its first line is complete and is kept — so the result is
+/// whole lines.
+fn read_log_tail(path: &Path) -> String {
+    let Ok(mut file) = File::open(path) else {
+        return String::new();
+    };
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let skipped = len > LOG_TAIL_CAP_BYTES;
+    // When the head was skipped, the tail window starts at
+    // `len - LOG_TAIL_CAP_BYTES`. When the byte before the window
+    // is `\n`, the window starts exactly on a line boundary and
+    // its first line is complete — keep it. Otherwise the window
+    // starts mid-line and the partial first line is dropped.
+    // Dropping unconditionally would delete a complete first
+    // line on the boundary, so a log whose last line is the
+    // `finished` line would read as an empty tail and a green
+    // build would be reported failed.
+    let on_boundary = skipped
+        && file
+            .seek(SeekFrom::Start(len - LOG_TAIL_CAP_BYTES - 1))
+            .is_ok()
+        && {
+            let mut probe = [0u8; 1];
+            file.read_exact(&mut probe).is_ok() && probe[0] == b'\n'
+        };
+    if skipped {
+        let _ = file.seek(SeekFrom::Start(len - LOG_TAIL_CAP_BYTES));
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    if skipped && !on_boundary {
+        match bytes.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                bytes.drain(..=pos);
+            }
+            None => return String::new(),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn last_lines(log: &str, n: usize) -> Vec<&str> {
+    let lines: Vec<&str> = log.lines().collect();
+    let skip = lines.len().saturating_sub(n);
+    lines[skip..].to_vec()
+}
+
+/// The hdrmd5 of an RPM file: the MD5 of the header section plus the
+/// payload — the bytes from the main-header start to the end of the
+/// file. That is what the signature header's tag 1004 carries, and
+/// what the backend puts in the buildinfo: the name is misleading,
+/// the payload is included (verified against real Tumbleweed RPMs).
+/// The file is lead (96 bytes) + signature header + header + payload.
+fn rpm_hdrmd5(path: &Path) -> Result<String, String> {
+    // The header offset lives in the first bytes; read only enough
+    // to find it, then stream the rest through the hasher — a
+    // planted multi-hundred-MB cache file must never be read whole.
+    // The probe grows a chunk at a time until the header is found:
+    // a real main header can be hundreds of KiB (glibc's ends past
+    // 64 KiB), so a fixed-size probe rejects real RPMs. The hash
+    // continues from where the probe stopped, so no seek is needed.
+    // A file genuinely truncated inside its header still fails
+    // correctly: its digest will not match the expected hdrmd5.
+    let mut file = File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut probe: Vec<u8> = Vec::new();
+    let header_start = loop {
+        match rpm_header_start(&probe) {
+            Ok(start) => break start,
+            Err(e) => {
+                if probe.len() >= RPM_HEADER_PROBE_CAP_BYTES {
+                    // The header was not found within the probe
+                    // cap. Two parse errors are probe-length-
+                    // dependent, so they say the header exceeds
+                    // the cap instead: "truncated RPM header"
+                    // (the header extends past the bytes probed
+                    // so far, including a prologue cut off within
+                    // the last 16 bytes of the probe) and
+                    // "malformed RPM signature header (header
+                    // past end of file)" (the signature header
+                    // alone is so large the main header starts
+                    // past the probe). The other parse errors
+                    // (bad magic, malformed headers) are reported
+                    // as-is — they do not depend on how much was
+                    // probed. A file smaller than the cap that is
+                    // genuinely truncated inside its header still
+                    // fails correctly: the probe hits EOF first
+                    // and the truncated error is returned below.
+                    // Past the cap that guarantee does not hold —
+                    // the cap branch returns before EOF is ever
+                    // read — so a larger file whose header claims
+                    // past EOF gets the over-cap message instead;
+                    // the refusal is the same either way.
+                    return Err(
+                        if e == "truncated RPM header"
+                            || e == "malformed RPM signature header (header past end of file)"
+                        {
+                            format!(
+                                "RPM header exceeds the {} MiB probe cap",
+                                RPM_HEADER_PROBE_CAP_BYTES / (1024 * 1024)
+                            )
+                        } else {
+                            e
+                        },
+                    );
+                }
+                let n = (&mut file)
+                    .take(RPM_HEADER_PROBE_CHUNK_BYTES as u64)
+                    .read_to_end(&mut probe)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                if n == 0 {
+                    return Err(e);
+                }
+            }
+        }
+    };
+    let mut ctx = md5::Context::new();
+    ctx.consume(&probe[header_start..]);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => ctx.consume(&chunk[..n]),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+    Ok(format!("{:x}", ctx.compute()))
+}
+
+/// The offset of the main header in an RPM file: lead (96 bytes) +
+/// the signature header. Lead magic `ED AB EE DB`, then the
+/// signature header (magic `8E AD E8`, 8-byte aligned). Every slice
+/// is bounds-checked: a corrupt cache file must error, never panic.
+fn rpm_header_start(bytes: &[u8]) -> Result<usize, String> {
+    if bytes.len() < 96 + 16 {
+        return Err("file too short to be an RPM".to_string());
+    }
+    if bytes[0..4] != [0xed, 0xab, 0xee, 0xdb] {
+        return Err("not an RPM file (bad lead magic)".to_string());
+    }
+    let sig_start = 96;
+    let (sig_len, _) = rpm_header_len(&bytes[sig_start..])
+        .ok_or_else(|| "malformed RPM signature header".to_string())?;
+    let header_start = sig_start
+        .checked_add(sig_len)
+        .ok_or_else(|| "malformed RPM signature header (size overflows)".to_string())?;
+    if header_start > bytes.len() {
+        return Err("malformed RPM signature header (header past end of file)".to_string());
+    }
+    // Fewer than 16 bytes left means the main header's prologue
+    // is cut off — by the probe cap as well as by EOF — so this
+    // is a truncation, not a malformation: the cap branch above
+    // relabels it as over-cap, and a genuinely short file still
+    // says truncated. A bad magic with a full prologue present
+    // stays "malformed RPM header".
+    if bytes.len() - header_start < 16 {
+        return Err("truncated RPM header".to_string());
+    }
+    let (header_len, _) =
+        rpm_header_len(&bytes[header_start..]).ok_or_else(|| "malformed RPM header".to_string())?;
+    if header_start
+        .checked_add(header_len)
+        .is_none_or(|end| end > bytes.len())
+    {
+        return Err("truncated RPM header".to_string());
+    }
+    Ok(header_start)
+}
+
+/// The length of one RPM header section starting at `bytes`:
+/// 16 bytes of prologue + index + store, padded to a multiple of 8.
+/// Returns (total length, entry count).
+fn rpm_header_len(bytes: &[u8]) -> Option<(usize, usize)> {
+    if bytes.len() < 16 {
+        return None;
+    }
+    if bytes[0..3] != [0x8e, 0xad, 0xe8] {
+        return None;
+    }
+    let nindex = u32::from_be_bytes(bytes[8..12].try_into().ok()?) as usize;
+    let hsize = u32::from_be_bytes(bytes[12..16].try_into().ok()?) as usize;
+    // Checked: a corrupt file's huge counts must error, never
+    // overflow (debug) or wrap (release) into a bogus length.
+    let len = 16usize
+        .checked_add(16usize.checked_mul(nindex)?)?
+        .checked_add(hsize)?;
+    let aligned = len.div_ceil(8).checked_mul(8)?;
+    Some((aligned, nindex))
+}
+
+/// Eviction and the companion operations.
+impl<'a> LocalBuild<'a> {
+    /// Take the shared eviction lock (non-blocking). None when
+    /// another build holds it — the caller skips eviction instead of
+    /// deleting under a concurrent eviction.
+    fn acquire_eviction_lock(&self) -> Option<BuildLock> {
+        let path = self.cache_dir.join(EVICTION_LOCK);
+        let _ = fs::create_dir_all(&self.cache_dir);
+        // No truncate: the file carries no content, and truncating
+        // on open would be a write to a file another build may hold.
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .ok()?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Some(BuildLock { _file: file }),
+            Err(_) => None,
+        }
+    }
+
+    /// The project-repo-arch lock file:
+    /// `pkg/<project>/<repo>/<arch>.lock`, next to the pkg files it
+    /// guards. The project is part of the key: the same repo name
+    /// in two projects is two different cache dirs, so it needs two
+    /// different locks.
+    fn pkg_lock_path(&self, project: &str, repo: &str, arch: &str) -> PathBuf {
+        self.cache_dir
+            .join("pkg")
+            .join(project)
+            .join(repo)
+            .join(format!("{arch}.lock"))
+    }
+
+    /// Open a project-repo-arch lock file (no truncate: the file
+    /// carries no content).
+    fn open_pkg_lock(&self, project: &str, repo: &str, arch: &str) -> Result<File, GeectlError> {
+        let path = self.pkg_lock_path(project, repo, arch);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot create package cache {}: {e}", parent.display()),
+                )
+            })?;
+        }
+        File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot open package cache lock {}: {e}", path.display()),
+                )
+            })
+    }
+
+    /// Take a project-repo-arch lock, blocking: the per-file
+    /// download/write path holds it for the whole ensure (check,
+    /// download, write, verify). A download is capped at 10 MiB, so
+    /// the hold is brief; a build that waits here is waiting on
+    /// another build's download of the same project-repo-arch, not
+    /// on a build.
+    fn acquire_pkg_lock(
+        &self,
+        project: &str,
+        repo: &str,
+        arch: &str,
+    ) -> Result<BuildLock, GeectlError> {
+        let file = self.open_pkg_lock(project, repo, arch)?;
+        file.lock_exclusive().map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot lock package cache {project}/{repo}/{arch}: {e}"),
+            )
+        })?;
+        Ok(BuildLock { _file: file })
+    }
+
+    /// Take a project-repo-arch lock, non-blocking: eviction holds
+    /// it while deleting that dir's pkg files. None when a download
+    /// holds it — the file is skipped, not deleted under the
+    /// download.
+    fn try_pkg_lock(&self, project: &str, repo: &str, arch: &str) -> Option<BuildLock> {
+        let file = self.open_pkg_lock(project, repo, arch).ok()?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Some(BuildLock { _file: file }),
+            Err(_) => None,
+        }
+    }
+
+    /// The cache usage: total bytes and per-area bytes, plus the cap
+    /// and low-water mark. The image size is every digest of this
+    /// vertical's repository, from podman when it answers; when it
+    /// does not, the images count as 0 and the record says so by
+    /// the missing size, not by a guess.
+    pub fn cache_usage(&self) -> Result<CacheUsage, GeectlError> {
+        let images = self.vertical_images();
+        self.cache_usage_with_images(&images)
+    }
+
+    /// `cache_usage` against a listing already taken: the plan
+    /// path takes the listing once and reuses it for the pre-check,
+    /// the usage and the image step, instead of shelling out to
+    /// `podman images` plus one `inspect` per digest up to four
+    /// times per over-cap build. The apply path still re-reads
+    /// fresh (`cache_usage`), so a delete that freed bytes another
+    /// build added is not reported against a stale total.
+    fn cache_usage_with_images(&self, images: &[(String, u64)]) -> Result<CacheUsage, GeectlError> {
+        let mut usage = CacheUsage {
+            cap_bytes: self.cache_cap_bytes,
+            low_water_bytes: self.low_water(),
+            ..CacheUsage::default()
+        };
+        usage.pkg_bytes = dir_size(&self.cache_dir.join("pkg"));
+        usage.sccache_bytes = dir_size(&self.cache_dir.join("sccache"));
+        usage.roots_bytes = dir_size(&self.cache_dir.join("build-roots"));
+        usage.total_bytes = usage.pkg_bytes + usage.sccache_bytes + usage.roots_bytes;
+        // The images are the one area not on the cache filesystem:
+        // count every digest of this vertical's repository, not
+        // just the current one — eviction's image step subtracts
+        // superseded digests from the same total, so the two must
+        // agree. When podman will not answer, the images count as 0.
+        usage.image_bytes = images.iter().map(|(_, size)| *size).sum();
+        usage.total_bytes += usage.image_bytes;
+        Ok(usage)
+    }
+
+    /// The digests of this vertical's image in the local podman
+    /// store, with sizes: only the Tumbleweed repository, never the
+    /// whole local image set. A digest is listed once even when
+    /// podman tags it twice (`latest` + a dated tag): one row per
+    /// repo:tag would double-count its bytes and list it twice for
+    /// deletion. The current digest is resolved by inspecting
+    /// `DEFAULT_IMAGE` directly, not only from the listing: if
+    /// podman spells the repository differently (a mirror, another
+    /// reference), the listing's exact-match filter would drop the
+    /// image entirely and the cap would stop covering images.
+    fn vertical_images(&self) -> Vec<(String, u64)> {
+        let Some(podman) = which(&self.podman) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, u64)> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        // The current digest first, as podman resolves it.
+        if let Ok(Some(digest)) = self.podman_digest(&podman) {
+            let size = self.podman_image_size(&digest).unwrap_or(0);
+            seen.push(digest.clone());
+            out.push((digest, size));
+        }
+        let mut cmd = Command::new(podman);
+        cmd.args(["images", "--format", "{{.Repository}} {{.Digest}}"]);
+        let output = run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS));
+        let Ok(output) = output else {
+            return out;
+        };
+        if !output.status.success() {
+            return out;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(repo), Some(digest)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            // No repository filter here would delete every local
+            // image on the machine (a dev database, another
+            // project's image) — only this vertical's repository.
+            if repo != IMAGE_REPOSITORY || digest == "<none>" {
+                continue;
+            }
+            if seen.contains(&digest.to_string()) {
+                continue;
+            }
+            seen.push(digest.to_string());
+            let size = self.podman_image_size(digest).unwrap_or(0);
+            out.push((digest.to_string(), size));
+        }
+        out
+    }
+
+    /// Every build root's marker, parsed: the basis for the
+    /// last-success digests and the most-recent-build digest. A
+    /// marker that does not parse is skipped — its root's key and
+    /// times are unknown, so eviction cannot reason about it.
+    fn root_markers(&self) -> Vec<RootMarker> {
+        let roots = self.cache_dir.join("build-roots");
+        let mut markers: Vec<RootMarker> = Vec::new();
+        let mut stack: Vec<PathBuf> = vec![roots];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.file_name().is_some_and(|n| n == ROOT_MARKER) {
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        if let Ok(marker) = serde_json::from_str::<RootMarker>(&text) {
+                            markers.push(marker);
+                        }
+                    }
+                }
+            }
+        }
+        markers
+    }
+
+    /// The digest the most recent build recorded (the marker with
+    /// the latest last-build time): image eviction never removes it.
+    fn most_recent_build_digest(&self) -> Option<String> {
+        self.root_markers()
+            .iter()
+            .max_by_key(|m| m.last_build_unix)
+            .and_then(|m| m.image_digest.clone())
+    }
+
+    /// The (project, package) pairs with a build root whose lock is
+    /// held: a sccache store for such a package is never evicted.
+    fn locked_root_keys(&self) -> std::collections::HashSet<(String, String)> {
+        let mut locked = std::collections::HashSet::new();
+        let roots = self.cache_dir.join("build-roots");
+        let mut stack: Vec<PathBuf> = vec![roots];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.file_name().is_some_and(|n| n == ROOT_MARKER) {
+                    let Ok(text) = fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let Ok(marker) = serde_json::from_str::<RootMarker>(&text) else {
+                        continue;
+                    };
+                    let Some(root) = path.parent() else {
+                        continue;
+                    };
+                    if root_lock_held(root) {
+                        locked.insert((marker.project, marker.package));
+                    }
+                }
+            }
+        }
+        locked
+    }
+
+    /// The current image digest from the sidecar's refresh record,
+    /// via podman. None when no image is recorded or podman will
+    /// not answer.
+    fn current_image_digest(&self) -> Option<String> {
+        let podman = which(&self.podman)?;
+        self.podman_digest(&podman).ok().flatten()
+    }
+
+    /// Plan the eviction: when usage is above the cap, select which
+    /// cache contents go, in the settled order, until the usage is
+    /// at or below the low-water mark — pkg files (oldest use
+    /// first), then sccache stores, then build roots, then
+    /// superseded images. The cap is the trigger, the low-water
+    /// mark is the target: a cache between the two is left alone.
+    /// Never selected: locked roots, the most recent root per
+    /// (project, package), the current dep set,
+    /// the current build's sccache store, a store whose package
+    /// has a locked build root, the 24h grace period, the current
+    /// image digest, the digest the most recent build recorded.
+    /// This only plans: it deletes nothing. The caller deletes what
+    /// the plan lists (see [`Self::evict`] and [`Self::prune_apply`]).
+    /// `protected_bytes` is the bytes skipped by a protection rule
+    /// while planning, capped at the bytes above the low-water mark.
+    fn evict_plan(
+        &self,
+        current_dep_files: &[String],
+        current_dep_names: &[String],
+        current_digest: Option<&str>,
+        current_sccache: Option<&Path>,
+        images: &[(String, u64)],
+    ) -> Result<EvictionReport, GeectlError> {
+        let mut report = EvictionReport {
+            cap_bytes: self.cache_cap_bytes,
+            low_water_bytes: self.low_water(),
+            ..EvictionReport::default()
+        };
+        let usage = self.cache_usage_with_images(images)?;
+        report.bytes_before = usage.total_bytes;
+        report.bytes_after = usage.total_bytes;
+        if usage.total_bytes <= report.cap_bytes {
+            return Ok(report);
+        }
+        report.ran = true;
+        // The simulated usage: candidates are selected until this
+        // reaches the low-water mark. Nothing is deleted here.
+        let mut remaining = usage.total_bytes;
+        let mut protected: u64 = 0;
+        let now = now_unix();
+
+        // 1. Package files, oldest use (mtime) first, across every
+        // repo/arch in the cache. The current dep set and anything
+        // used in the last 24h never evict.
+        let mut pkg_files: Vec<(PathBuf, u64, u64)> = Vec::new();
+        let mut pkg_skipped: u64 = 0;
+        collect_pkg_files(
+            &self.cache_dir.join("pkg"),
+            current_dep_files,
+            current_dep_names,
+            now,
+            &mut pkg_files,
+            &mut pkg_skipped,
+        );
+        protected += pkg_skipped;
+        pkg_files.sort_by_key(|(_, _, mtime)| *mtime);
+        for (path, size, _) in pkg_files {
+            if remaining <= report.low_water_bytes {
+                break;
+            }
+            remaining = remaining.saturating_sub(size);
+            report.evicted.push(EvictedItem {
+                path: path.display().to_string(),
+                bytes: size,
+                kind: "pkg".to_string(),
+                reason: "lru".to_string(),
+            });
+        }
+
+        // 2. Sccache stores, oldest use first. The current build's
+        // store, a store whose package has a locked build root, and
+        // anything in the 24h grace period never evict.
+        if remaining > report.low_water_bytes {
+            let mut stores: Vec<(PathBuf, u64, u64)> = Vec::new();
+            let mut stores_skipped: u64 = 0;
+            if let Ok(entries) = fs::read_dir(self.cache_dir.join("sccache")) {
+                for entry in entries.flatten() {
+                    collect_sccache_stores(&entry.path(), &mut stores, now, &mut stores_skipped);
+                }
+            }
+            protected += stores_skipped;
+            let locked_keys = self.locked_root_keys();
+            stores.retain(|(path, size, _)| {
+                if current_sccache.is_some_and(|keep| path == keep) {
+                    protected += *size;
+                    return false;
+                }
+                // The store's (project, package) from its path
+                // (see `store_project_package`): an unrecognised
+                // shape is protected, never evicted — a locked
+                // root must not be missed because the path parsed
+                // wrong.
+                match self.store_project_package(path) {
+                    Some(key) => {
+                        if locked_keys.contains(&key) {
+                            protected += *size;
+                            return false;
+                        }
+                    }
+                    None => {
+                        protected += *size;
+                        return false;
+                    }
+                }
+                true
+            });
+            stores.sort_by_key(|(_, _, mtime)| *mtime);
+            for (path, size, _) in stores {
+                if remaining <= report.low_water_bytes {
+                    break;
+                }
+                remaining = remaining.saturating_sub(size);
+                report.evicted.push(EvictedItem {
+                    path: path.display().to_string(),
+                    bytes: size,
+                    kind: "sccache".to_string(),
+                    reason: "lru".to_string(),
+                });
+            }
+        }
+
+        // 3. Build roots, oldest last-build first. A locked root, the
+        // most recent root per (project, package), and anything in
+        // the 24h grace period never evict. The grouping is by
+        // project+package: one root per 5-tuple key exists (the path
+        // is the key), so grouping by the full key protected every
+        // root that carries a parseable marker and roots effectively
+        // never evicted. Only the newest root of the package is
+        // protected, and an older root in another repo, arch or
+        // flavor is regenerable by reinstalling its deps (from the
+        // pkg cache when still cached, else re-downloaded from OBS)
+        // — root reuse
+        // itself stays per 5-tuple, so that repo's next build
+        // recreates its root rather than reusing the newest one.
+        if remaining > report.low_water_bytes {
+            let mut roots =
+                collect_root_entries(&self.cache_dir.join("build-roots"), now, &mut protected);
+            // The most recent root per (project, package) is
+            // protected, whatever its last build's outcome: a failed
+            // root is still the root the next build reuses.
+            let mut newest: HashMap<(String, String), u64> = HashMap::new();
+            for entry in &roots {
+                let key = (entry.project.clone(), entry.package.clone());
+                let best = newest.entry(key).or_insert(0);
+                *best = (*best).max(entry.last_build_unix);
+            }
+            for entry in &roots {
+                let key = (entry.project.clone(), entry.package.clone());
+                if newest.get(&key).copied().unwrap_or(0) == entry.last_build_unix {
+                    protected += dir_size(&entry.path);
+                }
+            }
+            roots.retain(|entry| {
+                let key = (entry.project.clone(), entry.package.clone());
+                newest.get(&key).copied().unwrap_or(0) != entry.last_build_unix
+            });
+            roots.sort_by_key(|entry| entry.last_build_unix);
+            for entry in roots {
+                if remaining <= report.low_water_bytes {
+                    break;
+                }
+                let size = dir_size(&entry.path);
+                remaining = remaining.saturating_sub(size);
+                report.evicted.push(EvictedItem {
+                    path: entry.path.display().to_string(),
+                    bytes: size,
+                    kind: "root".to_string(),
+                    reason: "lru".to_string(),
+                });
+            }
+        }
+
+        // 4. Superseded images: an older digest of the image, once a
+        // newer digest has been pulled and a build has succeeded
+        // with it. Never the current digest, never the digest the
+        // most recent build recorded.
+        if remaining > report.low_water_bytes {
+            self.plan_superseded_images(
+                current_digest,
+                &mut remaining,
+                &mut report,
+                &mut protected,
+                images,
+            );
+        }
+
+        report.bytes_after = remaining;
+        report.freed_bytes = report.evicted.iter().map(|item| item.bytes).sum();
+        report.shortfall_bytes = remaining.saturating_sub(report.low_water_bytes);
+        report.protected_bytes =
+            protected.min(report.bytes_before.saturating_sub(report.low_water_bytes));
+        Ok(report)
+    }
+
+    /// Evict at build start: plan under the shared eviction lock,
+    /// then delete what the plan lists. A failure to delete one
+    /// candidate is recorded and the eviction continues with the
+    /// next — a stuck file must not block the build. When another
+    /// build holds the eviction lock, this run skips eviction
+    /// (`ran` stays false, nothing deleted) rather than deleting
+    /// under a concurrent eviction.
+    fn evict(
+        &self,
+        current_dep_files: &[String],
+        current_dep_names: &[String],
+        current_digest: Option<&str>,
+        current_sccache: Option<&Path>,
+    ) -> Result<EvictionReport, GeectlError> {
+        // Cheap pre-check: no lock when already under the cap. The
+        // images listing is taken once here and handed to the plan,
+        // so one over-cap build shells out to podman once, not
+        // once per usage/image computation.
+        let images = self.vertical_images();
+        let usage = self.cache_usage_with_images(&images)?;
+        if usage.total_bytes <= self.cache_cap_bytes {
+            return Ok(EvictionReport {
+                cap_bytes: self.cache_cap_bytes,
+                low_water_bytes: self.low_water(),
+                bytes_before: usage.total_bytes,
+                bytes_after: usage.total_bytes,
+                ..EvictionReport::default()
+            });
+        }
+        let Some(_evict_lock) = self.acquire_eviction_lock() else {
+            return Ok(EvictionReport {
+                cap_bytes: self.cache_cap_bytes,
+                low_water_bytes: self.low_water(),
+                bytes_before: usage.total_bytes,
+                bytes_after: usage.total_bytes,
+                failures: vec!["eviction lock held by another build; eviction skipped".to_string()],
+                ..EvictionReport::default()
+            });
+        };
+        let mut report = self.evict_plan(
+            current_dep_files,
+            current_dep_names,
+            current_digest,
+            current_sccache,
+            &images,
+        )?;
+        self.apply_eviction_plan(&mut report);
+        Ok(report)
+    }
+
+    /// Delete what a plan lists. Each deletion is recorded; a
+    /// failure to delete one entry is recorded and the rest still
+    /// go. `bytes_after` is re-read after the deletes so it states
+    /// the cache as it stands, not as the plan assumed. The plan is
+    /// stale by the time it applies, so every root's lock is held
+    /// across its delete (a root locked between plan and apply is
+    /// never deleted under a running build), every sccache store's
+    /// root lock is held across its delete the same way, and every
+    /// pkg file's project-repo-arch lock is taken non-blocking
+    /// before its delete (a file being downloaded is skipped, not
+    /// deleted under the download).
+    fn apply_eviction_plan(&self, report: &mut EvictionReport) {
+        let planned = std::mem::take(&mut report.evicted);
+        let mut freed = 0u64;
+        for item in planned {
+            let result = if item.kind == "image" {
+                self.remove_image(Path::new(&item.path))
+            } else if item.kind == "root" {
+                let path = Path::new(&item.path);
+                // Hold the root's flock across the delete: the
+                // plan-time probe is stale by now, and a build that
+                // locks between probe and delete would have its root
+                // removed under it. The lock file itself goes last
+                // (see `remove_root_dir`): unlinking it first would
+                // let a concurrent build create a fresh lock file
+                // and run inside the root being deleted.
+                let held = match try_hold_root_lock(path) {
+                    Ok(held) => held,
+                    Err(()) => {
+                        report.failures.push(format!(
+                            "cannot delete {}: the root was locked after the plan was made",
+                            item.path
+                        ));
+                        continue;
+                    }
+                };
+                let _held = held;
+                self.remove_root_dir(path)
+            } else if item.kind == "sccache" {
+                // Hold the store's root lock across the delete: the
+                // plan-time locked-root snapshot is stale by now, and
+                // a store whose package started a build after the
+                // plan must not be deleted under it. The store is
+                // per root, so the root's flock is the guard — a
+                // build of that root holds it from before the store
+                // is created until the build ends. An unrecognised
+                // store path is never deleted: it cannot be
+                // attributed to a root, so no lock could guard it.
+                // A store whose root is already gone has no build
+                // in it (a build creates the root before the store),
+                // so it deletes unguarded.
+                let store_path = Path::new(&item.path);
+                let Some(root) = self.store_root_path(store_path) else {
+                    report.failures.push(format!(
+                        "cannot delete {}: its store path has an unrecognised shape",
+                        item.path
+                    ));
+                    continue;
+                };
+                let held = if root.exists() {
+                    match try_hold_root_lock(&root) {
+                        Ok(held) => held,
+                        Err(()) => {
+                            report.failures.push(format!(
+                                "cannot delete {}: its package has a locked build root",
+                                item.path
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let _held = held;
+                fs::remove_dir_all(&item.path)
+            } else if item.kind == "pkg" {
+                match self.pkg_lock_for_path(Path::new(&item.path)) {
+                    Some(_lock) => fs::remove_file(&item.path),
+                    None => {
+                        // A `None` is either a lock held by a
+                        // download or a path of an unrecognised
+                        // shape — a legacy file the collector
+                        // recursed over, which no lock could ever
+                        // guard. Report them apart: the shape
+                        // case is not a concurrent download.
+                        if self.pkg_path_has_current_shape(Path::new(&item.path)) {
+                            report.failures.push(format!(
+                                "cannot delete {}: its project-repo-arch lock is held by a download",
+                                item.path
+                            ));
+                        } else {
+                            report.failures.push(format!(
+                                "cannot delete {}: its path has an unrecognised shape",
+                                item.path
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            } else if Path::new(&item.path).is_dir() {
+                fs::remove_dir_all(&item.path)
+            } else {
+                fs::remove_file(&item.path)
+            };
+            match result {
+                Ok(()) => {
+                    freed += item.bytes;
+                    report.evicted.push(item);
+                }
+                Err(e) => {
+                    report
+                        .failures
+                        .push(format!("cannot delete {}: {e}", item.path));
+                }
+            }
+        }
+        report.freed_bytes = freed;
+        if let Ok(usage) = self.cache_usage() {
+            report.bytes_after = usage.total_bytes;
+        } else {
+            report.bytes_after = report.bytes_before.saturating_sub(freed);
+        }
+        report.shortfall_bytes = report.bytes_after.saturating_sub(report.low_water_bytes);
+    }
+
+    /// Whether `path` is a current-layout pkg file: exactly
+    /// `pkg/<project>/<repo>/<arch>/<file>` under the cache dir.
+    /// The apply arm uses it to tell an unrecognised shape (a
+    /// legacy file that can never be evicted, and is not a
+    /// concurrent download) from a lock held by a download.
+    fn pkg_path_has_current_shape(&self, path: &Path) -> bool {
+        let Ok(rel) = path.strip_prefix(self.cache_dir.join("pkg")) else {
+            return false;
+        };
+        rel.components().count() == 4
+    }
+
+    /// The project-repo-arch lock for a pkg file path
+    /// (`pkg/<project>/<repo>/<arch>/<file>`), non-blocking. None
+    /// when the path is not under the pkg cache, has an
+    /// unrecognised shape, or a download holds the lock — the
+    /// caller skips the file. The shape is exact: a legacy
+    /// `pkg/<repo>/<arch>/<file>` path must not be read as
+    /// project/repo/arch, or the lock taken would guard nothing
+    /// and the file would be deleted unguarded.
+    fn pkg_lock_for_path(&self, path: &Path) -> Option<BuildLock> {
+        let rel = path.strip_prefix(self.cache_dir.join("pkg")).ok()?;
+        let mut parts = rel.components();
+        let project = parts.next()?.as_os_str().to_string_lossy().to_string();
+        let repo = parts.next()?.as_os_str().to_string_lossy().to_string();
+        let arch = parts.next()?.as_os_str().to_string_lossy().to_string();
+        let _file = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        self.try_pkg_lock(&project, &repo, &arch)
+    }
+
+    /// Select superseded images for the plan: digests of this
+    /// vertical's repository that are neither the current digest
+    /// nor the digest the most recent build recorded. An older
+    /// digest may go only once a newer digest has been pulled and a
+    /// build has succeeded with it — here that is the current digest
+    /// with a last-success marker behind it. Without that evidence
+    /// no image evicts: deleting the only working image would leave
+    /// the next build pulling again. Digests skipped by a
+    /// protection rule add their sizes to `protected`.
+    fn plan_superseded_images(
+        &self,
+        current_digest: Option<&str>,
+        remaining: &mut u64,
+        report: &mut EvictionReport,
+        protected: &mut u64,
+        images: &[(String, u64)],
+    ) {
+        let Some(current) = current_digest else {
+            return;
+        };
+        // The gate: the current (newer) digest must have a
+        // successful build behind it.
+        if !self.last_success_digests().iter().any(|d| d == current) {
+            return;
+        }
+        let most_recent = self.most_recent_build_digest();
+        for (digest, size) in images {
+            if *remaining <= report.low_water_bytes {
+                break;
+            }
+            if digest.as_str() == current {
+                *protected += *size;
+                continue;
+            }
+            if most_recent.as_deref() == Some(digest.as_str()) {
+                *protected += *size;
+                continue;
+            }
+            *remaining = remaining.saturating_sub(*size);
+            report.evicted.push(EvictedItem {
+                path: digest.clone(),
+                bytes: *size,
+                kind: "image".to_string(),
+                reason: "superseded-image".to_string(),
+            });
+        }
+    }
+
+    /// Every digest with a last-success marker behind it, across all
+    /// build roots.
+    fn last_success_digests(&self) -> Vec<String> {
+        let mut digests: Vec<String> = Vec::new();
+        for marker in self.root_markers() {
+            if let Some(digest) = marker.last_success_digest {
+                if !digests.contains(&digest) {
+                    digests.push(digest);
+                }
+            }
+        }
+        digests
+    }
+
+    /// Build the plan for `build-prune` without deleting anything:
+    /// the same eviction order the build start uses, against the
+    /// current usage. No dep set is protected (no build is running),
+    /// but locked roots, most-recent roots, the grace period and the
+    /// current digest still are.
+    pub fn prune_plan(&self) -> Result<EvictionReport, GeectlError> {
+        let images = self.vertical_images();
+        self.evict_plan(
+            &[],
+            &[],
+            self.current_image_digest().as_deref(),
+            None,
+            &images,
+        )
+    }
+
+    /// Delete what `prune_plan` lists: plan under the shared
+    /// eviction lock, then delete. Each deletion is recorded; a
+    /// failure to delete one entry is recorded and the rest still
+    /// go. Returns the report of what was (and was not) deleted.
+    pub fn prune_apply(&self) -> Result<EvictionReport, GeectlError> {
+        self.evict(&[], &[], self.current_image_digest().as_deref(), None)
+    }
+
+    /// Remove one image by digest via podman.
+    fn remove_image(&self, digest: &Path) -> std::io::Result<()> {
+        let Some(podman) = which(&self.podman) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "podman not found on PATH",
+            ));
+        };
+        let mut cmd = Command::new(podman);
+        cmd.args(["rmi", digest.to_string_lossy().as_ref()]);
+        let output = run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS))?;
+        let status = output.status;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "podman rmi {} failed",
+                digest.display()
+            )))
+        }
+    }
+
+    /// Open a shell in the build container for a built root: the
+    /// engine's `--shell-cmd` path with the given commands joined by
+    /// ` && `. The root must exist and carry a marker; a missing
+    /// root is `NotAGeectlBuildRoot`. The shell is scripted only: a
+    /// command array, no TTY, a bounded timeout, stdout/stderr
+    /// captured as data in the result — never attached, never
+    /// unbounded. An empty command list is invalid input (no
+    /// interactive fallback). The argv is the build's shape minus
+    /// `--logfile`: `--rpmlist`/`--dist`/`--arch` are passed exactly
+    /// as the existing tool passes them for a `--shell-cmd` run
+    /// (they come from the root, which the build wrote). `--logfile`
+    /// is dropped on purpose: passing it would overwrite the last
+    /// build's log that `build-log` reads; the output rides in the
+    /// result instead. The spec itself is not passed: it lives in
+    /// the source dir, not the root, and the shell enters the
+    /// preserved root whose rpmlist/dist carry the resolved inputs.
+    // Seven arguments: the build-root coordinates plus the command
+    // array and the timeout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_shell(
+        &self,
+        project: &str,
+        package: &str,
+        repo: &str,
+        arch: &str,
+        flavor: &Option<String>,
+        commands: &[String],
+        timeout_secs: u64,
+    ) -> Result<ShellResult, GeectlError> {
+        validate_cache_components(project, repo, arch, flavor)?;
+        validate_path_component("package", package)?;
+        if commands.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "build-shell takes a scripted command array; an empty list is not an interactive shell",
+            ));
+        }
+        if timeout_secs == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "build-shell timeout must be greater than 0 seconds",
+            ));
+        }
+        let root = self.root_path(project, package, repo, arch, flavor);
+        let marker_path = root.join(ROOT_MARKER);
+        if !marker_path.exists() {
+            return Err(GeectlError::new(
+                ErrorKind::NotAGeectlBuildRoot,
+                format!(
+                    "no geectl build root at {}; build the package first",
+                    root.display()
+                ),
+            ));
+        }
+        // The shell needs the build's rpmlist and buildconfig: a
+        // root whose build never got that far has no shell to open.
+        let rpmlist_path = root.join(RPMLIST);
+        let buildconfig_path = root.join(BUILDCONFIG);
+        for path in [&rpmlist_path, &buildconfig_path] {
+            if !path.exists() {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "no {} in build root {}; build the package first",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        root.display()
+                    ),
+                ));
+            }
+        }
+        let _lock = self.acquire_root_lock(&root, package)?;
+        // The marker and the shell's inputs were checked before the
+        // lock; re-check after it, mirroring `build_wipe`: an
+        // eviction may have deleted the root in between (the lock
+        // open recreates an empty directory), and a shell in a
+        // markerless empty root would fail confusingly after
+        // populating it.
+        if !marker_path.exists() {
+            return Err(GeectlError::new(
+                ErrorKind::NotAGeectlBuildRoot,
+                format!(
+                    "no geectl build root at {}; build the package first",
+                    root.display()
+                ),
+            ));
+        }
+        for path in [&rpmlist_path, &buildconfig_path] {
+            if !path.exists() {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "no {} in build root {}; build the package first",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        root.display()
+                    ),
+                ));
+            }
+        }
+        let shell_cmd = commands.join(" && ");
+        let argv = [
+            self.engine.to_string_lossy().to_string(),
+            format!("--root={}", root.join(".mount").display()),
+            format!("--rpmlist={}", rpmlist_path.display()),
+            format!("--dist={}", buildconfig_path.display()),
+            format!("--arch={arch}"),
+            "--vm-type=podman".to_string(),
+            format!("--vm-disk={}", root.join("img").display()),
+            format!("--vm-swap={}", root.join("swap").display()),
+            "--shell-cmd".to_string(),
+            shell_cmd,
+        ];
+        self.debug
+            .emit(&format!("local-build shell: {}", argv.join(" ")));
+        let (outcome, stdout, stderr) =
+            run_engine(&argv, &root, Duration::from_secs(timeout_secs))?;
+        if outcome.timed_out {
+            return Err(GeectlError::new(
+                ErrorKind::BuildTimeout,
+                format!(
+                    "shell in build root {} timed out after {timeout_secs}s; the engine's process group was killed, but the container it started may still be running",
+                    root.display()
+                ),
+            ));
+        }
+        Ok(ShellResult {
+            exit_code: outcome.exit_code,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        })
+    }
+
+    /// Wipe a build root: the marker must be present and the root
+    /// must not be locked by another build. Refuses with
+    /// `NotAGeectlBuildRoot` when the marker is absent (never wipe
+    /// an unknown directory) and with `BuildRootInUse` when another
+    /// build holds the lock — a destructive op refused while the
+    /// root is in use, not a second build (`BuildInProgress`). The
+    /// lock file itself is created on demand by the lock attempt,
+    /// so it is not a precondition.
+    pub fn build_wipe(
+        &self,
+        project: &str,
+        package: &str,
+        repo: &str,
+        arch: &str,
+        flavor: &Option<String>,
+    ) -> Result<(), GeectlError> {
+        validate_cache_components(project, repo, arch, flavor)?;
+        validate_path_component("package", package)?;
+        let root = self.root_path(project, package, repo, arch, flavor);
+        let marker_path = root.join(ROOT_MARKER);
+        if !marker_path.exists() {
+            return Err(GeectlError::new(
+                ErrorKind::NotAGeectlBuildRoot,
+                format!(
+                    "no geectl build root at {}; refusing to wipe an unknown directory",
+                    root.display()
+                ),
+            ));
+        }
+        let _lock = self.acquire_root_lock(&root, package).map_err(|e| {
+            if e.kind() == ErrorKind::BuildInProgress {
+                GeectlError::new(
+                    ErrorKind::BuildRootInUse,
+                    format!("cannot wipe build root {}: {e}", root.display()),
+                )
+            } else {
+                e
+            }
+        })?;
+        // The marker was checked before the lock; re-check after
+        // it: an eviction may have deleted the root in between (the
+        // lock open recreates an empty directory — see
+        // `acquire_root_lock`), and wiping that empty directory
+        // would report success for a root that is already gone.
+        if !marker_path.exists() {
+            return Err(GeectlError::new(
+                ErrorKind::NotAGeectlBuildRoot,
+                format!(
+                    "no geectl build root at {}; refusing to wipe an unknown directory",
+                    root.display()
+                ),
+            ));
+        }
+        self.wipe_root_contents(&root)?;
+        Ok(())
+    }
+
+    /// Read a build log: the last `tail` lines, or the whole log when
+    /// `tail` is None. A tail request reads only the last 4 MiB (see
+    /// `read_log_tail`); the whole log is read only when `tail` is
+    /// None. The record's verdict rides along when a record exists;
+    /// a missing log is `InvalidInput` (the root may exist but has
+    /// never built, so there is no log to read).
+    pub fn build_log(
+        &self,
+        project: &str,
+        package: &str,
+        repo: &str,
+        arch: &str,
+        flavor: &Option<String>,
+        tail: Option<usize>,
+    ) -> Result<BuildLog, GeectlError> {
+        validate_cache_components(project, repo, arch, flavor)?;
+        validate_path_component("package", package)?;
+        let root = self.root_path(project, package, repo, arch, flavor);
+        let log_path = root.join(BUILD_LOG);
+        if !log_path.exists() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "no build log at {}; build the package first",
+                    log_path.display()
+                ),
+            ));
+        }
+        let text = match tail {
+            Some(_) => read_log_tail(&log_path),
+            None => fs::read(&log_path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot read build log {}: {e}", log_path.display()),
+                    )
+                })?,
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let shown: Vec<String> = match tail {
+            Some(n) => lines
+                .iter()
+                .skip(lines.len().saturating_sub(n))
+                .map(|l| l.to_string())
+                .collect(),
+            None => lines.iter().map(|l| l.to_string()).collect(),
+        };
+        let record = fs::read_to_string(root.join(BUILD_RECORD))
+            .ok()
+            .and_then(|text| serde_json::from_str::<BuildRecord>(&text).ok());
+        Ok(BuildLog {
+            log_path: log_path.to_path_buf(),
+            verdict: record.as_ref().map(|r| r.verdict.clone()),
+            exit_code: record.as_ref().map(|r| r.exit_code),
+            lines: shown,
+        })
+    }
+}
+
+/// The size of a directory tree in bytes, best-effort: unreadable
+/// entries count as 0 rather than failing the whole usage read.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(path),
+                Ok(_) => {
+                    if let Ok(meta) = fs::metadata(&path) {
+                        total += meta.len();
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
+/// Collect sccache stores under `dir` (project/package/root
+/// layout): each store is a directory with a size and a last-use
+/// mtime. The current build's store is skipped by the caller (its
+/// mtime was just touched); stores in the 24h grace period never
+/// evict, and their sizes are added to `skipped` (protected bytes).
+fn collect_sccache_stores(
+    dir: &Path,
+    out: &mut Vec<(PathBuf, u64, u64)>,
+    now: u64,
+    skipped: &mut u64,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // A store is a project dir (packages inside), a package
+        // dir (root names inside), or a root-name dir (the
+        // sccache.tar inside): walk one level deeper when the dir
+        // carries no tar.
+        if path.join("sccache.tar").exists() {
+            let size = dir_size(&path);
+            let mtime = fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now.saturating_sub(mtime) >= GRACE_PERIOD_SECS {
+                out.push((path, size, mtime));
+            } else {
+                *skipped += size;
+            }
+        } else {
+            collect_sccache_stores(&path, out, now, skipped);
+        }
+    }
+}
+
+/// A build root as an eviction candidate: path, last-build time,
+/// and the project/package it belongs to (from the marker, not the
+/// path — the path layout is an implementation detail). The
+/// repo/arch/flavor are not carried: the most-recent protection
+/// groups by (project, package), so they are not read. Whether the
+/// last build succeeded is not carried: the most-recent protection
+/// applies whatever the outcome was.
+struct RootEntry {
+    path: PathBuf,
+    last_build_unix: u64,
+    project: String,
+    package: String,
+}
+
+/// Whether a build root's lock is held by a running build: a
+/// non-blocking `flock` probe. A missing lock file reads as
+/// unlocked — the root has no build in it.
+fn root_lock_held(root: &Path) -> bool {
+    let Ok(lock_file) = File::options()
+        .read(true)
+        .write(true)
+        .open(root.join(ROOT_LOCK))
+    else {
+        return false;
+    };
+    // The probe lock releases on drop; the probe itself is the check.
+    lock_file.try_lock_exclusive().is_err()
+}
+
+/// Hold a build root's flock (non-blocking) across a delete.
+/// `Ok(Some)` holds the lock; `Ok(None)` means there is no lock
+/// file to hold (the root was never locked — nothing to guard);
+/// `Err(())` means another build holds it, so the caller must not
+/// delete. The eviction apply arm uses this instead of a probe: a
+/// probe taken before the delete is stale by the time the delete
+/// runs, and a build starting in between would lose its root (or
+/// its sccache store) under it. Holding the lock across the delete
+/// is the guard — the lock is the thing a build takes before it
+/// touches either.
+fn try_hold_root_lock(root: &Path) -> Result<Option<BuildLock>, ()> {
+    // Create the lock file when it is missing: a root without one
+    // has no build in it, but creating it here (and holding the
+    // flock across the delete) keeps a build that starts between
+    // the probe and the delete from entering the root.
+    let Ok(file) = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(ROOT_LOCK))
+    else {
+        return Ok(None);
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(BuildLock { _file: file })),
+        Err(_) => Err(()),
+    }
+}
+
+/// Collect package files under `dir` (the whole `pkg/` tree, every
+/// repo/arch): (path, size, mtime). The current dep set (by file
+/// name, and by dep name for deps whose file name is not known yet)
+/// and anything in the 24h grace period are never candidates; their
+/// sizes are added to `skipped` (protected bytes). The
+/// project-repo-arch lock files (`*.lock`) are not cache data and
+/// are never candidates.
+fn collect_pkg_files(
+    dir: &Path,
+    current_dep_files: &[String],
+    current_dep_names: &[String],
+    now: u64,
+    out: &mut Vec<(PathBuf, u64, u64)>,
+    skipped: &mut u64,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_pkg_files(
+                &path,
+                current_dep_files,
+                current_dep_names,
+                now,
+                out,
+                skipped,
+            );
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if name.ends_with(".lock") {
+            continue;
+        }
+        if let Ok(meta) = fs::metadata(&path) {
+            let size = meta.len();
+            // Exact file match (deps that carry a `binary`), or a
+            // dep-name prefix (deps resolved from the binary list
+            // only later — over-protects `helper-devel-…` for a
+            // `helper` dep, which costs a re-download at most).
+            if current_dep_files.iter().any(|d| d == &name)
+                || current_dep_names
+                    .iter()
+                    .any(|d| name.starts_with(&format!("{d}-")))
+            {
+                *skipped += size;
+                continue;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now.saturating_sub(mtime) < GRACE_PERIOD_SECS {
+                *skipped += size;
+                continue;
+            }
+            out.push((path, size, mtime));
+        }
+    }
+}
+
+/// Collect build roots under `dir` (project/package/repo-arch
+/// layout) as eviction candidates. A locked root (another build
+/// holds it) and anything in the 24h grace period never evict; their
+/// sizes are added to `skipped` (protected bytes). A root whose
+/// marker does not parse is not a candidate at all: its key and
+/// times are unknown, so eviction cannot reason about it (it is
+/// still a geectl root for `build-wipe`). The most-recent
+/// protection is applied by the caller, which sees the whole set.
+fn collect_root_entries(dir: &Path, now: u64, skipped: &mut u64) -> Vec<RootEntry> {
+    let mut out: Vec<RootEntry> = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let marker_path = path.join(ROOT_MARKER);
+        if marker_path.exists() {
+            // A locked root is in use: never evict it.
+            if root_lock_held(&path) {
+                *skipped += dir_size(&path);
+                continue;
+            }
+            let Some(marker) = fs::read_to_string(&marker_path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<RootMarker>(&text).ok())
+            else {
+                // Unparsable marker: not a candidate (see above).
+                continue;
+            };
+            if now.saturating_sub(marker.last_build_unix) < GRACE_PERIOD_SECS {
+                *skipped += dir_size(&path);
+                continue;
+            }
+            out.push(RootEntry {
+                path,
+                last_build_unix: marker.last_build_unix,
+                project: marker.project,
+                package: marker.package,
+            });
+        } else {
+            out.extend(collect_root_entries(&path, now, skipped));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::obs::test_support::{basic_credentials, FakeHttp};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A temp dir unique per test (tests run in parallel threads of
+    /// one process, so the process id alone is not unique). Removed
+    /// on drop: a test that leaves files behind fails the no-crust
+    /// assertion in the end-to-end test, and this guard keeps the
+    /// machine clean either way.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let dir = std::env::temp_dir().join(format!("geectl-local-build-test-{n}"));
+            fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn host_arch() -> &'static str {
+        std::env::consts::ARCH
+    }
+
+    fn other_arch() -> &'static str {
+        if host_arch() == "x86_64" {
+            "aarch64"
+        } else {
+            "x86_64"
+        }
+    }
+
+    fn buildinfo_url() -> String {
+        format!(
+            "https://api.opensuse.org/build/testproject/standard/{}/foo/_buildinfo",
+            host_arch()
+        )
+    }
+
+    fn buildconfig_url() -> String {
+        "https://api.opensuse.org/build/testproject/standard/_buildconfig".to_string()
+    }
+
+    fn write_source(dir: &Path, spec_name: &str) -> PathBuf {
+        let source = dir.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join(spec_name),
+            "Name: foo\nVersion: 1.0\nRelease: 1\nSummary: test\nLicense: MIT\n",
+        )
+        .unwrap();
+        source
+    }
+
+    #[test]
+    fn new_defaults_to_twenty_gib_cap() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dir = TempDir::new();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        assert_eq!(vertical.cache_cap_bytes(), 20 * 1024 * 1024 * 1024);
+        assert_eq!(vertical.cache_dir(), dir.path().join("cache"));
+    }
+
+    #[test]
+    fn find_spec_accepts_exactly_one() {
+        let dir = TempDir::new();
+        let source = write_source(dir.path(), "foo.spec");
+        let found = find_spec(&source).unwrap();
+        assert_eq!(found.file_name().unwrap(), "foo.spec");
+    }
+
+    #[test]
+    fn find_spec_refuses_zero_or_many() {
+        let dir = TempDir::new();
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let err = find_spec(&empty).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("no .spec file"));
+
+        let two = dir.path().join("two");
+        fs::create_dir_all(&two).unwrap();
+        fs::write(two.join("a.spec"), "").unwrap();
+        fs::write(two.join("b.spec"), "").unwrap();
+        let err = find_spec(&two).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("several .spec files"));
+    }
+
+    #[test]
+    fn multibuild_flavors_parses_packages() {
+        let dir = TempDir::new();
+        let source = write_source(dir.path(), "foo.spec");
+        assert_eq!(multibuild_flavors(&source).unwrap(), None);
+        fs::write(
+            source.join("_multibuild"),
+            "<multibuild><package>flavor-a</package><package>flavor-b</package></multibuild>",
+        )
+        .unwrap();
+        assert_eq!(
+            multibuild_flavors(&source).unwrap(),
+            Some(vec!["flavor-a".to_string(), "flavor-b".to_string()])
+        );
+    }
+
+    #[test]
+    fn multibuild_flavors_refuses_empty_or_malformed() {
+        let dir = TempDir::new();
+        let source = write_source(dir.path(), "foo.spec");
+        fs::write(source.join("_multibuild"), "<multibuild></multibuild>").unwrap();
+        assert!(multibuild_flavors(&source).is_err());
+        fs::write(source.join("_multibuild"), "<multibuild><package>flavor-a").unwrap();
+        assert!(multibuild_flavors(&source).is_err());
+    }
+
+    #[test]
+    fn parse_rpmlint_summary_reads_the_summary_line() {
+        let log = "some build output\n2 packages and 1 specfiles checked; 3 errors, 2 warnings.\n";
+        let summary = parse_rpmlint_summary(log);
+        assert_eq!(summary.errors, 3);
+        assert_eq!(summary.warnings, 2);
+        assert_eq!(summary.badness, 0);
+    }
+
+    #[test]
+    fn parse_rpmlint_summary_accepts_singular_and_badness() {
+        let log = "foo.x86_64: E: bad-thing (Badness: 5)\n1 packages and 1 specfiles checked; 1 error, 1 warning.\n";
+        let summary = parse_rpmlint_summary(log);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.warnings, 1);
+        assert_eq!(summary.badness, 5);
+    }
+
+    #[test]
+    fn parse_rpmlint_summary_falls_back_to_counting_lines() {
+        let log = "foo.x86_64: E: one\nfoo.x86_64: W: two\nfoo.x86_64: W: three\n";
+        let summary = parse_rpmlint_summary(log);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.warnings, 2);
+    }
+
+    #[test]
+    fn parse_check_summary_reads_ctest_line() {
+        let log = "100% tests passed, 0 tests failed out of 5\n";
+        let summary = parse_check_summary(log).unwrap();
+        assert_eq!(summary.passed, 5);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.total, 5);
+        assert!(parse_check_summary("no tests here").is_none());
+    }
+
+    #[test]
+    fn has_finished_line_matches_the_spec() {
+        assert!(has_finished_line(
+            "building...\nfinished \"build foo.spec\"\n",
+            "foo"
+        ));
+        assert!(!has_finished_line(
+            "building...\nfinished \"build bar.spec\"\n",
+            "foo"
+        ));
+        assert!(!has_finished_line("building...\n", "foo"));
+        // A suffix of another spec name is not the spec: `barfoo`
+        // must not match package `foo`.
+        assert!(!has_finished_line(
+            "building...\nfinished \"build barfoo.spec\"\n",
+            "foo"
+        ));
+        // A path prefix still matches: the engine prints the spec
+        // path, not just its name.
+        assert!(has_finished_line(
+            "building...\nfinished \"build /some/dir/foo.spec\"\n",
+            "foo"
+        ));
+        // A longer file name sharing the prefix is not the spec.
+        assert!(!has_finished_line(
+            "building...\nfinished \"build foo.spec.bak\"\n",
+            "foo"
+        ));
+    }
+
+    /// A minimal RPM: 96-byte lead + empty signature header +
+    /// empty header + payload. The hdrmd5 is the MD5 of the header
+    /// section plus the payload (bytes from the main-header start
+    /// to the end of the file) — the fixture carries a payload so
+    /// the test discriminates: a header-only MD5 does not match.
+    fn make_rpm(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 96];
+        bytes[0..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+        let header = [0x8eu8, 0xad, 0xe8, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// An RPM whose signature header carries a `store_len`-byte
+    /// store: the main header starts at 96 + 16 + `store_len` (for
+    /// a multiple-of-8 store; the store is all zeros, the lengths
+    /// are what the header parser reads).
+    fn make_rpm_with_sig_store(store_len: usize, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 96];
+        bytes[0..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+        let header = [0x8eu8, 0xad, 0xe8, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut sig = header;
+        sig[12..16].copy_from_slice(&(store_len as u32).to_be_bytes());
+        bytes.extend_from_slice(&sig);
+        bytes.extend_from_slice(&vec![0u8; store_len]);
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// An RPM whose main header carries a `store_len`-byte store:
+    /// the header end is 112 + 16 + `store_len` (the store is all
+    /// zeros; the lengths are what the header parser reads).
+    fn make_rpm_with_header_store(store_len: usize, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 96];
+        bytes[0..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+        let header = [0x8eu8, 0xad, 0xe8, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        bytes.extend_from_slice(&header);
+        let mut main = header;
+        main[12..16].copy_from_slice(&(store_len as u32).to_be_bytes());
+        bytes.extend_from_slice(&main);
+        bytes.extend_from_slice(&vec![0u8; store_len]);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn rpm_hdrmd5_covers_header_and_payload() {
+        let dir = TempDir::new();
+        let bytes = make_rpm(b"some payload bytes");
+        let path = dir.path().join("foo-1.0-1.x86_64.rpm");
+        fs::write(&path, &bytes).unwrap();
+        // The header starts after the 96-byte lead and the 16-byte
+        // signature header; the hdrmd5 covers it and the payload.
+        // The digests are literals computed from that layout, not
+        // from the implementation's own slice: computing the
+        // expected value with the same expression the
+        // implementation uses would let an off-by-offset error in
+        // both pass silently.
+        let expected = "8697390d2d06fb94dd00c1cf2581c323";
+        assert_eq!(rpm_hdrmd5(&path).unwrap(), expected);
+        // And it is not the header-only MD5.
+        let header_only = "000fc93ea19f678d44aa75e8251333d6";
+        assert_ne!(rpm_hdrmd5(&path).unwrap(), header_only);
+    }
+
+    #[test]
+    fn rpm_hdrmd5_streams_a_large_file() {
+        // A file larger than the header probe: the digest must still
+        // cover the whole header+payload, and the streaming read
+        // must not drop or duplicate a byte. The oracle is the
+        // one-shot MD5 over the full in-memory bytes; the offset
+        // (112) is pinned by the literal test above, not by this
+        // one.
+        let dir = TempDir::new();
+        let payload = vec![0xabu8; 200 * 1024];
+        let bytes = make_rpm(&payload);
+        assert!(bytes.len() > RPM_HEADER_PROBE_CHUNK_BYTES);
+        let path = dir.path().join("big-1.0-1.x86_64.rpm");
+        fs::write(&path, &bytes).unwrap();
+        let expected = format!("{:x}", md5::compute(&bytes[112..]));
+        assert_eq!(rpm_hdrmd5(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn rpm_hdrmd5_accepts_a_large_main_header() {
+        // A main header can end past a fixed 64 KiB probe
+        // (glibc's ends at 66,656). The probe must grow until the
+        // header is found. The fixture's main header carries a 70
+        // KiB store, so its end (70,128) is past one probe chunk.
+        let dir = TempDir::new();
+        let bytes = make_rpm_with_header_store(70_000, b"payload");
+        let path = dir.path().join("big-header-1.0-1.x86_64.rpm");
+        fs::write(&path, &bytes).unwrap();
+        let expected = format!("{:x}", md5::compute(&bytes[112..]));
+        assert_eq!(rpm_hdrmd5(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn read_log_tail_returns_only_the_tail() {
+        // A log larger than the cap: only the tail is read, and the
+        // `finished` line at the end survives it.
+        let dir = TempDir::new();
+        let path = dir.path().join("build.log");
+        let mut content = vec![b'x'; LOG_TAIL_CAP_BYTES as usize + 1024];
+        content.extend_from_slice(b"\nfinished \"build foo.spec\"\n");
+        fs::write(&path, &content).unwrap();
+        let tail = read_log_tail(&path);
+        // The tail starts at a line boundary: the partial head line
+        // is dropped, so only the complete `finished` line remains.
+        assert_eq!(tail, "finished \"build foo.spec\"\n");
+        // And a short log reads whole, and a missing log reads as
+        // empty.
+        let short = dir.path().join("short.log");
+        fs::write(&short, b"hello\n").unwrap();
+        assert_eq!(read_log_tail(&short), "hello\n");
+        assert_eq!(read_log_tail(&dir.path().join("missing.log")), "");
+    }
+
+    #[test]
+    fn read_log_tail_keeps_a_complete_first_line_on_a_line_boundary() {
+        // When the tail window starts exactly on a line boundary
+        // (the byte before it is `\n`), the first line in the
+        // window is complete and must be kept.
+        let dir = TempDir::new();
+        let path = dir.path().join("build.log");
+        // 26 bytes of head, then exactly one cap of body: the
+        // window starts at offset 26, right after the `\n`, and
+        // holds the whole body — the `finished` line included.
+        let mut content = vec![b'x'; 25];
+        content.push(b'\n');
+        content.extend_from_slice(&vec![b'y'; LOG_TAIL_CAP_BYTES as usize - 26]);
+        content.extend_from_slice(b"finished \"build foo.spec\"\n");
+        fs::write(&path, &content).unwrap();
+        let tail = read_log_tail(&path);
+        assert_eq!(tail.len(), LOG_TAIL_CAP_BYTES as usize);
+        assert!(tail.ends_with("finished \"build foo.spec\"\n"));
+    }
+
+    #[test]
+    fn rpm_package_name_parses_name_version_release_arch() {
+        assert_eq!(
+            rpm_package_name("foo-1.0-1.x86_64.rpm").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            rpm_package_name("helper-devel-1.0-1.x86_64.rpm").as_deref(),
+            Some("helper-devel")
+        );
+        assert_eq!(
+            rpm_package_name("glibc-2.38-1.aarch64.rpm").as_deref(),
+            Some("glibc")
+        );
+        // A source RPM has no binary name to resolve.
+        assert_eq!(rpm_package_name("foo-1.0-1.src.rpm"), None);
+        assert_eq!(rpm_package_name("not-an-rpm"), None);
+        assert_eq!(rpm_package_name("foo.rpm"), None);
+    }
+
+    #[test]
+    fn is_transport_cap_error_matches_the_cap_message_only() {
+        let cap = GeectlError::new(
+            ErrorKind::ServerError,
+            "response body exceeds the 10485760-byte limit",
+        );
+        assert!(is_transport_cap_error(&cap));
+        let other = GeectlError::new(ErrorKind::ServerError, "status 500 from the server");
+        assert!(!is_transport_cap_error(&other));
+        // The bare substring "exceeds the" in another message is
+        // not the cap error.
+        let bare = GeectlError::new(ErrorKind::ServerError, "the build exceeds the limit");
+        assert!(!is_transport_cap_error(&bare));
+    }
+
+    #[test]
+    fn rpm_hdrmd5_rejects_non_rpm_and_truncated() {
+        let dir = TempDir::new();
+        let path = dir.path().join("not-an-rpm.rpm");
+        fs::write(&path, b"hello").unwrap();
+        assert!(rpm_hdrmd5(&path).is_err());
+        let mut bytes = vec![0u8; 96];
+        bytes[0..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+        fs::write(&path, &bytes).unwrap();
+        assert!(rpm_hdrmd5(&path).is_err());
+    }
+
+    #[test]
+    fn rpm_hdrmd5_names_an_over_cap_header_instead_of_truncated() {
+        // A main header larger than the probe cap is not a
+        // "truncated RPM header": the file is not truncated, the
+        // header merely exceeds the cap. The diagnosis is distinct;
+        // the refusal is the same.
+        let dir = TempDir::new();
+        let bytes = make_rpm_with_header_store(RPM_HEADER_PROBE_CAP_BYTES + 1024, b"payload");
+        let path = dir.path().join("huge-header-1.0-1.x86_64.rpm");
+        fs::write(&path, &bytes).unwrap();
+        let err = rpm_hdrmd5(&path).unwrap_err();
+        assert!(err.contains("probe cap"), "got: {err}");
+        assert!(!err.contains("truncated"), "got: {err}");
+        // And a file genuinely truncated inside its header
+        // still says truncated: same header shape, cut short
+        // of its end, well under the cap.
+        let mut short = make_rpm_with_header_store(1000, b"payload");
+        short.truncate(500);
+        let path = dir.path().join("short-header-1.0-1.x86_64.rpm");
+        fs::write(&path, &short).unwrap();
+        let err = rpm_hdrmd5(&path).unwrap_err();
+        assert!(err.contains("truncated"), "got: {err}");
+        // And a signature header alone larger than the cap says
+        // over-cap too: the main header starts past the probe, so
+        // the "header past end of file" diagnosis is an artifact
+        // of the cap, not of the file.
+        let bytes = make_rpm_with_sig_store(RPM_HEADER_PROBE_CAP_BYTES, b"payload");
+        let path = dir.path().join("huge-sig-header-1.0-1.x86_64.rpm");
+        fs::write(&path, &bytes).unwrap();
+        let err = rpm_hdrmd5(&path).unwrap_err();
+        assert!(err.contains("probe cap"), "got: {err}");
+        assert!(!err.contains("truncated"), "got: {err}");
+        // And a main header starting within the last 16 bytes of
+        // the probe: its prologue is cut off by the cap, so the
+        // "malformed RPM header" diagnosis is a cap artifact too.
+        // The store puts the main header 8 bytes before the cap.
+        let bytes = make_rpm_with_sig_store(RPM_HEADER_PROBE_CAP_BYTES - 120, b"payload");
+        let path = dir.path().join("header-at-cap-edge-1.0-1.x86_64.rpm");
+        fs::write(&path, &bytes).unwrap();
+        let err = rpm_hdrmd5(&path).unwrap_err();
+        assert!(err.contains("probe cap"), "got: {err}");
+        assert!(!err.contains("truncated"), "got: {err}");
+        assert!(!err.contains("malformed"), "got: {err}");
+    }
+
+    #[test]
+    fn collect_rpms_ignores_a_stale_top_level_packages_dir() {
+        // The engine writes under `.mount/.build.packages`; a
+        // `.build.packages` at the root top level is stale (a
+        // previous layout, a stray file), and its RPMs must never
+        // be reported as this build's outputs.
+        let dir = TempDir::new();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".build.packages")).unwrap();
+        fs::write(
+            root.join(".build.packages").join("stale-1.0-1.x86_64.rpm"),
+            b"stale",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".mount").join(".build.packages").join("RPMS")).unwrap();
+        let real = root
+            .join(".mount")
+            .join(".build.packages")
+            .join("RPMS")
+            .join("foo-1.0-1.x86_64.rpm");
+        fs::write(&real, b"real").unwrap();
+        assert_eq!(collect_rpms(root), vec![real]);
+    }
+
+    /// The stub tests below run shell scripts, so they are unix-only.
+    /// They prove the flow end to end against a stub engine and a
+    /// stub podman — no real build runs in CI.
+    #[cfg(unix)]
+    mod unix_tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_script(path: &Path, body: &str) {
+            fs::write(path, body).unwrap();
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        /// A stub engine: answers `--version`, records its argv,
+        /// writes a canned log with a `finished` line, and drops a
+        /// fake RPM into the root's `.build.packages/RPMS/` — the
+        /// subdir the real engine uses. With `--shell-cmd` it
+        /// echoes the command to stdout (the captured shell output).
+        fn stub_engine(dir: &Path) -> (PathBuf, PathBuf) {
+            let script = dir.join("build-stub");
+            let argv_log = dir.join("engine-argv.log");
+            write_script(
+                &script,
+                &format!(
+                    r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "build stub 1.0"; exit 0; fi
+echo "$@" >> "{argv_log}"
+root=""
+logfile=""
+spec=""
+shell_cmd=""
+prev=""
+for arg in "$@"; do
+  case "$arg" in
+    --root=*) root="${{arg#--root=}}" ;;
+    --logfile=*) logfile="${{arg#--logfile=}}" ;;
+    *.spec) spec="$arg" ;;
+  esac
+  if [ "$prev" = "--shell-cmd" ]; then shell_cmd="$arg"; fi
+  prev="$arg"
+done
+if [ -n "$shell_cmd" ]; then echo "shell output: $shell_cmd"; fi
+if [ -n "$spec" ]; then
+  pkg=$(basename "$spec" .spec)
+  mkdir -p "$root/.build.packages/RPMS"
+  touch "$root/.build.packages/RPMS/$pkg-1.0-1.{arch}.rpm"
+  if [ -n "$logfile" ]; then printf 'build log\nfinished "build %s.spec"\n' "$pkg" > "$logfile"; fi
+fi
+"#,
+                    argv_log = argv_log.display(),
+                    arch = host_arch(),
+                ),
+            );
+            (script, argv_log)
+        }
+
+        /// A stub podman: `image inspect` reports a digest (or
+        /// nothing, when `with_image` is false), `pull` succeeds,
+        /// `images` lists the digest with its repository, `rmi`
+        /// succeeds.
+        fn stub_podman(dir: &Path, with_image: bool) -> (PathBuf, PathBuf) {
+            let script = dir.join("podman-stub");
+            let call_log = dir.join("podman-calls.log");
+            let digest_line = if with_image {
+                "echo \"sha256:fake-digest-1234\""
+            } else {
+                "exit 1"
+            };
+            write_script(
+                &script,
+                &format!(
+                    r#"#!/bin/sh
+echo "$@" >> "{call_log}"
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  case "$4" in
+    *Digest*) {digest_line} ;;
+    *Size*) echo "123456789" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "pull" ]; then exit 0; fi
+if [ "$1" = "images" ]; then
+  if {with_image}; then echo "registry.opensuse.org/opensuse/tumbleweed sha256:fake-digest-1234"; fi
+  exit 0
+fi
+if [ "$1" = "rmi" ]; then exit 0; fi
+exit 0
+"#,
+                    call_log = call_log.display(),
+                    with_image = with_image,
+                ),
+            );
+            (script, call_log)
+        }
+
+        fn client_with(http: &FakeHttp) -> ObsClient<'_> {
+            ObsClient::with_credentials(http, basic_credentials()).unwrap()
+        }
+
+        fn buildinfo_ok() -> String {
+            format!(
+                "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
+                <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\"/>\
+                <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\"/>\
+                <bdep name=\"helper\" project=\"testproject\" repository=\"standard\"/>\
+                </buildinfo>",
+                arch = host_arch()
+            )
+        }
+
+        /// Build the full stubbed setup: buildinfo + buildconfig +
+        /// dep downloads + binary list for the binary-less dep.
+        /// Returns the client and the http recorder (the client
+        /// borrows the recorder, so both must outlive the build).
+        struct Setup {
+            http: FakeHttp,
+        }
+
+        impl Setup {
+            fn new() -> Self {
+                let arch = host_arch();
+                let http = FakeHttp::new()
+                    .with_get(&buildinfo_url(), &buildinfo_ok())
+                    .with_get(&buildconfig_url(), "Macro: test 1\n")
+                    .with_get_bytes(
+                        &format!(
+                            "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+                        ),
+                        b"fake glibc rpm",
+                    )
+                    .with_get_bytes(
+                        &format!(
+                            "https://api.opensuse.org/build/home:scarabeus_iv/standard/{arch}/_repository/ownpkg-1.0-1.{arch}.rpm"
+                        ),
+                        b"fake ownpkg rpm",
+                    )
+                    .with_get_bytes(
+                        &format!(
+                            "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/pre-1.0-1.{arch}.rpm"
+                        ),
+                        b"fake pre rpm",
+                    )
+                    .with_get(
+                        &format!(
+                            "https://api.opensuse.org/build/testproject/standard/{arch}/_repository"
+                        ),
+                        &format!(
+                            "<binarylist><binary filename=\"helper-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/><binary filename=\"helper-debuginfo-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/></binarylist>"
+                        ),
+                    )
+                    .with_get_bytes(
+                        &format!(
+                            "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/helper-1.0-1.{arch}.rpm"
+                        ),
+                        b"fake helper rpm",
+                    );
+                Setup { http }
+            }
+
+            fn client(&self) -> ObsClient<'_> {
+                ObsClient::with_credentials(&self.http, basic_credentials()).unwrap()
+            }
+        }
+
+        fn vertical<'a>(
+            client: &'a ObsClient<'a>,
+            dir: &Path,
+            engine: PathBuf,
+            podman: PathBuf,
+        ) -> LocalBuild<'a> {
+            LocalBuild::new(client, dir.join("cache"))
+                .with_engine(engine)
+                .with_podman(podman)
+        }
+
+        /// Apply a one-item eviction plan, retrying while the item's
+        /// root reads as locked only because of the fork window
+        /// described on `acquire_root_lock` (eviction probes the
+        /// lock instead of retrying it, so the retry lives here):
+        /// the first apply may record a lock failure for a lock that
+        /// is already released, so retry until the item evicts or
+        /// the deadline passes.
+        fn apply_one_item_soon(vertical: &LocalBuild<'_>, item: EvictedItem) -> EvictionReport {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut report = EvictionReport {
+                    evicted: vec![item.clone()],
+                    ..Default::default()
+                };
+                vertical.apply_eviction_plan(&mut report);
+                if !report.evicted.is_empty() || std::time::Instant::now() >= deadline {
+                    return report;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        #[test]
+        fn dry_run_returns_the_plan_and_touches_nothing() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.dry_run = true;
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "dry-run");
+            assert!(record.dry_run);
+            let plan = record.plan.unwrap();
+            assert!(plan.argv.iter().any(|a| a == "--vm-type=podman"));
+            assert!(plan.argv.iter().any(|a| a.starts_with("--sccache-uri=")));
+            assert!(plan.argv.last().unwrap().ends_with("foo.spec"));
+            // Nothing was created: no root, no cache, no server call.
+            assert!(!dir.path().join("cache").join("build-roots").exists());
+            assert!(setup.http.get_calls().is_empty());
+            assert!(setup.http.get_bytes_calls().is_empty());
+        }
+
+        #[test]
+        fn build_refuses_another_architecture() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", other_arch());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::UnsupportedArch);
+            assert!(setup.http.get_calls().is_empty());
+        }
+
+        #[test]
+        fn build_refuses_a_foreign_home_project() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"glibc\" project=\"home:someoneelse\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                        arch = host_arch()
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n");
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::UntrustedProject);
+            assert!(err.to_string().contains("home:someoneelse"));
+        }
+
+        #[test]
+        fn build_allows_a_dep_without_a_project() {
+            // A dep without a `project` carries no origin to
+            // enumerate: it is a virtual provide or a not-installed
+            // flag, not a package the build would install, so it
+            // joins no trust set and must not refuse the build.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"glibc\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                        arch = host_arch()
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/glibc-2.38-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake glibc rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+        }
+
+        #[test]
+        fn build_refuses_a_foreign_home_project_even_with_trust_all_projects() {
+            // `--trust-all-projects` is accepted only after the
+            // trust check passes: it cannot override a foreign
+            // `home:` refusal.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"glibc\" project=\"home:someoneelse\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                        arch = host_arch()
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n");
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.trust_all_projects = true;
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::UntrustedProject);
+            assert!(err.to_string().contains("home:someoneelse"));
+        }
+
+        #[test]
+        fn build_fails_closed_on_an_unresolvable_buildinfo() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new().with_get(
+                &buildinfo_url(),
+                "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"x86_64\"><error>unresolvable: DOES-NOT-EXIST</error></buildinfo>",
+            );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(err.to_string().contains("DOES-NOT-EXIST"));
+        }
+
+        #[test]
+        fn multibuild_requires_a_flavor() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            fs::write(
+                source.join("_multibuild"),
+                "<multibuild><package>flavor-a</package><package>flavor-b</package></multibuild>",
+            )
+            .unwrap();
+            let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::MultibuildFlavorRequired);
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.flavor = Some("flavor-z".to_string());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn stub_build_end_to_end_and_second_run_reuses_the_root() {
+            let dir = TempDir::new();
+            let (engine, argv_log) = stub_engine(dir.path());
+            let (podman, podman_log) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(record.exit_code, 0);
+            assert!(!record.rpms.is_empty());
+            assert!(!record.root_reused);
+            assert_eq!(
+                record.image_digest.as_deref(),
+                Some("sha256:fake-digest-1234")
+            );
+            assert_eq!(record.engine_version.as_deref(), Some("build stub 1.0"));
+            assert_eq!(record.cache.pkg_misses, 4);
+            assert_eq!(record.cache.pkg_hits, 0);
+            assert!(record.log_path.exists());
+            // The root carries the marker, the record, the rpmlist
+            // (with the preinstall line) and the buildconfig.
+            let root = &record.root_path;
+            assert!(root.join(ROOT_MARKER).exists());
+            assert!(root.join(BUILD_RECORD).exists());
+            let rpmlist = fs::read_to_string(root.join(RPMLIST)).unwrap();
+            assert!(rpmlist.contains("preinstall: pre"));
+            assert!(rpmlist.contains("glibc-2.38-1."));
+            assert!(root.join(BUILDCONFIG).exists());
+            // The engine got the shape the existing tool uses.
+            let argv = fs::read_to_string(&argv_log).unwrap();
+            assert!(argv.contains("--vm-type=podman"));
+            assert!(argv.contains("--sccache-uri="));
+            assert!(argv.contains("--norootforbuild"));
+            assert!(argv.contains("--changelog"));
+            assert!(argv.contains("foo.spec"));
+            // The image was pulled (absent at first use).
+            let podman_calls = fs::read_to_string(&podman_log).unwrap();
+            assert!(podman_calls.contains("pull"));
+            // No crust: no temp files left anywhere in the cache.
+            let mut stack = vec![dir.path().join("cache")];
+            let mut crust = Vec::new();
+            while let Some(d) = stack.pop() {
+                for entry in fs::read_dir(d).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .starts_with(".geectl-tmp-")
+                    {
+                        crust.push(path);
+                    }
+                }
+            }
+            assert!(crust.is_empty(), "crust left behind: {crust:?}");
+
+            // The second run reuses the root and hits the pkg cache.
+            let record2 = vertical.build(&req).unwrap();
+            assert_eq!(record2.verdict, "green");
+            assert!(record2.root_reused);
+            assert_eq!(record2.cache.pkg_hits, 4);
+            assert_eq!(record2.cache.pkg_misses, 0);
+            // The image was not pulled again: the sidecar records
+            // the refresh, so the second build reuses the digest.
+            let podman_calls = fs::read_to_string(&podman_log).unwrap();
+            assert_eq!(
+                podman_calls.matches("pull").count(),
+                1,
+                "podman calls:\n{podman_calls}"
+            );
+        }
+
+        #[test]
+        fn dep_from_another_repo_uses_its_own_repo() {
+            // A dep resolved from a linked repo must be fetched
+            // from (and cached under) its own repository, not the
+            // build repo: the existing tool keys its cache and its
+            // download URL by the dep's own
+            // project/repository/repoarch.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"glibc\" project=\"testproject\" repository=\"other-repo\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/other-repo/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+                    ),
+                    b"fake glibc rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", arch);
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert!(dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("other-repo")
+                .join(arch)
+                .join(format!("glibc-2.38-1.{arch}.rpm"))
+                .exists());
+            // Nothing was cached under the build repo.
+            assert!(!dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .exists());
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(rpmlist.contains("other-repo"));
+        }
+
+        #[test]
+        fn rpmlist_lists_every_dep_for_a_spec_build() {
+            // For a spec build the existing tool lists every dep
+            // (noinstall included) as `name path`, with a
+            // `noinstall:` / `installonly:` line when non-empty
+            // and a `sysroot: ` prefix for sysroot deps.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
+                        <bdep name=\"helper\" project=\"testproject\" repository=\"standard\" binary=\"helper-1.0-1.{arch}.rpm\" noinstall=\"1\"/>\
+                        <bdep name=\"syspkg\" project=\"testproject\" repository=\"standard\" binary=\"syspkg-1.0-1.{arch}.rpm\" installonly=\"1\"/>\
+                        <bdep name=\"sysdep\" project=\"testproject\" repository=\"standard\" binary=\"sysdep-1.0-1.{arch}.rpm\" sysroot=\"1\"/>\
+                        </buildinfo>",
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+                    ),
+                    b"fake glibc rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/helper-1.0-1.{arch}.rpm"
+                    ),
+                    b"fake helper rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/syspkg-1.0-1.{arch}.rpm"
+                    ),
+                    b"fake syspkg rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/sysdep-1.0-1.{arch}.rpm"
+                    ),
+                    b"fake sysdep rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", arch);
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(record.cache.pkg_misses, 4);
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            // The noinstall dep is downloaded and listed like any
+            // dep: the rpmlist references the file, so it must exist.
+            assert!(rpmlist.contains("helper-1.0-1."));
+            assert!(rpmlist.contains("noinstall: helper"));
+            assert!(rpmlist.contains("installonly: syspkg"));
+            assert!(rpmlist.contains("sysroot: sysdep "));
+        }
+
+        #[test]
+        fn build_allows_the_callers_own_home_subproject() {
+            // The caller's own home subtree (branches,
+            // subprojects) is trusted exactly like the home
+            // project itself.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"ownpkg\" project=\"home:scarabeus_iv:branches:foo\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/home:scarabeus_iv:branches:foo/standard/{arch}/_repository/ownpkg-1.0-1.{arch}.rpm"
+                    ),
+                    b"fake ownpkg rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", arch);
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+        }
+
+        #[test]
+        fn build_allows_deps_from_the_foreign_build_project_itself() {
+            // The build project itself is trusted, exactly: a dep
+            // resolving from the project being built is the build's
+            // own output, not a foreign origin — even when that
+            // project is a foreign `home:`. A subproject of it
+            // would still be judged on its own; only the exact
+            // project is excluded.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let http = FakeHttp::new()
+                .with_get(
+                    &format!(
+                        "https://api.opensuse.org/build/home:someoneelse/standard/{arch}/foo/_buildinfo"
+                    ),
+                    &format!(
+                        "<buildinfo project=\"home:someoneelse\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"ownpkg\" project=\"home:someoneelse\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                    ),
+                )
+                .with_get(
+                    "https://api.opensuse.org/build/home:someoneelse/standard/_buildconfig",
+                    "Macro: test 1\n",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/home:someoneelse/standard/{arch}/_repository/ownpkg-1.0-1.{arch}.rpm"
+                    ),
+                    b"fake ownpkg rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "home:someoneelse", "standard", arch);
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+        }
+
+        #[test]
+        fn zero_timeout_is_invalid_input() {
+            // A zero timeout is an instant timeout, never a build
+            // — and never an instant shell.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.timeout_secs = 0;
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(setup.http.get_calls().is_empty());
+            let req = BuildRequest::new(
+                write_source(dir.path(), "foo.spec"),
+                "testproject",
+                "standard",
+                host_arch(),
+            );
+            vertical.build(&req).unwrap();
+            let err = vertical
+                .build_shell(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["echo hi".to_string()],
+                    0,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn concurrent_build_of_the_same_root_refuses() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            // Hold the root's lock before the build starts.
+            let root = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("standard-{}", host_arch()));
+            fs::create_dir_all(&root).unwrap();
+            let lock_file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(root.join(ROOT_LOCK))
+                .unwrap();
+            lock_file.try_lock_exclusive().unwrap();
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BuildInProgress);
+        }
+
+        #[test]
+        fn clean_wipe_keeps_the_root_lock() {
+            // The --clean wipe once deleted the root's own lock
+            // file, so the held flock sat on an unlinked inode and
+            // a second build for the same root could lock a fresh
+            // file and run concurrently — defeating the one-build-
+            // per-root rule on exactly the path taken after every
+            // failure. The wipe must preserve the lock file, so the
+            // held flock still refuses a second acquirer afterwards.
+            // (The fake HTTP client is RefCell-based, so the
+            // vertical cannot move into a thread for a live
+            // two-build race; this pins the exact invariant the
+            // race depends on instead.)
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let root = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("standard-{}", host_arch()));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("stale-output"), b"stale").unwrap();
+            // `BuildLock` carries no Debug, so the acquires go
+            // through matches rather than unwrap/unwrap_err.
+            let lock = match vertical.acquire_root_lock(&root, "foo") {
+                Ok(lock) => lock,
+                Err(e) => panic!("first lock acquire failed: {e}"),
+            };
+            vertical.wipe_root_contents(&root).unwrap();
+            assert!(!root.join("stale-output").exists());
+            assert!(root.join(ROOT_LOCK).exists());
+            let err = match vertical.acquire_root_lock(&root, "foo") {
+                Ok(_) => panic!("second lock acquire should have refused"),
+                Err(e) => e,
+            };
+            assert_eq!(err.kind(), ErrorKind::BuildInProgress);
+            drop(lock);
+            // The lock file survives the wipe and is usable again.
+            assert!(vertical.acquire_root_lock(&root, "foo").is_ok());
+        }
+
+        #[test]
+        fn shell_wipe_and_log_round_trip() {
+            let dir = TempDir::new();
+            let (engine, argv_log) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+
+            // Unknown roots refuse before any build.
+            let err = vertical
+                .build_shell(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["echo hi".to_string()],
+                    60,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+            let err = vertical
+                .build_wipe("testproject", "foo", "standard", host_arch(), &None)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+
+            let log = vertical
+                .build_log(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    Some(1),
+                )
+                .unwrap();
+            assert_eq!(log.verdict.as_deref(), Some("green"));
+            assert_eq!(log.exit_code, Some(0));
+            assert_eq!(log.lines.len(), 1);
+            assert!(log.lines[0].contains("finished"));
+
+            // An empty command list is invalid input, not an
+            // interactive shell.
+            let err = vertical
+                .build_shell(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &[],
+                    60,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+            // The shell is scripted and captured: its output rides
+            // in the result, and it writes no log file (the build
+            // log still reads the build's `finished` line).
+            let shell = vertical
+                .build_shell(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["echo hi".to_string()],
+                    60,
+                )
+                .unwrap();
+            assert_eq!(shell.exit_code, 0);
+            assert!(shell.stdout.contains("shell output: echo hi"));
+            // The argv log accumulates every engine invocation (the
+            // build above carried --logfile=); only the shell's own
+            // line — the last — must be free of it.
+            let argv = fs::read_to_string(&argv_log).unwrap();
+            let shell_argv = argv.lines().last().unwrap();
+            assert!(shell_argv.contains("--shell-cmd echo hi"));
+            assert!(!shell_argv.contains("--logfile="));
+            // The shell passes the build's argv shape: the rpmlist,
+            // the buildconfig and the arch from the root, exactly as
+            // the existing tool does for a --shell-cmd run.
+            assert!(shell_argv.contains("--rpmlist="));
+            assert!(shell_argv.contains("--dist="));
+            assert!(shell_argv.contains(&format!("--arch={}", host_arch())));
+            let log = vertical
+                .build_log(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    Some(1),
+                )
+                .unwrap();
+            assert!(log.lines[0].contains("finished"));
+
+            vertical
+                .build_wipe("testproject", "foo", "standard", host_arch(), &None)
+                .unwrap();
+            assert!(!record.root_path.join(ROOT_MARKER).exists());
+            assert!(record.root_path.exists());
+        }
+
+        #[test]
+        fn shell_refuses_a_root_without_a_build() {
+            // A marker-only root has no rpmlist/buildconfig for
+            // the shell to pass: the shell refuses rather than
+            // running a build shape with missing inputs.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let root = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("standard-{}", host_arch()));
+            fs::create_dir_all(&root).unwrap();
+            let marker = RootMarker {
+                project: "testproject".to_string(),
+                package: "foo".to_string(),
+                repo: "standard".to_string(),
+                arch: host_arch().to_string(),
+                flavor: None,
+                image_digest: None,
+                engine_version: None,
+                created_unix: now_unix(),
+                last_build_unix: now_unix(),
+                last_success_digest: None,
+            };
+            fs::write(
+                root.join(ROOT_MARKER),
+                serde_json::to_string(&marker).unwrap(),
+            )
+            .unwrap();
+            let err = vertical
+                .build_shell(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["echo hi".to_string()],
+                    60,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn prune_evicts_old_pkg_files_and_nothing_under_cap() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), false);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical =
+                vertical(&client, dir.path(), engine, podman).with_cache_cap_bytes(1024 * 1024);
+            // Nothing cached yet: the plan is empty.
+            let plan = vertical.prune_plan().unwrap();
+            assert!(plan.evicted.is_empty());
+
+            // An old pkg file (mtime 2 days ago) over the cap.
+            let pkg_dir = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch());
+            fs::create_dir_all(&pkg_dir).unwrap();
+            let pkg = pkg_dir.join("old-1.0-1.x86_64.rpm");
+            fs::write(&pkg, vec![0u8; 2 * 1024 * 1024]).unwrap();
+            let two_days_ago = SystemTime::now() - Duration::from_secs(2 * 86400);
+            let file = File::open(&pkg).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(two_days_ago))
+                .unwrap();
+            drop(file);
+            // A fresh pkg file (within the grace period) never evicts.
+            let fresh = pkg_dir.join("fresh-1.0-1.x86_64.rpm");
+            fs::write(&fresh, vec![0u8; 1024]).unwrap();
+
+            let plan = vertical.prune_plan().unwrap();
+            assert_eq!(plan.evicted.len(), 1);
+            assert_eq!(plan.evicted[0].kind, "pkg");
+            assert!(plan.evicted[0].path.ends_with("old-1.0-1.x86_64.rpm"));
+            assert!(plan.failures.is_empty());
+
+            let report = vertical.prune_apply().unwrap();
+            assert_eq!(report.evicted.len(), 1);
+            assert!(!pkg.exists());
+            assert!(fresh.exists());
+            assert!(report.bytes_after <= report.low_water_bytes);
+        }
+
+        #[test]
+        fn dry_run_without_an_engine_returns_the_plan() {
+            // A dry run prints the plan and touches nothing, so it
+            // does not need the engine installed: a missing engine
+            // records as an unknown version instead of failing.
+            let dir = TempDir::new();
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = LocalBuild::new(&client, dir.path().join("cache"))
+                .with_engine(PathBuf::from("/nonexistent/build"))
+                .with_podman(podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.dry_run = true;
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "dry-run");
+            assert_eq!(record.engine_version, None);
+            assert!(record.plan.is_some());
+        }
+
+        #[test]
+        fn build_times_out_on_a_sleeping_engine() {
+            let dir = TempDir::new();
+            // A stub engine that answers --version and then sleeps:
+            // the build must time out instead of hanging.
+            let script = dir.path().join("sleep-stub");
+            write_script(
+                &script,
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"build stub 1.0\"; exit 0; fi\nsleep 5\n",
+            );
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), script, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.timeout_secs = 1;
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BuildTimeout);
+            // The timeout message must not claim the container was
+            // killed: the group kill does not stop it.
+            assert!(err.context.contains("may still be running"));
+        }
+
+        #[test]
+        fn build_pull_and_engine_share_one_timeout_budget() {
+            // The timeout is one budget for the whole op: a pull
+            // that takes 2 s of a 3 s budget leaves the engine 1 s,
+            // not a fresh 3 s. Without the shared deadline this
+            // build takes 2 + 3 = 5 s; with it, ~3 s.
+            let dir = TempDir::new();
+            let script = dir.path().join("sleep-stub");
+            write_script(
+                &script,
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"build stub 1.0\"; exit 0; fi\nsleep 30\n",
+            );
+            let slow_podman = dir.path().join("podman-slow-pull");
+            write_script(
+                &slow_podman,
+                "#!/bin/sh\nif [ \"$1\" = \"pull\" ]; then sleep 2; exit 0; fi\nif [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then echo \"sha256:fake-digest-1234\"; exit 0; fi\nexit 0\n",
+            );
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), script, slow_podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.timeout_secs = 3;
+            req.refresh_image = true;
+            let started = std::time::Instant::now();
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BuildTimeout);
+            assert!(started.elapsed() < Duration::from_secs(4));
+        }
+
+        #[test]
+        fn resolve_image_refuses_a_pull_on_an_exhausted_budget() {
+            // A pull due on an exhausted budget is a timeout, and
+            // it names the budget — and the pull is never started.
+            let dir = TempDir::new();
+            let (podman, call_log) = stub_podman(dir.path(), false);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let past = std::time::Instant::now() - Duration::from_secs(1);
+            let err = vertical.resolve_image(&req, past).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BuildTimeout);
+            assert!(
+                err.context.contains("already exhausted"),
+                "got: {}",
+                err.context
+            );
+            assert!(
+                !fs::read_to_string(&call_log).unwrap().contains("pull"),
+                "the pull must never be attempted"
+            );
+        }
+
+        #[test]
+        fn resolve_image_reports_a_pull_timeout_as_build_timeout() {
+            // Regression (LOW-2 residual): a tiny-but-nonzero
+            // remaining budget still ran the pull, which timed out
+            // ("command timed out after 0s") and was mapped to
+            // `ImageUnavailable`, although podman and the image
+            // were fine. A pull timeout is a `BuildTimeout` naming
+            // the budget, the same kind as an engine timeout.
+            let dir = TempDir::new();
+            let slow_podman = dir.path().join("podman-slow-pull");
+            write_script(
+                &slow_podman,
+                "#!/bin/sh\nif [ \"$1\" = \"pull\" ]; then sleep 5; exit 0; fi\nif [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then echo \"sha256:fake-digest-1234\"; exit 0; fi\nexit 0\n",
+            );
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), slow_podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            let err = vertical.resolve_image(&req, deadline).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BuildTimeout);
+            assert!(err.context.contains("timed out"), "got: {}", err.context);
+        }
+
+        #[test]
+        fn resolve_dep_filename_picks_the_exact_package_name() {
+            // A package that builds subpackages: the binary list
+            // carries helper, helper-devel and helper-lang, plus a
+            // source RPM — only the exact package name resolves.
+            // No source package was sent, so the whole repository
+            // is listed (`_repository`): the list must not assume
+            // the binary name is the package.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new().with_get(
+                &format!(
+                    "https://api.opensuse.org/build/testproject/standard/{}/_repository",
+                    host_arch()
+                ),
+                &format!(
+                    "<binarylist><binary filename=\"helper-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/><binary filename=\"helper-devel-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/><binary filename=\"helper-lang-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/><binary filename=\"helper-1.0-1.{arch}.src.rpm\" size=\"10\" mtime=\"1\"/></binarylist>",
+                    arch = host_arch()
+                ),
+            );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(
+                dir.path().join("source"),
+                "testproject",
+                "standard",
+                host_arch(),
+            );
+            let dep = BuildDep {
+                name: "helper".to_string(),
+                project: Some("testproject".to_string()),
+                repository: None,
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: false,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let filename = vertical.resolve_dep_filename(&req, &dep).unwrap();
+            assert_eq!(filename, format!("helper-1.0-1.{}.rpm", host_arch()));
+        }
+
+        #[test]
+        fn resolve_dep_filename_computes_the_noarch_name() {
+            // A noarch dep with no `binary` attribute: the file name
+            // is computed from version/release/arch, and the expected
+            // name is written out literally — the test must not
+            // compute it with the same format string the
+            // implementation uses.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(
+                dir.path().join("source"),
+                "testproject",
+                "standard",
+                host_arch(),
+            );
+            let dep = BuildDep {
+                name: "foo-data".to_string(),
+                project: Some("testproject".to_string()),
+                repository: None,
+                package: None,
+                binary: None,
+                version: Some("2.0".to_string()),
+                release: Some("3.1".to_string()),
+                arch: Some("noarch".to_string()),
+                epoch: None,
+                hdrmd5: None,
+                preinstall: false,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let filename = vertical.resolve_dep_filename(&req, &dep).unwrap();
+            assert_eq!(filename, "foo-data-2.0-3.1.noarch.rpm");
+        }
+
+        #[test]
+        fn subpackage_dep_without_binary_attr_resolves_from_its_source_package() {
+            // Real scheduler buildinfo carries no `binary`
+            // attribute: the file name is computed locally from
+            // version/release/arch, and the download URL keys on
+            // the source package (`zlib`), never the binary name
+            // (`libz1`) — the binary name as the package segment
+            // 404s on the server. End to end: the build goes
+            // green, and the RPM lands in the cache under the
+            // dep's own project/repo/arch.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"libz1\" project=\"testproject\" repository=\"standard\" package=\"zlib\" version=\"1.3.1\" release=\"1\" arch=\"{arch}\"/>\
+                        </buildinfo>",
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/zlib/libz1-1.3.1-1.{arch}.rpm"
+                    ),
+                    b"fake libz1 rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", arch);
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(record.cache.pkg_misses, 1);
+            assert!(dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(arch)
+                .join(format!("libz1-1.3.1-1.{arch}.rpm"))
+                .exists());
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(rpmlist.contains("libz1-1.3.1-1."));
+        }
+
+        #[test]
+        fn dep_with_dotdot_project_is_refused() {
+            // Server data is not trusted as a path component: a dep
+            // whose project is `..` would escape the pkg cache dir
+            // when its file is cached (and the API path when it is
+            // downloaded), so the build refuses with `InvalidInput`
+            // before any path is built from it.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"foo\" project=\"..\" repository=\"standard\" package=\"foo\" version=\"1.0\" release=\"1\" arch=\"{arch}\"/>\
+                        </buildinfo>",
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n");
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", arch);
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn dep_with_dotdot_list_filename_is_refused() {
+            // The binary-list file name is server data, not a dep
+            // field, so `validate_dep` never sees it: `ensure_cached`
+            // must refuse a `/` or `..` in it itself, before any path
+            // is built from it. The download path already refuses it
+            // (`download_binary` validates the file name), so the
+            // hole is the cache-hit path: a file already sitting at
+            // the escaped location would be installed as the dep
+            // without any download. The escape resolves only when
+            // the intermediate directory exists, so plant it with
+            // the file — and require `InvalidInput` from the sink.
+            // Without the check the planted file is returned as the
+            // cached dep.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let inter = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(arch)
+                .join(format!("helper-1.0-1.{arch}"));
+            fs::create_dir_all(&inter).unwrap();
+            let escaped = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join("evil.rpm");
+            fs::write(&escaped, make_rpm(b"planted")).unwrap();
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "helper".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: false,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let mut stats = CacheStats::default();
+            let filename = format!("helper-1.0-1.{arch}/../../evil.rpm");
+            let err = vertical
+                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn resolve_dep_filename_falls_back_to_the_list_for_empty_version() {
+            // An empty attribute is no attribute: `version=""`
+            // must not compute `name--.arch.rpm` and 404 the
+            // download — the binary list of the whole repository
+            // resolves it instead, exactly like a missing one.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new().with_get(
+                &format!(
+                    "https://api.opensuse.org/build/testproject/standard/{}/_repository",
+                    host_arch()
+                ),
+                &format!(
+                    "<binarylist><binary filename=\"helper-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/><binary filename=\"helper-devel-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/></binarylist>",
+                    arch = host_arch()
+                ),
+            );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(
+                dir.path().join("source"),
+                "testproject",
+                "standard",
+                host_arch(),
+            );
+            let dep = BuildDep {
+                name: "helper".to_string(),
+                project: Some("testproject".to_string()),
+                repository: None,
+                package: None,
+                binary: None,
+                version: Some(String::new()),
+                release: Some(String::new()),
+                arch: Some(String::new()),
+                epoch: None,
+                hdrmd5: None,
+                preinstall: false,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let filename = vertical.resolve_dep_filename(&req, &dep).unwrap();
+            assert_eq!(filename, format!("helper-1.0-1.{}.rpm", host_arch()));
+            // One empty attribute alone must fall back too: a
+            // lone empty release must not compute
+            // `helper-1.0-.arch.rpm`.
+            let dep = BuildDep {
+                name: "helper".to_string(),
+                project: Some("testproject".to_string()),
+                repository: None,
+                package: None,
+                binary: None,
+                version: Some("1.0".to_string()),
+                release: Some(String::new()),
+                arch: Some(host_arch().to_string()),
+                epoch: None,
+                hdrmd5: None,
+                preinstall: false,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let filename = vertical.resolve_dep_filename(&req, &dep).unwrap();
+            assert_eq!(filename, format!("helper-1.0-1.{}.rpm", host_arch()));
+        }
+
+        /// A single-dep buildinfo carrying an hdrmd5, with the dep's
+        /// download canned to `download_bytes`.
+        fn hdrmd5_setup(download_bytes: &[u8]) -> (TempDir, FakeHttp, String) {
+            let dir = TempDir::new();
+            let good = make_rpm(b"the real payload");
+            let hdrmd5 = format!("{:x}", md5::compute(&good[112..]));
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\" hdrmd5=\"{hdrmd5}\"/>\
+                        </buildinfo>",
+                        arch = host_arch()
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/glibc-2.38-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    download_bytes,
+                );
+            (dir, http, hdrmd5)
+        }
+
+        #[test]
+        fn corrupt_cached_dep_is_redownloaded_then_refused() {
+            // A cached dep that fails its hdrmd5 is re-downloaded
+            // once; when the download fails the check too, the build
+            // refuses with CacheCorrupt and the bad file is gone.
+            let (dir, http, _) = hdrmd5_setup(b"also corrupt bytes");
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let cache_file = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch())
+                .join(format!("glibc-2.38-1.{}.rpm", host_arch()));
+            fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+            fs::write(&cache_file, b"corrupt cached bytes").unwrap();
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
+            assert!(!cache_file.exists());
+        }
+
+        #[test]
+        fn corrupt_cached_dep_recovers_on_redownload() {
+            // The same corrupt cache, but the download carries the
+            // real RPM: the build proceeds and the cache now holds
+            // the verified bytes.
+            let good = make_rpm(b"the real payload");
+            let (dir, http, _) = hdrmd5_setup(&good);
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let cache_file = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch())
+                .join(format!("glibc-2.38-1.{}.rpm", host_arch()));
+            fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+            fs::write(&cache_file, b"corrupt cached bytes").unwrap();
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(fs::read(&cache_file).unwrap(), good);
+        }
+
+        #[test]
+        fn prune_protects_locked_and_most_recent_roots() {
+            // The real layout, not a fabricated one: each root here
+            // is the most recent of its own (project, package) —
+            // foo, bar and baz are different packages — so every
+            // root stays protected and the cap is met from the pkg
+            // file. The pkg file goes; every root stays; the
+            // shortfall and the protected bytes are reported.
+            // Grouping is by project+package: an older root of the
+            // same package in another repo can evict — see
+            // prune_evicts_the_older_root_of_the_same_package.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), false);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical =
+                vertical(&client, dir.path(), engine, podman).with_cache_cap_bytes(1024 * 1024);
+            let now = now_unix();
+            let roots_base = dir.path().join("cache").join("build-roots");
+            let mk_root = |package: &str, last_build: u64| -> PathBuf {
+                let root = roots_base
+                    .join("testproject")
+                    .join(package)
+                    .join(format!("standard-{}", host_arch()));
+                fs::create_dir_all(&root).unwrap();
+                fs::write(root.join("blob"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+                let marker = RootMarker {
+                    project: "testproject".to_string(),
+                    package: package.to_string(),
+                    repo: "standard".to_string(),
+                    arch: host_arch().to_string(),
+                    flavor: None,
+                    image_digest: None,
+                    engine_version: None,
+                    created_unix: last_build,
+                    last_build_unix: last_build,
+                    last_success_digest: None,
+                };
+                fs::write(
+                    root.join(ROOT_MARKER),
+                    serde_json::to_string(&marker).unwrap(),
+                )
+                .unwrap();
+                root
+            };
+            let foo = mk_root("foo", now - 3 * 86400);
+            let bar = mk_root("bar", now - 2 * 86400);
+            let locked = mk_root("baz", now - 4 * 86400);
+            // Hold the locked root's lock for the test.
+            let lock_file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(locked.join(ROOT_LOCK))
+                .unwrap();
+            lock_file.try_lock_exclusive().unwrap();
+            // An old pkg file over the cap.
+            let pkg_dir = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch());
+            fs::create_dir_all(&pkg_dir).unwrap();
+            let pkg = pkg_dir.join("old-1.0-1.x86_64.rpm");
+            fs::write(&pkg, vec![0u8; 2 * 1024 * 1024]).unwrap();
+            let two_days_ago = SystemTime::now() - Duration::from_secs(2 * 86400);
+            let file = File::open(&pkg).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(two_days_ago))
+                .unwrap();
+            drop(file);
+
+            let plan = vertical.prune_plan().unwrap();
+            assert!(plan.ran);
+            let evicted_paths: Vec<&str> = plan.evicted.iter().map(|i| i.path.as_str()).collect();
+            assert_eq!(plan.evicted.len(), 1, "plan: {plan:?}");
+            assert!(
+                evicted_paths
+                    .iter()
+                    .any(|p| p.ends_with("old-1.0-1.x86_64.rpm")),
+                "plan: {plan:?}"
+            );
+            // No root evicts: each is most-recent of its own
+            // (project, package), and the locked one is protected
+            // as in use.
+            for root in [&foo, &bar, &locked] {
+                assert!(
+                    !evicted_paths.iter().any(|p| Path::new(p) == root),
+                    "plan: {plan:?}"
+                );
+            }
+            assert!(plan.shortfall_bytes > 0);
+            // Protected: the locked root (2 MiB) plus the two
+            // most-recent roots (2 MiB each) — just over 6 MiB,
+            // the excess being the markers and lock files inside
+            // the roots.
+            assert!(plan.protected_bytes > 6 * 1024 * 1024, "plan: {plan:?}");
+            assert!(plan.protected_bytes < 7 * 1024 * 1024, "plan: {plan:?}");
+
+            let report = vertical.prune_apply().unwrap();
+            assert_eq!(report.evicted.len(), 1);
+            assert!(!pkg.exists());
+            assert!(foo.exists());
+            assert!(bar.exists());
+            assert!(locked.exists());
+        }
+
+        #[test]
+        fn prune_evicts_the_older_root_of_the_same_package() {
+            // Grouping is by (project, package): an older root of a
+            // package in another repo can evict once a newer root
+            // of that same package exists — the next build reuses
+            // the newest root of its package, not every root it
+            // ever had. A root of a different package stays
+            // protected as its own package's most recent.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), false);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical =
+                vertical(&client, dir.path(), engine, podman).with_cache_cap_bytes(1024 * 1024);
+            let now = now_unix();
+            let roots_base = dir.path().join("cache").join("build-roots");
+            let mk_root = |package: &str, repo: &str, last_build: u64| -> PathBuf {
+                let root = roots_base
+                    .join("testproject")
+                    .join(package)
+                    .join(format!("{repo}-{}", host_arch()));
+                fs::create_dir_all(&root).unwrap();
+                fs::write(root.join("blob"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+                let marker = RootMarker {
+                    project: "testproject".to_string(),
+                    package: package.to_string(),
+                    repo: repo.to_string(),
+                    arch: host_arch().to_string(),
+                    flavor: None,
+                    image_digest: None,
+                    engine_version: None,
+                    created_unix: last_build,
+                    last_build_unix: last_build,
+                    last_success_digest: None,
+                };
+                fs::write(
+                    root.join(ROOT_MARKER),
+                    serde_json::to_string(&marker).unwrap(),
+                )
+                .unwrap();
+                root
+            };
+            let old_foo = mk_root("foo", "standard", now - 3 * 86400);
+            let new_foo = mk_root("foo", "other-repo", now - 2 * 86400);
+            let bar = mk_root("bar", "standard", now - 2 * 86400);
+
+            let plan = vertical.prune_plan().unwrap();
+            assert!(plan.ran);
+            let evicted_paths: Vec<&str> = plan.evicted.iter().map(|i| i.path.as_str()).collect();
+            assert_eq!(plan.evicted.len(), 1, "plan: {plan:?}");
+            assert_eq!(plan.evicted[0].kind, "root");
+            assert!(
+                evicted_paths.iter().any(|p| Path::new(p) == old_foo),
+                "plan: {plan:?}"
+            );
+            for root in [&new_foo, &bar] {
+                assert!(
+                    !evicted_paths.iter().any(|p| Path::new(p) == root),
+                    "plan: {plan:?}"
+                );
+            }
+
+            let report = vertical.prune_apply().unwrap();
+            assert_eq!(report.evicted.len(), 1);
+            assert!(!old_foo.exists());
+            assert!(new_foo.exists());
+            assert!(bar.exists());
+        }
+
+        #[test]
+        fn store_project_package_parses_only_the_three_level_shape() {
+            // The (project, package) of a store path is read for
+            // the locked-root check: a legacy per-package store
+            // (two levels, no root name) has no (project, package)
+            // to read, so it is never attributed to the wrong
+            // package — and neither is a deeper path.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let cache = dir.path().join("cache");
+            assert_eq!(
+                vertical.store_project_package(
+                    &cache
+                        .join("sccache")
+                        .join("testproject")
+                        .join("foo")
+                        .join("standard-x86_64")
+                ),
+                Some(("testproject".to_string(), "foo".to_string()))
+            );
+            assert_eq!(
+                vertical
+                    .store_project_package(&cache.join("sccache").join("testproject").join("foo")),
+                None
+            );
+            assert_eq!(
+                vertical.store_project_package(
+                    &cache
+                        .join("sccache")
+                        .join("a")
+                        .join("b")
+                        .join("c")
+                        .join("d")
+                ),
+                None
+            );
+            assert_eq!(
+                vertical.store_project_package(&cache.join("pkg").join("testproject")),
+                None
+            );
+            // Bare `sccache/` has no (project, package) to read.
+            assert_eq!(vertical.store_project_package(&cache.join("sccache")), None);
+            // A trailing slash is normalized away by `components`,
+            // so the store still parses.
+            assert_eq!(
+                vertical.store_project_package(
+                    &cache
+                        .join("sccache")
+                        .join("testproject")
+                        .join("foo")
+                        .join("standard-x86_64/")
+                ),
+                Some(("testproject".to_string(), "foo".to_string()))
+            );
+            // A relative path never strips against the absolute
+            // cache dir.
+            assert_eq!(
+                vertical
+                    .store_project_package(Path::new("sccache/testproject/foo/standard-x86_64")),
+                None
+            );
+        }
+
+        #[test]
+        fn pkg_lock_for_path_rejects_a_legacy_two_level_path() {
+            // A legacy pkg/<repo>/<arch>/<file> path must not be
+            // read as project/repo/arch: the lock it would take
+            // guards nothing, and the file would be deleted
+            // unguarded. The current four-level shape still takes
+            // its lock.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let cache = dir.path().join("cache");
+            let legacy = cache
+                .join("pkg")
+                .join("standard")
+                .join(host_arch())
+                .join("old-1.0-1.x86_64.rpm");
+            assert!(vertical.pkg_lock_for_path(&legacy).is_none());
+            assert!(!cache
+                .join("pkg")
+                .join("standard")
+                .join(host_arch())
+                .join("old-1.0-1.x86_64.rpm.lock")
+                .exists());
+            let current = cache
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch())
+                .join("glibc-2.38-1.x86_64.rpm");
+            assert!(vertical.pkg_lock_for_path(&current).is_some());
+        }
+
+        #[test]
+        fn apply_eviction_plan_reports_pkg_shape_and_held_lock_apart() {
+            // The apply arm must not report a legacy pkg file as
+            // a concurrent download: a legacy path has no lock to
+            // hold, so it is an unrecognised shape. A
+            // current-layout file whose lock is held really is a
+            // download in flight. Both are refused, neither is
+            // deleted — only the diagnosis differs.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let cache = dir.path().join("cache");
+            let legacy = cache
+                .join("pkg")
+                .join("standard")
+                .join(host_arch())
+                .join("old-1.0-1.x86_64.rpm");
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            fs::write(&legacy, b"x").unwrap();
+            let current = cache
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch())
+                .join("glibc-2.38-1.x86_64.rpm");
+            fs::create_dir_all(current.parent().unwrap()).unwrap();
+            fs::write(&current, b"x").unwrap();
+            // Hold the current file's project-repo-arch lock: the
+            // apply run must see it as held, not as a shape
+            // problem.
+            let _held = vertical.pkg_lock_for_path(&current).unwrap();
+            let mut report = EvictionReport {
+                evicted: vec![
+                    EvictedItem {
+                        kind: "pkg".to_string(),
+                        path: legacy.display().to_string(),
+                        bytes: 1,
+                        reason: "lru".to_string(),
+                    },
+                    EvictedItem {
+                        kind: "pkg".to_string(),
+                        path: current.display().to_string(),
+                        bytes: 1,
+                        reason: "lru".to_string(),
+                    },
+                ],
+                ..Default::default()
+            };
+            vertical.apply_eviction_plan(&mut report);
+            assert!(report.evicted.is_empty());
+            assert_eq!(report.failures.len(), 2);
+            assert!(report.failures[0].contains("unrecognised shape"));
+            assert!(report.failures[1].contains("held by a download"));
+            assert!(legacy.exists());
+            assert!(current.exists());
+        }
+
+        #[test]
+        fn apply_eviction_plan_holds_the_store_root_lock() {
+            // The apply-time check for a sccache store must hold the
+            // store's root lock across the delete, not re-probe a
+            // snapshot: a build that locks the root after the plan
+            // would otherwise lose its store under it. While the
+            // root is locked the store survives with a failure
+            // recorded; once the lock releases the same plan
+            // deletes it.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let cache = dir.path().join("cache");
+            let root_name = format!("standard-{}", host_arch());
+            let root = cache
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(&root_name);
+            fs::create_dir_all(&root).unwrap();
+            let store = cache
+                .join("sccache")
+                .join("testproject")
+                .join("foo")
+                .join(&root_name);
+            fs::create_dir_all(&store).unwrap();
+            fs::write(store.join("sccache.tar"), b"x").unwrap();
+            let lock_file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(root.join(ROOT_LOCK))
+                .unwrap();
+            lock_file.try_lock_exclusive().unwrap();
+            let item = || EvictedItem {
+                kind: "sccache".to_string(),
+                path: store.display().to_string(),
+                bytes: 1,
+                reason: "lru".to_string(),
+            };
+            let mut report = EvictionReport {
+                evicted: vec![item()],
+                ..Default::default()
+            };
+            vertical.apply_eviction_plan(&mut report);
+            assert!(report.evicted.is_empty());
+            assert_eq!(report.failures.len(), 1);
+            assert!(report.failures[0].contains("locked build root"));
+            assert!(store.exists());
+            drop(lock_file);
+            let report = apply_one_item_soon(&vertical, item());
+            assert_eq!(report.evicted.len(), 1);
+            assert!(report.failures.is_empty());
+            assert!(!store.exists());
+        }
+
+        #[test]
+        fn apply_eviction_plan_deletes_the_root_and_its_lock_file() {
+            // A root delete removes the whole directory, lock file
+            // included — and a locked root survives: the lock file
+            // goes last, so a build that slips in between the
+            // unlink and the rmdir makes the delete fail instead
+            // of running inside a half-deleted root. Afterwards a
+            // build can lock a fresh root at the same path.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let cache = dir.path().join("cache");
+            let root = cache
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("standard-{}", host_arch()));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("blob"), b"x").unwrap();
+            let lock_file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(root.join(ROOT_LOCK))
+                .unwrap();
+            lock_file.try_lock_exclusive().unwrap();
+            let item = || EvictedItem {
+                kind: "root".to_string(),
+                path: root.display().to_string(),
+                bytes: 1,
+                reason: "lru".to_string(),
+            };
+            let mut report = EvictionReport {
+                evicted: vec![item()],
+                ..Default::default()
+            };
+            vertical.apply_eviction_plan(&mut report);
+            assert!(report.evicted.is_empty());
+            assert_eq!(report.failures.len(), 1);
+            assert!(root.exists());
+            drop(lock_file);
+            let report = apply_one_item_soon(&vertical, item());
+            assert_eq!(report.evicted.len(), 1);
+            assert!(report.failures.is_empty());
+            assert!(!root.exists());
+            assert!(!root.join(ROOT_LOCK).exists());
+            assert!(vertical.acquire_root_lock(&root, "foo").is_ok());
+        }
+
+        #[test]
+        fn build_wipe_refuses_a_locked_root_with_build_root_in_use() {
+            // A destructive op refused while a build holds the root
+            // is `BuildRootInUse`, not a second build
+            // (`BuildInProgress`): the caller asked to wipe, not to
+            // build.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let root = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("standard-{}", host_arch()));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(ROOT_MARKER), "{\"project\":\"testproject\"}").unwrap();
+            let lock_file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(root.join(ROOT_LOCK))
+                .unwrap();
+            lock_file.try_lock_exclusive().unwrap();
+            let err = vertical
+                .build_wipe("testproject", "foo", "standard", host_arch(), &None)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BuildRootInUse);
+        }
+
+        #[test]
+        fn podman_digest_treats_none_as_absent() {
+            // Podman prints `<none>` when the image has no digest: that
+            // is "absent", not a digest to record and protect — a build
+            // would otherwise never pull.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman.clone());
+            let none_podman = dir.path().join("podman-none");
+            write_script(
+                &none_podman,
+                "#!/bin/sh\nif [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then echo \"<none>\"; exit 0; fi\nexit 0\n",
+            );
+            assert_eq!(vertical.podman_digest(&none_podman).unwrap(), None);
+            // And a real digest still reads.
+            assert_eq!(
+                vertical.podman_digest(&podman).unwrap().as_deref(),
+                Some("sha256:fake-digest-1234")
+            );
+        }
+
+        #[test]
+        fn run_with_timeout_kills_a_hung_command() {
+            // The probe deadline is the point: a hung command returns
+            // `TimedOut` promptly instead of blocking the caller.
+            let mut cmd = Command::new("sleep");
+            cmd.arg("30");
+            let err = run_with_timeout(&mut cmd, Duration::from_millis(100)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+            // And a fast command returns its output.
+            let mut cmd = Command::new("echo");
+            cmd.arg("hi");
+            let output = run_with_timeout(&mut cmd, Duration::from_secs(10)).unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
+        }
+
+        #[test]
+        fn run_with_timeout_returns_despite_a_pipe_holding_grandchild() {
+            // A child that exits while a grandchild holds its stdout
+            // pipe open: the drain never sees EOF, so an unbounded
+            // join would hang the caller until the grandchild exits
+            // (30 s). The bounded join returns the child's output
+            // after the drain timeout instead.
+            let dir = TempDir::new();
+            let pidfile = dir.path().join("grandchild.pid");
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(format!(
+                "sleep 30 >&1 & echo $! > \"{}\"; echo done",
+                pidfile.display()
+            ));
+            let started = std::time::Instant::now();
+            let output = run_with_timeout(&mut cmd, Duration::from_secs(30)).unwrap();
+            assert!(output.status.success());
+            // The partial buffer is the child's whole output: the
+            // drain already read it; only EOF was missing.
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+            assert!(started.elapsed() < Duration::from_secs(10));
+            // Reap the grandchild so it does not outlive the test.
+            if let Ok(pid) = fs::read_to_string(&pidfile) {
+                if let Ok(pid) = pid.trim().parse::<u32>() {
+                    let _ = Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                }
+            }
+        }
+    }
+}
