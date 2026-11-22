@@ -21,6 +21,26 @@
 //! Within a retryable method, only transient failures are retried
 //! (timeouts, transport errors, 429, 5xx). Client errors (other 4xx),
 //! auth failures, and TLS failures are returned immediately.
+
+//!
+//! Proxy: the client honours the process proxy environment.
+//! `ALL_PROXY`, `all_proxy`, `HTTPS_PROXY`, `https_proxy`,
+//! `HTTP_PROXY`, `http_proxy` are tried in that order; the first
+//! set variable with a valid URI wins, and one proxy serves all
+//! requests. A malformed URI is skipped in favour of the next
+//! variable; no proxy only when every set variable is malformed.
+//! `NO_PROXY` / `no_proxy` lists hosts that connect directly: exact hosts,
+//! `*.suffix` / `.suffix` matches, `*` for all, trailing-`*` / trailing-dot forms.
+//! Entries are matched verbatim: surrounding spaces are not
+//! trimmed, so `NO_PROXY=localhost, 127.0.0.1` leaves the second
+//! entry unmatched. Loopback targets go through the proxy too
+//! unless `NO_PROXY` lists them — a cleartext loopback request
+//! with credentials exposes its `Authorization` header to the
+//! proxy. Credentials otherwise never travel to the proxy: auth
+//! still comes only from the [`AuthProvider`] seam. A proxy URL
+//! carrying userinfo is a different matter: ureq sends it to the
+//! proxy as `Proxy-Authorization: Basic` on CONNECT. SOCKS proxies
+//! (`socks5://`, `socks4://`) are honoured too.
 //!
 //! Non-2xx statuses are converted to a [`crate::error::GeectlError`] at
 //! this layer, before any caller sees the body, so callers never have to
@@ -381,6 +401,15 @@ pub struct UreqClient {
     debug: Debug,
 }
 
+/// Read the proxy from the process environment, if any: see the
+/// module docs for the variable order and `no_proxy` matching.
+/// A malformed proxy URI is skipped in favour of the next variable
+/// (no proxy only when every set variable is malformed), never
+/// failing client construction.
+fn proxy_from_env() -> Option<ureq::Proxy> {
+    ureq::Proxy::try_from_env()
+}
+
 impl UreqClient {
     pub fn new(timeout: Timeout) -> Result<Self, GeectlError> {
         UreqClient::with_auth(timeout, None)
@@ -389,6 +418,19 @@ impl UreqClient {
     pub fn with_auth(
         timeout: Timeout,
         auth: Option<Box<dyn AuthProvider>>,
+    ) -> Result<Self, GeectlError> {
+        UreqClient::with_auth_and_proxy(timeout, auth, proxy_from_env())
+    }
+
+    /// Build a client with an explicit proxy (or none). `with_auth`
+    /// passes the proxy read from the process environment;
+    /// callers that need a fixed proxy pass one here, and tests
+    /// build one by hand so proxy behaviour is pinned without
+    /// mutating process environment variables.
+    pub fn with_auth_and_proxy(
+        timeout: Timeout,
+        auth: Option<Box<dyn AuthProvider>>,
+        proxy: Option<ureq::Proxy>,
     ) -> Result<Self, GeectlError> {
         // A manually built Timeout bypasses `Timeout::new`, so validate
         // here too: an invalid timeout would otherwise compile to an
@@ -421,6 +463,10 @@ impl UreqClient {
             // silently start leaking credentials to the redirect
             // target (which may be a different host entirely).
             .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
+            // Honour the process proxy environment (see the module
+            // docs): without this, ureq connects directly even
+            // behind a proxy.
+            .proxy(proxy)
             .build();
         let agent: ureq::Agent = config.into();
         Ok(UreqClient {
@@ -4457,5 +4503,582 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
         assert!(take_debug_lines(&lines).is_empty());
+    }
+
+    /// A fake HTTP CONNECT proxy: accepts one connection, answers
+    /// the CONNECT with `200 Connection Established`, then records
+    /// the request sent through the tunnel and answers it. ureq
+    /// tunnels every proxied request through CONNECT — even plain
+    /// HTTP targets — so a single-shot server cannot stand in for
+    /// a proxy: the handshake and the request are two exchanges on
+    /// one connection.
+    struct ConnectProxyServer {
+        port: u16,
+        handle: std::thread::JoinHandle<Option<(String, String)>>,
+    }
+
+    impl ConnectProxyServer {
+        fn serve(body: &'static str) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind proxy server");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("local addr").port();
+            let handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break Some(stream),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() > deadline {
+                                break None;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break None,
+                    }
+                }?;
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                use std::io::Write;
+                let connect = read_request(&mut stream);
+                let connect = String::from_utf8_lossy(&connect).into_owned();
+                let _ = stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+                let _ = stream.flush();
+                let tunneled = read_request(&mut stream);
+                let tunneled = String::from_utf8_lossy(&tunneled).into_owned();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                Some((connect, tunneled))
+            });
+            ConnectProxyServer { port, handle }
+        }
+
+        fn requests(self) -> Option<(String, String)> {
+            self.handle.join().ok().flatten()
+        }
+    }
+
+    #[test]
+    fn proxy_is_used_for_requests() {
+        // The client must tunnel through the proxy: a CONNECT to
+        // the target host first, then the request itself through
+        // the tunnel. The proxy's answer is what the client
+        // returns. The proxy URL carries userinfo, which ureq sends
+        // as `Proxy-Authorization: Basic` on CONNECT.
+        let proxy = ConnectProxyServer::serve("proxied");
+        let proxy_url = format!("http://user:pass@127.0.0.1:{}", proxy.port);
+        let client = UreqClient::with_auth_and_proxy(
+            Timeout::default(),
+            None,
+            Some(ureq::Proxy::new(&proxy_url).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(client.get("http://example.com/test").unwrap(), "proxied");
+        let (connect, tunneled) = proxy.requests().expect("requests reached the proxy");
+        assert!(
+            connect.starts_with("CONNECT example.com:80 "),
+            "unexpected CONNECT line: {connect}"
+        );
+        assert!(
+            connect.contains("Proxy-Authorization: Basic dXNlcjpwYXNz"),
+            "CONNECT lacks proxy credentials: {connect}"
+        );
+        assert!(
+            tunneled.starts_with("GET /test "),
+            "unexpected tunneled request: {tunneled}"
+        );
+    }
+
+    #[test]
+    fn no_proxy_bypasses_the_proxy() {
+        // A dead proxy (nothing listening on port 9) with
+        // `no_proxy` covering the loopback target: the request
+        // must go direct and succeed.
+        let server = LoopbackServer::serve("hello");
+        let proxy = ureq::Proxy::builder(ureq::ProxyProtocol::Http)
+            .host("127.0.0.1")
+            .port(9)
+            .no_proxy("127.0.0.1")
+            .build()
+            .unwrap();
+        let client =
+            UreqClient::with_auth_and_proxy(Timeout::default(), None, Some(proxy)).unwrap();
+        assert_eq!(client.get(&server.url()).unwrap(), "hello");
+        assert!(server.request().is_some());
+    }
+
+    #[test]
+    fn default_client_reflects_proxy_env() {
+        // The default client reflects the process environment.
+        // No proxy variables, no proxy. The assertion is written
+        // against the ambient environment rather than mutating
+        // it: tests share one process, so setting a proxy variable
+        // here would reroute other tests' clients mid-run. When
+        // the environment does carry a proxy, the configured
+        // proxy must be exactly the one the environment names.
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let env_has_proxy = [
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        if env_has_proxy {
+            // Independent of `try_from_env`: walk the variables in
+            // the documented order and take the first set one with
+            // a parseable URI.
+            let mut expected = None;
+            for name in [
+                "ALL_PROXY",
+                "all_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ] {
+                let Ok(value) = std::env::var(name) else {
+                    continue;
+                };
+                if let Ok(proxy) = ureq::Proxy::new(&value) {
+                    expected = Some(proxy);
+                    break;
+                }
+            }
+            assert_eq!(
+                client.agent.config().proxy().map(|p| p.uri()),
+                expected.as_ref().map(|p| p.uri())
+            );
+        } else {
+            assert!(client.agent.config().proxy().is_none());
+        }
+    }
+
+    #[test]
+    fn loopback_target_goes_through_the_proxy() {
+        // A loopback target with no `NO_PROXY` entry: the request
+        // must tunnel through the proxy, not go direct — the
+        // proxy's answer is what the client returns, not the
+        // loopback server's. The proxy is built by hand, so the
+        // process environment cannot exempt the target.
+        let proxy = ConnectProxyServer::serve("proxied");
+        let proxy_url = format!("http://127.0.0.1:{}", proxy.port);
+        let client = UreqClient::with_auth_and_proxy(
+            Timeout::default(),
+            None,
+            Some(ureq::Proxy::new(&proxy_url).unwrap()),
+        )
+        .unwrap();
+        let target = LoopbackServer::serve("hello");
+        assert_eq!(client.get(&target.url()).unwrap(), "proxied");
+        let (connect, tunneled) = proxy.requests().expect("requests reached the proxy");
+        assert!(
+            connect.starts_with("CONNECT 127.0.0.1:"),
+            "unexpected CONNECT line: {connect}"
+        );
+        assert!(
+            tunneled.starts_with("GET /test "),
+            "unexpected tunneled request: {tunneled}"
+        );
+    }
+
+    /// A minimal SOCKS5 server: one handshake, one CONNECT, then the
+    /// tunneled HTTP request answered directly, mirroring
+    /// `ConnectProxyServer` with the SOCKS5 greeting in front.
+    struct Socks5Server {
+        port: u16,
+        handle: std::thread::JoinHandle<Option<(String, String)>>,
+    }
+
+    impl Socks5Server {
+        fn serve(body: &'static str) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind socks server");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("local addr").port();
+            let handle = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break Some(stream),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() > deadline {
+                                break None;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break None,
+                    }
+                }?;
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                // SOCKS5 greeting: VER, NMETHODS, METHODS; no-auth only.
+                let mut greeting = [0u8; 2];
+                stream.read_exact(&mut greeting).ok()?;
+                if greeting[0] != 0x05 {
+                    return None;
+                }
+                let mut methods = vec![0u8; greeting[1] as usize];
+                stream.read_exact(&mut methods).ok()?;
+                stream.write_all(&[0x05, 0x00]).ok()?;
+                // CONNECT request: VER CMD RSV ATYP, then address + port.
+                let mut head = [0u8; 4];
+                stream.read_exact(&mut head).ok()?;
+                if head[0] != 0x05 || head[1] != 0x01 {
+                    return None;
+                }
+                let target = match head[3] {
+                    0x01 => {
+                        let mut addr = [0u8; 6];
+                        stream.read_exact(&mut addr).ok()?;
+                        format!(
+                            "{}.{}.{}.{}:{}",
+                            addr[0],
+                            addr[1],
+                            addr[2],
+                            addr[3],
+                            u16::from_be_bytes([addr[4], addr[5]])
+                        )
+                    }
+                    0x03 => {
+                        let mut len = [0u8; 1];
+                        stream.read_exact(&mut len).ok()?;
+                        let mut domain = vec![0u8; len[0] as usize + 2];
+                        stream.read_exact(&mut domain).ok()?;
+                        let port = u16::from_be_bytes([
+                            domain[len[0] as usize],
+                            domain[len[0] as usize + 1],
+                        ]);
+                        format!(
+                            "{}:{}",
+                            String::from_utf8_lossy(&domain[..len[0] as usize]),
+                            port
+                        )
+                    }
+                    0x04 => {
+                        let mut addr = [0u8; 18];
+                        stream.read_exact(&mut addr).ok()?;
+                        let mut ip = [0u8; 16];
+                        ip.copy_from_slice(&addr[..16]);
+                        format!(
+                            "{}:{}",
+                            std::net::Ipv6Addr::from(ip),
+                            u16::from_be_bytes([addr[16], addr[17]])
+                        )
+                    }
+                    _ => return None,
+                };
+                stream
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .ok()?;
+                let _ = stream.flush();
+                let tunneled = read_request(&mut stream);
+                let tunneled = String::from_utf8_lossy(&tunneled).into_owned();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                Some((target, tunneled))
+            });
+            Socks5Server { port, handle }
+        }
+
+        fn requests(self) -> Option<(String, String)> {
+            self.handle.join().ok().flatten()
+        }
+    }
+
+    #[test]
+    fn socks5_proxy_is_used_for_requests() {
+        // A SOCKS5 proxy used to be silently ignored: without the
+        // `socks-proxy` feature ureq falls back to a direct
+        // connection (and panics for a manually configured one).
+        // The request must tunnel through the SOCKS handshake and
+        // come back with the proxy's answer.
+        let proxy = Socks5Server::serve("proxied");
+        let proxy_url = format!("socks5://127.0.0.1:{}", proxy.port);
+        let client = UreqClient::with_auth_and_proxy(
+            Timeout::default(),
+            None,
+            Some(ureq::Proxy::new(&proxy_url).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(client.get("http://127.0.0.1:9/test").unwrap(), "proxied");
+        let (target, tunneled) = proxy.requests().expect("requests reached the proxy");
+        assert_eq!(target, "127.0.0.1:9");
+        assert!(
+            tunneled.starts_with("GET /test "),
+            "unexpected tunneled request: {tunneled}"
+        );
+    }
+
+    /// A minimal SOCKS4 server: one handshake, one CONNECT, then the
+    /// tunneled HTTP request answered directly, mirroring
+    /// `Socks5Server` with the SOCKS4 greeting in front.
+    struct Socks4Server {
+        port: u16,
+        handle: std::thread::JoinHandle<Option<(String, String)>>,
+    }
+
+    impl Socks4Server {
+        fn serve(body: &'static str) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind socks4 server");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("local addr").port();
+            let handle = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break Some(stream),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() > deadline {
+                                break None;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break None,
+                    }
+                }?;
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                // SOCKS4 CONNECT: VER CMD DSTPORT DSTIP USERID NUL.
+                let mut head = [0u8; 8];
+                stream.read_exact(&mut head).ok()?;
+                if head[0] != 0x04 || head[1] != 0x01 {
+                    return None;
+                }
+                let target = format!(
+                    "{}.{}.{}.{}:{}",
+                    head[4],
+                    head[5],
+                    head[6],
+                    head[7],
+                    u16::from_be_bytes([head[2], head[3]])
+                );
+                // Read the NUL-terminated USERID.
+                let mut userid = [0u8; 1];
+                loop {
+                    stream.read_exact(&mut userid).ok()?;
+                    if userid[0] == 0 {
+                        break;
+                    }
+                }
+                // Granted: VN 0x00, CD 0x5A, then DSTPORT DSTIP.
+                stream
+                    .write_all(&[
+                        0x00, 0x5A, head[2], head[3], head[4], head[5], head[6], head[7],
+                    ])
+                    .ok()?;
+                let _ = stream.flush();
+                let tunneled = read_request(&mut stream);
+                let tunneled = String::from_utf8_lossy(&tunneled).into_owned();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                Some((target, tunneled))
+            });
+            Socks4Server { port, handle }
+        }
+
+        fn requests(self) -> Option<(String, String)> {
+            self.handle.join().ok().flatten()
+        }
+    }
+
+    #[test]
+    fn socks4_proxy_is_used_for_requests() {
+        // SOCKS4 is honoured like SOCKS5: the request must go
+        // through the SOCKS4 handshake and come back with the
+        // proxy's answer.
+        let proxy = Socks4Server::serve("proxied");
+        let proxy_url = format!("socks4://127.0.0.1:{}", proxy.port);
+        let client = UreqClient::with_auth_and_proxy(
+            Timeout::default(),
+            None,
+            Some(ureq::Proxy::new(&proxy_url).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(client.get("http://127.0.0.1:9/test").unwrap(), "proxied");
+        let (target, tunneled) = proxy.requests().expect("requests reached the proxy");
+        assert_eq!(target, "127.0.0.1:9");
+        assert!(
+            tunneled.starts_with("GET /test "),
+            "unexpected tunneled request: {tunneled}"
+        );
+    }
+
+    #[test]
+    fn socks5h_proxy_sends_domain_targets() {
+        // A domain target reaches the SOCKS server as ATYP 0x03
+        // with the domain. Plain SOCKS5 resolves locally first, so
+        // the domain form is exercised through SOCKS5h (remote DNS).
+        let proxy = Socks5Server::serve("proxied");
+        let proxy_url = format!("socks5h://127.0.0.1:{}", proxy.port);
+        let client = UreqClient::with_auth_and_proxy(
+            Timeout::default(),
+            None,
+            Some(ureq::Proxy::new(&proxy_url).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(client.get("http://example.com/test").unwrap(), "proxied");
+        let (target, tunneled) = proxy.requests().expect("requests reached the proxy");
+        assert_eq!(target, "example.com:80");
+        assert!(
+            tunneled.starts_with("GET /test "),
+            "unexpected tunneled request: {tunneled}"
+        );
+    }
+
+    #[test]
+    fn socks5_proxy_sends_ipv6_targets() {
+        // An IPv6 literal target reaches the SOCKS5 server as ATYP
+        // 0x04 with the address, not a mapped IPv4 address.
+        let proxy = Socks5Server::serve("proxied");
+        let proxy_url = format!("socks5://127.0.0.1:{}", proxy.port);
+        let client = UreqClient::with_auth_and_proxy(
+            Timeout::default(),
+            None,
+            Some(ureq::Proxy::new(&proxy_url).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(client.get("http://[::1]:9/test").unwrap(), "proxied");
+        let (target, tunneled) = proxy.requests().expect("requests reached the proxy");
+        assert_eq!(target, "::1:9");
+        assert!(
+            tunneled.starts_with("GET /test "),
+            "unexpected tunneled request: {tunneled}"
+        );
+    }
+
+    /// Helper run only as a subprocess by
+    /// `proxy_env_precedence_and_malformed_in_subprocess`: it reads
+    /// the case from `GEectl_PROXY_ENV_CASE` and asserts what the
+    /// default client picks up. Run directly it does nothing, so a
+    /// plain `cargo test` run never mutates the process
+    /// environment.
+    #[test]
+    fn proxy_env_subprocess_helper() {
+        let Ok(case) = std::env::var("GEectl_PROXY_ENV_CASE") else {
+            return;
+        };
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let proxy = client.agent.config().proxy();
+        match case.as_str() {
+            "all-beats-https" => {
+                let expected = ureq::Proxy::new("http://127.0.0.1:9").unwrap();
+                assert_eq!(proxy.map(|p| p.uri()), Some(expected.uri()));
+            }
+            "malformed-skipped" => {
+                let expected = ureq::Proxy::new("http://127.0.0.1:10").unwrap();
+                assert_eq!(proxy.map(|p| p.uri()), Some(expected.uri()));
+            }
+            "malformed-only" => {
+                assert!(proxy.is_none());
+            }
+            "lowercase-only" => {
+                let expected = ureq::Proxy::new("http://127.0.0.1:11").unwrap();
+                assert_eq!(proxy.map(|p| p.uri()), Some(expected.uri()));
+            }
+            "http-only" => {
+                let expected = ureq::Proxy::new("http://127.0.0.1:12").unwrap();
+                assert_eq!(proxy.map(|p| p.uri()), Some(expected.uri()));
+            }
+            "all-lower-beats-https" => {
+                let expected = ureq::Proxy::new("http://127.0.0.1:9").unwrap();
+                assert_eq!(proxy.map(|p| p.uri()), Some(expected.uri()));
+            }
+            "no-proxy-bypasses-via-env" => {
+                // `NO_PROXY` from the environment must exempt the
+                // loopback target from a dead proxy: the request
+                // goes direct and succeeds.
+                let server = LoopbackServer::serve("hello");
+                assert_eq!(client.get(&server.url()).unwrap(), "hello");
+                assert!(server.request().is_some());
+            }
+            _ => panic!("unknown proxy env case: {case}"),
+        }
+    }
+
+    #[test]
+    fn proxy_env_precedence_and_malformed_in_subprocess() {
+        // Env precedence and the malformed-URI fallback cannot be
+        // pinned in-process: setting a proxy variable here would
+        // reroute other tests' clients in the shared process. Each
+        // case runs the helper above in a fresh process with a
+        // controlled environment instead.
+        let exe = std::env::current_exe().expect("current test binary");
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            (
+                "all-beats-https",
+                &[
+                    ("ALL_PROXY", "http://127.0.0.1:9"),
+                    ("HTTPS_PROXY", "http://127.0.0.1:10"),
+                ],
+            ),
+            (
+                "malformed-skipped",
+                &[
+                    ("ALL_PROXY", "http://[::1"),
+                    ("HTTPS_PROXY", "http://127.0.0.1:10"),
+                ],
+            ),
+            ("malformed-only", &[("ALL_PROXY", "http://[::1")]),
+            ("lowercase-only", &[("http_proxy", "http://127.0.0.1:11")]),
+            ("http-only", &[("HTTP_PROXY", "http://127.0.0.1:12")]),
+            (
+                "all-lower-beats-https",
+                &[
+                    ("all_proxy", "http://127.0.0.1:9"),
+                    ("HTTPS_PROXY", "http://127.0.0.1:10"),
+                ],
+            ),
+            (
+                "no-proxy-bypasses-via-env",
+                &[
+                    ("ALL_PROXY", "http://127.0.0.1:9"),
+                    ("NO_PROXY", "127.0.0.1"),
+                ],
+            ),
+        ];
+        for (case, vars) in cases {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.arg("http::tests::proxy_env_subprocess_helper")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env("GEectl_PROXY_ENV_CASE", case);
+            for name in [
+                "ALL_PROXY",
+                "all_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ] {
+                cmd.env_remove(name);
+            }
+            for (name, value) in *vars {
+                cmd.env(name, value);
+            }
+            let out = cmd.output().expect("spawn helper");
+            assert!(
+                out.status.success(),
+                "proxy env case {case} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }
