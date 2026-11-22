@@ -377,6 +377,16 @@ pub enum RemoteCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Delete a `_link` file from a package. A mutation: dry-run is
+    /// the default (only the plan is printed); `--live` performs the
+    /// deletion. The package keeps its files and meta, but stops
+    /// tracking the source.
+    DeleteLink {
+        /// The project the package lives in.
+        project: String,
+        /// The package whose `_link` is deleted.
+        package: String,
+    },
     /// Delete a project. A mutation: dry-run is the default (only
     /// the plan is printed); `--live` performs the deletion.
     /// Without `--recursive` a project holding packages is refused.
@@ -523,6 +533,7 @@ pub fn run_remote(
         RemoteCommand::CreateProject { .. } if !live => Credentials::None,
         RemoteCommand::CreatePackage { .. } if !live => Credentials::None,
         RemoteCommand::DeletePackage { .. } if !live => Credentials::None,
+        RemoteCommand::DeleteLink { .. } if !live => Credentials::None,
         RemoteCommand::DeleteProject { .. } if !live => Credentials::None,
         RemoteCommand::UndeletePackage { .. } if !live => Credentials::None,
         RemoteCommand::UndeleteProject { .. } if !live => Credentials::None,
@@ -1006,6 +1017,21 @@ pub fn run_remote(
                 plan,
             ))
         }
+        RemoteCommand::DeleteLink { project, package } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.delete_link(&project, &package, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(delete_link_result(
+                &project,
+                &package,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
         RemoteCommand::DeleteProject {
             project,
             recursive,
@@ -1406,6 +1432,32 @@ fn delete_package_result(
         format!("dry-run: would delete package {package} from project {project}{suffix}")
     } else {
         format!("deleted package {package} from project {project}{suffix}")
+    };
+    mutation_result(
+        payload,
+        format!("project: {project} package: {package}"),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The `delete-link` result: the payload carries the coordinates;
+/// the text states the deletion, or the dry-run plan.
+fn delete_link_result(
+    project: &str,
+    package: &str,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let payload = json!({
+        "project": project,
+        "package": package,
+    });
+    let result_line = if dry_run {
+        format!("dry-run: would delete link of package {package} from project {project}")
+    } else {
+        format!("deleted link of package {package} from project {project}")
     };
     mutation_result(
         payload,
@@ -2883,6 +2935,34 @@ mod tests {
             parsed,
             RemoteCommand::DeletePackage { force: true, .. }
         ));
+    }
+
+    #[test]
+    fn delete_link_parses_project_and_package() {
+        let parsed = parse(&["geectl", "remote", "delete-link", "P", "K"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::DeleteLink { project, package }
+                if project == "P" && package == "K"
+        ));
+    }
+
+    #[test]
+    fn delete_link_result_carries_coordinates_in_both_formats() {
+        let (payload, text) = delete_link_result(
+            "P",
+            "K",
+            true,
+            Some(vec!["[dry-run] would: delete link of P/K".to_string()]),
+        );
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["package"], "K");
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(payload["plan"][0], "[dry-run] would: delete link of P/K");
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: true\ndry-run: would delete link of package K from project P\n[dry-run] would: delete link of P/K"
+        );
     }
 
     #[test]

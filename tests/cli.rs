@@ -1475,6 +1475,48 @@ fn remote_delete_package_dry_run_ignores_half_set_credentials() {
 }
 
 #[test]
+fn remote_delete_link_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "delete-link", "home:alice", "vim"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "home:alice");
+    assert_eq!(value["package"], "vim");
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: delete link of home:alice/vim"
+    );
+}
+
+#[test]
+fn remote_delete_link_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "remote", "delete-link", "home:alice", "vim"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
 fn remote_delete_project_dry_run_ignores_half_set_credentials() {
     // A dry-run mutation preview needs no credentials — the
     // library's dry-run guard runs before its credentials check —

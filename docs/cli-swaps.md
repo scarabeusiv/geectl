@@ -32,6 +32,7 @@ what is specific to that group.
 | (no osc command) | `remote create-project` | New surface: osc has no project-create command; projects are created through `meta -e` — the library creates the server meta directly |
 | `osc rmkpac [--scmsync SCMSYNC] [--force] PROJECT PACKAGE` | `remote create-package` | One command per library operation. `--scmsync` / `--force` select the options form of the creation |
 | `osc rdelete [-m TEXT] PROJECT PACKAGE` | `remote delete-package` | One command per library operation; osc's `-m` is dropped — the package delete carries no comment |
+| (no osc command) | `remote delete-link PROJECT PACKAGE` | No single server-side command: a working copy can delete the `_link` file and commit it, or `osc api -X DELETE /source/PROJECT/PACKAGE/_link` deletes it directly; the library guards the delete behind dry-run |
 | `osc rdelete [-r] [-f] [-m TEXT] PROJECT` | `remote delete-project` | One command per library operation; `-r` is `--recursive`, `-f` is `--force`, `-m` is `--comment` |
 | `osc undelete [-m TEXT] PROJECT PACKAGE` | `remote undelete-package` | One command per library operation, one package per invocation; osc's `-m` is dropped — the library sends no comment |
 | `osc undelete [-m TEXT] PROJECT` | `remote undelete-project` | One command per library operation; osc's `-m` is dropped — the library sends no comment |
