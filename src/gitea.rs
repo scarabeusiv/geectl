@@ -1,6 +1,7 @@
 //! The Gitea operations for git-backed packages: repo read, fork,
-//! repo delete, and the `branch` composite (Gitea fork + OBS
-//! `cmd=fork`) behind the uniform flow.
+//! repo delete, repo list, repo create, branch read and branch head,
+//! and the `branch` composite (Gitea fork + OBS `cmd=fork`) behind
+//! the uniform flow.
 //!
 //! The client is internal plumbing, not the user-facing surface:
 //! the uniform flow verbs (`branch`, `submit`, …) are what an agent
@@ -71,10 +72,10 @@ pub struct GiteaParent {
     pub full_name: String,
 }
 
-/// A Gitea repository: only the fields the phase-1 operations need
-/// are modelled — identity, parent, default branch, and the clone
-/// URLs the fork result returns. A field the operation does not
-/// need is not parsed.
+/// A Gitea repository: only the fields the phase-1 and phase-2
+/// operations need are modelled — identity, parent, default
+/// branch, privacy, and the clone URLs the fork result returns. A
+/// field the operation does not need is not parsed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GiteaRepository {
     /// The repo's owner.
@@ -88,6 +89,8 @@ pub struct GiteaRepository {
     pub parent: Option<GiteaParent>,
     /// The repo's default branch.
     pub default_branch: String,
+    /// Whether the repo is private.
+    pub private: bool,
     /// The HTTPS clone URL.
     pub clone_url: String,
     /// The SSH clone URL.
@@ -161,6 +164,63 @@ struct ForkRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     organization: Option<String>,
 }
+
+/// The head commit of a branch: only the id (the sync-verification
+/// primitive) and the message are modelled.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaBranchCommit {
+    /// The commit SHA.
+    pub id: String,
+    /// The commit message.
+    #[serde(default)]
+    pub message: String,
+}
+
+/// A Gitea branch: only the fields the phase-2 operations need
+/// are modelled — the name, the head commit, and whether the
+/// branch is protected. A field the operation does not need is
+/// not parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaBranch {
+    /// The branch name.
+    pub name: String,
+    /// The head commit.
+    pub commit: GiteaBranchCommit,
+    /// Whether the branch is protected.
+    #[serde(default)]
+    pub protected: bool,
+}
+
+/// Options for `repo_create`: the repo is public and takes the
+/// server's default branch unless told otherwise.
+#[derive(Debug, Clone, Default)]
+pub struct RepoCreateOptions {
+    /// Create a private repository; public by default.
+    pub private: bool,
+    /// A short description; omitted when unset.
+    pub description: Option<String>,
+    /// The default branch; the server default when unset.
+    pub default_branch: Option<String>,
+}
+
+/// The body of `POST /api/v1/user/repos`: the name and the
+/// privacy flag always; the description and default branch only
+/// when set.
+#[derive(Debug, Serialize)]
+struct RepoCreateRequest {
+    name: String,
+    private: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_branch: Option<String>,
+}
+
+/// The page size for Gitea list calls (`limit=50`, like osc's
+/// fork list), and the page bound: past it the call fails instead
+/// of reading unboundedly or silently truncating.
+const LIST_PAGE_SIZE: u32 = 50;
+const MAX_LIST_PAGES: u32 = 10;
 
 /// A parsed scmsync URL, following the server's
 /// `generate_scmsyncinfo` (backend `BSSrcServer/ScmsyncDB.pm`):
@@ -473,6 +533,294 @@ impl<'a> GiteaClient<'a> {
         let url = build_url(&self.base, &["api", "v1", "repos", owner, repo], &[]);
         self.http.delete(&url, &self.credentials)?;
         Ok(Some(existing.name))
+    }
+
+    /// List repositories: the token owner's own repos when neither
+    /// filter is given (`GET /api/v1/user/repos`), one user's repos
+    /// (`GET /api/v1/users/{owner}/repos`), one organization's
+    /// repos (`GET /api/v1/orgs/{org}/repos`) — or both, the user's
+    /// repos first and then the organization's, the `repo list
+    /// --user --org` form (osc
+    /// `behave/features/git-repo-list.feature`). The agent use case is finding its forks
+    /// or an org's repos before acting on one — including finding
+    /// the fork of a source under a different name, which the
+    /// fork's 409 body does not name. Each list paginates
+    /// internally and is bounded (see `list_paged`): past the bound
+    /// the call fails naming the list and what the caller can do
+    /// about it, never a silent truncation.
+    pub fn repo_list(
+        &self,
+        owner: Option<&str>,
+        org: Option<&str>,
+    ) -> Result<Vec<GiteaRepository>, GeectlError> {
+        if let Some(owner) = owner {
+            validate_gitea_name(owner, "owner")?;
+        }
+        if let Some(org) = org {
+            validate_gitea_name(org, "organization")?;
+        }
+        let mut repos = Vec::new();
+        // The bound error's remedy is per form: only the own form
+        // can be narrowed (list one user or org instead); a single
+        // user, a single org, and a repo's branches have no
+        // narrower filter, so their remedy says the list is
+        // bounded.
+        match (owner, org) {
+            (None, None) => repos.extend(self.list_paged::<GiteaRepository>(
+                &["api", "v1", "user", "repos"],
+                "your repositories",
+                "list a single user or organization instead",
+            )?),
+            (Some(owner), None) => repos.extend(self.list_paged::<GiteaRepository>(
+                &["api", "v1", "users", owner, "repos"],
+                &format!("repositories of user {owner}"),
+                "the list is bounded at 500 entries",
+            )?),
+            (None, Some(org)) => repos.extend(self.list_paged::<GiteaRepository>(
+                &["api", "v1", "orgs", org, "repos"],
+                &format!("repositories of organization {org}"),
+                "the list is bounded at 500 entries",
+            )?),
+            (Some(owner), Some(org)) => {
+                // The user's repos first, then the org's — osc's
+                // `repo list --user --org` order (osc
+                // `behave/features/git-repo-list.feature`,
+                // "List repos owned by a user and an organization":
+                // the user's repo first, then the org's). An org
+                // is a user in Gitea, so when `owner` and `org`
+                // name the same account the two lists are the same
+                // repos — dedupe by full name (case-insensitive,
+                // the repo-identity rule) instead of returning
+                // every repo twice.
+                repos.extend(self.list_paged::<GiteaRepository>(
+                    &["api", "v1", "users", owner, "repos"],
+                    &format!("repositories of user {owner}"),
+                    "the list is bounded at 500 entries",
+                )?);
+                repos.extend(self.list_paged::<GiteaRepository>(
+                    &["api", "v1", "orgs", org, "repos"],
+                    &format!("repositories of organization {org}"),
+                    "the list is bounded at 500 entries",
+                )?);
+                let mut seen: Vec<String> = Vec::new();
+                repos.retain(|repo| {
+                    let full = repo.full_name.to_lowercase();
+                    if seen.contains(&full) {
+                        false
+                    } else {
+                        seen.push(full);
+                        true
+                    }
+                });
+            }
+        }
+        Ok(repos)
+    }
+
+    /// Create a repository (`POST /api/v1/user/repos`) and return
+    /// the created repo. The fixture primitive the live tests use,
+    /// and the repo the git-backed new-package flow's sources will
+    /// live in. DryRun-guarded like `fork_repo`: the guard runs
+    /// before any server read, and the result is `None` in
+    /// dry-run. The response is checked against what was asked
+    /// for — the name, the privacy flag, and the default branch
+    /// when one was named: the owner is the token owner, unknown
+    /// here without a read, so the name (not the full name) is the
+    /// identity guard.
+    pub fn repo_create(
+        &self,
+        name: &str,
+        options: &RepoCreateOptions,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaRepository>, GeectlError> {
+        validate_gitea_name(name, "repo")?;
+        if let Some(branch) = &options.default_branch {
+            validate_git_branch_name(branch)?;
+        }
+        let private = if options.private { " (private)" } else { "" };
+        if !dry_run.allow(&format!("create repository {name}{private}")) {
+            return Ok(None);
+        }
+        let request = RepoCreateRequest {
+            name: name.to_string(),
+            private: options.private,
+            description: options.description.clone(),
+            default_branch: options.default_branch.clone(),
+        };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea repo-create request: {err}"),
+            )
+        })?;
+        let url = build_url(&self.base, &["api", "v1", "user", "repos"], &[]);
+        let response = self.http.post_json_with(&url, &body, &self.credentials)?;
+        let created =
+            parse_repository_body(&response, &format!("for the created repository {name}"))?;
+        if created.name != name {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea repository response for the created repository {name}: the server answered for {}",
+                    created.full_name
+                ),
+            ));
+        }
+        // The create is verified against what was asked for: a
+        // server that silently created a public repo, or one with
+        // another default branch, must not report success — the
+        // options are the caller's instruction, not a hint.
+        if let Some(branch) = &options.default_branch {
+            if created.default_branch != *branch {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected Gitea repository response for the created repository {name}: the server answered with default branch {}, not {branch}",
+                        created.default_branch
+                    ),
+                ));
+            }
+        }
+        if created.private != options.private {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea repository response for the created repository {name}: the server answered with private={}, not {}",
+                    created.private, options.private
+                ),
+            ));
+        }
+        Ok(Some(created))
+    }
+
+    /// List a repository's branches (`GET
+    /// /api/v1/repos/{owner}/{repo}/branches`): the names and head
+    /// commits of what a fork carries. Paginates internally and is
+    /// bounded like `repo_list`.
+    pub fn branch_list(&self, owner: &str, repo: &str) -> Result<Vec<GiteaBranch>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        self.list_paged::<GiteaBranch>(
+            &["api", "v1", "repos", owner, repo, "branches"],
+            &format!("branches of {owner}/{repo}"),
+            "the list is bounded at 500 entries",
+        )
+    }
+
+    /// Read one branch (`GET
+    /// /api/v1/repos/{owner}/{repo}/branches/{branch}`): verify a
+    /// branch exists before naming it in a scmsync URL. The branch
+    /// is one encoded segment, so a slashed name (`feature/x`)
+    /// travels as `feature%2Fx` and the server decodes it.
+    pub fn branch_get(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<GiteaBranch, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_git_branch_name(branch)?;
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "repos", owner, repo, "branches", branch],
+            &[],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_branch(&body, owner, repo, branch)
+    }
+
+    /// The head commit SHA of a branch: the sync-verification
+    /// primitive — the SHA the filer compares against the OBS side
+    /// (`_scmsync.obsinfo`) before filing from a git-backed
+    /// package. A branch read; only the commit id is returned.
+    pub fn branch_head(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<String, GeectlError> {
+        Ok(self.branch_get(owner, repo, branch)?.commit.id)
+    }
+
+    /// Read every page of a list endpoint (`page`/`limit` query)
+    /// into one typed list. A page shorter than the page size ends
+    /// the list; a page of exactly the page size fetches the next
+    /// one. Past `MAX_LIST_PAGES` full pages the call reads one
+    /// more page to prove the list is longer: an empty page 11
+    /// means the list is exactly at the bound and is returned, a
+    /// non-empty one fails with `InvalidInput` naming `scope` and
+    /// the per-call-site `remedy` — what the caller can do about
+    /// it — instead of silently truncating or reading unboundedly.
+    /// The remedy is per call site because not every list can be
+    /// narrowed: the token owner's own repos can (list one user or
+    /// org instead), a single user, a single org, and a repo's
+    /// branches cannot.
+    fn list_paged<T>(
+        &self,
+        segments: &[&str],
+        scope: &str,
+        remedy: &str,
+    ) -> Result<Vec<T>, GeectlError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let mut items = Vec::new();
+        for page in 1..=MAX_LIST_PAGES {
+            let url = build_url(
+                &self.base,
+                segments,
+                &[
+                    ("page", &page.to_string()),
+                    ("limit", &LIST_PAGE_SIZE.to_string()),
+                ],
+            );
+            let body = self.http.get_with(&url, &self.credentials)?;
+            let page_items: Vec<T> = serde_json::from_str(&body).map_err(|err| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("unexpected Gitea {scope} response (page {page}): {err}"),
+                )
+            })?;
+            let full = page_items.len() == LIST_PAGE_SIZE as usize;
+            items.extend(page_items);
+            if !full {
+                return Ok(items);
+            }
+        }
+        // Ten full pages: the list is at least at the bound. One
+        // more read decides — an empty page 11 proves exactly 500
+        // entries, which is at the bound and is returned; anything
+        // on it proves more than 500, and only then does the call
+        // fail. Without this read a list of exactly 500 would fail
+        // on an unproven "more than 500 entries".
+        let page = MAX_LIST_PAGES + 1;
+        let url = build_url(
+            &self.base,
+            segments,
+            &[
+                ("page", &page.to_string()),
+                ("limit", &LIST_PAGE_SIZE.to_string()),
+            ],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        let page_items: Vec<T> = serde_json::from_str(&body).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected Gitea {scope} response (page {page}): {err}"),
+            )
+        })?;
+        if page_items.is_empty() {
+            return Ok(items);
+        }
+        Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "the list of {scope} has more than {} entries ({} pages of {LIST_PAGE_SIZE}); {remedy}",
+                MAX_LIST_PAGES * LIST_PAGE_SIZE,
+                MAX_LIST_PAGES
+            ),
+        ))
     }
 
     /// Give the agent a place to work on a git-backed package (or
@@ -828,12 +1176,7 @@ fn validate_git_branch_name(branch: &str) -> Result<(), GeectlError> {
 /// logins are case-insensitive, so the comparison canonicalizes
 /// case on both sides.
 fn parse_repository(body: &str, owner: &str, repo: &str) -> Result<GiteaRepository, GeectlError> {
-    let parsed: GiteaRepository = serde_json::from_str(body).map_err(|err| {
-        GeectlError::new(
-            ErrorKind::ServerError,
-            format!("unexpected Gitea repository response for {owner}/{repo}: {err}"),
-        )
-    })?;
+    let parsed = parse_repository_body(body, &format!("for {owner}/{repo}"))?;
     let expected = format!("{owner}/{repo}");
     if !parsed.full_name.eq_ignore_ascii_case(&expected) {
         return Err(GeectlError::new(
@@ -841,6 +1184,50 @@ fn parse_repository(body: &str, owner: &str, repo: &str) -> Result<GiteaReposito
             format!(
                 "unexpected Gitea repository response for {owner}/{repo}: the server answered for {}",
                 parsed.full_name
+            ),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Deserialize a Gitea repository out of a response body, naming
+/// `context` in the error when the body is not a repository. The
+/// identity check lives in `parse_repository` (for reads of a known
+/// repo) or in the caller (for creates, where the owner is the
+/// token owner and unknown here); this only proves the body is a
+/// repository at all.
+fn parse_repository_body(body: &str, context: &str) -> Result<GiteaRepository, GeectlError> {
+    serde_json::from_str(body).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected Gitea repository response {context}: {err}"),
+        )
+    })
+}
+
+/// Parse a Gitea branch out of a response body. A body that is not
+/// a branch is a server error naming the branch, never a silent
+/// empty value — the caller asked for this branch. A body that
+/// names another branch is a server error too: branch names are
+/// case-sensitive, so the comparison is exact.
+fn parse_branch(
+    body: &str,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> Result<GiteaBranch, GeectlError> {
+    let parsed: GiteaBranch = serde_json::from_str(body).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected Gitea branch response for {owner}/{repo}@{branch}: {err}"),
+        )
+    })?;
+    if parsed.name != branch {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected Gitea branch response for {owner}/{repo}@{branch}: the server answered for {}",
+                parsed.name
             ),
         ));
     }
@@ -1070,16 +1457,19 @@ mod tests {
     /// repos this helper is used for; repos whose default is
     /// `master` use `repo_json_branch` instead.
     fn repo_json(owner: &str, name: &str, parent: Option<(&str, &str)>) -> String {
-        repo_json_branch(owner, name, parent, "factory")
+        repo_json_branch(owner, name, parent, "factory", false)
     }
 
     /// Like `repo_json`, with the default branch given: the
     /// descent3 fork and the `_ObsPrj` fork inherit `master`.
+    /// The privacy flag is given too: the create tests answer a
+    /// private create with a private repo.
     fn repo_json_branch(
         owner: &str,
         name: &str,
         parent: Option<(&str, &str)>,
         default_branch: &str,
+        private: bool,
     ) -> String {
         let parent_json = match parent {
             Some((parent_owner, parent_name)) => format!(
@@ -1089,8 +1479,37 @@ mod tests {
         };
         let is_fork = parent.is_some();
         format!(
-            r#"{{"id": 7, "owner": {{"login": "{owner}", "future_field": 1}}, "name": "{name}", "full_name": "{owner}/{name}", "description": "", "empty": true, "private": false, "fork": {is_fork}, "parent": {parent_json}, "future_field": "tolerated", "html_url": "{BASE}/{owner}/{name}", "ssh_url": "gitea@src.opensuse.org:{owner}/{name}.git", "clone_url": "{BASE}/{owner}/{name}.git", "default_branch": "{default_branch}", "created_at": "2026-11-21T00:00:00Z"}}"#
+            r#"{{"id": 7, "owner": {{"login": "{owner}", "future_field": 1}}, "name": "{name}", "full_name": "{owner}/{name}", "description": "", "empty": true, "private": {private}, "fork": {is_fork}, "parent": {parent_json}, "future_field": "tolerated", "html_url": "{BASE}/{owner}/{name}", "ssh_url": "gitea@src.opensuse.org:{owner}/{name}.git", "clone_url": "{BASE}/{owner}/{name}.git", "default_branch": "{default_branch}", "created_at": "2026-11-21T00:00:00Z"}}"#
         )
+    }
+
+    /// A repository-list JSON body out of repo JSON bodies: the
+    /// array shape the list endpoints answer.
+    fn repo_list_json(repos: &[String]) -> String {
+        format!("[{}]", repos.join(","))
+    }
+
+    /// Fifty repos under one owner, named `repo-00` … — the full
+    /// page the pagination tests fill.
+    fn fifty_repos(owner: &str) -> Vec<String> {
+        (0..50)
+            .map(|n| repo_json(owner, &format!("repo-{n:02}"), None))
+            .collect()
+    }
+
+    /// A branch JSON body, shaped like Gitea 1.24.7 answers, with
+    /// an unknown field (`future_field`) to prove it is ignored.
+    /// The commit id is a real-looking SHA; `pool/systemd`'s real
+    /// branches are `factory`, `slfo-main`, `slfo-1.0` …
+    fn branch_json(name: &str, sha: &str, message: &str, protected: bool) -> String {
+        format!(
+            r#"{{"name": "{name}", "commit": {{"id": "{sha}", "message": "{message}", "url": "{BASE}/api/v1/repos/pool/systemd/git/commits/{sha}", "future_field": 1}}, "protected": {protected}, "future_field": "tolerated"}}"#
+        )
+    }
+
+    /// A branch-list JSON body out of branch JSON bodies.
+    fn branch_list_json(branches: &[String]) -> String {
+        format!("[{}]", branches.join(","))
     }
 
     /// A package meta with a scmsync URL (and, when `devel` is set,
@@ -1310,6 +1729,597 @@ mod tests {
         );
         let repo = client(&http).repo_get("pool", "systemd").unwrap();
         assert_eq!(repo.full_name, "Pool/systemd");
+    }
+
+    #[test]
+    fn repo_list_own_uses_user_repos_and_paginates() {
+        // Page 1 full (50 repos) fetches page 2; page 2 short (1
+        // repo) ends the list. Order is the server's order.
+        let page1 = fifty_repos("geectl");
+        let page2 = vec![repo_json("geectl", "repo-50", None)];
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user/repos?page=1&limit=50",
+                &repo_list_json(&page1),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/user/repos?page=2&limit=50",
+                &repo_list_json(&page2),
+            );
+        let repos = client(&http).repo_list(None, None).unwrap();
+        assert_eq!(repos.len(), 51);
+        assert_eq!(repos[0].full_name, "geectl/repo-00");
+        assert_eq!(repos[50].full_name, "geectl/repo-50");
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                (
+                    "https://src.opensuse.org/api/v1/user/repos?page=1&limit=50".to_string(),
+                    true
+                ),
+                (
+                    "https://src.opensuse.org/api/v1/user/repos?page=2&limit=50".to_string(),
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn repo_list_org_and_user_forms_and_both() {
+        // The org form: pool's repos, the real mirror org.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/orgs/pool/repos?page=1&limit=50",
+            &repo_list_json(&[repo_json("pool", "systemd", None)]),
+        );
+        let repos = client(&http).repo_list(None, Some("pool")).unwrap();
+        assert_eq!(
+            repos
+                .iter()
+                .map(|r| r.full_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pool/systemd"]
+        );
+        // The user form.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/users/fbui/repos?page=1&limit=50",
+            &repo_list_json(&[repo_json("fbui", "systemd", Some(("pool", "systemd")))]),
+        );
+        let repos = client(&http).repo_list(Some("fbui"), None).unwrap();
+        assert_eq!(
+            repos
+                .iter()
+                .map(|r| r.full_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fbui/systemd"]
+        );
+        // Both: the user's repos first, then the org's — osc's
+        // `repo list --user --org` order (osc
+        // `behave/features/git-repo-list.feature`, "List repos
+        // owned by a user and an organization").
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/users/Admin/repos?page=1&limit=50",
+                &repo_list_json(&[repo_json(
+                    "Admin",
+                    "test-GitPkgA",
+                    Some(("pool", "test-GitPkgA")),
+                )]),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/orgs/pool/repos?page=1&limit=50",
+                &repo_list_json(&[
+                    repo_json("pool", "new_package", None),
+                    repo_json("pool", "test-GitPkgA", None),
+                ]),
+            );
+        let repos = client(&http)
+            .repo_list(Some("Admin"), Some("pool"))
+            .unwrap();
+        assert_eq!(
+            repos
+                .iter()
+                .map(|r| r.full_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Admin/test-GitPkgA",
+                "pool/new_package",
+                "pool/test-GitPkgA"
+            ]
+        );
+    }
+
+    #[test]
+    fn repo_list_both_form_dedupes_the_same_account() {
+        // An org is a user in Gitea: naming the same account as
+        // owner and org lists the same repos twice, so the both
+        // form returns each repo once.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/users/pool/repos?page=1&limit=50",
+                &repo_list_json(&[repo_json("pool", "systemd", None)]),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/orgs/pool/repos?page=1&limit=50",
+                &repo_list_json(&[repo_json("pool", "systemd", None)]),
+            );
+        let repos = client(&http).repo_list(Some("pool"), Some("pool")).unwrap();
+        assert_eq!(
+            repos
+                .iter()
+                .map(|r| r.full_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pool/systemd"]
+        );
+    }
+
+    #[test]
+    fn repo_list_bound_fails_instead_of_truncating() {
+        // Ten full pages (500 repos) and page 11 still has one
+        // more: the call fails naming the scope, instead
+        // of silently returning the first 500.
+        let page = repo_list_json(&fifty_repos("pool"));
+        let mut http = FakeHttp::new();
+        for n in 1..=10 {
+            http = http.with_get(
+                &format!("https://src.opensuse.org/api/v1/orgs/pool/repos?page={n}&limit=50"),
+                &page,
+            );
+        }
+        http = http.with_get(
+            "https://src.opensuse.org/api/v1/orgs/pool/repos?page=11&limit=50",
+            &repo_list_json(&[repo_json("pool", "repo-500", None)]),
+        );
+        let err = client(&http).repo_list(None, Some("pool")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("organization pool"),
+            "the bound error must name the organization; got {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("the list is bounded at 500 entries"),
+            "an org list has no narrower filter, so the error must say the list is bounded; got {err}"
+        );
+        assert!(
+            !err.to_string().contains("narrow"),
+            "the error must not promise a narrower scope that does not exist; got {err}"
+        );
+    }
+
+    #[test]
+    fn repo_list_own_bound_names_the_narrower_form() {
+        // The own form is the one list that CAN be narrowed: the
+        // token owner's repos are reachable one account at a time,
+        // so the bound error names that remedy instead of claiming
+        // the list is merely bounded.
+        let page = repo_list_json(&fifty_repos("geectl"));
+        let mut http = FakeHttp::new();
+        for n in 1..=10 {
+            http = http.with_get(
+                &format!("https://src.opensuse.org/api/v1/user/repos?page={n}&limit=50"),
+                &page,
+            );
+        }
+        http = http.with_get(
+            "https://src.opensuse.org/api/v1/user/repos?page=11&limit=50",
+            &repo_list_json(&[repo_json("geectl", "repo-500", None)]),
+        );
+        let err = client(&http).repo_list(None, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .contains("list a single user or organization instead"),
+            "the own-form bound error must name the narrower form; got {err}"
+        );
+    }
+
+    #[test]
+    fn repo_list_exactly_at_the_bound_is_returned() {
+        // Ten full pages (500 repos) and page 11 is empty: the
+        // list is exactly at the bound, not past it, so it is
+        // returned — the page-11 read is what proves it.
+        let page = repo_list_json(&fifty_repos("pool"));
+        let mut http = FakeHttp::new();
+        for n in 1..=10 {
+            http = http.with_get(
+                &format!("https://src.opensuse.org/api/v1/orgs/pool/repos?page={n}&limit=50"),
+                &page,
+            );
+        }
+        http = http.with_get(
+            "https://src.opensuse.org/api/v1/orgs/pool/repos?page=11&limit=50",
+            "[]",
+        );
+        let repos = client(&http).repo_list(None, Some("pool")).unwrap();
+        assert_eq!(repos.len(), 500);
+    }
+
+    #[test]
+    fn repo_list_validates_names_before_any_call() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .repo_list(Some("up/stream"), None)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = client(&http).repo_list(None, Some("")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn repo_create_posts_and_parses_the_created_repo() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/user/repos",
+            &repo_json("geectl", "new-package", None),
+        );
+        let options = RepoCreateOptions {
+            private: false,
+            description: Some("sources for a new package".to_string()),
+            default_branch: Some("factory".to_string()),
+        };
+        let created = client(&http)
+            .repo_create("new-package", &options, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run create returns the repo");
+        assert_eq!(created.full_name, "geectl/new-package");
+        assert_eq!(created.default_branch, "factory");
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/user/repos".to_string(),
+                r#"{"name":"new-package","private":false,"description":"sources for a new package","default_branch":"factory"}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn repo_create_posts_the_default_options_body() {
+        // Default options: only the name and the privacy flag are
+        // sent — `description` and `default_branch` are omitted
+        // when unset, never sent as null.
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/user/repos",
+            &repo_json("geectl", "new-package", None),
+        );
+        let created = client(&http)
+            .repo_create(
+                "new-package",
+                &RepoCreateOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run create returns the repo");
+        assert_eq!(created.full_name, "geectl/new-package");
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/user/repos".to_string(),
+                r#"{"name":"new-package","private":false}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn repo_create_verifies_the_requested_options() {
+        // A private create answered with a private repo and the
+        // requested default branch succeeds.
+        let options = RepoCreateOptions {
+            private: true,
+            description: None,
+            default_branch: Some("factory".to_string()),
+        };
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/user/repos",
+            &repo_json_branch("geectl", "new-package", None, "factory", true),
+        );
+        let created = client(&http)
+            .repo_create("new-package", &options, &DryRun::new(false))
+            .unwrap()
+            .expect("a matching create returns the repo");
+        assert!(created.private);
+        assert_eq!(created.default_branch, "factory");
+        // A public answer to a private create is a server error,
+        // not a success.
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/user/repos",
+            &repo_json_branch("geectl", "new-package", None, "factory", false),
+        );
+        let err = client(&http)
+            .repo_create("new-package", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        // And a different default branch than requested.
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/user/repos",
+            &repo_json_branch("geectl", "new-package", None, "main", true),
+        );
+        let err = client(&http)
+            .repo_create("new-package", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn repo_create_dry_run_records_plan_and_creates_nothing() {
+        let http = FakeHttp::new();
+        let dry_run = DryRun::new(true);
+        let result = client(&http)
+            .repo_create("new-package", &RepoCreateOptions::default(), &dry_run)
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: create repository new-package".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+        // A private create names the privacy in the plan.
+        let options = RepoCreateOptions {
+            private: true,
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(true);
+        let result = client(&http)
+            .repo_create("new-package", &options, &dry_run)
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: create repository new-package (private)".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn repo_create_conflict_is_already_exists() {
+        let http = FakeHttp::new().with_post_error(
+            "https://src.opensuse.org/api/v1/user/repos",
+            ErrorKind::AlreadyExists,
+        );
+        let err = client(&http)
+            .repo_create(
+                "systemd",
+                &RepoCreateOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn repo_create_response_naming_another_repo_is_a_server_error() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/user/repos",
+            &repo_json("geectl", "other-name", None),
+        );
+        let err = client(&http)
+            .repo_create(
+                "new-package",
+                &RepoCreateOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn repo_create_validates_names_before_any_call() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .repo_create(
+                "up/stream",
+                &RepoCreateOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let options = RepoCreateOptions {
+            default_branch: Some("a#b".to_string()),
+            ..Default::default()
+        };
+        let err = client(&http)
+            .repo_create("new-package", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_list_parses_branches_and_paginates() {
+        // pool/systemd's real branches: factory, slfo-main,
+        // slfo-1.0 … — the first page is short, so the list ends
+        // after one page.
+        let sha = "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa";
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches?page=1&limit=50",
+            &branch_list_json(&[
+                branch_json("factory", sha, "OBS bridge sync", false),
+                branch_json("slfo-main", sha, "OBS bridge sync", true),
+                branch_json("slfo-1.0", sha, "OBS bridge sync", false),
+            ]),
+        );
+        let branches = client(&http).branch_list("pool", "systemd").unwrap();
+        assert_eq!(
+            branches.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            vec!["factory", "slfo-main", "slfo-1.0"]
+        );
+        assert_eq!(branches[0].commit.id, sha);
+        assert_eq!(branches[0].commit.message, "OBS bridge sync");
+        assert!(!branches[0].protected);
+        assert!(branches[1].protected);
+    }
+
+    #[test]
+    fn branch_list_bound_fails_instead_of_truncating() {
+        let page = branch_list_json(
+            &(0..50)
+                .map(|n| {
+                    branch_json(
+                        &format!("branch-{n:02}"),
+                        "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa",
+                        "x",
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut http = FakeHttp::new();
+        for n in 1..=10 {
+            http = http.with_get(
+                &format!(
+                    "https://src.opensuse.org/api/v1/repos/pool/systemd/branches?page={n}&limit=50"
+                ),
+                &page,
+            );
+        }
+        http = http.with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches?page=11&limit=50",
+            &branch_list_json(&[branch_json(
+                "branch-500",
+                "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa",
+                "x",
+                false,
+            )]),
+        );
+        let err = client(&http).branch_list("pool", "systemd").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("pool/systemd"),
+            "the bound error must name the repo; got {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("the list is bounded at 500 entries"),
+            "a branch list has no narrower filter, so the error must say the list is bounded; got {err}"
+        );
+        assert!(
+            !err.to_string().contains("narrow"),
+            "the error must not promise a narrower scope that does not exist; got {err}"
+        );
+    }
+
+    #[test]
+    fn branch_list_exactly_at_the_bound_is_returned() {
+        // Ten full pages (500 branches) and page 11 is empty: the
+        // list is exactly at the bound, so it is returned.
+        let page = branch_list_json(
+            &(0..50)
+                .map(|n| {
+                    branch_json(
+                        &format!("branch-{n:02}"),
+                        "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa",
+                        "x",
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut http = FakeHttp::new();
+        for n in 1..=10 {
+            http = http.with_get(
+                &format!(
+                    "https://src.opensuse.org/api/v1/repos/pool/systemd/branches?page={n}&limit=50"
+                ),
+                &page,
+            );
+        }
+        http = http.with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches?page=11&limit=50",
+            "[]",
+        );
+        let branches = client(&http).branch_list("pool", "systemd").unwrap();
+        assert_eq!(branches.len(), 500);
+    }
+
+    #[test]
+    fn branch_get_parses_a_branch() {
+        let sha = "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa";
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches/factory",
+            &branch_json("factory", sha, "OBS bridge sync", false),
+        );
+        let branch = client(&http)
+            .branch_get("pool", "systemd", "factory")
+            .unwrap();
+        assert_eq!(branch.name, "factory");
+        assert_eq!(branch.commit.id, sha);
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/branches/factory".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn branch_get_encodes_a_slashed_branch_name() {
+        let sha = "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa";
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches/feature%2Fx",
+            &branch_json("feature/x", sha, "work in progress", false),
+        );
+        let branch = client(&http)
+            .branch_get("pool", "systemd", "feature/x")
+            .unwrap();
+        assert_eq!(branch.name, "feature/x");
+        assert_eq!(branch.commit.id, sha);
+    }
+
+    #[test]
+    fn branch_get_missing_branch_is_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches/leap-16.0",
+            ErrorKind::NotFound,
+        );
+        // The real layout: pool/systemd has no leap-16.0 branch —
+        // it lives on openSUSE/Leap.
+        let err = client(&http)
+            .branch_get("pool", "systemd", "leap-16.0")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn branch_get_validates_names_before_any_call() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .branch_get("pool", "systemd", "a#b")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = client(&http)
+            .branch_get("up/stream", "systemd", "factory")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_get_rejects_a_response_for_another_branch() {
+        let sha = "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa";
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches/factory",
+            &branch_json("slfo-main", sha, "OBS bridge sync", false),
+        );
+        let err = client(&http)
+            .branch_get("pool", "systemd", "factory")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn branch_head_returns_the_commit_id() {
+        let sha = "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa";
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches/factory",
+            &branch_json("factory", sha, "OBS bridge sync", false),
+        );
+        let head = client(&http)
+            .branch_head("pool", "systemd", "factory")
+            .unwrap();
+        assert_eq!(head, sha);
     }
 
     #[test]
@@ -1931,8 +2941,13 @@ mod tests {
     fn branch_forks_a_package() {
         // The real per-package scmsync case: `games/descent3`
         // carries `jengelh/descent3#master` and no `<devel>`.
-        let fork_body =
-            repo_json_branch("fbui", "descent3", Some(("jengelh", "descent3")), "master");
+        let fork_body = repo_json_branch(
+            "fbui",
+            "descent3",
+            Some(("jengelh", "descent3")),
+            "master",
+            false,
+        );
         let gitea_http = fork_fixture(
             FakeHttp::new().with_get(
                 "https://src.opensuse.org/api/v1/user",
@@ -2200,8 +3215,13 @@ mod tests {
         // — the fork's scmsync keeps the base verbatim. The Gitea
         // cans use the `:443` base too: the client calls it.
         let base = "https://src.opensuse.org:443";
-        let fork_body =
-            repo_json_branch("fbui", "descent3", Some(("jengelh", "descent3")), "master");
+        let fork_body = repo_json_branch(
+            "fbui",
+            "descent3",
+            Some(("jengelh", "descent3")),
+            "master",
+            false,
+        );
         let gitea_http = FakeHttp::new()
             .with_get(&format!("{base}/api/v1/user"), r#"{"login": "fbui"}"#)
             .with_get_error_sequence(
@@ -2318,6 +3338,7 @@ mod tests {
             "git-quick-stats",
             Some(("adamm", "git-quick-stats")),
             "main",
+            false,
         );
         let gitea_http = fork_fixture(
             FakeHttp::new()
@@ -2327,7 +3348,7 @@ mod tests {
                 )
                 .with_get(
                     "https://src.opensuse.org/api/v1/repos/adamm/git-quick-stats",
-                    &repo_json_branch("adamm", "git-quick-stats", None, "main"),
+                    &repo_json_branch("adamm", "git-quick-stats", None, "main", false),
                 ),
             "adamm",
             "git-quick-stats",
@@ -2424,7 +3445,13 @@ mod tests {
         // The real project-level scmsync: the
         // `network:messaging:xmpp` project carries
         // `xmpp/_ObsPrj.git#master`.
-        let fork_body = repo_json_branch("fbui", "_ObsPrj", Some(("xmpp", "_ObsPrj")), "master");
+        let fork_body = repo_json_branch(
+            "fbui",
+            "_ObsPrj",
+            Some(("xmpp", "_ObsPrj")),
+            "master",
+            false,
+        );
         let gitea_http = fork_fixture(
             FakeHttp::new().with_get(
                 "https://src.opensuse.org/api/v1/user",
