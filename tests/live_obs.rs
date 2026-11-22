@@ -499,31 +499,6 @@ fn response_is_status_ok(body: &str) -> bool {
     })
 }
 
-/// Change the state of one review on a request, as the admin, by
-/// driving the raw `changereviewstate` command: the library has no
-/// review-state operation in this batch, so this is harness-only
-/// setup for the readback test, not a library operation. The comment
-/// travels as the POST body, the same form the change-state command
-/// uses.
-fn change_review_state(base: &str, id: &str, newstate: &str, by_user: &str) {
-    let http = Box::leak(Box::new(
-        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
-    ));
-    let body = http
-        .post_text(
-            &format!(
-                "{base}/request/{id}?cmd=changereviewstate&newstate={newstate}&by_user={by_user}"
-            ),
-            "accepted by the geectl live test",
-            &live_credentials(),
-        )
-        .expect("change the review state on the live instance");
-    assert!(
-        response_is_status_ok(&body),
-        "changing the review state of request {id} did not return <status code=\"ok\"/>; body: {body}"
-    );
-}
-
 /// True when the public directory listing for `path` (`project`, or
 /// `project/package`) answers 200. A 404 reads as false (the path is
 /// gone); anything else is a failure, not an answer. The reads are
@@ -1781,10 +1756,7 @@ fn live_add_review_marks_the_request_for_review() {
 
 /// A review that was acted on reads back with its history: the
 /// parser must read the review's `<history>` children, not refuse
-/// the whole request. The library has no review-state operation in
-/// this batch, so the harness drives the raw `changereviewstate`
-/// command to put the review into the accepted state the parser
-/// must then read back — the test's subject is the readback, and the
+/// the whole request. The test's subject is the readback, and the
 /// state change is only its setup.
 #[test]
 fn live_review_with_history_reads_back() {
@@ -1799,7 +1771,15 @@ fn live_review_with_history_reads_back() {
     client
         .add_review(&id, &target, "please review", &dry)
         .expect("ask Admin to review the request on the live instance");
-    change_review_state(&base, &id, "accepted", "Admin");
+    client
+        .change_review_state(
+            &id,
+            ReviewState::Accepted,
+            &target,
+            "accepted by the geectl live test",
+            &dry,
+        )
+        .expect("change the review state on the live instance");
     let request = client
         .show_request(&id)
         .expect("read the reviewed request back from the server");

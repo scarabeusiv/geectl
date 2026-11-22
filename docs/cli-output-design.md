@@ -85,7 +85,7 @@ what "one coherent channel" means.
   endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:3196` vs
   `decision: read via /source (authenticated)`; test `src/http.rs:3279`), and the accept-state check
   before a retried `change_state` (`decision: request 1398977 still new, re-issuing
-  accepted`; test `src/obs/request.rs:5652`).
+  accepted`; test `src/obs/request.rs:5901`).
 - **Service status lines**: `service_state <project>/<package>: <code>` and
   `list_services <project>/<package>: <n> service(s)` — emitted by the services
   reads, unprefixed (the verb names the operation, as with the startup line;

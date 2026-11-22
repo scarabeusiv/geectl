@@ -3130,6 +3130,113 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// Change the state of one review on submit request `id`
+    /// (`POST /request/:id?cmd=changereviewstate&newstate=<state>`
+    /// with the `by_*` target), with `comment` as the message left
+    /// with the change. An agent changes a review's state to answer
+    /// a review it was asked for — accepting it or declining it —
+    /// or to reopen it to `new`. Requires credentials; without them
+    /// the call fails loudly before any request. Takes the caller's
+    /// [`DryRun`]: in dry-run the change is recorded in the plan and
+    /// nothing changes, so a dry-run caller cannot mutate the server
+    /// by invoking this directly.
+    ///
+    /// Semantics, verified against the OBS API server
+    /// (`BsRequest#change_review_state`,
+    /// `RequestController#request_command_changereviewstate`) and the
+    /// live API — not taken from anywhere else:
+    /// - The server accepts `new`, `accepted`, `declined` and
+    ///   `superseded` as the new state. `obsoleted` is refused by
+    ///   the server, so it is refused here: a review is obsoleted
+    ///   by removing its reviewer, not by changing its state.
+    ///   `superseded` is refused here as well: superseding a submit
+    ///   request needs a replacement id, and
+    ///   [`ObsClient::supersede_request`] is the path that carries
+    ///   it.
+    /// - The server does not pre-check here, and neither does the
+    ///   library: the server stays the authority on the transition.
+    ///   A permission refusal is 403; a state-precondition refusal
+    ///   is 404 (`request_not_modifiable`). The request must be in
+    ///   `review`, or in `new`/`declined` moving the review back to
+    ///   `new`; anything else is refused by the server. Moving a
+    ///   review back to `new` from `declined` is admin-only: the
+    ///   permission check gates other actors to `review`/`new`.
+    /// - The comment travels as the request body, as plain text: the
+    ///   server sets the review's reason to the comment verbatim,
+    ///   empty included — an approval without a message is still an
+    ///   approval.
+    /// - Re-issuing the identical change — same state, same acting
+    ///   user, same reason — is a server no-op success, so a change
+    ///   that already landed is never an error.
+    /// - Success is the `<status code="ok"/>` body: any other body
+    ///   is a server error, never success.
+    pub fn change_review_state(
+        &self,
+        id: &str,
+        new_state: ReviewState,
+        target: &ReviewTarget,
+        comment: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        let id = validate_request_id(id)?;
+        let state_name = match new_state {
+            ReviewState::New | ReviewState::Accepted | ReviewState::Declined => new_state.as_str(),
+            ReviewState::Superseded => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "superseding a submit request needs a replacement id; use supersede_request",
+                ));
+            }
+            ReviewState::Obsoleted => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "a review is obsoleted by removing its reviewer, not by changing its state",
+                ));
+            }
+        };
+        if !dry_run.allow(&format!(
+            "change the state of the review by {} on submit request {id} to {state_name}",
+            target.describe()
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot change the state of a review on a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> =
+            vec![("cmd", "changereviewstate"), ("newstate", state_name)];
+        if let Some(by_user) = &target.by_user {
+            query.push(("by_user", by_user));
+        }
+        if let Some(by_group) = &target.by_group {
+            query.push(("by_group", by_group));
+        }
+        if let Some(by_project) = &target.by_project {
+            query.push(("by_project", by_project));
+        }
+        if let Some(by_package) = &target.by_package {
+            query.push(("by_package", by_package));
+        }
+        let url = build_url(&self.base, &["request", &id.to_string()], &query);
+        // The comment travels as the request body, as plain text:
+        // the server's `RequestController#request_command` takes
+        // `request.raw_post` as the comment (see
+        // `supersede_request`), so the body is the comment verbatim
+        // and its content type is its actual type (`text/plain`).
+        let body = self.http.post_text(&url, comment, &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS changereviewstate response for submit request {id}"),
+            ))
+        }
+    }
+
     /// List the comments on submit request `id` (`GET
     /// /comments/request/:id`): who said what, when, and which
     /// comment each reply answers. The list covers the comments on
@@ -5259,6 +5366,148 @@ description</description>
         let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
         let err = obs
             .add_review("42", &target, "please review", &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn change_review_state_accept_posts_changereviewstate_with_the_comment() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=changereviewstate&newstate=accepted&by_user=Admin",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        obs.change_review_state(
+            "42",
+            ReviewState::Accepted,
+            &target,
+            "accepted by the geectl live test",
+            &dry,
+        )
+        .expect("accept posts");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0,
+            "https://api.opensuse.org/request/42?cmd=changereviewstate&newstate=accepted&by_user=Admin"
+        );
+        assert_eq!(calls[0].1, "accepted by the geectl live test");
+        assert!(calls[0].2, "the change is credentialed");
+    }
+
+    #[test]
+    fn change_review_state_reopen_posts_newstate_new() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=changereviewstate&newstate=new&by_user=Admin",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        obs.change_review_state(
+            "42",
+            ReviewState::New,
+            &target,
+            "reopening for another look",
+            &dry,
+        )
+        .expect("reopen posts");
+        assert_eq!(
+            http.post_calls()[0].0,
+            "https://api.opensuse.org/request/42?cmd=changereviewstate&newstate=new&by_user=Admin"
+        );
+    }
+
+    #[test]
+    fn change_review_state_by_group_names_the_group() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=changereviewstate&newstate=declined&by_group=reviewers",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(None, Some("reviewers"), None, None).unwrap();
+        obs.change_review_state("42", ReviewState::Declined, &target, "not this way", &dry)
+            .expect("decline posts");
+        assert_eq!(
+            http.post_calls()[0].0,
+            "https://api.opensuse.org/request/42?cmd=changereviewstate&newstate=declined&by_group=reviewers"
+        );
+    }
+
+    #[test]
+    fn change_review_state_by_project_and_package_names_both() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=changereviewstate&newstate=accepted&by_project=openSUSE%3AFactory&by_package=foo",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(None, None, Some("openSUSE:Factory"), Some("foo")).unwrap();
+        obs.change_review_state("42", ReviewState::Accepted, &target, "looks good", &dry)
+            .expect("project/package change posts");
+        assert_eq!(
+            http.post_calls()[0].0,
+            "https://api.opensuse.org/request/42?cmd=changereviewstate&newstate=accepted&by_project=openSUSE%3AFactory&by_package=foo"
+        );
+    }
+
+    #[test]
+    fn change_review_state_refuses_obsoleted_and_superseded() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        for state in [ReviewState::Obsoleted, ReviewState::Superseded] {
+            let err = obs
+                .change_review_state("42", state, &target, "nope", &dry)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn change_review_state_dry_run_records_the_plan_and_posts_nothing() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        obs.change_review_state("42", ReviewState::Accepted, &target, "looks good", &dry)
+            .expect("dry-run change records");
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: change the state of the review by user Admin on submit request 42 to accepted".to_string()]
+        );
+    }
+
+    #[test]
+    fn change_review_state_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        let err = obs
+            .change_review_state("42", ReviewState::Accepted, &target, "looks good", &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn change_review_state_unexpected_response_is_error() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/request/42?cmd=changereviewstate&newstate=accepted&by_user=Admin",
+            "<status code=\"not_found\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let target = ReviewTarget::new(Some("Admin"), None, None, None).unwrap();
+        let err = obs
+            .change_review_state("42", ReviewState::Accepted, &target, "looks good", &dry)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
