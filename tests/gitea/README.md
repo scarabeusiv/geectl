@@ -73,6 +73,14 @@ server state through geectl's own HTTP client, with geectl's own
   shows the creation)
 - `GET /api/v1/user/repos` lists it
 - a missing repository maps to geectl's `NotFound`
+- phase 2 (`repo_list`, `repo_create`, `branch_list`/`branch_get`/
+  `branch_head`) runs through the typed operations: the list forms
+  (org, user, both), the create round-trip and collision, and the
+  branch reads against commits the contents API created — including
+  a slashed branch name through the encoded segment
+
+Phase 2 adds no token scope: repo list and branch reads are
+`read:repository`, repo create is `write:repository` + `write:user`.
 
 The instance serves plain HTTP on localhost. That is the single
 sanctioned exception to geectl's https-only rule (see `tests/gitea.rs`):

@@ -129,7 +129,9 @@ echo "Gitea is up."
 # alone returns 403.) Phase 1 of the Gitea ops (#20) added
 # `write:organization`: the cross-org fork-refusal live test creates
 # an organization, and the token names the scope the server demands
-# (403 otherwise). Scopes are recorded per phase here — do not widen
+# (403 otherwise). Phase 2 adds no scope: repo list and branch reads
+# are `read:repository`, repo create is `write:repository` +
+# `write:user`. Scopes are recorded per phase here — do not widen
 # them silently.
 echo "Creating the test user and token ..."
 $CONTAINER exec -u git "$CONTAINER_NAME" \
