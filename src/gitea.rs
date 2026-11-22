@@ -16,8 +16,8 @@
 //! test image (1.24.7, `tests/gitea/provision.sh`) without
 //! breaking. Only the fields each operation needs are modelled.
 //! The `HttpClient` trait is reused as-is (`get_with`,
-//! `post_json_with`, `delete`); the Gitea client adds no transport of
-//! its own. Gitea answers fork creation with 202 and the created
+//! `post_json_with`, `patch_json_with`, `delete`); the Gitea client
+//! adds no transport of its own. Gitea answers fork creation with 202 and the created
 //! fork is NOT verified by the response alone — the fork is
 //! re-read and its `parent` checked before success is reported.
 //!
@@ -380,6 +380,55 @@ impl GiteaReviewEvent {
     }
 }
 
+/// The merge style a `pr_merge` sends as `Do` (`merge` / `rebase` /
+/// `rebase-merge` / `squash` / `fast-forward-only` on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GiteaMergeMethod {
+    /// Merge commit.
+    Merge,
+    /// Rebase the head onto the base, no merge commit.
+    Rebase,
+    /// Rebase the head onto the base, then merge.
+    RebaseMerge,
+    /// Squash the head into one commit.
+    Squash,
+    /// Merge only when the head is a fast-forward of the base.
+    FastForwardOnly,
+}
+
+impl GiteaMergeMethod {
+    /// The server's spelling of this method.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GiteaMergeMethod::Merge => "merge",
+            GiteaMergeMethod::Rebase => "rebase",
+            GiteaMergeMethod::RebaseMerge => "rebase-merge",
+            GiteaMergeMethod::Squash => "squash",
+            GiteaMergeMethod::FastForwardOnly => "fast-forward-only",
+        }
+    }
+}
+
+impl std::str::FromStr for GiteaMergeMethod {
+    type Err = GeectlError;
+
+    /// Parse the lowercase spelling (`merge`, `rebase`, …).
+    /// Anything else is an invalid input naming the method.
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "merge" => Ok(GiteaMergeMethod::Merge),
+            "rebase" => Ok(GiteaMergeMethod::Rebase),
+            "rebase-merge" => Ok(GiteaMergeMethod::RebaseMerge),
+            "squash" => Ok(GiteaMergeMethod::Squash),
+            "fast-forward-only" => Ok(GiteaMergeMethod::FastForwardOnly),
+            _ => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("unknown Gitea merge method: {input:?}"),
+            )),
+        }
+    }
+}
+
 /// The body of a review-event POST: the event, plus the comment
 /// when one was given. The body is omitted when empty: the server
 /// takes an event without one.
@@ -402,6 +451,25 @@ struct CancelReviewersRequest {
 #[derive(Serialize)]
 struct IssueCommentRequest {
     body: String,
+}
+
+/// The body of a merge POST: the merge style and the merge commit
+/// message. The style is always sent: Gitea requires `Do` — an
+/// empty body answers 422 `[Do]: Required` — so an unset method
+/// sends `merge`, the server default style. The message is
+/// omitted when unset: the server applies its default message.
+#[derive(Serialize)]
+struct MergePullRequestRequest {
+    #[serde(rename = "Do")]
+    do_: &'static str,
+    #[serde(rename = "MergeMessageField", skip_serializing_if = "Option::is_none")]
+    merge_message_field: Option<String>,
+}
+
+/// The body of an issue PATCH: the state the issue moves to.
+#[derive(Serialize)]
+struct EditIssueRequest {
+    state: &'static str,
 }
 
 /// One comment on a pull request's issue thread: the issue
@@ -2277,6 +2345,149 @@ impl<'a> GiteaClient<'a> {
         );
         self.http.delete_json_with(&url, &body, &self.credentials)?;
         Ok(Some(cancelled))
+    }
+
+    /// Merge a pull request (`POST
+    /// /api/v1/repos/{owner}/{repo}/pulls/{number}/merge`).
+    /// `method` selects the merge style; unset sends `merge`, the
+    /// server default style — Gitea requires `Do`, an empty body
+    /// answers 422. `message` becomes the merge commit message.
+    /// The server answers 200 with an empty body on success, so
+    /// there is no merged record to return. No mergeability
+    /// pre-check: the flag is advisory, so the server's answer
+    /// decides. DryRun-guarded like
+    /// `pr_review`: the guard runs before the POST, and the result
+    /// is `None` in dry-run.
+    pub fn pr_merge(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        method: Option<GiteaMergeMethod>,
+        message: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<Option<()>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        let plan = match method {
+            Some(method) => format!(
+                "merge pull request {owner}/{repo}#{number} with {}",
+                method.as_str()
+            ),
+            None => format!("merge pull request {owner}/{repo}#{number}"),
+        };
+        if !dry_run.allow(&plan) {
+            return Ok(None);
+        }
+        let request = MergePullRequestRequest {
+            do_: method.map(|method| method.as_str()).unwrap_or("merge"),
+            merge_message_field: message
+                .filter(|message| !message.is_empty())
+                .map(str::to_string),
+        };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea merge request: {err}"),
+            )
+        })?;
+        let url = build_url(
+            &self.base,
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "pulls",
+                &number.to_string(),
+                "merge",
+            ],
+            &[],
+        );
+        self.http.post_json_with(&url, &body, &self.credentials)?;
+        Ok(Some(()))
+    }
+
+    /// Close a pull request (`PATCH
+    /// /api/v1/repos/{owner}/{repo}/issues/{number}` with `{state:
+    /// closed}`) and return the edited issue. A closed, unmerged
+    /// pull request reads as `closed` on the unified surface:
+    /// Gitea has no declined or withdrawn state. DryRun-guarded
+    /// like `pr_review`: the guard runs before the PATCH, and the
+    /// result is `None` in dry-run.
+    pub fn pr_close(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaIssue>, GeectlError> {
+        self.edit_issue_state(owner, repo, number, "closed", "close", dry_run)
+    }
+
+    /// Reopen a pull request (`PATCH
+    /// /api/v1/repos/{owner}/{repo}/issues/{number}` with `{state:
+    /// open}`) and return the edited issue. DryRun-guarded like
+    /// `pr_review`: the guard runs before the PATCH, and the result
+    /// is `None` in dry-run.
+    pub fn pr_reopen(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaIssue>, GeectlError> {
+        self.edit_issue_state(owner, repo, number, "open", "reopen", dry_run)
+    }
+
+    /// PATCH an issue's state and return the edited issue.
+    fn edit_issue_state(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        state: &'static str,
+        verb: &'static str,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaIssue>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        if !dry_run.allow(&format!("{verb} pull request {owner}/{repo}#{number}")) {
+            return Ok(None);
+        }
+        let request = EditIssueRequest { state };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea edit-issue request: {err}"),
+            )
+        })?;
+        let url = build_url(
+            &self.base,
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "issues",
+                &number.to_string(),
+            ],
+            &[],
+        );
+        let response = self.http.patch_json_with(&url, &body, &self.credentials)?;
+        let issue: GiteaIssue = serde_json::from_str(&response).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea issue response for pull request {owner}/{repo}#{number}: {err}"
+                ),
+            )
+        })?;
+        Ok(Some(issue))
     }
 
     /// Read every page of a list endpoint (`page`/`limit` query)
@@ -4584,6 +4795,175 @@ mod tests {
             .unwrap();
         assert!(cancelled.is_none());
         assert!(http.delete_json_calls().is_empty());
+    }
+
+    #[test]
+    fn merge_method_spellings_round_trip() {
+        use std::str::FromStr;
+        for (spelling, method) in [
+            ("merge", GiteaMergeMethod::Merge),
+            ("rebase", GiteaMergeMethod::Rebase),
+            ("rebase-merge", GiteaMergeMethod::RebaseMerge),
+            ("squash", GiteaMergeMethod::Squash),
+            ("fast-forward-only", GiteaMergeMethod::FastForwardOnly),
+        ] {
+            assert_eq!(GiteaMergeMethod::from_str(spelling).unwrap(), method);
+            assert_eq!(method.as_str(), spelling);
+        }
+        let err =
+            GiteaMergeMethod::from_str("cherry-pick").expect_err("an unknown merge method fails");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("cherry-pick"));
+    }
+
+    #[test]
+    fn pr_merge_posts_the_method_and_message() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/merge",
+            "",
+        );
+        let merged = client(&http)
+            .pr_merge(
+                "openSUSE",
+                "geectl",
+                122,
+                Some(GiteaMergeMethod::Squash),
+                Some("Merging."),
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert!(merged.is_some());
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            r#"{"Do":"squash","MergeMessageField":"Merging."}"#
+        );
+        assert!(calls[0].2);
+    }
+
+    #[test]
+    fn pr_merge_without_a_method_sends_merge() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/merge",
+            "",
+        );
+        client(&http)
+            .pr_merge("openSUSE", "geectl", 122, None, None, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(http.post_calls()[0].1, r#"{"Do":"merge"}"#);
+    }
+
+    #[test]
+    fn pr_merge_empty_message_omits_the_field() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/merge",
+            "",
+        );
+        client(&http)
+            .pr_merge(
+                "openSUSE",
+                "geectl",
+                122,
+                None,
+                Some(""),
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(http.post_calls()[0].1, r#"{"Do":"merge"}"#);
+    }
+
+    #[test]
+    fn pr_merge_dry_run_posts_nothing() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/merge",
+            "",
+        );
+        let dry = DryRun::new(true);
+        let merged = client(&http)
+            .pr_merge(
+                "openSUSE",
+                "geectl",
+                122,
+                Some(GiteaMergeMethod::Squash),
+                Some("Merging."),
+                &dry,
+            )
+            .unwrap();
+        assert!(merged.is_none());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(dry.plan().len(), 1);
+        assert_eq!(
+            dry.plan()[0],
+            "[dry-run] would: merge pull request openSUSE/geectl#122 with squash"
+        );
+    }
+
+    #[test]
+    fn pr_close_patches_the_state_closed() {
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+            &issue_json(122, "closed", false),
+        );
+        let issue = client(&http)
+            .pr_close("openSUSE", "geectl", 122, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(issue.number, 122);
+        assert_eq!(issue.state, "closed");
+        let calls = http.patch_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, r#"{"state":"closed"}"#);
+        assert!(calls[0].2);
+    }
+
+    #[test]
+    fn pr_close_dry_run_patches_nothing() {
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+            &issue_json(122, "closed", false),
+        );
+        let dry = DryRun::new(true);
+        let issue = client(&http)
+            .pr_close("openSUSE", "geectl", 122, &dry)
+            .unwrap();
+        assert!(issue.is_none());
+        assert!(http.patch_calls().is_empty());
+        assert_eq!(dry.plan().len(), 1);
+        assert_eq!(
+            dry.plan()[0],
+            "[dry-run] would: close pull request openSUSE/geectl#122"
+        );
+    }
+
+    #[test]
+    fn pr_reopen_patches_the_state_open() {
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+            &issue_json(122, "open", false),
+        );
+        let issue = client(&http)
+            .pr_reopen("openSUSE", "geectl", 122, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(issue.number, 122);
+        assert_eq!(issue.state, "open");
+        let calls = http.patch_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, r#"{"state":"open"}"#);
+        assert!(calls[0].2);
+    }
+
+    #[test]
+    fn pr_close_on_a_missing_pr_fails() {
+        let http = FakeHttp::new().with_patch_error(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122",
+            ErrorKind::NotFound,
+        );
+        let err = client(&http)
+            .pr_close("openSUSE", "geectl", 122, &DryRun::new(false))
+            .expect_err("a close of a missing PR must fail");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
     #[test]
