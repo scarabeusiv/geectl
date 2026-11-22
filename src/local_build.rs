@@ -2318,22 +2318,36 @@ const SPAWN_RETRY_ATTEMPTS: u32 = 3;
 const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Whether an I/O error from spawning a child is transient and
-/// worth one more attempt: resource exhaustion (EAGAIN/ENOMEM)
-/// under parallel load, not a missing binary or a denied exec.
+/// worth one more attempt: resource exhaustion (EAGAIN/ENOMEM, or
+/// a full file-descriptor table, EMFILE/ENFILE) under parallel
+/// load, not a missing binary or a denied exec. A spawn refused
+/// for descriptors clears as soon as the other in-flight
+/// children exit, so the same short backoff applies.
 fn is_transient_spawn_error(e: &std::io::Error) -> bool {
-    matches!(
+    if matches!(
         e.kind(),
         std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::ResourceBusy
             | std::io::ErrorKind::OutOfMemory
+    ) {
+        return true;
+    }
+    // Descriptor exhaustion is named by the raw errno, not the
+    // kind: the dedicated kind is still unstable, so a kind match
+    // would not compile — EMFILE (per-process table full) and
+    // ENFILE (system table full) both retry.
+    matches!(
+        e.raw_os_error(),
+        Some(code) if code == libc::EMFILE || code == libc::ENFILE
     )
 }
 
 /// Spawn a child, retrying a transient fork failure instead of
-/// surfacing it: a momentary EAGAIN while the test suite runs in
-/// parallel must not fail a build whose podman is fine. Permanent
-/// failures return on the first attempt, and the original error is
-/// kept when the retries run out.
+/// surfacing it: a momentary resource failure (EAGAIN, or a full
+/// descriptor table) while the test suite runs in parallel must
+/// not fail a build whose podman is fine. Permanent failures
+/// return on the first attempt, and the original error is kept
+/// when the retries run out.
 fn spawn_with_retry(
     mut spawn: impl FnMut() -> std::io::Result<std::process::Child>,
 ) -> std::io::Result<std::process::Child> {
@@ -7277,6 +7291,50 @@ exit 0
             .unwrap_err();
             assert_eq!(attempts.get(), 1);
             assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        }
+
+        #[test]
+        fn spawn_with_retry_retries_too_many_open_files() {
+            // A full descriptor table (EMFILE under parallel load)
+            // is retried like any other resource exhaustion: the
+            // first two attempts fail, the third spawns fine, so
+            // the caller never sees the transient error.
+            let attempts = std::cell::Cell::new(0);
+            let mut child = spawn_with_retry(|| {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                if n < 3 {
+                    Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+                } else {
+                    // /usr/bin/true, not /bin/true: the latter
+                    // does not exist on macOS.
+                    Command::new("/usr/bin/true").spawn()
+                }
+            })
+            .unwrap();
+            assert_eq!(attempts.get(), 3);
+            assert!(child.wait().unwrap().success());
+        }
+
+        #[test]
+        fn spawn_with_retry_gives_up_after_fd_exhaustion() {
+            // Descriptor exhaustion that never clears returns the
+            // original error once the attempts run out: the first
+            // attempt's EMFILE, not a success, and not an endless
+            // retry.
+            let attempts = std::cell::Cell::new(0);
+            let err = spawn_with_retry(|| {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                Err::<std::process::Child, _>(std::io::Error::from_raw_os_error(if n == 1 {
+                    libc::EMFILE
+                } else {
+                    libc::ENFILE
+                }))
+            })
+            .unwrap_err();
+            assert_eq!(attempts.get(), 3);
+            assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
         }
 
         #[test]
