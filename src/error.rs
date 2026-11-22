@@ -25,6 +25,11 @@ pub enum ErrorKind {
     /// The server returned an error (5xx, or a 4xx that is the server's
     /// fault, not the caller's).
     ServerError,
+    /// The server refused a search because the result exceeds its
+    /// configured limit (HTTP 403 with a result-limit body). A
+    /// distinct, actionable state: the caller narrows the search,
+    /// not an auth failure — the credentials are fine.
+    ResultLimitExceeded,
     /// The caller's input is invalid (bad package/project name, bad flag).
     InvalidInput,
     /// A resource with that name already exists (a fork, a repo). A
@@ -77,6 +82,7 @@ impl ErrorKind {
             ErrorKind::NotFound => "not_found",
             ErrorKind::AuthFailed => "auth_failed",
             ErrorKind::ServerError => "server_error",
+            ErrorKind::ResultLimitExceeded => "result_limit_exceeded",
             ErrorKind::InvalidInput => "invalid_input",
             ErrorKind::AlreadyExists => "already_exists",
             ErrorKind::Timeout => "timeout",
@@ -105,6 +111,9 @@ impl ErrorKind {
             ErrorKind::NotFound => "the requested resource does not exist",
             ErrorKind::AuthFailed => "authentication failed",
             ErrorKind::ServerError => "the server returned an error",
+            ErrorKind::ResultLimitExceeded => {
+                "the search returned more results than the server allows"
+            }
             ErrorKind::InvalidInput => "the input is invalid",
             ErrorKind::AlreadyExists => "the resource already exists",
             ErrorKind::Timeout => "the request timed out",
@@ -137,6 +146,9 @@ impl ErrorKind {
                 "check the credentials (environment variables or mounted secret file) and retry"
             }
             ErrorKind::ServerError => "retry later; if it persists, the server is at fault",
+            ErrorKind::ResultLimitExceeded => {
+                "narrow the search (fewer states, a project or package filter), or fetch ids only via the /search/.../id endpoint"
+            }
             ErrorKind::InvalidInput => "fix the input and retry; see --help for the expected form",
             ErrorKind::AlreadyExists => {
                 "reuse the existing resource, or pick another name and retry"
@@ -199,6 +211,7 @@ impl ErrorKind {
             ErrorKind::AuthFailed => 4,
             ErrorKind::Timeout => 5,
             ErrorKind::ServerError => 6,
+            ErrorKind::ResultLimitExceeded => 23,
             ErrorKind::NetworkError => 7,
             ErrorKind::TlsError => 8,
             ErrorKind::ConfigError => 9,
@@ -224,6 +237,7 @@ impl ErrorKind {
             ErrorKind::NotFound,
             ErrorKind::AuthFailed,
             ErrorKind::ServerError,
+            ErrorKind::ResultLimitExceeded,
             ErrorKind::InvalidInput,
             ErrorKind::AlreadyExists,
             ErrorKind::Timeout,

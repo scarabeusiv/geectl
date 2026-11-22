@@ -407,6 +407,14 @@ impl UreqClient {
             // explicitly — reading the body would return the
             // redirect body as a success.
             .max_redirects(0)
+            // Error statuses arrive as responses, not errors: the
+            // body of a 4xx/5xx carries the real cause (a 403 from a
+            // search that exceeded the server's result limit names
+            // the limit; a genuine auth failure does not), and the
+            // status mapping needs the body to tell them apart.
+            // Every call site maps a non-2xx response explicitly, so
+            // no error status is ever read as a success.
+            .http_status_as_error(false)
             // Never forward the Authorization header on a redirect.
             // The ureq default is already `Never`, but it is set
             // explicitly so a future ureq default change cannot
@@ -517,85 +525,93 @@ impl UreqClient {
                         }
                         return Err(redirect_error(status, location));
                     }
-                    if emit_debug_attempts {
-                        self.debug_attempt(
-                            "GET",
-                            url,
-                            &status.to_string(),
-                            started.elapsed(),
-                            attempt + 1,
-                            None,
-                        );
-                    }
-                    // The body is read inside the retry loop, not
-                    // after it: a read that times out or drops
-                    // mid-body retries like a failed call, within
-                    // the same budget — the previous code returned
-                    // the read error at once, so a stalled or
-                    // severed download never retried. Only a
-                    // timeout or a transport failure retries: an
-                    // over-cap body, a disk failure, or a
-                    // destination that already exists fails the
-                    // same way on every attempt, so retrying it
-                    // would only repeat the failure.
-                    match read_body(resp.into_body(), attempt) {
-                        Ok(body) => return Ok(body),
-                        Err(e) if is_retryable_body_error(&e) => {
-                            if emit_debug_attempts {
-                                let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
-                                self.debug_attempt(
-                                    "GET",
-                                    url,
-                                    if e.kind() == ErrorKind::Timeout {
-                                        "timeout"
-                                    } else {
-                                        "network error"
-                                    },
-                                    started.elapsed(),
-                                    attempt + 1,
-                                    Some((backoff, "body read failed")),
-                                );
-                            }
-                            last_desc = if e.kind() == ErrorKind::Timeout {
-                                "timeout".to_string()
-                            } else {
-                                "network error".to_string()
-                            };
-                            last_error = Some(e);
+                    if resp.status().is_success() {
+                        if emit_debug_attempts {
+                            self.debug_attempt(
+                                "GET",
+                                url,
+                                &status.to_string(),
+                                started.elapsed(),
+                                attempt + 1,
+                                None,
+                            );
                         }
-                        Err(e) => return Err(e),
-                    }
-                }
-                Err(ureq::Error::StatusCode(code)) => {
-                    let safe_url = sanitize_url_for_error(url);
-                    match status_action(code, &safe_url) {
-                        StatusAction::Return(err) => {
-                            if emit_debug_attempts {
-                                self.debug_attempt(
-                                    "GET",
-                                    url,
-                                    &code.to_string(),
-                                    started.elapsed(),
-                                    attempt + 1,
-                                    None,
-                                );
+                        // The body is read inside the retry loop, not
+                        // after it: a read that times out or drops
+                        // mid-body retries like a failed call, within
+                        // the same budget — the previous code returned
+                        // the read error at once, so a stalled or
+                        // severed download never retried. Only a
+                        // timeout or a transport failure retries: an
+                        // over-cap body, a disk failure, or a
+                        // destination that already exists fails the
+                        // same way on every attempt, so retrying it
+                        // would only repeat the failure.
+                        match read_body(resp.into_body(), attempt) {
+                            Ok(body) => return Ok(body),
+                            Err(e) if is_retryable_body_error(&e) => {
+                                if emit_debug_attempts {
+                                    let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                                    self.debug_attempt(
+                                        "GET",
+                                        url,
+                                        if e.kind() == ErrorKind::Timeout {
+                                            "timeout"
+                                        } else {
+                                            "network error"
+                                        },
+                                        started.elapsed(),
+                                        attempt + 1,
+                                        Some((backoff, "body read failed")),
+                                    );
+                                }
+                                last_desc = if e.kind() == ErrorKind::Timeout {
+                                    "timeout".to_string()
+                                } else {
+                                    "network error".to_string()
+                                };
+                                last_error = Some(e);
                             }
-                            return Err(err);
+                            Err(e) => return Err(e),
                         }
-                        StatusAction::Retry(err) => {
-                            if emit_debug_attempts {
-                                let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
-                                self.debug_attempt(
-                                    "GET",
-                                    url,
-                                    &code.to_string(),
-                                    started.elapsed(),
-                                    attempt + 1,
-                                    Some((backoff, &format!("transient status {code}"))),
-                                );
+                    } else {
+                        // A non-2xx status arrives as a response (see
+                        // http_status_as_error(false) in with_auth): map
+                        // it with its body. The error body is read once,
+                        // outside the retry loop: a transient status
+                        // retries the whole request, not the error-body
+                        // read.
+                        let body = read_error_body(resp.into_body().into_reader());
+                        let safe_url = sanitize_url_for_error(url);
+                        match status_action_with_body(status, &safe_url, &body) {
+                            StatusAction::Return(err) => {
+                                if emit_debug_attempts {
+                                    self.debug_attempt(
+                                        "GET",
+                                        url,
+                                        &status.to_string(),
+                                        started.elapsed(),
+                                        attempt + 1,
+                                        None,
+                                    );
+                                }
+                                return Err(err);
                             }
-                            last_desc = code.to_string();
-                            last_error = Some(err);
+                            StatusAction::Retry(err) => {
+                                if emit_debug_attempts {
+                                    let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                                    self.debug_attempt(
+                                        "GET",
+                                        url,
+                                        &status.to_string(),
+                                        started.elapsed(),
+                                        attempt + 1,
+                                        Some((backoff, &format!("transient status {status}"))),
+                                    );
+                                }
+                                last_desc = status.to_string();
+                                last_error = Some(err);
+                            }
                         }
                     }
                 }
@@ -906,18 +922,21 @@ impl UreqClient {
                 }
                 // Attempt line first (see read_response_body).
                 self.debug_single_attempt("POST", url, &status.to_string(), started.elapsed());
+                if !resp.status().is_success() {
+                    // A non-2xx status arrives as a response (see
+                    // http_status_as_error(false) in with_auth): map
+                    // it with its body.
+                    let body = read_error_body(resp.into_body().into_reader());
+                    let safe_url = sanitize_url_for_error(url);
+                    // No retry for POST: a Retry action is returned
+                    // as the error, immediately.
+                    return match status_action_with_body(status, &safe_url, &body) {
+                        StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
+                    };
+                }
                 let body = self.read_response_body(resp.into_body().into_reader(), "POST", url)?;
                 self.debug_body("response", "POST", url, &body);
                 Ok(body)
-            }
-            Err(ureq::Error::StatusCode(code)) => {
-                let safe_url = sanitize_url_for_error(url);
-                self.debug_single_attempt("POST", url, &code.to_string(), started.elapsed());
-                match status_action(code, &safe_url) {
-                    // No retry for POST: a Retry action is returned
-                    // as the error, immediately.
-                    StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
-                }
             }
             Err(ureq::Error::Tls(msg)) => {
                 self.debug_single_attempt("POST", url, "TLS error", started.elapsed());
@@ -998,18 +1017,21 @@ impl UreqClient {
                 }
                 // Attempt line first (see read_response_body).
                 self.debug_single_attempt("PATCH", url, &status.to_string(), started.elapsed());
+                if !resp.status().is_success() {
+                    // A non-2xx status arrives as a response (see
+                    // http_status_as_error(false) in with_auth): map
+                    // it with its body.
+                    let body = read_error_body(resp.into_body().into_reader());
+                    let safe_url = sanitize_url_for_error(url);
+                    // No retry for PATCH: a Retry action is returned
+                    // as the error, immediately.
+                    return match status_action_with_body(status, &safe_url, &body) {
+                        StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
+                    };
+                }
                 let body = self.read_response_body(resp.into_body().into_reader(), "PATCH", url)?;
                 self.debug_body("response", "PATCH", url, &body);
                 Ok(body)
-            }
-            Err(ureq::Error::StatusCode(code)) => {
-                let safe_url = sanitize_url_for_error(url);
-                self.debug_single_attempt("PATCH", url, &code.to_string(), started.elapsed());
-                match status_action(code, &safe_url) {
-                    // No retry for PATCH: a Retry action is returned
-                    // as the error, immediately.
-                    StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
-                }
             }
             Err(ureq::Error::Tls(msg)) => {
                 self.debug_single_attempt("PATCH", url, "TLS error", started.elapsed());
@@ -1107,28 +1129,32 @@ impl UreqClient {
                         );
                         return Err(redirect_error(status, location));
                     }
-                    // Attempt line first (see read_response_body).
-                    self.debug_attempt(
-                        "PUT",
-                        url,
-                        &status.to_string(),
-                        started.elapsed(),
-                        attempt + 1,
-                        None,
-                    );
-                    let body =
-                        self.read_response_body(resp.into_body().into_reader(), "PUT", url)?;
-                    self.debug_body("response", "PUT", url, &body);
-                    return Ok(body);
-                }
-                Err(ureq::Error::StatusCode(code)) => {
+                    if resp.status().is_success() {
+                        // Attempt line first (see read_response_body).
+                        self.debug_attempt(
+                            "PUT",
+                            url,
+                            &status.to_string(),
+                            started.elapsed(),
+                            attempt + 1,
+                            None,
+                        );
+                        let body =
+                            self.read_response_body(resp.into_body().into_reader(), "PUT", url)?;
+                        self.debug_body("response", "PUT", url, &body);
+                        return Ok(body);
+                    }
+                    // A non-2xx status arrives as a response (see
+                    // http_status_as_error(false) in with_auth): map
+                    // it with its body.
+                    let body = read_error_body(resp.into_body().into_reader());
                     let safe_url = sanitize_url_for_error(url);
-                    match status_action(code, &safe_url) {
+                    match status_action_with_body(status, &safe_url, &body) {
                         StatusAction::Return(err) => {
                             self.debug_attempt(
                                 "PUT",
                                 url,
-                                &code.to_string(),
+                                &status.to_string(),
                                 started.elapsed(),
                                 attempt + 1,
                                 None,
@@ -1140,12 +1166,12 @@ impl UreqClient {
                             self.debug_attempt(
                                 "PUT",
                                 url,
-                                &code.to_string(),
+                                &status.to_string(),
                                 started.elapsed(),
                                 attempt + 1,
-                                Some((backoff, &format!("transient status {code}"))),
+                                Some((backoff, &format!("transient status {status}"))),
                             );
-                            last_desc = code.to_string();
+                            last_desc = status.to_string();
                             last_error = Some(err);
                         }
                     }
@@ -1347,19 +1373,22 @@ impl UreqClient {
                 }
                 // Attempt line first (see read_response_body).
                 self.debug_single_attempt("DELETE", url, &status.to_string(), started.elapsed());
+                if !resp.status().is_success() {
+                    // A non-2xx status arrives as a response (see
+                    // http_status_as_error(false) in with_auth): map
+                    // it with its body.
+                    let body = read_error_body(resp.into_body().into_reader());
+                    let safe_url = sanitize_url_for_error(url);
+                    // No retry for DELETE: a Retry action is returned
+                    // as the error, immediately.
+                    return match status_action_with_body(status, &safe_url, &body) {
+                        StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
+                    };
+                }
                 let body =
                     self.read_response_body(resp.into_body().into_reader(), "DELETE", url)?;
                 self.debug_body("response", "DELETE", url, &body);
                 Ok(body)
-            }
-            Err(ureq::Error::StatusCode(code)) => {
-                let safe_url = sanitize_url_for_error(url);
-                self.debug_single_attempt("DELETE", url, &code.to_string(), started.elapsed());
-                match status_action(code, &safe_url) {
-                    // No retry for DELETE: a Retry action is returned
-                    // as the error, immediately.
-                    StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
-                }
             }
             Err(ureq::Error::Tls(msg)) => {
                 self.debug_single_attempt("DELETE", url, "TLS error", started.elapsed());
@@ -1536,6 +1565,41 @@ fn status_action(code: u16, safe_url: &str) -> StatusAction {
             ErrorKind::ServerError,
             format!("{safe_url} returned {code}"),
         )),
+    }
+}
+
+/// The OBS search result-limit marker: the `<status code>` the
+/// server returns when a search exceeds its configured result
+/// limit (HTTP 403). The code attribute is the discriminator — a
+/// genuine auth 403 carries a different code — and the match is a
+/// substring search for that attribute form.
+const SEARCH_RESULT_LIMIT_CODE: &str = "code=\"search_results_exceed_configured_limit\"";
+
+/// Map a non-2xx status with its response body to an error and a
+/// retry decision. A 403 whose body carries the search result-limit
+/// code is a result-limit refusal, not an auth failure: the caller
+/// narrows the search instead of checking credentials. Any other
+/// status, or a 403 without the marker, maps exactly as
+/// [`status_action`] maps it — the body never changes another
+/// mapping.
+fn status_action_with_body(code: u16, safe_url: &str, body: &str) -> StatusAction {
+    if code == 403 && body.contains(SEARCH_RESULT_LIMIT_CODE) {
+        return StatusAction::Return(GeectlError::new(
+            ErrorKind::ResultLimitExceeded,
+            format!("{safe_url} returned 403"),
+        ));
+    }
+    status_action(code, safe_url)
+}
+
+/// Read an error response body for the status mapping: capped like
+/// any other body, lossy UTF-8 (an error body is only inspected
+/// for a marker, never parsed), empty when unreadable or over the
+/// cap — the code-only mapping still applies then.
+fn read_error_body(reader: impl Read) -> String {
+    match read_body_bytes_capped(reader) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
     }
 }
 
@@ -2312,6 +2376,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn result_limit_403_is_not_an_auth_failure() {
+        // The OBS search result-limit body on a 403 is a
+        // result-limit refusal, not an auth failure: the
+        // credentials are fine, the search is too broad.
+        let limit_body = "<status code=\"search_results_exceed_configured_limit\">\n  <summary>The number of results returned by the performed search exceeds the configured limit.</summary>\n</status>";
+        assert!(matches!(
+            status_action_with_body(403, "u", limit_body),
+            StatusAction::Return(e) if e.kind() == ErrorKind::ResultLimitExceeded
+        ));
+        assert_eq!(
+            ErrorKind::ResultLimitExceeded.code(),
+            "result_limit_exceeded"
+        );
+        assert_eq!(ErrorKind::ResultLimitExceeded.exit_code(), 23);
+        // A 403 without the marker is still an auth failure.
+        assert!(matches!(
+            status_action_with_body(403, "u", ""),
+            StatusAction::Return(e) if e.kind() == ErrorKind::AuthFailed
+        ));
+        assert!(matches!(
+            status_action_with_body(403, "u", "<status code=\"forbidden\"><summary>no</summary></status>"),
+            StatusAction::Return(e) if e.kind() == ErrorKind::AuthFailed
+        ));
+        // The marker only matters on 403: other statuses map as
+        // status_action maps them, body or not.
+        assert!(matches!(
+            status_action_with_body(404, "u", limit_body),
+            StatusAction::Return(e) if e.kind() == ErrorKind::NotFound
+        ));
+        assert!(matches!(
+            status_action_with_body(500, "u", limit_body),
+            StatusAction::Retry(e) if e.kind() == ErrorKind::ServerError
+        ));
+    }
+
     // --- Authenticated-request tests (loopback server, fixture creds) ---
 
     /// An [`AuthProvider`] returning fixed credentials, for tests. The
@@ -2602,6 +2702,39 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::ServerError, "status {status}");
             assert_eq!(server.hits(), 1, "status {status}: exactly one attempt");
         }
+    }
+
+    /// The exact 403 body the OBS search returns when a search
+    /// exceeds its configured result limit (captured live from
+    /// api.opensuse.org, superseded Factory search).
+    const SEARCH_RESULT_LIMIT_BODY: &str = "<status code=\"search_results_exceed_configured_limit\">\n  <summary>The number of results returned by the performed search exceeds the configured limit.</summary>\n</status>";
+
+    #[test]
+    fn get_result_limit_403_reports_result_limit() {
+        let server = LoopbackServer::serve_status(SEARCH_RESULT_LIMIT_BODY, 403);
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let err = client.get(&server.url()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ResultLimitExceeded);
+        assert_eq!(err.exit_code(), 23);
+    }
+
+    #[test]
+    fn get_auth_403_still_reports_auth_failed() {
+        let server = LoopbackServer::serve_status(
+            "<status code=\"forbidden\"><summary>no</summary></status>",
+            403,
+        );
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let err = client.get(&server.url()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+    }
+
+    #[test]
+    fn post_result_limit_403_reports_result_limit() {
+        let server = LoopbackServer::serve_status(SEARCH_RESULT_LIMIT_BODY, 403);
+        let client = UreqClient::with_auth(Timeout::default(), None).unwrap();
+        let err = client.post_json(&server.url(), "{}").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ResultLimitExceeded);
     }
 
     #[test]
