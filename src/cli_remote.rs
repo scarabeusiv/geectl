@@ -51,7 +51,9 @@
 //! carries no md5 (a verification value, not an identifier);
 //! `package-log` text carries no comment or srcmd5 (long free text
 //! and a verification value); search tables carry no description
-//! (long free text — titles stay); `revision-patch`,
+//! (long free text — titles stay); `repo-add` text carries no
+//! `disable_publish` (a boolean; the dry-run plan names it when
+//! set); `revision-patch`,
 //! `project-diff`, and `diff-packages` diffs are the server text
 //! itself, not re-rendered.
 //! The JSON payload remains the complete record in every case.
@@ -544,11 +546,8 @@ pub fn run_remote(
                 "disable_publish": disable_publish,
                 "changed": changed,
             });
-            let result_line = if dry_run.enabled() {
-                format!("dry-run: would add repository {name} to project {project}")
-            } else {
-                format!("added repository {name} to project {project}")
-            };
+            let result_line =
+                repo_add_result_line(&name, &project, &arch, &repository.paths, dry_run.enabled());
             let plan = if dry_run.enabled() {
                 Some(dry_run.plan())
             } else {
@@ -617,6 +616,34 @@ fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
 // Per-command result builders: pure functions of the typed values, so
 // every command's payload and text are unit-testable without a server.
 // ---------------------------------------------------------------------
+
+/// The `repo-add` result line: the repository and project, plus the
+/// arch list and the rebuild-source paths — the repository's
+/// definition, so the text carries what the JSON payload carries.
+/// `disable_publish` is a boolean, not an identifier: the dry-run
+/// plan names it when set, and the JSON payload carries it.
+fn repo_add_result_line(
+    name: &str,
+    project: &str,
+    arch: &[String],
+    paths: &[(String, String)],
+    dry_run: bool,
+) -> String {
+    let definition = format!(
+        " (arch: {}; paths: {})",
+        arch.join(", "),
+        paths
+            .iter()
+            .map(|(project, repository)| format!("{project}/{repository}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if dry_run {
+        format!("dry-run: would add repository {name} to project {project}{definition}")
+    } else {
+        format!("added repository {name} to project {project}{definition}")
+    }
+}
 
 /// Prepend the one-line coordinate header to a text rendering
 /// (design rule 1): `header` first, then the body unchanged.
@@ -2049,5 +2076,175 @@ mod tests {
             }),
             "no changes in revision 5"
         );
+    }
+
+    #[test]
+    fn repo_add_result_line_carries_arch_and_paths() {
+        let arch = vec!["x86_64".to_string(), "aarch64".to_string()];
+        let paths = vec![("openSUSE:Factory".to_string(), "standard".to_string())];
+        assert_eq!(
+            repo_add_result_line("standard", "P", &arch, &paths, true),
+            "dry-run: would add repository standard to project P (arch: x86_64, aarch64; paths: openSUSE:Factory/standard)"
+        );
+        assert_eq!(
+            repo_add_result_line("standard", "P", &arch, &paths, false),
+            "added repository standard to project P (arch: x86_64, aarch64; paths: openSUSE:Factory/standard)"
+        );
+    }
+
+    /// The design doc's worked example for `list-files`, pinned
+    /// literally: the `NAME SIZE MTIME` table under the coordinate
+    /// header, `-` for an unknown size or mtime.
+    #[test]
+    fn list_files_text_is_the_design_table() {
+        let files = vec![
+            SourceFile {
+                name: "vim.spec".to_string(),
+                size: Some(1234),
+                mtime: Some(1_700_000_000),
+                md5: Some("deadbeef".to_string()),
+            },
+            SourceFile {
+                name: "README".to_string(),
+                size: None,
+                mtime: None,
+                md5: None,
+            },
+        ];
+        let text = with_header(
+            "project: openSUSE:Factory package: vim",
+            render_source_files(&files),
+        );
+        assert_eq!(
+            text,
+            "project: openSUSE:Factory package: vim\nNAME     SIZE MTIME\nvim.spec 1234 1700000000\nREADME   -    -"
+        );
+    }
+
+    #[test]
+    fn package_log_text_is_a_table() {
+        let entries = vec![HistoryEntry {
+            rev: 3,
+            vrev: 3,
+            srcmd5: Some("abcd1234".to_string()),
+            version: Some("9.1".to_string()),
+            time: Some(1_700_000_000),
+            user: Some("alice".to_string()),
+            comment: Some("Fix a long-standing bug in the parser".to_string()),
+            request_id: Some("123456".to_string()),
+        }];
+        let text = with_header(
+            "project: openSUSE:Factory package: vim",
+            render_history(&entries),
+        );
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "project: openSUSE:Factory package: vim"
+        );
+        assert_eq!(
+            lines.next().unwrap(),
+            "REV VREV VERSION TIME       USER  REQUEST"
+        );
+        assert_eq!(
+            lines.next().unwrap(),
+            "3   3    9.1     1700000000 alice 123456"
+        );
+        assert!(lines.next().is_none());
+    }
+
+    /// The agreement test: every id, name, and revision the JSON
+    /// payload carries appears in the text rendering, except the
+    /// documented omissions (md5, srcmd5, comments; descriptions
+    /// only in search tables).
+    #[test]
+    fn text_carries_every_identifying_field() {
+        let meta = sample_project_meta();
+        let payload = project_meta_json(&meta);
+        let text = render_project_meta(&meta);
+        for field in [
+            "openSUSE:Factory",
+            "Factory",
+            "The rolling distribution",
+            "url: https://www.opensuse.org",
+            "alice",
+            "maintainer",
+            "standard",
+            "x86_64",
+            "aarch64",
+        ] {
+            assert!(
+                text.contains(field),
+                "project meta text misses {field}:\n{text}"
+            );
+        }
+        assert_eq!(payload["repositories"][0]["name"], "standard");
+
+        let package_meta = PackageMeta {
+            name: "vim".to_string(),
+            project: "openSUSE:Factory".to_string(),
+            title: Some("Vi IMproved".to_string()),
+            description: Some("A very long description".to_string()),
+            url: Some("https://www.vim.org".to_string()),
+            scmsync: None,
+            releasename: Some("vim".to_string()),
+            devel: Some(("editors".to_string(), "vim".to_string())),
+            persons: vec![NamedRole {
+                name: "alice".to_string(),
+                role: "maintainer".to_string(),
+            }],
+            groups: vec![],
+        };
+        let text = render_package_meta(&package_meta);
+        for field in [
+            "vim",
+            "openSUSE:Factory",
+            "Vi IMproved",
+            "A very long description",
+            "https://www.vim.org",
+            "editors/vim",
+            "alice (maintainer)",
+        ] {
+            assert!(
+                text.contains(field),
+                "package meta text misses {field}:\n{text}"
+            );
+        }
+
+        let owners = vec![Owner {
+            root_project: "openSUSE:Factory".to_string(),
+            project: "openSUSE:Factory".to_string(),
+            package: Some("vim".to_string()),
+            persons: vec![NamedRole {
+                name: "alice".to_string(),
+                role: "maintainer".to_string(),
+            }],
+            groups: vec![NamedRole {
+                name: "editors".to_string(),
+                role: "bugowner".to_string(),
+            }],
+        }];
+        let text = render_owners(&owners);
+        for field in [
+            "openSUSE:Factory",
+            "vim",
+            "alice (maintainer)",
+            "editors (bugowner)",
+        ] {
+            assert!(text.contains(field), "owners text misses {field}:\n{text}");
+        }
+        assert_eq!(owner_json(&owners[0])["package"], "vim");
+
+        let matches = vec![PackageMatch {
+            name: "vim".to_string(),
+            project: "openSUSE:Factory".to_string(),
+            title: Some("Vi IMproved".to_string()),
+            description: Some("A very long description".to_string()),
+        }];
+        let text = render_package_matches("vim", &matches);
+        for field in ["vim", "openSUSE:Factory", "Vi IMproved"] {
+            assert!(text.contains(field), "search text misses {field}:\n{text}");
+        }
+        assert!(!text.contains("A very long description"));
     }
 }
