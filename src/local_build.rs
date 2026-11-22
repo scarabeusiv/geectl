@@ -104,6 +104,11 @@ const KILL_GRACE_SECS: u64 = 5;
 /// slow. The image pull is not a probe — it takes the build's own
 /// timeout (see `podman_pull`).
 const PROBE_TIMEOUT_SECS: u64 = 60;
+/// How long a `podman kill` of the service container may take
+/// (seconds): the run has already failed, so a hung kill must not
+/// delay the timeout error. The bound matches the 10s `stop`
+/// passes to the container.
+const KILL_TIMEOUT_SECS: u64 = 10;
 /// How long the caller waits for a drain thread to finish after
 /// the child exits (seconds): the drain only has to read what is
 /// already in the pipe, so this is generous — but a descendant
@@ -4616,7 +4621,9 @@ const SERVICE_CONTAINER_PIDS_LIMIT: &str = "1024";
 /// directory. Capabilities are dropped except the install set,
 /// new privileges are denied, and memory and process counts are
 /// capped; the network stays open — `download_url` fetches over
-/// it. The container carries the runner version as `OSC_VERSION` (the
+/// it. A timed-out `exec` kills the container: the exec'd process
+/// ends with it instead of running on to the sleep budget. The
+/// container carries the runner version as `OSC_VERSION` (the
 /// value is the geectl version); the `OBS_SERVICE_*` variables
 /// stay unset — a local run carries no project context. No CPU cap
 /// is set: the wall-clock timeout already bounds CPU time, and a
@@ -4729,6 +4736,7 @@ impl ServiceContainer {
             .args(argv);
         run_with_timeout(&mut cmd, remaining).map_err(|e| {
             if e.kind() == std::io::ErrorKind::TimedOut {
+                self.kill();
                 GeectlError::new(
                     ErrorKind::BuildTimeout,
                     format!(
@@ -4749,6 +4757,16 @@ impl ServiceContainer {
         let mut cmd = Command::new(&self.podman);
         cmd.args(["stop", "--time", "10", &self.name]);
         let _ = run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS));
+    }
+
+    /// Kill the container at once: the run has already failed,
+    /// so nothing in the container has anything left to finish.
+    /// SIGKILL to the container's init ends the pid namespace,
+    /// which ends the exec'd process with it.
+    fn kill(&self) {
+        let mut cmd = Command::new(&self.podman);
+        cmd.args(["kill", &self.name]);
+        let _ = run_with_timeout(&mut cmd, Duration::from_secs(KILL_TIMEOUT_SECS));
     }
 }
 
@@ -8234,6 +8252,7 @@ if [ "$1" = "exec" ]; then
     /usr/lib/obs/service/*)
       name="${1#/usr/lib/obs/service/}"
       if [ "$name" = "failme" ]; then echo "boom: service failed" >&2; exit 1; fi
+      if [ "$name" = "slowpoke" ]; then sleep 5; fi
       outdir=""
       prev=""
       for arg in "$@"; do
@@ -8822,6 +8841,41 @@ exit 0
                     "flag {flag} follows the image name: {run_line}"
                 );
             }
+        }
+
+        #[test]
+        fn service_container_exec_timeout_kills_the_container() {
+            // A service that runs past the deadline: the error is
+            // a timeout, and a kill is issued for the container.
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"slowpoke\"/></services>",
+            )
+            .unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            req.timeout_secs = 2;
+            let started = std::time::Instant::now();
+            let err = vertical.service_run(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BuildTimeout);
+            assert!(started.elapsed() < Duration::from_secs(10));
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let Some(exec_pos) = log.find("exec ") else {
+                panic!("no exec call in log: {log}");
+            };
+            let Some(kill_pos) = log.find("kill geectl-service-") else {
+                panic!("no kill call in log: {log}");
+            };
+            assert!(
+                kill_pos > exec_pos,
+                "kill precedes the timed-out exec: {log}"
+            );
         }
 
         #[test]
