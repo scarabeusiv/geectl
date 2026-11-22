@@ -44,23 +44,10 @@ The skill's `contrib/harness/README.md` "Smoke test" section is unrelated
 
 ## 0c. Survey boundary
 
-- Surveyed in detail: **62 behave files / 216 scenarios** and
-  **369 unit tests**.
-- NOT surveyed in detail: `behave/features/git-*.feature` — 15 files /
-  56 scenarios (Gitea/git-obs side; batch 9) — and
-  338 unit tests in 32 files: config/credentials (`test_conf.py` 102,
-  `test_config_parser.py`, `test_credentials.py`), Gitea/git-SCM
-  (`test_gitea_api_*.py` 10 files, `test_maintainership.py` 3,
-  `test_maintainership_converter.py` 7, `test_git_scm_store.py` 20,
-  `test_gitattributes.py`, `test_gitignore.py`, `test_gitea_exceptions.py` 22,
-  `test_git_editor.py`, `test_scmsync_obsinfo.py`), utilities
-  (`test_helpers.py`, `test_grabber.py`, `test_keyinfo.py`,
-  `test_util_ar.py`, `test_util_cpio.py`, `test_util_yaml.py` 8),
-  `test_output.py` 28 (CLI formatting), `test__private_api.py`,
-  `test__private_package.py`, `test_doc_plugins.py`, and the remaining
-  47 of `test_commandline.py` (67 total, 20 in the slice below).
-  None of these map to gap-map operations except as noted under batch 9.
-- 216 + 56 = 272 scenarios ✓; 369 + 338 = 707 unit tests ✓.
+- Surveyed in detail: **all 77 behave files / 272 scenarios** and
+  **all 707 unit tests** (the 15 `git-*.feature` files and the 338 unsurveyed unit tests).
+- Nothing unsurveyed remains: 272 scenarios and 707 unit tests,
+  all surveyed in detail.
 
 ---
 
@@ -593,30 +580,133 @@ Valid service run, `source_validator` gate (gate 2), `precommit`,
 `test_conf.py`, `test_deletefiles.py`, `test_update.py` — `_service` file
 handling, not the run operation).
 
-## Batch 9 — Gitea operations (deferred)
+## Batch 9 — Gitea operations
 
-Not surveyed in detail; material exists for the batch:
+**Direct adoptions: 15 (2 unit + 13 behave). Surveyed in full
+(sweep 2): all 15 `git-*.feature` files (56 scenarios) and all 338
+unsurveyed unit tests.**
 
-- Behave: `behave/features/git-*.feature` — 15 files / 56 scenarios
-  (`git-pr.feature` 15, `git-obs-staging-group.feature` 6,
-  `git-pr-review-request.feature` 5, `git-ssh-key.feature` 5,
-  `git-pr-new-package-request.feature` 4, `git-repo-list.feature` 4,
-  `git-login.feature` 3, `git-repo-clone.feature` 3,
-  `git-repo-fork.feature` 3, `git-obs-staging-remove.feature` 2,
-  `git-pr-empty.feature` 2, `git-osc-precommit-hook.feature` 1,
-  `git-pr-fork-to-fork.feature` 1, `git-repo-init-local.feature` 1,
-  `git-repo-init-remote.feature` 1).
-- Surveyed: `behave/features/fork.feature:11` / `:19` — Gitea fork
-  incl. cross-org re-fork refused (exit 1) and `--new-repo-name` retry;
-  `behave/features/user.feature:5` — `ls` under a newly registered user
+### Behave — adopt
+
+- `git-pr.feature` (15; surveyed in the #121–#141 sweep): 6 read
+  scenarios adopted in #140, 1 read scenario adopted in sweep 2
+  (`:170` "Get a pull request that doesn't exist" →
+  `pr_get_missing_pr_is_not_found`, a 404 mapping to `NotFound`),
+  8 checkout/rebase/create scenarios out of scope for the read
+  surface (working-copy ops / `pr create`, not implemented).
+- `git-pr-review-request.feature` (5): 5 adopted in #154 (step 4).
+- `git-repo-fork.feature` (3): 1 adopted in sweep 2 (`:72`
+  fork-of-fork → `fork_repo_fork_of_a_fork_verifies_the_immediate_parent`,
+  the re-read parent is the fork it was made from, not the root);
+  `:9` basic fork covered by `fork_repo_creates_and_verifies_by_re_read`;
+  `:31` fork-twice-under-a-different-name NOT adopted — geectl refuses
+  `AlreadyExists` where osc reuses the existing fork with a warning
+  (deliberate divergence; the fork-discovery-by-source the reuse needs
+  is a `repo_list` use case, recorded under gaps).
+- `git-repo-list.feature` (4): covered in substance — org/user/both
+  forms, user-first-then-org order, same-account dedupe, and the
+  JSON/text agreement on repo objects (`repo_list_*`,
+  `repository_renders_parent_when_a_fork`,
+  `repositories_render_a_table_without_clone_urls`).
+- `behave/features/fork.feature:11` / `:19` — Gitea fork incl.
+  cross-org re-fork refused (exit 1) and `--new-repo-name` retry
+  (covered by `fork_repo_refuses_a_fork_of_another_source` and the
+  reuse tests).
+- `behave/features/user.feature:5` — `ls` under a newly registered user
   whose password contains unicode (🚀🚀🚀) — adoptable as an
   auth-with-unicode-password case.
-- Unit (unsurveyed): `test_gitea_api_*.py` (10 files),
-  `test_maintainership.py` (3 — `obs-maintainers` document parsing, v1 +
-  legacy formats), `test_maintainership_converter.py` (7),
-  `test_git_scm_store.py` (20), `test_gitattributes.py`,
-  `test_gitignore.py`, `test_gitea_exceptions.py` (22),
-  `test_git_editor.py`, `test_scmsync_obsinfo.py`.
+
+### Unit — adopt
+
+- `test_gitea_api_pr.py::test_object_pull_request` — head/base commit
+  SHAs → `pr_get_pins_head_and_base_commit_shas` (sweep 2). The rest
+  of the case is not modelled: `url`, `allow_maintainer_edit`, and the
+  head/base `ssh_url` are deliberately unparsed (a field the operation
+  does not need is not parsed); head/base repo owner+name are not
+  modelled (full name only).
+- `tests/test__private_api.py::TestXmlEscape` (5 cases) →
+  `xml_escape_escapes_the_five_xml_specials` (sweep 2).
+- Covered in substance, no new test: `test_gitea_api_repo.py`
+  (`repo_get_parses_a_repo_and_ignores_unknown_fields`,
+  `repo_get_parses_a_fork_parent`); `test_gitea_api_branch.py`
+  (`branch_get_parses_a_branch`,
+  `branch_without_protected_fails_to_parse`); `test_gitea_api_conf.py`
+  (config-path rules — the absolute/default/empty cases match the
+  `resolve_config_path` tests; relative and tilde diverge
+  deliberately, geectl follows the XDG spec; the explicit-path case
+  (`test_explicit_path_takes_precedence`, an explicit `Config(path)`
+  wins over XDG) has no `resolve_config_path` equivalent — geectl
+  loads an explicit path through `load_config_at`, a different
+  entry point);
+  `test_gitea_exceptions.py` (22 × 301 → `redirect_is_not_followed`
+  at the transport layer; geectl maps 3xx to `ServerError` naming the
+  Location, not a distinct `MovedPermanently` type).
+- Modelled differently, not adopted: `test_object_issue`
+  (issue-shaped PR object — geectl models search items as `GiteaIssue`,
+  not as a PR with empty endpoints); `test_gitea_api_user.py`
+  (`full_name`/`email` — `GiteaOwner` models the login only).
+
+### Gap — no geectl operation yet, cases recorded for the batch that builds it
+
+- Staging group/remove (`git-obs-staging-group.feature` 6,
+  `git-obs-staging-remove.feature` 2): needs `pr create` + label
+  add/remove + close + PR-reference parse/add/remove
+  (`test_gitea_api_pr.py` reference cases are the spec for the
+  helpers: parse, add-after-last-ref, remove).
+- SSH keys (`git-ssh-key.feature` 5, `test_gitea_api_ssh_key.py` 1):
+  no `ssh-key` operations.
+- PR-URL parsing (`test_gitea_api_pr.py`
+  `test_get_host_owner_repo_number_*`, 5): geectl handles are
+  `owner/repo#n` and there is no PR-URL parser; the only URL parser
+  is `parse_scmsync_url` (`src/gitea.rs:3221`). The five cases
+  (https with/without port, issues endpoint, invalid endpoint,
+  invalid format) are the spec for one.
+- Fork discovery by source: finding an existing fork of a source repo
+  needs a `repo_list`-by-source use case; no such operation (this is
+  what the fork-twice reuse in `git-repo-fork.feature:31` needs).
+- New-package request (`git-pr-new-package-request.feature` 4): no
+  issue-create/label operations.
+- Login management (`git-login.feature` 3): no config-entry
+  add/remove/update operations (credentials come from env/file).
+- Repo clone (`git-repo-clone.feature` 3), repo init
+  (`git-repo-init-local.feature` 1, `git-repo-init-remote.feature` 1),
+  precommit hook (`git-osc-precommit-hook.feature` 1), pr
+  checkout/rebase (`git-pr.feature` lines 190, 217, 231, 259):
+  working-copy layer (#17, blocked on Gitea ops).
+- PR create (`git-pr.feature` create scenarios, `git-pr-empty.feature`
+  2, `git-pr-fork-to-fork.feature` 1): not implemented; the empty-PR
+  rule ("Source and target are identical" refused) and the
+  fork-to-fork target form are validation rules for the create op.
+  `Branch.split_id` (`test_gitea_api_branch.py`) is the target-spec
+  parser for it.
+- Git helpers for the working-copy layer: `Git.urlparse`/`urljoin`/
+  `detect_git` (`test_gitea_api_git.py`), `GitDiffGenerator`
+  (`test_gitea_api_git_diff_generator.py`, incl. the `.gitmodules`
+  rendering), `TarDiff` (`test_gitea_api_tardiff.py`),
+  `test_git_scm_store.py` (20), `.gitattributes`/`.gitignore`
+  parsing and merging (`test_gitattributes.py` 7,
+  `test_gitignore.py` 7), `ScmsyncObsinfo`
+  (`test_scmsync_obsinfo.py` 3).
+- Maintainership (`test_maintainership.py` 3,
+  `test_maintainership_converter.py` 7): no `obs-maintainers`
+  parsing.
+- No equivalent, surveyed and closed: `test_conf.py` (102, oscrc
+  attributes geectl does not have), `test_config_parser.py` (6, INI
+  format preservation — geectl config is TOML and never written),
+  `test_credentials.py` (1, obfuscated passwords — geectl never
+  stores passwords), `test_helpers.py` (2, bytes→str coercion —
+  strings are UTF-8 by construction), `test_grabber.py` (1,
+  mirror-group download — the transport covers downloads),
+  `test_gitea_api_common.py` (3, `dt_sanitize` — no datetime
+  normalisation in geectl — and `TemporaryDirectory` delete/no-delete
+  — a test helper only),
+  `test_keyinfo.py` (2, no keyinfo operation), `test_util_ar.py` (6),
+  `test_util_cpio.py` (4), `test_util_yaml.py` (8, no YAML anywhere),
+  `test__private_package.py` (7, osc-internal Package framework),
+  `test_doc_plugins.py` (5, no plugins), `test_git_editor.py` (6,
+  interactive editor), `test_output.py` (28, CLI formatting — SKIP),
+  `test_commandline.py` remaining 47 (CLI arity / WC inference —
+  SKIP; the `can_fail` pair is counted under batch 2).
 
 ---
 
@@ -677,13 +767,16 @@ Batch in brackets:
 | 6 working-copy layer | 0 (+36 spec ref) | 0 | 0 (+spec) |
 | 7 maintenance requests | 0 (counted in 2/4) | 0 (counted in 2/4) | 0 (+gaps) |
 | 8 services | 0 | 1 | 1 |
-| 9 Gitea ops | deferred | deferred | deferred |
-| **Total adopted** | **103** | **107** | **210** |
+| 9 Gitea ops | 2 | 13 | 15 |
+| **Total adopted** | **105** | **120** | **225** |
 
-Surveyed base: 216 behave scenarios + 369 unit tests = 585 items;
-adoptable as written: 210 of them (107 behave scenarios, 103 unit tests),
+Surveyed base: 272 behave scenarios + 707 unit tests = 979 items;
+adoptable as written: 225 of them (120 behave scenarios, 105 unit tests),
 plus the batch 1/6 protocol specs. The rest is SKIP (osc-internal),
-stdout-only, or covered by geectl's existing live tests.
+stdout-only, covered by geectl's existing tests, or a gap for a batch
+that has not landed. The table sums to 225; issue #40 counts 231
+(125 behave + 106 unit) — the 6-count gap (5 behave + 1 unit)
+predates this sweep and is unresolved.
 
 ## Quirks in osc's own tests
 
