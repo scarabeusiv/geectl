@@ -497,6 +497,16 @@ impl XmlDoc {
             .cloned()
     }
 
+    /// The names of the direct child elements, in document order.
+    /// Opaque entries (comments, processing instructions, text)
+    /// carry no name and are skipped.
+    pub(crate) fn child_names(&self) -> Vec<&str> {
+        self.children
+            .iter()
+            .filter_map(|entry| element_name(entry))
+            .collect()
+    }
+
     /// Drop the first child element named one of `names` and
     /// everything after it. True when anything was dropped; false
     /// when no child carries one of the names. Entries before the
@@ -1018,6 +1028,24 @@ mod tests {
             Some("<person userid=\"alice\" role=\"maintainer\"/>")
         );
         assert!(doc.child("missing").is_none());
+    }
+
+    #[test]
+    fn child_names_lists_direct_child_elements() {
+        let doc = XmlDoc::parse(META).unwrap();
+        assert_eq!(
+            doc.child_names(),
+            vec!["title", "description", "devel", "person", "lock"]
+        );
+    }
+
+    #[test]
+    fn child_names_skips_comments_processing_instructions_and_text() {
+        let doc = XmlDoc::parse(
+            "<project>text<!-- a comment --><?pi data?><title>T</title><!--x--><description>D</description></project>",
+        )
+        .unwrap();
+        assert_eq!(doc.child_names(), vec!["title", "description"]);
     }
 
     #[test]

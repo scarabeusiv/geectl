@@ -2,9 +2,12 @@ use super::build_url;
 use super::parse_status_ok;
 use super::valid_obs_filename;
 use super::valid_obs_name;
+use super::DownloadMaster;
 use super::DryRun;
 use super::ObsClient;
+use super::ReleaseTarget;
 use super::Repository;
+use super::RepositoryDownload;
 use crate::auth::Credentials;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
@@ -1580,9 +1583,11 @@ pub(crate) fn parse_builddepinfo(body: &str) -> Result<Vec<PackageDeps>, GeectlE
 }
 
 /// Parse a `<project ...>...</project>` document (`_meta`) into the
-/// project's repositories. A document that is not a project — or a
-/// `<repository>` without a name, or a `<path>` without a project —
-/// is a server error, never an empty list.
+/// project's repositories, with each repository's rebuild, block,
+/// and linkedbuild flags, downloads, release targets, and host
+/// systems. A document that is not a project — or a `<repository>`
+/// without a name, or a `<path>` without a project — is a server
+/// error, never an empty list.
 pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlError> {
     let body = body.trim();
     // A malformed project meta response still fails closed, but the error
@@ -1671,30 +1676,109 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
                 paths.push((project, repository));
             }
         }
+        let mut downloads = Vec::new();
+        for download in xml_elements(content, "download")? {
+            let (download_tag, download_inner) = xml_split_element(download, "download");
+            let Some(url) = xml_attr(download_tag, "url") else {
+                continue;
+            };
+            let master = xml_elements(download_inner, "master")?
+                .into_iter()
+                .find_map(|master_element| {
+                    let (master_tag, _) = xml_split_element(master_element, "master");
+                    xml_attr(master_tag, "url").map(|master_url| DownloadMaster {
+                        url: master_url,
+                        sslfingerprint: xml_attr(master_tag, "sslfingerprint"),
+                    })
+                });
+            downloads.push(RepositoryDownload {
+                arch: xml_attr(download_tag, "arch"),
+                url,
+                repotype: xml_attr(download_tag, "repotype"),
+                archfilter: xml_element_text(download_inner, "archfilter")
+                    .filter(|value| !value.is_empty()),
+                pubkey: xml_element_text(download_inner, "pubkey")
+                    .filter(|value| !value.is_empty()),
+                master,
+            });
+        }
+        let mut release_targets = Vec::new();
+        for target in xml_elements(content, "releasetarget")? {
+            let (target_tag, _) = xml_split_element(target, "releasetarget");
+            let Some(project) = xml_attr(target_tag, "project") else {
+                continue;
+            };
+            release_targets.push(ReleaseTarget {
+                project,
+                repository: xml_attr(target_tag, "repository"),
+                trigger: xml_attr(target_tag, "trigger"),
+            });
+        }
+        let mut hostsystem = Vec::new();
+        for host_element in xml_elements(content, "hostsystem")? {
+            let (host_tag, _) = xml_split_element(host_element, "hostsystem");
+            if let (Some(project), Some(repository)) = (
+                xml_attr(host_tag, "project"),
+                xml_attr(host_tag, "repository"),
+            ) {
+                hostsystem.push((project, repository));
+            }
+        }
         repositories.push(Repository {
             name,
             arch,
             paths,
-            rebuild: None,
-            block: None,
-            linkedbuild: None,
-            downloads: vec![],
-            release_targets: vec![],
-            hostsystem: None,
+            rebuild: xml_attr(tag, "rebuild"),
+            block: xml_attr(tag, "block"),
+            linkedbuild: xml_attr(tag, "linkedbuild"),
+            downloads,
+            release_targets,
+            hostsystem,
         });
     }
     Ok(repositories)
 }
 
-/// Render a `<repository>` element for `repository`: its name, one
-/// `<arch>` per architecture, and one `<path>` per rebuild source.
-/// Values are escaped, so a value carrying XML syntax cannot break
-/// out of the element.
+/// Render a `<repository>` element for `repository`: its name,
+/// rebuild, block, and linkedbuild flags, one `<arch>` per
+/// architecture, one `<path>` per rebuild source, its downloads,
+/// release targets, and host system. Values are escaped, so a value
+/// carrying XML syntax cannot break out of the element.
 pub(crate) fn repository_element(repository: &Repository) -> String {
     let mut out = String::new();
     out.push_str("<repository name=\"");
     out.push_str(&xml_escape(&repository.name));
-    out.push_str("\">");
+    out.push('"');
+    // An empty value renders as nothing: the parser reads an empty
+    // attribute as absent, so rendering one would not round-trip.
+    if let Some(rebuild) = repository
+        .rebuild
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        out.push_str(" rebuild=\"");
+        out.push_str(&xml_escape(rebuild));
+        out.push('"');
+    }
+    if let Some(block) = repository
+        .block
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        out.push_str(" block=\"");
+        out.push_str(&xml_escape(block));
+        out.push('"');
+    }
+    if let Some(linkedbuild) = repository
+        .linkedbuild
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        out.push_str(" linkedbuild=\"");
+        out.push_str(&xml_escape(linkedbuild));
+        out.push('"');
+    }
+    out.push('>');
     for arch in &repository.arch {
         out.push_str("<arch>");
         out.push_str(&xml_escape(arch));
@@ -1707,7 +1791,106 @@ pub(crate) fn repository_element(repository: &Repository) -> String {
         out.push_str(&xml_escape(repo));
         out.push_str("\"/>");
     }
+    for download in &repository.downloads {
+        out.push_str(&download_element(download));
+    }
+    for target in &repository.release_targets {
+        out.push_str("<releasetarget project=\"");
+        out.push_str(&xml_escape(&target.project));
+        out.push('"');
+        if let Some(repo) = target
+            .repository
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            out.push_str(" repository=\"");
+            out.push_str(&xml_escape(repo));
+            out.push('"');
+        }
+        if let Some(trigger) = target.trigger.as_deref().filter(|value| !value.is_empty()) {
+            out.push_str(" trigger=\"");
+            out.push_str(&xml_escape(trigger));
+            out.push('"');
+        }
+        out.push_str("/>");
+    }
+    for (project, repo) in &repository.hostsystem {
+        out.push_str("<hostsystem project=\"");
+        out.push_str(&xml_escape(project));
+        out.push_str("\" repository=\"");
+        out.push_str(&xml_escape(repo));
+        out.push_str("\"/>");
+    }
     out.push_str("</repository>");
+    out
+}
+
+/// Render a `<download>` element for `download`: its arch, url, and
+/// repotype attributes, with its archfilter, master, and pubkey
+/// children. A download without children is self-closing. Values
+/// are escaped, so a value carrying XML syntax cannot break out of
+/// the element.
+fn download_element(download: &RepositoryDownload) -> String {
+    let mut out = String::new();
+    out.push_str("<download");
+    if let Some(arch) = download.arch.as_deref().filter(|value| !value.is_empty()) {
+        out.push_str(" arch=\"");
+        out.push_str(&xml_escape(arch));
+        out.push('"');
+    }
+    out.push_str(" url=\"");
+    out.push_str(&xml_escape(&download.url));
+    out.push('"');
+    if let Some(repotype) = download
+        .repotype
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        out.push_str(" repotype=\"");
+        out.push_str(&xml_escape(repotype));
+        out.push('"');
+    }
+    // An empty text child renders as nothing: the parser reads an
+    // empty `<archfilter>` or `<pubkey>` as absent, so rendering one
+    // would not round-trip. Empty attribute values render as nothing
+    // for the same reason.
+    let archfilter = download
+        .archfilter
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let pubkey = download.pubkey.as_deref().filter(|value| !value.is_empty());
+    let has_children = archfilter.is_some() || download.master.is_some() || pubkey.is_some();
+    if !has_children {
+        out.push_str("/>");
+        return out;
+    }
+    out.push('>');
+    if let Some(archfilter) = archfilter {
+        out.push_str("<archfilter>");
+        out.push_str(&xml_escape(archfilter));
+        out.push_str("</archfilter>");
+    }
+    if let Some(master) = &download.master {
+        out.push_str("<master url=\"");
+        out.push_str(&xml_escape(&master.url));
+        out.push('"');
+        if let Some(sslfingerprint) = master
+            .sslfingerprint
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            out.push_str(" sslfingerprint=\"");
+            out.push_str(&xml_escape(sslfingerprint));
+            out.push('"');
+        }
+        out.push_str("/>");
+    }
+    if let Some(pubkey) = pubkey {
+        out.push_str("<pubkey>");
+        out.push_str(&xml_escape(pubkey));
+        out.push_str("</pubkey>");
+    }
+    out.push_str("</download>");
     out
 }
 
@@ -1921,7 +2104,7 @@ pub(crate) fn parse_directory_entry_names(body: &str) -> Result<Vec<String>, Gee
     Ok(names)
 }
 
-pub(crate) fn xml_attr(element: &str, name: &str) -> Option<String> {
+fn xml_attr_raw(element: &str, name: &str) -> Option<String> {
     // Quote-aware: a `name=` inside an earlier attribute's value
     // (e.g. `details="x dirty=y"`) must not match. The scan tracks
     // whether it is inside a quoted value and only matches outside
@@ -1977,6 +2160,12 @@ pub(crate) fn xml_attr(element: &str, name: &str) -> Option<String> {
         i += 1;
     }
     None
+}
+
+/// The attribute value, or None when the attribute is absent. An
+/// empty value reads as absent.
+pub(crate) fn xml_attr(element: &str, name: &str) -> Option<String> {
+    xml_attr_raw(element, name).filter(|value| !value.is_empty())
 }
 
 /// The text between `<name>` and `</name>` in `body` (first
@@ -2038,7 +2227,7 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    match xml_attr(tag, name) {
+    match xml_attr_raw(tag, name) {
         None => Ok(None),
         Some(value) => value.parse::<T>().map(Some).map_err(|_| {
             GeectlError::new(
@@ -3075,6 +3264,7 @@ impl<'a> ObsClient<'a> {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+    use crate::obs::parse_project_meta;
     use crate::obs::test_support::{basic_credentials, FakeHttp};
 
     #[test]
@@ -3148,6 +3338,8 @@ mod tests {
         assert_eq!(xml_attr("code=failed", "code"), None);
         // Missing attribute is None.
         assert_eq!(xml_attr("code=\"failed\"", "state"), None);
+        // An empty value reads as absent.
+        assert_eq!(xml_attr("code=\"\"", "code"), None);
     }
 
     #[test]
@@ -5243,6 +5435,184 @@ mod tests {
         assert_eq!(parsed[0].paths[0].1, "standard");
         assert_eq!(parsed[1].name, "ports");
         assert_eq!(parsed[1].arch, vec!["aarch64".to_string()]);
+    }
+
+    #[test]
+    fn parse_repositories_reads_the_full_repository_shape() {
+        let parsed = parse_repositories(
+            "<project name=\"testproject\"><repository name=\"standard\" rebuild=\"local\" block=\"never\" linkedbuild=\"all\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><master url=\"https://master.example.com\" sslfingerprint=\"AB:CD\"/><pubkey>key-material</pubkey></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0],
+            Repository {
+                name: "standard".to_string(),
+                arch: vec!["x86_64".to_string()],
+                paths: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
+                rebuild: Some("local".to_string()),
+                block: Some("never".to_string()),
+                linkedbuild: Some("all".to_string()),
+                downloads: vec![RepositoryDownload {
+                    arch: Some("x86_64".to_string()),
+                    url: "https://example.com".to_string(),
+                    repotype: Some("rpmmd".to_string()),
+                    archfilter: Some("x86_64".to_string()),
+                    pubkey: Some("key-material".to_string()),
+                    master: Some(DownloadMaster {
+                        url: "https://master.example.com".to_string(),
+                        sslfingerprint: Some("AB:CD".to_string()),
+                    }),
+                }],
+                release_targets: vec![ReleaseTarget {
+                    project: "openSUSE:Leap:15.6".to_string(),
+                    repository: Some("standard".to_string()),
+                    trigger: Some("manual".to_string()),
+                }],
+                hostsystem: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
+            }
+        );
+        // Rendered back, the repository is byte-identical.
+        assert_eq!(
+            repository_element(&parsed[0]),
+            "<repository name=\"standard\" rebuild=\"local\" block=\"never\" linkedbuild=\"all\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><master url=\"https://master.example.com\" sslfingerprint=\"AB:CD\"/><pubkey>key-material</pubkey></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository>"
+        );
+    }
+
+    #[test]
+    fn repository_element_drops_empty_optional_values() {
+        let repo = Repository {
+            name: "standard".to_string(),
+            arch: vec!["x86_64".to_string()],
+            paths: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
+            rebuild: Some(String::new()),
+            block: Some(String::new()),
+            linkedbuild: Some(String::new()),
+            downloads: vec![RepositoryDownload {
+                arch: Some(String::new()),
+                url: "https://example.com".to_string(),
+                repotype: Some(String::new()),
+                archfilter: None,
+                pubkey: None,
+                master: Some(DownloadMaster {
+                    url: "https://master.example.com".to_string(),
+                    sslfingerprint: Some(String::new()),
+                }),
+            }],
+            release_targets: vec![ReleaseTarget {
+                project: "openSUSE:Leap:15.6".to_string(),
+                repository: Some(String::new()),
+                trigger: Some(String::new()),
+            }],
+            hostsystem: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
+        };
+        assert_eq!(
+            repository_element(&repo),
+            "<repository name=\"standard\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download url=\"https://example.com\"><master url=\"https://master.example.com\"/></download><releasetarget project=\"openSUSE:Leap:15.6\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository>"
+        );
+    }
+
+    #[test]
+    fn parse_repositories_reads_multiple_hostsystems() {
+        let parsed = parse_repositories(
+            "<project name=\"testproject\"><repository name=\"standard\"><arch>x86_64</arch><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/><hostsystem project=\"openSUSE:Factory:ARM\" repository=\"standard\"/></repository></project>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].hostsystem,
+            vec![
+                ("openSUSE:Factory".to_string(), "snapshot".to_string()),
+                ("openSUSE:Factory:ARM".to_string(), "standard".to_string()),
+            ]
+        );
+        let rendered = repository_element(&parsed[0]);
+        assert!(
+            rendered.contains("<hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/>")
+        );
+        assert!(rendered
+            .contains("<hostsystem project=\"openSUSE:Factory:ARM\" repository=\"standard\"/>"));
+        assert_eq!(
+            parse_repositories(&format!(
+                "<project name=\"testproject\">{rendered}</project>"
+            ))
+            .unwrap(),
+            parsed
+        );
+    }
+
+    #[test]
+    fn parse_repositories_round_trips_a_template_ordered_repository() {
+        // The server emits children in template order (download,
+        // releasetarget, path, hostsystem, arch); the renderer emits
+        // arch first. The typed value survives the reorder.
+        let parsed = parse_repositories(
+            "<project name=\"testproject\"><repository name=\"standard\" rebuild=\"local\"><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"/><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/><arch>x86_64</arch></repository></project>",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        let rendered = repository_element(&parsed[0]);
+        let reparsed = parse_repositories(&format!(
+            "<project name=\"testproject\">{rendered}</project>"
+        ))
+        .unwrap();
+        assert_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn both_repository_parsers_agree_on_empty_attribute_values() {
+        let body = "<project name=\"testproject\"><repository name=\"standard\" rebuild=\"\" block=\"\" linkedbuild=\"\"><arch>x86_64</arch><download arch=\"\" url=\"https://example.com\" repotype=\"\"><archfilter> </archfilter><master url=\"https://master.example.com\" sslfingerprint=\"\"/><pubkey> </pubkey></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"\" trigger=\"\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        let via_project_meta = parse_project_meta(body).unwrap();
+        let via_repositories = parse_repositories(body).unwrap();
+        assert_eq!(via_project_meta.repositories, via_repositories);
+        let repo = &via_project_meta.repositories[0];
+        assert_eq!(repo.rebuild, None);
+        assert_eq!(repo.block, None);
+        assert_eq!(repo.linkedbuild, None);
+        assert_eq!(repo.downloads.len(), 1);
+        assert_eq!(repo.downloads[0].arch, None);
+        assert_eq!(repo.downloads[0].repotype, None);
+        assert_eq!(repo.downloads[0].archfilter, None);
+        assert_eq!(repo.downloads[0].pubkey, None);
+        assert_eq!(
+            repo.downloads[0].master.as_ref().unwrap().sslfingerprint,
+            None
+        );
+        assert_eq!(repo.release_targets[0].repository, None);
+        assert_eq!(repo.release_targets[0].trigger, None);
+    }
+
+    #[test]
+    fn repository_element_escapes_values_in_the_full_shape() {
+        let repo = Repository {
+            name: "standard".to_string(),
+            arch: vec!["x86_64".to_string()],
+            paths: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
+            rebuild: Some("local".to_string()),
+            block: None,
+            linkedbuild: None,
+            downloads: vec![RepositoryDownload {
+                arch: Some("x86_64".to_string()),
+                url: "https://example.com/?a=1&b=2".to_string(),
+                repotype: Some("rpmmd".to_string()),
+                archfilter: None,
+                pubkey: None,
+                master: Some(DownloadMaster {
+                    url: "https://master.example.com/?x=\"y\"".to_string(),
+                    sslfingerprint: None,
+                }),
+            }],
+            release_targets: vec![ReleaseTarget {
+                project: "openSUSE:Leap:15.6".to_string(),
+                repository: Some("standard".to_string()),
+                trigger: Some("a<b".to_string()),
+            }],
+            hostsystem: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
+        };
+        assert_eq!(
+            repository_element(&repo),
+            "<repository name=\"standard\" rebuild=\"local\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com/?a=1&amp;b=2\" repotype=\"rpmmd\"><master url=\"https://master.example.com/?x=&quot;y&quot;\"/></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"a&lt;b\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository>"
+        );
     }
 
     #[test]

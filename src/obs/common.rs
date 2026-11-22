@@ -633,10 +633,58 @@ pub(crate) fn find_element_tag<'a>(body: &'a str, name: &str) -> Option<&'a str>
             rest = after_tag;
             continue;
         }
-        let end = after_tag.find('>')?;
+        let end = find_tag_end(after_tag)?;
         return Some(&after_tag[..end]);
     }
     None
+}
+
+/// The attribute names on an opening tag's text (the text between
+/// `<tag` and `>`), in order, without duplicates. The scan is
+/// quote-aware: a name inside an earlier attribute's value is not
+/// an attribute. An occurrence without a following `=` is not an
+/// attribute, like [`tag_attr`].
+pub(crate) fn tag_attr_names(element: &str) -> Vec<String> {
+    let bytes = element.as_bytes();
+    let mut names = Vec::new();
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(quote) = in_quote {
+            if b == quote {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if (b.is_ascii_alphabetic() || b == b'_') && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+        {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric()
+                    || matches!(bytes[i], b'_' | b'-' | b'.' | b':'))
+            {
+                i += 1;
+            }
+            let name = &element[start..i];
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' && !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+            continue;
+        }
+        i += 1;
+    }
+    names
 }
 
 /// The text of the first `<data name="NAME">VALUE</data>` element in
@@ -819,7 +867,7 @@ pub(crate) fn element_text(block: &str, tag: &str) -> Option<String> {
             rest = after_tag;
             continue;
         }
-        let end = after_tag.find('>')?;
+        let end = find_tag_end(after_tag)?;
         let open_text = &after_tag[..end];
         if open_text.trim_end().ends_with('/') {
             return None;
@@ -855,7 +903,7 @@ pub(crate) fn elements(block: &str, tag: &str) -> Result<Vec<(String, String)>, 
             rest = after_tag;
             continue;
         }
-        let Some(end) = after_tag.find('>') else {
+        let Some(end) = find_tag_end(after_tag) else {
             return Err(malformed());
         };
         let element = &after_tag[..end];
@@ -1366,6 +1414,36 @@ mod tests {
         assert_eq!(
             tag_attr("entry name = 'foo'", "name").as_deref(),
             Some("foo")
+        );
+    }
+
+    #[test]
+    fn tag_attr_names_lists_attributes_in_order() {
+        assert_eq!(
+            tag_attr_names("entry name=\"foo\" md5=\"abc\""),
+            vec!["name".to_string(), "md5".to_string()]
+        );
+        // A name inside an earlier attribute's value is not an attribute.
+        assert_eq!(
+            tag_attr_names("entry details=\"see name=x\" name=\"foo\""),
+            vec!["details".to_string(), "name".to_string()]
+        );
+        // An occurrence without a following `=` is not an attribute,
+        // and a repeated attribute is listed once.
+        assert_eq!(
+            tag_attr_names("entry name=\"foo\" name=\"bar\" stray"),
+            vec!["name".to_string()]
+        );
+        assert_eq!(tag_attr_names("entry"), Vec::<String>::new());
+        // A `>` inside a quoted value does not end the tag.
+        assert_eq!(
+            tag_attr_names("download url=\"https://example.com/?a=b>c\" arch=\"x86_64\""),
+            vec!["url".to_string(), "arch".to_string()]
+        );
+        // Single-quoted values work the same way.
+        assert_eq!(
+            tag_attr_names("download url='https://example.com/?a=b>c' arch='x86_64'"),
+            vec!["url".to_string(), "arch".to_string()]
         );
     }
 

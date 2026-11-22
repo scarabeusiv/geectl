@@ -5,6 +5,7 @@ use super::parse_project_meta;
 use super::parse_status_ok;
 use super::repository_element;
 use super::tag_attr;
+use super::tag_attr_names;
 use super::valid_obs_filename;
 use super::valid_obs_name;
 use super::DryRun;
@@ -257,33 +258,161 @@ fn validate_repositories(repositories: &[Repository]) -> Result<(), GeectlError>
 }
 
 /// The repository settings a meta write does not model, as named in
-/// the refusal: the `rebuild`, `block`, and `linkedbuild`
-/// attributes and the `<download>`, `<releasetarget>`, and
-/// `<hostsystem>` children.
-fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Vec<&'static str> {
+/// the refusal: any attribute outside `name`, `rebuild`, `block`,
+/// and `linkedbuild` on the repository itself; any child outside
+/// `arch`, `path`, `download`, `releasetarget`, and `hostsystem` —
+/// the expanded-repo `<base>` element, for one, is never part of a
+/// project meta; any attribute outside the modeled set on a child
+/// (`download`, `master`, `releasetarget`, `hostsystem`, `path`,
+/// `arch`, `archfilter`, `pubkey`); any child of `<download>`
+/// outside `archfilter`, `master`, and `pubkey`; a second
+/// `<master>`, `<archfilter>`, or `<pubkey>` in one `<download>`;
+/// and any child the parser drops for a missing required value (a
+/// `<repository>` without `name`, a `<download>` without `url`, a
+/// `<releasetarget>` without `project`, a `<hostsystem>` without
+/// `project` or `repository`, a `<path>` without `project` or
+/// `repository`, a `<master>` without `url`); and any content inside
+/// `<master>`, `<releasetarget>`, `<hostsystem>`, or `<path>`, which
+/// carry attributes only.
+fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<String>, GeectlError> {
     let mut found = Vec::new();
-    if tag_attr(open_tag, "rebuild").is_some() {
-        found.push("rebuild attribute");
+    if tag_attr(open_tag, "name").is_none() {
+        push_finding(&mut found, "repository elements without name".to_string());
     }
-    if tag_attr(open_tag, "block").is_some() {
-        found.push("block attribute");
-    }
-    if tag_attr(open_tag, "linkedbuild").is_some() {
-        found.push("linkedbuild attribute");
-    }
-    for (child, label) in [
-        ("download", "download elements"),
-        ("releasetarget", "releasetarget elements"),
-        ("hostsystem", "hostsystem elements"),
-    ] {
-        if elements(inner, child)
-            .map(|found| !found.is_empty())
-            .unwrap_or(false)
-        {
-            found.push(label);
+    for attr in tag_attr_names(open_tag) {
+        if !matches!(attr.as_str(), "name" | "rebuild" | "block" | "linkedbuild") {
+            push_finding(&mut found, format!("{attr} attribute"));
         }
     }
-    found
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<repository .../>`: no children to check.
+        return Ok(found);
+    }
+    let doc = XmlDoc::parse(&format!("<repository{open_tag}>{inner}</repository>"))?;
+    for child in doc.child_names() {
+        if !matches!(
+            child,
+            "arch" | "path" | "download" | "releasetarget" | "hostsystem"
+        ) {
+            push_finding(&mut found, format!("<{child}> elements"));
+        }
+    }
+    for (download_tag, download_inner) in elements(inner, "download")? {
+        if tag_attr(&download_tag, "url").is_none() {
+            push_finding(&mut found, "download elements without url".to_string());
+        }
+        for attr in tag_attr_names(&download_tag) {
+            if !matches!(attr.as_str(), "arch" | "url" | "repotype") {
+                push_finding(&mut found, format!("{attr} attribute on <download>"));
+            }
+        }
+        if download_tag.trim_end().ends_with('/') {
+            continue;
+        }
+        let download_doc = XmlDoc::parse(&format!(
+            "<download{download_tag}>{download_inner}</download>"
+        ))?;
+        for child in ["master", "archfilter", "pubkey"] {
+            let count = download_doc
+                .child_names()
+                .iter()
+                .filter(|name| **name == child)
+                .count();
+            if count > 1 {
+                push_finding(&mut found, format!("duplicate <{child}> in <download>"));
+            }
+        }
+        for child in download_doc.child_names() {
+            if !matches!(child, "archfilter" | "master" | "pubkey") {
+                push_finding(&mut found, format!("<{child}> elements in <download>"));
+            }
+        }
+        for (master_tag, master_inner) in elements(&download_inner, "master")? {
+            if tag_attr(&master_tag, "url").is_none() {
+                push_finding(&mut found, "master elements without url".to_string());
+            }
+            if !master_inner.trim().is_empty() {
+                push_finding(&mut found, "master elements with content".to_string());
+            }
+            for attr in tag_attr_names(&master_tag) {
+                if !matches!(attr.as_str(), "url" | "sslfingerprint") {
+                    push_finding(&mut found, format!("{attr} attribute on <master>"));
+                }
+            }
+        }
+        for name in ["archfilter", "pubkey"] {
+            for (tag, _) in elements(&download_inner, name)? {
+                for attr in tag_attr_names(&tag) {
+                    push_finding(&mut found, format!("{attr} attribute on <{name}>"));
+                }
+            }
+        }
+    }
+    for (target_tag, target_inner) in elements(inner, "releasetarget")? {
+        if tag_attr(&target_tag, "project").is_none() {
+            push_finding(
+                &mut found,
+                "releasetarget elements without project".to_string(),
+            );
+        }
+        if !target_inner.trim().is_empty() {
+            push_finding(
+                &mut found,
+                "releasetarget elements with content".to_string(),
+            );
+        }
+        for attr in tag_attr_names(&target_tag) {
+            if !matches!(attr.as_str(), "project" | "repository" | "trigger") {
+                push_finding(&mut found, format!("{attr} attribute on <releasetarget>"));
+            }
+        }
+    }
+    for (host_tag, host_inner) in elements(inner, "hostsystem")? {
+        if tag_attr(&host_tag, "project").is_none() || tag_attr(&host_tag, "repository").is_none() {
+            push_finding(
+                &mut found,
+                "hostsystem elements without project or repository".to_string(),
+            );
+        }
+        if !host_inner.trim().is_empty() {
+            push_finding(&mut found, "hostsystem elements with content".to_string());
+        }
+        for attr in tag_attr_names(&host_tag) {
+            if !matches!(attr.as_str(), "project" | "repository") {
+                push_finding(&mut found, format!("{attr} attribute on <hostsystem>"));
+            }
+        }
+    }
+    for (path_tag, path_inner) in elements(inner, "path")? {
+        if tag_attr(&path_tag, "project").is_none() || tag_attr(&path_tag, "repository").is_none() {
+            push_finding(
+                &mut found,
+                "path elements without project or repository".to_string(),
+            );
+        }
+        if !path_inner.trim().is_empty() {
+            push_finding(&mut found, "path elements with content".to_string());
+        }
+        for attr in tag_attr_names(&path_tag) {
+            if !matches!(attr.as_str(), "project" | "repository") {
+                push_finding(&mut found, format!("{attr} attribute on <path>"));
+            }
+        }
+    }
+    for (arch_tag, _) in elements(inner, "arch")? {
+        for attr in tag_attr_names(&arch_tag) {
+            push_finding(&mut found, format!("{attr} attribute on <arch>"));
+        }
+    }
+    Ok(found)
+}
+
+/// Record a refusal reason once: the same dropped piece named twice
+/// reads as two problems.
+fn push_finding(found: &mut Vec<String>, finding: String) {
+    if !found.contains(&finding) {
+        found.push(finding);
+    }
 }
 
 /// Refuse a repository rewrite when the fetched document carries
@@ -299,7 +428,7 @@ fn refuse_unmodeled_repositories(body: &str) -> Result<(), GeectlError> {
         )
     })?;
     for (open_tag, inner) in elements(body, "repository")? {
-        let unmodeled = unmodeled_repository_content(&open_tag, &inner);
+        let unmodeled = unmodeled_repository_content(&open_tag, &inner)?;
         if !unmodeled.is_empty() {
             let name = tag_attr(&open_tag, "name").unwrap_or_default();
             return Err(GeectlError::new(
@@ -993,6 +1122,7 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use crate::obs::test_support::{basic_credentials, FakeHttp};
+    use crate::obs::{DownloadMaster, ReleaseTarget, RepositoryDownload};
 
     const PROJECT_META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><description>Old description</description><lock><enable/></lock><person userid=\"alice\" role=\"maintainer\"/><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository><build><disable/></build></project>";
 
@@ -1000,6 +1130,35 @@ mod tests {
 
     fn project_client(http: &FakeHttp) -> ObsClient<'_> {
         ObsClient::with_credentials(http, basic_credentials()).unwrap()
+    }
+
+    fn replacement_repository() -> Repository {
+        Repository {
+            name: "openSUSE_Leap_15.6".to_string(),
+            arch: vec!["x86_64".to_string()],
+            paths: vec![("openSUSE:Leap:15.6".to_string(), "standard".to_string())],
+            rebuild: None,
+            block: None,
+            linkedbuild: None,
+            downloads: vec![],
+            release_targets: vec![],
+            hostsystem: vec![],
+        }
+    }
+
+    fn set_project_meta_replacing_repositories_is_refused(fetched: &str) {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            fetched,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(fetched).unwrap();
+        meta.repositories = vec![replacement_repository()];
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
     }
 
     #[test]
@@ -1035,46 +1194,85 @@ mod tests {
         assert!(rendered.contains("<build><disable/></build>"));
     }
 
-    const PROJECT_META_WITH_UNMODELED_REPOSITORY: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" rebuild=\"local\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpm-md\"/></repository></project>";
+    const PROJECT_META_WITH_FULL_REPOSITORY: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" rebuild=\"local\" block=\"never\" linkedbuild=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><master url=\"https://master.example.com\" sslfingerprint=\"AB:CD\"/><pubkey>key-material</pubkey></download><download arch=\"aarch64\" url=\"https://other.example.com\" repotype=\"rpmmd\"/><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/><releasetarget project=\"openSUSE:Leap:15.5\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+
+    const PROJECT_META_WITH_BASE_REPOSITORY: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><base project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+
+    const PROJECT_META_WITH_UNKNOWN_ATTRIBUTE: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" foo=\"bar\"><arch>x86_64</arch></repository></project>";
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_that_would_drop_settings() {
-        let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
-            PROJECT_META_WITH_UNMODELED_REPOSITORY,
-        );
-        let client = project_client(&http);
-        let mut meta = parse_project_meta(PROJECT_META_WITH_UNMODELED_REPOSITORY).unwrap();
-        meta.repositories = vec![Repository {
-            name: "openSUSE_Leap_15.6".to_string(),
-            arch: vec!["x86_64".to_string()],
-            paths: vec![("openSUSE:Leap:15.6".to_string(), "standard".to_string())],
-            rebuild: None,
-            block: None,
-            linkedbuild: None,
-            downloads: vec![],
-            release_targets: vec![],
-            hostsystem: vec![],        }];
-        let err = client
-            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
-            .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(http.put_calls().is_empty());
-    }
-
-    #[test]
-    fn set_project_meta_keeps_unmodeled_repository_settings_when_they_do_not_change() {
+    fn set_project_meta_replaces_a_repository_that_carries_all_settings() {
         let http = FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
-                PROJECT_META_WITH_UNMODELED_REPOSITORY,
+                PROJECT_META_WITH_FULL_REPOSITORY,
             )
             .with_put(
                 "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
                 "<status code=\"ok\" />",
             );
         let client = project_client(&http);
-        let mut meta = parse_project_meta(PROJECT_META_WITH_UNMODELED_REPOSITORY).unwrap();
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories = vec![Repository {
+            name: "openSUSE_Leap_15.6".to_string(),
+            arch: vec!["x86_64".to_string()],
+            paths: vec![("openSUSE:Leap:15.6".to_string(), "standard".to_string())],
+            rebuild: Some("direct".to_string()),
+            block: Some("local".to_string()),
+            linkedbuild: Some("localdep".to_string()),
+            downloads: vec![RepositoryDownload {
+                arch: Some("x86_64".to_string()),
+                url: "https://replacement.example.com".to_string(),
+                repotype: Some("rpmmd".to_string()),
+                archfilter: None,
+                pubkey: None,
+                master: Some(DownloadMaster {
+                    url: "https://replacement-master.example.com".to_string(),
+                    sslfingerprint: Some("AB:CD".to_string()),
+                }),
+            }],
+            release_targets: vec![ReleaseTarget {
+                project: "openSUSE:Leap:15.5".to_string(),
+                repository: Some("ports".to_string()),
+                trigger: Some("manual".to_string()),
+            }],
+            hostsystem: vec![("openSUSE:Factory:ARM".to_string(), "standard".to_string())],
+        }];
+        assert!(client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert!(puts[0].1.contains("rebuild=\"direct\""));
+        assert!(puts[0].1.contains("block=\"local\""));
+        assert!(puts[0].1.contains("linkedbuild=\"localdep\""));
+        assert!(puts[0].1.contains(
+            "<download arch=\"x86_64\" url=\"https://replacement.example.com\" repotype=\"rpmmd\">"
+        ));
+        assert!(puts[0].1.contains(
+            "<master url=\"https://replacement-master.example.com\" sslfingerprint=\"AB:CD\"/>"
+        ));
+        assert!(puts[0].1.contains(
+            "<releasetarget project=\"openSUSE:Leap:15.5\" repository=\"ports\" trigger=\"manual\"/>"
+        ));
+        assert!(puts[0]
+            .1
+            .contains("<hostsystem project=\"openSUSE:Factory:ARM\" repository=\"standard\"/>"));
+    }
+
+    #[test]
+    fn set_project_meta_keeps_repository_settings_when_they_do_not_change() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PROJECT_META_WITH_FULL_REPOSITORY,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
         meta.title = Some("New title".to_string());
         assert!(client
             .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
@@ -1082,7 +1280,202 @@ mod tests {
         let puts = http.put_calls();
         assert_eq!(puts.len(), 1);
         assert!(puts[0].1.contains("rebuild=\"local\""));
-        assert!(puts[0].1.contains("<download"));    }
+        assert!(puts[0].1.contains("block=\"never\""));
+        assert!(puts[0].1.contains("linkedbuild=\"all\""));
+        assert!(puts[0]
+            .1
+            .contains("<download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\">"));
+        assert!(puts[0].1.contains("<archfilter>x86_64</archfilter>"));
+        assert!(puts[0]
+            .1
+            .contains("<master url=\"https://master.example.com\" sslfingerprint=\"AB:CD\"/>"));
+        assert!(puts[0].1.contains("<pubkey>key-material</pubkey>"));
+        assert!(puts[0].1.contains(
+            "<download arch=\"aarch64\" url=\"https://other.example.com\" repotype=\"rpmmd\"/>"
+        ));
+        assert!(puts[0].1.contains(
+            "<releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/>"
+        ));
+        assert!(puts[0]
+            .1
+            .contains("<releasetarget project=\"openSUSE:Leap:15.5\"/>"));
+        assert!(puts[0]
+            .1
+            .contains("<hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/>"));
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_that_would_drop_settings() {
+        set_project_meta_replacing_repositories_is_refused(PROJECT_META_WITH_BASE_REPOSITORY);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_an_unknown_attribute() {
+        set_project_meta_replacing_repositories_is_refused(PROJECT_META_WITH_UNKNOWN_ATTRIBUTE);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_download_without_url() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" repotype=\"rpmmd\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_releasetarget_without_project() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><releasetarget repository=\"standard\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_hostsystem_without_repository() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><hostsystem project=\"openSUSE:Factory\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_master_without_url() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master sslfingerprint=\"AB:CD\"/></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_an_unknown_download_attribute() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\" foo=\"bar\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_an_unknown_download_child() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><foo/></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_duplicate_master() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://a.example.com\"/><master url=\"https://b.example.com\"/></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_duplicate_archfilter() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><archfilter>aarch64</archfilter></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_duplicate_pubkey() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><pubkey>key-one</pubkey><pubkey>key-two</pubkey></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_status_child() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><status>dirty</status></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_crosshostarch_child() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><crosshostarch>aarch64</crosshostarch></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_self_closing_repository_with_an_unknown_attribute(
+    ) {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" foo=\"bar\"/></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_an_unknown_releasetarget_attribute() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" foo=\"bar\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_an_unknown_hostsystem_attribute() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\" foo=\"bar\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_an_unknown_path_attribute() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\" foo=\"bar\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_an_unknown_arch_attribute() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch foo=\"bar\">x86_64</arch></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_an_unknown_master_attribute() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://master.example.com\" foo=\"bar\"/></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_an_unknown_archfilter_attribute() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter foo=\"bar\">x86_64</archfilter></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_path_without_a_project() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path repository=\"snapshot\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_path_without_a_repository() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_repository_without_a_name() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository><arch>x86_64</arch></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_repository_with_an_empty_name() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"\"><arch>x86_64</arch></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_master_with_a_child() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://master.example.com\"><foo/></master></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_master_with_text() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://master.example.com\">junk</master></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_releasetarget_with_content() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\">junk</releasetarget></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_hostsystem_with_content() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\">junk</hostsystem></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_path_with_content() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\">junk</path></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
 
     #[test]
     fn set_project_meta_accepts_a_repository_without_architectures_or_paths() {
@@ -1100,11 +1493,19 @@ mod tests {
         let mut meta = parse_project_meta(META_HOSTSYSTEM_ONLY).unwrap();
         assert!(meta.repositories[0].arch.is_empty());
         assert!(meta.repositories[0].paths.is_empty());
+        assert_eq!(
+            meta.repositories[0].hostsystem,
+            vec![("openSUSE:Factory".to_string(), "snapshot".to_string())]
+        );
         meta.title = Some("New title".to_string());
         assert!(client
             .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
             .is_ok());
-        assert_eq!(http.put_calls().len(), 1);
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert!(puts[0]
+            .1
+            .contains("<hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/>"));
     }
 
     #[test]

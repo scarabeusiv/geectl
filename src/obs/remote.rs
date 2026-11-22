@@ -15,6 +15,7 @@ use super::AggregateOptions;
 use super::CreatePackageOptions;
 use super::DeleteProjectOptions;
 use super::DirectoryListing;
+use super::DownloadMaster;
 use super::DryRun;
 use super::FilePatch;
 use super::FilePatchStatus;
@@ -30,7 +31,9 @@ use super::Person;
 use super::ProjectMatch;
 use super::ProjectMeta;
 use super::ReleaseOptions;
+use super::ReleaseTarget;
 use super::Repository;
+use super::RepositoryDownload;
 use super::RevisionPatch;
 use super::RevisionRange;
 use super::RevisionSpec;
@@ -1023,8 +1026,9 @@ pub(crate) fn unified_diff(old_path: &str, old: &str, new_path: &str, new: &str)
 }
 
 /// Parse a project meta (`<project>` with `title`, `description`,
-/// `url?`, `scmsync?`, `devel?`, persons, groups, and
-/// `<repository name><arch>*<path project repository/>` children).
+/// `url?`, `scmsync?`, `devel?`, persons, groups, and repositories
+/// carrying name, architectures, paths, rebuild/block/linkedbuild
+/// flags, downloads, release targets, and host systems).
 /// The body must be a `<project>` document with a `name` attribute:
 /// either is missing and the parse is an error, never a meta with
 /// no name.
@@ -1068,16 +1072,64 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
                 paths.push((xml_unescape(&project), xml_unescape(&repository)));
             }
         }
+        let mut downloads = Vec::new();
+        for (download_tag, download_inner) in elements(&repo_inner, "download")? {
+            let Some(url) = tag_attr(&download_tag, "url") else {
+                continue;
+            };
+            let master =
+                elements(&download_inner, "master")?
+                    .into_iter()
+                    .find_map(|(master_tag, _)| {
+                        tag_attr(&master_tag, "url").map(|master_url| DownloadMaster {
+                            url: xml_unescape(&master_url),
+                            sslfingerprint: tag_attr(&master_tag, "sslfingerprint")
+                                .map(|value| xml_unescape(&value)),
+                        })
+                    });
+            downloads.push(RepositoryDownload {
+                arch: tag_attr(&download_tag, "arch").map(|value| xml_unescape(&value)),
+                url: xml_unescape(&url),
+                repotype: tag_attr(&download_tag, "repotype").map(|value| xml_unescape(&value)),
+                archfilter: element_text(&download_inner, "archfilter")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                pubkey: element_text(&download_inner, "pubkey")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                master,
+            });
+        }
+        let mut release_targets = Vec::new();
+        for (target_tag, _) in elements(&repo_inner, "releasetarget")? {
+            let Some(project) = tag_attr(&target_tag, "project") else {
+                continue;
+            };
+            release_targets.push(ReleaseTarget {
+                project: xml_unescape(&project),
+                repository: tag_attr(&target_tag, "repository").map(|value| xml_unescape(&value)),
+                trigger: tag_attr(&target_tag, "trigger").map(|value| xml_unescape(&value)),
+            });
+        }
+        let mut hostsystem = Vec::new();
+        for (host_tag, _) in elements(&repo_inner, "hostsystem")? {
+            if let (Some(project), Some(repository)) = (
+                tag_attr(&host_tag, "project"),
+                tag_attr(&host_tag, "repository"),
+            ) {
+                hostsystem.push((xml_unescape(&project), xml_unescape(&repository)));
+            }
+        }
         repositories.push(Repository {
             name: xml_unescape(&repo_name),
             arch,
             paths,
-            rebuild: None,
-            block: None,
-            linkedbuild: None,
-            downloads: vec![],
-            release_targets: vec![],
-            hostsystem: None,
+            rebuild: tag_attr(&element, "rebuild").map(|value| xml_unescape(&value)),
+            block: tag_attr(&element, "block").map(|value| xml_unescape(&value)),
+            linkedbuild: tag_attr(&element, "linkedbuild").map(|value| xml_unescape(&value)),
+            downloads,
+            release_targets,
+            hostsystem,
         });
     }
     let (persons, groups) = meta_roles(inner)?;
@@ -6844,6 +6896,76 @@ mod tests {
                     hostsystem: vec![],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn project_meta_parses_the_full_repository_shape() {
+        let meta = parse_project_meta(
+            "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" rebuild=\"local\" block=\"never\" linkedbuild=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><master url=\"https://master.example.com\" sslfingerprint=\"AB:CD\"/><pubkey>key-material</pubkey></download><download url=\"https://other.example.com\"/><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/><releasetarget project=\"openSUSE:Leap:15.5\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>",
+        )
+        .unwrap();
+        assert_eq!(meta.repositories.len(), 1);
+        assert_eq!(
+            meta.repositories[0],
+            Repository {
+                name: "openSUSE_Tumbleweed".to_string(),
+                arch: vec!["x86_64".to_string(), "aarch64".to_string()],
+                paths: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
+                rebuild: Some("local".to_string()),
+                block: Some("never".to_string()),
+                linkedbuild: Some("all".to_string()),
+                downloads: vec![
+                    RepositoryDownload {
+                        arch: Some("x86_64".to_string()),
+                        url: "https://example.com".to_string(),
+                        repotype: Some("rpmmd".to_string()),
+                        archfilter: Some("x86_64".to_string()),
+                        pubkey: Some("key-material".to_string()),
+                        master: Some(DownloadMaster {
+                            url: "https://master.example.com".to_string(),
+                            sslfingerprint: Some("AB:CD".to_string()),
+                        }),
+                    },
+                    RepositoryDownload {
+                        arch: None,
+                        url: "https://other.example.com".to_string(),
+                        repotype: None,
+                        archfilter: None,
+                        pubkey: None,
+                        master: None,
+                    },
+                ],
+                release_targets: vec![
+                    ReleaseTarget {
+                        project: "openSUSE:Leap:15.6".to_string(),
+                        repository: Some("standard".to_string()),
+                        trigger: Some("manual".to_string()),
+                    },
+                    ReleaseTarget {
+                        project: "openSUSE:Leap:15.5".to_string(),
+                        repository: None,
+                        trigger: None,
+                    },
+                ],
+                hostsystem: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn project_meta_parses_a_download_url_containing_a_greater_than_sign() {
+        // A `>` inside a quoted attribute value is legal XML and
+        // must not truncate the open tag.
+        let meta = parse_project_meta(
+            "<project name=\"home:scarabeus_iv\"><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com/?a=b>c\" repotype=\"rpmmd\"/></repository></project>",
+        )
+        .unwrap();
+        assert_eq!(meta.repositories.len(), 1);
+        assert_eq!(meta.repositories[0].downloads.len(), 1);
+        assert_eq!(
+            meta.repositories[0].downloads[0].url,
+            "https://example.com/?a=b>c"
         );
     }
 
