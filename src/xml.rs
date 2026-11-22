@@ -1339,6 +1339,18 @@ mod tests {
     }
 
     #[test]
+    fn xml_escape_escapes_the_five_xml_specials() {
+        // `tests/test__private_api.py::TestXmlEscape` pins the same
+        // five escapes (`<`, `>`, `'`, `"`, `&`).
+        assert_eq!(xml_escape("<"), "&lt;");
+        assert_eq!(xml_escape(">"), "&gt;");
+        assert_eq!(xml_escape("'"), "&apos;");
+        assert_eq!(xml_escape("\""), "&quot;");
+        assert_eq!(xml_escape("&"), "&amp;");
+        assert_eq!(xml_escape("a<b>&\"c\""), "a&lt;b&gt;&amp;&quot;c&quot;");
+    }
+
+    #[test]
     fn xml_unescape_decodes_named_and_numeric_entities() {
         assert_eq!(
             xml_unescape("a &amp; b &lt; c &gt; d &quot;e&quot; &apos;f&apos;"),
