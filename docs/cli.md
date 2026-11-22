@@ -136,37 +136,45 @@ Remote reads and mutations: inspect what the distribution holds, and change it
 Usage: geectl remote [OPTIONS] <COMMAND>
 
 Commands:
-  cat                Print a source file to standard output. Text only: the library reads the file as a UTF-8 string, so a binary file fails the call with a server error ("response body is not valid UTF-8") instead of printing bytes
-  list-files         List the files of a package
-  list-packages      List the packages of a project
-  list-projects      List the top-level projects on the instance
-  package-log        Show the commit history of a package
-  revision-patch     Show the per-file diff of one revision against the previous one. Computed client-side from per-file reads (the library lists both revisions and cats each changed file), not a server-side diff; a differing binary file fails the call
-  project-meta       Show a project's meta (title, description, persons, repositories)
-  package-meta       Show a package's meta (title, description, persons, devel project)
-  search-packages    Search packages by name. Substring matches on name, title, and description by default; `--exact` keeps only exact-name matches (exact matching is not provided server-side, so the filter runs client-side)
-  search-projects    Search projects by name. Substring matches on name, title, and description by default; `--exact` keeps only exact-name matches (exact matching is not provided server-side, so the filter runs client-side)
-  owners             Show the owners of a package (project/package scope)
-  owners-for-binary  Show the owners of a binary package
-  maintainers        Show the maintainers of a package
-  whois              Show a user's full name, email, and account state
-  link-target        Show the link target of a package, when it is a link
-  project-diff       Diff two projects, package by package. Computed client-side: the library lists both projects and reads every file of every differing package, so a large diff issues many requests and a differing binary file fails the call
-  diff-packages      Diff two packages, file by file. Computed client-side: the library diffs the two file lists and cats each changed file, so a differing binary file fails the call
-  devel-project      Show the devel project and devel package of a package on Factory, when it has one
-  repo-add           Add a repository to a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the addition
-  repo-remove        Remove a repository from a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the removal. A repository that is not there is not an error
-  upload-file        Upload a file into a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the upload. The local file is read from `--from`; `--binary` uploads bytes instead of text
-  create-project     Create a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the creation
-  create-package     Create a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the creation. Without `--scmsync` and `--force` the package is created directly; with either, the creation goes through the options form, which refuses an existing package unless `--force` is set and refuses a project managed in git
-  delete-package     Delete a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the deletion. Without `--force` a package with open submit requests is refused
-  delete-project     Delete a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the deletion. Without `--recursive` a project holding packages is refused
-  undelete-package   Restore a deleted package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the restore
-  undelete-project   Restore a deleted project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the restore
-  aggregate-package  Aggregate a package's binaries into another package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the aggregation. The target package is created from the source package's meta when it does not exist yet; an `_aggregate` file that already exists is refused
-  release-package    Release a package's sources and binaries. A mutation: dry-run is the default (only the plan is printed); `--live` performs the release. A release to a target project needs a repository and a target repository
-  release-project    Release a whole project's sources and binaries. A mutation: dry-run is the default (only the plan is printed); `--live` performs the release. A release to a target project needs a repository and a target repository
-  help               Print this message or the help of the given subcommand(s)
+  cat                            Print a source file to standard output. Text only: the library reads the file as a UTF-8 string, so a binary file fails the call with a server error ("response body is not valid UTF-8") instead of printing bytes
+  list-files                     List the files of a package
+  list-packages                  List the packages of a project
+  list-projects                  List the top-level projects on the instance
+  list-staging-projects          List the staging projects of a workflow project
+  staging-project                Show one staging project of a workflow project
+  package-log                    Show the commit history of a package
+  revision-patch                 Show the per-file diff of one revision against the previous one. Computed client-side from per-file reads (the library lists both revisions and cats each changed file), not a server-side diff; a differing binary file fails the call
+  project-meta                   Show a project's meta (title, description, persons, repositories)
+  set-project-meta               Set fields of a project's meta. A mutation: dry-run is the default (only the plan is printed); `--live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
+  package-meta                   Show a package's meta (title, description, persons, devel project)
+  set-package-meta               Set fields of a package's meta. A mutation: dry-run is the default (only the plan is printed); `--live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
+  update-package-meta-from-spec  Update a package's meta from its spec file. A mutation: dry-run is the default (only the plan is printed); `--live` performs the update. The spec file is found by listing the package files when exactly one `*.spec` exists; otherwise name it with `--spec`
+  search-packages                Search packages by name. Substring matches on name, title, and description by default; `--exact` keeps only exact-name matches (exact matching is not provided server-side, so the filter runs client-side)
+  search-projects                Search projects by name. Substring matches on name, title, and description by default; `--exact` keeps only exact-name matches (exact matching is not provided server-side, so the filter runs client-side)
+  search-projects-by-person      Search projects by a person's login: every project whose meta names the login in a role
+  count-scmsync-projects         Count the projects syncing from a git URL prefix
+  owners                         Show the owners of a package (project/package scope)
+  owners-for-binary              Show the owners of a binary package
+  maintainers                    Show the maintainers of a package
+  whois                          Show a user's full name, email, and account state
+  link-target                    Show the link target of a package, when it is a link
+  project-diff                   Diff two projects, package by package. Computed client-side: the library lists both projects and reads every file of every differing package, so a large diff issues many requests and a differing binary file fails the call
+  diff-packages                  Diff two packages, file by file. Computed client-side: the library diffs the two file lists and cats each changed file, so a differing binary file fails the call
+  devel-project                  Show the devel project and devel package of a package on Factory, when it has one
+  repo-add                       Add a repository to a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the addition
+  repo-remove                    Remove a repository from a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the removal. A repository that is not there is not an error
+  upload-file                    Upload a file into a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the upload. The local file is read from `--from`; `--binary` uploads bytes instead of text
+  create-project                 Create a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the creation
+  create-package                 Create a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the creation. Without `--scmsync` and `--force` the package is created directly; with either, the creation goes through the options form, which refuses an existing package unless `--force` is set and refuses a project managed in git
+  delete-package                 Delete a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the deletion. Without `--force` a package with open submit requests is refused
+  delete-link                    Delete a `_link` file from a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the deletion. The package keeps its files and meta, but stops tracking the source
+  delete-project                 Delete a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the deletion. Without `--recursive` a project holding packages is refused
+  undelete-package               Restore a deleted package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the restore
+  undelete-project               Restore a deleted project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the restore
+  aggregate-package              Aggregate a package's binaries into another package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the aggregation. The target package is created from the source package's meta when it does not exist yet; an `_aggregate` file that already exists is refused
+  release-package                Release a package's sources and binaries. A mutation: dry-run is the default (only the plan is printed); `--live` performs the release. A release to a target project needs a repository and a target repository
+  release-project                Release a whole project's sources and binaries. A mutation: dry-run is the default (only the plan is printed); `--live` performs the release. A release to a target project needs a repository and a target repository
+  help                           Print this message or the help of the given subcommand(s)
 
 Options:
       --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
@@ -342,6 +350,9 @@ Commands:
   build-log          Read the build log for a package
   build-status       Read the build status code for a package
   job-status         Read the running build job for a package, if any
+  rebuild-package    Rebuild a package: rerun a build without touching the sources. A mutation: dry-run is the default (only the plan is printed); `--live` performs the rebuild
+  restart-build      Restart the running build of a package, without touching the sources. A mutation: dry-run is the default (only the plan is printed); `--live` performs the restart
+  abort-build        Abort the running build of a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the abort
   buildinfo          Read the buildinfo for a package: the blocking error, if any, and the dependencies the build pulls in
   build-history      List the completed builds for a package, newest first
   job-history        List the build jobs that ran in a repository, newest first
