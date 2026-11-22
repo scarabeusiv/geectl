@@ -60,7 +60,7 @@ into the build container is not specified here.
 | `build` | Build the package in `<dir>` for `<repo>` / `<arch>` in a podman container, native arch only. Returns a typed result (verdict, exit code, log path, RPMs, rpmlint summary). | `buildinfo` (GET `/_buildinfo`, the resolved dep list — a prerequisite pure-API op, not part of this vertical) |
 | `build-shell` | Run a scripted command array inside the preserved build root (`chroot` equivalent). No TTY, bounded timeout, stdout/stderr captured as data. | None |
 | `build-wipe` | Delete a build root. Refuses when a build holds the root's lock, and refuses when the directory is not a geectl root (marker file). | None |
-| `build-log` | Read the last build's log (`<root>/.build.log`) — tail, or full, plus the recorded verdict. | None |
+| `build-log` | Read the last build's log (`<root>/.build.log`) — tail, or full up to the 4 MiB read cap, plus the recorded verdict. | None |
 | `build-prune` | Print the eviction plan (what would be evicted, in order, with bytes); delete only with `--apply`. Same policy and safeguards as automatic eviction. | None |
 
 `build` inputs: source directory (spec + sources — a checkout from #17,

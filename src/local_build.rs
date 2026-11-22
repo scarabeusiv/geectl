@@ -104,11 +104,11 @@ const PROBE_TIMEOUT_SECS: u64 = 60;
 /// that inherited the pipe and outlives the child holds EOF open
 /// forever, and the caller must not hang on it (see `take_drain`).
 const DRAIN_JOIN_TIMEOUT_SECS: u64 = 2;
-/// How much of a build log `finish_build` reads (bytes): the
-/// verdict, the rpmlint/check/sccache summaries and the `finished`
-/// line all live at the end of the log, so the tail is what the
-/// parsers need — a verbose build's whole log must never be read
-/// into memory twice over (see `read_log_tail`).
+/// How much of a build log is read at most (bytes):
+/// `finish_build` reads only the tail for its verdict parsing,
+/// and `build_log` reads at most the same window — a verbose
+/// build's whole log must never be read into memory twice over
+/// (see `read_log_tail`).
 const LOG_TAIL_CAP_BYTES: u64 = 4 * 1024 * 1024;
 /// How much of an RPM's head is read at a time to locate its
 /// header (bytes): the lead (96) plus both headers fit in one
@@ -347,6 +347,9 @@ pub struct ShellResult {
 pub struct BuildLog {
     pub log_path: PathBuf,
     pub lines: Vec<String>,
+    /// True when the log file is larger than the read cap, so the
+    /// returned lines come only from its last 4 MiB.
+    pub truncated: bool,
     /// The verdict from the build record (`green`, `failed`), when
     /// the root carries one.
     pub verdict: Option<String>,
@@ -3799,9 +3802,11 @@ impl<'a> LocalBuild<'a> {
     }
 
     /// Read a build log: the last `tail` lines, or the whole log when
-    /// `tail` is None. A tail request reads only the last 4 MiB (see
-    /// `read_log_tail`); the whole log is read only when `tail` is
-    /// None. The record's verdict rides along when a record exists;
+    /// `tail` is None and the log fits the read cap. Both arms read
+    /// at most the last 4 MiB (see `read_log_tail`); in the whole-log
+    /// arm, a larger log returns its last 4 MiB of whole lines with
+    /// `truncated` set.
+    /// The record's verdict rides along when a record exists;
     /// a missing log is `InvalidInput` (the root may exist but has
     /// never built, so there is no log to read).
     pub fn build_log(
@@ -3826,16 +3831,23 @@ impl<'a> LocalBuild<'a> {
                 ),
             ));
         }
+        let truncated = fs::metadata(&log_path)
+            .map(|m| m.len() > LOG_TAIL_CAP_BYTES)
+            .unwrap_or(false);
         let text = match tail {
             Some(_) => read_log_tail(&log_path),
-            None => fs::read(&log_path)
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .map_err(|e| {
+            None => {
+                // `read_log_tail` reads an unreadable log as empty;
+                // the whole-log arm keeps the old contract and
+                // surfaces a read failure instead.
+                File::open(&log_path).map_err(|e| {
                     GeectlError::new(
                         ErrorKind::InternalError,
                         format!("cannot read build log {}: {e}", log_path.display()),
                     )
-                })?,
+                })?;
+                read_log_tail(&log_path)
+            }
         };
         let lines: Vec<&str> = text.lines().collect();
         let shown: Vec<String> = match tail {
@@ -3854,6 +3866,7 @@ impl<'a> LocalBuild<'a> {
             verdict: record.as_ref().map(|r| r.verdict.clone()),
             exit_code: record.as_ref().map(|r| r.exit_code),
             lines: shown,
+            truncated,
         })
     }
 }
@@ -5421,6 +5434,62 @@ exit 0
                 .unwrap();
             assert!(!record.root_path.join(ROOT_MARKER).exists());
             assert!(record.root_path.exists());
+        }
+
+        #[test]
+        fn build_log_full_read_is_capped() {
+            // A log larger than the read cap: the whole-log read
+            // returns only the last 4 MiB of whole lines and
+            // reports truncated, instead of reading the whole file.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let root = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("standard-{}", host_arch()));
+            fs::create_dir_all(&root).unwrap();
+            // build_log reads only the log file, so no marker is
+            // needed here.
+            let mut content = vec![b'x'; LOG_TAIL_CAP_BYTES as usize + 1024];
+            content.extend_from_slice(b"\nfinished \"build foo.spec\"\n");
+            fs::write(root.join(BUILD_LOG), &content).unwrap();
+            let log = vertical
+                .build_log("testproject", "foo", "standard", host_arch(), &None, None)
+                .unwrap();
+            assert!(log.truncated);
+            assert_eq!(log.lines, vec!["finished \"build foo.spec\"".to_string()]);
+            // The returned text stays within the cap.
+            let bytes: usize = log.lines.iter().map(|l| l.len() + 1).sum();
+            assert!(bytes <= LOG_TAIL_CAP_BYTES as usize);
+
+            // The tail arm reports truncation the same way.
+            let log = vertical
+                .build_log(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    Some(1),
+                )
+                .unwrap();
+            assert!(log.truncated);
+            assert_eq!(log.lines, vec!["finished \"build foo.spec\"".to_string()]);
+
+            // A short log reads whole and reports no truncation.
+            fs::write(root.join(BUILD_LOG), b"first\nsecond\n").unwrap();
+            let log = vertical
+                .build_log("testproject", "foo", "standard", host_arch(), &None, None)
+                .unwrap();
+            assert!(!log.truncated);
+            assert_eq!(log.lines, vec!["first".to_string(), "second".to_string()]);
         }
 
         #[test]
