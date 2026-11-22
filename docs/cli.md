@@ -115,7 +115,7 @@ Options:
   -V, --version          Print version
 ```
 
-## `remote` — read-only inspection
+## `remote` — inspection, plus repository edits
 
 ```
 Remote reads: inspect what the distribution holds
@@ -126,6 +126,7 @@ Commands:
   cat                Print a source file to standard output. Text only: the library reads the file as a UTF-8 string, so a binary file fails the call with a server error ("response body is not valid UTF-8") instead of printing bytes
   list-files         List the files of a package
   list-packages      List the packages of a project
+  list-projects      List the top-level projects on the instance
   package-log        Show the commit history of a package
   revision-patch     Show the per-file diff of one revision against the previous one. Computed client-side from per-file reads (the library lists both revisions and cats each changed file), not a server-side diff; a differing binary file fails the call
   project-meta       Show a project's meta (title, description, persons, repositories)
@@ -138,7 +139,10 @@ Commands:
   whois              Show a user's full name, email, and account state
   link-target        Show the link target of a package, when it is a link
   project-diff       Diff two projects, package by package. Computed client-side: the library lists both projects and reads every file of every differing package, so a large diff issues many requests and a differing binary file fails the call
+  diff-packages      Diff two packages, file by file. Computed client-side: the library diffs the two file lists and cats each changed file, so a differing binary file fails the call
   devel-project      Show the devel project and devel package of a package on Factory, when it has one
+  repo-add           Add a repository to a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the addition
+  repo-remove        Remove a repository from a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the removal. A repository that is not there is not an error
   help               Print this message or the help of the given subcommand(s)
 
 Options:

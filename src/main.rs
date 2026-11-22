@@ -155,7 +155,7 @@ fn run(
                 (payload, text)
             }
         },
-        Some(Command::Remote { command }) => cli_remote::run_remote(command, debug)?,
+        Some(Command::Remote { command }) => cli_remote::run_remote(command, debug, cli.live)?,
         Some(Command::Branch { command }) => cli_branch::run_branch(*command, debug, cli.live)?,
         Some(Command::Maintenance { command }) => {
             let (payload, text) = maintenance::run(command, debug, cli.live)?;

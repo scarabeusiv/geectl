@@ -605,7 +605,11 @@ fn remote_help_lists_every_command() {
         "whois",
         "link-target",
         "project-diff",
+        "diff-packages",
         "devel-project",
+        "repo-add",
+        "repo-remove",
+        "list-projects",
     ] {
         assert!(
             stdout.contains(command),

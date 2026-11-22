@@ -1,7 +1,9 @@
 //! Remote-read CLI commands (`geectl remote ...`).
 //!
 //! The read surface for inspecting what the distribution holds: file
-//! contents, listings, history, meta, search, ownership, and diffs.
+//! contents, listings, history, meta, search, ownership, and diffs —
+//! plus the group's two mutations, `repo-add` and `repo-remove`,
+//! which edit a project's repository list in its meta.
 //! Each command is a thin wrapper over one `ObsClient` operation: the
 //! flags mirror the library parameters, the JSON payload carries the
 //! typed values, and the text renderer prints the same values in a
@@ -32,28 +34,36 @@
 //! Tables stay as designed; the header is the only addition. Two
 //! commands are content commands and stay verbatim (design rule 4):
 //! `cat` (the file itself) and the diffs (`revision-patch`,
-//! `project-diff`) — a synthetic empty line (`no changes …`,
+//! `project-diff`, `diff-packages`) — a synthetic empty line (`no changes …`,
 //! `no packages`) still carries the header. Three single-object
 //! renders need no separate header because their first line already
 //! is the coordinate: `project-meta` (`name:`), `package-meta`
-//! (`name:` + `project:`) and `whois` (`login:`).
+//! (`name:` + `project:`) and `whois` (`login:`). `list-projects`
+//! carries no header either: the query names no project, package,
+//! or term to echo, so the table is the whole rendering.
+//!
+//! The group's two mutations (`repo-add`, `repo-remove`) follow the
+//! CLI-wide rule: dry-run by default, the global `--live` performs
+//! them, and the text opens with the coordinate header, then
+//! `dry_run:`, then the result line and the plan.
 //!
 //! Documented omissions (decided, not gaps): `list-files` text
 //! carries no md5 (a verification value, not an identifier);
 //! `package-log` text carries no comment or srcmd5 (long free text
 //! and a verification value); search tables carry no description
-//! (long free text — titles stay); `revision-patch` and
-//! `project-diff` diffs are the server text itself, not re-rendered.
+//! (long free text — titles stay); `revision-patch`,
+//! `project-diff`, and `diff-packages` diffs are the server text
+//! itself, not re-rendered.
 //! The JSON payload remains the complete record in every case.
 
 use clap::Subcommand;
 use geectl::auth::{Credentials, EnvObsAuth};
 use geectl::config;
 use geectl::debug::Debug;
-use geectl::error::GeectlError;
+use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff,
+    DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff,
     PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch, ProjectMeta, Repository,
     RevisionPatch, RevisionRange, SourceFile, FACTORY_PROJECT, OBS_API_BASE,
 };
@@ -90,6 +100,8 @@ pub enum RemoteCommand {
         /// The project to list.
         project: String,
     },
+    /// List the top-level projects on the instance.
+    ListProjects,
     /// Show the commit history of a package.
     PackageLog {
         /// The project the package lives in.
@@ -197,17 +209,64 @@ pub enum RemoteCommand {
         #[arg(long)]
         annotate_requests: bool,
     },
+    /// Diff two packages, file by file. Computed client-side: the
+    /// library diffs the two file lists and cats each changed file,
+    /// so a differing binary file fails the call.
+    DiffPackages {
+        /// The old project.
+        old_project: String,
+        /// The old package.
+        old_package: String,
+        /// The new project.
+        new_project: String,
+        /// The new package.
+        new_package: String,
+    },
     /// Show the devel project and devel package of a package on
     /// Factory, when it has one.
     DevelProject {
         /// The package to look up.
         package: String,
     },
+    /// Add a repository to a project. A mutation: dry-run is the
+    /// default (only the plan is printed); `--live` performs the
+    /// addition.
+    RepoAdd {
+        /// The project to add the repository to.
+        project: String,
+        /// The repository name.
+        name: String,
+        /// An architecture the repository builds for (repeatable;
+        /// at least one is required).
+        #[arg(long, required = true)]
+        arch: Vec<String>,
+        /// A rebuild source as `PROJECT/REPOSITORY` (repeatable; at
+        /// least one is required).
+        #[arg(long, required = true)]
+        path: Vec<String>,
+        /// Disable publishing for the added repository.
+        #[arg(long)]
+        disable_publish: bool,
+    },
+    /// Remove a repository from a project. A mutation: dry-run is
+    /// the default (only the plan is printed); `--live` performs
+    /// the removal. A repository that is not there is not an error.
+    RepoRemove {
+        /// The project to remove the repository from.
+        project: String,
+        /// The repository name.
+        name: String,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
-/// rendering.
-pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, String), GeectlError> {
+/// rendering. `live` performs the group's two mutations
+/// (`repo-add`, `repo-remove`); the reads ignore it.
+pub fn run_remote(
+    command: RemoteCommand,
+    debug: &Debug,
+    live: bool,
+) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let (base, credentials) = obs_endpoint()?;
     let client =
@@ -245,6 +304,13 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
         RemoteCommand::ListPackages { project } => {
             let packages = client.list_packages(&project)?;
             Ok(list_packages_result(&project, packages))
+        }
+        RemoteCommand::ListProjects => {
+            let projects = client.list_projects()?;
+            let payload = json!({
+                "projects": projects,
+            });
+            Ok((payload, render_project_names(&projects)))
         }
         RemoteCommand::PackageLog {
             project,
@@ -407,6 +473,102 @@ pub fn run_remote(command: RemoteCommand, debug: &Debug) -> Result<(Value, Strin
             let devel = client.devel_project(FACTORY_PROJECT, &package)?;
             Ok(devel_project_result(&package, devel))
         }
+        RemoteCommand::DiffPackages {
+            old_project,
+            old_package,
+            new_project,
+            new_package,
+        } => {
+            let files =
+                client.diff_packages(&old_project, &old_package, &new_project, &new_package)?;
+            let payload = json!({
+                "old_project": old_project,
+                "old_package": old_package,
+                "new_project": new_project,
+                "new_package": new_package,
+                "files": files.iter().map(file_patch_json).collect::<Vec<_>>(),
+            });
+            let text = render_diff_packages(&files);
+            // Content stays verbatim; only the synthetic empty line
+            // carries the header (design rule 1).
+            let text = if files.is_empty() {
+                with_header(
+                    &format!("old: {old_project}/{old_package} new: {new_project}/{new_package}"),
+                    text,
+                )
+            } else {
+                text
+            };
+            Ok((payload, text))
+        }
+        RemoteCommand::RepoAdd {
+            project,
+            name,
+            arch,
+            path,
+            disable_publish,
+        } => {
+            let paths = parse_repo_paths(&path)?;
+            let repository = Repository {
+                name: name.clone(),
+                arch: arch.clone(),
+                paths,
+            };
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            let changed =
+                client.add_repository(&project, &repository, disable_publish, &dry_run)?;
+            let payload = json!({
+                "project": project,
+                "repository": repository_json(&repository),
+                "disable_publish": disable_publish,
+                "changed": changed,
+            });
+            let result_line = if dry_run.enabled() {
+                format!("dry-run: would add repository {name} to project {project}")
+            } else {
+                format!("added repository {name} to project {project}")
+            };
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(mutation_result(
+                payload,
+                format!("project: {project} repository: {name}"),
+                result_line,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
+        RemoteCommand::RepoRemove { project, name } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            let changed = client.remove_repository(&project, &name, &dry_run)?;
+            let payload = json!({
+                "project": project,
+                "repository": name,
+                "changed": changed,
+            });
+            let result_line = if dry_run.enabled() {
+                format!("dry-run: would remove repository {name} from project {project}")
+            } else if changed {
+                format!("removed repository {name} from project {project}")
+            } else {
+                format!("repository {name} not present in project {project}")
+            };
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(mutation_result(
+                payload,
+                format!("project: {project} repository: {name}"),
+                result_line,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
     }
 }
 
@@ -488,6 +650,56 @@ fn render_package_names(packages: &[String]) -> String {
     }
     let rows: Vec<Vec<String>> = packages.iter().map(|name| vec![name.clone()]).collect();
     render_table(&["NAME"], &rows)
+}
+
+/// The top-level project names as a table. No coordinate header:
+/// the query names no project, package, or term to echo, so the
+/// table is the whole rendering.
+fn render_project_names(projects: &[String]) -> String {
+    if projects.is_empty() {
+        return "no projects".to_string();
+    }
+    let rows: Vec<Vec<String>> = projects.iter().map(|name| vec![name.clone()]).collect();
+    render_table(&["NAME"], &rows)
+}
+
+/// Combine a mutation payload and its text lines: `dry_run` joins
+/// the payload and goes right after the header line (the branch
+/// renderer's order); the plan, when present, joins the payload and
+/// follows the header and result lines verbatim.
+fn mutation_result(
+    mut payload: Value,
+    header: String,
+    result_line: String,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    payload["dry_run"] = json!(dry_run);
+    let mut lines = vec![header, format!("dry_run: {dry_run}"), result_line];
+    if let Some(plan) = plan {
+        payload["plan"] = json!(plan);
+        lines.extend(plan);
+    }
+    (payload, lines.join("\n"))
+}
+
+/// Parse `--path PROJECT/REPOSITORY` values into
+/// `(project, repository)` pairs: the two sides split on the first
+/// `/`. A value with no `/`, or an empty side, is an input error
+/// naming the expected form.
+fn parse_repo_paths(paths: &[String]) -> Result<Vec<(String, String)>, GeectlError> {
+    paths
+        .iter()
+        .map(|path| match path.split_once('/') {
+            Some((project, repository)) if !project.is_empty() && !repository.is_empty() => {
+                Ok((project.to_string(), repository.to_string()))
+            }
+            _ => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid repository path {path:?}: expected PROJECT/REPOSITORY"),
+            )),
+        })
+        .collect()
 }
 
 fn maintainers_result(
@@ -838,8 +1050,25 @@ fn render_revision_patch(patch: &RevisionPatch) -> String {
         }
         return format!("no changes in revision {}", patch.rev);
     }
+    render_file_patch_sections(&patch.files)
+}
+
+/// The per-file diff sections of a two-package diff, verbatim: one
+/// `file: <name> (<status>)` header per file, then the unified diff
+/// itself. A content rendering — the diffs are the server text, not
+/// re-rendered.
+fn render_diff_packages(files: &[FilePatch]) -> String {
+    if files.is_empty() {
+        return "no changes".to_string();
+    }
+    render_file_patch_sections(files)
+}
+
+/// One `file: <name> (<status>)` section per file patch, the diff
+/// text verbatim underneath.
+fn render_file_patch_sections(files: &[FilePatch]) -> String {
     let mut sections = Vec::new();
-    for file in &patch.files {
+    for file in files {
         sections.push(format!(
             "file: {} ({})\n{}",
             file.filename,
@@ -1203,6 +1432,130 @@ mod tests {
                 ..
             } if include == vec!["vim", "curl"] && exclude == vec!["kernel"]
         ));
+    }
+
+    #[test]
+    fn new_remote_commands_parse() {
+        assert!(matches!(
+            parse(&["geectl", "remote", "list-projects"]),
+            RemoteCommand::ListProjects
+        ));
+        assert!(matches!(
+            parse(&[
+                "geectl",
+                "remote",
+                "diff-packages",
+                "OLD",
+                "vim",
+                "NEW",
+                "vim"
+            ]),
+            RemoteCommand::DiffPackages { .. }
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "repo-add",
+            "P",
+            "standard",
+            "--arch",
+            "x86_64",
+            "--arch",
+            "aarch64",
+            "--path",
+            "openSUSE:Factory/standard",
+            "--disable-publish",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::RepoAdd {
+                arch,
+                path,
+                disable_publish: true,
+                ..
+            } if arch == vec!["x86_64", "aarch64"]
+                && path == vec!["openSUSE:Factory/standard"]
+        ));
+        assert!(matches!(
+            parse(&["geectl", "remote", "repo-remove", "P", "standard"]),
+            RemoteCommand::RepoRemove { .. }
+        ));
+    }
+
+    #[test]
+    fn repo_add_requires_arch_and_path() {
+        // clap enforces at least one `--arch` and one `--path`:
+        // the library refuses an empty arch or path list, so the
+        // flags must fail at parse time, not at the call.
+        assert!(Cli::try_parse_from([
+            "geectl",
+            "remote",
+            "repo-add",
+            "P",
+            "standard",
+            "--path",
+            "openSUSE:Factory/standard",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "geectl", "remote", "repo-add", "P", "standard", "--arch", "x86_64",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn repo_paths_split_on_the_first_slash() {
+        assert_eq!(
+            parse_repo_paths(&["openSUSE:Factory/standard".to_string()]).unwrap(),
+            vec![("openSUSE:Factory".to_string(), "standard".to_string())]
+        );
+        assert!(parse_repo_paths(&["no-slash".to_string()]).is_err());
+        assert!(parse_repo_paths(&["/standard".to_string()]).is_err());
+        assert!(parse_repo_paths(&["openSUSE:Factory/".to_string()]).is_err());
+    }
+
+    #[test]
+    fn list_projects_renders_a_name_table() {
+        let text =
+            render_project_names(&["openSUSE:Factory".to_string(), "home:alice".to_string()]);
+        assert!(text.contains("openSUSE:Factory"));
+        assert!(text.contains("home:alice"));
+        assert_eq!(render_project_names(&[]), "no projects");
+    }
+
+    #[test]
+    fn diff_packages_renders_per_file_sections_verbatim() {
+        let files = vec![FilePatch {
+            filename: "vim.spec".to_string(),
+            status: FilePatchStatus::Modified,
+            diff: "--- a/vim.spec\n+++ b/vim.spec\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
+        }];
+        let text = render_diff_packages(&files);
+        assert!(text.contains("file: vim.spec (modified)"));
+        assert!(text.contains("--- a/vim.spec"));
+        assert_eq!(render_diff_packages(&[]), "no changes");
+    }
+
+    #[test]
+    fn mutation_result_carries_dry_run_and_plan_in_order() {
+        let payload = json!({ "project": "P", "repository": "standard" });
+        let (payload, text) = mutation_result(
+            payload,
+            "project: P repository: standard".to_string(),
+            "dry-run: would remove repository standard from project P".to_string(),
+            true,
+            Some(vec!["remove repository standard from project P".to_string()]),
+        );
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "remove repository standard from project P"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "project: P repository: standard");
+        assert_eq!(lines[1], "dry_run: true");
+        assert!(lines[2].starts_with("dry-run: would remove"));
+        assert_eq!(lines[3], "remove repository standard from project P");
     }
 
     #[test]
