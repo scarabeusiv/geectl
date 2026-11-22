@@ -902,7 +902,7 @@ impl<'a> GiteaClient<'a> {
     ) -> Result<Option<GiteaRepository>, GeectlError> {
         let source = format!("{source_owner}/{source_repo}");
         match &existing.parent {
-            Some(parent) if parent.full_name == source => {
+            Some(parent) if parent.full_name.eq_ignore_ascii_case(&source) => {
                 self.debug.emit(&format!(
                     "decision: reusing existing fork {} for {source}",
                     existing.full_name
@@ -944,7 +944,7 @@ impl<'a> GiteaClient<'a> {
             }
         };
         match &re_read.parent {
-            Some(parent) if parent.full_name == source => Ok(re_read),
+            Some(parent) if parent.full_name.eq_ignore_ascii_case(&source) => Ok(re_read),
             _ => Err(GeectlError::new(
                 ErrorKind::ServerError,
                 format!(
@@ -4478,6 +4478,36 @@ mod tests {
     }
 
     #[test]
+    fn fork_repo_verify_accepts_a_parent_whose_case_differs() {
+        // The re-read reports the parent as Pool/Systemd while the
+        // source was requested as pool/systemd: the fork was created
+        // fine, so the verification accepts it instead of failing
+        // with a ServerError.
+        let fork_body = repo_json("fbui", "systemd", Some(("Pool", "Systemd")));
+        let http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui", "future_field": 1}"#,
+            ),
+            "pool",
+            "systemd",
+            "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+            &fork_body,
+        );
+        let fork = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fork.full_name, "fbui/systemd");
+        assert_eq!(fork.parent.as_ref().unwrap().full_name, "Pool/Systemd");
+    }
+
+    #[test]
     fn fork_repo_sends_name_and_organization_when_given() {
         let fork_body = repo_json("rpm", "systemd-slfo", Some(("pool", "systemd")));
         let http = FakeHttp::new()
@@ -4546,6 +4576,34 @@ mod tests {
             lines.lock().unwrap().clone(),
             vec!["decision: reusing existing fork fbui/systemd for pool/systemd".to_string()]
         );
+    }
+
+    #[test]
+    fn fork_repo_reuses_the_existing_fork_when_the_parent_case_differs() {
+        // The parent is reported as Pool/Systemd while the source was
+        // requested as pool/systemd: repo identity is case-insensitive
+        // (like parse_repository), so the fork is reused, not refused.
+        let fork_body = repo_json("fbui", "systemd", Some(("Pool", "Systemd")));
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/fbui/systemd",
+                &fork_body,
+            );
+        let fork = client(&http)
+            .fork_repo(
+                "pool",
+                "systemd",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fork.full_name, "fbui/systemd");
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]
