@@ -8,7 +8,6 @@ use super::meta_roles;
 use super::parse_search_matches;
 use super::parse_status_invoked;
 use super::parse_status_ok;
-use super::quoted_attr_value;
 use super::tag_attr;
 use super::valid_obs_filename;
 use super::valid_obs_name;
@@ -163,95 +162,6 @@ fn create_package_option_suffix(options: &CreatePackageOptions) -> String {
     } else {
         format!(" ({})", parts.join(", "))
     }
-}
-
-/// Extract the devel project from an OBS directory listing
-/// (`<devel project="..." package="..."/>`). None when the listing
-/// carries no `<devel>` element. The element is found by tag and the
-/// `project` attribute read within it, so the attribute order does
-/// not matter.
-///
-/// The body must be a `<directory>` document: a body that is not one
-/// (empty, truncated, or some other document) is an error, never
-/// None — a truncated 200 body must not read as "no devel project".
-/// A `<devel>` element without a `project` attribute is skipped, not
-/// an error: only the directory envelope itself is validated here.
-pub(crate) fn parse_devel_project(body: &str) -> Result<Option<String>, GeectlError> {
-    let malformed = || {
-        GeectlError::new(
-            ErrorKind::ServerError,
-            "unexpected OBS directory response: not a <directory> document",
-        )
-    };
-    let body = body.trim();
-    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
-    // before the directory element; skip it. The prolog must
-    // terminate (`?>`) — an unterminated prolog is malformed, not a
-    // missing directory.
-    let body = if let Some(after) = body.strip_prefix("<?xml") {
-        let first = after.chars().next();
-        if !matches!(first, Some(c) if c.is_whitespace() || c == '?') {
-            return Err(malformed());
-        }
-        let Some(end) = after.find("?>") else {
-            return Err(malformed());
-        };
-        after[end + 2..].trim_start()
-    } else {
-        body
-    };
-    let Some(after_open) = body.strip_prefix("<directory") else {
-        return Err(malformed());
-    };
-    // The tag name must end here: `<directorylisting>` is not a
-    // directory element. The next character is whitespace, `/`, or `>`.
-    let Some(first) = after_open.chars().next() else {
-        return Err(malformed());
-    };
-    if !(first.is_whitespace() || first == '/' || first == '>') {
-        return Err(malformed());
-    }
-    // The opening tag ends at the first `>`.
-    let Some(end) = after_open.find('>') else {
-        return Err(malformed());
-    };
-    let open_tag = &after_open[..end];
-    if open_tag.trim_end().ends_with('/') {
-        // Self-closing `<directory .../>`: no children, so no devel.
-        return Ok(None);
-    }
-    let inner = &after_open[end + 1..];
-    let Some(close) = inner.find("</directory>") else {
-        return Err(malformed());
-    };
-    // Nothing but whitespace may follow the closing tag.
-    if !inner[close + "</directory>".len()..].trim().is_empty() {
-        return Err(malformed());
-    }
-    let mut rest = &inner[..close];
-    while let Some(pos) = rest.find("<devel") {
-        let after_tag = &rest[pos + "<devel".len()..];
-        // The tag name must end here: `<development>` is not a devel
-        // element. The next character is whitespace, `/`, or `>`.
-        let Some(first) = after_tag.chars().next() else {
-            return Err(malformed());
-        };
-        if !(first.is_whitespace() || first == '/' || first == '>') {
-            rest = after_tag;
-            continue;
-        }
-        // The element ends at the first `>`: an unterminated devel
-        // element is a malformed listing, not "no devel project".
-        let Some(end) = after_tag.find('>') else {
-            return Err(malformed());
-        };
-        let element = &after_tag[..end];
-        if let Some(project) = quoted_attr_value(element, "project") {
-            return Ok(Some(project));
-        }
-        rest = &after_tag[end..];
-    }
-    Ok(None)
 }
 
 /// Extract the Version field from a spec file. Returns None if absent.
@@ -1173,6 +1083,8 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
 /// Parse a package meta (`<package>` with `title`, `description`,
 /// `url?`, `scmsync?`, `releasename?`, `devel project package?`,
 /// `<person userid role/>`, and `<group groupid role/>` children).
+/// A `<devel>` without a `package` attribute means the devel package
+/// keeps this package's name.
 /// The body must be a `<package>` document with `name` and `project`
 /// attributes: either is missing and the parse is an error, never a
 /// meta with no name.
@@ -1189,9 +1101,11 @@ pub(crate) fn parse_package_meta(body: &str) -> Result<PackageMeta, GeectlError>
     let devel = {
         let mut found = None;
         for (element, _) in elements(inner, "devel")? {
-            if let (Some(devel_project), Some(devel_package)) =
-                (tag_attr(&element, "project"), tag_attr(&element, "package"))
-            {
+            if let Some(devel_project) = tag_attr(&element, "project") {
+                // A missing package attribute means the devel package
+                // keeps this package's name: the setter omits it in
+                // exactly that case (see `set_devel_project`).
+                let devel_package = tag_attr(&element, "package").unwrap_or_else(|| name.clone());
                 found = Some((xml_unescape(&devel_project), xml_unescape(&devel_package)));
                 break;
             }
@@ -1414,73 +1328,77 @@ fn validate_login(login: &str) -> Result<(), GeectlError> {
 }
 
 impl<'a> ObsClient<'a> {
-    /// Return the devel project for `package` on Factory, or None
-    /// when no devel project is registered. A 404 is None as well:
-    /// the package is not there, so it has no devel project. Any
-    /// other failed lookup is an error, never None.
-    pub fn devel_project(&self, package: &str) -> Result<Option<String>, GeectlError> {
-        if !valid_obs_name(package) {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!("invalid OBS package name: {package:?}"),
-            ));
+    /// Return the devel (project, package) pair for `package` in
+    /// project `project`, or None when no devel mapping is
+    /// registered. `GET /public/source/<project>/<package>/_meta`; a
+    /// public read, no credentials. The pair comes from the package
+    /// meta (`<devel project package/>`): the package half can differ
+    /// from the queried package name, so only the pair carries it. A
+    /// 404 is None as well: the package is not there, so it has no
+    /// devel mapping. Any other failed lookup is an error, never None.
+    pub fn devel_project(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<Option<(String, String)>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
         }
-        let url = build_url(
-            &self.base,
-            &["public", "source", FACTORY_PROJECT, package],
-            &[],
-        );
-        let body = match self.http.get_with(&url, &Credentials::None) {
-            Ok(body) => body,
-            // A 404 means the package (or Factory itself) is not
-            // there, so it has no devel project — that is None, not
+        let meta = match self.package_meta(project, package) {
+            Ok(meta) => meta,
+            // A 404 means the package (or the project itself) is not
+            // there, so it has no devel mapping — that is None, not
             // a failed lookup. Any other failure stays an error.
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let project = parse_devel_project(&body)?;
-        // The project comes from network XML, so it is validated at
-        // the source like any other interpolated value: a devel
-        // project that is not a valid OBS name is unexpected server
-        // data (ServerError), not a caller mistake — the
-        // caller-supplied package name is what InvalidInput is for.
-        if let Some(project) = &project {
-            if !valid_obs_name(project) {
+        let Some((devel_project, devel_package)) = meta.devel else {
+            return Ok(None);
+        };
+        // Both halves come from network XML, so they are validated at
+        // the source like any other interpolated value: a devel name
+        // that is not a valid OBS name is unexpected server data
+        // (ServerError), not a caller mistake — the caller-supplied
+        // names are what InvalidInput is for.
+        for (label, value) in [("project", &devel_project), ("package", &devel_package)] {
+            if !valid_obs_name(value) {
                 return Err(GeectlError::new(
                     ErrorKind::ServerError,
-                    format!("invalid OBS project name: {project:?}"),
+                    format!("invalid OBS {label} name: {value:?}"),
                 ));
             }
         }
-        Ok(project)
+        Ok(Some((devel_project, devel_package)))
     }
 
-    /// Return the devel project's Version of `package`, or None when
-    /// the package has no devel project or its spec carries no
-    /// Version. A failed lookup is an error, never None.
+    /// Return the devel package's Version of `package`, or None when
+    /// the package has no devel mapping or its spec carries no
+    /// Version. A failed lookup is an error, never None — including a
+    /// missing spec file: the devel package may carry no spec, or the
+    /// spec may keep the Factory package name after a rename, so the
+    /// `{devel_package}.spec` read can 404 with `NotFound`. The spec is
+    /// read from the devel package, not the queried package: the
+    /// devel package name can differ from the queried one.
     pub fn devel_version(&self, package: &str) -> Result<Option<String>, GeectlError> {
-        let project = match self.devel_project(package)? {
-            Some(project) => project,
+        // `devel_project` validates both halves at the source, so
+        // the names are safe to interpolate here.
+        let (project, devel_package) = match self.devel_project(FACTORY_PROJECT, package)? {
+            Some(pair) => pair,
             None => return Ok(None),
         };
-        // The project comes from network XML (`<devel project>`), so
-        // it is validated and encoded like any other interpolated
-        // value before it goes into a URL. Like `devel_project`,
-        // an invalid network-sourced name is unexpected server data.
-        if !valid_obs_name(&project) {
-            return Err(GeectlError::new(
-                ErrorKind::ServerError,
-                format!("invalid OBS project name: {project:?}"),
-            ));
-        }
         let url = build_url(
             &self.base,
             &[
                 "public",
                 "source",
                 &project,
-                package,
-                &format!("{package}.spec"),
+                &devel_package,
+                &format!("{devel_package}.spec"),
             ],
             &[],
         );
@@ -3290,20 +3208,25 @@ mod tests {
 
     #[test]
     fn devel_project_extracted() {
+        // The devel package differs from the queried package: the
+        // pair must carry it, not just the project.
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-            "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"python-foo\"/></package>",
         );
         let client = ObsClient::new(&http);
         assert_eq!(
-            client.devel_project("foo").unwrap(),
-            Some("devel:languages:python".to_string())
+            client.devel_project("openSUSE:Factory", "foo").unwrap(),
+            Some((
+                "devel:languages:python".to_string(),
+                "python-foo".to_string()
+            ))
         );
         // The public read carries no credentials.
         assert_eq!(
             http.get_calls(),
             vec![(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo".to_string(),
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta".to_string(),
                 false
             )]
         );
@@ -3312,37 +3235,43 @@ mod tests {
     #[test]
     fn devel_project_missing_is_none() {
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-            "<directory name=\"foo\"></directory>",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"></package>",
         );
         let client = ObsClient::new(&http);
-        assert_eq!(client.devel_project("foo").unwrap(), None);
+        assert_eq!(
+            client.devel_project("openSUSE:Factory", "foo").unwrap(),
+            None
+        );
     }
 
     #[test]
     fn devel_project_missing_package_is_none() {
         // A 404 means the package is not there, so it has no devel
-        // project — that is None, not a failed lookup. Any other
+        // mapping — that is None, not a failed lookup. Any other
         // failure stays an error (see the transport-failure test).
         let http = FakeHttp::new().with_get_error(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
             ErrorKind::NotFound,
         );
         let client = ObsClient::new(&http);
-        assert_eq!(client.devel_project("foo").unwrap(), None);
+        assert_eq!(
+            client.devel_project("openSUSE:Factory", "foo").unwrap(),
+            None
+        );
     }
 
     #[test]
     fn devel_project_attribute_order_does_not_matter() {
-        // The package attribute first: the project must still be found.
+        // The package attribute first: the pair must still be found.
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-            "<directory name=\"foo\"><devel package=\"foo\" project=\"devel:languages:python\"/></directory>",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel package=\"foo\" project=\"devel:languages:python\"/></package>",
         );
         let client = ObsClient::new(&http);
         assert_eq!(
-            client.devel_project("foo").unwrap(),
-            Some("devel:languages:python".to_string())
+            client.devel_project("openSUSE:Factory", "foo").unwrap(),
+            Some(("devel:languages:python".to_string(), "foo".to_string()))
         );
     }
 
@@ -3353,20 +3282,26 @@ mod tests {
         // differently (FakeHttp: "no canned response").
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
-        let err = client.devel_project("foo/bar").unwrap_err();
+        let err = client
+            .devel_project("openSUSE:Factory", "foo/bar")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = client
+            .devel_project("openSUSE:Factory/x", "foo")
+            .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(http.get_calls().is_empty());
     }
 
     #[test]
     fn devel_project_malformed_body_is_error_not_none() {
-        // A truncated 200 body must not read as "no devel project".
+        // A truncated 200 body must not read as "no devel mapping".
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-            "<directory name=\"foo\"><devel project=\"devel:languages:python\"",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\"",
         );
         let client = ObsClient::new(&http);
-        let err = client.devel_project("foo").unwrap_err();
+        let err = client.devel_project("openSUSE:Factory", "foo").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
@@ -3378,34 +3313,64 @@ mod tests {
         // (see the invalid-package test above) is what InvalidInput
         // is for.
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-            "<directory name=\"foo\"><devel project=\"devel/foo\" package=\"foo\"/></directory>",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel/foo\" package=\"foo\"/></package>",
         );
         let client = ObsClient::new(&http);
-        let err = client.devel_project("foo").unwrap_err();
+        let err = client.devel_project("openSUSE:Factory", "foo").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]
+    fn devel_project_invalid_package_from_xml_is_error() {
+        // The package half is validated at the source too.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"python/foo\"/></package>",
+        );
+        let client = ObsClient::new(&http);
+        let err = client.devel_project("openSUSE:Factory", "foo").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn devel_project_without_package_defaults_to_queried_package() {
+        // A `<devel>` element without a package attribute means the
+        // devel package keeps this package's name: the pair carries
+        // the queried package name.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\"/></package>",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client.devel_project("openSUSE:Factory", "foo").unwrap(),
+            Some(("devel:languages:python".to_string(), "foo".to_string()))
+        );
+    }
+
+    #[test]
     fn devel_project_transport_failure_is_error_not_none() {
-        // A failed lookup must never read as "no devel project": no
+        // A failed lookup must never read as "no devel mapping": no
         // canned response is a transport error, not None.
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
-        let err = client.devel_project("foo").unwrap_err();
+        let err = client.devel_project("openSUSE:Factory", "foo").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NetworkError);
     }
 
     #[test]
     fn devel_version_reads_the_spec() {
+        // The spec is read from the devel package, whose name differs
+        // from the queried package here.
         let http = FakeHttp::new()
             .with_get(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-                "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"python-foo\"/></package>",
             )
             .with_get(
-                "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
-                "Name: foo\nVersion: 2.0\nRelease: 1\n",
+                "https://api.opensuse.org/public/source/devel:languages:python/python-foo/python-foo.spec",
+                "Name: python-foo\nVersion: 2.0\nRelease: 1\n",
             );
         let client = ObsClient::new(&http);
         assert_eq!(
@@ -3417,11 +3382,30 @@ mod tests {
     #[test]
     fn devel_version_none_when_no_devel_project() {
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-            "<directory name=\"foo\"></directory>",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"></package>",
         );
         let client = ObsClient::new(&http);
         assert_eq!(client.devel_version("foo").unwrap(), None);
+    }
+
+    #[test]
+    fn devel_version_missing_spec_is_not_found() {
+        // The devel package carries no spec: the spec read 404s, and
+        // that is an error, not None — None covers no mapping or a
+        // spec with no Version only.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"python-foo\"/></package>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/devel:languages:python/python-foo/python-foo.spec",
+                ErrorKind::NotFound,
+            );
+        let client = ObsClient::new(&http);
+        let err = client.devel_version("foo").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
     #[test]
@@ -3431,8 +3415,8 @@ mod tests {
         // not a caller mistake, so it errors rather than being
         // interpolated into a URL.
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-            "<directory name=\"foo\"><devel project=\"weird/project\" package=\"foo\"/></directory>",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"weird/project\" package=\"foo\"/></package>",
         );
         let client = ObsClient::new(&http);
         let err = client.devel_version("foo").unwrap_err();
@@ -3450,66 +3434,6 @@ mod tests {
         // Valid OBS names pass.
         assert!(client.search_url("python3-requests").is_ok());
         assert!(client.search_url("foo:bar").is_ok());
-    }
-
-    #[test]
-    fn parse_devel_project_handles_missing_and_malformed() {
-        assert_eq!(
-            parse_devel_project("<directory></directory>").unwrap(),
-            None
-        );
-        assert_eq!(parse_devel_project("<directory/>").unwrap(), None);
-        // A `<development>` tag is not a devel element.
-        assert_eq!(
-            parse_devel_project("<directory><development project=\"x\"/></directory>").unwrap(),
-            None
-        );
-        // Not a directory document: an error, never None.
-        assert!(parse_devel_project("").is_err());
-        assert!(parse_devel_project("<collection></collection>").is_err());
-        // A truncated body is malformed, not "no devel project".
-        assert!(
-            parse_devel_project("<directory name=\"foo\"><devel project=\"devel:foo\"").is_err()
-        );
-        assert!(parse_devel_project("<directory name=\"foo\">").is_err());
-        // A devel element whose opening tag is complete still yields
-        // its project, even without a closing tag: the parser reads
-        // the tag, not the element balance.
-        assert_eq!(
-            parse_devel_project("<directory><devel project=\"devel:foo\"></directory>").unwrap(),
-            Some("devel:foo".to_string())
-        );
-        // Either quote style carries the project.
-        assert_eq!(
-            parse_devel_project("<directory><devel project='devel:foo'/></directory>").unwrap(),
-            Some("devel:foo".to_string())
-        );
-        // Trailing junk after the closing tag is malformed.
-        assert!(parse_devel_project("<directory></directory>junk").is_err());
-    }
-
-    #[test]
-    fn parse_devel_project_accepts_an_xml_prolog() {
-        // The server may emit an XML prolog before the directory
-        // element; the result is the same as without one.
-        assert_eq!(
-            parse_devel_project(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><directory name=\"foo\"><devel project=\"devel:foo\"/></directory>"
-            )
-            .unwrap(),
-            Some("devel:foo".to_string())
-        );
-        assert_eq!(
-            parse_devel_project("<?xml version=\"1.0\"?>\n<directory></directory>").unwrap(),
-            None
-        );
-        // A prolog that never terminates is malformed, not a missing
-        // directory.
-        assert!(parse_devel_project("<?xml version=\"1.0\" <directory></directory>").is_err());
-        assert!(parse_devel_project("<?xml version=\"1.0\"").is_err());
-        // `<?xmlfoo` is not a prolog at all: the guard rejects it as
-        // malformed rather than skipping a prefix that is not one.
-        assert!(parse_devel_project("<?xmlfoo version=\"1.0\"?><directory></directory>").is_err());
     }
 
     #[test]

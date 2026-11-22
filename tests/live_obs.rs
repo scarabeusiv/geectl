@@ -572,15 +572,107 @@ fn live_obs_devel_project_missing_is_none() {
     let Some(base) = live_url() else {
         return;
     };
-    // A package that was never created has no devel project on the
-    // instance: the lookup must return None from the server's own
-    // directory listing, not from a fixture.
+    // A package that was never created has no devel mapping on
+    // the instance: the lookup must return None from the server's
+    // own package meta, not from a fixture. The project exists, so
+    // the 404 is about the package only.
+    let authed = live_client_authed(&base);
+    let project = create_source_branch(&authed, &live_package());
     let client = live_client(&base);
     assert_eq!(
         client
-            .devel_project("geectl-live-no-such-package")
+            .devel_project(&project, "geectl-live-no-such-package")
             .expect("devel lookup on the live instance"),
         None
+    );
+}
+
+/// `devel_project` returns the (project, package) pair from the
+/// package meta — including when the devel package differs from the
+/// queried package.
+#[test]
+fn live_devel_project_returns_pair() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let factory = create_source_branch(&authed, &package);
+    let devel = format!("geectl-tmp-devel-{}", unique_suffix());
+    authed
+        .create_project(
+            &devel,
+            "geectl live test devel",
+            "Created by the geectl live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel project on the live instance");
+    // The server refuses a devel whose package does not exist in
+    // the devel project, so the devel package is created there
+    // first.
+    authed
+        .create_package(
+            &devel,
+            &package,
+            "geectl live test devel package",
+            "Created by the geectl live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel package on the live instance");
+    authed
+        .set_devel_project(
+            &factory,
+            &package,
+            Some(&devel),
+            Some(&package),
+            &DryRun::new(false),
+        )
+        .expect("set the devel on the live instance");
+    let public = live_client(&base);
+    assert_eq!(
+        public
+            .devel_project(&factory, &package)
+            .expect("devel lookup on the live instance"),
+        Some((devel.clone(), package.clone()))
+    );
+    // A devel set without a package keeps this package's name: the
+    // setter omits the package attribute, so the read-back pair must
+    // carry the queried package name.
+    authed
+        .set_devel_project(&factory, &package, Some(&devel), None, &DryRun::new(false))
+        .expect("set the devel without a package on the live instance");
+    assert_eq!(
+        public
+            .devel_project(&factory, &package)
+            .expect("devel lookup on the live instance"),
+        Some((devel.clone(), package.clone()))
+    );
+    // A cross-package mapping: this package's devel is another
+    // package in the devel project, and the pair must carry it.
+    let devel_package = format!("{package}-devel");
+    authed
+        .create_package(
+            &devel,
+            &devel_package,
+            "geectl live test devel package",
+            "Created by the geectl live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel package on the live instance");
+    authed
+        .set_devel_project(
+            &factory,
+            &package,
+            Some(&devel),
+            Some(&devel_package),
+            &DryRun::new(false),
+        )
+        .expect("set the cross-package devel on the live instance");
+    assert_eq!(
+        public
+            .devel_project(&factory, &package)
+            .expect("devel lookup on the live instance"),
+        Some((devel, devel_package))
     );
 }
 

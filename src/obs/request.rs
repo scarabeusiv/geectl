@@ -729,10 +729,9 @@ fn parse_root<'a>(xml: &'a str, name: &'a str) -> Option<Element<'a>> {
     let xml = xml.trim();
     let xml = match xml.strip_prefix("<?xml") {
         Some(rest) => {
-            // The prolog must start here, exactly as in
-            // `parse_devel_project`: `<?xmlfoo` is not a prolog, so it
-            // is not stripped — the `<` handling below rejects `<?...`
-            // as not an element.
+            // The prolog must start here: `<?xmlfoo` is not a
+            // prolog, so it is not stripped — the `<` handling below
+            // rejects `<?...` as not an element.
             let first = rest.chars().next();
             if !matches!(first, Some(c) if c.is_whitespace() || c == '?') {
                 xml
