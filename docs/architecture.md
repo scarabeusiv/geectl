@@ -492,15 +492,17 @@ result.
 Credentials: the public reads (devel project, devel version, file
 and directory reads, meta, link target, project diff (without
 annotation), package diff, revision patch, repository list)
-need none; the package log, the open-SR search, the package and project
+need none; the package log, the top-level project listing, the
+maintained-instances listing, the open-SR search, the package and project
 search, the owner search, and reading a person, plus the filing POST,
 superseding, deleting, creating, and uploading, repository add and
 remove, and every `/build` read,
 and every request read and act (show, log, search, state change,
 review, comment, diff) need OBS Basic and fail loudly without them —
-except the package log, which reads with whatever credentials the client
-carries and fails on the server's 403 instead of refusing up front. OBS
-accepts Basic only —
+except the package log, the top-level project listing, and the
+`_project` service reads, which read with whatever credentials the
+client carries and fail on the server's 401/403 instead of refusing
+up front. OBS accepts Basic only —
 a Bearer token or SSH key is refused at client construction. No
 credential is stored here, and no request carries one over cleartext
 http except to a loopback host (the transport guard in `http.rs`).

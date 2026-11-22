@@ -787,7 +787,7 @@ fn remote_unreachable_server_fails_with_network_error() {
 
 /// A one-shot HTTP fixture: serves a single canned response to the
 /// first connection, then the thread ends. Lets a remote command run
-/// its success path offline. The thread is deliberately not joined:
+/// its success path offline. The thread is not joined:
 /// if the binary never connects, the test fails on its own assertion
 /// and the blocked thread dies with the test process.
 fn serve_once(body: &str) -> std::net::SocketAddr {
@@ -813,8 +813,8 @@ fn serve_once(body: &str) -> std::net::SocketAddr {
 /// A many-shot HTTP fixture: serves the same canned response to
 /// every connection, until the test process ends. For commands that
 /// fan out (a diff lists both sides, then reads files), where one
-/// canned body answers every request. The thread is deliberately
-/// not joined, like `serve_once`: if the binary never connects, the
+/// canned body answers every request. The thread is not joined,
+/// like `serve_once`: if the binary never connects, the
 /// test fails on its own assertion and the thread dies with the
 /// test process.
 fn serve_many(body: &str) -> std::net::SocketAddr {
@@ -1091,8 +1091,7 @@ fn remote_public_reads_ignore_half_set_credentials() {
 #[test]
 fn remote_search_packages_with_half_set_credentials_fails_with_config_error() {
     // The credentialed reads still resolve up front and fail fast on
-    // a half-set env — the asymmetry with the public reads is
-    // intended.
+    // a half-set env.
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["remote", "search-packages", "vim"])
@@ -1893,8 +1892,7 @@ fn build_results_with_half_set_credentials_fails_with_config_error() {
         .output()
         .unwrap();
     // The credentialed reads resolve credentials eagerly and fail loud
-    // on a half-set env — the asymmetry with the public read is
-    // intended.
+    // on a half-set env.
     assert_eq!(out.status.code(), Some(9));
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
