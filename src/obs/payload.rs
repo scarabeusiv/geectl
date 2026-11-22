@@ -775,6 +775,207 @@ impl ChangeDevelPayload {
     }
 }
 
+/// Grant a person or a group a role on a project or a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddRolePayload {
+    /// The project the role is granted on.
+    target_project: String,
+    /// The package the role is granted on; absent for a
+    /// project-level grant.
+    target_package: Option<String>,
+    /// The person and the role granted, when the action names one.
+    person: Option<(String, String)>,
+    /// The group and the role granted, when the action names one.
+    group: Option<(String, String)>,
+    /// The request description text.
+    description: String,
+}
+
+impl AddRolePayload {
+    /// Build and validate a payload. The target project (and package,
+    /// when named) must be valid OBS names, at least one of person
+    /// and group must be named, a person and a group named together
+    /// must carry the same role (the server keeps one role per
+    /// action), and the description must be non-empty.
+    pub fn new(
+        target_project: &str,
+        target_package: Option<&str>,
+        person: Option<(&str, &str)>,
+        group: Option<(&str, &str)>,
+        description: &str,
+    ) -> Result<Self, GeectlError> {
+        let payload = AddRolePayload {
+            target_project: target_project.to_string(),
+            target_package: target_package.map(str::to_string),
+            person: person.map(|(name, role)| (name.to_string(), role.to_string())),
+            group: group.map(|(name, role)| (name.to_string(), role.to_string())),
+            description: description.to_string(),
+        };
+        payload.validate_semantics()?;
+        payload.validate_xml()?;
+        Ok(payload)
+    }
+
+    /// The project the role is granted on.
+    pub fn target_project(&self) -> &str {
+        &self.target_project
+    }
+
+    /// The package the role is granted on; None for a project-level
+    /// grant.
+    pub fn target_package(&self) -> Option<&str> {
+        self.target_package.as_deref()
+    }
+
+    /// The person and the role granted, when the action names one.
+    pub fn person(&self) -> Option<(&str, &str)> {
+        self.person
+            .as_ref()
+            .map(|(name, role)| (name.as_str(), role.as_str()))
+    }
+
+    /// The group and the role granted, when the action names one.
+    pub fn group(&self) -> Option<(&str, &str)> {
+        self.group
+            .as_ref()
+            .map(|(name, role)| (name.as_str(), role.as_str()))
+    }
+
+    /// The request description text.
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// The semantic checks [`AddRolePayload::new`] runs: the target
+    /// project (and package, when named) must be valid OBS names,
+    /// every named person or group must be a valid OBS name with a
+    /// non-empty role, at least one of person and group must be
+    /// named, a person and a group named together must carry the
+    /// same role, and the description must be non-empty.
+    pub fn validate_semantics(&self) -> Result<(), GeectlError> {
+        if !valid_obs_name(&self.target_project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "invalid OBS project name for target project: {:?}",
+                    self.target_project
+                ),
+            ));
+        }
+        if let Some(package) = &self.target_package {
+            if !valid_obs_name(package) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name for target package: {package:?}"),
+                ));
+            }
+        }
+        for (label, grantee) in [("person", &self.person), ("group", &self.group)] {
+            if let Some((name, role)) = grantee {
+                if !valid_obs_name(name) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid OBS name for {label}: {name:?}"),
+                    ));
+                }
+                if role.is_empty() {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("role must not be empty for {label} {name:?}"),
+                    ));
+                }
+            }
+        }
+        if let (Some((_, person_role)), Some((_, group_role))) = (&self.person, &self.group) {
+            if person_role != group_role {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "add-role payload grants different roles to person ({person_role:?}) and group ({group_role:?}); the server keeps one role per action"
+                    ),
+                ));
+            }
+        }
+        if self.person.is_none() && self.group.is_none() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "add-role payload must name a person or a group",
+            ));
+        }
+        if self.description.trim().is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "add-role description must not be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Render the OBS request XML for this payload: one `add_role`
+    /// action with its target and the person and/or group granted.
+    /// All text is XML-escaped. No `<options>`: the server forbids
+    /// them here.
+    pub fn to_xml(&self) -> String {
+        let mut out = String::from("<request>\n  <action type=\"add_role\">\n");
+        out.push_str(&format!(
+            "    <target project=\"{}\"",
+            xml_escape(&self.target_project)
+        ));
+        if let Some(package) = &self.target_package {
+            out.push_str(&format!(" package=\"{}\"", xml_escape(package)));
+        }
+        out.push_str(" />\n");
+        if let Some((name, role)) = &self.person {
+            out.push_str(&format!(
+                "    <person name=\"{}\" role=\"{}\" />\n",
+                xml_escape(name),
+                xml_escape(role)
+            ));
+        }
+        if let Some((name, role)) = &self.group {
+            out.push_str(&format!(
+                "    <group name=\"{}\" role=\"{}\" />\n",
+                xml_escape(name),
+                xml_escape(role)
+            ));
+        }
+        out.push_str("  </action>\n");
+        out.push_str(&format!(
+            "  <description>{}</description>\n</request>",
+            xml_escape(&self.description),
+        ));
+        out
+    }
+
+    /// Verify the rendered XML is well-formed and carries exactly
+    /// one `add_role` action with its target, plus the description —
+    /// and no `<options>` block.
+    pub fn validate_xml(&self) -> Result<(), GeectlError> {
+        let xml = self.to_xml();
+        check_well_formed(
+            &xml,
+            &[
+                "request/action",
+                "request/action/target",
+                "request/description",
+            ],
+        )?;
+        if action_types(&xml)? != ["add_role"] {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "malformed add-role XML: expected exactly one add_role action",
+            ));
+        }
+        if xml.contains("<options>") {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "malformed add-role XML: <options> is forbidden on this action type",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// What a delete request targets: one package, one repository, or
 /// the whole project. The server forbids a target package and a
 /// target repository together, so the shape is an enum, not two
@@ -1703,6 +1904,69 @@ impl<'a> SrFiling<'a> {
         let id = self
             .obs
             .create_request_with_query(&xml, &[("cmd", "create")], "submit")?;
+        Ok(Some(id))
+    }
+
+    /// File `payload` as an add-role request: grant a person or a
+    /// group a role on a project or a package. Returns the new OBS
+    /// request id in live mode, or None in dry-run (nothing was
+    /// filed). The payload is validated before either path is taken.
+    /// In live mode an open add-role request already targeting the
+    /// same project (and package, when the payload names one) is
+    /// refused (dedup); the dedup keys on the target alone. The
+    /// server grants the role on accept; there is no branch cleanup
+    /// to opt into. The filing follows the same dedup rule as
+    /// `request file`: an open request for the target blocks the
+    /// filing outright.
+    pub fn file_add_role(&self, payload: &AddRolePayload) -> Result<Option<String>, GeectlError> {
+        payload.validate_semantics()?;
+        payload.validate_xml()?;
+        let target = match &payload.target_package {
+            Some(package) => format!("{}/{}", payload.target_project, package),
+            None => payload.target_project.clone(),
+        };
+        if !self
+            .dry_run
+            .allow(&format!("file add-role request for {target}"))
+        {
+            self.dry_run
+                .note("--- would-be add-role request (dry-run) ---");
+            self.dry_run.note(&format!("target: {target}"));
+            if let Some((name, role)) = &payload.person {
+                self.dry_run.note(&format!("person: {name} as {role}"));
+            }
+            if let Some((name, role)) = &payload.group {
+                self.dry_run.note(&format!("group: {name} as {role}"));
+            }
+            self.dry_run
+                .note(&format!("description: {}", payload.description));
+            self.dry_run.note(&payload.to_xml());
+            self.dry_run
+                .note("--- end of would-be add-role request ---");
+            return Ok(None);
+        }
+        // The dedup keys on the target alone, stricter than the
+        // server: the server's add-role identity is target project
+        // and package, person name, and role, and it runs no
+        // cross-request duplicate check — a second grant on the same
+        // target would pass the server.
+        self.check_no_open_action_request(
+            &ActionTarget {
+                action_type: "add_role",
+                source_project: None,
+                source_package: None,
+                target_project: &payload.target_project,
+                target_package: payload.target_package.as_deref(),
+                target_repository: None,
+                shape: ActionShape::Any,
+            },
+            &target,
+            None,
+        )?;
+        let xml = payload.to_xml();
+        let id = self
+            .obs
+            .create_request_with_query(&xml, &[("cmd", "create")], "add_role")?;
         Ok(Some(id))
     }
 
@@ -2811,6 +3075,47 @@ mod tests {
         .expect("test change devel payload")
     }
 
+    /// The dedup search URL for an add-role filing on
+    /// `openSUSE:Factory/foo`, written out in full: the test pins
+    /// the exact URL the client sends, not a rebuild of it.
+    const ADD_ROLE_SEARCH_URL: &str = "https://api.opensuse.org/search/request?match=%28state%2F%40name%3D%27new%27%20or%20state%2F%40name%3D%27review%27%29%20and%20action%2F%40type%3D%27add_role%27%20and%20action%5Btarget%2F%40project%3D%27openSUSE%3AFactory%27%20and%20target%2F%40package%3D%27foo%27%5D";
+    /// The dedup search URL for a project-level add-role filing on
+    /// `openSUSE:Factory`, written out in full, like
+    /// [`ADD_ROLE_SEARCH_URL`].
+    const ADD_ROLE_PROJECT_SEARCH_URL: &str = "https://api.opensuse.org/search/request?match=%28state%2F%40name%3D%27new%27%20or%20state%2F%40name%3D%27review%27%29%20and%20action%2F%40type%3D%27add_role%27%20and%20action%5Btarget%2F%40project%3D%27openSUSE%3AFactory%27%5D";
+
+    fn add_role_payload() -> AddRolePayload {
+        AddRolePayload::new(
+            "openSUSE:Factory",
+            Some("foo"),
+            Some(("alice", "maintainer")),
+            None,
+            "Grant alice the maintainer role on foo",
+        )
+        .expect("test add role payload")
+    }
+
+    #[test]
+    fn add_role_payload_refuses_person_and_group_with_different_roles() {
+        let err = AddRolePayload::new(
+            "openSUSE:Factory",
+            Some("foo"),
+            Some(("alice", "maintainer")),
+            Some(("factory-maintainers", "reviewer")),
+            "Grant roles",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(AddRolePayload::new(
+            "openSUSE:Factory",
+            Some("foo"),
+            Some(("alice", "maintainer")),
+            Some(("factory-maintainers", "maintainer")),
+            "Grant roles",
+        )
+        .is_ok());
+    }
+
     fn delete_package_payload() -> DeletePayload {
         DeletePayload::new(
             "openSUSE:Factory",
@@ -3125,6 +3430,144 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_role_payload_to_xml_renders_target_person_and_description() {
+        let payload = add_role_payload();
+        let xml = payload.to_xml();
+        assert!(xml.contains("<target project=\"openSUSE:Factory\" package=\"foo\" />"));
+        assert!(xml.contains("<person name=\"alice\" role=\"maintainer\" />"));
+        assert!(!xml.contains("<group "));
+        assert!(xml.contains("<description>Grant alice the maintainer role on foo</description>"));
+        assert!(payload.validate_xml().is_ok());
+    }
+
+    #[test]
+    fn add_role_payload_project_level_omits_the_package() {
+        let payload = AddRolePayload::new(
+            "openSUSE:Factory",
+            None,
+            None,
+            Some(("factory-maintainers", "maintainer")),
+            "Grant the group the maintainer role",
+        )
+        .unwrap();
+        let xml = payload.to_xml();
+        assert!(xml.contains("<target project=\"openSUSE:Factory\" />"));
+        assert!(xml.contains("<group name=\"factory-maintainers\" role=\"maintainer\" />"));
+        assert!(payload.validate_xml().is_ok());
+    }
+
+    #[test]
+    fn add_role_payload_rejects_no_grantee_and_empty_description() {
+        assert!(
+            AddRolePayload::new("openSUSE:Factory", Some("foo"), None, None, "Grant nothing",)
+                .is_err()
+        );
+        assert!(AddRolePayload::new(
+            "openSUSE:Factory",
+            Some("foo"),
+            Some(("alice", "maintainer")),
+            None,
+            "   ",
+        )
+        .is_err());
+        assert!(AddRolePayload::new(
+            "openSUSE:Factory",
+            Some("foo"),
+            Some(("alice", "")),
+            None,
+            "Grant alice nothing",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn file_add_role_live_returns_id() {
+        let search_url = ADD_ROLE_SEARCH_URL;
+        let http = FakeHttp::new()
+            .with_get(search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"alice\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing.file_add_role(&add_role_payload()).unwrap(),
+            Some("1400001".to_string())
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_add_role_live_refuses_when_open_request_exists() {
+        let search_url = ADD_ROLE_SEARCH_URL;
+        let http = FakeHttp::new().with_get(
+            search_url,
+            "<collection matches=\"1\"><request id=\"1399002\" creator=\"alice\"><action type=\"add_role\"><target project=\"openSUSE:Factory\" package=\"foo\" /><person name=\"bob\" role=\"reviewer\" /></action><state name=\"review\" /></request></collection>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.file_add_role(&add_role_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_add_role_project_level_searches_the_project_only() {
+        let search_url = ADD_ROLE_PROJECT_SEARCH_URL;
+        let http = FakeHttp::new()
+            .with_get(search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"alice\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let payload = AddRolePayload::new(
+            "openSUSE:Factory",
+            None,
+            Some(("alice", "maintainer")),
+            None,
+            "Grant alice the maintainer role on Factory",
+        )
+        .unwrap();
+        assert_eq!(
+            filing.file_add_role(&payload).unwrap(),
+            Some("1400001".to_string())
+        );
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_add_role_dry_run_returns_none_and_makes_no_requests() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(true);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(filing.file_add_role(&add_role_payload()).unwrap(), None);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec![
+                "[dry-run] would: file add-role request for openSUSE:Factory/foo"
+                    .to_string(),
+                "[dry-run] --- would-be add-role request (dry-run) ---".to_string(),
+                "[dry-run] target: openSUSE:Factory/foo".to_string(),
+                "[dry-run] person: alice as maintainer".to_string(),
+                "[dry-run] description: Grant alice the maintainer role on foo".to_string(),
+                "[dry-run] <request>\n  <action type=\"add_role\">\n    <target project=\"openSUSE:Factory\" package=\"foo\" />\n    <person name=\"alice\" role=\"maintainer\" />\n  </action>\n  <description>Grant alice the maintainer role on foo</description>\n</request>"
+                    .to_string(),
+                "[dry-run] --- end of would-be add-role request ---".to_string(),
+            ]
+        );
     }
 
     #[test]

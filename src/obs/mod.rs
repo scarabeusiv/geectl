@@ -168,6 +168,7 @@ pub use self::common::valid_obs_name;
 pub(crate) use self::common::validate_base;
 pub use self::common::FACTORY_PROJECT;
 pub use self::common::OBS_API_BASE;
+pub use self::payload::AddRolePayload;
 pub use self::payload::ChangeDevelPayload;
 pub use self::payload::DeletePayload;
 pub use self::payload::DeleteTarget;
