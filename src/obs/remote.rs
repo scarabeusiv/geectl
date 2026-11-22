@@ -2368,15 +2368,16 @@ impl<'a> ObsClient<'a> {
         Ok(self.public_directory(&[project, package])?.linkinfo)
     }
 
-    /// The per-file diff between two listings of the same package:
+    /// The per-file diff between two listings, one per package:
     /// files added, modified (contents differ), or deleted, each
     /// with a unified diff. Unchanged files do not appear.
     fn diff_files(
         &self,
         old_project: &str,
-        package: &str,
+        old_package: &str,
         old_files: &[SourceFile],
         new_project: &str,
+        new_package: &str,
         new_files: &[SourceFile],
     ) -> Result<Vec<FilePatch>, GeectlError> {
         let mut patches = Vec::new();
@@ -2384,7 +2385,7 @@ impl<'a> ObsClient<'a> {
             match old_files.iter().find(|old| old.name == new.name) {
                 None => {
                     // Added: the whole file is new.
-                    let content = self.cat(new_project, package, &new.name, None)?;
+                    let content = self.cat(new_project, new_package, &new.name, None)?;
                     patches.push(FilePatch {
                         filename: new.name.clone(),
                         status: FilePatchStatus::Added,
@@ -2392,8 +2393,8 @@ impl<'a> ObsClient<'a> {
                     });
                 }
                 Some(old) if old.md5 != new.md5 => {
-                    let old_content = self.cat(old_project, package, &new.name, None)?;
-                    let new_content = self.cat(new_project, package, &new.name, None)?;
+                    let old_content = self.cat(old_project, old_package, &new.name, None)?;
+                    let new_content = self.cat(new_project, new_package, &new.name, None)?;
                     let diff = unified_diff(
                         &format!("a/{}", new.name),
                         &old_content,
@@ -2416,7 +2417,7 @@ impl<'a> ObsClient<'a> {
         }
         for old in old_files {
             if !new_files.iter().any(|new| new.name == old.name) {
-                let content = self.cat(old_project, package, &old.name, None)?;
+                let content = self.cat(old_project, old_package, &old.name, None)?;
                 patches.push(FilePatch {
                     filename: old.name.clone(),
                     status: FilePatchStatus::Deleted,
@@ -2426,6 +2427,51 @@ impl<'a> ObsClient<'a> {
         }
         patches.sort_by(|a, b| a.filename.cmp(&b.filename));
         Ok(patches)
+    }
+
+    /// The per-file diff between package `old_package` in project
+    /// `old_project` and package `new_package` in project
+    /// `new_project`: the files added, modified (contents differ),
+    /// or deleted, each with a unified diff. Unchanged files do not
+    /// appear. The two sides may be differently-named packages; the
+    /// same-name case is the per-package half of
+    /// [`ObsClient::project_diff`].
+    ///
+    /// Two public reads (`GET /public/source/<project>/<package>`,
+    /// one per side) plus one public file read per added or deleted
+    /// file and two per changed file: a public read, no credentials.
+    /// A failed read aborts the whole diff with its error, never a
+    /// partial list — including a missing package on either side.
+    pub fn diff_packages(
+        &self,
+        old_project: &str,
+        old_package: &str,
+        new_project: &str,
+        new_package: &str,
+    ) -> Result<Vec<FilePatch>, GeectlError> {
+        for (label, value) in [
+            ("old project", old_project),
+            ("old package", old_package),
+            ("new project", new_project),
+            ("new package", new_package),
+        ] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let old_files = self.list_files(old_project, old_package)?;
+        let new_files = self.list_files(new_project, new_package)?;
+        self.diff_files(
+            old_project,
+            old_package,
+            &old_files,
+            new_project,
+            new_package,
+            &new_files,
+        )
     }
 
     /// Diff two projects package by package (`old` vs `new`): every
@@ -2505,7 +2551,7 @@ impl<'a> ObsClient<'a> {
                 (true, true) => {
                     let old_files = self.list_files(old, &name)?;
                     let new_files = self.list_files(new, &name)?;
-                    let files = self.diff_files(old, &name, &old_files, new, &new_files)?;
+                    let files = self.diff_files(old, &name, &old_files, new, &name, &new_files)?;
                     let status = if files.is_empty() {
                         PackageDiffStatus::Identical
                     } else {
@@ -6901,6 +6947,78 @@ mod tests {
             .project_diff("old", "new", &[], &["bad/name"], false)
             .is_err());
         assert!(client.project_diff("o/l", "new", &[], &[], false).is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn diff_packages_diffs_differently_named_packages() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/old/old-pkg",
+                "<directory><entry name=\"foo.spec\" md5=\"aaa\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/new/new-pkg",
+                "<directory><entry name=\"foo.spec\" md5=\"bbb\"/><entry name=\"extra.txt\" md5=\"eee\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/old/old-pkg/foo.spec",
+                "Version: 1.0\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/new/new-pkg/foo.spec",
+                "Version: 1.1\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/new/new-pkg/extra.txt",
+                "extra\n",
+            );
+        let client = ObsClient::new(&http);
+        let patches = client
+            .diff_packages("old", "old-pkg", "new", "new-pkg")
+            .unwrap();
+        assert_eq!(
+            patches
+                .iter()
+                .map(|file| (file.filename.as_str(), file.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("extra.txt", FilePatchStatus::Added),
+                ("foo.spec", FilePatchStatus::Modified),
+            ]
+        );
+        assert!(patches[1].diff.contains("-Version: 1.0\n+Version: 1.1\n"));
+    }
+
+    #[test]
+    fn diff_packages_missing_package_is_error_not_partial() {
+        // The old side reads; the new side's listing 404s, so the
+        // diff is an error, never a partial list of the old side's
+        // files.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/old/old-pkg",
+                "<directory><entry name=\"foo.spec\" md5=\"aaa\"/></directory>",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/new/new-pkg",
+                ErrorKind::NotFound,
+            );
+        let client = ObsClient::new(&http);
+        let err = client
+            .diff_packages("old", "old-pkg", "new", "new-pkg")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn diff_packages_rejects_bad_names_without_requesting() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.diff_packages("o/l", "a", "new", "b").is_err());
+        assert!(client.diff_packages("old", "a/b", "new", "b").is_err());
+        assert!(client.diff_packages("old", "a", "n/w", "b").is_err());
+        assert!(client.diff_packages("old", "a", "new", "b/c").is_err());
         assert!(http.get_calls().is_empty());
     }
 

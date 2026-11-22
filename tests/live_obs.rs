@@ -44,7 +44,8 @@
 //! `live_search_finds_package_and_project`,
 //! `live_owners_call_succeeds`, `live_whois_reads_admin`,
 //! `live_link_target_reads_linkinfo`, and
-//! `live_project_diff_classifies`) exercise the read operations
+//! `live_project_diff_classifies`,
+//! `live_diff_packages_diffs_two_packages`) exercise the read operations
 //! the same way: create through geectl's own write operations, then
 //! read back through the new operations and assert on server state.
 //! The log and link-target tests poll for up to a minute: the history
@@ -1408,6 +1409,78 @@ fn live_project_diff_classifies() {
         changed_diff.files[0].diff.contains("+Version: 1.1"),
         "the diff must add the new version; got {}",
         changed_diff.files[0].diff
+    );
+}
+
+/// `diff_packages` diffs two differently-named packages across two
+/// projects, through the public reads: a modified file and a file
+/// added on the new side.
+#[test]
+fn live_diff_packages_diffs_two_packages() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let suffix = unique_suffix();
+    let old_project = format!("geectl-tmp-diff-old-{suffix}");
+    let new_project = format!("geectl-tmp-diff-new-{suffix}");
+    for project in [&old_project, &new_project] {
+        authed
+            .create_project(
+                project,
+                "geectl live test project",
+                "Created by the geectl live test; the instance is destroyed after the run.",
+                &DryRun::new(false),
+            )
+            .expect("create a diff project on the live instance");
+    }
+    let old_package = format!("pkg-old-{suffix}");
+    let new_package = format!("pkg-new-{suffix}");
+    for (project, package, version) in [
+        (&old_project, &old_package, "1.0"),
+        (&new_project, &new_package, "1.1"),
+    ] {
+        authed
+            .create_package(
+                project,
+                package,
+                "geectl live test package",
+                "Created by the geectl live test; the instance is destroyed after the run.",
+                &DryRun::new(false),
+            )
+            .expect("create package on the live instance");
+        authed
+            .upload_file(
+                project,
+                package,
+                "pkg.spec",
+                &format!("Name: pkg\nVersion: {version}\n"),
+                &DryRun::new(false),
+            )
+            .expect("upload a spec file on the live instance");
+    }
+    authed
+        .upload_file(
+            &new_project,
+            &new_package,
+            "extra.txt",
+            "extra\n",
+            &DryRun::new(false),
+        )
+        .expect("upload an added file on the live instance");
+    let public = live_client(&base);
+    let patches = public
+        .diff_packages(&old_project, &old_package, &new_project, &new_package)
+        .expect("diff the two packages on the live instance");
+    assert_eq!(
+        patches
+            .iter()
+            .map(|file| (file.filename.as_str(), file.status))
+            .collect::<Vec<_>>(),
+        vec![
+            ("extra.txt", FilePatchStatus::Added),
+            ("pkg.spec", FilePatchStatus::Modified),
+        ]
     );
 }
 
