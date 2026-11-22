@@ -1,12 +1,15 @@
-//! `local-build` — the container service-run command group: run a
-//! package's `_service` services, the precommit gate, and
-//! `spec-cleaner`, all in the podman build vertical's container.
+//! `local-build` — the podman build vertical's command group: build
+//! a package in the container, run its `_service` services, the
+//! precommit gate, and `spec-cleaner`.
 //!
 //! Thin like `service` and `build`: the flags mirror the library
 //! parameters, the JSON payload carries the typed record, and the
 //! text renderer prints the same values in a human-readable form.
-//! The commands make no server calls, so no credentials resolve:
-//! a half-set credential env never breaks a local run.
+//! The service leaves make no server calls, so no credentials
+//! resolve there: a half-set credential env never breaks a local
+//! run. The build leaf fetches buildinfo/buildconfig on a live run,
+//! so it resolves the endpoint's credentials; its dry run touches
+//! nothing and resolves none.
 //!
 //! Mutations are gated on the global `--live`: without it, each
 //! command prints the plan only (the library dry run) and touches
@@ -20,14 +23,14 @@
 //! them).
 
 use clap::Subcommand;
-use geectl::auth::Credentials;
+use geectl::auth::{Credentials, EnvObsAuth};
 use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::GeectlError;
 use geectl::http::{Timeout, UreqClient};
 use geectl::local_build::{
-    LocalBuild, PrecommitRecord, ServiceRunMode, ServiceRunRecord, ServiceRunRequest,
-    SpecCleanerResult,
+    validate_build_request, BuildRecord, BuildRequest, LocalBuild, PrecommitRecord, ServiceRunMode,
+    ServiceRunRecord, ServiceRunRequest, SpecCleanerResult,
 };
 use geectl::obs::{ObsClient, OBS_API_BASE};
 use serde_json::{json, Value};
@@ -80,6 +83,42 @@ pub enum LocalBuildCommand {
         #[arg(long, default_value_t = 3600)]
         timeout_secs: u64,
     },
+    /// Build the package in the container: the run-mode service
+    /// run, the precommit gate, then the engine build.
+    ///
+    /// A failing pre-step fails the command before the build runs.
+    Build {
+        /// The source directory (spec + sources).
+        directory: PathBuf,
+        /// The OBS project the package belongs to.
+        #[arg(long)]
+        project: String,
+        /// The repository to build for (e.g. `standard`).
+        #[arg(long)]
+        repo: String,
+        /// The architecture to build for; must equal the host arch.
+        #[arg(long, default_value_t = std::env::consts::ARCH.to_string())]
+        arch: String,
+        /// The multibuild flavor; required when the source carries
+        /// a `_multibuild` file. One invocation builds one flavor.
+        #[arg(long)]
+        flavor: Option<String>,
+        /// Wipe the root before building.
+        #[arg(long)]
+        clean: bool,
+        /// The release number, passed through to the engine.
+        #[arg(long)]
+        release: Option<String>,
+        /// Accept the resolved dep set.
+        #[arg(long)]
+        trust_all_projects: bool,
+        /// Force an image pull even when the local image is fresh.
+        #[arg(long)]
+        refresh_image: bool,
+        /// Timeout in seconds for the whole run.
+        #[arg(long, default_value_t = 3600)]
+        timeout_secs: u64,
+    },
 }
 
 /// Run a `local-build` command, returning the JSON payload and its
@@ -89,9 +128,6 @@ pub fn run_local_build(
     command: LocalBuildCommand,
     live: bool,
 ) -> Result<(Value, String), GeectlError> {
-    // No server calls: the service runs never touch OBS, so no
-    // credentials resolve — a half-set credential env must not
-    // break a local run.
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
     let effective = config::effective_config(&file_config)?;
@@ -99,8 +135,20 @@ pub fn run_local_build(
     // Some(obs_url) — but kept as a defensive default rather than an
     // unwrap: a config change must not turn into a panic here.
     let obs_url = effective.config.obs_url.as_deref().unwrap_or(OBS_API_BASE);
+    // Credentials resolve per command: the service leaves make no
+    // server calls, so none resolve there — a half-set credential
+    // env must not break a local run. The build leaf fetches
+    // buildinfo/buildconfig on a live run, so it resolves the
+    // endpoint's credentials; its dry run touches nothing and
+    // resolves none.
+    let credentials = match &command {
+        LocalBuildCommand::Build { .. } if live => {
+            EnvObsAuth::credentials_for_url(obs_url, obs_url, &file_config.instances)?
+        }
+        _ => Credentials::None,
+    };
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = ObsClient::with_base_and_credentials(&http, obs_url, Credentials::None)?
+    let client = ObsClient::with_base_and_credentials(&http, obs_url, credentials)?
         .with_debug(debug.clone());
     let vertical = LocalBuild::from_config(&client, &effective.config)?.with_debug(debug.clone());
     match command {
@@ -174,6 +222,86 @@ pub fn run_local_build(
                 "spec": spec,
                 "dry_run": !live,
                 "result": result,
+            });
+            Ok((payload, text))
+        }
+        LocalBuildCommand::Build {
+            directory,
+            project,
+            repo,
+            arch,
+            flavor,
+            clean,
+            release,
+            trust_all_projects,
+            refresh_image,
+            timeout_secs,
+        } => {
+            // One invocation does the whole loop: the run-mode
+            // service run fetches the sources, the precommit gate
+            // runs the precommit-mode services and pre_checkin.sh,
+            // then the engine builds. A failing pre-step fails the
+            // command before the build runs. The run-mode step
+            // already covers trylocal/localonly services, so the
+            // precommit step runs them a second time; services
+            // regenerate their outputs, so the repeat is a second
+            // run of the same generation, not a second effect.
+            // The request is built and validated first: a bad
+            // coordinate (project, repo, arch, timeout) fails
+            // before any service runs or script executes — the
+            // pre-steps take no project or arch, so they cannot
+            // reject one themselves.
+            let mut build_req = BuildRequest::new(directory.clone(), &project, &repo, &arch);
+            build_req.flavor = flavor.clone();
+            build_req.clean = clean;
+            build_req.release = release.clone();
+            build_req.trust_all_projects = trust_all_projects;
+            build_req.refresh_image = refresh_image;
+            build_req.timeout_secs = timeout_secs;
+            build_req.dry_run = !live;
+            validate_build_request(&build_req)?;
+            let mut service_req = ServiceRunRequest::new(directory.clone(), ServiceRunMode::Run);
+            service_req.timeout_secs = timeout_secs;
+            service_req.dry_run = !live;
+            // One budget for the whole run: the service run, the
+            // precommit gate, and the engine build share a single
+            // deadline minted here, so a slow pre-step leaves less
+            // time for the build instead of each phase taking a
+            // fresh full timeout.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+            let services = vertical.service_run_with_deadline(&service_req, deadline)?;
+            let precommit =
+                vertical.precommit_with_deadline(&directory, timeout_secs, deadline, !live)?;
+            let record = vertical.build_with_deadline(&build_req, deadline)?;
+            let header = match &flavor {
+                Some(flavor) => format!(
+                    "directory: {} project: {project} repo: {repo} arch: {arch} flavor: {flavor}",
+                    directory.display()
+                ),
+                None => format!(
+                    "directory: {} project: {project} repo: {repo} arch: {arch}",
+                    directory.display()
+                ),
+            };
+            let text = with_header(
+                &header,
+                format!(
+                    "services:\n{}\nprecommit:\n{}\nbuild:\n{}",
+                    render_service_run(&services),
+                    render_precommit(&precommit),
+                    render_build(&record)
+                ),
+            );
+            let payload = json!({
+                "directory": directory,
+                "project": project,
+                "repo": repo,
+                "arch": arch,
+                "flavor": flavor,
+                "dry_run": !live,
+                "services": services,
+                "precommit": precommit,
+                "record": record,
             });
             Ok((payload, text))
         }
@@ -258,13 +386,107 @@ fn render_spec_cleaner(result: &SpecCleanerResult) -> String {
     }
 }
 
+/// A build record as text: the dry-run plan (image, root, repo,
+/// arch, and the engine argv), or the verdict with the exit code,
+/// log path, RPMs, rpmlint and check summaries, image digest,
+/// engine version, root, cache numbers, and eviction.
+fn render_build(record: &BuildRecord) -> String {
+    if record.dry_run {
+        match &record.plan {
+            Some(plan) => {
+                let mut lines = vec![
+                    format!("plan: {}", plan.argv.join(" ")),
+                    format!("image: {}", plan.image),
+                    format!("root: {}", plan.root.display()),
+                    format!("repo: {}", plan.repo),
+                    format!("arch: {}", plan.arch),
+                ];
+                if let Some(flavor) = &plan.flavor {
+                    lines.push(format!("flavor: {flavor}"));
+                }
+                lines.join("\n")
+            }
+            None => "no plan".to_string(),
+        }
+    } else {
+        let mut lines = vec![
+            format!("verdict: {}", record.verdict),
+            format!("exit: {}", record.exit_code),
+            format!("log: {}", record.log_path.display()),
+        ];
+        if record.rpms.is_empty() {
+            lines.push("rpms: none".to_string());
+        } else {
+            for rpm in &record.rpms {
+                lines.push(format!("rpm: {}", rpm.display()));
+            }
+        }
+        lines.push(format!(
+            "rpmlint: {} errors, {} warnings (badness {})",
+            record.rpmlint.errors, record.rpmlint.warnings, record.rpmlint.badness
+        ));
+        if let Some(checks) = &record.checks {
+            lines.push(format!(
+                "check: {} passed, {} failed of {}",
+                checks.passed, checks.failed, checks.total
+            ));
+        }
+        lines.push(format!(
+            "image: {}",
+            record.image_digest.as_deref().unwrap_or("<unknown>")
+        ));
+        lines.push(format!(
+            "engine: {}",
+            record.engine_version.as_deref().unwrap_or("<unknown>")
+        ));
+        if record.root_reused {
+            lines.push(format!("root: {} (reused)", record.root_path.display()));
+        } else {
+            lines.push(format!("root: {}", record.root_path.display()));
+        }
+        lines.push(format!(
+            "cache: pkg {} hits, {} misses{}",
+            record.cache.pkg_hits,
+            record.cache.pkg_misses,
+            match record.cache.sccache_hits {
+                Some(hits) => format!(", sccache {hits} hits"),
+                None => String::new(),
+            }
+        ));
+        if let Some(image) = &record.preinstall_image {
+            lines.push(format!("preinstall-image: {image}"));
+        }
+        if record.eviction.ran {
+            lines.push(format!(
+                "eviction: ran, freed {} bytes ({} items)",
+                record.eviction.freed_bytes,
+                record.eviction.evicted.len()
+            ));
+            if record.eviction.shortfall_bytes > 0 {
+                lines.push(format!(
+                    "eviction shortfall: {} bytes",
+                    record.eviction.shortfall_bytes
+                ));
+            }
+        }
+        if !record.eviction.failures.is_empty() {
+            lines.push(format!(
+                "eviction failures: {}",
+                record.eviction.failures.join("; ")
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Cli, Command};
     use clap::Parser;
     use geectl::local_build::{
-        PlannedService, PrecheckinOutcome, ServiceRunOutcome, ServiceRunPlan,
+        BuildRecord, CacheStats, CheckSummary, EnginePlan, EvictedItem, EvictionReport,
+        PlannedService, PrecheckinOutcome, RpmlintSummary, ServiceRunOutcome, ServiceRunPlan,
     };
 
     fn parse(args: &[&str]) -> LocalBuildCommand {
@@ -351,6 +573,96 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["geectl", "local-build", "frobnicate"]).is_err());
         assert!(Cli::try_parse_from(["geectl", "local-build", "service-run"]).is_err());
+    }
+
+    #[test]
+    fn build_parses_defaults_and_flags() {
+        match parse(&[
+            "geectl",
+            "local-build",
+            "build",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--repo",
+            "standard",
+        ]) {
+            LocalBuildCommand::Build {
+                directory,
+                project,
+                repo,
+                arch,
+                flavor,
+                clean,
+                release,
+                trust_all_projects,
+                refresh_image,
+                timeout_secs,
+            } => {
+                assert_eq!(directory, PathBuf::from("/tmp/pkg"));
+                assert_eq!(project, "home:foo");
+                assert_eq!(repo, "standard");
+                assert_eq!(arch, std::env::consts::ARCH);
+                assert_eq!(flavor, None);
+                assert!(!clean);
+                assert_eq!(release, None);
+                assert!(!trust_all_projects);
+                assert!(!refresh_image);
+                assert_eq!(timeout_secs, 3600);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match parse(&[
+            "geectl",
+            "local-build",
+            "build",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--repo",
+            "standard",
+            "--arch",
+            "x86_64",
+            "--flavor",
+            "lib",
+            "--clean",
+            "--release",
+            "2",
+            "--trust-all-projects",
+            "--refresh-image",
+            "--timeout-secs",
+            "60",
+        ]) {
+            LocalBuildCommand::Build {
+                arch,
+                flavor,
+                clean,
+                release,
+                trust_all_projects,
+                refresh_image,
+                timeout_secs,
+                ..
+            } => {
+                assert_eq!(arch, "x86_64");
+                assert_eq!(flavor.as_deref(), Some("lib"));
+                assert!(clean);
+                assert_eq!(release.as_deref(), Some("2"));
+                assert!(trust_all_projects);
+                assert!(refresh_image);
+                assert_eq!(timeout_secs, 60);
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert!(Cli::try_parse_from(["geectl", "local-build", "build", "/tmp/pkg"]).is_err());
+        assert!(Cli::try_parse_from([
+            "geectl",
+            "local-build",
+            "build",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+        ])
+        .is_err());
     }
 
     fn dry_run_record() -> ServiceRunRecord {
@@ -488,5 +800,259 @@ mod tests {
         let text = render_spec_cleaner(&result);
         assert!(text.contains("exit: 0"));
         assert!(text.contains("cleaned foo.spec"));
+    }
+
+    fn build_record() -> BuildRecord {
+        BuildRecord {
+            verdict: "green".to_string(),
+            exit_code: 0,
+            log_path: PathBuf::from("/tmp/root/.build.log"),
+            rpms: vec![PathBuf::from("/tmp/root/RPMS/foo-1.0-1.x86_64.rpm")],
+            rpmlint: RpmlintSummary {
+                errors: 0,
+                warnings: 1,
+                badness: 10,
+            },
+            checks: Some(CheckSummary {
+                passed: 12,
+                failed: 0,
+                total: 12,
+            }),
+            image_digest: Some("sha256:abc".to_string()),
+            engine_version: Some("20261016".to_string()),
+            root_path: PathBuf::from("/tmp/root"),
+            root_reused: true,
+            cache: CacheStats {
+                pkg_hits: 3,
+                pkg_misses: 0,
+                sccache_hits: Some(5),
+            },
+            eviction: EvictionReport::default(),
+            preinstall_image: Some("preinstallimage.x86_64.rpm".to_string()),
+            dry_run: false,
+            plan: None,
+        }
+    }
+
+    fn dry_run_build_record() -> BuildRecord {
+        BuildRecord {
+            verdict: "dry-run".to_string(),
+            exit_code: 0,
+            log_path: PathBuf::from("/tmp/root/.build.log"),
+            rpms: vec![],
+            rpmlint: RpmlintSummary::default(),
+            checks: None,
+            image_digest: None,
+            engine_version: Some("20261016".to_string()),
+            root_path: PathBuf::from("/tmp/root"),
+            root_reused: false,
+            cache: CacheStats::default(),
+            eviction: EvictionReport::default(),
+            preinstall_image: None,
+            dry_run: true,
+            plan: Some(EnginePlan {
+                image: "registry.opensuse.org/opensuse/tumbleweed".to_string(),
+                root: PathBuf::from("/tmp/root"),
+                repo: "standard".to_string(),
+                arch: "x86_64".to_string(),
+                flavor: None,
+                argv: vec![
+                    "build".to_string(),
+                    "--root=/tmp/root".to_string(),
+                    "foo.spec".to_string(),
+                ],
+            }),
+        }
+    }
+
+    #[test]
+    fn build_renders_plan_and_record() {
+        let text = render_build(&dry_run_build_record());
+        assert!(text.contains("plan: build --root=/tmp/root foo.spec"));
+        assert!(text.contains("image: registry.opensuse.org/opensuse/tumbleweed"));
+        assert!(text.contains("root: /tmp/root"));
+        assert!(text.contains("repo: standard"));
+        assert!(text.contains("arch: x86_64"));
+        let mut record = dry_run_build_record();
+        record.plan = None;
+        assert_eq!(render_build(&record), "no plan");
+        let text = render_build(&build_record());
+        assert!(text.contains("verdict: green"));
+        assert!(text.contains("exit: 0"));
+        assert!(text.contains("log: /tmp/root/.build.log"));
+        assert!(text.contains("rpm: /tmp/root/RPMS/foo-1.0-1.x86_64.rpm"));
+        assert!(text.contains("rpmlint: 0 errors, 1 warnings (badness 10)"));
+        assert!(text.contains("check: 12 passed, 0 failed of 12"));
+        assert!(text.contains("image: sha256:abc"));
+        assert!(text.contains("engine: 20261016"));
+        assert!(text.contains("root: /tmp/root (reused)"));
+        assert!(text.contains("cache: pkg 3 hits, 0 misses, sccache 5 hits"));
+        assert!(text.contains("preinstall-image: preinstallimage.x86_64.rpm"));
+        assert!(!text.contains("eviction:"));
+        let mut record = build_record();
+        record.verdict = "failed".to_string();
+        record.exit_code = 1;
+        record.rpms = vec![];
+        record.checks = None;
+        record.preinstall_image = None;
+        let text = render_build(&record);
+        assert!(text.contains("verdict: failed"));
+        assert!(text.contains("exit: 1"));
+        assert!(text.contains("rpms: none"));
+        assert!(!text.contains("check:"));
+        assert!(!text.contains("preinstall-image:"));
+        let mut record = build_record();
+        record.eviction = EvictionReport {
+            ran: true,
+            freed_bytes: 4096,
+            evicted: vec![
+                EvictedItem {
+                    kind: "root".to_string(),
+                    path: "/tmp/old-root".to_string(),
+                    bytes: 3072,
+                    reason: "lru".to_string(),
+                },
+                EvictedItem {
+                    kind: "pkg".to_string(),
+                    path: "/tmp/old.rpm".to_string(),
+                    bytes: 1024,
+                    reason: "lru".to_string(),
+                },
+            ],
+            failures: vec!["cannot remove /tmp/stuck: permission denied".to_string()],
+            shortfall_bytes: 512,
+            ..EvictionReport::default()
+        };
+        let text = render_build(&record);
+        assert!(text.contains("eviction: ran, freed 4096 bytes (2 items)"));
+        assert!(text.contains("eviction shortfall: 512 bytes"));
+        assert!(text.contains("eviction failures: cannot remove /tmp/stuck: permission denied"));
+        let mut record = build_record();
+        record.image_digest = None;
+        record.engine_version = None;
+        record.root_reused = false;
+        record.cache.sccache_hits = None;
+        let text = render_build(&record);
+        assert!(text.contains("image: <unknown>"));
+        assert!(text.contains("engine: <unknown>"));
+        assert!(text.contains("root: /tmp/root"));
+        assert!(!text.contains("(reused)"));
+        assert!(text.contains("cache: pkg 3 hits, 0 misses"));
+        assert!(!text.contains("sccache"));
+    }
+
+    /// The agreement test: every identifying field the JSON payload
+    /// carries for the build — the verdict, exit code, log path,
+    /// RPMs, rpmlint and check summaries, image digest, engine
+    /// version, root, cache and eviction summaries, and the plan
+    /// argv, repo, and arch — appears in the text rendering.
+    /// The expected fields come from the payload itself, not from
+    /// literals repeated from the rendering tests, so a payload
+    /// field the text drops fails here.
+    #[test]
+    fn build_text_carries_every_identifying_field() {
+        let mut record = build_record();
+        record.eviction = EvictionReport {
+            ran: true,
+            freed_bytes: 4096,
+            evicted: vec![EvictedItem {
+                kind: "root".to_string(),
+                path: "/tmp/old-root".to_string(),
+                bytes: 4096,
+                reason: "lru".to_string(),
+            }],
+            failures: vec!["cannot remove /tmp/stuck: permission denied".to_string()],
+            ..EvictionReport::default()
+        };
+        let payload = serde_json::to_value(&record).expect("record serializes");
+        let text = render_build(&record);
+        for field in ["verdict", "log_path", "root_path"] {
+            let value = payload[field].as_str().expect("field is a string");
+            assert!(
+                text.contains(value),
+                "build text misses {field}: {value}:\n{text}"
+            );
+        }
+        assert!(text.contains(&format!("exit: {}", payload["exit_code"])));
+        for rpm in payload["rpms"].as_array().expect("rpms is an array") {
+            let rpm = rpm.as_str().expect("rpm is a string");
+            assert!(text.contains(rpm), "build text misses rpm {rpm}:\n{text}");
+        }
+        let rpmlint = &payload["rpmlint"];
+        assert!(text.contains(&format!(
+            "{} errors, {} warnings (badness {})",
+            rpmlint["errors"], rpmlint["warnings"], rpmlint["badness"]
+        )));
+        let checks = &payload["checks"];
+        assert!(text.contains(&format!(
+            "{} passed, {} failed of {}",
+            checks["passed"], checks["failed"], checks["total"]
+        )));
+        assert!(text.contains(
+            payload["image_digest"]
+                .as_str()
+                .expect("digest is a string")
+        ));
+        assert!(text.contains(
+            payload["engine_version"]
+                .as_str()
+                .expect("version is a string")
+        ));
+        assert!(text.contains(
+            payload["preinstall_image"]
+                .as_str()
+                .expect("image is a string")
+        ));
+        let eviction = &payload["eviction"];
+        assert!(text.contains(&format!("freed {} bytes", eviction["freed_bytes"])));
+        assert!(text.contains(&format!(
+            "({} items)",
+            eviction["evicted"]
+                .as_array()
+                .expect("evicted is an array")
+                .len()
+        )));
+        for failure in eviction["failures"]
+            .as_array()
+            .expect("failures is an array")
+        {
+            let failure = failure.as_str().expect("failure is a string");
+            assert!(
+                text.contains(failure),
+                "build text misses eviction failure {failure}:\n{text}"
+            );
+        }
+        let cache = &payload["cache"];
+        assert!(text.contains(&format!(
+            "pkg {} hits, {} misses",
+            cache["pkg_hits"], cache["pkg_misses"]
+        )));
+        if let Some(hits) = cache["sccache_hits"].as_u64() {
+            assert!(text.contains(&format!("sccache {hits} hits")));
+        }
+        // The dry-run plan: the argv carries the invocation.
+        let plan_record = dry_run_build_record();
+        let plan_payload = serde_json::to_value(&plan_record).expect("record serializes");
+        let plan_text = render_build(&plan_record);
+        for arg in plan_payload["plan"]["argv"]
+            .as_array()
+            .expect("argv is an array")
+        {
+            let arg = arg.as_str().expect("argv element is a string");
+            assert!(
+                plan_text.contains(arg),
+                "plan text misses argv {arg}:\n{plan_text}"
+            );
+        }
+        assert!(plan_text.contains(
+            plan_payload["plan"]["repo"]
+                .as_str()
+                .expect("repo is a string")
+        ));
+        assert!(plan_text.contains(
+            plan_payload["plan"]["arch"]
+                .as_str()
+                .expect("arch is a string")
+        ));
     }
 }

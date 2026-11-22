@@ -111,8 +111,9 @@ enum Command {
         #[command(subcommand)]
         command: cli_build::BuildCommand,
     },
-    /// Container service runs: `_service` services, the precommit
-    /// gate, and `spec-cleaner` in the podman build vertical.
+    /// Local builds in the podman build vertical: build a package,
+    /// run its `_service` services, the precommit gate, and
+    /// `spec-cleaner`.
     LocalBuild {
         #[command(subcommand)]
         command: cli_local_build::LocalBuildCommand,

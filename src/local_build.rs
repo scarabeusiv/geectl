@@ -708,6 +708,51 @@ pub fn default_cache_dir() -> Result<PathBuf, GeectlError> {
     Ok(PathBuf::from(home).join(".cache").join("geectl"))
 }
 
+/// The request-level checks a build needs before anything runs:
+/// the project and repository names, the cache-dir components, the
+/// host architecture, and a non-zero timeout. Pure input checks —
+/// the spec and flavor checks need the source directory, so they
+/// stay in `build`. The CLI calls this before the pre-steps, so a
+/// bad coordinate fails before any service runs or script executes.
+pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
+    if !valid_obs_name(&req.project) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OBS project name: {:?}", req.project),
+        ));
+    }
+    if !valid_obs_name(&req.repo) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OBS repository name: {:?}", req.repo),
+        ));
+    }
+    // The path components under the cache dir must be single
+    // components: `valid_obs_name` allows `.`, so `..` would
+    // pass it and escape the cache dir (a `build --clean` would
+    // then wipe an arbitrary directory). The package component
+    // is checked in `build` once it is known from the spec.
+    validate_cache_components(&req.project, &req.repo, &req.arch, &req.flavor)?;
+    if req.arch != std::env::consts::ARCH {
+        return Err(GeectlError::new(
+            ErrorKind::UnsupportedArch,
+            format!(
+                "local build for {} on a {} host; other architectures go to the server (OBS-ONLY)",
+                req.arch,
+                std::env::consts::ARCH
+            ),
+        ));
+    }
+    // A zero timeout is an instant timeout, never a build.
+    if req.timeout_secs == 0 {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "build timeout must be greater than 0 seconds",
+        ));
+    }
+    Ok(())
+}
+
 /// The build flow: validate, fetch buildinfo + buildconfig, check
 /// trust, resolve the image, evict, prepare the deps, run the
 /// engine, read the verdict. A dry run stops after the plan is
@@ -721,46 +766,26 @@ impl<'a> LocalBuild<'a> {
     /// verdict `failed`, not an error — the record states what was
     /// read. The record is written to the root on every run.
     pub fn build(&self, req: &BuildRequest) -> Result<BuildRecord, GeectlError> {
-        if !valid_obs_name(&req.project) {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!("invalid OBS project name: {:?}", req.project),
-            ));
-        }
-        if !valid_obs_name(&req.repo) {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!("invalid OBS repository name: {:?}", req.repo),
-            ));
-        }
-        // The path components under the cache dir must be single
-        // components: `valid_obs_name` allows `.`, so `..` would
-        // pass it and escape the cache dir (a `build --clean` would
-        // then wipe an arbitrary directory). The package component
-        // is checked once it is known from the spec, below.
-        validate_cache_components(&req.project, &req.repo, &req.arch, &req.flavor)?;
-        if req.arch != std::env::consts::ARCH {
-            return Err(GeectlError::new(
-                ErrorKind::UnsupportedArch,
-                format!(
-                    "local build for {} on a {} host; other architectures go to the server (OBS-ONLY)",
-                    req.arch,
-                    std::env::consts::ARCH
-                ),
-            ));
-        }
-        // A zero timeout is an instant timeout, never a build.
-        if req.timeout_secs == 0 {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "build timeout must be greater than 0 seconds",
-            ));
-        }
+        validate_build_request(req)?;
         // One budget for the whole build op: the image pull and the
         // engine share it (see below) — a slow pull leaves less
         // time for the engine, instead of each phase taking a fresh
         // full timeout.
         let deadline = std::time::Instant::now() + Duration::from_secs(req.timeout_secs);
+        self.build_with_deadline(req, deadline)
+    }
+
+    /// The build against a fixed deadline: the caller owns the
+    /// deadline - the `build` leaf passes one deadline for the
+    /// service run, the precommit gate, and the engine build, so a
+    /// slow pre-step leaves less time for the build instead of
+    /// each phase taking a fresh full timeout.
+    pub fn build_with_deadline(
+        &self,
+        req: &BuildRequest,
+        deadline: std::time::Instant,
+    ) -> Result<BuildRecord, GeectlError> {
+        validate_build_request(req)?;
         // The source dir is resolved to an absolute path: the engine
         // runs with its cwd in the source dir, so a relative source
         // dir would make the spec path resolve to
@@ -4112,6 +4137,29 @@ impl<'a> LocalBuild<'a> {
             ));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        self.precommit_with_deadline(source_dir, timeout_secs, deadline, dry_run)
+    }
+
+    /// The precommit gate against a fixed deadline: the caller
+    /// owns the deadline - the `build` leaf passes one deadline
+    /// for the service run, the precommit gate, and the engine
+    /// build, so a slow service run leaves less time for the
+    /// script instead of the gate taking a fresh full timeout.
+    /// `timeout_secs` is the whole-run budget the
+    /// exhausted-budget message names.
+    pub fn precommit_with_deadline(
+        &self,
+        source_dir: &Path,
+        timeout_secs: u64,
+        deadline: std::time::Instant,
+        dry_run: bool,
+    ) -> Result<PrecommitRecord, GeectlError> {
+        if timeout_secs == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "precommit timeout must be greater than 0 seconds",
+            ));
+        }
         let req = ServiceRunRequest {
             source_dir: source_dir.to_path_buf(),
             mode: ServiceRunMode::Precommit,
@@ -4271,15 +4319,22 @@ impl<'a> LocalBuild<'a> {
         })
     }
 
-    /// The service run against a fixed deadline: the direct entry
-    /// shares the deadline with the caller (precommit passes its
-    /// own deadline so the services and `pre_checkin.sh` share one
-    /// budget).
-    fn service_run_with_deadline(
+    /// The service run against a fixed deadline: the caller owns
+    /// the deadline - `precommit` passes its own deadline so the
+    /// services and `pre_checkin.sh` share one budget, and the
+    /// `build` leaf passes one deadline for the service run, the
+    /// precommit gate, and the engine build.
+    pub fn service_run_with_deadline(
         &self,
         req: &ServiceRunRequest,
         deadline: std::time::Instant,
     ) -> Result<ServiceRunRecord, GeectlError> {
+        if req.timeout_secs == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "service run timeout must be greater than 0 seconds",
+            ));
+        }
         let source_dir = std::path::absolute(&req.source_dir).map_err(|e| {
             GeectlError::new(
                 ErrorKind::InvalidInput,
@@ -5896,6 +5951,52 @@ exit 0
         }
 
         #[test]
+        fn validate_build_request_rejects_bad_coordinates() {
+            let dir = TempDir::new();
+            let source = dir.path().join("pkg");
+            let good = BuildRequest::new(
+                source.clone(),
+                "testproject",
+                "standard",
+                std::env::consts::ARCH,
+            );
+            assert!(validate_build_request(&good).is_ok());
+            let bad_arch =
+                BuildRequest::new(source.clone(), "testproject", "standard", other_arch());
+            assert_eq!(
+                validate_build_request(&bad_arch).unwrap_err().kind(),
+                ErrorKind::UnsupportedArch
+            );
+            let bad_project = BuildRequest::new(
+                source.clone(),
+                "bad project",
+                "standard",
+                std::env::consts::ARCH,
+            );
+            assert_eq!(
+                validate_build_request(&bad_project).unwrap_err().kind(),
+                ErrorKind::InvalidInput
+            );
+            let bad_repo = BuildRequest::new(
+                source.clone(),
+                "testproject",
+                "bad/repo",
+                std::env::consts::ARCH,
+            );
+            assert_eq!(
+                validate_build_request(&bad_repo).unwrap_err().kind(),
+                ErrorKind::InvalidInput
+            );
+            let mut zero_timeout =
+                BuildRequest::new(source, "testproject", "standard", std::env::consts::ARCH);
+            zero_timeout.timeout_secs = 0;
+            assert_eq!(
+                validate_build_request(&zero_timeout).unwrap_err().kind(),
+                ErrorKind::InvalidInput
+            );
+        }
+
+        #[test]
         fn build_refuses_a_foreign_home_project() {
             let dir = TempDir::new();
             let (engine, _) = stub_engine(dir.path());
@@ -6691,6 +6792,159 @@ exit 0
             let err = vertical.build(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::BuildTimeout);
             assert!(started.elapsed() < Duration::from_secs(4));
+        }
+
+        /// A podman stub whose service runs take 2 s each: the
+        /// service binary sleeps before writing its output, and
+        /// `pre_checkin.sh` runs on the host as the stub's `bash`
+        /// arm runs it. `image inspect` reports a digest, `pull`
+        /// exits at once, `run` reports a fake container id.
+        fn stub_slow_service_podman(dir: &Path, src: &Path) -> PathBuf {
+            let script = dir.join("podman-slow-services");
+            let body = r##"#!/bin/sh
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then echo "sha256:fake-digest-1234"; exit 0; fi
+if [ "$1" = "pull" ]; then exit 0; fi
+if [ "$1" = "run" ]; then echo "fake-container-id"; exit 0; fi
+if [ "$1" = "stop" ]; then exit 0; fi
+if [ "$1" = "exec" ]; then
+  shift 1
+  if [ "$1" = "-w" ]; then shift 2; fi
+  shift 1
+  if [ "$1" = "zypper" ]; then exit 0; fi
+  if [ "$1" = "bash" ]; then cd "{SRC}" && bash ./pre_checkin.sh; exit $?; fi
+  case "$1" in
+    /usr/lib/obs/service/*)
+      sleep 2
+      name="${1#/usr/lib/obs/service/}"
+      outdir=""
+      prev=""
+      for arg in "$@"; do
+        if [ "$prev" = "--outdir" ]; then outdir="$arg"; fi
+        prev="$arg"
+      done
+      outdir="{SRC}/$(basename "$outdir")"
+      echo "output of $name" > "$outdir/$name.out"
+      exit 0
+      ;;
+  esac
+  exit 0
+fi
+exit 0
+"##
+            .replace("{SRC}", &src.display().to_string());
+            write_script(&script, &body);
+            script
+        }
+
+        #[test]
+        fn build_leaf_phases_share_one_timeout_budget() {
+            // One budget for the whole `build` leaf: the run-mode
+            // service run, the precommit gate, and the engine build
+            // share a single deadline. Without it each phase takes
+            // a fresh full timeout, so the whole run can take ~3x
+            // the documented budget: 4 s of services, 4 s of
+            // precommit, then a fresh 10 s for the engine.
+            let dir = TempDir::new();
+            let script = dir.path().join("sleep-stub");
+            write_script(
+                &script,
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"build stub 1.0\"; exit 0; fi\nsleep 30\n",
+            );
+            let src = write_source(dir.path(), "foo.spec");
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/><service name=\"beta\" mode=\"trylocal\"/></services>",
+            )
+            .unwrap();
+            write_script(&src.join("pre_checkin.sh"), "#!/bin/sh\nsleep 2\n");
+            let slow_podman = stub_slow_service_podman(dir.path(), &src);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), script, slow_podman);
+            let mut service_req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            service_req.timeout_secs = 10;
+            let mut build_req =
+                BuildRequest::new(src.clone(), "testproject", "standard", host_arch());
+            build_req.timeout_secs = 10;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let started = std::time::Instant::now();
+            let err = (|| -> Result<BuildRecord, GeectlError> {
+                vertical.service_run_with_deadline(&service_req, deadline)?;
+                vertical.precommit_with_deadline(&src, 10, deadline, false)?;
+                vertical.build_with_deadline(&build_req, deadline)
+            })()
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BuildTimeout);
+            assert!(started.elapsed() < Duration::from_secs(13));
+        }
+
+        #[test]
+        fn build_leaf_precommit_shares_the_timeout_budget() {
+            // The precommit gate shares the leaf's deadline too:
+            // its work here takes 10 s against a 10 s budget with
+            // 6 s already spent on services, so the gate itself
+            // times out at the deadline. A fresh deadline for the
+            // gate would let it finish and push the run past the
+            // bound.
+            let dir = TempDir::new();
+            let script = dir.path().join("sleep-stub");
+            write_script(
+                &script,
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"build stub 1.0\"; exit 0; fi\nsleep 30\n",
+            );
+            let src = write_source(dir.path(), "foo.spec");
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/><service name=\"beta\" mode=\"trylocal\"/><service name=\"gamma\" mode=\"trylocal\"/></services>",
+            )
+            .unwrap();
+            write_script(&src.join("pre_checkin.sh"), "#!/bin/sh\nsleep 6\n");
+            let slow_podman = stub_slow_service_podman(dir.path(), &src);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), script, slow_podman);
+            let mut service_req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            service_req.timeout_secs = 10;
+            let mut build_req =
+                BuildRequest::new(src.clone(), "testproject", "standard", host_arch());
+            build_req.timeout_secs = 10;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let started = std::time::Instant::now();
+            let err = (|| -> Result<BuildRecord, GeectlError> {
+                vertical.service_run_with_deadline(&service_req, deadline)?;
+                vertical.precommit_with_deadline(&src, 10, deadline, false)?;
+                vertical.build_with_deadline(&build_req, deadline)
+            })()
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BuildTimeout);
+            assert!(started.elapsed() < Duration::from_secs(13));
+        }
+
+        #[test]
+        fn service_run_with_deadline_honours_a_short_deadline() {
+            // A deadline the services cannot meet fails the run
+            // with a timeout instead of running them to completion:
+            // the passed deadline is the authority, not a fresh
+            // budget. A method that minted its own deadline would
+            // return Ok here.
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            let slow_podman = stub_slow_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), slow_podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let err = vertical
+                .service_run_with_deadline(&req, deadline)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::BuildTimeout);
         }
 
         #[test]

@@ -113,7 +113,7 @@ Commands:
   request      Read and act on OBS submit requests, and file new ones
   branch       Branch, copy, and link packages
   build        Build-status commands: results, logs, histories, binaries
-  local-build  Container service runs: `_service` services, the precommit gate, and `spec-cleaner` in the podman build vertical
+  local-build  Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, and `spec-cleaner`
   maintenance  Maintenance operations: maintained-instances listing and maintenance branching
   service      Service reads: list a package's services and their run state
   gitea        Gitea operations: repository and branch reads and mutations on the configured instance
@@ -376,10 +376,10 @@ Options:
   -h, --help                     Print help
 ```
 
-## `local-build` — container service runs
+## `local-build` — podman build vertical
 
 ```
-Container service runs: `_service` services, the precommit gate, and `spec-cleaner` in the podman build vertical
+Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, and `spec-cleaner`
 
 Usage: geectl local-build [OPTIONS] <COMMAND>
 
@@ -387,6 +387,7 @@ Commands:
   service-run   Run the `_service` file's services in the container, filtered by the run mode
   precommit     The precommit gate: the `precommit`-mode service run, then `pre_checkin.sh` when the source directory carries one
   spec-cleaner  Run `spec-cleaner` on a spec in the container
+  build         Build the package in the container: the run-mode service run, the precommit gate, then the engine build
   help          Print this message or the help of the given subcommand(s)
 
 Options:

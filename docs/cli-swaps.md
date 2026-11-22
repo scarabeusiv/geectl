@@ -127,12 +127,18 @@ with no osc counterpart.
 
 No geectl equivalent (coverage gaps, not deviations): `osc rebuild` /
 `restartbuild` / `abortbuild` — build-control writes; the library
-has no rebuild operation, so no CLI for them. `osc build` / `chroot`
-/ `wipe` / `lbl` — local build; out of scope (issue #43,
-podman vertical). `build build-status`, `build job-status`, `build
+has no rebuild operation, so no CLI for them. `chroot` / `wipe` /
+`lbl` — local build; out of scope (issue #43, podman vertical).
+`build build-status`, `build job-status`, `build
 fileinfo`, `build dependson`, `build check-constraints`, `build
 list-binaries` — new surface with no osc command (reachable in osc
 only via `osc api`).
+
+## `local-build` — podman build vertical (issue #43)
+
+| osc | geectl | Why |
+|---|---|---|
+| `build` | `local-build build DIRECTORY --project PROJECT --repo REPOSITORY` | One operation per the design: the run-mode service run, the precommit gate, then the engine build in one invocation; project and repo are explicit coordinates, arch defaults to the host arch; `--arch`, `--clean`, `--flavor`, `--release`, `--trust-all-projects`, `--refresh-image`, `--timeout-secs` are the only options in v1 |
 
 ## `maintenance` — maintained instances + branching (issue #69)
 
