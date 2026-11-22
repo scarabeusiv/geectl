@@ -8,6 +8,7 @@ use super::tag_attr;
 use super::tag_attr_names;
 use super::valid_obs_filename;
 use super::valid_obs_name;
+use super::validate_repository_settings;
 use super::DryRun;
 use super::NamedRole;
 use super::ObsClient;
@@ -209,12 +210,12 @@ fn remove_role_from_lists(
 }
 
 /// Validate the repositories of a project meta write: each name,
-/// architecture, and path entry must be a valid OBS name, and no
-/// name may repeat. Deliberately lenient about shape: valid server
+/// architecture, and path entry must be a valid OBS name, each
+/// repository's settings must be valid, and no name may repeat.
+/// Deliberately lenient about shape: valid server
 /// state can have no architectures or no paths (a hostsystem-only
-/// path parses to no paths; a download-only repository has no
-/// architectures), so this write-path check requires neither. The
-/// add path keeps its own stricter check.
+/// repository has neither), so this write-path check requires
+/// neither. The add path keeps its own stricter check.
 fn validate_repositories(repositories: &[Repository]) -> Result<(), GeectlError> {
     let mut names = Vec::new();
     for repository in repositories {
@@ -246,6 +247,7 @@ fn validate_repositories(repositories: &[Repository]) -> Result<(), GeectlError>
                 ));
             }
         }
+        validate_repository_settings(repository)?;
         if names.contains(&repository.name) {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
@@ -1194,7 +1196,7 @@ mod tests {
         assert!(rendered.contains("<build><disable/></build>"));
     }
 
-    const PROJECT_META_WITH_FULL_REPOSITORY: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" rebuild=\"local\" block=\"never\" linkedbuild=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><master url=\"https://master.example.com\" sslfingerprint=\"AB:CD\"/><pubkey>key-material</pubkey></download><download arch=\"aarch64\" url=\"https://other.example.com\" repotype=\"rpmmd\"/><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/><releasetarget project=\"openSUSE:Leap:15.5\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+    const PROJECT_META_WITH_FULL_REPOSITORY: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" rebuild=\"local\" block=\"never\" linkedbuild=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><master url=\"https://master.example.com\" sslfingerprint=\"AB:CD\"/><pubkey>key-material</pubkey></download><download arch=\"aarch64\" url=\"https://other.example.com\" repotype=\"rpmmd\"/><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/><releasetarget project=\"openSUSE:Leap:15.5\" repository=\"ports\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
 
     const PROJECT_META_WITH_BASE_REPOSITORY: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><base project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
 
@@ -1298,7 +1300,7 @@ mod tests {
         ));
         assert!(puts[0]
             .1
-            .contains("<releasetarget project=\"openSUSE:Leap:15.5\"/>"));
+            .contains("<releasetarget project=\"openSUSE:Leap:15.5\" repository=\"ports\"/>"));
         assert!(puts[0]
             .1
             .contains("<hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/>"));
@@ -1475,6 +1477,219 @@ mod tests {
     fn set_project_meta_refuses_a_repository_rewrite_with_a_path_with_content() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\">junk</path></repository></project>";
         set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_rejects_an_invalid_rebuild_value() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].rebuild = Some("bogus".to_string());
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_rejects_an_invalid_linkedbuild_value() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].linkedbuild = Some("bogus".to_string());
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_rejects_an_empty_download_url() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].downloads[0].url = String::new();
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_rejects_an_invalid_hostsystem() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].hostsystem =
+            vec![("bad project!".to_string(), "standard".to_string())];
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_accepts_blank_rebuild_and_linkedbuild_values() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PROJECT_META_WITH_FULL_REPOSITORY,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].rebuild = Some(String::new());
+        meta.repositories[0].linkedbuild = Some(String::new());
+        assert!(client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.put_calls().len(), 1);
+    }
+
+    #[test]
+    fn set_project_meta_rejects_a_download_arch_outside_the_repository() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].downloads[0].arch = Some("i586".to_string());
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_rejects_a_download_without_a_repotype() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].downloads[0].repotype = None;
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_rejects_an_unknown_download_repotype() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].downloads[0].repotype = Some("rpm-md".to_string());
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_rejects_a_duplicate_download_arch() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].downloads.push(RepositoryDownload {
+            arch: Some("x86_64".to_string()),
+            url: "https://other.example.com".to_string(),
+            repotype: Some("deb".to_string()),
+            archfilter: None,
+            pubkey: None,
+            master: None,
+        });
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_rejects_a_duplicate_download_arch_case_insensitively() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].arch.push("X86_64".to_string());
+        meta.repositories[0].downloads.push(RepositoryDownload {
+            arch: Some("X86_64".to_string()),
+            url: "https://other.example.com".to_string(),
+            repotype: Some("deb".to_string()),
+            archfilter: None,
+            pubkey: None,
+            master: None,
+        });
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_rejects_a_download_url_without_a_scheme() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].downloads[0].url = "example.com/no-scheme".to_string();
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_rejects_a_releasetarget_without_a_repository() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].release_targets[1].repository = None;
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
     }
 
     #[test]

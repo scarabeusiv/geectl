@@ -124,6 +124,7 @@ pub(crate) mod types;
 
 pub(crate) use self::branch::build_link_meta;
 pub(crate) use self::build::repository_element;
+pub(crate) use self::build::validate_repository_settings;
 pub use self::build::BinaryFile;
 pub use self::build::BuildDep;
 pub use self::build::BuildHistoryEntry;

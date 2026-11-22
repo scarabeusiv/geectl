@@ -1895,11 +1895,11 @@ fn download_element(download: &RepositoryDownload) -> String {
 }
 
 /// Validate a repository for adding: the name and every architecture
-/// and path component must be an OBS name, and the repository must
-/// carry at least one architecture and one path — like `osc repo
-/// add`, which requires `--arch` and `--path`. A repository with no
-/// path builds against nothing, so it is not addable through this
-/// operation.
+/// and path component must be an OBS name, the repository's settings
+/// must be valid, and the repository must carry at least one
+/// architecture and one path — like `osc repo add`, which requires
+/// `--arch` and `--path`. A repository with no path builds against
+/// nothing, so it is not addable through this operation.
 pub(crate) fn validate_repository(repository: &Repository) -> Result<(), GeectlError> {
     if !valid_obs_name(&repository.name) {
         return Err(GeectlError::new(
@@ -1944,7 +1944,140 @@ pub(crate) fn validate_repository(repository: &Repository) -> Result<(), GeectlE
             ));
         }
     }
+    validate_repository_settings(repository)?;
     Ok(())
+}
+
+/// Validate the settings of one repository beyond name,
+/// architectures, and paths: the rebuild and linkedbuild flags carry
+/// the server's enumerations (blank accepted, like the API model),
+/// and the download, release-target, and hostsystem settings carry
+/// the server's rules — a download's arch is required, one of the
+/// repository's architectures, and unique in the repository; a
+/// download's url carries a scheme and its repotype is one of the
+/// server's types; a release target names its repository; a master
+/// url carries a scheme when present. A missing optional value is
+/// never an error — only a present value is checked.
+pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<(), GeectlError> {
+    let invalid = |what: &str| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid repository {:?}: {what}", repository.name),
+        )
+    };
+    if let Some(rebuild) = &repository.rebuild {
+        if !matches!(rebuild.as_str(), "" | "transitive" | "direct" | "local") {
+            return Err(invalid(&format!(
+                "rebuild {rebuild:?} is not one of transitive, direct, local"
+            )));
+        }
+    }
+    if let Some(linkedbuild) = &repository.linkedbuild {
+        if !matches!(
+            linkedbuild.as_str(),
+            "" | "off" | "localdep" | "all" | "alldirect" | "alldirect_or_localdep"
+        ) {
+            return Err(invalid(&format!(
+                "linkedbuild {linkedbuild:?} is not one of off, localdep, all, alldirect, alldirect_or_localdep"
+            )));
+        }
+    }
+    let mut download_arches = Vec::new();
+    for download in &repository.downloads {
+        let arch = match &download.arch {
+            Some(arch) => arch,
+            None => return Err(invalid("download arch is required")),
+        };
+        if !valid_obs_name(arch) {
+            return Err(invalid(&format!(
+                "download arch {arch:?} is not a valid name"
+            )));
+        }
+        if !repository.arch.iter().any(|a| a == arch) {
+            return Err(invalid(&format!(
+                "download arch {arch:?} is not one of the repository's architectures"
+            )));
+        }
+        let lower = arch.to_lowercase();
+        if download_arches.contains(&lower) {
+            return Err(invalid(&format!(
+                "download arch {arch:?} is used more than once"
+            )));
+        }
+        download_arches.push(lower);
+        if !has_url_scheme(&download.url) {
+            return Err(invalid(&format!(
+                "download url {:?} has no scheme",
+                download.url
+            )));
+        }
+        let repotype = match &download.repotype {
+            Some(repotype) => repotype,
+            None => return Err(invalid("download repotype is required")),
+        };
+        if !DOWNLOAD_REPOTYPES.contains(&repotype.as_str()) {
+            return Err(invalid(&format!(
+                "download repotype {repotype:?} is not one of {}",
+                DOWNLOAD_REPOTYPES.join(", ")
+            )));
+        }
+        if let Some(master) = &download.master {
+            if !has_url_scheme(&master.url) {
+                return Err(invalid(&format!(
+                    "download master url {:?} has no scheme",
+                    master.url
+                )));
+            }
+        }
+    }
+    for target in &repository.release_targets {
+        if !valid_obs_name(&target.project) {
+            return Err(invalid(&format!(
+                "releasetarget project {:?} is not a valid name",
+                target.project
+            )));
+        }
+        let repo = match &target.repository {
+            Some(repo) => repo,
+            None => return Err(invalid("releasetarget repository is required")),
+        };
+        if !valid_obs_name(repo) {
+            return Err(invalid(&format!(
+                "releasetarget repository {repo:?} is not a valid name"
+            )));
+        }
+    }
+    for (project, repo) in &repository.hostsystem {
+        if !valid_obs_name(project) {
+            return Err(invalid(&format!(
+                "hostsystem project {project:?} is not a valid name"
+            )));
+        }
+        if !valid_obs_name(repo) {
+            return Err(invalid(&format!(
+                "hostsystem repository {repo:?} is not a valid name"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The download repository types the server accepts.
+const DOWNLOAD_REPOTYPES: [&str; 7] =
+    ["rpmmd", "susetags", "deb", "arch", "mdk", "registry", "apk"];
+
+/// A url carries a scheme when it starts with letters followed by a
+/// colon, and holds printable characters only, like the server's
+/// url check.
+fn has_url_scheme(url: &str) -> bool {
+    match url.find(':') {
+        Some(colon) => {
+            colon > 0
+                && url[..colon].chars().all(|c| c.is_ascii_alphabetic())
+                && url.chars().all(|c| !c.is_control())
+        }
+        None => false,
+    }
 }
 
 /// Add `repository` to the project meta document `doc`: a
@@ -6221,6 +6354,120 @@ mod tests {
             repository_element(&repo),
             "<repository name=\"a&amp;b\"><arch>x86_64</arch><path project=\"p&amp;q\" repository=\"r&quot;s\"/></repository>"
         );
+    }
+
+    #[test]
+    fn repository_settings_validation_rejects_invalid_values() {
+        let mut repo = new_repo();
+        repo.rebuild = Some("bogus".to_string());
+        assert!(validate_repository_settings(&repo).is_err());
+        assert!(validate_repository(&repo).is_err());
+        repo.rebuild = Some(String::new());
+        assert!(validate_repository_settings(&repo).is_ok());
+        repo.rebuild = Some("local".to_string());
+        repo.linkedbuild = Some("bogus".to_string());
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.linkedbuild = Some(String::new());
+        assert!(validate_repository_settings(&repo).is_ok());
+        repo.linkedbuild = Some("all".to_string());
+        // A download needs its arch, in the repository's architectures.
+        repo.downloads = vec![RepositoryDownload {
+            arch: None,
+            url: "https://example.com".to_string(),
+            repotype: Some("rpmmd".to_string()),
+            archfilter: None,
+            pubkey: None,
+            master: None,
+        }];
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads[0].arch = Some("bad arch!".to_string());
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads[0].arch = Some("i586".to_string());
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads[0].arch = Some("x86_64".to_string());
+        assert!(validate_repository_settings(&repo).is_ok());
+        // A second download on the same arch is a duplicate: the
+        // arch is in the repository's architectures, so only the
+        // dedup check rejects it.
+        repo.downloads.push(RepositoryDownload {
+            arch: Some("x86_64".to_string()),
+            url: "https://other.example.com".to_string(),
+            repotype: Some("deb".to_string()),
+            archfilter: None,
+            pubkey: None,
+            master: None,
+        });
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads.pop();
+        // The duplicate check is case-insensitive: both casings are
+        // in the repository's architectures, so only dedup rejects.
+        repo.arch.push("X86_64".to_string());
+        repo.downloads.push(RepositoryDownload {
+            arch: Some("X86_64".to_string()),
+            url: "https://other.example.com".to_string(),
+            repotype: Some("deb".to_string()),
+            archfilter: None,
+            pubkey: None,
+            master: None,
+        });
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads.pop();
+        repo.arch.pop();
+        // The url needs a scheme; the repotype is required and one of
+        // the server's types.
+        repo.downloads[0].url = "example.com/no-scheme".to_string();
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads[0].url = "https://example.com/\u{1}".to_string();
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads[0].url = "https://example.com".to_string();
+        repo.downloads[0].repotype = None;
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads[0].repotype = Some("rpm-md".to_string());
+        assert!(validate_repository_settings(&repo).is_err());
+        // Every server type is accepted.
+        for repotype in ["rpmmd", "susetags", "deb", "arch", "mdk", "registry", "apk"] {
+            repo.downloads[0].repotype = Some(repotype.to_string());
+            assert!(validate_repository_settings(&repo).is_ok());
+        }
+        // A master url needs a scheme when present.
+        repo.downloads[0].master = Some(DownloadMaster {
+            url: "master.example.com".to_string(),
+            sslfingerprint: None,
+        });
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads[0].master.as_mut().unwrap().url = "https://master.example.com".to_string();
+        assert!(validate_repository_settings(&repo).is_ok());
+        repo.downloads = vec![];
+        // A release target names its repository.
+        repo.release_targets = vec![ReleaseTarget {
+            project: "openSUSE:Leap:15.6".to_string(),
+            repository: None,
+            trigger: None,
+        }];
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.release_targets[0].repository = Some("standard".to_string());
+        assert!(validate_repository_settings(&repo).is_ok());
+        // Empty values the server does not check are accepted.
+        repo.block = Some(String::new());
+        repo.release_targets[0].trigger = Some(String::new());
+        repo.downloads = vec![RepositoryDownload {
+            arch: Some("x86_64".to_string()),
+            url: "https://example.com".to_string(),
+            repotype: Some("rpmmd".to_string()),
+            archfilter: Some(String::new()),
+            pubkey: Some(String::new()),
+            master: Some(DownloadMaster {
+                url: "https://master.example.com".to_string(),
+                sslfingerprint: Some(String::new()),
+            }),
+        }];
+        assert!(validate_repository_settings(&repo).is_ok());
+        repo.downloads = vec![];
+        repo.hostsystem = vec![("bad project!".to_string(), "standard".to_string())];
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.hostsystem = vec![("openSUSE:Factory".to_string(), "snapshot".to_string())];
+        assert!(validate_repository_settings(&repo).is_ok());
+        assert!(validate_repository(&repo).is_ok());
     }
 
     #[test]
