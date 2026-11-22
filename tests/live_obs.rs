@@ -467,6 +467,7 @@ fn request_xml(base: &str, id: &str) -> String {
         UreqClient::new(Timeout::default()).expect("default timeout is valid"),
     ));
     http.get_with(&format!("{base}/request/{id}"), &live_credentials())
+        .map_err(|err| redact_live_username(&format!("{err}")))
         .expect("GET the filed request back from the server")
 }
 
@@ -534,7 +535,11 @@ fn public_path_exists(base: &str, path: &str) -> bool {
     match http.get(&format!("{base}/public/source/{path}")) {
         Ok(_) => true,
         Err(err) if err.kind() == ErrorKind::NotFound => false,
-        Err(err) => panic!("GET /public/source/{path} failed unexpectedly: {err}"),
+        Err(err) => panic!(
+            "GET /public/source/{} failed unexpectedly: {}",
+            redact_live_username(path),
+            redact_live_username(&format!("{err}"))
+        ),
     }
 }
 
@@ -551,7 +556,10 @@ fn wait_until_gone(base: &str, path: &str) {
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    panic!("{path} still exists on the server 60s after the accept");
+    panic!(
+        "{} still exists on the server 60s after the accept",
+        redact_live_username(path)
+    );
 }
 
 /// Poll until the public path exists, for up to a minute: the target
@@ -565,7 +573,10 @@ fn wait_until_present(base: &str, path: &str) {
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    panic!("{path} is still missing on the server 60s after the accept");
+    panic!(
+        "{} is still missing on the server 60s after the accept",
+        redact_live_username(path)
+    );
 }
 
 #[test]
@@ -872,6 +883,7 @@ fn file_content(base: &str, project: &str, package: &str, filename: &str) -> Str
         &format!("{base}/source/{project}/{package}/{filename}"),
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("GET the uploaded file back from the server")
 }
 
@@ -949,6 +961,7 @@ fn set_project_link(base: &str, project: &str, link_project: &str) {
         &meta,
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("PUT the project meta with a project link");
 }
 /// PUT a package `_meta` carrying a `<devel project="..."/>`, so the
@@ -967,6 +980,7 @@ fn set_package_devel(base: &str, project: &str, package: &str, devel_project: &s
         &meta,
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("PUT the package meta with a devel project");
 }
 /// Read a package's `_link` back from the server, authenticated: the
@@ -979,6 +993,7 @@ fn read_link(base: &str, project: &str, package: &str) -> String {
         &format!("{base}/source/{project}/{package}/_link"),
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("GET the _link back from the server")
 }
 /// Create a factory project with a package, an update project linked
@@ -1051,12 +1066,17 @@ fn wait_until_log(
     loop {
         let log = client
             .package_log(project, package, None)
+            .map_err(|err| redact_live_username(&format!("{err}")))
             .expect("read the package log on the live instance");
         if log.len() >= count {
             return log;
         }
         if std::time::Instant::now() >= deadline {
-            panic!("package log for {project}/{package} still holds fewer than {count} entries after 60s");
+            panic!(
+                "package log for {}/{} still holds fewer than {count} entries after 60s",
+                redact_live_username(project),
+                redact_live_username(package)
+            );
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
@@ -1074,12 +1094,17 @@ fn wait_until_link_target(
     loop {
         if let Some(target) = client
             .link_target(project, package)
+            .map_err(|err| redact_live_username(&format!("{err}")))
             .expect("read the link target on the live instance")
         {
             return target;
         }
         if std::time::Instant::now() >= deadline {
-            panic!("{project}/{package} still links nothing after 60s");
+            panic!(
+                "{}/{} still links nothing after 60s",
+                redact_live_username(project),
+                redact_live_username(package)
+            );
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
@@ -1984,6 +2009,7 @@ fn read_file(base: &str, project: &str, package: &str, filename: &str) -> String
         &format!("{base}/source/{project}/{package}/{filename}"),
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("GET the file back from the server")
 }
 
@@ -1998,6 +2024,7 @@ fn read_expanded_file(base: &str, project: &str, package: &str, filename: &str) 
         &format!("{base}/source/{project}/{package}/{filename}?expand=1"),
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("GET the expanded file back from the server")
 }
 
@@ -2010,6 +2037,7 @@ fn read_meta(base: &str, project: &str, package: &str) -> String {
         &format!("{base}/source/{project}/{package}/_meta"),
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("GET the _meta back from the server")
 }
 
@@ -2139,6 +2167,7 @@ fn live_copy_self_with_keep_link_and_revision() {
         &format!("<link project=\"{source_project}\" package=\"{package}\"/>"),
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("PUT the _link into the link package");
     // Self-copy with keep-link and a revision succeeds, and the link
     // survives the copy.
@@ -2371,6 +2400,7 @@ fn set_package_lock(base: &str, project: &str, package: &str) {
         &meta,
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("PUT the package meta with a lock");
 }
 
@@ -2553,6 +2583,7 @@ fn put_link(base: &str, project: &str, package: &str, link: &str) {
         link,
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("PUT the _link on the live instance");
 }
 
@@ -2566,6 +2597,7 @@ fn read_directory(base: &str, project: &str, package: &str) -> String {
         &format!("{base}/source/{project}/{package}?rev=latest"),
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("GET the directory back from the server")
 }
 
@@ -2943,7 +2975,11 @@ fn project_exists(base: &str, project: &str) -> bool {
     match http.get_with(&format!("{base}/source/{project}"), &live_credentials()) {
         Ok(_) => true,
         Err(err) if err.kind() == ErrorKind::NotFound => false,
-        Err(err) => panic!("GET /source/{project} failed unexpectedly: {err}"),
+        Err(err) => panic!(
+            "GET /source/{} failed unexpectedly: {}",
+            redact_live_username(project),
+            redact_live_username(&format!("{err}"))
+        ),
     }
 }
 
@@ -2958,7 +2994,10 @@ fn wait_until_project_gone(base: &str, project: &str) {
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    panic!("{project} still exists on the server 60s after the delete");
+    panic!(
+        "{} still exists on the server 60s after the delete",
+        redact_live_username(project)
+    );
 }
 
 #[test]
@@ -3121,6 +3160,7 @@ fn set_project_repository(
         &meta,
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("PUT the project meta with a repository");
 }
 
@@ -3335,6 +3375,7 @@ fn set_project_scmsync(base: &str, project: &str, scmsync: &str) {
         &meta,
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("PUT the project meta with a scmsync");
 }
 
@@ -4493,7 +4534,8 @@ fn live_maintenance_branch_lists_and_branches_on_server() {
     assert_eq!(
         instances.len(),
         1,
-        "the maintained project must yield exactly one instance; got {instances:?}"
+        "the maintained project must yield exactly one instance; got {}",
+        redact_live_username(&format!("{instances:?}"))
     );
     let instance = &instances[0];
     assert_eq!(instance.source_project, maintained_project);
@@ -4501,7 +4543,12 @@ fn live_maintenance_branch_lists_and_branches_on_server() {
     assert_eq!(instance.devel_project, None);
     assert_eq!(instance.devel_package, None);
     let branch_project = format!("home:{}:branches:OBS_Maintained:{package}", live_username());
-    assert_eq!(instance.target_project, branch_project);
+    // Compare redacted forms: both sides carry the live username,
+    // so equality is preserved while a failure never prints it.
+    assert_eq!(
+        redact_live_username(&instance.target_project),
+        redact_live_username(&branch_project)
+    );
     assert_eq!(
         instance.target_package,
         format!("{package}.{maintained_project}")
@@ -4511,7 +4558,10 @@ fn live_maintenance_branch_lists_and_branches_on_server() {
         .maintenance_branch(&package, &options, &dry)
         .expect("branch the maintained package on the live instance")
         .expect("live branch returns a result");
-    assert_eq!(result.target_project, branch_project);
+    assert_eq!(
+        redact_live_username(&result.target_project),
+        redact_live_username(&branch_project)
+    );
     assert_eq!(
         result.target_package.as_deref(),
         Some(format!("{package}.{maintained_project}").as_str())
@@ -4830,6 +4880,78 @@ fn live_username() -> String {
     }
 }
 
+/// Redact the live username where it appears as a `home:<user>`
+/// project in a diagnostic string: `home:<user>:` becomes
+/// `home:[redacted]:`, and the bare form `home:<user>` at a segment
+/// boundary (`/`, `?`, `#`, `"`, ` `, or end-of-string) becomes
+/// `home:[redacted]`. Segment-scoped, not a bare username replace, so
+/// a username that appears elsewhere (a package name, say) is left
+/// alone, and a longer name sharing the prefix (`home:Administrator`)
+/// is never corrupted. Only the text that reaches a panic message or
+/// an assertion is redacted — the polling and the comparisons still
+/// use the real values. The `src/debug.rs` scrub deliberately does
+/// not catch a bare `home:<user>:` segment, so the harness redacts it
+/// itself.
+fn redact_live_username(text: &str) -> String {
+    let user = live_username();
+    let mut out = text.replace(&format!("home:{user}:"), "home:[redacted]:");
+    for boundary in ['/', '?', '#', '"', ' '] {
+        out = out.replace(
+            &format!("home:{user}{boundary}"),
+            &format!("home:[redacted]{boundary}"),
+        );
+    }
+    if let Some(prefix) = out.strip_suffix(&format!("home:{user}")) {
+        out = format!("{prefix}home:[redacted]");
+    }
+    out
+}
+
+#[test]
+fn redact_live_username_replaces_only_the_home_segment() {
+    let user = live_username();
+    assert_eq!(
+        redact_live_username(&format!("home:{user}:branches:OBS_Maintained:pkg")),
+        "home:[redacted]:branches:OBS_Maintained:pkg"
+    );
+    // A bare username elsewhere is untouched, and so is another
+    // `home:` project.
+    assert_eq!(
+        redact_live_username(&format!("{user} reported home:geectl-live")),
+        format!("{user} reported home:geectl-live")
+    );
+    // An error value whose context embeds the request URL is redacted
+    // the same way — the HTTP layer puts the URL in the context.
+    assert_eq!(
+        redact_live_username(&format!(
+            "http://127.0.0.1:3000/source/home:{user}:branches:OBS_Maintained:pkg returned 500"
+        )),
+        "http://127.0.0.1:3000/source/home:[redacted]:branches:OBS_Maintained:pkg returned 500"
+    );
+    // The bare form: a top-level home project ends the segment without
+    // a trailing colon.
+    assert_eq!(
+        redact_live_username(&format!(
+            "http://127.0.0.1:3000/source/home:{user}/pkg/_meta returned 404"
+        )),
+        "http://127.0.0.1:3000/source/home:[redacted]/pkg/_meta returned 404"
+    );
+    // A longer name sharing the prefix is never corrupted.
+    assert_eq!(
+        redact_live_username(&format!("home:{user}istrator/pkg")),
+        format!("home:{user}istrator/pkg")
+    );
+    // The space boundary: error values read `{url} returned {code}`,
+    // so a URL ending exactly at a bare home project is followed by
+    // a space.
+    assert_eq!(
+        redact_live_username(&format!(
+            "http://127.0.0.1:3000/source/home:{user} returned 500"
+        )),
+        "http://127.0.0.1:3000/source/home:[redacted] returned 500"
+    );
+}
+
 /// The `_meta` document of a package, read back from the server. The
 /// library has no read-a-package-meta operation, so the harness
 /// reads it through geectl's own HTTP client with the admin
@@ -4842,6 +4964,7 @@ fn package_meta(base: &str, project: &str, package: &str) -> String {
         &format!("{base}/source/{project}/{package}/_meta"),
         &live_credentials(),
     )
+    .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("GET package _meta from the live instance")
 }
 
@@ -4859,6 +4982,7 @@ fn set_project_attribute(base: &str, project: &str, namespace: &str, name: &str)
             &xml,
             &live_credentials(),
         )
+        .map_err(|err| redact_live_username(&format!("{err}")))
         .expect("POST project attribute on the live instance");
     assert!(
         response_is_status_ok(&body),
@@ -4884,6 +5008,7 @@ fn set_project_kind(base: &str, project: &str, kind: &str) {
             &meta,
             &live_credentials(),
         )
+        .map_err(|err| redact_live_username(&format!("{err}")))
         .expect("PUT project _meta with kind on the live instance");
     assert!(
         response_is_status_ok(&body),
@@ -5401,6 +5526,7 @@ fn set_project_config(base: &str, project: &str, config: &str) {
             config,
             &live_credentials(),
         )
+        .map_err(|err| redact_live_username(&format!("{err}")))
         .expect("PUT the project config on the live instance");
     assert!(
         response_is_status_ok(&body),
@@ -5425,6 +5551,7 @@ fn set_project_meta(base: &str, project: &str, meta: &str) {
             meta,
             &live_credentials(),
         )
+        .map_err(|err| redact_live_username(&format!("{err}")))
         .expect("PUT the project meta on the live instance");
     assert!(
         response_is_status_ok(&body),
