@@ -51,7 +51,7 @@ use crate::obs::ObsClient;
 use crate::url::UrlBuilder;
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// A Gitea user: only the login is modelled (the fork target-owner
 /// resolution reads it from `GET /api/v1/user`).
@@ -425,7 +425,7 @@ impl GiteaAccessMode {
     /// level: the modes order none < read < write < admin <
     /// owner, and a mode a newer server reports cannot be
     /// ordered, so it grants nothing.
-    fn grants_at_least(&self, level: GiteaAccess) -> bool {
+    pub fn grants_at_least(&self, level: GiteaAccess) -> bool {
         let rank = match self {
             GiteaAccessMode::None => 0,
             GiteaAccessMode::Read => 1,
@@ -440,6 +440,16 @@ impl GiteaAccessMode {
             GiteaAccess::Admin => 3,
         };
         rank >= want
+    }
+}
+
+impl From<GiteaAccess> for GiteaAccessMode {
+    fn from(level: GiteaAccess) -> Self {
+        match level {
+            GiteaAccess::Read => GiteaAccessMode::Read,
+            GiteaAccess::Write => GiteaAccessMode::Write,
+            GiteaAccess::Admin => GiteaAccessMode::Admin,
+        }
     }
 }
 
@@ -462,6 +472,111 @@ pub struct GiteaCollaboratorPermission {
 #[derive(Debug, Serialize)]
 struct AddCollaboratorRequest {
     permission: GiteaAccess,
+}
+
+/// A Gitea organization, as a team response names it: only the
+/// name is modelled.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaTeamOrg {
+    /// The organization's name.
+    pub name: String,
+}
+
+/// A Gitea org team: only the fields the team operations need
+/// are modelled — identity, permission, units, and flags. A
+/// field the operation does not need is not parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaTeam {
+    /// The team's numeric id: the address of every member and
+    /// repo operation on the team.
+    pub id: i64,
+    /// The team's name.
+    pub name: String,
+    /// The team's description.
+    #[serde(default)]
+    pub description: String,
+    /// The organization the team belongs to, when the server
+    /// names it: the team list leaves it null, while create and
+    /// get return it.
+    #[serde(default)]
+    pub organization: Option<GiteaTeamOrg>,
+    /// The access level the team grants on its repositories, as
+    /// the server reports it. The server reports `none` here for
+    /// read and write teams; the grant lives per unit in
+    /// `units_map`. Only admin and owner teams report their
+    /// level here.
+    pub permission: GiteaAccessMode,
+    /// The repo units the team can access, when the server
+    /// names them.
+    #[serde(default)]
+    pub units: Vec<String>,
+    /// The access level per repo unit, as the server reports it:
+    /// the grant a read or write team actually holds, since the
+    /// top-level `permission` reports `none` for those teams.
+    /// Empty when the server names no per-unit grant.
+    #[serde(default)]
+    pub units_map: HashMap<String, GiteaAccessMode>,
+    /// Whether the team can access every repository of the org.
+    #[serde(default)]
+    pub includes_all_repositories: bool,
+    /// Whether the team can create repositories in the org.
+    #[serde(default)]
+    pub can_create_org_repo: bool,
+}
+
+/// The repo units a team can access, as the server names them:
+/// the full set, sent when `team_create` is not told otherwise.
+/// A create with no units is refused by the server (500) for a
+/// non-admin team — an admin team is created with all units —
+/// so an unset units list means all of them, not none.
+const GITEA_TEAM_ALL_UNITS: [&str; 10] = [
+    "repo.code",
+    "repo.issues",
+    "repo.ext_issues",
+    "repo.pulls",
+    "repo.releases",
+    "repo.wiki",
+    "repo.ext_wiki",
+    "repo.projects",
+    "repo.packages",
+    "repo.actions",
+];
+
+/// Options for `team_create`: the name is required; the rest
+/// default to a read team over all repo units, no all-repo
+/// access, and no repo creation.
+#[derive(Debug, Clone, Default)]
+pub struct TeamCreateOptions {
+    /// A short description; omitted when unset.
+    pub description: Option<String>,
+    /// The access level the team grants; read when unset.
+    pub permission: Option<GiteaAccess>,
+    /// The repo units the team can access; all of them when unset — a create with no units is refused by the server for a non-admin team.
+    pub units: Option<Vec<String>>,
+    /// Whether the team can access every repository of the org.
+    pub includes_all_repositories: bool,
+    /// Whether the team can create repositories in the org.
+    pub can_create_org_repo: bool,
+}
+
+/// The body of `POST /api/v1/orgs/{org}/teams`: the name, the
+/// permission, the units, the per-unit grant, and the flags
+/// always; the description only when set. The permission is
+/// always sent: the server defaults an omitted permission to
+/// `none`, not read. The units are always sent: the server
+/// refuses a create with no units for a non-admin team. The
+/// per-unit grant is sent alongside the units: `units` is
+/// deprecated in favour of `units_map`.
+#[derive(Debug, Serialize)]
+struct TeamCreateRequest {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    permission: GiteaAccess,
+    units: Vec<String>,
+    units_map: BTreeMap<String, GiteaAccess>,
+    includes_all_repositories: bool,
+    can_create_org_repo: bool,
 }
 /// Options for `repo_create`: the repo is public and takes the
 /// server's default branch unless told otherwise.
@@ -1240,6 +1355,255 @@ impl<'a> GiteaClient<'a> {
         Ok(Some(user.to_string()))
     }
 
+    /// List an organization's teams (`GET
+    /// /api/v1/orgs/{org}/teams`). Paginates internally and is
+    /// bounded like `repo_list`.
+    pub fn team_list(&self, org: &str) -> Result<Vec<GiteaTeam>, GeectlError> {
+        validate_gitea_name(org, "organization")?;
+        self.list_paged::<GiteaTeam>(
+            &["api", "v1", "orgs", org, "teams"],
+            &[],
+            &format!("teams of organization {org}"),
+            "the list is bounded at 500 entries",
+        )
+    }
+
+    /// Read one team (`GET /api/v1/teams/{id}`).
+    pub fn team_get(&self, id: i64) -> Result<GiteaTeam, GeectlError> {
+        validate_team_id(id)?;
+        let id_str = id.to_string();
+        let url = build_url(&self.base, &["api", "v1", "teams", &id_str], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_team(&body, id)
+    }
+
+    /// Create an org team (`POST /api/v1/orgs/{org}/teams`) and
+    /// return the created team. DryRun-guarded like
+    /// `repo_create`: the guard runs before any server read, and
+    /// the result is `None` in dry-run. `force` is the
+    /// confirmation for a privileged team: without it a create
+    /// granting admin permission, access to all repositories,
+    /// or repository creation is refused client-side
+    /// (`InvalidInput` naming force) before any server read. A
+    /// dry-run plan needs no force. The response is checked
+    /// against what was asked for — the name, the organization
+    /// when the server names it, the permission per unit in
+    /// `units_map` (read when none was named), the units, and
+    /// both flags: a server that silently created a different
+    /// team must not report success.
+    pub fn team_create(
+        &self,
+        org: &str,
+        name: &str,
+        options: &TeamCreateOptions,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaTeam>, GeectlError> {
+        validate_gitea_name(org, "organization")?;
+        validate_gitea_team_name(name)?;
+        if let Some(description) = &options.description {
+            if description.chars().count() > 255 {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "invalid Gitea team description: over 255 characters".to_string(),
+                ));
+            }
+        }
+        if let Some(units) = &options.units {
+            for unit in units {
+                if !GITEA_TEAM_ALL_UNITS.contains(&unit.as_str()) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid Gitea team unit: {unit:?}"),
+                    ));
+                }
+            }
+        }
+        if !dry_run.allow(&format!("create team {name} in organization {org}")) {
+            return Ok(None);
+        }
+        let want_permission = options.permission.unwrap_or(GiteaAccess::Read);
+        if !force
+            && (want_permission == GiteaAccess::Admin
+                || options.includes_all_repositories
+                || options.can_create_org_repo)
+        {
+            let grant = if want_permission == GiteaAccess::Admin {
+                "admin permission"
+            } else if options.includes_all_repositories {
+                "access to all repositories"
+            } else {
+                "repository creation"
+            };
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to create team {name} in organization {org} without force: creating a team with {grant} is a privilege grant; pass force to confirm"
+                ),
+            ));
+        }
+        // Duplicates are dropped and an empty list means unset:
+        // the server dedupes the units it grants, so the request
+        // and the verification must agree on the deduped set.
+        let want_units: Vec<String> = match &options.units {
+            Some(units) if !units.is_empty() => {
+                let mut seen = HashSet::new();
+                units
+                    .iter()
+                    .filter(|u| seen.insert(u.as_str()))
+                    .cloned()
+                    .collect()
+            }
+            _ => GITEA_TEAM_ALL_UNITS.iter().map(|u| u.to_string()).collect(),
+        };
+        let request = TeamCreateRequest {
+            name: name.to_string(),
+            description: options.description.clone(),
+            permission: want_permission,
+            units: want_units.clone(),
+            units_map: want_units
+                .iter()
+                .map(|u| (u.clone(), want_permission))
+                .collect(),
+            includes_all_repositories: options.includes_all_repositories,
+            can_create_org_repo: options.can_create_org_repo,
+        };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea team-create request: {err}"),
+            )
+        })?;
+        let url = build_url(&self.base, &["api", "v1", "orgs", org, "teams"], &[]);
+        let response = self.http.post_json_with(&url, &body, &self.credentials)?;
+        let created = parse_team_body(&response, &format!("for the created team {name}"))?;
+        if created.name != name {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea team response for the created team {name}: the server answered for {}",
+                    created.name
+                ),
+            ));
+        }
+        // The list endpoint leaves the organization null, so the
+        // check runs only when the server names it.
+        if let Some(org_name) = &created.organization {
+            if !org_name.name.eq_ignore_ascii_case(org) {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected Gitea team response for the created team {name}: the server answered for organization {}",
+                        org_name.name
+                    ),
+                ));
+            }
+        }
+        // An admin team is granted all units whatever subset was
+        // asked for, so the verification expects the full set
+        // for an admin team and the asked set otherwise.
+        let verify_units: Vec<String> = if want_permission == GiteaAccess::Admin {
+            GITEA_TEAM_ALL_UNITS.iter().map(|u| u.to_string()).collect()
+        } else {
+            want_units.clone()
+        };
+        // The server reports `none` as the team permission for
+        // read and write teams — the grant lives per unit in
+        // `units_map` — so the permission is verified there, not
+        // on the top-level field. An admin team reports `admin`
+        // on the top level too, and that is checked.
+        if want_permission == GiteaAccess::Admin && created.permission != GiteaAccessMode::Admin {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea team response for the created team {name}: the server answered with {:?} permission, not admin",
+                    created.permission
+                ),
+            ));
+        }
+        let want_mode = GiteaAccessMode::from(want_permission);
+        for unit in &verify_units {
+            match created.units_map.get(unit) {
+                Some(mode) if *mode == want_mode => {}
+                _ => {
+                    return Err(GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!(
+                            "unexpected Gitea team response for the created team {name}: the server answered with {:?} for unit {unit}, not {want_mode:?}",
+                            created.units_map.get(unit)
+                        ),
+                    ));
+                }
+            }
+        }
+        // The server reorders the units list, so the set is
+        // compared sorted, not in order.
+        let mut got_units = created.units.clone();
+        got_units.sort();
+        let mut want_units_sorted = verify_units.clone();
+        want_units_sorted.sort();
+        if got_units != want_units_sorted {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea team response for the created team {name}: the server answered with units {got_units:?}, not {want_units_sorted:?}"
+                ),
+            ));
+        }
+        if created.includes_all_repositories != options.includes_all_repositories {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea team response for the created team {name}: the server answered with includes_all_repositories={}, not {}",
+                    created.includes_all_repositories, options.includes_all_repositories
+                ),
+            ));
+        }
+        if created.can_create_org_repo != options.can_create_org_repo {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea team response for the created team {name}: the server answered with can_create_org_repo={}, not {}",
+                    created.can_create_org_repo, options.can_create_org_repo
+                ),
+            ));
+        }
+        Ok(Some(created))
+    }
+
+    /// Delete an org team (`DELETE /api/v1/teams/{id}`) and
+    /// return the deleted team's name. The team is read first:
+    /// a team that does not exist answers 404 there, so the
+    /// delete refuses with `NotFound` naming the id before any
+    /// delete runs — like `repo_delete` reads the repo first.
+    /// `force` is the confirmation: without it the delete is
+    /// refused client-side (`InvalidInput` naming force) before
+    /// any server read. A dry-run plan needs no force.
+    pub fn team_delete(
+        &self,
+        id: i64,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<Option<String>, GeectlError> {
+        validate_team_id(id)?;
+        if !dry_run.allow(&format!("delete team {id}")) {
+            return Ok(None);
+        }
+        if !force {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to delete team {id} without force: deleting a team is destructive; pass force to confirm"
+                ),
+            ));
+        }
+        let existing = self.team_get(id)?;
+        let id_str = id.to_string();
+        let url = build_url(&self.base, &["api", "v1", "teams", &id_str], &[]);
+        self.http.delete(&url, &self.credentials)?;
+        Ok(Some(existing.name))
+    }
+
     /// List a repository's branches (`GET
     /// /api/v1/repos/{owner}/{repo}/branches`): the names and head
     /// commits of what a fork carries. Paginates internally and is
@@ -1779,6 +2143,7 @@ pub(crate) fn validate_gitea_name(name: &str, label: &str) -> Result<(), GeectlE
     Ok(())
 }
 
+
 /// Split an `owner/repo` coordinate into its parts, validating
 /// both names. Anything else is an invalid input naming the
 /// coordinate.
@@ -1804,6 +2169,39 @@ fn validate_pr_number(number: u64) -> Result<(), GeectlError> {
     }
     Ok(())
 }
+
+
+/// A Gitea team id: a positive integer. Zero and negatives name
+/// no team.
+fn validate_team_id(id: i64) -> Result<(), GeectlError> {
+    if id <= 0 {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid Gitea team id: {id}"),
+        ));
+    }
+    Ok(())
+}
+
+/// A Gitea team name: the server's rule is alphanumerics plus
+/// `-_.`, at most 255 characters — spaces are refused with 422,
+/// and a longer name too. The server is the authority on the
+/// rest.
+fn validate_gitea_team_name(name: &str) -> Result<(), GeectlError> {
+    let valid = !name.is_empty()
+        && name.chars().count() <= 255
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !valid {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid Gitea team name: {name:?}"),
+        ));
+    }
+    Ok(())
+}
+
 
 /// A git branch name for the explicit fork branch — and for the
 /// resolved branch before it is embedded in a fork's scmsync URL.
@@ -1948,6 +2346,39 @@ fn parse_collaborator_permission(
         ));
     }
     Ok(parsed)
+}
+
+/// Parse a Gitea team out of a response body. A body that is not
+/// a team is a server error naming the team id, never a silent
+/// empty value — the caller asked for this team. A body that
+/// names another id is a server error too: the callers (the
+/// create verification, the delete pre-read) treat the read as
+/// the requested team, so a response for another team must fail
+/// here instead of being verified or deleted as the requested one.
+fn parse_team(body: &str, id: i64) -> Result<GiteaTeam, GeectlError> {
+    let parsed = parse_team_body(body, &format!("for team {id}"))?;
+    if parsed.id != id {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected Gitea team response for team {id}: the server answered for team {}",
+                parsed.id
+            ),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Parse a team body without an id check: the create response
+/// names an id the caller does not know yet, so the id is
+/// verified by the caller against the created name instead.
+fn parse_team_body(body: &str, context: &str) -> Result<GiteaTeam, GeectlError> {
+    serde_json::from_str(body).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected Gitea team response {context}: {err}"),
+        )
+    })
 }
 
 /// Parse a Gitea branch out of a response body. A body that is not
@@ -5178,6 +5609,561 @@ mod tests {
             .collaborator_remove("pool", "systemd", "fbui", true, &DryRun::new(false))
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(http.delete_calls().is_empty());
+    }
+
+    /// A team JSON body, shaped like Gitea 1.24.7 answers, with
+    /// an unknown field to prove it is ignored. The top-level
+    /// permission and the per-unit permission are separate on
+    /// purpose: the server reports `none` on top for read and
+    /// write teams, and the grant lives in `units_map`.
+    #[allow(clippy::too_many_arguments)]
+    fn team_json(
+        id: i64,
+        org: &str,
+        name: &str,
+        permission: &str,
+        unit_permission: &str,
+        units: &[&str],
+        includes_all_repositories: bool,
+        can_create_org_repo: bool,
+    ) -> String {
+        let units_json: Vec<String> = units.iter().map(|u| format!("\"{u}\"")).collect();
+        let units_map_json: Vec<String> = units
+            .iter()
+            .map(|u| format!("\"{u}\": \"{unit_permission}\""))
+            .collect();
+        format!(
+            r#"{{"id": {id}, "name": "{name}", "description": "", "organization": {{"name": "{org}"}}, "permission": "{permission}", "units": [{}], "units_map": {{{}}}, "includes_all_repositories": {includes_all_repositories}, "can_create_org_repo": {can_create_org_repo}, "future_field": "tolerated"}}"#,
+            units_json.join(","),
+            units_map_json.join(",")
+        )
+    }
+
+    /// A team-list JSON body out of team JSON bodies.
+    fn team_list_json(teams: &[String]) -> String {
+        format!("[{}]", teams.join(","))
+    }
+
+    #[test]
+    fn team_list_returns_the_teams() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/orgs/pool/teams?page=1&limit=50",
+            &team_list_json(&[
+                team_json(7, "pool", "reviewers", "none", "read", &["repo.code"], false, false),
+                team_json(8, "pool", "owners", "admin", "admin", &["repo.code"], true, true),
+                // The list leaves the organization null: it still parses.
+                r#"{"id": 9, "name": "watchers", "description": "", "organization": null, "permission": "none", "units": ["repo.code"], "units_map": {"repo.code": "read"}, "includes_all_repositories": false, "can_create_org_repo": false, "future_field": "tolerated"}"#.to_string(),
+            ]),
+        );
+        let teams = client(&http).team_list("pool").unwrap();
+        assert_eq!(
+            teams.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["reviewers", "owners", "watchers"]
+        );
+        assert_eq!(teams[1].permission, GiteaAccessMode::Admin);
+        assert!(teams[1].includes_all_repositories);
+        assert!(teams[2].organization.is_none());
+    }
+
+    #[test]
+    fn team_list_empty_list_is_empty() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/orgs/pool/teams?page=1&limit=50",
+            "null",
+        );
+        let teams = client(&http).team_list("pool").unwrap();
+        assert!(teams.is_empty());
+    }
+
+    #[test]
+    fn team_list_refuses_an_invalid_org_name() {
+        let http = FakeHttp::new();
+        let err = client(&http).team_list("has space").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn team_get_parses_the_team() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/teams/7",
+            &team_json(
+                7,
+                "pool",
+                "reviewers",
+                "none",
+                "read",
+                &["repo.code"],
+                false,
+                false,
+            ),
+        );
+        let team = client(&http).team_get(7).unwrap();
+        assert_eq!(team.name, "reviewers");
+        assert_eq!(
+            team.organization
+                .as_ref()
+                .expect("a team names its organization")
+                .name,
+            "pool"
+        );
+        assert_eq!(team.permission, GiteaAccessMode::None);
+        assert_eq!(
+            team.units_map.get("repo.code"),
+            Some(&GiteaAccessMode::Read)
+        );
+    }
+
+    #[test]
+    fn team_get_wrong_id_is_a_server_error() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/teams/7",
+            &team_json(
+                8,
+                "pool",
+                "owners",
+                "admin",
+                "admin",
+                &["repo.code"],
+                true,
+                true,
+            ),
+        );
+        let err = client(&http).team_get(7).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn team_get_refuses_an_invalid_id() {
+        let http = FakeHttp::new();
+        let err = client(&http).team_get(0).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn team_create_posts_and_verifies_the_created_team() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/orgs/pool/teams",
+            &team_json(
+                7,
+                "pool",
+                "reviewers",
+                "none",
+                "read",
+                &GITEA_TEAM_ALL_UNITS,
+                false,
+                false,
+            ),
+        );
+        let created = client(&http)
+            .team_create(
+                "pool",
+                "reviewers",
+                &TeamCreateOptions::default(),
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run create returns the team");
+        assert_eq!(created.id, 7);
+        // A read team reports `none` on top; the grant is per unit.
+        assert_eq!(created.permission, GiteaAccessMode::None);
+        assert_eq!(created.units_map.len(), GITEA_TEAM_ALL_UNITS.len());
+        assert!(created
+            .units_map
+            .values()
+            .all(|m| *m == GiteaAccessMode::Read));
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/orgs/pool/teams".to_string(),
+                r#"{"name":"reviewers","permission":"read","units":["repo.code","repo.issues","repo.ext_issues","repo.pulls","repo.releases","repo.wiki","repo.ext_wiki","repo.projects","repo.packages","repo.actions"],"units_map":{"repo.actions":"read","repo.code":"read","repo.ext_issues":"read","repo.ext_wiki":"read","repo.issues":"read","repo.packages":"read","repo.projects":"read","repo.pulls":"read","repo.releases":"read","repo.wiki":"read"},"includes_all_repositories":false,"can_create_org_repo":false}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn team_create_with_options_posts_the_full_body() {
+        let options = TeamCreateOptions {
+            description: Some("reviews submissions".to_string()),
+            permission: Some(GiteaAccess::Write),
+            units: Some(vec!["repo.code".to_string(), "repo.issues".to_string()]),
+            includes_all_repositories: true,
+            can_create_org_repo: false,
+        };
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/orgs/pool/teams",
+            &team_json(
+                7,
+                "pool",
+                "reviewers",
+                "none",
+                "write",
+                &["repo.code", "repo.issues"],
+                true,
+                false,
+            ),
+        );
+        let created = client(&http)
+            .team_create("pool", "reviewers", &options, true, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run create returns the team");
+        assert_eq!(created.permission, GiteaAccessMode::None);
+        assert_eq!(created.units, vec!["repo.code", "repo.issues"]);
+        assert_eq!(
+            created.units_map.get("repo.code"),
+            Some(&GiteaAccessMode::Write)
+        );
+        assert_eq!(
+            created.units_map.get("repo.issues"),
+            Some(&GiteaAccessMode::Write)
+        );
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/orgs/pool/teams".to_string(),
+                r#"{"name":"reviewers","description":"reviews submissions","permission":"write","units":["repo.code","repo.issues"],"units_map":{"repo.code":"write","repo.issues":"write"},"includes_all_repositories":true,"can_create_org_repo":false}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn team_create_wrong_permission_is_a_server_error() {
+        let options = TeamCreateOptions {
+            permission: Some(GiteaAccess::Write),
+            ..Default::default()
+        };
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/orgs/pool/teams",
+            &team_json(
+                7,
+                "pool",
+                "reviewers",
+                "none",
+                "read",
+                &GITEA_TEAM_ALL_UNITS,
+                false,
+                false,
+            ),
+        );
+        let err = client(&http)
+            .team_create("pool", "reviewers", &options, false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn team_create_dry_run_plans_and_posts_nothing() {
+        let http = FakeHttp::new();
+        let planned = client(&http)
+            .team_create(
+                "pool",
+                "reviewers",
+                &TeamCreateOptions::default(),
+                false,
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert!(planned.is_none());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn team_create_duplicate_units_are_deduped() {
+        let options = TeamCreateOptions {
+            units: Some(vec![
+                "repo.code".to_string(),
+                "repo.code".to_string(),
+                "repo.issues".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/orgs/pool/teams",
+            &team_json(
+                7,
+                "pool",
+                "reviewers",
+                "none",
+                "read",
+                &["repo.code", "repo.issues"],
+                false,
+                false,
+            ),
+        );
+        let created = client(&http)
+            .team_create("pool", "reviewers", &options, false, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run create returns the team");
+        assert_eq!(created.units, vec!["repo.code", "repo.issues"]);
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/orgs/pool/teams".to_string(),
+                r#"{"name":"reviewers","permission":"read","units":["repo.code","repo.issues"],"units_map":{"repo.code":"read","repo.issues":"read"},"includes_all_repositories":false,"can_create_org_repo":false}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn team_create_empty_units_mean_all_units() {
+        let options = TeamCreateOptions {
+            units: Some(vec![]),
+            ..Default::default()
+        };
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/orgs/pool/teams",
+            &team_json(
+                7,
+                "pool",
+                "reviewers",
+                "none",
+                "read",
+                &GITEA_TEAM_ALL_UNITS,
+                false,
+                false,
+            ),
+        );
+        let created = client(&http)
+            .team_create("pool", "reviewers", &options, false, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run create returns the team");
+        assert_eq!(created.units.len(), GITEA_TEAM_ALL_UNITS.len());
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/orgs/pool/teams".to_string(),
+                r#"{"name":"reviewers","permission":"read","units":["repo.code","repo.issues","repo.ext_issues","repo.pulls","repo.releases","repo.wiki","repo.ext_wiki","repo.projects","repo.packages","repo.actions"],"units_map":{"repo.actions":"read","repo.code":"read","repo.ext_issues":"read","repo.ext_wiki":"read","repo.issues":"read","repo.packages":"read","repo.projects":"read","repo.pulls":"read","repo.releases":"read","repo.wiki":"read"},"includes_all_repositories":false,"can_create_org_repo":false}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn team_create_admin_team_is_granted_all_units() {
+        let options = TeamCreateOptions {
+            permission: Some(GiteaAccess::Admin),
+            units: Some(vec!["repo.code".to_string(), "repo.issues".to_string()]),
+            ..Default::default()
+        };
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/orgs/pool/teams",
+            &team_json(
+                7,
+                "pool",
+                "reviewers",
+                "admin",
+                "admin",
+                &GITEA_TEAM_ALL_UNITS,
+                false,
+                false,
+            ),
+        );
+        let created = client(&http)
+            .team_create("pool", "reviewers", &options, true, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run create returns the team");
+        assert_eq!(created.permission, GiteaAccessMode::Admin);
+        assert_eq!(created.units.len(), GITEA_TEAM_ALL_UNITS.len());
+    }
+
+    #[test]
+    fn team_create_refuses_a_spaced_name() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_create(
+                "pool",
+                "has space",
+                &TeamCreateOptions::default(),
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn team_create_refuses_a_name_over_255_chars() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_create(
+                "pool",
+                &"n".repeat(256),
+                &TeamCreateOptions::default(),
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn team_create_refuses_a_description_over_255_chars() {
+        let options = TeamCreateOptions {
+            description: Some("d".repeat(256)),
+            ..Default::default()
+        };
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_create("pool", "reviewers", &options, false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn team_create_refuses_an_unknown_unit() {
+        let options = TeamCreateOptions {
+            units: Some(vec!["repo.code".to_string(), "repo.nope".to_string()]),
+            ..Default::default()
+        };
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_create("pool", "reviewers", &options, false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn team_create_admin_refuses_without_force() {
+        let options = TeamCreateOptions {
+            permission: Some(GiteaAccess::Admin),
+            ..Default::default()
+        };
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_create("pool", "reviewers", &options, false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn team_create_all_repositories_refuses_without_force() {
+        let options = TeamCreateOptions {
+            includes_all_repositories: true,
+            ..Default::default()
+        };
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_create("pool", "reviewers", &options, false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn team_create_can_create_repo_refuses_without_force() {
+        let options = TeamCreateOptions {
+            can_create_org_repo: true,
+            ..Default::default()
+        };
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_create("pool", "reviewers", &options, false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn team_create_admin_dry_run_plans_and_posts_nothing() {
+        let options = TeamCreateOptions {
+            permission: Some(GiteaAccess::Admin),
+            ..Default::default()
+        };
+        let http = FakeHttp::new();
+        let planned = client(&http)
+            .team_create("pool", "reviewers", &options, false, &DryRun::new(true))
+            .unwrap();
+        assert!(planned.is_none());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn team_delete_reads_then_deletes() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/teams/7",
+                &team_json(
+                    7,
+                    "pool",
+                    "reviewers",
+                    "none",
+                    "read",
+                    &["repo.code"],
+                    false,
+                    false,
+                ),
+            )
+            .with_delete("https://src.opensuse.org/api/v1/teams/7", "");
+        let deleted = client(&http)
+            .team_delete(7, true, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run delete returns the name");
+        assert_eq!(deleted, "reviewers");
+        assert_eq!(
+            http.delete_calls(),
+            vec![("https://src.opensuse.org/api/v1/teams/7".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn team_delete_refuses_without_force() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_delete(7, false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.delete_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn team_delete_missing_team_is_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/teams/7",
+            ErrorKind::NotFound,
+        );
+        let err = client(&http)
+            .team_delete(7, true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn team_delete_dry_run_plans_and_deletes_nothing() {
+        let http = FakeHttp::new();
+        let dry_run = DryRun::new(true);
+        // Planning a delete needs no force: the refusal guards the
+        // live delete, not the plan.
+        let result = client(&http).team_delete(7, false, &dry_run).unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: delete team 7".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn team_delete_refuses_an_invalid_id() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .team_delete(-1, true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
         assert!(http.delete_calls().is_empty());
     }
 }
