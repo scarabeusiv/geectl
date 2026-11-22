@@ -189,9 +189,11 @@ is preemptive.)
   takes pre-formed lines, so the check is one bool per event.
 - **The two existing prints.** `try_change_state` already emits a
   `decision:` line on the channel when it declines an accept
-  (`src/obs/request.rs:3010`, the `Ok(false)` paths at `:3030` and
-  `:3047`), and returns `Ok(false)` — its information is already in
-  the payload, so nothing is lost. The re-issue `decision:` lines
+  (`src/obs/request.rs:3010`): the refused-change path (`:3030`)
+  propagates the error, so the reason reaches the JSON error
+  payload, while the already-in-target-state path (`:3047`)
+  returns `Ok(false)` — the boolean outcome is in the payload, so
+  nothing is lost. The re-issue `decision:` lines
   emit live in `post_changestate_with_retry` (`:2747`, emits
   `:2787-2813`). The `[dry-run]` plan echo
   (`src/obs/types.rs`, `DryRun::note`) stays as unconditional stderr

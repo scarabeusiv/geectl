@@ -2989,10 +2989,10 @@ impl<'a> ObsClient<'a> {
     /// and return whether it happened. A request-side or transport
     /// failure — the request is already closed or does not exist, the
     /// server is unreachable or errored — reports the failure on the
-    /// debug channel (gated on `--debug`) and returns `false`
-    /// instead of failing, so a batch triaging many requests does not
-    /// stop at the first one that cannot move. An authentication
-    /// failure does not get swallowed: it almost always means
+    /// debug channel (gated on `--debug`) and propagates the error,
+    /// so the decline reason reaches the payload instead of hiding
+    /// behind a bare `false`. An authentication failure does not get
+    /// swallowed: it almost always means
     /// misconfiguration (wrong or expired credentials), not a missing
     /// request, so it propagates — a batch with bad credentials fails
     /// loudly instead of reporting all-false. The one exception is a
@@ -3030,7 +3030,7 @@ impl<'a> ObsClient<'a> {
                 self.debug.emit(&format!(
                     "decision: could not change state of submit request {id}: {err}"
                 ));
-                Ok(false)
+                Err(err)
             }
             Err(err) if err.kind() == ErrorKind::AuthFailed => {
                 // The server answers a changestate on a request
@@ -5016,21 +5016,22 @@ description</description>
     }
 
     #[test]
-    fn try_change_state_false_on_a_refused_change() {
+    fn try_change_state_propagates_a_refused_change() {
         // A transport failure (TLS verification here — a kind the
         // changestate retry does not retry, so the test stays fast)
-        // is swallowed with a warning and the call reports false, so
-        // a batch triaging many requests does not stop at the first
-        // one that cannot move.
+        // propagates with the error, so the payload distinguishes a
+        // refused change from a request already in the target state
+        // (which still reports false).
         let http = FakeHttp::new().with_post_error(
             "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
             ErrorKind::TlsError,
         );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dry = DryRun::new(false);
-        assert!(!obs
+        let err = obs
             .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
-            .unwrap());
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TlsError);
         assert_eq!(http.post_calls().len(), 1);
     }
 
@@ -5762,9 +5763,10 @@ description</description>
             .unwrap()
             .with_debug(debug);
         let dry = DryRun::new(false);
-        assert!(!obs
+        let err = obs
             .try_change_state("42", RequestState::Accepted, "ok", false, &dry)
-            .unwrap());
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TlsError);
         let got: Vec<String> = lines.lock().unwrap().clone();
         assert_eq!(
             got,
