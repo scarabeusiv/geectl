@@ -3469,8 +3469,18 @@ mod tests {
     /// fork, the base is `main` on `openSUSE/geectl`.
     fn pr_json(number: u64, state: &str, merged: bool) -> String {
         let sha = "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa";
+        pr_json_with_shas(number, state, merged, sha, sha)
+    }
+
+    fn pr_json_with_shas(
+        number: u64,
+        state: &str,
+        merged: bool,
+        head_sha: &str,
+        base_sha: &str,
+    ) -> String {
         format!(
-            r#"{{"id": 122, "number": {number}, "user": {{"login": "scarabeusiv", "future_field": 1}}, "title": "change_review_state", "body": "A test PR body.", "labels": [{{"id": 1, "name": "bug", "future_field": true}}], "state": "{state}", "draft": false, "merged": {merged}, "mergeable": true, "head": {{"label": "scarabeusiv:change-review-state", "ref": "change-review-state", "sha": "{sha}", "repo": {{"full_name": "scarabeusiv/geectl", "future_field": 1}}}}, "base": {{"label": "main", "ref": "main", "sha": "{sha}", "repo": {{"full_name": "openSUSE/geectl", "future_field": 1}}}}, "future_field": "tolerated"}}"#
+            r#"{{"id": 122, "number": {number}, "user": {{"login": "scarabeusiv", "future_field": 1}}, "title": "change_review_state", "body": "A test PR body.", "labels": [{{"id": 1, "name": "bug", "future_field": true}}], "state": "{state}", "draft": false, "merged": {merged}, "mergeable": true, "head": {{"label": "scarabeusiv:change-review-state", "ref": "change-review-state", "sha": "{head_sha}", "repo": {{"full_name": "scarabeusiv/geectl", "future_field": 1}}}}, "base": {{"label": "main", "ref": "main", "sha": "{base_sha}", "repo": {{"full_name": "openSUSE/geectl", "future_field": 1}}}}, "future_field": "tolerated"}}"#
         )
     }
 
@@ -4444,6 +4454,23 @@ mod tests {
     }
 
     #[test]
+    fn pr_get_pins_head_and_base_commit_shas() {
+        // `test_gitea_api_pr.py::test_object_pull_request` pins the
+        // head and base commits; the round-trip test above pins the
+        // labels and branches but not the SHAs. Head and base carry
+        // distinct SHAs so the test pins which SHA belongs where.
+        let head_sha = "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa";
+        let base_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+            &pr_json_with_shas(122, "open", false, head_sha, base_sha),
+        );
+        let pr = client(&http).pr_get("openSUSE", "geectl", 122).unwrap();
+        assert_eq!(pr.head.sha, head_sha);
+        assert_eq!(pr.base.sha, base_sha);
+    }
+
+    #[test]
     fn pr_get_wrong_number_is_a_server_error() {
         let http = FakeHttp::new().with_get(
             "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
@@ -4492,6 +4519,23 @@ mod tests {
             .pr_get("openSUSE", "geectl", 0)
             .expect_err("pull request number 0 must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn pr_get_missing_pr_is_not_found() {
+        // `git-pr.feature`: "Get a pull request that doesn't exist" —
+        // a get on a missing PR fails instead of answering an empty
+        // PR. The 404 → `NotFound` mapping lives in the transport
+        // (pinned in `src/http.rs`); this test pins that `pr_get`
+        // surfaces it.
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/does-not/exist/pulls/1",
+            ErrorKind::NotFound,
+        );
+        let err = client(&http)
+            .pr_get("does-not", "exist", 1)
+            .expect_err("a missing pull request must fail");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
     #[test]
@@ -5384,6 +5428,52 @@ mod tests {
             .unwrap();
         assert_eq!(fork.full_name, "fbui/systemd");
         assert_eq!(fork.parent.as_ref().unwrap().full_name, "Pool/Systemd");
+    }
+
+    #[test]
+    fn fork_repo_fork_of_a_fork_verifies_the_immediate_parent() {
+        // `git-repo-fork.feature`: "Fork a git repo from pool and
+        // fork someone else's fork of the same repo" — forking a fork
+        // succeeds, and the re-read parent is the fork it was made
+        // from, not the root repo.
+        let fork_body = repo_json(
+            "Admin",
+            "test-GitPkgA-alice",
+            Some(("Alice", "test-GitPkgA-alice")),
+        );
+        let http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "Admin", "future_field": 1}"#,
+            ),
+            "Alice",
+            "test-GitPkgA-alice",
+            "https://src.opensuse.org/api/v1/repos/Admin/test-GitPkgA-alice",
+            &fork_body,
+        );
+        let fork = client(&http)
+            .fork_repo(
+                "Alice",
+                "test-GitPkgA-alice",
+                &ForkRepoOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fork.full_name, "Admin/test-GitPkgA-alice");
+        assert_eq!(
+            fork.parent.as_ref().unwrap().full_name,
+            "Alice/test-GitPkgA-alice"
+        );
+        // The fork POST targets the fork, not the root repo.
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/Alice/test-GitPkgA-alice/forks".to_string(),
+                "{}".to_string(),
+                true
+            )]
+        );
     }
 
     #[test]
