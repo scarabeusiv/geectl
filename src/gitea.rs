@@ -199,6 +199,171 @@ pub struct GiteaBranch {
     pub protected: bool,
 }
 
+/// A Gitea pull request: only the fields the read operations need
+/// are modelled — identity, title and body, state and merge flags,
+/// author, labels, and the head/base endpoints. A field the
+/// operation does not need is not parsed. Shaped like Gitea 1.24.7
+/// answers (`GET /api/v1/repos/{owner}/{repo}/pulls/{n}` and the
+/// list endpoint, which answers the same objects).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaPullRequest {
+    /// The pull request number, unique per repo.
+    pub number: u64,
+    /// The pull request title.
+    pub title: String,
+    /// The pull request body; `None` when the PR carries none.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// The wire state (`open`/`closed`).
+    pub state: String,
+    /// Whether the PR is a draft.
+    #[serde(default)]
+    pub draft: bool,
+    /// Whether the PR is merged.
+    #[serde(default)]
+    pub merged: bool,
+    /// Whether the PR is mergeable; `None` when the server has not
+    /// computed it.
+    #[serde(default)]
+    pub mergeable: Option<bool>,
+    /// The PR author.
+    pub user: GiteaOwner,
+    /// The label names on the PR.
+    #[serde(default)]
+    pub labels: Vec<GiteaLabel>,
+    /// Where the change comes from.
+    pub head: GiteaPullRequestRef,
+    /// Where the change goes to.
+    pub base: GiteaPullRequestRef,
+}
+
+/// One endpoint of a Gitea pull request: the repo, branch, and head
+/// commit the change comes from or goes to.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaPullRequestRef {
+    /// The branch label (`owner:branch` on a fork, the branch name
+    /// otherwise).
+    pub label: String,
+    /// The branch name.
+    #[serde(rename = "ref")]
+    pub branch: String,
+    /// The head/base commit SHA.
+    pub sha: String,
+    /// The repo the branch lives in; `None` when the fork the
+    /// branch lived in is deleted.
+    #[serde(default)]
+    pub repo: Option<GiteaPullRequestRepo>,
+}
+
+/// The repo of a pull-request endpoint: only its full name is
+/// modelled.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaPullRequestRepo {
+    /// `owner/name`.
+    pub full_name: String,
+}
+
+/// A Gitea label: only the name is modelled.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaLabel {
+    /// The label name.
+    pub name: String,
+}
+
+/// A Gitea issue as the global pull-request search answers it
+/// (`GET /api/v1/repos/issues/search?type=pulls`): the issue
+/// fields plus the `pull_request` block carrying the merged flag
+/// and the `repository` block carrying the repo. The head/base
+/// endpoints are not in the search answer, so a search result
+/// reads with empty endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaIssue {
+    /// The issue/PR number, unique per repo.
+    pub number: u64,
+    /// The issue title.
+    pub title: String,
+    /// The issue body; `None` when it carries none.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// The wire state (`open`/`closed`).
+    pub state: String,
+    /// The issue author.
+    pub user: GiteaOwner,
+    /// The label names on the issue.
+    #[serde(default)]
+    pub labels: Vec<GiteaLabel>,
+    /// The pull-request block; `None` when the item is not a PR.
+    #[serde(default)]
+    pub pull_request: Option<GiteaIssuePullRequest>,
+    /// The repo the issue lives in.
+    pub repository: GiteaIssueRepository,
+}
+
+/// The `pull_request` block of a search item: only the merged
+/// flag is modelled.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaIssuePullRequest {
+    /// Whether the PR is merged.
+    #[serde(default)]
+    pub merged: bool,
+}
+
+/// The `repository` block of a search item: only its full name is
+/// modelled.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaIssueRepository {
+    /// `owner/name`.
+    pub full_name: String,
+}
+
+/// A Gitea pull-request review: only the fields the read
+/// operations need are modelled — the reviewer, the state, the
+/// body, the dismissed flag, and when it was submitted. Shaped
+/// like Gitea 1.24.7 answers (`GET
+/// /api/v1/repos/{owner}/{repo}/pulls/{n}/reviews`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaReview {
+    /// The reviewer.
+    pub user: GiteaOwner,
+    /// The wire state (`PENDING`/`REQUEST_REVIEW`/`APPROVED`/
+    /// `REQUEST_CHANGES`/`COMMENT`).
+    pub state: String,
+    /// The review body; `None` when it carries none.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Whether a maintainer dismissed the review.
+    #[serde(default)]
+    pub dismissed: bool,
+    /// When the review was submitted; `None` when the server does
+    /// not record one.
+    #[serde(default)]
+    pub submitted_at: Option<String>,
+}
+
+/// The wire state filter for the pull-request list and search
+/// endpoints (`open`/`closed`/`all`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GiteaPullRequestState {
+    /// Open pull requests.
+    Open,
+    /// Closed pull requests (merged or closed unmerged).
+    Closed,
+    /// Every pull request, open or closed.
+    All,
+}
+
+impl GiteaPullRequestState {
+    /// The wire spelling of this state, as it appears in the
+    /// `state` query parameter.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GiteaPullRequestState::Open => "open",
+            GiteaPullRequestState::Closed => "closed",
+            GiteaPullRequestState::All => "all",
+        }
+    }
+}
+
 /// Options for `repo_create`: the repo is public and takes the
 /// server's default branch unless told otherwise.
 #[derive(Debug, Clone, Default)]
@@ -646,16 +811,19 @@ impl<'a> GiteaClient<'a> {
         match (owner, org) {
             (None, None) => repos.extend(self.list_paged::<GiteaRepository>(
                 &["api", "v1", "user", "repos"],
+                &[],
                 "your repositories",
                 "list a single user or organization instead",
             )?),
             (Some(owner), None) => repos.extend(self.list_paged::<GiteaRepository>(
                 &["api", "v1", "users", owner, "repos"],
+                &[],
                 &format!("repositories of user {owner}"),
                 "the list is bounded at 500 entries",
             )?),
             (None, Some(org)) => repos.extend(self.list_paged::<GiteaRepository>(
                 &["api", "v1", "orgs", org, "repos"],
+                &[],
                 &format!("repositories of organization {org}"),
                 "the list is bounded at 500 entries",
             )?),
@@ -672,11 +840,13 @@ impl<'a> GiteaClient<'a> {
                 // every repo twice.
                 repos.extend(self.list_paged::<GiteaRepository>(
                     &["api", "v1", "users", owner, "repos"],
+                    &[],
                     &format!("repositories of user {owner}"),
                     "the list is bounded at 500 entries",
                 )?);
                 repos.extend(self.list_paged::<GiteaRepository>(
                     &["api", "v1", "orgs", org, "repos"],
+                    &[],
                     &format!("repositories of organization {org}"),
                     "the list is bounded at 500 entries",
                 )?);
@@ -782,6 +952,7 @@ impl<'a> GiteaClient<'a> {
         validate_gitea_name(repo, "repo")?;
         self.list_paged::<GiteaBranch>(
             &["api", "v1", "repos", owner, repo, "branches"],
+            &[],
             &format!("branches of {owner}/{repo}"),
             "the list is bounded at 500 entries",
         )
@@ -823,6 +994,104 @@ impl<'a> GiteaClient<'a> {
         Ok(self.branch_get(owner, repo, branch)?.commit.id)
     }
 
+    /// Read one pull request (`GET
+    /// /api/v1/repos/{owner}/{repo}/pulls/{number}`): the title and
+    /// body, state and merge flags, author, labels, and the
+    /// head/base endpoints. The number is verified against what
+    /// was asked for: a server that answers for another PR is a
+    /// server error, like `repo_get`'s full-name check.
+    pub fn pr_get(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<GiteaPullRequest, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        let url = build_url(
+            &self.base,
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "pulls",
+                &number.to_string(),
+            ],
+            &[],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_pull_request(&body, owner, repo, number)
+    }
+
+    /// List a repository's pull requests (`GET
+    /// /api/v1/repos/{owner}/{repo}/pulls?state=…`): the PRs in
+    /// the given wire state. Paginates internally and is bounded
+    /// like `repo_list`.
+    pub fn pr_list(
+        &self,
+        owner: &str,
+        repo: &str,
+        state: GiteaPullRequestState,
+    ) -> Result<Vec<GiteaPullRequest>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        self.list_paged::<GiteaPullRequest>(
+            &["api", "v1", "repos", owner, repo, "pulls"],
+            &[("state", state.as_str())],
+            &format!("pull requests of {owner}/{repo}"),
+            "the list is bounded at 500 entries",
+        )
+    }
+
+    /// Search pull requests across the instance (`GET
+    /// /api/v1/repos/issues/search?type=pulls&state=…`): the
+    /// search answers issues, so the items carry the repo and the
+    /// merged flag but no head/base endpoints. Paginates
+    /// internally and is bounded like `repo_list`. The token
+    /// needs the `read:issue` scope: the server gates the issues
+    /// search on it (403 without it).
+    pub fn pr_search(&self, state: GiteaPullRequestState) -> Result<Vec<GiteaIssue>, GeectlError> {
+        self.list_paged::<GiteaIssue>(
+            &["api", "v1", "repos", "issues", "search"],
+            &[("type", "pulls"), ("state", state.as_str())],
+            "pull requests on the instance",
+            "the list is bounded at 500 entries",
+        )
+    }
+
+    /// List the reviews on a pull request (`GET
+    /// /api/v1/repos/{owner}/{repo}/pulls/{number}/reviews`): one
+    /// entry per review, in order. Paginates internally and is
+    /// bounded like `repo_list`.
+    pub fn pr_reviews(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GiteaReview>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        self.list_paged::<GiteaReview>(
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "pulls",
+                &number.to_string(),
+                "reviews",
+            ],
+            &[],
+            &format!("reviews of pull request {owner}/{repo}#{number}"),
+            "the list is bounded at 500 entries",
+        )
+    }
+
     /// Read every page of a list endpoint (`page`/`limit` query)
     /// into one typed list. A page shorter than the page size ends
     /// the list; a page of exactly the page size fetches the next
@@ -839,6 +1108,7 @@ impl<'a> GiteaClient<'a> {
     fn list_paged<T>(
         &self,
         segments: &[&str],
+        params: &[(&str, &str)],
         scope: &str,
         remedy: &str,
     ) -> Result<Vec<T>, GeectlError>
@@ -847,14 +1117,12 @@ impl<'a> GiteaClient<'a> {
     {
         let mut items = Vec::new();
         for page in 1..=MAX_LIST_PAGES {
-            let url = build_url(
-                &self.base,
-                segments,
-                &[
-                    ("page", &page.to_string()),
-                    ("limit", &LIST_PAGE_SIZE.to_string()),
-                ],
-            );
+            let page_arg = page.to_string();
+            let limit_arg = LIST_PAGE_SIZE.to_string();
+            let mut query: Vec<(&str, &str)> = params.to_vec();
+            query.push(("page", &page_arg));
+            query.push(("limit", &limit_arg));
+            let url = build_url(&self.base, segments, &query);
             let body = self.http.get_with(&url, &self.credentials)?;
             // Gitea answers a JSON `null` body for an empty list —
             // verified live on the branches endpoint of
@@ -883,14 +1151,12 @@ impl<'a> GiteaClient<'a> {
         // fail. Without this read a list of exactly 500 would fail
         // on an unproven "more than 500 entries".
         let page = MAX_LIST_PAGES + 1;
-        let url = build_url(
-            &self.base,
-            segments,
-            &[
-                ("page", &page.to_string()),
-                ("limit", &LIST_PAGE_SIZE.to_string()),
-            ],
-        );
+        let page_arg = page.to_string();
+        let limit_arg = LIST_PAGE_SIZE.to_string();
+        let mut query: Vec<(&str, &str)> = params.to_vec();
+        query.push(("page", &page_arg));
+        query.push(("limit", &limit_arg));
+        let url = build_url(&self.base, segments, &query);
         let body = self.http.get_with(&url, &self.credentials)?;
         let page_items: Vec<T> = serde_json::from_str::<Option<Vec<T>>>(&body)
             .map_err(|err| {
@@ -1216,6 +1482,32 @@ pub(crate) fn validate_gitea_name(name: &str, label: &str) -> Result<(), GeectlE
     Ok(())
 }
 
+/// Split an `owner/repo` coordinate into its parts, validating
+/// both names. Anything else is an invalid input naming the
+/// coordinate.
+pub fn parse_gitea_repo(value: &str) -> Result<(String, String), GeectlError> {
+    let (owner, repo) = value.split_once('/').ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid Gitea repository: {value:?} (expected owner/repo)"),
+        )
+    })?;
+    validate_gitea_name(owner, "owner")?;
+    validate_gitea_name(repo, "repo")?;
+    Ok((owner.to_string(), repo.to_string()))
+}
+
+/// A Gitea pull-request number: positive, like an OBS request id.
+fn validate_pr_number(number: u64) -> Result<(), GeectlError> {
+    if number == 0 {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "invalid Gitea pull-request number: 0",
+        ));
+    }
+    Ok(())
+}
+
 /// A git branch name for the explicit fork branch — and for the
 /// resolved branch before it is embedded in a fork's scmsync URL.
 /// The git-check-ref-format rules, for one-level names
@@ -1293,6 +1585,35 @@ fn parse_repository_body(body: &str, context: &str) -> Result<GiteaRepository, G
             format!("unexpected Gitea repository response {context}: {err}"),
         )
     })
+}
+
+/// Parse a Gitea pull request out of a response body. A body that
+/// is not a pull request is a server error naming the PR, never a
+/// silent empty value — the caller asked for this PR. A body that
+/// names another PR number is a server error too: numbers are
+/// unique per repo, so the comparison is exact.
+fn parse_pull_request(
+    body: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<GiteaPullRequest, GeectlError> {
+    let parsed: GiteaPullRequest = serde_json::from_str(body).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected Gitea pull-request response for {owner}/{repo}#{number}: {err}"),
+        )
+    })?;
+    if parsed.number != number {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected Gitea pull-request response for {owner}/{repo}#{number}: the server answered for pull request {}",
+                parsed.number
+            ),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Parse a Gitea branch out of a response body. A body that is not
@@ -1616,6 +1937,34 @@ mod tests {
     /// A branch-list JSON body out of branch JSON bodies.
     fn branch_list_json(branches: &[String]) -> String {
         format!("[{}]", branches.join(","))
+    }
+    /// A pull-request JSON body, shaped like Gitea 1.24.7 answers,
+    /// with an unknown field (`future_field`) to prove it is
+    /// ignored. The PR is `openSUSE/geectl#122`: the head is the
+    /// `change-review-state` branch on the `scarabeusiv/geectl`
+    /// fork, the base is `main` on `openSUSE/geectl`.
+    fn pr_json(number: u64, state: &str, merged: bool) -> String {
+        let sha = "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa";
+        format!(
+            r#"{{"id": 122, "number": {number}, "user": {{"login": "scarabeusiv", "future_field": 1}}, "title": "change_review_state", "body": "A test PR body.", "labels": [{{"id": 1, "name": "bug", "future_field": true}}], "state": "{state}", "draft": false, "merged": {merged}, "mergeable": true, "head": {{"label": "scarabeusiv:change-review-state", "ref": "change-review-state", "sha": "{sha}", "repo": {{"full_name": "scarabeusiv/geectl", "future_field": 1}}}}, "base": {{"label": "main", "ref": "main", "sha": "{sha}", "repo": {{"full_name": "openSUSE/geectl", "future_field": 1}}}}, "future_field": "tolerated"}}"#
+        )
+    }
+
+    /// An issue-search JSON item, shaped like Gitea 1.24.7 answers
+    /// for `GET /api/v1/repos/issues/search?type=pulls`: the issue
+    /// fields plus the `pull_request` block and the `repository`
+    /// block.
+    fn issue_json(number: u64, state: &str, merged: bool) -> String {
+        format!(
+            r#"{{"id": 122, "number": {number}, "user": {{"login": "scarabeusiv"}}, "title": "change_review_state", "body": "A test PR body.", "labels": [], "state": "{state}", "pull_request": {{"merged": {merged}, "draft": false}}, "repository": {{"id": 1, "name": "geectl", "owner": "openSUSE", "full_name": "openSUSE/geectl"}}, "future_field": "tolerated"}}"#
+        )
+    }
+
+    /// A review JSON body, shaped like Gitea 1.24.7 answers.
+    fn review_json(login: &str, state: &str, body: &str) -> String {
+        format!(
+            r#"{{"id": 1, "user": {{"login": "{login}"}}, "state": "{state}", "body": "{body}", "dismissed": false, "submitted_at": "2026-11-22T19:52:58Z", "future_field": "tolerated"}}"#
+        )
     }
 
     /// A package meta with a scmsync URL (and, when `devel` is set,
@@ -2534,6 +2883,209 @@ mod tests {
         );
         let branches = client(&http).branch_list("pool", "systemd").unwrap();
         assert!(branches.is_empty());
+    }
+    #[test]
+    fn pr_get_round_trip() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+            &pr_json(122, "open", false),
+        );
+        let pr = client(&http).pr_get("openSUSE", "geectl", 122).unwrap();
+        assert_eq!(pr.number, 122);
+        assert_eq!(pr.title, "change_review_state");
+        assert_eq!(pr.body.as_deref(), Some("A test PR body."));
+        assert_eq!(pr.state, "open");
+        assert!(!pr.draft);
+        assert!(!pr.merged);
+        assert_eq!(pr.mergeable, Some(true));
+        assert_eq!(pr.user.login, "scarabeusiv");
+        assert_eq!(
+            pr.labels
+                .iter()
+                .map(|l| l.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bug"]
+        );
+        assert_eq!(pr.head.label, "scarabeusiv:change-review-state");
+        assert_eq!(pr.head.branch, "change-review-state");
+        assert_eq!(
+            pr.head.repo.as_ref().map(|r| r.full_name.as_str()),
+            Some("scarabeusiv/geectl")
+        );
+        assert_eq!(pr.base.branch, "main");
+        assert_eq!(
+            pr.base.repo.as_ref().map(|r| r.full_name.as_str()),
+            Some("openSUSE/geectl")
+        );
+    }
+
+    #[test]
+    fn pr_get_wrong_number_is_a_server_error() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+            &pr_json(123, "open", false),
+        );
+        let err = client(&http)
+            .pr_get("openSUSE", "geectl", 122)
+            .expect_err("a PR body naming another number must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn pr_get_missing_fields_are_a_server_error() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+            "{}",
+        );
+        let err = client(&http)
+            .pr_get("openSUSE", "geectl", 122)
+            .expect_err("a PR body missing required fields must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn pr_get_tolerates_null_body_mergeable_and_deleted_fork_head() {
+        // A PR with no body, mergeability not computed, and the
+        // head fork deleted: the body and mergeable read as `None`,
+        // the head repo as `None` — not a parse failure.
+        let body = r#"{"number": 122, "title": "change_review_state", "body": null, "state": "open", "draft": false, "merged": false, "mergeable": null, "user": {"login": "scarabeusiv"}, "labels": [], "head": {"label": "change-review-state", "ref": "change-review-state", "sha": "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa", "repo": null}, "base": {"label": "main", "ref": "main", "sha": "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa", "repo": {"full_name": "openSUSE/geectl"}}}"#;
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122",
+            body,
+        );
+        let pr = client(&http).pr_get("openSUSE", "geectl", 122).unwrap();
+        assert_eq!(pr.body, None);
+        assert_eq!(pr.mergeable, None);
+        assert_eq!(pr.head.repo, None);
+    }
+
+    #[test]
+    fn pr_get_zero_is_an_invalid_input() {
+        // The guard runs before any server read: no canned
+        // response exists, so a request would fail differently.
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .pr_get("openSUSE", "geectl", 0)
+            .expect_err("pull request number 0 must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn pr_list_parses_prs_and_sends_the_state() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls?state=open&page=1&limit=50",
+            &format!("[{}, {}]", pr_json(122, "open", false), pr_json(123, "open", false)),
+        );
+        let prs = client(&http)
+            .pr_list("openSUSE", "geectl", GiteaPullRequestState::Open)
+            .unwrap();
+        assert_eq!(
+            prs.iter().map(|p| p.number).collect::<Vec<_>>(),
+            vec![122, 123]
+        );
+        assert_eq!(prs[0].title, "change_review_state");
+    }
+
+    #[test]
+    fn pr_list_null_page_is_an_empty_list() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls?state=all&page=1&limit=50",
+            "null",
+        );
+        let prs = client(&http)
+            .pr_list("openSUSE", "geectl", GiteaPullRequestState::All)
+            .unwrap();
+        assert!(prs.is_empty());
+    }
+
+    #[test]
+    fn pr_search_parses_issue_items() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page=1&limit=50",
+            &format!("[{}]", issue_json(122, "open", false)),
+        );
+        let items = client(&http)
+            .pr_search(GiteaPullRequestState::Open)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].number, 122);
+        assert_eq!(items[0].title, "change_review_state");
+        assert_eq!(items[0].state, "open");
+        assert_eq!(items[0].user.login, "scarabeusiv");
+        assert_eq!(items[0].repository.full_name, "openSUSE/geectl");
+        assert_eq!(
+            items[0].pull_request.as_ref().map(|p| p.merged),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn pr_search_null_page_is_an_empty_list() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=closed&page=1&limit=50",
+            "null",
+        );
+        let items = client(&http)
+            .pr_search(GiteaPullRequestState::Closed)
+            .unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn pr_reviews_parses_reviews() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+            &format!(
+                "[{}, {}]",
+                review_json("plusky", "APPROVED", "Looks good."),
+                review_json("mimi1vx", "COMMENT", "One nit.")
+            ),
+        );
+        let reviews = client(&http).pr_reviews("openSUSE", "geectl", 122).unwrap();
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].user.login, "plusky");
+        assert_eq!(reviews[0].state, "APPROVED");
+        assert_eq!(reviews[0].body.as_deref(), Some("Looks good."));
+        assert!(!reviews[0].dismissed);
+        assert_eq!(
+            reviews[0].submitted_at.as_deref(),
+            Some("2026-11-22T19:52:58Z")
+        );
+        assert_eq!(reviews[1].state, "COMMENT");
+    }
+
+    #[test]
+    fn pr_reviews_missing_state_is_a_server_error() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+            r#"[{"user": {"login": "plusky"}, "body": "Looks good."}]"#,
+        );
+        let err = client(&http)
+            .pr_reviews("openSUSE", "geectl", 122)
+            .expect_err("a review missing its state must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn parse_gitea_repo_splits_and_validates() {
+        assert_eq!(
+            parse_gitea_repo("pool/systemd").unwrap(),
+            ("pool".to_string(), "systemd".to_string())
+        );
+        for invalid in [
+            "pool",
+            "pool/",
+            "/systemd",
+            "a/b/c",
+            "pool/systemd ",
+            "",
+            "pool//systemd",
+        ] {
+            assert!(
+                parse_gitea_repo(invalid).is_err(),
+                "{invalid:?} must not parse as a repository"
+            );
+        }
     }
 
     #[test]
