@@ -45,7 +45,9 @@
 //! or term to echo, so the table is the whole rendering.
 //! `list-staging-projects` echoes the workflow project (`project:`);
 //! `staging-project` echoes the workflow project and the staging
-//! name (`project:` + `staging:`).
+//! name (`project:` + `staging:`). `search-projects-by-person`
+//! echoes the login (`login:`); `count-scmsync-projects` echoes the
+//! URL prefix (`url-prefix:`).
 //!
 //! The group's mutations follow the
 //! CLI-wide rule: dry-run by default, the global `--live` performs
@@ -196,6 +198,17 @@ pub enum RemoteCommand {
         /// Only show projects whose name is exactly the term.
         #[arg(long)]
         exact: bool,
+    },
+    /// Search projects by a person's login: every project whose meta
+    /// names the login in a role.
+    SearchProjectsByPerson {
+        /// The login to search projects for.
+        userid: String,
+    },
+    /// Count the projects syncing from a git URL prefix.
+    CountScmsyncProjects {
+        /// The git URL prefix to count projects for.
+        url_prefix: String,
     },
     /// Show the owners of a package (project/package scope).
     Owners {
@@ -686,6 +699,30 @@ pub fn run_remote(
                     render_project_matches(&term, &matches),
                 ),
             ))
+        }
+        RemoteCommand::SearchProjectsByPerson { userid } => {
+            let matches = client.search_projects_by_person(&userid)?;
+            let text = with_header(
+                &format!("login: {userid}"),
+                render_project_matches(&userid, &matches),
+            );
+            let payload = json!({
+                "login": userid,
+                "projects": matches.iter().map(project_match_json).collect::<Vec<_>>(),
+            });
+            Ok((payload, text))
+        }
+        RemoteCommand::CountScmsyncProjects { url_prefix } => {
+            let count = client.count_scmsync_projects(&url_prefix)?;
+            let text = with_header(
+                &format!("url-prefix: {url_prefix}"),
+                format!("count: {count}"),
+            );
+            let payload = json!({
+                "url_prefix": url_prefix,
+                "count": count,
+            });
+            Ok((payload, text))
         }
         RemoteCommand::Owners { project, package } => {
             let owners = client.owners(&project, &package)?;
@@ -3415,6 +3452,30 @@ mod tests {
                 no_requests: false,
                 no_status: true,
             } if project == "openSUSE:Factory" && name == "A"
+        ));
+    }
+
+    #[test]
+    fn search_projects_by_person_parses_login_positional() {
+        let command = parse(&["geectl", "remote", "search-projects-by-person", "alice"]);
+        assert!(matches!(
+            command,
+            RemoteCommand::SearchProjectsByPerson { userid } if userid == "alice"
+        ));
+    }
+
+    #[test]
+    fn count_scmsync_projects_parses_url_prefix_positional() {
+        let command = parse(&[
+            "geectl",
+            "remote",
+            "count-scmsync-projects",
+            "https://github.com/openSUSE/",
+        ]);
+        assert!(matches!(
+            command,
+            RemoteCommand::CountScmsyncProjects { url_prefix }
+                if url_prefix == "https://github.com/openSUSE/"
         ));
     }
 

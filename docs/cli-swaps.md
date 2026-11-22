@@ -41,6 +41,8 @@ what is specific to that group.
 | `osc ls /` | `remote list-projects` | Same listing, named as a leaf under `remote` |
 | (no osc command) | `remote list-staging-projects PROJECT` | New surface: osc has no staging read (`osc staging` is not a command in this osc); the library reads `/staging/<workflow>/staging_projects` |
 | (no osc command) | `remote staging-project PROJECT NAME` | Same; the one-project read |
+| `osc search -i LOGIN --project` | `remote search-projects-by-person LOGIN` | Same search: the projects a person is involved in, by login |
+| (no osc command) | `remote count-scmsync-projects URL-PREFIX` | New surface: the scmsync-prefix project count is API-only in osc |
 
 ## `request` — submit requests (issue #73)
 

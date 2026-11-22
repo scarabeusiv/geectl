@@ -1168,6 +1168,40 @@ fn remote_staging_project_with_half_set_credentials_fails_with_config_error() {
     assert_eq!(value["error"]["code"], "config_error");
 }
 
+#[test]
+fn remote_search_projects_by_person_with_half_set_credentials_fails_with_config_error() {
+    // The person search needs credentials, so it fails fast like the
+    // other credentialed reads.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "search-projects-by-person", "alice"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_count_scmsync_projects_with_half_set_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "count-scmsync-projects",
+            "https://github.com/openSUSE/",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
 // --- unconfigured credentialed read (issue #108) ---
 //
 // With nothing configured the credentialed read goes out without
