@@ -665,6 +665,7 @@ fn remote_help_lists_every_command() {
         "devel-project",
         "repo-add",
         "repo-remove",
+        "upload-file",
         "list-projects",
     ] {
         assert!(
@@ -1192,6 +1193,41 @@ fn remote_repo_remove_dry_run_ignores_half_set_credentials() {
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["dry_run"], true);
+}
+
+#[test]
+fn remote_upload_file_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let from = dir.0.join("vim.spec");
+    std::fs::write(&from, "Name: vim\n").unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "upload-file",
+            "openSUSE:Factory",
+            "vim",
+            "vim.spec",
+            "--from",
+        ])
+        .arg(&from)
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "openSUSE:Factory");
+    assert_eq!(value["package"], "vim");
+    assert_eq!(value["file"], "vim.spec");
+    assert_eq!(value["rev"], serde_json::Value::Null);
 }
 
 #[test]

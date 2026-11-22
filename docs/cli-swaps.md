@@ -28,6 +28,7 @@ what is specific to that group.
 | `osc rdiff` two-package form | `remote diff-packages` | Client-side diff of two packages from per-file reads (issue #74); a differing binary file fails the call |
 | `osc develproject` (prints devel project + package) | `remote devel-project <package>` | Factory-only; the library op returns the (project, package) pair (issue #77). `remote package-meta` shows the same pair as `devel: project/package`. |
 | `osc repo add` / `osc repo remove` (project admin writes) | `remote repo-add` / `remote repo-remove` | Grouped under `remote` with the other project reads; mutations take the global `--live` |
+| (no osc command) | `remote upload-file` | New surface: a raw file upload is API-only in osc (`osc api -X PUT -T FILE <path>`); the local file is read from `--from`, `--binary` uploads bytes |
 | `osc ls /` | `remote list-projects` | Same listing, named as a leaf under `remote` |
 
 ## `request` — submit requests (issue #73)
