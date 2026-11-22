@@ -1591,6 +1591,21 @@ fn history_to_xml(entry: &RequestHistory, indent: usize) -> String {
 /// rather than truncating), so a short collection is a server shape
 /// change, not a partial result.
 pub fn parse_request_collection(body: &str) -> Option<Vec<Request>> {
+    parse_request_collection_limited(body, None)
+}
+
+/// Parse a `<collection>` of requests, with an explicit server-side
+/// limit: the server reports the full match count in `matches` but
+/// returns only the first `limit` requests, so the parse accepts
+/// exactly `min(matches, limit)` requests instead of requiring
+/// `parsed == matches`. Without a limit the strict form applies.
+pub fn parse_request_collection_limited(body: &str, limit: Option<usize>) -> Option<Vec<Request>> {
+    // A limit of 0 asks for no rows. The search layers refuse it as
+    // InvalidInput before parsing; the parser rejects it too, so a
+    // zero limit never parses as an empty result.
+    if limit == Some(0) {
+        return None;
+    }
     if !body.contains("<collection") {
         return None;
     }
@@ -1619,7 +1634,11 @@ pub fn parse_request_collection(body: &str) -> Option<Vec<Request>> {
         requests.push(parse_request(&element)?);
         rest = &inner[close + "</request>".len()..];
     }
-    if parsed != matches as usize {
+    let expected = match limit {
+        Some(limit) => (matches as usize).min(limit),
+        None => matches as usize,
+    };
+    if parsed != expected {
         return None;
     }
     Some(requests)
@@ -1988,6 +2007,10 @@ pub struct RequestSearch {
     /// as `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`. A date alone reads
     /// as midnight.
     since: Option<String>,
+    /// Ask the server for at most this many matches. The server
+    /// reports the full match count in `matches` and returns only
+    /// the first `limit` requests, in the server's order.
+    limit: Option<usize>,
 }
 
 impl RequestSearch {
@@ -2090,6 +2113,20 @@ impl RequestSearch {
     pub fn since(mut self, since: String) -> Self {
         self.since = Some(since);
         self
+    }
+
+    /// Ask the server for at most this many matches. A limit of 0 is
+    /// refused by [`ObsClient::search_requests`] as `InvalidInput`:
+    /// the server reads an explicit `limit=0` as zero rows, never as
+    /// unlimited.
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// The requested bound, when one was set.
+    pub fn limit_value(&self) -> Option<usize> {
+        self.limit
     }
 
     /// Whether the search asks for the request history.
@@ -3504,12 +3541,21 @@ impl<'a> ObsClient<'a> {
     /// an empty list.
     pub fn search_requests(&self, search: &RequestSearch) -> Result<Vec<Request>, GeectlError> {
         let match_expr = search.match_expr()?;
+        if let Some(limit) = search.limit_value() {
+            if limit == 0 {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "a request search limit must be at least 1",
+                ));
+            }
+        }
         if !self.has_basic() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
                 "cannot search submit requests without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
             ));
         }
+        let limit_param = search.limit_value().map(|limit| limit.to_string());
         let mut query: Vec<(&str, &str)> = vec![("match", &match_expr)];
         if search.wants_history() {
             query.push(("withhistory", "1"));
@@ -3517,9 +3563,16 @@ impl<'a> ObsClient<'a> {
         if search.wants_full_history() {
             query.push(("withfullhistory", "1"));
         }
+        if let Some(limit) = &limit_param {
+            query.push(("limit", limit));
+        }
         let url = build_url(&self.base, &["search", "request"], &query);
         let body = self.http.get_with(&url, &self.credentials)?;
-        parse_request_collection(&body).ok_or_else(|| {
+        let parsed = match search.limit_value() {
+            Some(limit) => parse_request_collection_limited(&body, Some(limit)),
+            None => parse_request_collection(&body),
+        };
+        parsed.ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
                 "unexpected OBS request search response",
@@ -6105,6 +6158,72 @@ description</description>
     }
 
     #[test]
+    fn search_requests_with_limit_adds_the_limit_param() {
+        let search = RequestSearch::new().limit(2);
+        let url = build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[("match", &search.match_expr().unwrap()), ("limit", "2")],
+        );
+        let collection =
+            format!("<collection matches=\"2\">\n{REQUEST1_XML}\n{REQUEST2_XML}\n</collection>");
+        let http = FakeHttp::new().with_get(&url, &collection);
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let requests = obs.search_requests(&search).expect("limited search parses");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(http.get_calls()[0].0, url);
+    }
+
+    #[test]
+    fn search_requests_with_limit_zero_is_invalid_input() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = obs
+            .search_requests(&RequestSearch::new().limit(0))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn parse_request_collection_limited_accepts_a_prefix() {
+        let collection =
+            format!("<collection matches=\"3\">\n{REQUEST1_XML}\n{REQUEST2_XML}\n</collection>");
+        let requests =
+            parse_request_collection_limited(&collection, Some(2)).expect("a full prefix parses");
+        assert_eq!(requests.len(), 2);
+        // Fewer matches than the limit: the whole collection parses.
+        let collection = format!("<collection matches=\"1\">\n{REQUEST1_XML}\n</collection>");
+        let requests = parse_request_collection_limited(&collection, Some(5))
+            .expect("a short collection under the limit parses");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn parse_request_collection_limited_refuses_a_short_prefix() {
+        let collection = format!("<collection matches=\"3\">\n{REQUEST1_XML}\n</collection>");
+        assert_eq!(parse_request_collection_limited(&collection, Some(2)), None);
+        // The strict form still refuses the same body.
+        assert_eq!(parse_request_collection(&collection), None);
+    }
+
+    #[test]
+    fn parse_request_collection_limited_refuses_over_return_and_zero_limit() {
+        // Three rows against a limit of 2: the server returned more
+        // than asked for, so the collection is not the limited
+        // result. (The third row repeats the first fixture; the row
+        // count is what this pins.)
+        let three = format!(
+            "<collection matches=\"3\">\n{REQUEST1_XML}\n{REQUEST2_XML}\n{REQUEST1_XML}\n</collection>"
+        );
+        assert_eq!(parse_request_collection_limited(&three, Some(2)), None);
+        // A zero limit parses as nothing, even for an empty collection.
+        let empty = "<collection matches=\"0\"></collection>";
+        assert_eq!(parse_request_collection_limited(empty, Some(0)), None);
+        assert_eq!(parse_request_collection_limited(&three, Some(0)), None);
+    }
+
+    #[test]
     fn parse_request_collection_rejects_a_malformed_request() {
         let collection = "<collection matches=\"1\">\n<request creator=\"creator\" id=\"42\">\n  <action type=\"explode\">\n    <target project=\"foo\" />\n  </action>\n  <state name=\"new\" when=\"2010-12-27T01:36:29\" who=\"creator\" />\n</request>\n</collection>";
         assert_eq!(parse_request_collection(collection), None);
@@ -6120,10 +6239,12 @@ description</description>
 
     #[test]
     fn parse_request_collection_rejects_a_short_collection() {
-        // The server returns every match in one response (over the
-        // limit it refuses with 403 rather than truncating), so a
-        // collection carrying fewer requests than its `matches`
-        // count is a shape change, not a partial result.
+        // Without an explicit limit the server returns every match
+        // in one response (over the configured result cap it refuses
+        // with 403 rather than truncating), so a collection carrying
+        // fewer requests than its `matches` count is a shape change,
+        // not a partial result. With a limit the short form is
+        // expected; see `parse_request_collection_limited`.
         let collection = format!("<collection matches=\"2\">\n{REQUEST1_XML}\n</collection>");
         assert_eq!(parse_request_collection(&collection), None);
     }

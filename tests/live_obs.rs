@@ -2462,6 +2462,32 @@ fn live_search_requests_since_bounds_by_history_date() {
     assert_eq!(past[0].id, request_id);
 }
 
+/// The `limit` bound is evaluated server-side: a one-match search
+/// capped at 1 returns that request, and a multi-match search capped
+/// at 1 returns exactly one row.
+#[test]
+fn live_search_requests_limit_bounds_the_result() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _package) = file_live_request(&client, "2.0");
+    let request_id: u64 = id.parse().expect("the filed request id is a number");
+    let capped = client
+        .search_requests(&RequestSearch::new().request_ids(vec![request_id]).limit(1))
+        .expect("a limited search runs on the live instance");
+    assert_eq!(capped.len(), 1, "limit 1 returns exactly one request");
+    assert_eq!(capped[0].id, request_id);
+    let multi = client
+        .search_requests(
+            &RequestSearch::new()
+                .creators(vec!["Admin".to_string()])
+                .limit(1),
+        )
+        .expect("a limited creator search runs on the live instance");
+    assert_eq!(multi.len(), 1, "limit 1 caps a multi-match search");
+}
+
 /// The lenient state change on a request the server refuses to move:
 /// accepting an accepted request reports `false` instead of failing,
 /// so a batch triaging many requests does not stop here.
