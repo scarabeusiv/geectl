@@ -913,6 +913,11 @@ pub struct DeletePayload {
     target: DeleteTarget,
     /// The request description text.
     description: String,
+    /// The auto-accept time, when set: the server accepts the
+    /// request on its own once this UTC time passes (`osc
+    /// deletereq --accept-in-hours`). `None` files a plain
+    /// request that waits for a human.
+    accept_at: Option<String>,
 }
 
 impl DeletePayload {
@@ -928,6 +933,7 @@ impl DeletePayload {
             target_project: target_project.to_string(),
             target,
             description: description.to_string(),
+            accept_at: None,
         };
         payload.validate_semantics()?;
         payload.validate_xml()?;
@@ -947,6 +953,28 @@ impl DeletePayload {
     /// The request description text.
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// The auto-accept time, when one is set.
+    pub fn accept_at(&self) -> Option<&str> {
+        self.accept_at.as_deref()
+    }
+
+    /// Set the auto-accept time to `hours` from now (UTC), as `osc
+    /// deletereq --accept-in-hours` does: the server accepts the
+    /// request on its own once that time passes. The timestamp is
+    /// computed now, in ISO-8601 UTC with a `+00:00` offset, and
+    /// rendered after `<description>`, the order osc emits. Hours
+    /// that overflow the clock or would land past year 9999 are
+    /// refused — a four-digit year is the most the format carries.
+    /// Zero hours is allowed, matching osc: the CLI passes
+    /// `--accept-in-hours 0` through as a timer for now (the value
+    /// arrives as the string `"0"`, which is truthy in Python), so
+    /// the method and the CLI agree on 0.
+    pub fn with_accept_at_in_hours(mut self, hours: u64) -> Result<Self, GeectlError> {
+        self.accept_at = Some(accept_at_in_hours(hours)?);
+        self.validate_xml()?;
+        Ok(self)
     }
 
     /// The semantic checks [`DeletePayload::new`] runs: the target
@@ -994,7 +1022,8 @@ impl DeletePayload {
 
     /// Render the OBS request XML for this payload: one `delete`
     /// action with its target (package, repository, or neither for
-    /// a whole-project delete). All text is XML-escaped.
+    /// a whole-project delete), then the description, then the
+    /// auto-accept time when one is set. All text is XML-escaped.
     pub fn to_xml(&self) -> String {
         let target_attrs = match &self.target {
             DeleteTarget::Package(package) => {
@@ -1005,34 +1034,116 @@ impl DeletePayload {
             }
             DeleteTarget::WholeProject => String::new(),
         };
+        let accept_at = match &self.accept_at {
+            Some(accept_at) => format!("\n  <accept_at>{}</accept_at>", xml_escape(accept_at)),
+            None => String::new(),
+        };
         format!(
-            "<request>\n  <action type=\"delete\">\n    <target project=\"{}\"{} />\n  </action>\n  <description>{}</description>\n</request>",
+            "<request>\n  <action type=\"delete\">\n    <target project=\"{}\"{} />\n  </action>\n  <description>{}</description>{}\n</request>",
             xml_escape(&self.target_project),
             target_attrs,
             xml_escape(&self.description),
+            accept_at,
         )
     }
 
     /// Verify the rendered XML is well-formed and carries exactly
-    /// one `delete` action with its target, plus the description.
+    /// one `delete` action with its target, plus the description —
+    /// and an `<accept_at>` exactly when an auto-accept time is set.
     pub fn validate_xml(&self) -> Result<(), GeectlError> {
         let xml = self.to_xml();
-        check_well_formed(
-            &xml,
-            &[
-                "request/action",
-                "request/action/target",
-                "request/description",
-            ],
-        )?;
+        let mut required = vec![
+            "request/action",
+            "request/action/target",
+            "request/description",
+        ];
+        if self.accept_at.is_some() {
+            required.push("request/accept_at");
+        }
+        check_well_formed(&xml, &required)?;
         if action_types(&xml)? != ["delete"] {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 "malformed delete XML: expected exactly one delete action",
             ));
         }
+        let expected = usize::from(self.accept_at.is_some());
+        if xml.matches("<accept_at>").count() != expected
+            || xml.matches("</accept_at>").count() != expected
+        {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "malformed delete XML: <accept_at> does not match the opted-in auto-accept time",
+            ));
+        }
         Ok(())
     }
+}
+
+/// The UTC timestamp `hours` from now, in whole-second ISO-8601
+/// with a `+00:00` offset. osc emits the same instant
+/// typically with microseconds (`isoformat()` omits the fraction
+/// when it lands on a whole second); geectl emits whole seconds.
+/// The server stores its
+/// own rendering of the value (no offset) on the request. The clock
+/// read fails
+/// only when the system clock predates the epoch; an hour count
+/// that overflows the clock or lands past year 9999 is refused.
+fn accept_at_in_hours(hours: u64) -> Result<String, GeectlError> {
+    let too_many = || {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("auto-accept time overflows the clock: {hours} hours is too many"),
+        )
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                "system clock predates the Unix epoch; cannot compute an auto-accept time",
+            )
+        })?;
+    let delta = hours.checked_mul(3600).ok_or_else(too_many)?;
+    let secs = now.as_secs().checked_add(delta).ok_or_else(too_many)?;
+    let (year, _, _) = civil_from_days((secs / 86_400) as i64);
+    if year > 9999 {
+        return Err(too_many());
+    }
+    Ok(iso8601_utc_from_unix(secs))
+}
+
+/// Format Unix `secs` as ISO-8601 UTC
+/// (`2026-11-22T12:34:56+00:00`). The civil conversion is Howard
+/// Hinnant's days-from-civil algorithm, so leap years (including
+/// the 400-year rule) fall out of the arithmetic instead of a
+/// lookup table.
+fn iso8601_utc_from_unix(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}+00:00",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// The (year, month, day) of `days` counted from the Unix epoch.
+/// Hinnant's civil-from-days: the era split keeps every division
+/// exact, so 2000-02-29 exists and 2100-02-29 does not.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { y + 1 } else { y }, month, day)
 }
 
 /// The `type` attributes of the `<action>` elements in `xml`, in
@@ -2131,6 +2242,107 @@ mod tests {
             "   ",
         )
         .is_err());
+    }
+
+    #[test]
+    fn delete_accept_at_renders_after_description() {
+        let payload = DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::Package("foo".to_string()),
+            "Drop foo",
+        )
+        .expect("test delete payload")
+        .with_accept_at_in_hours(48)
+        .expect("48 hours from now is representable");
+        let xml = payload.to_xml();
+        assert!(
+            xml.contains("</description>\n  <accept_at>"),
+            "accept_at must follow the description, osc order: {xml}"
+        );
+        assert!(
+            xml.ends_with("</accept_at>\n</request>"),
+            "accept_at must close the document: {xml}"
+        );
+        assert!(
+            xml.ends_with("+00:00</accept_at>\n</request>"),
+            "accept_at must carry a UTC offset: {xml}"
+        );
+        assert!(payload.validate_xml().is_ok());
+        assert!(payload.accept_at().is_some());
+        // Without the timer the rendering is unchanged.
+        let plain = DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::Package("foo".to_string()),
+            "Drop foo",
+        )
+        .expect("test delete payload");
+        assert!(!plain.to_xml().contains("accept_at"));
+        assert!(plain.accept_at().is_none());
+        assert!(plain.validate_xml().is_ok());
+    }
+
+    #[test]
+    fn iso8601_utc_conversion_matches_known_instants() {
+        // Epoch, a second before Y2K, the 400-year leap day, a
+        // 4-year leap day, a plain instant, the century non-leap
+        // year (2100 has no Feb 29, so Mar 1 follows Feb 28), and
+        // the 32-bit rollover.
+        assert_eq!(iso8601_utc_from_unix(0), "1970-01-01T00:00:00+00:00");
+        assert_eq!(
+            iso8601_utc_from_unix(946_684_799),
+            "1999-12-31T23:59:59+00:00"
+        );
+        assert_eq!(
+            iso8601_utc_from_unix(951_782_400),
+            "2000-02-29T00:00:00+00:00"
+        );
+        assert_eq!(
+            iso8601_utc_from_unix(1_709_164_800),
+            "2024-02-29T00:00:00+00:00"
+        );
+        assert_eq!(
+            iso8601_utc_from_unix(1_795_350_896),
+            "2026-11-22T12:34:56+00:00"
+        );
+        assert_eq!(
+            iso8601_utc_from_unix(4_107_542_400),
+            "2100-03-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            iso8601_utc_from_unix(2_147_483_647),
+            "2038-01-19T03:14:07+00:00"
+        );
+    }
+
+    #[test]
+    fn accept_at_in_hours_rejects_overflow() {
+        let err = DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::Package("foo".to_string()),
+            "Drop foo",
+        )
+        .expect("test delete payload")
+        .with_accept_at_in_hours(u64::MAX)
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("too many"), "{}", err.context);
+    }
+
+    #[test]
+    fn accept_at_in_hours_year_bound() {
+        // ~6,900 years out is still representable (year ~8870);
+        // ~11,400 years out lands past year 9999, the most the
+        // four-digit format carries.
+        let payload = DeletePayload::new(
+            "openSUSE:Factory",
+            DeleteTarget::Package("foo".to_string()),
+            "Drop foo",
+        )
+        .expect("test delete payload");
+        assert!(payload.clone().with_accept_at_in_hours(60_000_000).is_ok());
+        let err = payload.with_accept_at_in_hours(100_000_000).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("too many"), "{}", err.context);
     }
 
     #[test]

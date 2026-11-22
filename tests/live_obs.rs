@@ -3611,6 +3611,61 @@ mod tests {
     }
 
     #[test]
+    fn iso8601_utc_to_unix_accepts_server_shapes() {
+        // The shape the server stores: no offset.
+        assert_eq!(
+            iso8601_utc_to_unix("2010-12-30T00:00:00"),
+            Some(1_293_667_200)
+        );
+        assert_eq!(
+            iso8601_utc_to_unix("2026-11-24T12:34:56"),
+            Some(1_795_523_696)
+        );
+        // `Z`, an explicit UTC offset, fractional seconds, and
+        // surrounding whitespace are tolerated.
+        assert_eq!(
+            iso8601_utc_to_unix("2026-11-24T12:34:56Z"),
+            Some(1_795_523_696)
+        );
+        assert_eq!(
+            iso8601_utc_to_unix("2026-11-24T12:34:56+00:00"),
+            Some(1_795_523_696)
+        );
+        assert_eq!(
+            iso8601_utc_to_unix("2026-11-24T12:34:56.123456+00:00"),
+            Some(1_795_523_696)
+        );
+        assert_eq!(
+            iso8601_utc_to_unix("  2026-11-24T12:34:56  "),
+            Some(1_795_523_696)
+        );
+        // The shape the live server actually stores: a space in
+        // place of `T` with a trailing ` UTC` zone name, and the
+        // same shape without the zone name.
+        assert_eq!(
+            iso8601_utc_to_unix("2026-11-24 12:33:55 UTC"),
+            Some(1_795_523_635)
+        );
+        assert_eq!(
+            iso8601_utc_to_unix("2026-11-24 12:34:56"),
+            Some(1_795_523_696)
+        );
+        // A non-UTC offset is still rejected after a space
+        // separator.
+        assert_eq!(iso8601_utc_to_unix("2026-11-24 12:34:56 +02:00"), None);
+        // A non-UTC offset, a missing field, and an impossible
+        // calendar date never parse as a wrong time.
+        assert_eq!(iso8601_utc_to_unix("2026-11-24T12:34:56+02:00"), None);
+        // `-00:00` is an unknown offset per RFC 3339, not UTC.
+        assert_eq!(iso8601_utc_to_unix("2026-11-24T12:34:56-00:00"), None);
+        assert_eq!(iso8601_utc_to_unix("2026-11-24T12:34"), None);
+        assert_eq!(iso8601_utc_to_unix("2026-02-31T00:00:00"), None);
+        assert_eq!(iso8601_utc_to_unix("2026-04-31T00:00:00"), None);
+        assert_eq!(iso8601_utc_to_unix("2026-13-01T00:00:00"), None);
+        assert_eq!(iso8601_utc_to_unix("not a timestamp"), None);
+    }
+
+    #[test]
     fn live_base_validation() {
         // Bare loopback bases pass, trimmed and slash-stripped.
         assert_eq!(
@@ -4266,6 +4321,156 @@ fn live_delete_accept_deletes_package_on_server() {
         "request {id} must be accepted; body: {accepted}"
     );
     wait_until_gone(&base, &format!("{project}/{package}"));
+}
+
+/// The text of the first `<tag>...</tag>` element in `body`, if the
+/// element is present and closed. The harness reads single-value
+/// elements (like `<accept_at>`) back from the server this way; the
+/// library's own parser is not available to integration tests.
+fn xml_element_text(body: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let after = body.split_once(&open)?.1;
+    Some(after.split_once(&format!("</{tag}>"))?.0.to_string())
+}
+
+/// Parse an ISO-8601 UTC timestamp back to Unix seconds. The
+/// server stores its own rendering of the value — a bare
+/// `YYYY-MM-DDTHH:MM:SS` with no offset, as its request fixtures
+/// show — so that shape is accepted first, plus `Z`, `+00:00`,
+/// and fractional seconds for robustness. The live server
+/// actually stores the Rails rendering, a space in place of `T`
+/// with a trailing ` UTC` zone name (`2026-11-24 12:33:55 UTC`),
+/// so that shape is accepted too. Anything else (a
+/// non-UTC offset, a missing field, an impossible calendar date)
+/// is None, never a wrong time: the day is checked against the
+/// month with the leap-year rule, so `2026-02-31` does not
+/// silently normalise to March.
+fn iso8601_utc_to_unix(text: &str) -> Option<u64> {
+    let text = text.trim();
+    // The stored value's trailing ` UTC` zone name is stripped
+    // first; the date/time separator is then `T` or a space.
+    let text = text.strip_suffix(" UTC").unwrap_or(text);
+    let (date, rest) = text.split_once('T').or_else(|| text.split_once(' '))?;
+    // Split the time from its offset: a trailing `Z`, `+00:00`,
+    // or nothing at all. Any other offset is not UTC — `-00:00`
+    // means "unknown offset" per RFC 3339, not UTC.
+    let (time, offset) = match rest.find(['+', '-']) {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => match rest.strip_suffix('Z') {
+            Some(bare) => (bare, "Z"),
+            None => (rest, ""),
+        },
+    };
+    if !(offset.is_empty() || offset == "Z" || offset == "+00:00") {
+        return None;
+    }
+    let mut date = date.split('-');
+    let year: i64 = date.next()?.parse().ok()?;
+    let month: u32 = date.next()?.parse().ok()?;
+    let day: u32 = date.next()?.parse().ok()?;
+    if date.next().is_some() {
+        return None;
+    }
+    let mut time = time.split(':');
+    let hour: u64 = time.next()?.parse().ok()?;
+    let minute: u64 = time.next()?.parse().ok()?;
+    let seconds_field = time.next()?;
+    if time.next().is_some() {
+        return None;
+    }
+    let (second_str, fraction) = match seconds_field.split_once('.') {
+        Some((second, fraction)) => (second, Some(fraction)),
+        None => (seconds_field, None),
+    };
+    let second: u64 = second_str.parse().ok()?;
+    if let Some(fraction) = fraction {
+        if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => unreachable!(),
+    };
+    if day == 0 || day > days_in_month {
+        return None;
+    }
+    // Days from civil (Hinnant's inverse): the month shift puts
+    // March first so the leap day lands at the end of the year.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let total = days
+        .checked_mul(86_400)?
+        .checked_add(hour as i64 * 3600 + minute as i64 * 60 + second as i64)?;
+    u64::try_from(total).ok()
+}
+
+/// Filing a delete request with an auto-accept timer: the server
+/// stores the timer on the request, and revoking the request cleans
+/// it up without deleting anything.
+#[test]
+fn live_delete_with_accept_at_stores_timer_on_server() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let dry = DryRun::new(false);
+    let filing = SrFiling::new(&client, &dry);
+    let payload = DeletePayload::new(
+        &project,
+        DeleteTarget::Package(package.clone()),
+        &format!("Delete {package} with a timer: live test"),
+    )
+    .expect("live delete payload")
+    .with_accept_at_in_hours(48)
+    .expect("48 hours from now is representable");
+    let id = filing
+        .file_delete_request(&payload)
+        .expect("file a delete request with a timer on the live instance")
+        .expect("live filing returns a request id");
+    let body = request_xml(&base, &id);
+    let stored = xml_element_text(&body, "accept_at").unwrap_or_else(|| {
+        panic!("filed request {id} must store an accept_at timer; body: {body}")
+    });
+    let stored_secs = iso8601_utc_to_unix(&stored).unwrap_or_else(|| {
+        panic!("stored accept_at {stored:?} on request {id} must parse as ISO-8601 UTC")
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock predates the Unix epoch")
+        .as_secs();
+    assert!(
+        stored_secs >= now + 47 * 3600 && stored_secs <= now + 49 * 3600,
+        "stored accept_at {stored} on request {id} must be ~48h out (now {now})"
+    );
+    client
+        .revoke_request(&id, "revoked by the geectl live test", &dry)
+        .expect("revoke the timer request on the live instance");
+    let revoked = request_xml(&base, &id);
+    assert_eq!(
+        request_state(&revoked).as_deref(),
+        Some("revoked"),
+        "request {id} must be revoked; body: {revoked}"
+    );
 }
 
 /// Listing the maintained instances of a package and branching it:
