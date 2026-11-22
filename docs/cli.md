@@ -18,7 +18,8 @@ geectl [--format json|text] [--debug] [--debug-body] [--live] <group> <command> 
   the build group orders them project, package, repository, arch.
   Branch and maintenance take coordinates as long flags. The exact
   order per leaf is in its `--help` block below. Everything else is
-  a named long flag. There are no short flags and no aliases.
+  a named long flag. No short flags on group/leaf options apart from
+  clap's built-in `-h`/`-V`, and no command aliases.
 - `--format` selects the stdout payload: `json` (default — the only
   format an agent should parse) or `text` (a human rendering of the
   same data). The same invocation produces the same bytes in every
@@ -46,9 +47,14 @@ geectl [--format json|text] [--debug] [--debug-body] [--live] <group> <command> 
   exit code. A parse error has no parsed CLI yet, so it stays JSON.
 - Text renderings open with one header line echoing the query
   coordinates (`project: … package: … …`); tables follow as designed.
-  Content commands (`remote cat`, `build build-log`, `request diff`)
+  Content commands (`remote cat`, `remote revision-patch`,
+  `remote project-diff`, `remote diff-packages`, `build build-log`,
+  `request diff`, `gitea branch-head`)
   render verbatim, with no header — the coordinates live in the JSON
-  payload.
+  payload. Two renderings keep no header either: `remote
+  list-projects` (the query names nothing to echo) and the request
+  action texts (one-line outcome summaries; the plan is on stderr
+  and in the payload).
 
 ### Credentials in dry-run
 
@@ -527,6 +533,15 @@ geectl request file --source-project home:alice:branches:openSUSE:Factory --sour
 # Maintenance
 geectl maintenance maintained-instances --package vim
 geectl maintenance maintenance-branch --package vim
+
+# Services
+geectl service list openSUSE:Factory vim
+geectl service state openSUSE:Factory vim
+
+# Gitea (needs GEECTL_GITEA_TOKEN, even in dry-run)
+geectl gitea repo-get pool systemd
+geectl gitea branch-head pool systemd factory
+geectl gitea repo-create vim --private
 ```
 
 The `request file` flags above are illustrative — run

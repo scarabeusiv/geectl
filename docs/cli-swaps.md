@@ -5,7 +5,7 @@ rollout, with the consistency reason. Where geectl matches osc, there
 is no row. Sources: the osc gap map
 (`~/workspace/geectl-osc-gap-map.md`) and osc's `commandline.py`
 (verified live 2026-11-21). The scheme-level rows apply across all
-five groups and are listed once; the per-group sections list only
+seven groups and are listed once; the per-group sections list only
 what is specific to that group.
 
 ## Scheme-level (all groups)
@@ -20,15 +20,17 @@ what is specific to that group.
 | `osc` mutates on invocation | Every mutation is dry-run by default; the global `--live` performs it | Geectl-wide rule (library `DryRun` default): an agent sees the plan before anything changes. The dry run prints the plan on stderr and returns `dry_run: true` |
 | `osc -m/--message` for several meanings | `--comment` for state-change, review, and branch messages; `--description` for a filing's description | One flag name per concept everywhere, instead of one flag carrying two meanings |
 
-## `remote` — read-only inspection (issue #72)
+## `remote` — inspection and repository edits (issue #72)
 
 | osc | geectl | Why |
 |---|---|---|
 | Overloaded commands (`ls`, `cat`, `log`, `meta`, `search` with modes) | One command per library operation (`list-files`, `cat`, `package-log`, `project-meta`, `package-meta`, `search-packages`, `search-projects`, …) | One subcommand per operation, grouped under the `remote` noun; no mode flags |
 | `osc search` exact-name default | Substring matches on name, title, and description by default; `--exact` keeps only exact-name matches | The library has no exact search server-side; the filter runs in the CLI, and osc's default stays reachable via `--exact` |
 | `osc rdiff` (server-side diff) | `remote revision-patch` and `remote project-diff`, computed client-side from per-file reads | The library lists and cats the files itself; a large `project-diff` issues many requests and a differing binary file fails the call |
-| `osc rdiff` two-package form | No counterpart | The library has no public two-package diff op (issue #74) |
-| `osc develproject` (prints devel project + package) | `remote devel-project <package>` | Factory-only by design; the library op returns the (project, package) pair (issue #77) |
+| `osc rdiff` two-package form | `remote diff-packages` | Client-side diff of two packages from per-file reads (issue #74); a differing binary file fails the call |
+| `osc develproject` (prints devel project + package) | `remote devel-project <package>` | Factory-only by design; the library op returns the (project, package) pair (issue #77). `remote package-meta` shows the same pair as `devel: project/package`. |
+| `osc repo add` / `osc repo remove` (project admin writes) | `remote repo-add` / `remote repo-remove` | Grouped under `remote` with the other project reads; mutations take the global `--live` |
+| `osc ls /` | `remote list-projects` | Same listing, named as a leaf under `remote` |
 
 ## `request` — submit requests (issue #73)
 
@@ -39,6 +41,8 @@ what is specific to that group.
 | `osc mr` / `maintenancerequest` (top-level command) | `request file-maintenance-incident`, `request refile-maintenance-incident --supersede` | Incident filing is an `SrFiling` op, so it lives with the other filings under `request`, not with the maintenance group's read/branch ops (`maintained-instances`, `maintenance-branch`, issue #69) |
 | `osc changedevelrequest` (`cr`, `changedevelreq`) | `request file-change-devel` | Same grouping: a filing leaf under `request` |
 | `osc deletereq` (top-level command, positional `PROJECT [PACKAGE]`) | `request file-delete --target-project … [--package … \| --repository …]` | Same grouping; the target is selected by flags (package, repository, or neither for the whole project) instead of positionals |
+| `osc deletereq --accept-in-hours` | `request file-delete --accept-in-hours` | Name kept; the flag names the accept timer on the delete request |
+| `osc sr` / `osc creq` with no `--cleanup` / `--no-cleanup` / `--no-update` (and no config) | `request file` (and every filing) always sends `cleanup` unless `--without-cleanup` | Geectl's default is cleanup on every filing; osc sends no `<sourceupdate>` unless told to (or configured) — which matches osc's documented default for branch sources only |
 | `osc request show -d` | `request diff` (+ opt-in `--xml`) | The diff is its own leaf, not a flag on `show`; the XML view is an explicit opt-in |
 | `osc request review add` | `request add-review --user/--group/--project/--package` | Verb-first leaf; the review target is named by flags |
 | `osc comment list/create request ID` (top-level `comment` command with a `request` target word) | `request list-comments`, `request add-comment [--parent …]` | Comments live under the request they belong to, not under a top-level `comment` command. (osc itself has no `request comment` subcommand — comments are API-only there.) |
@@ -60,7 +64,7 @@ no row.
 
 | osc | geectl | Why (consistency reason) |
 |---|---|---|
-| Flat top-level commands (`branch`, `copypac`, `linkpac`, …) | `branch <subcommand>` group | Uniform grouping: one top-level noun per library module across all five CLI groups; osc's flat list doesn't scale and collides (`branch` vs `mbranch`) |
+| Flat top-level commands (`branch`, `copypac`, `linkpac`, …) | `branch <subcommand>` group | Uniform grouping: one top-level noun per library module across all seven CLI groups; osc's flat list doesn't scale and collides (`branch` vs `mbranch`) |
 | `osc branch` | `branch branch-package` | Grouped + spelled-out operation name (kebab-case library name) |
 | `osc branch --nodevelproject` | `--no-devel-project` | Kebab-case flag names everywhere (osc concatenates) |
 | `osc branch -c/--checkout` | Dropped (aliases `bco`/`branchco`/`getpac` go with it) | Branches AND checks out a working copy; geectl has no working copy in v1 |
@@ -149,3 +153,20 @@ Not swaps (kept as-is): `--attribute` and
 layout. `osc mr` (`maintenancerequest`) is NOT here: incident filing
 lives with the other filings under `request` (`request
 file-maintenance-incident`, issue #73).
+
+## `service` — service reads
+
+| osc | geectl | Why |
+|---|---|---|
+| (no osc command) | `service list` / `service state` | New surface: read a package's `_service` file and its last run state; osc has no service reads |
+
+## `gitea` — Gitea operations
+
+| osc | geectl | Why |
+|---|---|---|
+| (no osc command) | `gitea repo-get` / `gitea repo-list` / `gitea branch-list` / `gitea branch-get` / `gitea branch-head` | New surface: Gitea reads on the configured instance; osc has no Gitea reads |
+| (no osc command) | `gitea repo-create` | New surface: create a repository on the configured instance; mutations take the global `--live` |
+| `osc api -X DELETE /repos/...` | `gitea repo-delete` | The delete op under the `gitea` noun; mutations take the global `--live`, and the library refuses without `--force` |
+| `osc fork` | `gitea repo-fork` (Gitea half only) | `osc fork` is a composite: Gitea fork + OBS branch. `gitea repo-fork` is the Gitea half; the `branch` composite (Gitea fork + OBS `cmd=fork`) has no CLI command yet. `osc fork` is also scmsync-only, and it clones the fork locally and inits `.osc` — neither of which the Gitea half does |
+
+Scope note: the sibling `git-obs` entry point has `repo list` and `repo fork` (`osc/commands_git/repo_list.py`, `repo_fork.py`); they are `git-obs` commands, not `osc` commands, so they sit outside this table's stated scope — `git-obs repo list` requires `--org`/`--user` (no own-repos form).
