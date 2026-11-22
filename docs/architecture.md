@@ -90,12 +90,19 @@ OBS Basic credentials come from `EnvObsAuth` (per-URL, via
 instance alias's variables (`GEECTL_OBS_USERNAME_<ALIAS>` and
 friends), else the plain `GEECTL_OBS_USERNAME` +
 `GEECTL_OBS_PASSWORD` or `GEECTL_OBS_PASSWORD_FILE` when the URL is
-the configured default. Credentials are otherwise resolved by
-providers implementing the `AuthProvider` trait (`src/auth.rs`):
-`EnvGiteaAuth` (Gitea Bearer from `GEECTL_GITEA_TOKEN` or
-`GEECTL_GITEA_TOKEN_FILE`) and `GiteaSshKey` (the SSH private key
-from `GEECTL_GITEA_SSH_KEY`). Unconfigured
-resolves to `Credentials::None`; a half-configured pair, both secret
+the configured default. Gitea Bearer <redacted> credentials come from
+`EnvGiteaAuth` the same way (per-URL, via `credentials_for_url`):
+the matching alias's variables (`GEECTL_GITEA_TOKEN_<ALIAS>`),
+else the plain `GEECTL_GITEA_TOKEN` or
+`GEECTL_GITEA_TOKEN_FILE` when the URL is the configured default.
+When an alias matches but its variables are unset and the URL is
+also the default, the plain variables apply. The default's token
+is never forwarded to another instance. Credentials are otherwise
+resolved by providers implementing the `AuthProvider` trait
+(`src/auth.rs`): `EnvGiteaAuth` (the plain single-URL path) and
+`GiteaSshKey` (the SSH private key from `GEECTL_GITEA_SSH_KEY`).
+Unconfigured resolves to `Credentials::None`; a half-configured
+pair, both secret
 sources set, or a malformed value is a `ConfigError` naming the
 source, never the value. The SSH key must be a PEM private key in a
 file mode 0600 or stricter (unix).

@@ -425,9 +425,8 @@ fn split_api_url(url: &str) -> Result<(String, String, Option<u16>), GeectlError
     // The URL itself is never echoed: it could carry userinfo
     // (`ftp://user:secret@host` fails the scheme check before
     // the `@` check), and an error must never carry a credential.
-    let invalid = |what: &str| {
-        GeectlError::new(ErrorKind::InvalidInput, format!("invalid API URL: {what}"))
-    };
+    let invalid =
+        |what: &str| GeectlError::new(ErrorKind::InvalidInput, format!("invalid API URL: {what}"));
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| invalid("expected scheme://host"))?;
@@ -650,12 +649,26 @@ pub fn resolve_gitea_bearer(
     vars: VarLookup<'_>,
     read_file: FileReader<'_>,
 ) -> Result<Credentials, GeectlError> {
-    let token = vars(GITEA_TOKEN_VAR);
-    let token_file = vars(GITEA_TOKEN_FILE_VAR);
+    resolve_gitea_bearer_with(GITEA_TOKEN_VAR, GITEA_TOKEN_FILE_VAR, vars, read_file)
+}
+
+/// The same resolution as [`resolve_gitea_bearer`], but from the named
+/// variables: the plain names for the configured instance, the
+/// alias names (`GEECTL_GITEA_TOKEN_<ALIAS>` and friends) for one
+/// other instance. The error messages name the variables actually
+/// read, so an alias misconfiguration points at the alias names.
+fn resolve_gitea_bearer_with(
+    token_var: &str,
+    token_file_var: &str,
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    let token = vars(token_var);
+    let token_file = vars(token_file_var);
     if token.is_some() && token_file.is_some() {
         return Err(GeectlError::new(
             ErrorKind::ConfigError,
-            format!("both {GITEA_TOKEN_VAR} and {GITEA_TOKEN_FILE_VAR} are set; set exactly one"),
+            format!("both {token_var} and {token_file_var} are set; set exactly one"),
         ));
     }
     let token_from_file = token_file.is_some();
@@ -673,13 +686,119 @@ pub fn resolve_gitea_bearer(
             // must not be attributed to the env variable when it came
             // from the file (or vice versa).
             let token_source = if token_from_file {
-                GITEA_TOKEN_FILE_VAR
+                token_file_var
             } else {
-                GITEA_TOKEN_VAR
+                token_var
             };
             let token = validate_bearer_token(&token).map_err(|e| config_error(token_source, e))?;
             Ok(Credentials::Bearer { token })
         }
+    }
+}
+
+/// The credential variable names for one instance alias: the alias
+/// as written in the config, uppercased (env vars are conventionally
+/// uppercase).
+pub fn gitea_alias_vars(alias: &str) -> (String, String) {
+    let upper = alias.to_ascii_uppercase();
+    (
+        format!("{GITEA_TOKEN_VAR}_{upper}"),
+        format!("{GITEA_TOKEN_FILE_VAR}_{upper}"),
+    )
+}
+
+/// Resolve the Gitea API token for one Gitea URL.
+///
+/// Precedence, in order:
+/// 1. The matching alias's variables (`GEECTL_GITEA_TOKEN_<ALIAS>`
+///    / `GEECTL_GITEA_TOKEN_FILE_<ALIAS>`, with `<ALIAS>` the
+///    alias as written in the config file's `[instances]` table,
+///    uppercased) win when any of them is set — resolved strictly
+///    from that set, with the same rules as [`resolve_gitea_bearer`].
+///    The alias is the one whose configured URL matches this URL
+///    under [`same_api_url`].
+/// 2. Otherwise the plain variables apply when the URL is the
+///    configured default (`default_url`, compared with
+///    [`same_api_url`]): one configured URL works exactly as before.
+/// 3. Otherwise — a different URL, credentials configured for the
+///    default, none for this URL — a `ConfigError` naming what to
+///    set: the alias variables when an alias matches this URL, or
+///    the `[instances]` entry to add when none does. The default's
+///    credentials are never forwarded to another instance.
+///
+/// When nothing is configured at all the result is [`Credentials::None`]:
+/// public reads and dry runs need no credentials.
+pub fn resolve_gitea_bearer_for_url(
+    url: &str,
+    default_url: &str,
+    instances: &[(String, String)],
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    if let Some(alias) = alias_for_url(url, instances)? {
+        let (token_var, token_file_var) = gitea_alias_vars(alias);
+        let alias_set = vars(&token_var).is_some() || vars(&token_file_var).is_some();
+        if alias_set {
+            return resolve_gitea_bearer_with(&token_var, &token_file_var, vars, read_file);
+        }
+        // No alias variables set: the URL may still be the
+        // configured default, which takes the plain variables.
+        if same_api_url(url, default_url)? {
+            return resolve_gitea_bearer(vars, read_file);
+        }
+        return resolve_gitea_unmatched_url(
+            url,
+            &format!(
+                "instance alias '{alias}' matches this URL — set {token_var} (or {token_file_var})"
+            ),
+            vars,
+            read_file,
+        );
+    }
+    if same_api_url(url, default_url)? {
+        return resolve_gitea_bearer(vars, read_file);
+    }
+    // The example is rendered by the TOML serializer, not
+    // `Debug`: `Debug` renders control characters as `\u{...}`,
+    // which TOML rejects, so the copied example would not parse.
+    let example = toml::Value::String(url.to_string());
+    resolve_gitea_unmatched_url(
+        url,
+        &format!(
+            "no instance alias matches it; add an [instances] entry for it in the config file (e.g. [instances] myinstance = {example}) and set GEECTL_GITEA_TOKEN_<ALIAS> (or GEECTL_GITEA_TOKEN_FILE_<ALIAS>) for that alias"
+        ),
+        vars,
+        read_file,
+    )
+}
+
+/// The fallback when neither alias nor plain variables apply to
+/// this URL: `None` when nothing is configured at all, else a
+/// `ConfigError` naming what to set (`guidance` — the alias
+/// variables when an alias matches, the `[instances]` entry to add
+/// when none does). The plain token, when configured, belongs to
+/// the default instance and is never forwarded.
+fn resolve_gitea_unmatched_url(
+    url: &str,
+    guidance: &str,
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    match resolve_gitea_bearer(vars, read_file) {
+        Ok(Credentials::None) => Ok(Credentials::None),
+        Ok(_) => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "no credentials configured for {url}; {guidance} — the credentials configured for the default instance are never forwarded to another instance"
+            ),
+        )),
+        // Both token sources set errors about the plain
+        // variables — but for a different URL those are not the ones
+        // to fix, so the error carries the guidance too.
+        Err(err) => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{} — for {url}, {guidance}", err.context),
+        )),
     }
 }
 
@@ -832,6 +951,44 @@ impl AuthProvider for EnvGiteaAuth {
     fn credentials(&self) -> Result<Credentials, GeectlError> {
         let env = snapshot_env(&[GITEA_TOKEN_VAR, GITEA_TOKEN_FILE_VAR])?;
         resolve_gitea_bearer(&|name| env.get(name).cloned(), &read_secret_file_production)
+    }
+}
+
+impl EnvGiteaAuth {
+    /// Gitea Bearer auth for one Gitea URL from the process
+    /// environment. See [`resolve_gitea_bearer_for_url`] for the
+    /// precedence and the fail-clear rule. `default_url` is the
+    /// effective configured Gitea URL — environment, then config
+    /// file, then default — never the bare
+    /// [`crate::config::DEFAULT_GITEA_URL`] constant when a custom
+    /// URL is configured, or a custom single URL with a plain
+    /// token would fail resolution. `instances` is the config
+    /// file's `[instances]` table: the alias variables for the
+    /// matching alias are snapshotted alongside the plain ones,
+    /// so resolution sees one consistent view of the environment.
+    pub fn credentials_for_url(
+        url: &str,
+        default_url: &str,
+        instances: &[(String, String)],
+    ) -> Result<Credentials, GeectlError> {
+        let mut names: Vec<String> = vec![
+            GITEA_TOKEN_VAR.to_string(),
+            GITEA_TOKEN_FILE_VAR.to_string(),
+        ];
+        if let Some(alias) = alias_for_url(url, instances)? {
+            let (token_var, token_file_var) = gitea_alias_vars(alias);
+            names.push(token_var);
+            names.push(token_file_var);
+        }
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let env = snapshot_env(&refs)?;
+        resolve_gitea_bearer_for_url(
+            url,
+            default_url,
+            instances,
+            &|name| env.get(name).cloned(),
+            &read_secret_file_production,
+        )
     }
 }
 
@@ -1053,6 +1210,211 @@ mod tests {
             alias_for_url("https://api.example.org", &table).unwrap(),
             Some("alpha")
         );
+    }
+
+    #[test]
+    fn gitea_alias_vars_uppercase_the_alias_as_written() {
+        assert_eq!(
+            gitea_alias_vars("MyInstance"),
+            (
+                "GEECTL_GITEA_TOKEN_MYINSTANCE".to_string(),
+                "GEECTL_GITEA_TOKEN_FILE_MYINSTANCE".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn gitea_alias_vars_win_over_plain_vars_for_their_url() {
+        let map = vars(&[
+            (GITEA_TOKEN_VAR, "plain-token"),
+            ("GEECTL_GITEA_TOKEN_EXAMPLE", "target-token"),
+        ]);
+        let creds = resolve_gitea_bearer_for_url(
+            "https://gitea.example.org",
+            "https://src.opensuse.org",
+            &instances(&[("example", "https://gitea.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::Bearer { ref token } if token == "target-token"));
+    }
+
+    #[test]
+    fn gitea_alias_token_from_file_is_read() {
+        let map = vars(&[(
+            "GEECTL_GITEA_TOKEN_FILE_EXAMPLE",
+            "/run/secrets/gitea-token",
+        )]);
+        let files = files(&[("/run/secrets/gitea-token", "file-token\n")]);
+        let creds = resolve_gitea_bearer_for_url(
+            "https://gitea.example.org",
+            "https://src.opensuse.org",
+            &instances(&[("example", "https://gitea.example.org")]),
+            &lookup(&map),
+            &reader(&files),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::Bearer { ref token } if token == "file-token"));
+    }
+
+    #[test]
+    fn gitea_alias_both_token_sources_is_config_error() {
+        let map = vars(&[
+            ("GEECTL_GITEA_TOKEN_EXAMPLE", "a"),
+            (
+                "GEECTL_GITEA_TOKEN_FILE_EXAMPLE",
+                "/run/secrets/gitea-token",
+            ),
+        ]);
+        let err = resolve_gitea_bearer_for_url(
+            "https://gitea.example.org",
+            "https://src.opensuse.org",
+            &instances(&[("example", "https://gitea.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("GEECTL_GITEA_TOKEN_EXAMPLE"));
+        assert!(err.context.contains("GEECTL_GITEA_TOKEN_FILE_EXAMPLE"));
+    }
+
+    #[test]
+    fn gitea_default_url_falls_back_to_plain_vars() {
+        let map = vars(&[(GITEA_TOKEN_VAR, "plain-token")]);
+        let creds = resolve_gitea_bearer_for_url(
+            "https://src.opensuse.org",
+            "https://src.opensuse.org",
+            &instances(&[]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::Bearer { ref token } if token == "plain-token"));
+        // The same instance spelled with its default port still
+        // takes the plain variables.
+        let creds = resolve_gitea_bearer_for_url(
+            "https://src.opensuse.org:443",
+            "https://src.opensuse.org",
+            &instances(&[]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::Bearer { .. }));
+    }
+
+    #[test]
+    fn gitea_alias_defined_but_unset_with_plain_vars_configured_names_the_alias_vars() {
+        let map = vars(&[(GITEA_TOKEN_VAR, "plain-token")]);
+        let err = resolve_gitea_bearer_for_url(
+            "https://gitea.example.org",
+            "https://src.opensuse.org",
+            &instances(&[("example", "https://gitea.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("GEECTL_GITEA_TOKEN_EXAMPLE"),
+            "alias token var name missing from the error"
+        );
+        // The default's credentials never leak into the message.
+        assert!(!err.context.contains("plain-token"));
+    }
+
+    #[test]
+    fn gitea_other_url_with_no_alias_names_the_instances_entry() {
+        let map = vars(&[(GITEA_TOKEN_VAR, "plain-token")]);
+        let err = resolve_gitea_bearer_for_url(
+            "https://gitea.example.org",
+            "https://src.opensuse.org",
+            &instances(&[]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("[instances]"),
+            "instances entry missing from the error"
+        );
+        assert!(
+            err.context.contains("https://gitea.example.org"),
+            "URL missing from the error"
+        );
+        assert!(!err.context.contains("plain-token"));
+    }
+
+    #[test]
+    fn gitea_unmatched_url_with_nothing_configured_is_none() {
+        // Nothing configured anywhere: a second instance with no
+        // token is public reads, not an error — the failure only
+        // bites when credentials exist for another instance.
+        let map = vars(&[]);
+        let creds = resolve_gitea_bearer_for_url(
+            "https://gitea.example.org",
+            "https://src.opensuse.org",
+            &instances(&[]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::None));
+    }
+
+    /// The TOML string literal at the start of `text`: from the
+    /// opening quote to its closing quote. A basic string (`"`)
+    /// skips backslash escapes; a literal string (`'`, which the
+    /// serializer uses when the value contains `"`) has none —
+    /// so a `)` inside the value cannot truncate it either way.
+    fn toml_string_literal(text: &str) -> &str {
+        let bytes = text.as_bytes();
+        let quote = *bytes.first().expect("empty TOML string literal");
+        assert!(quote == b'"' || quote == b'\'');
+        let mut index = 1;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' if quote == b'"' => index += 2,
+                b if b == quote => return &text[..=index],
+                _ => index += 1,
+            }
+        }
+        panic!("unterminated TOML string literal");
+    }
+
+    #[test]
+    fn gitea_no_alias_guidance_example_is_valid_toml() {
+        // The example must parse as TOML and round-trip the URL —
+        // including a control character, which `Debug` would render
+        // as `\u{...}` (not valid TOML), and a quote, which the
+        // serializer renders as a literal string.
+        for url in [
+            "http://127.0.0.1\u{1}x:3000",
+            "http://127.0.0.1\"x:3000",
+            "http://127.0.0.1)x:3000",
+        ] {
+            let map = vars(&[(GITEA_TOKEN_VAR, "plain-token")]);
+            let err = resolve_gitea_bearer_for_url(
+                url,
+                "https://src.opensuse.org",
+                &instances(&[]),
+                &lookup(&map),
+                &reader(&empty_files()),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError);
+            let example = toml_string_literal(
+                err.context
+                    .split("myinstance = ")
+                    .nth(1)
+                    .expect("guidance example missing"),
+            );
+            let doc: toml::Table = format!("myinstance = {example}").parse().unwrap();
+            assert_eq!(doc["myinstance"].as_str(), Some(url));
+        }
     }
 
     #[test]
