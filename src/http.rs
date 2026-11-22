@@ -126,6 +126,43 @@ pub fn is_retryable_method(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "PUT")
 }
 
+/// True when a body-read failure may retry within [`RETRY_POLICY`]:
+/// a timeout (a stalled transfer) or a transport failure (a severed
+/// one). Anything else fails the same way on every attempt — an
+/// over-cap body stays over the cap, a disk failure stays a disk
+/// failure, an already-existing destination stays existing — so
+/// retrying it only repeats the failure.
+fn is_retryable_body_error(e: &GeectlError) -> bool {
+    matches!(e.kind(), ErrorKind::Timeout | ErrorKind::NetworkError)
+}
+
+/// True when an I/O error from a body read is a timeout: a bare
+/// `TimedOut`, or a ureq timeout wrapped as the error's source.
+/// ureq's body reader converts its `Error::Timeout` into an
+/// `io::Error` of kind `Other` carrying the timeout
+/// (`Error::into_io`), so the kind alone does not say timeout —
+/// the wrapped error is checked.
+fn is_read_timeout(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        return true;
+    }
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+        .is_some_and(|error| matches!(error, ureq::Error::Timeout(_)))
+}
+
+/// Map a body-read I/O error: a timeout is a timeout, anything
+/// else a network error — so a stalled transfer is distinguishable
+/// from a severed one wherever a body is read.
+fn body_read_error(e: std::io::Error) -> GeectlError {
+    let kind = if is_read_timeout(&e) {
+        ErrorKind::Timeout
+    } else {
+        ErrorKind::NetworkError
+    };
+    GeectlError::new(kind, e.to_string())
+}
+
 /// The HTTP client interface. Implementations are synchronous and return
 /// the response body as a string on a 2xx status, or a [`GeectlError`].
 /// `get` uses the client's configured credentials (from its
@@ -187,11 +224,28 @@ pub trait HttpClient {
     /// so a file larger than the cap downloads instead of failing.
     /// The file is created exclusively: an existing file is an
     /// `AlreadyExists` error, not a truncation. A failure mid-stream
-    /// leaves a partial file for the caller to delete. Returns the
-    /// bytes written. A failure reading the body is a network error; a
-    /// failure writing the file is an internal error. The default
-    /// implementation refuses: a client that only reads text cannot
-    /// stream downloads. [`UreqClient`] overrides it.
+    /// leaves a partial file for the caller to delete, unless a
+    /// retry follows: a retried attempt deletes the partial file
+    /// first, so the next attempt's exclusive create succeeds.
+    /// Returns the bytes written. A failure reading the body is a
+    /// network error, except a read timeout, which is a timeout
+    /// error; a failure writing the file is an internal error. The
+    /// default implementation refuses: a client that only reads text
+    /// cannot stream downloads. [`UreqClient`] overrides it.
+    ///
+    /// Mid-stream failures retry like call failures, within the
+    /// same [`RETRY_POLICY`] budget: a body read that times out or
+    /// drops re-issues the GET from byte zero (restart, not resume —
+    /// the backends are not required to answer Range requests) after
+    /// deleting the partial file. The per-attempt total deadline
+    /// still bounds each attempt, so a download that needs more
+    /// than one deadline of continuous transfer still fails: the
+    /// retry recovers a stalled or severed transfer, it does not
+    /// stretch the deadline. A read timeout surfaces as `Timeout`,
+    /// not `NetworkError`, so a stalled transfer is distinguishable
+    /// from a severed one; other read failures stay `NetworkError`.
+    /// Non-retryable body failures (an over-cap body, a disk write
+    /// failure, an already-existing destination) return at once.
     fn get_to_file(
         &self,
         url: &str,
@@ -378,11 +432,16 @@ impl UreqClient {
     /// the `Accept` header to send, if any: text reads ask for
     /// `application/xml` (a dual-routed path would otherwise serve the
     /// WebUI HTML page), a binary download sends none — the bytes are
-    /// a file, not an XML document. `read_body` is `FnOnce`: the body
-    /// is read at most once, on the first successful response, so a
-    /// closure that consumes its captures is fine. A redirect is
-    /// refused, like POST: automatic redirects are disabled, so a 3xx
-    /// is an error, not a body.
+    /// a file, not an XML document. `read_body` is `FnMut`: the body
+    /// is read once per attempt — a mid-stream failure retries it on
+    /// the next attempt, within the same budget — so a closure that
+    /// consumes its captures does not fit. The second argument is
+    /// the attempt index (0-based): a closure that owns a file uses
+    /// it to tell a retried attempt, which must clean up after the
+    /// failed one, from the final attempt, which must leave the
+    /// partial file for the caller. A redirect is refused, like
+    /// POST: automatic redirects are disabled, so a 3xx is an error,
+    /// not a body.
     ///
     /// `emit_debug_attempts` selects the debug channel's per-attempt
     /// lines: text reads emit them, binary downloads do not. The debug
@@ -394,7 +453,7 @@ impl UreqClient {
         credentials: &Credentials,
         accept: Option<&str>,
         emit_debug_attempts: bool,
-        read_body: impl FnOnce(ureq::Body) -> Result<T, GeectlError>,
+        mut read_body: impl FnMut(ureq::Body, u32) -> Result<T, GeectlError>,
     ) -> Result<T, GeectlError> {
         // Credentials never travel over cleartext http, except to a
         // loopback host (see require_credentials_transport).
@@ -439,7 +498,44 @@ impl UreqClient {
                             None,
                         );
                     }
-                    return read_body(resp.into_body());
+                    // The body is read inside the retry loop, not
+                    // after it: a read that times out or drops
+                    // mid-body retries like a failed call, within
+                    // the same budget — the previous code returned
+                    // the read error at once, so a stalled or
+                    // severed download never retried. Only a
+                    // timeout or a transport failure retries: an
+                    // over-cap body, a disk failure, or a
+                    // destination that already exists fails the
+                    // same way on every attempt, so retrying it
+                    // would only repeat the failure.
+                    match read_body(resp.into_body(), attempt) {
+                        Ok(body) => return Ok(body),
+                        Err(e) if is_retryable_body_error(&e) => {
+                            if emit_debug_attempts {
+                                let backoff = RETRY_POLICY.backoff_base * 2u32.pow(attempt);
+                                self.debug_attempt(
+                                    "GET",
+                                    url,
+                                    if e.kind() == ErrorKind::Timeout {
+                                        "timeout"
+                                    } else {
+                                        "network error"
+                                    },
+                                    started.elapsed(),
+                                    attempt + 1,
+                                    Some((backoff, "body read failed")),
+                                );
+                            }
+                            last_desc = if e.kind() == ErrorKind::Timeout {
+                                "timeout".to_string()
+                            } else {
+                                "network error".to_string()
+                            };
+                            last_error = Some(e);
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(ureq::Error::StatusCode(code)) => {
                     let safe_url = sanitize_url_for_error(url);
@@ -1143,7 +1239,7 @@ fn read_body_bytes_capped(reader: impl Read) -> Result<Vec<u8>, GeectlError> {
     reader
         .take(MAX_BODY_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| GeectlError::new(ErrorKind::NetworkError, e.to_string()))?;
+        .map_err(body_read_error)?;
     if bytes.len() > MAX_BODY_BYTES {
         return Err(GeectlError::new(
             ErrorKind::ServerError,
@@ -1318,15 +1414,21 @@ impl HttpClient for UreqClient {
         // The endpoint selection for this read: public or
         // authenticated, reported once per call, not per attempt.
         self.debug_endpoint(url, credentials);
-        self.get_with_body(url, credentials, Some("application/xml"), true, |body| {
-            let text = self.read_response_body(body.into_reader(), "GET", url)?;
-            self.debug_body("response", "GET", url, &text);
-            Ok(text)
-        })
+        self.get_with_body(
+            url,
+            credentials,
+            Some("application/xml"),
+            true,
+            |body, _attempt| {
+                let text = self.read_response_body(body.into_reader(), "GET", url)?;
+                self.debug_body("response", "GET", url, &text);
+                Ok(text)
+            },
+        )
     }
 
     fn get_bytes(&self, url: &str, credentials: &Credentials) -> Result<Vec<u8>, GeectlError> {
-        self.get_with_body(url, credentials, None, false, |body| {
+        self.get_with_body(url, credentials, None, false, |body, _attempt| {
             read_body_bytes_capped(body.into_reader())
         })
     }
@@ -1337,7 +1439,7 @@ impl HttpClient for UreqClient {
         credentials: &Credentials,
         path: &Path,
     ) -> Result<u64, GeectlError> {
-        self.get_with_body(url, credentials, None, false, |body| {
+        self.get_with_body(url, credentials, None, false, |body, attempt| {
             let mut file = std::fs::File::options()
                 .write(true)
                 .create_new(true)
@@ -1367,10 +1469,34 @@ impl HttpClient for UreqClient {
                     Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        return Err(GeectlError::new(
-                            ErrorKind::NetworkError,
-                            format!("cannot read download body for {}: {e}", path.display()),
-                        ));
+                        // A read timeout is a timeout, not a network
+                        // error: a stalled transfer must be
+                        // distinguishable from a severed one. The
+                        // error retries either way (see
+                        // `get_with_body`), but the kind decides what
+                        // the caller sees when the budget runs out.
+                        let kind = if is_read_timeout(&e) {
+                            ErrorKind::Timeout
+                        } else {
+                            ErrorKind::NetworkError
+                        };
+                        let message =
+                            format!("cannot read download body for {}: {e}", path.display());
+                        // A retry follows, so the partial file goes
+                        // first: the next attempt creates it
+                        // exclusively, and a stale partial would
+                        // read as a name collision instead. On the
+                        // final attempt the partial stays, as the
+                        // trait documents — the caller deletes it.
+                        // If the delete fails the retry cannot
+                        // proceed, so the read error is reported at
+                        // once instead of being masked behind the
+                        // collision the next attempt would hit.
+                        if attempt < RETRY_POLICY.max_retries && std::fs::remove_file(path).is_err()
+                        {
+                            return Err(GeectlError::new(kind, message));
+                        }
+                        return Err(GeectlError::new(kind, message));
                     }
                 };
                 if n == 0 {
@@ -1752,6 +1878,173 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"existing");
         let _ = std::fs::remove_file(&path);
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn get_to_file_retries_a_severed_download_and_restarts() {
+        // First attempt sends half the body then drops the
+        // connection; the retry re-downloads from byte zero. The
+        // halves differ, so the content pins the order: a resume
+        // that appended the re-download to the partial and
+        // truncated to length would repeat the first half.
+        let mut body = vec![b'a'; 100 * 1024];
+        body.extend_from_slice(&vec![b'b'; 100 * 1024]);
+        let (port, count, server) = serve_download(body.clone(), DownloadBehavior::SeverOnce);
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let path = std::env::temp_dir().join(format!(
+            "geectl-get-to-file-sever-{}.rpm",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let written = client.get_to_file(&url, &Credentials::None, &path).unwrap();
+        assert_eq!(written, body.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        let _ = std::fs::remove_file(&path);
+        server.join().expect("server thread");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn get_to_file_retries_a_stalled_download() {
+        // First attempt stalls mid-body past the read timeout; the
+        // retry downloads the whole body.
+        let body = vec![b'b'; 200 * 1024];
+        let (port, count, server) = serve_download(body.clone(), DownloadBehavior::StallOnce);
+        let timeout = Timeout::new(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let client = UreqClient::new(timeout).unwrap();
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let path = std::env::temp_dir().join(format!(
+            "geectl-get-to-file-stall-{}.rpm",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let written = client.get_to_file(&url, &Credentials::None, &path).unwrap();
+        assert_eq!(written, body.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        let _ = std::fs::remove_file(&path);
+        server.join().expect("server thread");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn get_to_file_severed_download_stops_after_the_retry_budget() {
+        // A server that severs every attempt: exactly 1 + 3
+        // attempts, then the network error — the retry budget is
+        // shared with the call-stage retries, not a second budget.
+        let body = vec![b'b'; 200 * 1024];
+        let (port, count, server) = serve_download(body, DownloadBehavior::SeverAlways);
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let path = std::env::temp_dir().join(format!(
+            "geectl-get-to-file-sever-budget-{}.rpm",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let err = client
+            .get_to_file(&url, &Credentials::None, &path)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NetworkError);
+        // The final failure leaves the partial file for the caller.
+        assert!(path.exists());
+        let _ = std::fs::remove_file(&path);
+        server.join().expect("server thread");
+        assert_eq!(count.load(Ordering::SeqCst), RETRY_POLICY.max_retries + 1);
+    }
+
+    #[test]
+    fn get_to_file_stalled_download_fails_as_a_timeout() {
+        // A server that stalls every attempt: the budget runs out
+        // on a Timeout, not a NetworkError — a stalled transfer is
+        // distinguishable from a severed one.
+        let body = vec![b'b'; 200 * 1024];
+        let (port, count, server) = serve_download(body, DownloadBehavior::StallAlways);
+        let timeout = Timeout::new(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let client = UreqClient::new(timeout).unwrap();
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let path = std::env::temp_dir().join(format!(
+            "geectl-get-to-file-stall-budget-{}.rpm",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let err = client
+            .get_to_file(&url, &Credentials::None, &path)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Timeout);
+        let _ = std::fs::remove_file(&path);
+        server.join().expect("server thread");
+        assert_eq!(count.load(Ordering::SeqCst), RETRY_POLICY.max_retries + 1);
+    }
+
+    #[test]
+    fn over_cap_body_read_is_not_retried() {
+        // An over-cap body fails as a ServerError on the first
+        // attempt: retrying it would return the same body.
+        let body = vec![b'a'; MAX_BODY_BYTES + 1];
+        let (port, count, server) = serve_download(body, DownloadBehavior::AlwaysOk);
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let err = client.get_bytes(&url, &Credentials::None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        server.join().expect("server thread");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn body_read_failures_retry_only_on_timeout_or_network_error() {
+        assert!(is_retryable_body_error(&GeectlError::new(
+            ErrorKind::Timeout,
+            "stalled"
+        )));
+        assert!(is_retryable_body_error(&GeectlError::new(
+            ErrorKind::NetworkError,
+            "severed"
+        )));
+        assert!(!is_retryable_body_error(&GeectlError::new(
+            ErrorKind::ServerError,
+            "over cap"
+        )));
+        assert!(!is_retryable_body_error(&GeectlError::new(
+            ErrorKind::InternalError,
+            "disk"
+        )));
+        assert!(!is_retryable_body_error(&GeectlError::new(
+            ErrorKind::AlreadyExists,
+            "exists"
+        )));
+    }
+
+    #[test]
+    fn read_timeout_is_recognized_through_the_ureq_wrapper() {
+        // A bare TimedOut is a timeout.
+        assert!(is_read_timeout(&std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out"
+        )));
+        // ureq's body reader converts its Error::Timeout into an
+        // io error of kind Other carrying the timeout — the kind
+        // alone does not say timeout, the wrapped error does.
+        assert!(is_read_timeout(&std::io::Error::other(
+            ureq::Error::Timeout(ureq::Timeout::PerRead)
+        )));
+        // A severed connection is not a timeout, wrapped or not.
+        assert!(!is_read_timeout(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        )));
+        assert!(!is_read_timeout(&std::io::Error::other(
+            ureq::Error::StatusCode(500)
+        )));
     }
 
     #[test]
@@ -2918,6 +3211,100 @@ mod tests {
         (port, count, handle)
     }
 
+    /// How a download server fails a `get_to_file` download.
+    /// `Sever` closes the socket mid-body; `Stall` holds it open
+    /// past the client's read timeout, then closes it. `Once` fails
+    /// only the first attempt, `Always` every attempt.
+    enum DownloadBehavior {
+        SeverOnce,
+        StallOnce,
+        SeverAlways,
+        StallAlways,
+        AlwaysOk,
+    }
+
+    /// A loopback server that answers `get_to_file` downloads with
+    /// `body`, failing attempts per `behavior`. Returns the port,
+    /// the request count, and the server thread. The server stays
+    /// up past the longest backoff gap (4 s) so a retrying client
+    /// still finds it on its last attempt.
+    fn serve_download(
+        body: Vec<u8>,
+        behavior: DownloadBehavior,
+    ) -> (
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicU32>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("local addr").port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = count.clone();
+        let handle = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut last_request: Option<std::time::Instant> = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let n = count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        last_request = Some(std::time::Instant::now());
+                        // On macOS/BSD, the accepted stream inherits the
+                        // listener's non-blocking mode: without this
+                        // the read below returns WouldBlock at once
+                        // (and the read timeout is a no-op), so the
+                        // server answers a request it never read.
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        let _ = read_request(&mut stream);
+                        let fail = match behavior {
+                            DownloadBehavior::SeverOnce | DownloadBehavior::StallOnce => n == 0,
+                            DownloadBehavior::SeverAlways | DownloadBehavior::StallAlways => true,
+                            DownloadBehavior::AlwaysOk => false,
+                        };
+                        let headers = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(headers.as_bytes());
+                        if fail {
+                            let half = body.len() / 2;
+                            let _ = stream.write_all(&body[..half]);
+                            if matches!(
+                                behavior,
+                                DownloadBehavior::StallOnce | DownloadBehavior::StallAlways
+                            ) {
+                                // Hold the socket open past the
+                                // client's read timeout (1 s in the
+                                // stall tests) before closing it.
+                                std::thread::sleep(std::time::Duration::from_secs(3));
+                            }
+                        } else {
+                            let _ = stream.write_all(&body);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if let Some(last) = last_request {
+                            // Past the longest backoff gap (4 s) with
+                            // margin: the client may still be
+                            // sleeping before its last attempt.
+                            if last.elapsed() > std::time::Duration::from_secs(8) {
+                                break;
+                            }
+                        }
+                        if std::time::Instant::now() > deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, count, handle)
+    }
+
     #[test]
     fn post_is_never_retried() {
         // A 500 must come back as a ServerError after exactly ONE
@@ -3464,6 +3851,34 @@ mod tests {
                 "http: GET /public/source/openSUSE:Factory/foo -> 500 (attempt 4/4)".to_string(),
                 "http: GET /public/source/openSUSE:Factory/foo failed after 4 attempts (last: 500)"
                     .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn debug_on_records_body_failure_line_for_severed_read() {
+        // A 200 whose body severs mid-read emits two lines for the
+        // attempt: the status line when the headers arrive, then a
+        // body-failure line naming the retry — the body read is a
+        // separate event from the status, not a second attempt.
+        let body = vec![b'b'; 200 * 1024];
+        let (port, count, server) = serve_download(body, DownloadBehavior::SeverOnce);
+        let (debug, lines) = Debug::captured(true, false);
+        let client = UreqClient::new(Timeout::default())
+            .unwrap()
+            .with_debug(debug);
+        let url = format!("http://127.0.0.1:{port}/public/source/openSUSE:Factory/foo");
+        let read = client.get(&url).unwrap();
+        assert_eq!(read.len(), 200 * 1024);
+        server.join().expect("server thread");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            debug_lines_without_durations(&take_debug_lines(&lines)),
+            vec![
+                "decision: read via /public/source (no credentials)".to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo -> 200 (attempt 1/4)".to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo -> network error (attempt 1/4, retry in 1s: body read failed)".to_string(),
+                "http: GET /public/source/openSUSE:Factory/foo -> 200 (attempt 2/4)".to_string(),
             ]
         );
     }
