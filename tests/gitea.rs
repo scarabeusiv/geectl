@@ -202,6 +202,14 @@ fn gitea_create_repo_shows_up_on_server() {
         "description": "geectl live-test repository",
     })
     .to_string();
+    // The guard deletes the repo when the test ends — or panics —
+    // so the raw creation does not leak it onto the instance. It
+    // is built before the creation, so a failing create — or an
+    // assertion on the created value — cannot leak the repo either;
+    // the drop cleanup is best effort, so a repo that was never
+    // created deletes to nothing.
+    let typed = typed_client(&client, &base);
+    let _repo_guard = LiveRepo::new(&typed, &gitea_user(), &repo);
     let created = client
         .post_json(&format!("{base}/api/v1/user/repos"), &create_body)
         .expect("POST /api/v1/user/repos on the Gitea instance");
@@ -322,6 +330,61 @@ fn delete_live(client: &GiteaClient, owner: &str, repo: &str) -> String {
         .expect("a non-dry-run delete returns the name")
 }
 
+/// A live-test repository deleted when it goes out of scope —
+/// including when the test panics — so a mid-test assertion
+/// failure cannot leak the disposable repo onto the instance.
+/// Create the guard before the repo exists: the create itself
+/// can panic — a failed POST, an unparsable reply — and only a
+/// guard already in place deletes the repo then. The drop cleanup
+/// is best effort, so a repo that was never created deletes to
+/// nothing. The explicit delete at the end of a test goes through
+/// `delete`, which disarms the drop cleanup after asserting the
+/// delete reported the repo. The shared `pool/systemd` fork is
+/// not guarded: it is reused across re-runs, not a disposable
+/// repo of one test.
+struct LiveRepo<'a> {
+    client: &'a GiteaClient<'a>,
+    owner: String,
+    repo: String,
+    /// Set once the repository is deleted, so the drop cleanup
+    /// does not delete it twice.
+    deleted: bool,
+}
+
+impl<'a> LiveRepo<'a> {
+    /// Guard a repository that may not exist yet on the instance.
+    fn new(client: &'a GiteaClient<'a>, owner: &str, repo: &str) -> Self {
+        Self {
+            client,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            deleted: false,
+        }
+    }
+
+    /// Delete the repository now through the typed operation and
+    /// disarm the drop cleanup. Returns the deleted name, so the
+    /// test can assert the delete reported the right repo.
+    fn delete(mut self) -> String {
+        let deleted = delete_live(self.client, &self.owner, &self.repo);
+        self.deleted = true;
+        deleted
+    }
+}
+
+impl Drop for LiveRepo<'_> {
+    fn drop(&mut self) {
+        if !self.deleted {
+            // Best effort: the test already failed if this runs
+            // during unwinding, and a delete failure must not
+            // panic out of a destructor.
+            let _ = self
+                .client
+                .repo_delete(&self.owner, &self.repo, true, &DryRun::new(false));
+        }
+    }
+}
+
 /// Create a repository through the raw API and return its full name.
 /// Repo creation is not a phase-1 operation, so the setup stays raw;
 /// the assertions then go through the typed operations.
@@ -440,6 +503,7 @@ fn gitea_repo_get_round_trip_and_missing() {
     let http = gitea_client();
     let client = typed_client(&http, &base);
     let repo = unique_repo_name();
+    let _repo_guard = LiveRepo::new(&client, &gitea_user(), &repo);
     let full_name = create_repo_raw(&http, &base, &repo);
     // The typed read shows the creation on the server, with the
     // fields the phase-1 operations rely on.
@@ -478,6 +542,7 @@ fn gitea_repo_delete_removes_the_repo() {
     let http = gitea_client();
     let client = typed_client(&http, &base);
     let repo = unique_repo_name();
+    let repo_guard = LiveRepo::new(&client, &gitea_user(), &repo);
     create_repo_raw(&http, &base, &repo);
     // Without force the delete is refused client-side, before any
     // server read — and the repository survives the refusal.
@@ -492,7 +557,7 @@ fn gitea_repo_delete_removes_the_repo() {
     client
         .repo_get(&gitea_user(), &repo)
         .expect("the refused delete must leave the repository in place");
-    let deleted = delete_live(&client, &gitea_user(), &repo);
+    let deleted = repo_guard.delete();
     assert_eq!(deleted, repo);
     // The deletion shows up on the server: the repo no longer reads.
     let err = client
@@ -601,6 +666,7 @@ fn gitea_repo_create_round_trip_and_collision() {
     let http = gitea_client();
     let client = typed_client(&http, &base);
     let repo = unique_repo_name();
+    let repo_guard = LiveRepo::new(&client, &gitea_user(), &repo);
     let created = create_repo_typed(&client, &repo, "factory");
     assert_eq!(created.full_name, format!("{}/{repo}", gitea_user()));
     assert_eq!(created.name, repo);
@@ -632,8 +698,9 @@ fn gitea_repo_create_round_trip_and_collision() {
         ErrorKind::AlreadyExists,
         "creating a repository of an existing name must be AlreadyExists; got {err:?}"
     );
-    // Clean up: the created repo is removed again.
-    let deleted = delete_live(&client, &gitea_user(), &repo);
+    // Clean up: the created repo is removed again — through
+    // the guard, so a failure above still deletes it.
+    let deleted = repo_guard.delete();
     assert_eq!(deleted, repo);
 }
 
@@ -670,6 +737,7 @@ fn gitea_branch_read_round_trip() {
     let http = gitea_client();
     let client = typed_client(&http, &base);
     let repo = unique_repo_name();
+    let repo_guard = LiveRepo::new(&client, &gitea_user(), &repo);
     create_repo_typed(&client, &repo, "factory");
     // The first commit creates the default branch; the second
     // commit creates a branch off it; the third proves a slashed
@@ -785,8 +853,9 @@ fn gitea_branch_read_round_trip() {
         "a missing repository must map to NotFound; got {err:?}"
     );
     // Clean up: the created repo is removed again, so the live
-    // runs do not grow the token owner's repository list.
-    let deleted = delete_live(&client, &gitea_user(), &repo);
+    // runs do not grow the token owner's repository list — through
+    // the guard, so a failure above still deletes it.
+    let deleted = repo_guard.delete();
     assert_eq!(deleted, repo);
 }
 
@@ -799,6 +868,7 @@ fn gitea_fork_round_trip() {
     let http = gitea_client();
     let client = typed_client(&http, &base);
     let source = unique_repo_name();
+    let _source_guard = LiveRepo::new(&client, &gitea_user(), &source);
     let source_full = create_repo_raw(&http, &base, &source);
     let source_read = client
         .repo_get(&gitea_user(), &source)
@@ -806,6 +876,7 @@ fn gitea_fork_round_trip() {
     // A self-fork needs a different name: forking onto the source's
     // own name would collide with the source itself (409).
     let fork_name = unique_repo_name();
+    let _fork_guard = LiveRepo::new(&client, &gitea_user(), &fork_name);
     let forked = fork_live(
         &client,
         &gitea_user(),
@@ -842,8 +913,10 @@ fn gitea_fork_twice_with_the_same_name_reuses_the_fork() {
     let http = gitea_client();
     let client = typed_client(&http, &base);
     let source = unique_repo_name();
+    let _source_guard = LiveRepo::new(&client, &gitea_user(), &source);
     let source_full = create_repo_raw(&http, &base, &source);
     let fork_name = unique_repo_name();
+    let _fork_guard = LiveRepo::new(&client, &gitea_user(), &fork_name);
     let first = fork_live(
         &client,
         &gitea_user(),
@@ -885,8 +958,10 @@ fn gitea_fork_twice_with_a_different_name_reports_the_collision() {
     let http = gitea_client();
     let client = typed_client(&http, &base);
     let source = unique_repo_name();
+    let _source_guard = LiveRepo::new(&client, &gitea_user(), &source);
     create_repo_raw(&http, &base, &source);
     let first_name = unique_repo_name();
+    let _fork_guard = LiveRepo::new(&client, &gitea_user(), &first_name);
     client
         .fork_repo(
             &gitea_user(),
@@ -940,8 +1015,10 @@ fn gitea_fork_of_fork_parent_is_the_direct_parent() {
     let http = gitea_client();
     let client = typed_client(&http, &base);
     let source = unique_repo_name();
+    let _source_guard = LiveRepo::new(&client, &gitea_user(), &source);
     let source_full = create_repo_raw(&http, &base, &source);
     let first_name = unique_repo_name();
+    let _first_guard = LiveRepo::new(&client, &gitea_user(), &first_name);
     let first = fork_live(
         &client,
         &gitea_user(),
@@ -963,6 +1040,7 @@ fn gitea_fork_of_fork_parent_is_the_direct_parent() {
     // (the direct parent), not the root — that is what the
     // composite's re-read check verifies.
     let second_name = unique_repo_name();
+    let _second_guard = LiveRepo::new(&client, &gitea_user(), &second_name);
     let second = fork_live(
         &client,
         &gitea_user(),
@@ -993,8 +1071,10 @@ fn gitea_fork_name_collision_retries_with_a_new_name() {
     // A plain repository already holds the target name — not a fork
     // of the source, so the fork is refused, not reused.
     let blocking = unique_repo_name();
+    let _blocking_guard = LiveRepo::new(&client, &gitea_user(), &blocking);
     create_repo_raw(&http, &base, &blocking);
     let source = unique_repo_name();
+    let _source_guard = LiveRepo::new(&client, &gitea_user(), &source);
     create_repo_raw(&http, &base, &source);
     let err = client
         .fork_repo(
@@ -1014,6 +1094,7 @@ fn gitea_fork_name_collision_retries_with_a_new_name() {
     );
     // The retry with a fresh name succeeds.
     let retry = unique_repo_name();
+    let _fork_guard = LiveRepo::new(&client, &gitea_user(), &retry);
     let forked = fork_live(
         &client,
         &gitea_user(),
@@ -1057,8 +1138,10 @@ fn gitea_fork_into_org_refuses_when_a_non_fork_exists() {
         "private": false,
     })
     .to_string();
+    let _org_repo_guard = LiveRepo::new(&client, &org, &source);
     http.post_json(&format!("{base}/api/v1/orgs/{org}/repos"), &org_repo_body)
         .expect("POST /api/v1/orgs/{org}/repos on the Gitea instance");
+    let _source_guard = LiveRepo::new(&client, &gitea_user(), &source);
     create_repo_raw(&http, &base, &source);
     let err = client
         .fork_repo(
@@ -1093,8 +1176,9 @@ fn gitea_typed_call_emits_a_debug_attempt_line() {
     let http = UreqClient::with_auth(Timeout::default(), Some(Box::new(EnvGiteaAuth)))
         .expect("default timeout is valid")
         .with_debug(debug.clone());
-    create_repo_raw(&http, &base, &repo);
     let client = typed_client(&http, &base).with_debug(debug);
+    let _repo_guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    create_repo_raw(&http, &base, &repo);
     client
         .repo_get(&gitea_user(), &repo)
         .expect("typed repo_get with a debug sink reads the repository");
