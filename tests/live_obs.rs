@@ -73,12 +73,13 @@ use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{sanitize_url_for_error, HttpClient, Timeout, UreqClient};
 use geectl::obs::{
-    AggregateOptions, BranchOptions, BuildLogQuery, ChangeDevelPayload, CopyOptions,
-    CopyProjectOptions, CreatePackageOptions, DeletePayload, DeleteProjectOptions, DeleteTarget,
-    DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision, MaintenanceBranchOptions,
-    MaintenanceIncidentPayload, ObsClient, PackageDiffStatus, ReleaseOptions, Repository, Request,
-    RequestAction, RequestSearch, RequestState, ResultsQuery, ReviewState, ReviewTarget,
-    RevisionRange, SourceUpdate, SrFiling, SrPayload,
+    AddRolePayload, AggregateOptions, BranchOptions, BuildLogQuery, ChangeDevelPayload,
+    CopyOptions, CopyProjectOptions, CreatePackageOptions, DeletePayload, DeleteProjectOptions,
+    DeleteTarget, DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision,
+    MaintenanceBranchOptions, MaintenanceIncidentPayload, NamedRole, ObsClient, PackageDiffStatus,
+    ReleaseOptions, Repository, Request, RequestAction, RequestSearch, RequestState, ResultsQuery,
+    ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling, SrPayload,
+    StagingReadOptions,
 };
 
 /// Whether `url` points at a loopback host.
@@ -5844,4 +5845,318 @@ fn live_service_state_on_project_probe() {
     let source_project = create_source_branch(&authed, &package);
     let outcome = authed.service_state(&source_project, "_project");
     eprintln!("P4 probe: service_state on _project returned {outcome:?}");
+}
+
+/// The newer read and write operations against the live instance:
+/// staging read, person-match search, scmsync count, meta write
+/// (project and package), update from spec, `_link` delete,
+/// add-role filing, and build control. A rebuild queues a rebuild
+/// event for the package; a restart or abort is accepted even when
+/// nothing is building, so all three return Ok on a package that
+/// was never built.
+#[test]
+fn live_staging_read_missing_workflow_is_not_found() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    assert_eq!(
+        client
+            .list_staging_projects(&project, StagingReadOptions::default())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound,
+        "a project with no staging workflow must 404, not read as an empty list"
+    );
+    assert_eq!(
+        client
+            .staging_project(
+                &project,
+                "openSUSE:Factory:Staging:A",
+                StagingReadOptions::default(),
+            )
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// The person-match search finds a project once its maintainer is
+/// granted, and finds nothing for a user with no projects. A freshly
+/// created project carries no person roles, so the maintainer grant
+/// (through the meta write) is part of the setup.
+#[test]
+fn live_search_projects_by_person_finds_the_maintainer() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let mut meta = client
+        .project_meta(&project)
+        .expect("read the project meta on the live instance");
+    meta.persons = vec![NamedRole {
+        name: "Admin".to_string(),
+        role: "maintainer".to_string(),
+    }];
+    client
+        .set_project_meta(&project, &meta, &DryRun::new(false))
+        .expect("grant Admin the maintainer role on the live instance");
+    let matches = client
+        .search_projects_by_person("Admin")
+        .expect("search projects by person on the live instance");
+    assert!(
+        matches.iter().any(|found| found.name == project),
+        "the search must find the project Admin maintains {project}; got {matches:?}"
+    );
+    let nobody = format!("geectl-live-nobody-{}", unique_suffix());
+    let matches = client
+        .search_projects_by_person(&nobody)
+        .expect("search projects by a user with no projects on the live instance");
+    assert!(
+        matches.is_empty(),
+        "a user with no projects must match nothing; got {matches:?}"
+    );
+}
+
+/// The scmsync count counts the project whose scmsync starts with
+/// the prefix, and zero for a prefix nothing uses.
+#[test]
+fn live_count_scmsync_projects_counts_the_synced_project() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let prefix = format!("https://live.example-{}/", unique_suffix());
+    let mut meta = client
+        .project_meta(&project)
+        .expect("read the project meta on the live instance");
+    meta.scmsync = Some(format!("{prefix}repo.git#main"));
+    client
+        .set_project_meta(&project, &meta, &DryRun::new(false))
+        .expect("point the project at its git source on the live instance");
+    assert_eq!(
+        client
+            .count_scmsync_projects(&prefix)
+            .expect("count scmsync projects on the live instance"),
+        1,
+        "exactly the one synced project must match the prefix"
+    );
+    assert_eq!(
+        client
+            .count_scmsync_projects("https://live.example-nobody/")
+            .expect("count scmsync projects for an unused prefix"),
+        0
+    );
+}
+
+/// The project meta write reads back what was written.
+#[test]
+fn live_set_project_meta_writes_and_reads_back() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let mut meta = client
+        .project_meta(&project)
+        .expect("read the project meta on the live instance");
+    meta.title = Some("geectl live test retitled".to_string());
+    meta.description = Some("Retitled by the geectl live test.".to_string());
+    meta.url = Some("https://example.com/live".to_string());
+    client
+        .set_project_meta(&project, &meta, &DryRun::new(false))
+        .expect("write the project meta on the live instance");
+    let read_back = client
+        .project_meta(&project)
+        .expect("read the project meta back from the server");
+    assert_eq!(
+        read_back.title.as_deref(),
+        Some("geectl live test retitled")
+    );
+    assert_eq!(
+        read_back.description.as_deref(),
+        Some("Retitled by the geectl live test.")
+    );
+    assert_eq!(read_back.url.as_deref(), Some("https://example.com/live"));
+}
+
+/// The package meta write reads back what was written, and leaves
+/// the fields it did not touch alone.
+#[test]
+fn live_set_package_meta_writes_and_reads_back() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let mut meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta on the live instance");
+    meta.title = Some("geectl live test retitled package".to_string());
+    meta.url = Some("https://example.com/live-pkg".to_string());
+    client
+        .set_package_meta(&project, &package, &meta, &DryRun::new(false))
+        .expect("write the package meta on the live instance");
+    let read_back = client
+        .package_meta(&project, &package)
+        .expect("read the package meta back from the server");
+    assert_eq!(
+        read_back.title.as_deref(),
+        Some("geectl live test retitled package")
+    );
+    assert_eq!(
+        read_back.url.as_deref(),
+        Some("https://example.com/live-pkg")
+    );
+    assert_eq!(
+        read_back.description.as_deref(),
+        Some("Created by the geectl live test; the instance is destroyed after the run.")
+    );
+}
+
+/// Updating package meta from the spec writes the spec's Summary,
+/// Url, and %description into the meta.
+#[test]
+fn live_update_package_meta_from_spec_writes_the_spec_fields() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let spec = "Name: geectl-live-pkg\nVersion: 1.0\nSummary: A live test package\nUrl: https://example.com/live-pkg\n\n%description\nA package for the live test.\n\n%prep\n%autosetup\n";
+    client
+        .upload_file(
+            &project,
+            &package,
+            "geectl-live-pkg.spec",
+            spec,
+            &DryRun::new(false),
+        )
+        .expect("upload a spec file to the live instance");
+    client
+        .update_package_meta_from_spec(&project, &package, None, &DryRun::new(false))
+        .expect("update the package meta from the spec on the live instance");
+    let meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta back from the server");
+    assert_eq!(meta.title.as_deref(), Some("A live test package"));
+    assert_eq!(meta.url.as_deref(), Some("https://example.com/live-pkg"));
+    assert_eq!(
+        meta.description.as_deref(),
+        Some("A package for the live test.")
+    );
+}
+
+/// Deleting a link removes the `_link` file from the package.
+#[test]
+fn live_delete_link_removes_the_link() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (_, target_project, package) = setup_link(&client);
+    let before = read_directory(&base, &target_project, &package);
+    assert!(
+        before.contains("name=\"_link\""),
+        "the linked package must carry a _link before the delete; directory: {before}"
+    );
+    client
+        .delete_link(&target_project, &package, &DryRun::new(false))
+        .expect("delete the _link on the live instance");
+    let after = read_directory(&base, &target_project, &package);
+    assert!(
+        !after.contains("name=\"_link\""),
+        "the _link must be gone after the delete; directory: {after}"
+    );
+}
+
+/// Filing an add-role request files one `add_role` action on the
+/// server, readable back through the request read.
+#[test]
+fn live_file_add_role_files_and_reads_back() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let payload = AddRolePayload::new(
+        &project,
+        Some(&package),
+        Some(("Admin", "maintainer")),
+        None,
+        "Grant Admin the maintainer role on the live test package",
+    )
+    .expect("build the add-role payload");
+    let dry = DryRun::new(false);
+    let filing = SrFiling::new(&client, &dry);
+    let id = filing
+        .file_add_role(&payload)
+        .expect("file the add-role request on the live instance")
+        .expect("filing in live mode returns an id");
+    let request = client
+        .show_request(&id)
+        .expect("read the filed request back from the server");
+    assert_eq!(request.creator, "Admin");
+    match &request.actions[..] {
+        [RequestAction::AddRole {
+            target_project,
+            target_package,
+            person,
+            group,
+        }] => {
+            assert_eq!(target_project, &project);
+            assert_eq!(target_package.as_deref(), Some(package.as_str()));
+            assert_eq!(
+                person
+                    .as_ref()
+                    .map(|(name, role)| (name.as_str(), role.as_str())),
+                Some(("Admin", "maintainer"))
+            );
+            assert_eq!(group, &None);
+        }
+        other => panic!("expected one add_role action; got {other:?}"),
+    }
+}
+
+/// Build control against the live instance: rebuild, restart, and
+/// abort all return Ok on a package that was never built — a
+/// rebuild queues a rebuild event, and a restart or abort is
+/// accepted even when nothing is building.
+#[test]
+fn live_build_control_accepts_commands_on_a_never_built_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let path_target = create_path_target(&client, &base);
+    add_repository(
+        &base,
+        &source_project,
+        "standard",
+        "x86_64",
+        &path_target,
+        "standard",
+    );
+    let dry = DryRun::new(false);
+    client
+        .rebuild_package(&source_project, "standard", "x86_64", &package, &dry)
+        .expect("rebuild on the live instance");
+    client
+        .restart_build(&source_project, "standard", "x86_64", &package, &dry)
+        .expect("restart on the live instance");
+    client
+        .abort_build(&source_project, "standard", "x86_64", &package, &dry)
+        .expect("abort on the live instance");
 }
