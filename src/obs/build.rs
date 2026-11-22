@@ -2266,7 +2266,7 @@ impl<'a> ObsClient<'a> {
     }
 
     /// Rebuild package `package` in `project`/`repository`/`arch` on OBS
-    /// (`POST /build/<project>/<repository>/<arch>/<package>?cmd=rebuild`).
+    /// (`POST /build/<project>?cmd=rebuild&repository=<repository>&arch=<arch>&package=<package>`).
     /// Requires credentials; without them the call fails loudly before
     /// any request. In dry-run the rebuild is recorded in the plan and
     /// nothing is rebuilt — the guard runs before the credentials
@@ -2299,7 +2299,7 @@ impl<'a> ObsClient<'a> {
 
     /// Restart the build of package `package` in
     /// `project`/`repository`/`arch` on OBS (`POST
-    /// /build/<project>/<repository>/<arch>/<package>?cmd=restartbuild`).
+    /// /build/<project>?cmd=restartbuild&repository=<repository>&arch=<arch>&package=<package>`).
     /// Requires credentials; without them the call fails loudly before
     /// any request. In dry-run the restart is recorded in the plan and
     /// nothing is restarted — the guard runs before the credentials
@@ -2331,7 +2331,7 @@ impl<'a> ObsClient<'a> {
 
     /// Abort the build of package `package` in
     /// `project`/`repository`/`arch` on OBS (`POST
-    /// /build/<project>/<repository>/<arch>/<package>?cmd=abortbuild`).
+    /// /build/<project>?cmd=abortbuild&repository=<repository>&arch=<arch>&package=<package>`).
     /// Requires credentials; without them the call fails loudly before
     /// any request. In dry-run the abort is recorded in the plan and
     /// nothing is aborted — the guard runs before the credentials
@@ -2363,9 +2363,10 @@ impl<'a> ObsClient<'a> {
 
     /// Send a build-control command (`rebuild`, `restartbuild`,
     /// `abortbuild`) for one package: `POST
-    /// /build/<project>/<repository>/<arch>/<package>?cmd=<cmd>` with
-    /// an empty body. The command is package-scoped: the build API has
-    /// no POST route for a whole repository.
+    /// /build/<project>?cmd=<cmd>&repository=<repository>&arch=<arch>&package=<package>`
+    /// with an empty body. The package is a query parameter: omitting
+    /// it would target every package in the repository/arch, but this
+    /// op always passes one package.
     ///
     /// Success means the command was accepted. A rebuild queues a
     /// rebuild event for the package; a restart or abort is accepted
@@ -2403,8 +2404,13 @@ impl<'a> ObsClient<'a> {
         }
         let url = build_url(
             &self.base,
-            &["build", project, repository, arch, package],
-            &[("cmd", cmd)],
+            &["build", project],
+            &[
+                ("cmd", cmd),
+                ("repository", repository),
+                ("arch", arch),
+                ("package", package),
+            ],
         );
         let body = self.http.post(&url, "", &self.credentials)?;
         if parse_status_ok(&body) {
@@ -5573,7 +5579,7 @@ mod tests {
     #[test]
     fn rebuild_package_posts_the_rebuild_command_and_succeeds() {
         let http = FakeHttp::new().with_post(
-            "https://api.opensuse.org/build/test:factory/standard/x86_64/test-pkgA?cmd=rebuild",
+            "https://api.opensuse.org/build/test:factory?cmd=rebuild&repository=standard&arch=x86_64&package=test-pkgA",
             "<status code=\"ok\"/>",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -5595,7 +5601,7 @@ mod tests {
     #[test]
     fn restart_build_posts_the_restartbuild_command() {
         let http = FakeHttp::new().with_post(
-            "https://api.opensuse.org/build/test:factory/standard/x86_64/test-pkgA?cmd=restartbuild",
+            "https://api.opensuse.org/build/test:factory?cmd=restartbuild&repository=standard&arch=x86_64&package=test-pkgA",
             "<status code=\"ok\"/>",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -5614,7 +5620,7 @@ mod tests {
     #[test]
     fn abort_build_posts_the_abortbuild_command() {
         let http = FakeHttp::new().with_post(
-            "https://api.opensuse.org/build/test:factory/standard/x86_64/test-pkgA?cmd=abortbuild",
+            "https://api.opensuse.org/build/test:factory?cmd=abortbuild&repository=standard&arch=x86_64&package=test-pkgA",
             "<status code=\"ok\"/>",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -5633,7 +5639,7 @@ mod tests {
     #[test]
     fn build_control_non_ok_body_is_error_not_success() {
         let http = FakeHttp::new().with_post(
-            "https://api.opensuse.org/build/test:factory/standard/x86_64/test-pkgA?cmd=rebuild",
+            "https://api.opensuse.org/build/test:factory?cmd=rebuild&repository=standard&arch=x86_64&package=test-pkgA",
             "<status code=\"error\"/>",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
