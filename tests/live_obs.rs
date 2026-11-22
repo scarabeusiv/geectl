@@ -6232,6 +6232,64 @@ fn live_role_remove_project_refuses_the_last_maintainer() {
     assert!(err.context.contains("last maintainer"), "{}", err.context);
 }
 
+/// The live server accepts project meta with no maintainers: the
+/// client-side refusal to drop the last maintainer rests on the
+/// lockout that follows for a non-admin user — only an administrator
+/// can write the project meta afterwards — not on a server error.
+#[test]
+fn live_server_accepts_project_meta_without_maintainers() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let mut meta = client
+        .project_meta(&project)
+        .expect("read the project meta on the live instance");
+    if !meta
+        .persons
+        .iter()
+        .chain(meta.groups.iter())
+        .any(|entry| entry.role == "maintainer")
+    {
+        let user = live_username();
+        meta.persons.push(NamedRole {
+            name: user,
+            role: "maintainer".to_string(),
+        });
+        client
+            .set_project_meta(&project, &meta, &DryRun::new(false))
+            .expect("grant a maintainer on the live instance");
+        meta = client
+            .project_meta(&project)
+            .expect("read the project meta back from the server");
+    }
+    assert!(
+        meta.persons
+            .iter()
+            .chain(meta.groups.iter())
+            .any(|entry| entry.role == "maintainer"),
+        "the live project has a maintainer to strip"
+    );
+    meta.persons.retain(|entry| entry.role != "maintainer");
+    meta.groups.retain(|entry| entry.role != "maintainer");
+    client
+        .set_project_meta(&project, &meta, &DryRun::new(false))
+        .expect("write project meta without maintainers on the live instance");
+    let read_back = client
+        .project_meta(&project)
+        .expect("read the project meta back from the server");
+    assert!(
+        !read_back
+            .persons
+            .iter()
+            .chain(read_back.groups.iter())
+            .any(|entry| entry.role == "maintainer"),
+        "the server kept the meta without maintainers"
+    );
+}
+
 /// Updating package meta from the spec writes the spec's Summary,
 /// Url, and %description into the meta.
 #[test]
