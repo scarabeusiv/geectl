@@ -1461,7 +1461,7 @@ fn gitea_pull_request_read_round_trip() {
         .pr_reviews(&user, &repo, number)
         .expect("typed pr_reviews lists the reviews");
     assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].user.login, user);
+    assert_eq!(reviews[0].user.as_ref().unwrap().login, user);
     assert_eq!(reviews[0].state, "COMMENT");
     assert_eq!(reviews[0].body.as_deref(), Some("Looks good to me."));
     assert!(!reviews[0].dismissed);

@@ -331,7 +331,7 @@ pub struct PullRequestEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewOpinion {
     /// The asked-of target on OBS (user, group, project, or package);
-    /// the reviewer login on Gitea.
+    /// the reviewer login on Gitea, or @<team name> for a team review.
     #[serde(default)]
     pub reviewer: String,
     /// The review's state.
@@ -466,8 +466,16 @@ impl PullRequest {
     ) -> Result<Self, GeectlError> {
         let mut opinions = Vec::new();
         for review in reviews {
+            // A team review carries no user: its reviewer reads as
+            // @<team name>, the same name cancel-review-request
+            // --reviewer accepts.
+            let reviewer = match (&review.user, &review.team) {
+                (Some(user), _) => user.login.clone(),
+                (None, Some(team)) => format!("@{}", team.name),
+                (None, None) => String::new(),
+            };
             opinions.push(ReviewOpinion {
-                reviewer: review.user.login.clone(),
+                reviewer,
                 state: OpinionState::from_gitea(&review.state, review.dismissed)?,
                 comment: review.body.clone().unwrap_or_default(),
                 when: review.submitted_at.clone(),

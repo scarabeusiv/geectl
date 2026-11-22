@@ -323,8 +323,15 @@ pub struct GiteaIssueRepository {
 /// /api/v1/repos/{owner}/{repo}/pulls/{n}/reviews`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GiteaReview {
-    /// The reviewer.
-    pub user: GiteaOwner,
+    /// The reviewing user, when the review is asked of or given by
+    /// one. A review asked of a team carries no user: the server
+    /// sends `user: null` and a `team` object instead.
+    #[serde(default)]
+    pub user: Option<GiteaOwner>,
+    /// The reviewing team, when the review is asked of one. Only
+    /// a team review carries it; a user review leaves it unset.
+    #[serde(default)]
+    pub team: Option<GiteaTeam>,
     /// The wire state (`PENDING`/`REQUEST_REVIEW`/`APPROVED`/
     /// `REQUEST_CHANGES`/`COMMENT`).
     pub state: String,
@@ -338,6 +345,82 @@ pub struct GiteaReview {
     /// not record one.
     #[serde(default)]
     pub submitted_at: Option<String>,
+}
+
+/// The review event a `pr_review` posts (`APPROVED` /
+/// `REQUEST_CHANGES` / `COMMENT` on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GiteaReviewEvent {
+    /// Approve the pull request.
+    Approve,
+    /// Ask for changes on the pull request.
+    RequestChanges,
+    /// Comment on the pull request without approving or asking
+    /// for changes.
+    Comment,
+}
+
+impl GiteaReviewEvent {
+    /// The server's spelling of this event.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GiteaReviewEvent::Approve => "APPROVED",
+            GiteaReviewEvent::RequestChanges => "REQUEST_CHANGES",
+            GiteaReviewEvent::Comment => "COMMENT",
+        }
+    }
+
+    /// The dry-run plan verb for this event.
+    fn plan_verb(&self) -> &'static str {
+        match self {
+            GiteaReviewEvent::Approve => "approve",
+            GiteaReviewEvent::RequestChanges => "request changes on",
+            GiteaReviewEvent::Comment => "comment on the review of",
+        }
+    }
+}
+
+/// The body of a review-event POST: the event, plus the comment
+/// when one was given. The body is omitted when empty: the server
+/// takes an event without one.
+#[derive(Serialize)]
+struct ReviewEventRequest {
+    event: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+}
+
+/// The body of a review-request cancel DELETE: the users and teams
+/// whose pending request is cancelled.
+#[derive(Serialize)]
+struct CancelReviewersRequest {
+    reviewers: Vec<String>,
+    team_reviewers: Vec<String>,
+}
+
+/// The body of an issue-comment POST.
+#[derive(Serialize)]
+struct IssueCommentRequest {
+    body: String,
+}
+
+/// One comment on a pull request's issue thread: the issue
+/// comments are where pull-request comments live, since a review
+/// event carries no standalone comment thread of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaComment {
+    /// The comment id.
+    pub id: u64,
+    /// The comment author; `None` when the server names none.
+    #[serde(default)]
+    pub user: Option<GiteaOwner>,
+    /// The comment body; empty when the server sends none.
+    #[serde(default)]
+    pub body: String,
+    /// When the comment was created; `None` when the server does
+    /// not record one.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// The wire state filter for the pull-request list and search
@@ -1985,6 +2068,215 @@ impl<'a> GiteaClient<'a> {
             &format!("reviews of pull request {owner}/{repo}#{number}"),
             "the list is bounded at 500 entries",
         )
+    }
+
+    /// Submit a review event on a pull request (`POST
+    /// /api/v1/repos/{owner}/{repo}/pulls/{number}/reviews`) and
+    /// return the created review. DryRun-guarded like `fork_repo`:
+    /// the guard runs before the POST, and the result is `None`
+    /// in dry-run.
+    pub fn pr_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        event: GiteaReviewEvent,
+        body: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaReview>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        if !dry_run.allow(&format!(
+            "{} pull request {owner}/{repo}#{number}",
+            event.plan_verb()
+        )) {
+            return Ok(None);
+        }
+        let request = ReviewEventRequest {
+            event: event.as_str(),
+            body: body.map(str::to_string),
+        };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea review request: {err}"),
+            )
+        })?;
+        let url = build_url(
+            &self.base,
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "pulls",
+                &number.to_string(),
+                "reviews",
+            ],
+            &[],
+        );
+        let response = self.http.post_json_with(&url, &body, &self.credentials)?;
+        let review: GiteaReview = serde_json::from_str(&response).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea review response for pull request {owner}/{repo}#{number}: {err}"
+                ),
+            )
+        })?;
+        Ok(Some(review))
+    }
+
+    /// List the issue comments on a pull request (`GET
+    /// /api/v1/repos/{owner}/{repo}/issues/{number}/comments`).
+    /// Issue comments are the pull request's comment thread: a
+    /// review event carries no standalone comment of its own.
+    pub fn pr_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<GiteaComment>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        self.list_paged::<GiteaComment>(
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "issues",
+                &number.to_string(),
+                "comments",
+            ],
+            &[],
+            &format!("comments of pull request {owner}/{repo}#{number}"),
+            "the list is bounded at 500 entries",
+        )
+    }
+
+    /// Comment on a pull request (`POST
+    /// /api/v1/repos/{owner}/{repo}/issues/{number}/comments`) and
+    /// return the created comment. DryRun-guarded like
+    /// `fork_repo`: the guard runs before the POST, and the result
+    /// is `None` in dry-run.
+    pub fn pr_comment_add(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaComment>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        if !dry_run.allow(&format!("comment on pull request {owner}/{repo}#{number}")) {
+            return Ok(None);
+        }
+        let request = IssueCommentRequest {
+            body: body.to_string(),
+        };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea comment request: {err}"),
+            )
+        })?;
+        let url = build_url(
+            &self.base,
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "issues",
+                &number.to_string(),
+                "comments",
+            ],
+            &[],
+        );
+        let response = self.http.post_json_with(&url, &body, &self.credentials)?;
+        let comment: GiteaComment = serde_json::from_str(&response).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea comment response for pull request {owner}/{repo}#{number}: {err}"
+                ),
+            )
+        })?;
+        Ok(Some(comment))
+    }
+
+    /// Cancel pending review requests on a pull request (`DELETE
+    /// /api/v1/repos/{owner}/{repo}/pulls/{number}/
+    /// requested_reviewers`) and return the cancelled names: user
+    /// logins as themselves, team names with the `@` prefix the
+    /// cancel flag accepts. The lists are the resolved pending
+    /// set — the caller reads the reviews first and passes only
+    /// reviewers with a pending request, since the server answers
+    /// 204 even for a reviewer with no pending request. Both
+    /// lists empty is refused client-side instead of sending a
+    /// DELETE that cancels nothing. DryRun-guarded like
+    /// `fork_repo`: the guard runs before the DELETE, and the
+    /// result is `None` in dry-run.
+    pub fn pr_review_cancel_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        reviewers: &[String],
+        team_reviewers: &[String],
+        dry_run: &DryRun,
+    ) -> Result<Option<Vec<String>>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        if reviewers.is_empty() && team_reviewers.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("no reviewers to cancel on pull request {owner}/{repo}#{number}"),
+            ));
+        }
+        let mut cancelled: Vec<String> = reviewers.to_vec();
+        cancelled.extend(team_reviewers.iter().map(|team| format!("@{team}")));
+        if !dry_run.allow(&format!(
+            "cancel the review request of {} on pull request {owner}/{repo}#{number}",
+            cancelled.join(", ")
+        )) {
+            return Ok(None);
+        }
+        let request = CancelReviewersRequest {
+            reviewers: reviewers.to_vec(),
+            team_reviewers: team_reviewers.to_vec(),
+        };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea cancel-reviewers request: {err}"),
+            )
+        })?;
+        let url = build_url(
+            &self.base,
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "pulls",
+                &number.to_string(),
+                "requested_reviewers",
+            ],
+            &[],
+        );
+        self.http.delete_json_with(&url, &body, &self.credentials)?;
+        Ok(Some(cancelled))
     }
 
     /// Read every page of a list endpoint (`page`/`limit` query)
@@ -4064,7 +4356,8 @@ mod tests {
         );
         let reviews = client(&http).pr_reviews("openSUSE", "geectl", 122).unwrap();
         assert_eq!(reviews.len(), 2);
-        assert_eq!(reviews[0].user.login, "plusky");
+        assert_eq!(reviews[0].user.as_ref().unwrap().login, "plusky");
+        assert!(reviews[0].team.is_none());
         assert_eq!(reviews[0].state, "APPROVED");
         assert_eq!(reviews[0].body.as_deref(), Some("Looks good."));
         assert!(!reviews[0].dismissed);
@@ -4085,6 +4378,212 @@ mod tests {
             .pr_reviews("openSUSE", "geectl", 122)
             .expect_err("a review missing its state must fail");
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn pr_reviews_parses_team_review() {
+        // A team review carries `user: null` and a team object:
+        // the user must parse as None, not fail the whole list.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews?page=1&limit=50",
+            r#"[{"id": 2, "user": null, "team": {"id": 3, "name": "probe-team", "description": "", "permission": "none", "units": [], "units_map": {}, "includes_all_repositories": false, "can_create_org_repo": false}, "state": "REQUEST_REVIEW", "body": "", "dismissed": false, "submitted_at": "2026-11-22T22:05:11Z"}]"#,
+        );
+        let reviews = client(&http).pr_reviews("openSUSE", "geectl", 122).unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert!(reviews[0].user.is_none());
+        assert_eq!(reviews[0].team.as_ref().unwrap().name, "probe-team");
+        assert_eq!(reviews[0].state, "REQUEST_REVIEW");
+    }
+
+    #[test]
+    fn pr_review_posts_the_event() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews",
+            &review_json("plusky", "APPROVED", "Looks good."),
+        );
+        let review = client(&http)
+            .pr_review(
+                "openSUSE",
+                "geectl",
+                122,
+                GiteaReviewEvent::Approve,
+                Some("Looks good."),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(review.user.as_ref().unwrap().login, "plusky");
+        assert_eq!(review.state, "APPROVED");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, r#"{"event":"APPROVED","body":"Looks good."}"#);
+        assert!(calls[0].2);
+    }
+
+    #[test]
+    fn pr_review_comment_posts_the_event() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews",
+            &review_json("plusky", "COMMENT", "One nit."),
+        );
+        let review = client(&http)
+            .pr_review(
+                "openSUSE",
+                "geectl",
+                122,
+                GiteaReviewEvent::Comment,
+                Some("One nit."),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(review.user.as_ref().unwrap().login, "plusky");
+        assert_eq!(review.state, "COMMENT");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, r#"{"event":"COMMENT","body":"One nit."}"#);
+        assert!(calls[0].2);
+    }
+
+    #[test]
+    fn pr_review_without_a_body_omits_it() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews",
+            &review_json("plusky", "APPROVED", ""),
+        );
+        client(&http)
+            .pr_review(
+                "openSUSE",
+                "geectl",
+                122,
+                GiteaReviewEvent::Approve,
+                None,
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert_eq!(http.post_calls()[0].1, r#"{"event":"APPROVED"}"#);
+    }
+
+    #[test]
+    fn pr_review_dry_run_posts_nothing() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/reviews",
+            &review_json("plusky", "APPROVED", "Looks good."),
+        );
+        let review = client(&http)
+            .pr_review(
+                "openSUSE",
+                "geectl",
+                122,
+                GiteaReviewEvent::Approve,
+                Some("Looks good."),
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert!(review.is_none());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_comments_parses_comments() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments?page=1&limit=50",
+            r#"[{"id": 7, "user": {"login": "plusky"}, "body": "One nit.", "created_at": "2026-11-22T19:52:58Z"}]"#,
+        );
+        let comments = client(&http)
+            .pr_comments("openSUSE", "geectl", 122)
+            .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, 7);
+        assert_eq!(comments[0].user.as_ref().unwrap().login, "plusky");
+        assert_eq!(comments[0].body, "One nit.");
+    }
+
+    #[test]
+    fn pr_comment_add_posts_the_comment() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+            r#"{"id": 7, "user": {"login": "plusky"}, "body": "One nit.", "created_at": "2026-11-22T19:52:58Z"}"#,
+        );
+        let comment = client(&http)
+            .pr_comment_add("openSUSE", "geectl", 122, "One nit.", &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(comment.id, 7);
+        assert_eq!(comment.body, "One nit.");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, r#"{"body":"One nit."}"#);
+    }
+
+    #[test]
+    fn pr_comment_add_dry_run_posts_nothing() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+            r#"{"id": 7, "user": {"login": "plusky"}, "body": "One nit.", "created_at": "2026-11-22T19:52:58Z"}"#,
+        );
+        let comment = client(&http)
+            .pr_comment_add("openSUSE", "geectl", 122, "One nit.", &DryRun::new(true))
+            .unwrap();
+        assert!(comment.is_none());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_review_cancel_request_deletes_with_the_lists() {
+        let http = FakeHttp::new().with_delete(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/requested_reviewers",
+            "",
+        );
+        let cancelled = client(&http)
+            .pr_review_cancel_request(
+                "openSUSE",
+                "geectl",
+                122,
+                &["bob".to_string()],
+                &["probe-team".to_string()],
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled, vec!["bob", "@probe-team"]);
+        let calls = http.delete_json_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            r#"{"reviewers":["bob"],"team_reviewers":["probe-team"]}"#
+        );
+        assert!(calls[0].2);
+    }
+
+    #[test]
+    fn pr_review_cancel_request_empty_lists_are_refused() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .pr_review_cancel_request("openSUSE", "geectl", 122, &[], &[], &DryRun::new(false))
+            .expect_err("an empty cancel must fail before any DELETE");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.delete_json_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_review_cancel_request_dry_run_deletes_nothing() {
+        let http = FakeHttp::new().with_delete(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls/122/requested_reviewers",
+            "",
+        );
+        let cancelled = client(&http)
+            .pr_review_cancel_request(
+                "openSUSE",
+                "geectl",
+                122,
+                &["bob".to_string()],
+                &[],
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert!(cancelled.is_none());
+        assert!(http.delete_json_calls().is_empty());
     }
 
     #[test]
