@@ -4352,13 +4352,7 @@ impl<'a> LocalBuild<'a> {
         let container =
             ServiceContainer::start(self, &source_dir, DEFAULT_IMAGE, remaining.as_secs())?;
         let install = container.exec(
-            &[
-                "zypper".to_string(),
-                "--non-interactive".to_string(),
-                "install".to_string(),
-                "--no-recommends".to_string(),
-                "spec-cleaner".to_string(),
-            ],
+            &service_install_argv(&["spec-cleaner".to_string()]),
             deadline,
         )?;
         if !install.status.success() {
@@ -4503,13 +4497,7 @@ impl<'a> LocalBuild<'a> {
         let container =
             ServiceContainer::start(self, source_dir, DEFAULT_IMAGE, remaining.as_secs())?;
         let packages = service_packages(selected);
-        let mut install_argv = vec![
-            "zypper".to_string(),
-            "--non-interactive".to_string(),
-            "install".to_string(),
-            "--no-recommends".to_string(),
-        ];
-        install_argv.extend(packages.iter().cloned());
+        let install_argv = service_install_argv(&packages);
         let install = container.exec(&install_argv, deadline)?;
         if !install.status.success() {
             return Err(GeectlError::new(
@@ -4645,10 +4633,11 @@ impl<'a> LocalBuild<'a> {
     }
 }
 
-/// Capabilities the service container keeps: file ownership and
-/// modes, user and group changes, file capabilities, device
-/// nodes. Every other capability is dropped.
-const SERVICE_CONTAINER_CAPS: &str = "CHOWN,DAC_OVERRIDE,FOWNER,FSETID,SETGID,SETUID,SETFCAP,MKNOD";
+/// Capabilities the service container keeps: `DAC_OVERRIDE` for
+/// the cpio writes of the package install, `SETGID`/`SETUID` for
+/// the `setpriv` elevation of the install exec. Every other
+/// capability is dropped.
+const SERVICE_CONTAINER_CAPS: &str = "DAC_OVERRIDE,SETGID,SETUID";
 
 /// Memory cap for the service container, for RAM and for RAM
 /// plus swap together.
@@ -4662,9 +4651,14 @@ const SERVICE_CONTAINER_PIDS_LIMIT: &str = "1024";
 /// steps run as `podman exec` calls in the same container, stopped
 /// on drop. The `sleep` duration bounds a container orphaned by a
 /// killed client: it exits on its own when the budget lapses. The
-/// container runs as root: the package install needs root, and a
-/// non-root service user cannot write the bind-mounted source
-/// directory. Capabilities are dropped except the install set,
+/// container runs as the invoking user (`--userns=keep-id` maps
+/// that user into the container, so the bind-mounted source
+/// directory is owned by the container user and service writes
+/// land there). Only the package install elevates, via
+/// `setpriv --reuid=0 --regid=0 --clear-groups` under the
+/// granted capabilities, to the container's root user,
+/// unprivileged on the host. Capabilities are dropped except the
+/// install set,
 /// new privileges are denied, and memory and process counts are
 /// capped; the network stays open — `download_url` fetches over
 /// it. A timed-out `exec` kills the container: the exec'd process
@@ -4682,6 +4676,25 @@ struct ServiceContainer {
 }
 
 static SERVICE_CONTAINER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The install exec argv for the service container: `zypper`
+/// under a scoped `setpriv` elevation to the container's root
+/// user. The container runs as the invoking user, and `zypper`
+/// refuses a non-root install, so only this exec elevates.
+fn service_install_argv(packages: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        "setpriv".to_string(),
+        "--reuid=0".to_string(),
+        "--regid=0".to_string(),
+        "--clear-groups".to_string(),
+        "zypper".to_string(),
+        "--non-interactive".to_string(),
+        "install".to_string(),
+        "--no-recommends".to_string(),
+    ];
+    argv.extend(packages.iter().cloned());
+    argv
+}
 
 impl ServiceContainer {
     fn start(
@@ -4709,6 +4722,8 @@ impl ServiceContainer {
             "--rm",
             "--name",
             &name,
+            "--userns",
+            "keep-id",
             "--cap-drop",
             "ALL",
             "--cap-add",
@@ -7112,6 +7127,9 @@ if [ "$1" = "exec" ]; then
   shift 1
   if [ "$1" = "-w" ]; then shift 2; fi
   shift 1
+  # The install exec elevates via setpriv: skip the prefix to
+  # reach the installed command.
+  if [ "$1" = "setpriv" ]; then shift 4; fi
   if [ "$1" = "zypper" ]; then exit 0; fi
   if [ "$1" = "bash" ]; then cd "{SRC}" && bash ./pre_checkin.sh; exit $?; fi
   case "$1" in
@@ -8344,6 +8362,9 @@ if [ "$1" = "exec" ]; then
   shift 1
   if [ "$1" = "-w" ]; then shift 2; fi
   shift 1
+  # The install exec elevates via setpriv: skip the prefix to
+  # reach the installed command.
+  if [ "$1" = "setpriv" ]; then shift 4; fi
   if [ "$1" = "zypper" ]; then exit 0; fi
   if [ "$1" = "bash" ]; then cd "{SRC}" && bash ./pre_checkin.sh; exit $?; fi
   if [ "$1" = "spec-cleaner" ]; then
@@ -8748,7 +8769,7 @@ exit 0
                 .starts_with(".geectl-service-")));
             // The install ran once, for both services.
             let calls = fs::read_to_string(&call_log).unwrap();
-            assert!(calls.contains("zypper --non-interactive install --no-recommends obs-service-alpha obs-service-beta"));
+            assert!(calls.contains("setpriv --reuid=0 --regid=0 --clear-groups zypper --non-interactive install --no-recommends obs-service-alpha obs-service-beta"));
             assert!(calls.contains("run -d --rm --name geectl-service-"));
         }
 
@@ -8904,9 +8925,10 @@ exit 0
 
         #[test]
         fn service_container_run_carries_hardening_flags() {
-            // The container runs hardened: capabilities dropped
-            // except the install set, no new privileges, memory
-            // and process counts capped.
+            // The container runs hardened: as the invoking user
+            // (`--userns=keep-id`), capabilities dropped except
+            // the install set, no new privileges, memory and
+            // process counts capped.
             let dir = TempDir::new();
             let src = dir.path().join("source");
             fs::create_dir_all(&src).unwrap();
@@ -8931,8 +8953,9 @@ exit 0
                 .find(DEFAULT_IMAGE)
                 .expect("run line carries no image");
             for flag in [
+                "--userns keep-id",
                 "--cap-drop ALL",
-                "--cap-add CHOWN,DAC_OVERRIDE,FOWNER,FSETID,SETGID,SETUID,SETFCAP,MKNOD",
+                "--cap-add DAC_OVERRIDE,SETGID,SETUID",
                 "--security-opt no-new-privileges",
                 "--memory 4g",
                 "--memory-swap 4g",
