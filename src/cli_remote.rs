@@ -361,6 +361,13 @@ pub enum RemoteCommand {
         /// The package to restore.
         package: String,
     },
+    /// Restore a deleted project. A mutation: dry-run is the
+    /// default (only the plan is printed); `--live` performs the
+    /// restore.
+    UndeleteProject {
+        /// The project to restore.
+        project: String,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
@@ -398,6 +405,7 @@ pub fn run_remote(
         RemoteCommand::DeletePackage { .. } if !live => Credentials::None,
         RemoteCommand::DeleteProject { .. } if !live => Credentials::None,
         RemoteCommand::UndeletePackage { .. } if !live => Credentials::None,
+        RemoteCommand::UndeleteProject { .. } if !live => Credentials::None,
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -846,6 +854,16 @@ pub fn run_remote(
                 plan,
             ))
         }
+        RemoteCommand::UndeleteProject { project } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.undelete_project(&project, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(undelete_project_result(&project, dry_run.enabled(), plan))
+        }
     }
 }
 
@@ -1144,6 +1162,30 @@ fn undelete_package_result(
     mutation_result(
         payload,
         format!("project: {project} package: {package}"),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The `undelete-project` result: the payload carries the project;
+/// the text carries it too, in the header and the result line.
+fn undelete_project_result(
+    project: &str,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let payload = json!({
+        "project": project,
+    });
+    let result_line = if dry_run {
+        format!("dry-run: would restore deleted project {project}")
+    } else {
+        format!("restored deleted project {project}")
+    };
+    mutation_result(
+        payload,
+        format!("project: {project}"),
         result_line,
         dry_run,
         plan,
@@ -2383,6 +2425,41 @@ mod tests {
         assert_eq!(
             text,
             "project: P package: K\ndry_run: true\ndry-run: would restore deleted package K in project P\n[dry-run] would: restore deleted package P/K"
+        );
+    }
+
+    #[test]
+    fn undelete_project_parses_positional() {
+        assert!(matches!(
+            parse(&["geectl", "remote", "undelete-project", "P"]),
+            RemoteCommand::UndeleteProject { .. }
+        ));
+    }
+
+    #[test]
+    fn undelete_project_result_carries_project_in_both_formats() {
+        let (payload, text) = undelete_project_result("P", false, None);
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "project: P\ndry_run: false\nrestored deleted project P"
+        );
+        let (payload, text) = undelete_project_result(
+            "P",
+            true,
+            Some(vec![
+                "[dry-run] would: restore deleted project P".to_string()
+            ]),
+        );
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: restore deleted project P"
+        );
+        assert_eq!(
+            text,
+            "project: P\ndry_run: true\ndry-run: would restore deleted project P\n[dry-run] would: restore deleted project P"
         );
     }
 
