@@ -1952,7 +1952,7 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 15 blocks (top level, 7 groups, 7 leaves) — a
+    // The docs carry 17 blocks (top level, 8 groups, 8 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
     // groups and one leaf each — and the count assertion guards the
@@ -1962,8 +1962,8 @@ fn docs_help_blocks_match_the_binary() {
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-        15,
-        "docs/cli.md should carry 15 --help blocks (top level, 7 groups, 7 leaves);          update this count when a block is deliberately added or removed"
+        17,
+        "docs/cli.md should carry 17 --help blocks (top level, 8 groups, 8 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();

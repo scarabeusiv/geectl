@@ -41,6 +41,7 @@
 //!   RPM over the cap fails closed with a structured error: streaming
 //!   downloads are not supported yet. Small dep sets build end to end.
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
@@ -51,6 +52,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -66,9 +69,12 @@ use crate::config::Config;
 use crate::debug::Debug;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
+use crate::obs::services::parse_services;
 use crate::obs::valid_obs_name;
 use crate::obs::BuildDep;
 use crate::obs::ObsClient;
+use crate::obs::ServiceDef;
+use crate::obs::ServiceParam;
 
 /// The default build image: Tumbleweed `latest`. One image, one
 /// target — a Leap pool build stays OBS-ONLY.
@@ -351,6 +357,197 @@ pub struct BuildLog {
     /// the root carries one.
     pub verdict: Option<String>,
     pub exit_code: Option<i32>,
+}
+
+/// A local service run mode: the `osc service` command it mirrors.
+/// `runall` is not a mode: it runs every service regardless of
+/// mode, including `buildtime` services, and is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ServiceRunMode {
+    /// `run`: every service except `buildtime`, `serveronly`,
+    /// `manual`, and `disabled` — a service with an unrecognised
+    /// stored mode runs.
+    Run,
+    /// `manualrun`: services with mode `manual` only.
+    ManualRun,
+    /// `precommit`: services with mode `trylocal` or `localonly`
+    /// only — the set a commit runs.
+    Precommit,
+    /// `localrun`: `run` plus services with mode `serveronly`.
+    LocalRun,
+    /// `disabledrun`: services with mode `disabled` only.
+    DisabledRun,
+}
+
+impl ServiceRunMode {
+    /// The `osc service` command name for this mode.
+    pub fn command_name(self) -> &'static str {
+        match self {
+            ServiceRunMode::Run => "run",
+            ServiceRunMode::ManualRun => "manualrun",
+            ServiceRunMode::Precommit => "precommit",
+            ServiceRunMode::LocalRun => "localrun",
+            ServiceRunMode::DisabledRun => "disabledrun",
+        }
+    }
+
+    /// Parse an `osc service` command name. `runall` is refused:
+    /// it runs every service regardless of mode.
+    pub fn from_command_name(name: &str) -> Result<Self, GeectlError> {
+        match name {
+            "run" | "r" => Ok(ServiceRunMode::Run),
+            "manualrun" | "mr" => Ok(ServiceRunMode::ManualRun),
+            "precommit" => Ok(ServiceRunMode::Precommit),
+            "localrun" | "lr" => Ok(ServiceRunMode::LocalRun),
+            "disabledrun" | "dr" => Ok(ServiceRunMode::DisabledRun),
+            "runall" | "ra" => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "runall is refused: it runs every service regardless of mode, including buildtime services",
+            )),
+            _ => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("unknown service run mode {name:?}; expected run, manualrun, precommit, localrun, or disabledrun"),
+            )),
+        }
+    }
+
+    /// The mode filter value the selection applies, mirroring the
+    /// reference implementation's `callmode`: `None` for `run`,
+    /// `"local"` for `localrun`, `"manual"` for `manualrun`,
+    /// `"disabled"` for `disabledrun`, `"trylocal"` for `precommit`.
+    fn callmode(self) -> Option<&'static str> {
+        match self {
+            ServiceRunMode::Run => None,
+            ServiceRunMode::ManualRun => Some("manual"),
+            ServiceRunMode::Precommit => Some("trylocal"),
+            ServiceRunMode::LocalRun => Some("local"),
+            ServiceRunMode::DisabledRun => Some("disabled"),
+        }
+    }
+}
+
+/// A service run request: a source directory (a checkout carrying
+/// a `_service` file) plus the mode filter. A service run needs no
+/// OBS client call: it reads the local `_service` file and runs the
+/// binaries in the container.
+#[derive(Debug, Clone)]
+pub struct ServiceRunRequest {
+    /// The source directory (the checkout the services run in).
+    pub source_dir: PathBuf,
+    /// The mode filter.
+    pub mode: ServiceRunMode,
+    /// Run only this service, with its stored mode forced to the
+    /// run mode. `None` runs every service the mode selects.
+    pub service: Option<String>,
+    /// The service timeout in seconds (default 3600): one budget
+    /// for the whole run — the image pull, the package install,
+    /// and every service share it.
+    pub timeout_secs: u64,
+    /// Print the plan and touch nothing.
+    pub dry_run: bool,
+}
+
+impl ServiceRunRequest {
+    /// A request with the defaults: the default timeout, a real run.
+    pub fn new(source_dir: PathBuf, mode: ServiceRunMode) -> Self {
+        ServiceRunRequest {
+            source_dir,
+            mode,
+            service: None,
+            timeout_secs: DEFAULT_BUILD_TIMEOUT_SECS,
+            dry_run: false,
+        }
+    }
+}
+
+/// The outcome of one service binary run: its exit code and its
+/// captured output (capped, as in the engine run).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServiceRunOutcome {
+    /// The service name from the `_service` file.
+    pub name: String,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// One service as the dry run plans it: the name, the stored mode,
+/// and the binary argv the container would run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlannedService {
+    /// The service name from the `_service` file.
+    pub name: String,
+    /// The mode as stored (empty is the default mode).
+    pub mode: String,
+    /// The binary argv, service binary first, `--outdir` last.
+    pub argv: Vec<String>,
+}
+
+/// The dry-run plan for a service run: the image and the services
+/// that would run, in `_service` file order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServiceRunPlan {
+    pub image: String,
+    pub services: Vec<PlannedService>,
+}
+
+/// The record of one service run: the mode, one outcome per service
+/// that ran (in `_service` file order), and the resolved image
+/// digest when podman answered. A run that selects no services
+/// records an empty `ran` list and starts no container; stale
+/// service files are still removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServiceRunRecord {
+    /// The `osc service` command name for the mode that ran.
+    pub mode: String,
+    pub ran: Vec<ServiceRunOutcome>,
+    /// The resolved image digest, when podman answered.
+    pub image_digest: Option<String>,
+    /// True for a dry run: nothing was touched, `plan` holds the
+    /// invocation.
+    pub dry_run: bool,
+    pub plan: Option<ServiceRunPlan>,
+}
+
+/// The outcome of the `pre_checkin.sh` step of a precommit run:
+/// whether the script exists and ran, its exit code, and its
+/// captured output (capped, as in the engine run). A missing script
+/// records `ran: false` and no exit code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrecheckinOutcome {
+    /// True when `pre_checkin.sh` exists in the source directory
+    /// and ran.
+    pub ran: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// The record of one precommit run: the service run in `precommit`
+/// mode, then `pre_checkin.sh` when the source directory carries
+/// one. A failing service or a failing `pre_checkin.sh` fails the
+/// whole run with [`ErrorKind::ServiceFailed`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrecommitRecord {
+    pub services: ServiceRunRecord,
+    pub pre_checkin: PrecheckinOutcome,
+    /// True for a dry run: nothing was touched.
+    pub dry_run: bool,
+}
+
+/// The result of a `spec-cleaner` run: the exit code and the
+/// captured output (capped, as in the engine run).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpecCleanerResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    /// The resolved image digest, when podman answered.
+    pub image_digest: Option<String>,
+    /// True for a dry run: nothing was touched, `plan` holds the
+    /// invocation.
+    pub dry_run: bool,
+    pub plan: Option<Vec<String>>,
 }
 
 /// The root marker: the identity of a build root, written on first
@@ -692,7 +889,7 @@ impl<'a> LocalBuild<'a> {
 
         // The image is resolved before eviction: the current digest
         // is protected, and the record names the digest actually used.
-        let image = self.resolve_image(req, deadline)?;
+        let image = self.resolve_image(req.refresh_image, req.timeout_secs, deadline)?;
         self.debug.emit(&format!(
             "local-build image: {} digest {}",
             DEFAULT_IMAGE,
@@ -1319,7 +1516,8 @@ impl<'a> LocalBuild<'a> {
     /// (see `podman_pull`): the same kind as an engine timeout.
     fn resolve_image(
         &self,
-        req: &BuildRequest,
+        refresh_image: bool,
+        timeout_secs: u64,
         deadline: std::time::Instant,
     ) -> Result<ImageInfo, GeectlError> {
         let podman = which(&self.podman).ok_or_else(|| {
@@ -1336,7 +1534,7 @@ impl<'a> LocalBuild<'a> {
         let refreshed = sidecar.refreshed.get(DEFAULT_IMAGE).copied().unwrap_or(0);
         let stale =
             refreshed == 0 || now_unix().saturating_sub(refreshed) > IMAGE_REFRESH_DAYS * 86400;
-        if digest.is_none() || req.refresh_image || stale {
+        if digest.is_none() || refresh_image || stale {
             // The pull gets the build's remaining budget — but a
             // budget already exhausted fails as a timeout, not as
             // an image failure: handing a 0s timeout to the pull
@@ -1354,7 +1552,7 @@ impl<'a> LocalBuild<'a> {
                     ErrorKind::BuildTimeout,
                     format!(
                         "image pull refused: build budget of {}s already exhausted ({}s remaining); podman and the image are fine, the build ran out of time before the pull",
-                        req_timeout(req),
+                        timeout_secs,
                         remaining.as_secs()
                     ),
                 ));
@@ -1363,7 +1561,7 @@ impl<'a> LocalBuild<'a> {
                 "local-build image pull: {} (absent={}, refresh={}, stale={})",
                 DEFAULT_IMAGE,
                 digest.is_none(),
-                req.refresh_image,
+                refresh_image,
                 stale
             ));
             self.podman_pull(&podman, remaining)?;
@@ -3858,6 +4056,907 @@ impl<'a> LocalBuild<'a> {
     }
 }
 
+/// Service runs and the precommit gate.
+///
+/// A service run executes the `_service` file's binaries in the
+/// vertical's container, not on the host: the container fixes the
+/// host divergence (a macOS or Windows host cannot run the Linux
+/// service binaries). The binaries come from the distribution, not
+/// from the image: the plain image carries no `obs-service-*`
+/// package, and the vertical never builds an image — each run
+/// installs the selected services' packages inside one ephemeral
+/// container, then runs the binaries there. The mode filter, the
+/// single-service forcing, the outdir handling, and the output
+/// placement mirror the reference implementation's
+/// `Serviceinfo._execute` (`osc/obs_scm/serviceinfo.py`) and the
+/// command-to-mode mapping of its `do_service`
+/// (`osc/commandline.py`).
+impl<'a> LocalBuild<'a> {
+    /// Run the services of the `_service` file in `req.source_dir`
+    /// in the container, filtered by `req.mode`. One container for
+    /// the whole run: the package install and every service share
+    /// it, and the run's timeout budget. The first failing service
+    /// aborts the run with [`ErrorKind::ServiceFailed`]; a run
+    /// that selects no services starts no container and records an
+    /// empty `ran` list, and stale service files are still removed.
+    /// A dry run returns the plan and touches nothing.
+    pub fn service_run(&self, req: &ServiceRunRequest) -> Result<ServiceRunRecord, GeectlError> {
+        if req.timeout_secs == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "service run timeout must be greater than 0 seconds",
+            ));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(req.timeout_secs);
+        self.service_run_with_deadline(req, deadline)
+    }
+
+    /// The precommit gate: the `precommit`-mode service run, then
+    /// `pre_checkin.sh` when the source directory carries one.
+    /// The script step is part of the gate, not of the service
+    /// mode: the mode filter alone runs services only. Both steps
+    /// share one timeout budget. A failing service or a failing
+    /// `pre_checkin.sh` fails the whole run with
+    /// [`ErrorKind::ServiceFailed`]. A dry run returns the plan
+    /// and touches nothing.
+    pub fn precommit(
+        &self,
+        source_dir: &Path,
+        timeout_secs: u64,
+        dry_run: bool,
+    ) -> Result<PrecommitRecord, GeectlError> {
+        if timeout_secs == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "precommit timeout must be greater than 0 seconds",
+            ));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let req = ServiceRunRequest {
+            source_dir: source_dir.to_path_buf(),
+            mode: ServiceRunMode::Precommit,
+            service: None,
+            timeout_secs,
+            dry_run,
+        };
+        let services = self.service_run_with_deadline(&req, deadline)?;
+        let source_dir = std::path::absolute(&req.source_dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot resolve source directory {}: {e}",
+                    req.source_dir.display()
+                ),
+            )
+        })?;
+        let pre_checkin = self.run_precheckin(&source_dir, deadline, dry_run)?;
+        Ok(PrecommitRecord {
+            services,
+            pre_checkin,
+            dry_run,
+        })
+    }
+
+    /// Run `spec-cleaner` on `spec` in the container. `spec` is a
+    /// path inside `source_dir` (relative, or absolute under it).
+    /// `extra_args` pass through to the binary as argv elements.
+    /// A non-zero exit fails with [`ErrorKind::ServiceFailed`].
+    /// A dry run returns the plan and touches nothing.
+    pub fn spec_cleaner(
+        &self,
+        source_dir: &Path,
+        spec: &Path,
+        extra_args: &[String],
+        timeout_secs: u64,
+        dry_run: bool,
+    ) -> Result<SpecCleanerResult, GeectlError> {
+        if timeout_secs == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "spec-cleaner timeout must be greater than 0 seconds",
+            ));
+        }
+        let source_dir = std::path::absolute(source_dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot resolve source directory {}: {e}",
+                    source_dir.display()
+                ),
+            )
+        })?;
+        if !source_dir.is_dir() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "source directory {} is not a directory",
+                    source_dir.display()
+                ),
+            ));
+        }
+        let spec_path = if spec.is_absolute() {
+            spec.to_path_buf()
+        } else {
+            source_dir.join(spec)
+        };
+        let spec_name = spec_path.strip_prefix(&source_dir).map_err(|_| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "spec {} is outside source directory {}",
+                    spec_path.display(),
+                    source_dir.display()
+                ),
+            )
+        })?;
+        // A lexically joined `..` passes the prefix check above:
+        // reject it here, so an escaping spec fails here instead
+        // of confusingly in the container.
+        if spec_name
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "spec {} is outside source directory {}",
+                    spec_path.display(),
+                    source_dir.display()
+                ),
+            ));
+        }
+        if spec_name.as_os_str().is_empty() || !spec_path.is_file() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("spec {} is not a file", spec_path.display()),
+            ));
+        }
+        let mut argv: Vec<String> = vec!["spec-cleaner".to_string()];
+        argv.extend(extra_args.iter().cloned());
+        argv.push(spec_name.to_string_lossy().into_owned());
+        if dry_run {
+            return Ok(SpecCleanerResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                image_digest: None,
+                dry_run: true,
+                plan: Some(argv),
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let image = self.resolve_image(false, timeout_secs, deadline)?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let container =
+            ServiceContainer::start(self, &source_dir, DEFAULT_IMAGE, remaining.as_secs())?;
+        let install = container.exec(
+            &[
+                "zypper".to_string(),
+                "--non-interactive".to_string(),
+                "install".to_string(),
+                "--no-recommends".to_string(),
+                "spec-cleaner".to_string(),
+            ],
+            deadline,
+        )?;
+        if !install.status.success() {
+            return Err(GeectlError::new(
+                ErrorKind::ServiceFailed,
+                format!(
+                    "cannot install spec-cleaner in the service container: {}",
+                    last_lines(&String::from_utf8_lossy(&install.stderr), 20).join("\n")
+                ),
+            ));
+        }
+        let output = container.exec(&argv, deadline)?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !output.status.success() {
+            return Err(GeectlError::new(
+                ErrorKind::ServiceFailed,
+                format!(
+                    "spec-cleaner failed with exit {}: {}",
+                    output.status.code().unwrap_or(-1),
+                    last_lines(&stderr, 20).join("\n")
+                ),
+            ));
+        }
+        Ok(SpecCleanerResult {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+            image_digest: image.digest,
+            dry_run: false,
+            plan: None,
+        })
+    }
+
+    /// The service run against a fixed deadline: the direct entry
+    /// shares the deadline with the caller (precommit passes its
+    /// own deadline so the services and `pre_checkin.sh` share one
+    /// budget).
+    fn service_run_with_deadline(
+        &self,
+        req: &ServiceRunRequest,
+        deadline: std::time::Instant,
+    ) -> Result<ServiceRunRecord, GeectlError> {
+        let source_dir = std::path::absolute(&req.source_dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot resolve source directory {}: {e}",
+                    req.source_dir.display()
+                ),
+            )
+        })?;
+        if !source_dir.is_dir() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "source directory {} is not a directory",
+                    source_dir.display()
+                ),
+            ));
+        }
+        let definitions = read_local_services(&source_dir)?;
+        let selected = select_services(&definitions, req.mode, req.service.as_deref())?;
+        let outdirs: Vec<PathBuf> = selected
+            .iter()
+            .enumerate()
+            .map(|(index, service)| service_outdir(&source_dir, &service.name, index))
+            .collect();
+        if req.dry_run {
+            let plan = ServiceRunPlan {
+                image: DEFAULT_IMAGE.to_string(),
+                services: selected
+                    .iter()
+                    .enumerate()
+                    .map(|(index, service)| PlannedService {
+                        name: service.name.clone(),
+                        mode: service.effective_mode.clone(),
+                        argv: service_argv(
+                            service,
+                            &service_outdir_container(&service.name, index),
+                        ),
+                    })
+                    .collect(),
+            };
+            return Ok(ServiceRunRecord {
+                mode: req.mode.command_name().to_string(),
+                ran: Vec::new(),
+                image_digest: None,
+                dry_run: true,
+                plan: Some(plan),
+            });
+        }
+        // Stale generated files move aside before the run and are
+        // deleted after it, whatever the outcome: a service that
+        // no longer generates a file must not leave a stale
+        // `_service:` file behind. The stash runs even when the
+        // selection is empty, so an empty run still clears stale
+        // files.
+        let stash = stash_service_files(&source_dir)?;
+        if selected.is_empty() {
+            self.debug.emit(&format!(
+                "service-run {}: no services selected",
+                req.mode.command_name()
+            ));
+            remove_stash(&stash, &self.debug);
+            return Ok(ServiceRunRecord {
+                mode: req.mode.command_name().to_string(),
+                ran: Vec::new(),
+                image_digest: None,
+                dry_run: false,
+                plan: None,
+            });
+        }
+        let image = self.resolve_image(false, req.timeout_secs, deadline)?;
+        let result =
+            self.service_run_inner(req, &source_dir, &selected, &outdirs, &image, deadline);
+        remove_stash(&stash, &self.debug);
+        result
+    }
+
+    /// The service run body: the container, the package install,
+    /// and one binary run per selected service, in file order.
+    /// The stash cleanup lives in the caller, so it runs whatever
+    /// this returns.
+    fn service_run_inner(
+        &self,
+        req: &ServiceRunRequest,
+        source_dir: &Path,
+        selected: &[SelectedService],
+        outdirs: &[PathBuf],
+        image: &ImageInfo,
+        deadline: std::time::Instant,
+    ) -> Result<ServiceRunRecord, GeectlError> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let container =
+            ServiceContainer::start(self, source_dir, DEFAULT_IMAGE, remaining.as_secs())?;
+        let packages = service_packages(selected);
+        let mut install_argv = vec![
+            "zypper".to_string(),
+            "--non-interactive".to_string(),
+            "install".to_string(),
+            "--no-recommends".to_string(),
+        ];
+        install_argv.extend(packages.iter().cloned());
+        let install = container.exec(&install_argv, deadline)?;
+        if !install.status.success() {
+            return Err(GeectlError::new(
+                ErrorKind::ServiceFailed,
+                format!(
+                    "cannot install {} in the service container: {}",
+                    packages.join(", "),
+                    last_lines(&String::from_utf8_lossy(&install.stderr), 20).join("\n")
+                ),
+            ));
+        }
+        let mut ran = Vec::new();
+        for (index, (service, outdir)) in selected.iter().zip(outdirs.iter()).enumerate() {
+            fs::create_dir(outdir).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot create service outdir {}: {e}", outdir.display()),
+                )
+            })?;
+            let argv = service_argv(service, &service_outdir_container(&service.name, index));
+            self.debug.emit(&format!(
+                "service-run {}: {}",
+                req.mode.command_name(),
+                argv.join(" ")
+            ));
+            let output = container.exec(&argv, deadline)?;
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let exit_code = output.status.code().unwrap_or(-1);
+            if !output.status.success() {
+                let _ = fs::remove_dir_all(outdir);
+                return Err(GeectlError::new(
+                    ErrorKind::ServiceFailed,
+                    format!(
+                        "service {} failed with exit {exit_code}: {}",
+                        service.name,
+                        last_lines(&stderr, 20).join("\n")
+                    ),
+                ));
+            }
+            place_outputs(
+                outdir,
+                source_dir,
+                &service.name,
+                service_plain_output(&service.effective_mode, req.mode.callmode()),
+            )?;
+            let _ = fs::remove_dir(outdir);
+            ran.push(ServiceRunOutcome {
+                name: service.name.clone(),
+                exit_code,
+                stdout,
+                stderr,
+            });
+        }
+        Ok(ServiceRunRecord {
+            mode: req.mode.command_name().to_string(),
+            ran,
+            image_digest: image.digest.clone(),
+            dry_run: false,
+            plan: None,
+        })
+    }
+
+    /// Run `pre_checkin.sh` in the container when the source
+    /// directory carries one. A missing script is not an error:
+    /// most packages carry none. A failing script fails with
+    /// [`ErrorKind::ServiceFailed`]. The script runs under `bash`
+    /// with the source directory as its working directory, in the
+    /// bare base image: no packages are installed for it, so a
+    /// script needing tools beyond the base image fails. A script
+    /// that shells out to `osc` cannot work here (no osc working
+    /// copy, no osc in the container).
+    fn run_precheckin(
+        &self,
+        source_dir: &Path,
+        deadline: std::time::Instant,
+        dry_run: bool,
+    ) -> Result<PrecheckinOutcome, GeectlError> {
+        let script = source_dir.join("pre_checkin.sh");
+        if !script.is_file() {
+            return Ok(PrecheckinOutcome {
+                ran: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+        if dry_run {
+            return Ok(PrecheckinOutcome {
+                ran: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.as_secs() == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::BuildTimeout,
+                "precommit budget exhausted before pre_checkin.sh; the services ran, the script did not",
+            ));
+        }
+        let image = self.resolve_image(false, remaining.as_secs(), deadline)?;
+        self.debug.emit(&format!(
+            "precommit image: {} digest {}",
+            DEFAULT_IMAGE,
+            image.digest.as_deref().unwrap_or("<unknown>")
+        ));
+        let container =
+            ServiceContainer::start(self, source_dir, DEFAULT_IMAGE, remaining.as_secs())?;
+        let output = container.exec(
+            &["bash".to_string(), "./pre_checkin.sh".to_string()],
+            deadline,
+        )?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let exit_code = output.status.code().unwrap_or(-1);
+        if !output.status.success() {
+            return Err(GeectlError::new(
+                ErrorKind::ServiceFailed,
+                format!(
+                    "pre_checkin.sh failed with exit {exit_code}: {}",
+                    last_lines(&stderr, 20).join("\n")
+                ),
+            ));
+        }
+        Ok(PrecheckinOutcome {
+            ran: true,
+            exit_code: Some(exit_code),
+            stdout,
+            stderr,
+        })
+    }
+}
+
+/// One ephemeral container for a service run, a precommit, or a
+/// `spec-cleaner` invocation: started detached on `sleep` so the
+/// steps run as `podman exec` calls in the same container, stopped
+/// on drop. The `sleep` duration bounds a container orphaned by a
+/// killed client: it exits on its own when the budget lapses. The
+/// container carries the runner version as `OSC_VERSION` (the
+/// value is the geectl version); the `OBS_SERVICE_*` variables
+/// stay unset — a local run carries no project context.
+struct ServiceContainer {
+    podman: PathBuf,
+    name: String,
+}
+
+static SERVICE_CONTAINER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+impl ServiceContainer {
+    fn start(
+        vertical: &LocalBuild<'_>,
+        source_dir: &Path,
+        image: &str,
+        timeout_secs: u64,
+    ) -> Result<Self, GeectlError> {
+        let podman = which(&vertical.podman).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ImageUnavailable,
+                format!(
+                    "podman {:?} not found on PATH; install podman to run local builds",
+                    vertical.podman.to_string_lossy()
+                ),
+            )
+        })?;
+        let n = SERVICE_CONTAINER_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let name = format!("geectl-service-{}-{n}", std::process::id());
+        let osc_version = format!("OSC_VERSION={}", env!("CARGO_PKG_VERSION"));
+        let mut cmd = Command::new(&podman);
+        cmd.args([
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &name,
+            "-e",
+            &osc_version,
+            "-v",
+            &format!("{}:/work", source_dir.display()),
+            "-w",
+            "/work",
+            image,
+            "sleep",
+            &timeout_secs.to_string(),
+        ]);
+        let output =
+            run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS)).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::ImageUnavailable,
+                    format!("cannot start the service container: {e}"),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(GeectlError::new(
+                ErrorKind::ImageUnavailable,
+                format!(
+                    "cannot start the service container: {}",
+                    last_lines(&String::from_utf8_lossy(&output.stderr), 20).join("\n")
+                ),
+            ));
+        }
+        if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::ImageUnavailable,
+                "podman run started no container: empty container id",
+            ));
+        }
+        Ok(ServiceContainer { podman, name })
+    }
+
+    /// Run `argv` in the container, bounded by the deadline. The
+    /// argv form carries no shell: `_service` parameter values
+    /// reach the binary as single arguments, whatever they contain.
+    /// Every call sets the working directory explicitly instead of
+    /// relying on the create-time value.
+    fn exec(
+        &self,
+        argv: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<std::process::Output, GeectlError> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(GeectlError::new(
+                ErrorKind::BuildTimeout,
+                "service container budget exhausted before the command started",
+            ));
+        }
+        let budget_secs = remaining.as_secs();
+        let mut cmd = Command::new(&self.podman);
+        cmd.arg("exec")
+            .arg("-w")
+            .arg("/work")
+            .arg(&self.name)
+            .args(argv);
+        run_with_timeout(&mut cmd, remaining).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                GeectlError::new(
+                    ErrorKind::BuildTimeout,
+                    format!(
+                        "service container command timed out after {budget_secs}s: {}",
+                        argv.first().map(String::as_str).unwrap_or("")
+                    ),
+                )
+            } else {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot run a command in the service container: {e}"),
+                )
+            }
+        })
+    }
+
+    fn stop(&self) {
+        let mut cmd = Command::new(&self.podman);
+        cmd.args(["stop", "--time", "10", &self.name]);
+        let _ = run_with_timeout(&mut cmd, Duration::from_secs(PROBE_TIMEOUT_SECS));
+    }
+}
+
+impl Drop for ServiceContainer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A service selected for a run: the file's definition with its
+/// mode replaced by the run mode's callmode when the reference
+/// implementation forces it (a single-service run, or a mode whose
+/// callmode a service's stored mode cannot override).
+#[derive(Debug)]
+struct SelectedService {
+    name: String,
+    effective_mode: String,
+    params: Vec<ServiceParam>,
+}
+
+/// Read the `_service` file of a source directory. A missing file
+/// selects nothing; a malformed file is a caller error.
+fn read_local_services(source_dir: &Path) -> Result<Vec<ServiceDef>, GeectlError> {
+    let path = source_dir.join("_service");
+    let body = match fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("_service in {} is not valid UTF-8", source_dir.display()),
+            ));
+        }
+        Err(e) => {
+            return Err(GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot read _service in {}: {e}", source_dir.display()),
+            ));
+        }
+    };
+    parse_services(&body).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "malformed _service in {}: {}",
+                source_dir.display(),
+                e.context
+            ),
+        )
+    })
+}
+
+/// Select the services a run executes, in file order. A
+/// single-service run executes only that service: when the file
+/// defines it, with its parameters and the run mode forced as its
+/// mode; when it does not, with no parameters and the run mode as
+/// its mode. Any other run filters the file's services by the run
+/// mode.
+fn select_services(
+    definitions: &[ServiceDef],
+    mode: ServiceRunMode,
+    single: Option<&str>,
+) -> Result<Vec<SelectedService>, GeectlError> {
+    let callmode = mode.callmode();
+    if let Some(name) = single {
+        if name.chars().count() < 3 || name.contains('/') {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid service name {name:?}: at least 3 characters, no '/'",),
+            ));
+        }
+        let effective_mode = callmode.unwrap_or_default().to_string();
+        if let Some(def) = definitions.iter().find(|d| d.name == name) {
+            return Ok(vec![SelectedService {
+                name: def.name.clone(),
+                effective_mode,
+                params: def.params.clone(),
+            }]);
+        }
+        return Ok(vec![SelectedService {
+            name: name.to_string(),
+            effective_mode,
+            params: Vec::new(),
+        }]);
+    }
+    Ok(definitions
+        .iter()
+        .filter(|def| service_selected(&def.mode, callmode))
+        .map(|def| SelectedService {
+            name: def.name.clone(),
+            effective_mode: def.mode.clone(),
+            params: def.params.clone(),
+        })
+        .collect())
+}
+
+/// The mode filter, mirroring the reference implementation's
+/// skip chain (`Serviceinfo._execute`,
+/// `osc/obs_scm/serviceinfo.py`): `buildtime` never runs outside
+/// a `runall` run; `serveronly` runs only under `localrun`;
+/// `manual` and `disabled` run only under their own mode; under
+/// `precommit` only `trylocal` and `localonly` run (a service with
+/// no stored mode does not run there). Any other stored mode runs
+/// under `run` and `localrun`.
+fn service_selected(mode: &str, callmode: Option<&str>) -> bool {
+    // `all` is runall's callmode: no constructed mode yields it,
+    // since runall is refused. The arm keeps the mirrored filter
+    // complete, and the exhaustive test pins it.
+    if callmode == Some("all") {
+        return true;
+    }
+    if mode == "buildtime" {
+        return false;
+    }
+    if mode == "serveronly" && callmode != Some("local") {
+        return false;
+    }
+    if mode == "manual" && callmode != Some("manual") {
+        return false;
+    }
+    if mode != "manual" && callmode == Some("manual") {
+        return false;
+    }
+    if mode == "disabled" && callmode != Some("disabled") {
+        return false;
+    }
+    if mode != "disabled" && callmode == Some("disabled") {
+        return false;
+    }
+    if mode != "trylocal" && mode != "localonly" && callmode == Some("trylocal") {
+        return false;
+    }
+    true
+}
+
+/// Whether a service's outputs land as plain filenames in the
+/// source directory, rather than prefixed `_service:<name>:`:
+/// plain when the service's mode is `manual`, `disabled`,
+/// `trylocal`, or `localonly`, or when the run mode is `local`,
+/// `trylocal`, or `all`. The reference implementation's placement
+/// condition, verbatim. The `all` callmode is runall's: no
+/// constructed mode yields it, since runall is refused; the arm
+/// keeps the mirrored rule complete, and the exhaustive test pins
+/// it.
+fn service_plain_output(mode: &str, callmode: Option<&str>) -> bool {
+    matches!(mode, "manual" | "disabled" | "trylocal" | "localonly")
+        || matches!(callmode, Some("local") | Some("trylocal") | Some("all"))
+}
+
+/// The binary argv for one service: the distribution binary path,
+/// one `--<param> <value>` pair per parameter, and the `--outdir`.
+/// Argv elements, never a shell string: parameter values reach the
+/// binary verbatim.
+fn service_argv(service: &SelectedService, outdir: &str) -> Vec<String> {
+    let mut argv = vec![format!("/usr/lib/obs/service/{}", service.name)];
+    for param in &service.params {
+        argv.push(format!("--{}", param.name));
+        argv.push(param.value.clone());
+    }
+    argv.push("--outdir".to_string());
+    argv.push(outdir.to_string());
+    argv
+}
+
+/// The distribution packages a run installs in its container: one
+/// `obs-service-<name>` per selected service, plus `spec-cleaner`
+/// when `format_spec_file` runs and `cpio` when `obs_scm` runs
+/// (each binary shells out to it). Deduplicated and sorted, so
+/// the install argv is stable.
+fn service_packages(selected: &[SelectedService]) -> Vec<String> {
+    let mut packages: BTreeSet<String> = selected
+        .iter()
+        .map(|s| format!("obs-service-{}", s.name))
+        .collect();
+    if selected.iter().any(|s| s.name == "format_spec_file") {
+        packages.insert("spec-cleaner".to_string());
+    }
+    if selected.iter().any(|s| s.name == "obs_scm") {
+        packages.insert("cpio".to_string());
+    }
+    packages.into_iter().collect()
+}
+
+/// The host-side temporary directory for one service's outputs:
+/// a dot-directory in the source directory, named per service,
+/// process, and position in the run. The position keeps the name
+/// stable between the dry-run plan and the real run within one
+/// process: the process id in the name differs across processes.
+fn service_outdir(source_dir: &Path, service: &str, index: usize) -> PathBuf {
+    source_dir.join(service_outdir_name(service, index))
+}
+
+/// The same directory, as the container sees it (`/work` is the
+/// source directory's mount point).
+fn service_outdir_container(service: &str, index: usize) -> String {
+    format!("/work/{}", service_outdir_name(service, index))
+}
+
+fn service_outdir_name(service: &str, index: usize) -> String {
+    format!(".geectl-service-{service}-{}-{index}", std::process::id())
+}
+
+/// Move the `_service:*` and `_service_*` files aside into
+/// `.geectl-service-old` before a run, so a service that no longer
+/// generates a file leaves no stale output behind. A pre-existing
+/// stash directory fails the run: it is the previous run's leftover
+/// and the run never removes it — remove it before running services
+/// again. The run waits briefly for a concurrent run to finish
+/// removing it before failing.
+fn stash_service_files(source_dir: &Path) -> Result<Option<PathBuf>, GeectlError> {
+    // A pre-existing stash fails the run before anything moves:
+    // it is the previous run's leftover, and the run leaves it in
+    // place — remove it before running services again. Wait
+    // briefly first: a concurrent run may be removing it.
+    let stash = source_dir.join(".geectl-service-old");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while stash.exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "stale service stash {} exists; remove it before running services",
+                    stash.display()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let mut stale = Vec::new();
+    for entry in fs::read_dir(source_dir).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("cannot list source directory {}: {e}", source_dir.display()),
+        )
+    })? {
+        let entry = entry.map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot list source directory {}: {e}", source_dir.display()),
+            )
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("_service:") || name.starts_with("_service_") {
+            stale.push(entry.path());
+        }
+    }
+    if stale.is_empty() {
+        return Ok(None);
+    }
+    fs::create_dir(&stash).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("cannot create service stash {}: {e}", stash.display()),
+        )
+    })?;
+    for path in stale {
+        let name = path.file_name().unwrap_or_default().to_os_string();
+        fs::rename(&path, stash.join(name)).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot stash service file {}: {e}", path.display()),
+            )
+        })?;
+    }
+    Ok(Some(stash))
+}
+
+/// Delete a stash directory after a run, whatever the run's
+/// outcome. A failure to delete is a debug note, never a run
+/// failure: the outputs are already placed.
+fn remove_stash(stash: &Option<PathBuf>, debug: &Debug) {
+    if let Some(stash) = stash {
+        if let Err(e) = fs::remove_dir_all(stash) {
+            debug.emit(&format!(
+                "service-run: cannot remove service stash {}: {e}",
+                stash.display()
+            ));
+        }
+    }
+}
+
+/// Move a service's outputs from its outdir into the source
+/// directory: plain filenames, or prefixed `_service:<name>:`.
+/// The outdir itself is removed by the caller.
+fn place_outputs(
+    outdir: &Path,
+    source_dir: &Path,
+    service: &str,
+    plain: bool,
+) -> Result<(), GeectlError> {
+    for entry in fs::read_dir(outdir).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("cannot list service outdir {}: {e}", outdir.display()),
+        )
+    })? {
+        let entry = entry.map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot list service outdir {}: {e}", outdir.display()),
+            )
+        })?;
+        let name = entry.file_name();
+        let dest = if plain {
+            source_dir.join(&name)
+        } else {
+            source_dir.join(format!("_service:{service}:{}", name.to_string_lossy()))
+        };
+        fs::rename(entry.path(), &dest).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot place service output {}: {e}", dest.display()),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// The size of a directory tree in bytes, best-effort: unreadable
 /// entries count as 0 rather than failing the whole usage read.
 fn dir_size(dir: &Path) -> u64 {
@@ -5606,7 +6705,9 @@ exit 0
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             let past = std::time::Instant::now() - Duration::from_secs(1);
-            let err = vertical.resolve_image(&req, past).unwrap_err();
+            let err = vertical
+                .resolve_image(req.refresh_image, req.timeout_secs, past)
+                .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::BuildTimeout);
             assert!(
                 err.context.contains("already exhausted"),
@@ -5639,7 +6740,9 @@ exit 0
             let source = write_source(dir.path(), "foo.spec");
             let req = BuildRequest::new(source, "testproject", "standard", host_arch());
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
-            let err = vertical.resolve_image(&req, deadline).unwrap_err();
+            let err = vertical
+                .resolve_image(req.refresh_image, req.timeout_secs, deadline)
+                .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::BuildTimeout);
             assert!(err.context.contains("timed out"), "got: {}", err.context);
         }
@@ -6599,6 +7702,751 @@ exit 0
                         .status();
                 }
             }
+        }
+
+        /// A stub podman for service runs: image inspect and pull
+        /// as `stub_podman`, plus `run -d` (a fake container id),
+        /// `exec` (the `-w /work` prefix is skipped; zypper
+        /// succeeds; a service binary writes a canned `<name>.out`
+        /// into its `--outdir`, except `failme`, which fails;
+        /// `bash ./pre_checkin.sh` runs the real script in the
+        /// source directory; `spec-cleaner` appends a marker to
+        /// the spec), and `stop`.
+        fn stub_service_podman(dir: &Path, src: &Path) -> (PathBuf, PathBuf) {
+            let script = dir.join("podman-service-stub");
+            let call_log = dir.join("podman-service-calls.log");
+            let body = r##"#!/bin/sh
+echo "$@" >> "{CALL_LOG}"
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  case "$4" in
+    *Digest*) echo "sha256:fake-digest-1234" ;;
+    *Size*) echo "123456789" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "pull" ]; then exit 0; fi
+if [ "$1" = "run" ]; then echo "fake-container-id"; exit 0; fi
+if [ "$1" = "stop" ]; then exit 0; fi
+if [ "$1" = "exec" ]; then
+  shift 1
+  if [ "$1" = "-w" ]; then shift 2; fi
+  shift 1
+  if [ "$1" = "zypper" ]; then exit 0; fi
+  if [ "$1" = "bash" ]; then cd "{SRC}" && bash ./pre_checkin.sh; exit $?; fi
+  if [ "$1" = "spec-cleaner" ]; then
+    for last; do true; done
+    echo "# spec-cleaner ran" >> "{SRC}/$last"
+    exit 0
+  fi
+  case "$1" in
+    /usr/lib/obs/service/*)
+      name="${1#/usr/lib/obs/service/}"
+      if [ "$name" = "failme" ]; then echo "boom: service failed" >&2; exit 1; fi
+      outdir=""
+      prev=""
+      for arg in "$@"; do
+        if [ "$prev" = "--outdir" ]; then outdir="$arg"; fi
+        prev="$arg"
+      done
+      # The outdir arrives as the container path (/work/...): the
+      # stub runs on the host, so the file lands in the source
+      # directory's outdir of the same name.
+      outdir="{SRC}/$(basename "$outdir")"
+      echo "output of $name" > "$outdir/$name.out"
+      exit 0
+      ;;
+  esac
+  exit 0
+fi
+exit 0
+"##
+            .replace("{CALL_LOG}", &call_log.display().to_string())
+            .replace("{SRC}", &src.display().to_string());
+            write_script(&script, &body);
+            (script, call_log)
+        }
+
+        fn service_defs() -> Vec<ServiceDef> {
+            vec![
+                ServiceDef {
+                    name: "plain".to_string(),
+                    mode: String::new(),
+                    params: vec![],
+                },
+                ServiceDef {
+                    name: "manualsvc".to_string(),
+                    mode: "manual".to_string(),
+                    params: vec![],
+                },
+                ServiceDef {
+                    name: "disabledsvc".to_string(),
+                    mode: "disabled".to_string(),
+                    params: vec![],
+                },
+                ServiceDef {
+                    name: "trylocalsvc".to_string(),
+                    mode: "trylocal".to_string(),
+                    params: vec![],
+                },
+                ServiceDef {
+                    name: "buildtimesvc".to_string(),
+                    mode: "buildtime".to_string(),
+                    params: vec![],
+                },
+                ServiceDef {
+                    name: "serversvc".to_string(),
+                    mode: "serveronly".to_string(),
+                    params: vec![],
+                },
+            ]
+        }
+
+        #[test]
+        fn service_selected_covers_every_mode_and_callmode() {
+            // The mode filter, verified against every case it
+            // covers: eight stored modes against six callmodes.
+            // `runall` runs everything, including `buildtime`;
+            // `precommit` (trylocal) runs only `trylocal` and
+            // `localonly` — a service with no stored mode does not
+            // run there.
+            let modes = [
+                "",
+                "buildtime",
+                "serveronly",
+                "manual",
+                "disabled",
+                "trylocal",
+                "localonly",
+                "weird",
+            ];
+            let cases: &[(Option<&str>, [bool; 8])] = &[
+                (None, [true, false, false, false, false, true, true, true]),
+                (
+                    Some("local"),
+                    [true, false, true, false, false, true, true, true],
+                ),
+                (
+                    Some("manual"),
+                    [false, false, false, true, false, false, false, false],
+                ),
+                (
+                    Some("disabled"),
+                    [false, false, false, false, true, false, false, false],
+                ),
+                (
+                    Some("trylocal"),
+                    [false, false, false, false, false, true, true, false],
+                ),
+                (
+                    Some("all"),
+                    [true, true, true, true, true, true, true, true],
+                ),
+            ];
+            for (callmode, expected) in cases {
+                for (mode, want) in modes.iter().zip(expected.iter()) {
+                    assert_eq!(
+                        service_selected(mode, *callmode),
+                        *want,
+                        "mode {mode:?} under callmode {callmode:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn service_plain_output_covers_every_mode_and_callmode() {
+            // The placement rule, verified against every case it
+            // covers: plain when the stored mode is manual,
+            // disabled, trylocal, or localonly, or when the run
+            // mode is local, trylocal, or all.
+            let cases: &[(&str, Option<&str>, bool)] = &[
+                ("", None, false),
+                ("manual", None, true),
+                ("disabled", None, true),
+                ("trylocal", None, true),
+                ("localonly", None, true),
+                ("serveronly", None, false),
+                ("buildtime", None, false),
+                ("weird", None, false),
+                ("", Some("local"), true),
+                ("", Some("trylocal"), true),
+                ("", Some("all"), true),
+                ("", Some("manual"), false),
+                ("", Some("disabled"), false),
+                ("weird", Some("local"), true),
+                ("buildtime", Some("all"), true),
+            ];
+            for (mode, callmode, want) in cases {
+                assert_eq!(
+                    service_plain_output(mode, *callmode),
+                    *want,
+                    "mode {mode:?} under callmode {callmode:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn service_run_mode_names_round_trip() {
+            for mode in [
+                ServiceRunMode::Run,
+                ServiceRunMode::ManualRun,
+                ServiceRunMode::Precommit,
+                ServiceRunMode::LocalRun,
+                ServiceRunMode::DisabledRun,
+            ] {
+                assert_eq!(
+                    ServiceRunMode::from_command_name(mode.command_name()).unwrap(),
+                    mode
+                );
+            }
+            assert!(ServiceRunMode::from_command_name("runall").is_err());
+            assert!(ServiceRunMode::from_command_name("ra").is_err());
+            assert!(ServiceRunMode::from_command_name("bogus").is_err());
+        }
+
+        #[test]
+        fn service_argv_passes_params_verbatim() {
+            let service = SelectedService {
+                name: "download_url".to_string(),
+                effective_mode: String::new(),
+                params: vec![
+                    ServiceParam {
+                        name: "protocol".to_string(),
+                        value: "https".to_string(),
+                    },
+                    ServiceParam {
+                        name: "path".to_string(),
+                        value: "/a b/c?x=1&y=2".to_string(),
+                    },
+                ],
+            };
+            assert_eq!(
+                service_argv(&service, "/work/.geectl-service-download_url-1-0"),
+                vec![
+                    "/usr/lib/obs/service/download_url",
+                    "--protocol",
+                    "https",
+                    "--path",
+                    "/a b/c?x=1&y=2",
+                    "--outdir",
+                    "/work/.geectl-service-download_url-1-0",
+                ]
+            );
+        }
+
+        #[test]
+        fn service_packages_dedups_and_adds_spec_cleaner() {
+            let selected = vec![
+                SelectedService {
+                    name: "format_spec_file".to_string(),
+                    effective_mode: String::new(),
+                    params: vec![],
+                },
+                SelectedService {
+                    name: "obs_scm".to_string(),
+                    effective_mode: String::new(),
+                    params: vec![],
+                },
+                SelectedService {
+                    name: "tar_scm".to_string(),
+                    effective_mode: String::new(),
+                    params: vec![],
+                },
+                SelectedService {
+                    name: "tar_scm".to_string(),
+                    effective_mode: String::new(),
+                    params: vec![],
+                },
+            ];
+            assert_eq!(
+                service_packages(&selected),
+                vec![
+                    "cpio",
+                    "obs-service-format_spec_file",
+                    "obs-service-obs_scm",
+                    "obs-service-tar_scm",
+                    "spec-cleaner",
+                ]
+            );
+            let selected = vec![SelectedService {
+                name: "tar_scm".to_string(),
+                effective_mode: String::new(),
+                params: vec![],
+            }];
+            assert_eq!(service_packages(&selected), vec!["obs-service-tar_scm"]);
+        }
+
+        #[test]
+        fn select_services_filters_by_mode_and_forces_single() {
+            let defs = service_defs();
+            let names = |services: Vec<SelectedService>| {
+                services.into_iter().map(|s| s.name).collect::<Vec<_>>()
+            };
+            assert_eq!(
+                names(select_services(&defs, ServiceRunMode::Run, None).unwrap()),
+                vec!["plain", "trylocalsvc"]
+            );
+            assert_eq!(
+                names(select_services(&defs, ServiceRunMode::Precommit, None).unwrap()),
+                vec!["trylocalsvc"]
+            );
+            assert_eq!(
+                names(select_services(&defs, ServiceRunMode::ManualRun, None).unwrap()),
+                vec!["manualsvc"]
+            );
+            assert_eq!(
+                names(select_services(&defs, ServiceRunMode::DisabledRun, None).unwrap()),
+                vec!["disabledsvc"]
+            );
+            assert_eq!(
+                names(select_services(&defs, ServiceRunMode::LocalRun, None).unwrap()),
+                vec!["plain", "trylocalsvc", "serversvc"]
+            );
+            // A single-service run forces the run mode, keeping the
+            // stored parameters: a manual service runs under a
+            // plain `run` when named.
+            let single = select_services(&defs, ServiceRunMode::Run, Some("manualsvc")).unwrap();
+            assert_eq!(single.len(), 1);
+            assert_eq!(single[0].name, "manualsvc");
+            assert_eq!(single[0].effective_mode, "");
+            // A service the file does not define runs with no
+            // parameters and the run mode as its mode.
+            let single = select_services(&defs, ServiceRunMode::ManualRun, Some("newsvc")).unwrap();
+            assert_eq!(single.len(), 1);
+            assert_eq!(single[0].name, "newsvc");
+            assert_eq!(single[0].effective_mode, "manual");
+            assert!(single[0].params.is_empty());
+            // A short or slash-carrying name is a caller error.
+            assert!(
+                select_services(&defs, ServiceRunMode::Run, Some("ab"))
+                    .unwrap_err()
+                    .kind()
+                    == ErrorKind::InvalidInput
+            );
+            assert!(
+                select_services(&defs, ServiceRunMode::Run, Some("a/b"))
+                    .unwrap_err()
+                    .kind()
+                    == ErrorKind::InvalidInput
+            );
+        }
+
+        #[test]
+        fn read_local_services_handles_missing_malformed_and_valid() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            assert!(read_local_services(&src).unwrap().is_empty());
+            fs::write(src.join("_service"), "not a services document").unwrap();
+            let err = read_local_services(&src).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"tar_scm\"><param name=\"url\">https://example.com/r.git</param></service>\
+                <service name=\"set_version\" mode=\"buildtime\"/></services>",
+            )
+            .unwrap();
+            let defs = read_local_services(&src).unwrap();
+            assert_eq!(defs.len(), 2);
+            assert_eq!(defs[0].name, "tar_scm");
+            assert_eq!(defs[0].mode, "");
+            assert_eq!(defs[0].params.len(), 1);
+            assert_eq!(defs[0].params[0].name, "url");
+            assert_eq!(defs[0].params[0].value, "https://example.com/r.git");
+            assert_eq!(defs[1].name, "set_version");
+            assert_eq!(defs[1].mode, "buildtime");
+        }
+
+        #[test]
+        fn stash_and_place_move_files() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("_service:alpha:alpha.tar.gz"), "tarball").unwrap();
+            fs::write(src.join("_service_beta"), "old").unwrap();
+            fs::write(src.join("keep.spec"), "spec").unwrap();
+            let stash = stash_service_files(&src).unwrap().unwrap();
+            assert!(!src.join("_service:alpha:alpha.tar.gz").exists());
+            assert!(!src.join("_service_beta").exists());
+            assert!(src.join("keep.spec").exists());
+            assert!(stash.join("_service:alpha:alpha.tar.gz").exists());
+            // A second stash while one exists fails closed.
+            fs::write(src.join("_service:gamma:x"), "x").unwrap();
+            let err = stash_service_files(&src).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            remove_stash(&Some(stash), &Debug::disabled());
+            assert!(!src.join(".geectl-service-old").exists());
+            // Placement: plain filenames, or prefixed.
+            let outdir = src.join("out");
+            fs::create_dir_all(&outdir).unwrap();
+            fs::write(outdir.join("plain.txt"), "p").unwrap();
+            place_outputs(&outdir, &src, "alpha", true).unwrap();
+            assert!(src.join("plain.txt").exists());
+            fs::write(outdir.join("prefixed.txt"), "q").unwrap();
+            place_outputs(&outdir, &src, "alpha", false).unwrap();
+            assert!(src.join("_service:alpha:prefixed.txt").exists());
+        }
+
+        #[test]
+        fn service_run_end_to_end_stubbed() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"><param name=\"file\">x</param></service>\
+                <service name=\"beta\" mode=\"trylocal\"/></services>",
+            )
+            .unwrap();
+            fs::write(src.join("_service:alpha:stale"), "stale").unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.mode, "run");
+            assert!(!record.dry_run);
+            assert!(record.plan.is_none());
+            assert_eq!(
+                record.image_digest.as_deref(),
+                Some("sha256:fake-digest-1234")
+            );
+            assert_eq!(record.ran.len(), 2);
+            assert_eq!(record.ran[0].name, "alpha");
+            assert_eq!(record.ran[1].name, "beta");
+            // The plain service's output is prefixed; the trylocal
+            // service's output lands plain.
+            assert_eq!(
+                fs::read_to_string(src.join("_service:alpha:alpha.out")).unwrap(),
+                "output of alpha\n"
+            );
+            assert_eq!(
+                fs::read_to_string(src.join("beta.out")).unwrap(),
+                "output of beta\n"
+            );
+            // The stale prefixed file is gone, and no outdir or
+            // stash is left behind.
+            assert!(!src.join("_service:alpha:stale").exists());
+            assert!(fs::read_dir(&src).unwrap().flatten().all(|e| !e
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".geectl-service-")));
+            // The install ran once, for both services.
+            let calls = fs::read_to_string(&call_log).unwrap();
+            assert!(calls.contains("zypper --non-interactive install --no-recommends obs-service-alpha obs-service-beta"));
+            assert!(calls.contains("run -d --rm --name geectl-service-"));
+        }
+
+        #[test]
+        fn service_run_dry_run_touches_nothing() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            req.dry_run = true;
+            let record = vertical.service_run(&req).unwrap();
+            assert!(record.dry_run);
+            assert!(record.ran.is_empty());
+            let plan = record.plan.unwrap();
+            assert_eq!(plan.image, DEFAULT_IMAGE);
+            assert_eq!(plan.services.len(), 1);
+            assert_eq!(plan.services[0].name, "alpha");
+            assert_eq!(plan.services[0].argv[0], "/usr/lib/obs/service/alpha");
+            assert!(plan.services[0].argv.contains(&"--outdir".to_string()));
+            // No container was started and no file appeared: the
+            // call log does not exist when podman never ran.
+            assert!(!fs::read_to_string(&call_log)
+                .unwrap_or_default()
+                .contains("run -d"));
+            assert!(!src.join("_service:alpha:alpha.out").exists());
+        }
+
+        #[test]
+        fn service_run_missing_service_file_is_a_noop() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert!(record.ran.is_empty());
+            assert!(!fs::read_to_string(&call_log)
+                .unwrap_or_default()
+                .contains("run -d"));
+        }
+
+        #[test]
+        fn service_run_empty_selection_clears_stale_files() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\" mode=\"buildtime\"/></services>",
+            )
+            .unwrap();
+            fs::write(src.join("_service:alpha:old"), "stale").unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert!(record.ran.is_empty());
+            assert!(!src.join("_service:alpha:old").exists());
+            assert!(!fs::read_to_string(&call_log)
+                .unwrap_or_default()
+                .contains("run -d"));
+        }
+
+        #[test]
+        fn service_container_exec_sets_workdir_and_runner_env() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.ran.len(), 1);
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            assert!(
+                log.lines()
+                    .any(|l| l.starts_with("exec ") && l.contains("-w /work")),
+                "exec calls carry no -w /work: {log}"
+            );
+            assert!(
+                log.contains(&format!("OSC_VERSION={}", env!("CARGO_PKG_VERSION"))),
+                "container carries no runner version: {log}"
+            );
+        }
+
+        #[test]
+        fn service_run_stops_at_the_first_failure() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/><service name=\"failme\"/><service name=\"beta\"/></services>",
+            )
+            .unwrap();
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let err = vertical.service_run(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServiceFailed);
+            assert!(err.context.contains("failme"), "got: {}", err.context);
+            assert!(err.context.contains("boom"), "got: {}", err.context);
+            // The earlier service's output is placed; the later
+            // service never ran; no outdir or stash is left.
+            assert!(src.join("_service:alpha:alpha.out").exists());
+            assert!(!src.join("_service:beta:beta.out").exists());
+            assert!(!src.join("beta.out").exists());
+            assert!(fs::read_dir(&src).unwrap().flatten().all(|e| !e
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".geectl-service-")));
+        }
+
+        #[test]
+        fn service_run_single_service_runs_only_that_one() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/><service name=\"beta\"/></services>",
+            )
+            .unwrap();
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            req.service = Some("beta".to_string());
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.ran.len(), 1);
+            assert_eq!(record.ran[0].name, "beta");
+            assert!(!src.join("_service:alpha:alpha.out").exists());
+            assert!(src.join("_service:beta:beta.out").exists());
+        }
+
+        #[test]
+        fn service_run_rejects_a_zero_timeout() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            req.timeout_secs = 0;
+            let err = vertical.service_run(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn service_run_refuses_a_stale_stash() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            fs::create_dir(src.join(".geectl-service-old")).unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let err = vertical.service_run(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            // The refused run calls no podman: the call log does
+            // not exist when podman never ran.
+            assert!(!fs::read_to_string(&call_log)
+                .unwrap_or_default()
+                .contains("run -d"));
+        }
+
+        #[test]
+        fn precommit_runs_trylocal_services_and_the_script() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/><service name=\"beta\" mode=\"trylocal\"/><service name=\"gamma\" mode=\"manual\"/></services>",
+            )
+            .unwrap();
+            write_script(
+                &src.join("pre_checkin.sh"),
+                "#!/bin/sh\necho ran > pre_checkin.marker\n",
+            );
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let record = vertical.precommit(&src, 3600, false).unwrap();
+            assert!(!record.dry_run);
+            assert_eq!(record.services.ran.len(), 1);
+            assert_eq!(record.services.ran[0].name, "beta");
+            assert!(record.pre_checkin.ran);
+            assert_eq!(record.pre_checkin.exit_code, Some(0));
+            assert!(src.join("pre_checkin.marker").exists());
+            assert!(src.join("beta.out").exists());
+            assert!(!src.join("_service:alpha:alpha.out").exists());
+            assert!(!src.join("gamma.out").exists());
+        }
+
+        #[test]
+        fn precommit_without_a_script_reports_it_did_not_run() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let record = vertical.precommit(&src, 3600, false).unwrap();
+            assert!(record.services.ran.is_empty());
+            assert!(!record.pre_checkin.ran);
+            assert_eq!(record.pre_checkin.exit_code, None);
+        }
+
+        #[test]
+        fn precommit_failing_script_blocks_the_run() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            write_script(&src.join("pre_checkin.sh"), "#!/bin/sh\nexit 3\n");
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let err = vertical.precommit(&src, 3600, false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServiceFailed);
+            assert!(
+                err.context.contains("pre_checkin.sh"),
+                "got: {}",
+                err.context
+            );
+        }
+
+        #[test]
+        fn spec_cleaner_edits_the_spec_in_place_stubbed() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("foo.spec"), "Name: foo\n").unwrap();
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let result = vertical
+                .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, false)
+                .unwrap();
+            assert_eq!(result.exit_code, 0);
+            assert!(!result.dry_run);
+            assert!(result.plan.is_none());
+            assert!(fs::read_to_string(src.join("foo.spec"))
+                .unwrap()
+                .contains("# spec-cleaner ran"));
+            // A dry run returns the plan and touches nothing.
+            fs::write(src.join("foo.spec"), "Name: foo\n").unwrap();
+            let result = vertical
+                .spec_cleaner(&src, Path::new("foo.spec"), &[], 3600, true)
+                .unwrap();
+            assert!(result.dry_run);
+            assert_eq!(result.plan.as_ref().unwrap().last().unwrap(), "foo.spec");
+            assert_eq!(
+                fs::read_to_string(src.join("foo.spec")).unwrap(),
+                "Name: foo\n"
+            );
+            // A spec outside the source directory is a caller error.
+            let err = vertical
+                .spec_cleaner(&src, Path::new("/etc/passwd"), &[], 3600, false)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            // A relative spec escaping the source directory is a
+            // caller error too, not a confusing in-container failure.
+            let other = dir.path().join("other");
+            fs::create_dir_all(&other).unwrap();
+            fs::write(other.join("foo.spec"), "Name: foo\n").unwrap();
+            let err = vertical
+                .spec_cleaner(&src, Path::new("../other/foo.spec"), &[], 3600, false)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.context.contains("outside source directory"),
+                "got: {}",
+                err.context
+            );
         }
     }
 }

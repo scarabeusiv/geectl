@@ -9,6 +9,7 @@
 mod cli_branch;
 mod cli_build;
 mod cli_gitea;
+mod cli_local_build;
 mod cli_remote;
 mod cli_request;
 mod cli_service;
@@ -110,6 +111,12 @@ enum Command {
         #[command(subcommand)]
         command: cli_build::BuildCommand,
     },
+    /// Container service runs: `_service` services, the precommit
+    /// gate, and `spec-cleaner` in the podman build vertical.
+    LocalBuild {
+        #[command(subcommand)]
+        command: cli_local_build::LocalBuildCommand,
+    },
     /// Maintenance operations: maintained-instances listing and
     /// maintenance branching.
     Maintenance {
@@ -157,6 +164,9 @@ fn run(
         }
         Some(Command::Request { command }) => cli_request::run(*command, debug, cli.live)?,
         Some(Command::Build { command }) => cli_build::run_build(debug, command)?,
+        Some(Command::LocalBuild { command }) => {
+            cli_local_build::run_local_build(debug, command, cli.live)?
+        }
         Some(Command::Config { command }) => match command {
             ConfigCommand::Show => {
                 let payload = config_show_payload(format, format_source)?;

@@ -113,6 +113,7 @@ Commands:
   request      Read and act on OBS submit requests, and file new ones
   branch       Branch, copy, and link packages
   build        Build-status commands: results, logs, histories, binaries
+  local-build  Container service runs: `_service` services, the precommit gate, and `spec-cleaner` in the podman build vertical
   maintenance  Maintenance operations: maintained-instances listing and maintenance branching
   service      Service reads: list a package's services and their run state
   gitea        Gitea operations: repository and branch reads and mutations on the configured instance
@@ -373,6 +374,48 @@ Options:
       --lastbuild                The last build's results instead of the current state
       --oldstate <OLDSTATE>      Poll for changes since this state hash (from a previous run). Only `results` takes it: `wait-for-results` polls plainly, and the library strips a caller-set `oldstate` there (a held reply would outlast the read timeout), so the flag is not offered on the wait
   -h, --help                     Print help
+```
+
+## `local-build` — container service runs
+
+```
+Container service runs: `_service` services, the precommit gate, and `spec-cleaner` in the podman build vertical
+
+Usage: geectl local-build [OPTIONS] <COMMAND>
+
+Commands:
+  service-run   Run the `_service` file's services in the container, filtered by the run mode
+  precommit     The precommit gate: the `precommit`-mode service run, then `pre_checkin.sh` when the source directory carries one
+  spec-cleaner  Run `spec-cleaner` on a spec in the container
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+One leaf, the mode-filtered service run:
+
+```
+Run the `_service` file's services in the container, filtered by the run mode
+
+Usage: geectl local-build service-run [OPTIONS] <DIRECTORY>
+
+Arguments:
+  <DIRECTORY>  The source directory carrying the `_service` file
+
+Options:
+      --format <FORMAT>              Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --mode <MODE>                  The run mode: run, manualrun, precommit, localrun, disabledrun [default: run]
+      --debug                        Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --service <SERVICE>            Run only this service, with the run mode forced as its mode
+      --debug-body                   Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --timeout-secs <TIMEOUT_SECS>  Timeout in seconds for the whole run [default: 3600]
+      --live                         Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help                         Print help
 ```
 
 ## `maintenance` — maintained instances + branching

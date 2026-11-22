@@ -64,6 +64,10 @@ pub enum ErrorKind {
     BuildRootInUse,
     /// The directory is not a geectl build root (no marker file).
     NotAGeectlBuildRoot,
+    /// A source service run failed (a service binary exited
+    /// non-zero, a package install failed, or pre_checkin.sh
+    /// failed).
+    ServiceFailed,
 }
 
 impl ErrorKind {
@@ -91,6 +95,7 @@ impl ErrorKind {
             ErrorKind::CacheCorrupt => "cache_corrupt",
             ErrorKind::BuildRootInUse => "build_root_in_use",
             ErrorKind::NotAGeectlBuildRoot => "not_a_geectl_build_root",
+            ErrorKind::ServiceFailed => "service_failed",
         }
     }
 
@@ -120,6 +125,7 @@ impl ErrorKind {
             ErrorKind::CacheCorrupt => "a cached package failed its hdrmd5 check",
             ErrorKind::BuildRootInUse => "the build root is in use",
             ErrorKind::NotAGeectlBuildRoot => "the directory is not a geectl build root",
+            ErrorKind::ServiceFailed => "a source service failed",
         }
     }
 
@@ -177,6 +183,9 @@ impl ErrorKind {
             ErrorKind::NotAGeectlBuildRoot => {
                 "pass a directory created by a geectl build (it carries the marker file)"
             }
+            ErrorKind::ServiceFailed => {
+                "read the failing service's output in the run record; fix the service or its inputs and retry"
+            }
         }
     }
 
@@ -205,6 +214,7 @@ impl ErrorKind {
             ErrorKind::CacheCorrupt => 19,
             ErrorKind::BuildRootInUse => 20,
             ErrorKind::NotAGeectlBuildRoot => 21,
+            ErrorKind::ServiceFailed => 22,
         }
     }
 
@@ -232,6 +242,7 @@ impl ErrorKind {
             ErrorKind::CacheCorrupt,
             ErrorKind::BuildRootInUse,
             ErrorKind::NotAGeectlBuildRoot,
+            ErrorKind::ServiceFailed,
         ]
     }
 }
