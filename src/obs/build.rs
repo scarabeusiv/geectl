@@ -2265,6 +2265,158 @@ impl<'a> ObsClient<'a> {
         parse_buildinfo(&body)
     }
 
+    /// Rebuild package `package` in `project`/`repository`/`arch` on OBS
+    /// (`POST /build/<project>/<repository>/<arch>/<package>?cmd=rebuild`).
+    /// Requires credentials; without them the call fails loudly before
+    /// any request. In dry-run the rebuild is recorded in the plan and
+    /// nothing is rebuilt — the guard runs before the credentials
+    /// check, like `create_package`.
+    ///
+    /// An agent rebuilds a package to rerun a build that failed for a
+    /// transient reason or to pick up a changed dependency, without
+    /// touching the sources.
+    ///
+    /// Success is the `<status code="ok"/>` body; any other body is a
+    /// server error, never success.
+    pub fn rebuild_package(
+        &self,
+        project: &str,
+        repository: &str,
+        arch: &str,
+        package: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        self.build_control(
+            project,
+            repository,
+            arch,
+            package,
+            "rebuild",
+            "rebuild package",
+            dry_run,
+        )
+    }
+
+    /// Restart the build of package `package` in
+    /// `project`/`repository`/`arch` on OBS (`POST
+    /// /build/<project>/<repository>/<arch>/<package>?cmd=restartbuild`).
+    /// Requires credentials; without them the call fails loudly before
+    /// any request. In dry-run the restart is recorded in the plan and
+    /// nothing is restarted — the guard runs before the credentials
+    /// check, like `create_package`.
+    ///
+    /// An agent restarts a build that is stuck or running against
+    /// stale inputs, without touching the sources.
+    ///
+    /// Success is the `<status code="ok"/>` body; any other body is a
+    /// server error, never success.
+    pub fn restart_build(
+        &self,
+        project: &str,
+        repository: &str,
+        arch: &str,
+        package: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        self.build_control(
+            project,
+            repository,
+            arch,
+            package,
+            "restartbuild",
+            "restart the build of",
+            dry_run,
+        )
+    }
+
+    /// Abort the build of package `package` in
+    /// `project`/`repository`/`arch` on OBS (`POST
+    /// /build/<project>/<repository>/<arch>/<package>?cmd=abortbuild`).
+    /// Requires credentials; without them the call fails loudly before
+    /// any request. In dry-run the abort is recorded in the plan and
+    /// nothing is aborted — the guard runs before the credentials
+    /// check, like `create_package`.
+    ///
+    /// An agent aborts a build that is no longer wanted, for example
+    /// after superseding the request that triggered it.
+    ///
+    /// Success is the `<status code="ok"/>` body; any other body is a
+    /// server error, never success.
+    pub fn abort_build(
+        &self,
+        project: &str,
+        repository: &str,
+        arch: &str,
+        package: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        self.build_control(
+            project,
+            repository,
+            arch,
+            package,
+            "abortbuild",
+            "abort the build of",
+            dry_run,
+        )
+    }
+
+    /// Send a build-control command (`rebuild`, `restartbuild`,
+    /// `abortbuild`) for one package: `POST
+    /// /build/<project>/<repository>/<arch>/<package>?cmd=<cmd>` with
+    /// an empty body. The command is package-scoped: the build API has
+    /// no POST route for a whole repository.
+    ///
+    /// Success means the command was accepted. A rebuild queues a
+    /// rebuild event for the package; a restart or abort is accepted
+    /// even when nothing is building — the backend swallows the
+    /// "not building" failure and still answers ok — so for those
+    /// two Ok carries no build state.
+    // Seven arguments: the four build coordinates, the command and
+    // its wording, and the dry-run guard. A coordinates struct would
+    // break the library's positional convention for exactly this
+    // one op.
+    #[allow(clippy::too_many_arguments)]
+    fn build_control(
+        &self,
+        project: &str,
+        repository: &str,
+        arch: &str,
+        package: &str,
+        cmd: &str,
+        action: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        if !dry_run.allow(&format!(
+            "{action} {project}/{package} ({repository}/{arch})"
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "cannot {cmd} package {project}/{package} without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"
+                ),
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, package],
+            &[("cmd", cmd)],
+        );
+        let body = self.http.post(&url, "", &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS {cmd} response for package {project}/{package}"),
+            ))
+        }
+    }
+
     /// The build configuration for `project`/`repository`: the
     /// expanded `_buildconfig` the engine takes as `--dist`. The text
     /// passes through as-is — it is the build script's own format,
@@ -5416,5 +5568,134 @@ mod tests {
         assert!(rendered.contains("<publish>"));
         assert!(!rendered.contains("<disable"));
         assert!(!rendered.contains("<repository"));
+    }
+
+    #[test]
+    fn rebuild_package_posts_the_rebuild_command_and_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory/standard/x86_64/test-pkgA?cmd=rebuild",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .rebuild_package(
+                "test:factory",
+                "standard",
+                "x86_64",
+                "test-pkgA",
+                &DryRun::new(false)
+            )
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn restart_build_posts_the_restartbuild_command() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory/standard/x86_64/test-pkgA?cmd=restartbuild",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .restart_build(
+                "test:factory",
+                "standard",
+                "x86_64",
+                "test-pkgA",
+                &DryRun::new(false)
+            )
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn abort_build_posts_the_abortbuild_command() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory/standard/x86_64/test-pkgA?cmd=abortbuild",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .abort_build(
+                "test:factory",
+                "standard",
+                "x86_64",
+                "test-pkgA",
+                &DryRun::new(false)
+            )
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn build_control_non_ok_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory/standard/x86_64/test-pkgA?cmd=rebuild",
+            "<status code=\"error\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .rebuild_package(
+                "test:factory",
+                "standard",
+                "x86_64",
+                "test-pkgA",
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn build_control_rejects_invalid_coordinates_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .rebuild_package(
+                "bad/project",
+                "standard",
+                "x86_64",
+                "test-pkgA",
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn build_control_dry_run_records_the_plan_and_posts_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .rebuild_package("test:factory", "standard", "x86_64", "test-pkgA", &dry_run)
+            .is_ok());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: rebuild package test:factory/test-pkgA (standard/x86_64)"]
+        );
+    }
+
+    #[test]
+    fn build_control_missing_credentials_is_an_error_without_http() {
+        use crate::auth::Credentials;
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let err = client
+            .rebuild_package(
+                "test:factory",
+                "standard",
+                "x86_64",
+                "test-pkgA",
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
     }
 }
