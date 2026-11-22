@@ -40,11 +40,14 @@
 //! `live_list_files_and_packages_read_back`,
 //! `live_package_log_newest_first_and_range`,
 //! `live_revision_patch_diffs_revisions`,
+//! `live_revision_patch_rev1_missing_package_errors`,
 //! `live_meta_reads_back`,
 //! `live_search_finds_package_and_project`,
 //! `live_owners_call_succeeds`, `live_whois_reads_admin`,
 //! `live_link_target_reads_linkinfo`, and
-//! `live_project_diff_classifies`) exercise the read operations
+//! `live_project_diff_classifies`,
+//! `live_diff_packages_diffs_two_packages`, and
+//! `live_list_projects_lists_top_level_projects`) exercise the read operations
 //! the same way: create through geectl's own write operations, then
 //! read back through the new operations and assert on server state.
 //! The log and link-target tests poll for up to a minute: the history
@@ -581,15 +584,107 @@ fn live_obs_devel_project_missing_is_none() {
     let Some(base) = live_url() else {
         return;
     };
-    // A package that was never created has no devel project on the
-    // instance: the lookup must return None from the server's own
-    // directory listing, not from a fixture.
+    // A package that was never created has no devel mapping on
+    // the instance: the lookup must return None from the server's
+    // own package meta, not from a fixture. The project exists, so
+    // the 404 is about the package only.
+    let authed = live_client_authed(&base);
+    let project = create_source_branch(&authed, &live_package());
     let client = live_client(&base);
     assert_eq!(
         client
-            .devel_project("geectl-live-no-such-package")
+            .devel_project(&project, "geectl-live-no-such-package")
             .expect("devel lookup on the live instance"),
         None
+    );
+}
+
+/// `devel_project` returns the (project, package) pair from the
+/// package meta — including when the devel package differs from the
+/// queried package.
+#[test]
+fn live_devel_project_returns_pair() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let factory = create_source_branch(&authed, &package);
+    let devel = format!("geectl-tmp-devel-{}", unique_suffix());
+    authed
+        .create_project(
+            &devel,
+            "geectl live test devel",
+            "Created by the geectl live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel project on the live instance");
+    // The server refuses a devel whose package does not exist in
+    // the devel project, so the devel package is created there
+    // first.
+    authed
+        .create_package(
+            &devel,
+            &package,
+            "geectl live test devel package",
+            "Created by the geectl live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel package on the live instance");
+    authed
+        .set_devel_project(
+            &factory,
+            &package,
+            Some(&devel),
+            Some(&package),
+            &DryRun::new(false),
+        )
+        .expect("set the devel on the live instance");
+    let public = live_client(&base);
+    assert_eq!(
+        public
+            .devel_project(&factory, &package)
+            .expect("devel lookup on the live instance"),
+        Some((devel.clone(), package.clone()))
+    );
+    // A devel set without a package keeps this package's name: the
+    // setter omits the package attribute, so the read-back pair must
+    // carry the queried package name.
+    authed
+        .set_devel_project(&factory, &package, Some(&devel), None, &DryRun::new(false))
+        .expect("set the devel without a package on the live instance");
+    assert_eq!(
+        public
+            .devel_project(&factory, &package)
+            .expect("devel lookup on the live instance"),
+        Some((devel.clone(), package.clone()))
+    );
+    // A cross-package mapping: this package's devel is another
+    // package in the devel project, and the pair must carry it.
+    let devel_package = format!("{package}-devel");
+    authed
+        .create_package(
+            &devel,
+            &devel_package,
+            "geectl live test devel package",
+            "Created by the geectl live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create devel package on the live instance");
+    authed
+        .set_devel_project(
+            &factory,
+            &package,
+            Some(&devel),
+            Some(&devel_package),
+            &DryRun::new(false),
+        )
+        .expect("set the cross-package devel on the live instance");
+    assert_eq!(
+        public
+            .devel_project(&factory, &package)
+            .expect("devel lookup on the live instance"),
+        Some((devel, devel_package))
     );
 }
 
@@ -1113,6 +1208,28 @@ fn live_list_files_and_packages_read_back() {
     );
 }
 
+/// The top-level project listing holds a project created on the
+/// instance, and comes back sorted.
+#[test]
+fn live_list_projects_lists_top_level_projects() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let projects = authed
+        .list_projects()
+        .expect("list the top-level projects on the live instance");
+    assert!(
+        projects.contains(&source_project),
+        "the top-level listing must hold the created project {source_project}; got {projects:?}"
+    );
+    let mut sorted = projects.clone();
+    sorted.sort();
+    assert_eq!(projects, sorted, "the top-level listing must be sorted");
+}
+
 /// The package log comes back newest-first, and a revision range
 /// narrows it to the revisions in the range.
 #[test]
@@ -1215,6 +1332,23 @@ fn live_revision_patch_diffs_revisions() {
         first.files.is_empty(),
         "revision 1 has nothing to diff against"
     );
+}
+
+/// Revision 1 of a package that does not exist is an error, not an
+/// empty patch.
+#[test]
+fn live_revision_patch_rev1_missing_package_errors() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let public = live_client(&base);
+    let err = public
+        .revision_patch(&source_project, "geectl-live-no-such-package", 1)
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
 }
 
 /// The project and package meta read back what creation put there.
@@ -1433,6 +1567,78 @@ fn live_project_diff_classifies() {
         changed_diff.files[0].diff.contains("+Version: 1.1"),
         "the diff must add the new version; got {}",
         changed_diff.files[0].diff
+    );
+}
+
+/// `diff_packages` diffs two differently-named packages across two
+/// projects, through the public reads: a modified file and a file
+/// added on the new side.
+#[test]
+fn live_diff_packages_diffs_two_packages() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let suffix = unique_suffix();
+    let old_project = format!("geectl-tmp-diff-old-{suffix}");
+    let new_project = format!("geectl-tmp-diff-new-{suffix}");
+    for project in [&old_project, &new_project] {
+        authed
+            .create_project(
+                project,
+                "geectl live test project",
+                "Created by the geectl live test; the instance is destroyed after the run.",
+                &DryRun::new(false),
+            )
+            .expect("create a diff project on the live instance");
+    }
+    let old_package = format!("pkg-old-{suffix}");
+    let new_package = format!("pkg-new-{suffix}");
+    for (project, package, version) in [
+        (&old_project, &old_package, "1.0"),
+        (&new_project, &new_package, "1.1"),
+    ] {
+        authed
+            .create_package(
+                project,
+                package,
+                "geectl live test package",
+                "Created by the geectl live test; the instance is destroyed after the run.",
+                &DryRun::new(false),
+            )
+            .expect("create package on the live instance");
+        authed
+            .upload_file(
+                project,
+                package,
+                "pkg.spec",
+                &format!("Name: pkg\nVersion: {version}\n"),
+                &DryRun::new(false),
+            )
+            .expect("upload a spec file on the live instance");
+    }
+    authed
+        .upload_file(
+            &new_project,
+            &new_package,
+            "extra.txt",
+            "extra\n",
+            &DryRun::new(false),
+        )
+        .expect("upload an added file on the live instance");
+    let public = live_client(&base);
+    let patches = public
+        .diff_packages(&old_project, &old_package, &new_project, &new_package)
+        .expect("diff the two packages on the live instance");
+    assert_eq!(
+        patches
+            .iter()
+            .map(|file| (file.filename.as_str(), file.status))
+            .collect::<Vec<_>>(),
+        vec![
+            ("extra.txt", FilePatchStatus::Added),
+            ("pkg.spec", FilePatchStatus::Modified),
+        ]
     );
 }
 
