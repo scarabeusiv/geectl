@@ -390,7 +390,7 @@ The OBS command surface exists in the binary (PR #83): `remote`,
 The library operations behind it (`show_request`,
 `search_requests`, `cat`, `list_files`, `list_packages`,
 `package_log`, `request_diff`, `change_state`, `branch_package`,
-`build` reads, … — 193 public functions across `src/obs/`, of which
+`build` reads, … — 194 public functions across `src/obs/`, of which
 the command surface exposes a thin subset). The text renderers ride
 on that work:
 
