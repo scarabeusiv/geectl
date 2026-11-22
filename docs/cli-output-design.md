@@ -159,8 +159,8 @@ never changes stdout" — this design implements that line).
 ### Granularity: one `--debug`, no `-v` ladder
 
 One level that prints everything the channel carries. Leveled
-verbosity (`-v`, `-vv`) is preemptive complexity: no command has
-produced debug output too noisy to read whole, and a ladder would split
+verbosity (`-v`, `-vv`) is preemptive complexity: no evidence any
+command is too noisy to read whole, and a ladder would split
 the event
 catalog across levels with no rule for which event belongs where. If
 a command's debug output gets too noisy, that is a new decision with
