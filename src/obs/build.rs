@@ -15,6 +15,7 @@ use crate::xml::xml_elements;
 use crate::xml::xml_escape;
 use crate::xml::xml_unescape;
 use crate::xml::XmlDoc;
+use std::path::Path;
 
 /// The build-results matrix for a project: one entry per
 /// repository/architecture cell, plus the state hash for polling.
@@ -2698,6 +2699,38 @@ impl<'a> ObsClient<'a> {
         self.http.get_bytes(&url, &self.credentials)
     }
 
+    /// Download one built file (`filename`) for `package` in
+    /// `repository`/`arch`, streaming the body to `dest` instead of
+    /// buffering it: the byte-download counterpart of
+    /// [`ObsClient::download_binary`], without the transport's 10 MiB
+    /// body cap. Same validation and credentials; the file is created
+    /// exclusively, and a failure mid-stream leaves a partial file
+    /// for the caller to delete. Returns the bytes written.
+    pub fn download_binary_to_file(
+        &self,
+        project: &str,
+        package: &str,
+        repository: &str,
+        arch: &str,
+        filename: &str,
+        dest: &Path,
+    ) -> Result<u64, GeectlError> {
+        Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        if !valid_obs_filename(filename) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS binary filename: {filename:?}"),
+            ));
+        }
+        self.require_build_credentials()?;
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, arch, package, filename],
+            &[],
+        );
+        self.http.get_to_file(&url, &self.credentials, dest)
+    }
+
     /// The versions of one binary in `repository`/`arch`: the
     /// server-reported name (`<binary>.<suffix>`, e.g. `foo.rpm`),
     /// the RPM header md5, and the size in KiB the server reports
@@ -4818,6 +4851,62 @@ mod tests {
             .download_binary("testproject", "foo", "standard", "x86_64", "../evil")
             .is_err());
         assert!(http.get_bytes_calls().is_empty());
+    }
+
+    #[test]
+    fn download_binary_to_file_writes_the_body_to_disk() {
+        // The streamed download writes the body to the given path
+        // and returns its length; an unsafe file name is refused
+        // before any HTTP call, like `download_binary`.
+        let bytes: &[u8] = &[0xED, 0xAB, 0xEE, 0xDB, 0xFF, 0xFE];
+        let http = FakeHttp::new().with_get_to_file(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/foo-1.0-1.x86_64.rpm",
+            bytes,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "geectl-download-binary-to-file-{}.rpm",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let err = client
+            .download_binary_to_file("testproject", "foo", "standard", "x86_64", "../evil", &path)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_to_file_calls().is_empty());
+        let written = client
+            .download_binary_to_file(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                "foo-1.0-1.x86_64.rpm",
+                &path,
+            )
+            .unwrap();
+        assert_eq!(written, bytes.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.to_vec());
+        assert_eq!(
+            http.get_to_file_calls(),
+            vec![(
+                "https://api.opensuse.org/build/testproject/standard/x86_64/foo/foo-1.0-1.x86_64.rpm"
+                    .to_string(),
+                true
+            )]
+        );
+        let err = client
+            .download_binary_to_file(
+                "testproject",
+                "foo",
+                "standard",
+                "x86_64",
+                "foo-1.0-1.x86_64.rpm",
+                &path,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.to_vec());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

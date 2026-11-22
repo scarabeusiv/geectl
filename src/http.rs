@@ -29,7 +29,8 @@
 use crate::auth::{validate_basic, validate_bearer_token, AuthProvider, Credentials};
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
-use std::io::Read;
+use std::io::{Read, Write};
+use std::path::Path;
 use std::time::Duration;
 
 /// Default connect timeout: 10 seconds.
@@ -176,6 +177,31 @@ pub trait HttpClient {
         Err(GeectlError::new(
             ErrorKind::InternalError,
             "this HTTP client cannot download binary bodies",
+        ))
+    }
+    /// GET a URL and stream the response body to a file, without the
+    /// `MAX_BODY_BYTES` cap. The byte-download counterpart of
+    /// [`HttpClient::get_bytes`]: same transport guard, same retry
+    /// policy, same timeouts, no `Accept` header — but the body is
+    /// copied to disk as it arrives instead of buffered in memory,
+    /// so a file larger than the cap downloads instead of failing.
+    /// The file is created exclusively: an existing file is an
+    /// `AlreadyExists` error, not a truncation. A failure mid-stream
+    /// leaves a partial file for the caller to delete. Returns the
+    /// bytes written. A failure reading the body is a network error; a
+    /// failure writing the file is an internal error. The default
+    /// implementation refuses: a client that only reads text cannot
+    /// stream downloads. [`UreqClient`] overrides it.
+    fn get_to_file(
+        &self,
+        url: &str,
+        credentials: &Credentials,
+        path: &Path,
+    ) -> Result<u64, GeectlError> {
+        let _ = (url, credentials, path);
+        Err(GeectlError::new(
+            ErrorKind::InternalError,
+            "this HTTP client cannot stream downloads to disk",
         ))
     }
     fn post(&self, url: &str, body: &str, credentials: &Credentials)
@@ -1305,6 +1331,69 @@ impl HttpClient for UreqClient {
         })
     }
 
+    fn get_to_file(
+        &self,
+        url: &str,
+        credentials: &Credentials,
+        path: &Path,
+    ) -> Result<u64, GeectlError> {
+        self.get_with_body(url, credentials, None, false, |body| {
+            let mut file = std::fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| {
+                    let kind = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        ErrorKind::AlreadyExists
+                    } else {
+                        ErrorKind::InternalError
+                    };
+                    GeectlError::new(
+                        kind,
+                        format!("cannot create download file {}: {e}", path.display()),
+                    )
+                })?;
+            // Copy in a loop, not `io::copy`: a read failure is the
+            // network, a write failure is the disk, and the two must
+            // not share one error kind.
+            let mut reader = body.into_reader();
+            let mut buf = [0u8; 65536];
+            let mut bytes: u64 = 0;
+            loop {
+                // `io::copy` retries `Interrupted` reads internally;
+                // the manual loop must do the same, or a transient
+                // EINTR fails the whole download.
+                let n = match reader.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        return Err(GeectlError::new(
+                            ErrorKind::NetworkError,
+                            format!("cannot read download body for {}: {e}", path.display()),
+                        ));
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n]).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot write download file {}: {e}", path.display()),
+                    )
+                })?;
+                bytes += n as u64;
+            }
+            file.sync_all().map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot sync download file {}: {e}", path.display()),
+                )
+            })?;
+            Ok(bytes)
+        })
+    }
+
     fn post_json(&self, url: &str, body: &str) -> Result<String, GeectlError> {
         // Resolve credentials once: re-resolving per attempt would
         // re-read the secret source for no reason — and there is only
@@ -1621,6 +1710,48 @@ mod tests {
         let data = vec![b'a'; MAX_BODY_BYTES + 1];
         let err = read_body_bytes_capped(std::io::Cursor::new(data)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn get_to_file_streams_a_body_over_the_cap_to_disk() {
+        // A body over the cap streams to disk through `get_to_file`:
+        // the bytes land whole, and the returned count is the file's
+        // length.
+        let data = vec![b'a'; MAX_BODY_BYTES + 1];
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let (port, server) = serve_bytes_once(data.clone());
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let path =
+            std::env::temp_dir().join(format!("geectl-get-to-file-{}.rpm", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let written = client.get_to_file(&url, &Credentials::None, &path).unwrap();
+        assert_eq!(written, data.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        let _ = std::fs::remove_file(&path);
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn get_to_file_refuses_a_pre_existing_destination() {
+        // The destination is created exclusively: a pre-existing file
+        // is an `AlreadyExists` error, and its contents are left
+        // intact.
+        let data = vec![b'a'; MAX_BODY_BYTES + 1];
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let (port, server) = serve_bytes_once(data);
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let path = std::env::temp_dir().join(format!(
+            "geectl-get-to-file-exists-{}.rpm",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"existing").unwrap();
+        let err = client
+            .get_to_file(&url, &Credentials::None, &path)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+        let _ = std::fs::remove_file(&path);
+        server.join().expect("server thread");
     }
 
     #[test]
@@ -3350,12 +3481,13 @@ mod tests {
         )
         .unwrap()
         .with_debug(debug);
-        assert_eq!(client.get(&server.url()).unwrap(), "hello");
+        let url = format!("http://127.0.0.1:{}/source", server.port);
+        assert_eq!(client.get(&url).unwrap(), "hello");
         let lines = take_debug_lines(&lines);
         assert!(
             lines
                 .iter()
-                .any(|l| l == "decision: read via /test (authenticated)"),
+                .any(|l| l == "decision: read via /source (authenticated)"),
             "lines: {lines:?}"
         );
         // The fixture credential never reaches a debug line.

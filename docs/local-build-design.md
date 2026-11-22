@@ -89,9 +89,8 @@ The existing tool's invocation, from `osc` `build.py`:
   cache (`fetcher.run(bi)`), verifies every cached package by hdrmd5
   (`verify_pacs`), writes the dep list to an `rpmlist` file, then runs the
   engine. Geectl does the same preparation with its own typed calls. The
-  library transport caps response bodies at 10 MiB: a dep RPM over the cap
-  fails closed with a structured error; streaming downloads are not
-  supported yet.
+  library transport caps response bodies at 10 MiB; a dep RPM over the cap
+  streams to disk instead of failing.
 - Dep file names resolve from the buildinfo's `<bdep>` attributes:
   the scheduler sends no `binary` attribute, so the file name is computed
   locally as `name-version-release.arch.rpm` from `version`/`release`/`arch`

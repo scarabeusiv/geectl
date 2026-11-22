@@ -3,9 +3,10 @@ use super::SrPayload;
 use crate::auth::Credentials;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
-use crate::http::HttpClient;
+use crate::http::{HttpClient, MAX_BODY_BYTES};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 /// A fake HTTP client with canned responses, for fixtures. GET,
 /// POST, and DELETE are keyed separately by URL; a URL with no
@@ -26,6 +27,12 @@ pub(crate) struct FakeHttp {
     get_bearer_tokens: RefCell<Vec<(String, Option<String>)>>,
     get_bytes: RefCell<HashMap<String, Vec<u8>>>,
     get_bytes_error_sequences: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
+    get_bytes_cap_errors: RefCell<HashSet<String>>,
+    get_to_file: RefCell<HashMap<String, Vec<u8>>>,
+    get_to_file_errors: RefCell<HashMap<String, ErrorKind>>,
+    get_to_file_error_writes: RefCell<HashMap<String, Vec<u8>>>,
+    get_to_file_error_sequences: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
+    get_to_file_calls: RefCell<Vec<(String, bool)>>,
     get_bytes_calls: RefCell<Vec<(String, bool)>>,
     post_calls: RefCell<Vec<(String, String, bool)>>,
     delete_calls: RefCell<Vec<(String, bool)>>,
@@ -50,6 +57,12 @@ impl FakeHttp {
             get_bearer_tokens: RefCell::new(Vec::new()),
             get_bytes: RefCell::new(HashMap::new()),
             get_bytes_error_sequences: RefCell::new(HashMap::new()),
+            get_bytes_cap_errors: RefCell::new(HashSet::new()),
+            get_to_file: RefCell::new(HashMap::new()),
+            get_to_file_errors: RefCell::new(HashMap::new()),
+            get_to_file_error_writes: RefCell::new(HashMap::new()),
+            get_to_file_error_sequences: RefCell::new(HashMap::new()),
+            get_to_file_calls: RefCell::new(Vec::new()),
             get_bytes_calls: RefCell::new(Vec::new()),
             post_calls: RefCell::new(Vec::new()),
             delete_calls: RefCell::new(Vec::new()),
@@ -109,6 +122,63 @@ impl FakeHttp {
     /// warms it).
     pub(crate) fn with_get_bytes_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
         self.get_bytes_error_sequences
+            .borrow_mut()
+            .insert(url.to_string(), kinds.iter().copied().collect());
+        self
+    }
+
+    /// Answer byte GETs of `url` with the transport's over-cap
+    /// rejection: the response body exceeds the `MAX_BODY_BYTES`
+    /// limit. Models a body the real transport refuses, so a caller
+    /// that falls back to streaming can be tested without serving a
+    /// 10 MiB body.
+    pub(crate) fn with_get_bytes_cap_error(self, url: &str) -> Self {
+        self.get_bytes_cap_errors
+            .borrow_mut()
+            .insert(url.to_string());
+        self
+    }
+
+    /// Answer streamed downloads of `url` with `body`: the bytes the
+    /// fake writes to the destination file.
+    pub(crate) fn with_get_to_file(self, url: &str, body: &[u8]) -> Self {
+        self.get_to_file
+            .borrow_mut()
+            .insert(url.to_string(), body.to_vec());
+        self
+    }
+
+    /// Answer streamed downloads of `url` with this error after
+    /// writing `body` first: models a stream that fails mid-download,
+    /// leaving a partial file for the caller to delete. An
+    /// `AlreadyExists` error writes nothing: a server 409 never
+    /// creates the file.
+    pub(crate) fn with_get_to_file_error_after_write(
+        self,
+        url: &str,
+        body: &[u8],
+        kind: ErrorKind,
+    ) -> Self {
+        self.get_to_file_error_writes
+            .borrow_mut()
+            .insert(url.to_string(), body.to_vec());
+        self.get_to_file_errors
+            .borrow_mut()
+            .insert(url.to_string(), kind);
+        self
+    }
+
+    /// Answer the next streamed downloads of `url` with these errors,
+    /// in order; once the queue is empty the canned `get_to_file` body
+    /// answers. The streamed twin of `with_get_bytes_error_sequence`.
+    /// An `AlreadyExists` entry models a temp-name collision: the
+    /// destination is created, as if another downloader won the name
+    /// between the name allocation and this open, and the error is
+    /// returned. The caller retries with the next name and must not
+    /// delete a file it did not create. One file per entry: the queue
+    /// is popped, so a retry never recreates it.
+    pub(crate) fn with_get_to_file_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
+        self.get_to_file_error_sequences
             .borrow_mut()
             .insert(url.to_string(), kinds.iter().copied().collect());
         self
@@ -190,6 +260,10 @@ impl FakeHttp {
         self.get_bytes_calls.borrow().clone()
     }
 
+    pub(crate) fn get_to_file_calls(&self) -> Vec<(String, bool)> {
+        self.get_to_file_calls.borrow().clone()
+    }
+
     pub(crate) fn post_calls(&self) -> Vec<(String, String, bool)> {
         self.post_calls.borrow().clone()
     }
@@ -260,6 +334,12 @@ impl HttpClient for FakeHttp {
         self.get_bytes_calls
             .borrow_mut()
             .push((url.to_string(), authed));
+        if self.get_bytes_cap_errors.borrow().contains(url) {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("response body exceeds the {MAX_BODY_BYTES}-byte limit"),
+            ));
+        }
         if let Some(kind) = self
             .get_bytes_error_sequences
             .borrow_mut()
@@ -283,6 +363,110 @@ impl HttpClient for FakeHttp {
                 format!("no canned GET bytes response for {url}"),
             )
         })
+    }
+
+    fn get_to_file(
+        &self,
+        url: &str,
+        credentials: &Credentials,
+        path: &std::path::Path,
+    ) -> Result<u64, GeectlError> {
+        let authed = !matches!(credentials, Credentials::None);
+        self.get_to_file_calls
+            .borrow_mut()
+            .push((url.to_string(), authed));
+        if let Some(kind) = self
+            .get_to_file_error_sequences
+            .borrow_mut()
+            .get_mut(url)
+            .and_then(|queue| queue.pop_front())
+        {
+            if kind == ErrorKind::AlreadyExists {
+                // A temp-name collision: the destination was created
+                // by another downloader between the name allocation
+                // and this open. The file is created once, by this
+                // entry only, and left in place: the caller retries
+                // with the next name and must not delete a file it
+                // did not create.
+                let _ = std::fs::File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(path);
+            }
+            return Err(GeectlError::new(
+                kind,
+                format!("canned GET error for {url}"),
+            ));
+        }
+        if let Some(kind) = self.get_to_file_errors.borrow().get(url).cloned() {
+            // A server 409 reports `AlreadyExists` without creating
+            // the file: writing a partial first would make the caller
+            // read the error as a temp-name collision and retry,
+            // creating a fresh temp file on every attempt.
+            let partial = if kind == ErrorKind::AlreadyExists {
+                None
+            } else {
+                self.get_to_file_error_writes.borrow().get(url).cloned()
+            };
+            if let Some(partial) = partial {
+                // The partial file is created the way the real client
+                // creates it: exclusively. A pre-existing destination
+                // is an `AlreadyExists` error, not a truncation.
+                let mut file = std::fs::File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map_err(|e| {
+                        let kind = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                            ErrorKind::AlreadyExists
+                        } else {
+                            ErrorKind::InternalError
+                        };
+                        GeectlError::new(
+                            kind,
+                            format!("cannot create download file {}: {e}", path.display()),
+                        )
+                    })?;
+                std::io::Write::write_all(&mut file, &partial).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot write download file {}: {e}", path.display()),
+                    )
+                })?;
+            }
+            return Err(GeectlError::new(
+                kind,
+                format!("canned GET error for {url}"),
+            ));
+        }
+        let body = self.get_to_file.borrow().get(url).cloned().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::NetworkError,
+                format!("no canned GET bytes response for {url}"),
+            )
+        })?;
+        let mut file = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| {
+                let kind = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    ErrorKind::AlreadyExists
+                } else {
+                    ErrorKind::InternalError
+                };
+                GeectlError::new(
+                    kind,
+                    format!("cannot create download file {}: {e}", path.display()),
+                )
+            })?;
+        std::io::Write::write_all(&mut file, &body).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot write download file {}: {e}", path.display()),
+            )
+        })?;
+        Ok(body.len() as u64)
     }
 
     fn post(

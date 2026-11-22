@@ -1971,32 +1971,60 @@ impl<'a> LocalBuild<'a> {
             }
         }
         stats.pkg_misses += 1;
-        let (bytes, warmed_hdrmd5) = self.download_dep(req, dep, project, filename)?;
-        write_atomic(&path, &bytes).map_err(|e| {
-            GeectlError::new(
-                ErrorKind::InternalError,
-                format!("cannot write package cache {}: {e}", path.display()),
-            )
-        })?;
-        self.verify_hdrmd5(&path, Self::effective_hdrmd5(dep, warmed_hdrmd5.as_deref()))
-            .map_err(|e| {
-                let _ = fs::remove_file(&path);
-                GeectlError::new(
-                    ErrorKind::CacheCorrupt,
-                    format!(
-                        "cached package {filename} failed its hdrmd5 check after re-download ({}); deleted from the cache",
-                        e.context
-                    ),
-                )
-            })?;
+        match self.download_dep(req, dep, project, filename, &dir)? {
+            DownloadedDep::InMemory(bytes, warmed_hdrmd5) => {
+                write_atomic(&path, &bytes).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot write package cache {}: {e}", path.display()),
+                    )
+                })?;
+                self.verify_hdrmd5(&path, Self::effective_hdrmd5(dep, warmed_hdrmd5.as_deref()))
+                    .map_err(|e| {
+                        let _ = fs::remove_file(&path);
+                        GeectlError::new(
+                            ErrorKind::CacheCorrupt,
+                            format!(
+                                "cached package {filename} failed its hdrmd5 check after re-download ({}); deleted from the cache",
+                                e.context
+                            ),
+                        )
+                    })?;
+            }
+            DownloadedDep::Streamed(tmp, warmed_hdrmd5) => {
+                // The streamed file is verified before it lands in
+                // the cache: a corrupt stream never becomes a cached
+                // package, and the temp file is deleted on failure.
+                if let Err(e) =
+                    self.verify_hdrmd5(&tmp, Self::effective_hdrmd5(dep, warmed_hdrmd5.as_deref()))
+                {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(GeectlError::new(
+                        ErrorKind::CacheCorrupt,
+                        format!(
+                            "cached package {filename} failed its hdrmd5 check after re-download ({}); streamed download discarded",
+                            e.context
+                        ),
+                    ));
+                }
+                fs::rename(&tmp, &path).map_err(|e| {
+                    let _ = fs::remove_file(&tmp);
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot write package cache {}: {e}", path.display()),
+                    )
+                })?;
+            }
+        }
         touch(&path);
         Ok(path)
     }
 
-    /// Download one dep RPM. The transport caps bodies at 10 MiB: a
-    /// dep over the cap fails here with the cap named, not with a
-    /// truncated file. Streaming downloads are not supported yet;
-    /// this refuses rather than guessing.
+    /// Download one dep RPM. A dep over the transport's 10 MiB body
+    /// cap streams to a temp file in the cache directory instead of
+    /// failing: the bytes never sit in memory at once, and the
+    /// streamed file is verified before it lands in the cache (see
+    /// `ensure_cached`).
     /// The download URL keys on the dep's *source* package, never
     /// the binary name: a subpackage binary lives under its source
     /// package, and the binary name as the package segment 404s.
@@ -2023,7 +2051,8 @@ impl<'a> LocalBuild<'a> {
         dep: &BuildDep,
         project: &str,
         filename: &str,
-    ) -> Result<(Vec<u8>, Option<String>), GeectlError> {
+        dir: &Path,
+    ) -> Result<DownloadedDep, GeectlError> {
         let package = dep.package.as_deref().unwrap_or("_repository");
         let repo = Self::dep_repo(dep, req);
         let arch = Self::dep_arch(dep, req);
@@ -2031,8 +2060,10 @@ impl<'a> LocalBuild<'a> {
             .obs
             .download_binary(project, package, repo, arch, filename)
         {
-            Ok(bytes) => Ok((bytes, None)),
-            Err(e) if is_transport_cap_error(&e) => Err(download_cap_error(dep, filename)),
+            Ok(bytes) => Ok(DownloadedDep::InMemory(bytes, None)),
+            Err(e) if is_transport_cap_error(&e) => {
+                self.stream_dep(req, dep, project, filename, None, dir)
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 match self.obs.binary_versions(project, repo, arch, &dep.name) {
                     Ok(versions) => {
@@ -2056,13 +2087,20 @@ impl<'a> LocalBuild<'a> {
                         for name in &candidates {
                             match self.obs.download_binary(project, package, repo, arch, name) {
                                 Ok(bytes) => {
-                                    return Ok((
+                                    return Ok(DownloadedDep::InMemory(
                                         bytes,
                                         warmed.and_then(|version| version.hdrmd5.clone()),
                                     ));
                                 }
                                 Err(err) if is_transport_cap_error(&err) => {
-                                    return Err(download_cap_error(dep, filename));
+                                    return self.stream_dep(
+                                        req,
+                                        dep,
+                                        project,
+                                        name,
+                                        warmed.and_then(|version| version.hdrmd5.clone()),
+                                        dir,
+                                    );
                                 }
                                 Err(err) => last_err = Some(err),
                             }
@@ -2083,6 +2121,67 @@ impl<'a> LocalBuild<'a> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Stream one dep RPM to a temp file in the cache directory: the
+    /// over-cap fallback for `download_dep`. The temp name is
+    /// allocated by `fresh_temp_path` and created exclusively by the
+    /// download, so a name that already exists is retried with the
+    /// next name instead of deleting a file this call did not create.
+    /// A 409 from the server reports the same kind without creating
+    /// the file, so it is returned, not retried. Any other failure
+    /// deletes the temp file; on success the caller verifies it and
+    /// renames it into the cache.
+    fn stream_dep(
+        &self,
+        req: &BuildRequest,
+        dep: &BuildDep,
+        project: &str,
+        filename: &str,
+        warmed_hdrmd5: Option<String>,
+        dir: &Path,
+    ) -> Result<DownloadedDep, GeectlError> {
+        let package = dep.package.as_deref().unwrap_or("_repository");
+        let repo = Self::dep_repo(dep, req);
+        let arch = Self::dep_arch(dep, req);
+        for _ in 0..1000 {
+            let tmp = fresh_temp_path(dir).map_err(|e| {
+                let kind = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    ErrorKind::AlreadyExists
+                } else {
+                    ErrorKind::InternalError
+                };
+                GeectlError::new(
+                    kind,
+                    format!("cannot allocate a temp file in {}: {e}", dir.display()),
+                )
+            })?;
+            match self
+                .obs
+                .download_binary_to_file(project, package, repo, arch, filename, &tmp)
+            {
+                Ok(_) => return Ok(DownloadedDep::Streamed(tmp, warmed_hdrmd5)),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    // `AlreadyExists` has two sources: a temp name
+                    // that already exists (retry with the next name),
+                    // and a 409 from the server, which never created
+                    // the file (return it: retrying a 409 a thousand
+                    // times ends in a misleading exhaustion error).
+                    if tmp.exists() {
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            }
+        }
+        Err(GeectlError::new(
+            ErrorKind::AlreadyExists,
+            "no free temp file name for streamed download",
+        ))
     }
 
     /// The hdrmd5 to verify a downloaded dep against. The warmed
@@ -2246,18 +2345,6 @@ impl<'a> LocalBuild<'a> {
         }
         Ok(record)
     }
-}
-
-/// The friendly over-cap error for a dep download: the file exceeds
-/// the 10 MiB transport body limit.
-fn download_cap_error(dep: &BuildDep, filename: &str) -> GeectlError {
-    GeectlError::new(
-        ErrorKind::ServerError,
-        format!(
-            "cannot download {filename} for dependency {}: the file exceeds the 10 MiB transport body limit; streaming downloads are not supported yet",
-            dep.name
-        ),
-    )
 }
 
 /// Whether `e` is the transport's over-cap rejection: the response
@@ -2640,6 +2727,33 @@ fn which(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// What `download_dep` brought back: bytes in memory, or a file
+/// already streamed to a temp file in the cache directory (with the
+/// warmed hdrmd5, when the download went through the warm).
+#[derive(Debug)]
+enum DownloadedDep {
+    InMemory(Vec<u8>, Option<String>),
+    Streamed(PathBuf, Option<String>),
+}
+
+/// A temp file name in `parent` that does not exist yet, in the same
+/// `.geectl-tmp-<pid>-<n>` scheme `write_atomic` uses, so a streamed
+/// download lands beside its final path (an atomic rename needs the
+/// same filesystem). The name is only allocated, not created: the
+/// writer creates it exclusively.
+fn fresh_temp_path(parent: &Path) -> std::io::Result<PathBuf> {
+    for n in 0..1000 {
+        let tmp = parent.join(format!(".geectl-tmp-{}-{n}", std::process::id()));
+        if !tmp.exists() {
+            return Ok(tmp);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free temp file name",
+    ))
 }
 
 /// Write a file via temp file + atomic rename, so a half-written
@@ -3331,10 +3445,11 @@ impl<'a> LocalBuild<'a> {
 
     /// Take a project-repo-arch lock, blocking: the per-file
     /// download/write path holds it for the whole ensure (check,
-    /// download, write, verify). A download is capped at 10 MiB, so
-    /// the hold is brief; a build that waits here is waiting on
-    /// another build's download of the same project-repo-arch, not
-    /// on a build.
+    /// download, write, verify). A download is bounded by the
+    /// transport's global timeout plus verify time, so the hold is
+    /// bounded; a build that waits here is waiting on another
+    /// build's download of the same project-repo-arch, not on a
+    /// build.
     fn acquire_pkg_lock(
         &self,
         project: &str,
@@ -8188,6 +8303,144 @@ exit 0
         }
 
         #[test]
+        fn ensure_cached_streams_an_over_cap_dep_to_disk() {
+            // A dep RPM over the transport's 10 MiB body cap streams
+            // to disk instead of failing: the direct download hits
+            // the cap, the stream writes the file, the hdrmd5
+            // verifies, and the cache holds the whole file — with no
+            // temp file left behind.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(&vec![b'k'; crate::http::MAX_BODY_BYTES]);
+            let real_hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/kernel-obs-build-7.3.5-1.1.{arch}.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_cap_error(&download_url)
+                .with_get_to_file(&download_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "kernel-obs-build".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(real_hdrmd5),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let mut stats = CacheStats::default();
+            let filename = format!("kernel-obs-build-7.3.5-1.1.{arch}.rpm");
+            let path = vertical
+                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), rpm);
+            assert_eq!(stats.pkg_misses, 1);
+            assert_eq!(http.get_to_file_calls().len(), 1);
+            let cache_dir = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(arch);
+            for entry in fs::read_dir(&cache_dir).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(
+                    !name.to_string_lossy().starts_with(".geectl-tmp-"),
+                    "temp file left in the cache dir: {name:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn ensure_cached_streamed_dep_with_mismatched_warmed_hdrmd5_is_rejected() {
+            // The warm reports a digest that is not the streamed
+            // file's: the streamed file is verified before it lands
+            // in the cache, so the ensure fails `CacheCorrupt` and
+            // neither the package nor the temp file is left behind.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"big payload");
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/big-1.0-1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=big"
+            );
+            let streamed_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/big.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
+                .with_get_bytes_cap_error(&streamed_url)
+                .with_get_to_file(&streamed_url, &rpm)
+                .with_get(
+                    &warm_url,
+                    "<binaryversionlist><binary name=\"big.rpm\" hdrmd5=\"00000000000000000000000000000000\" sizek=\"10\"/></binaryversionlist>",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "big".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(DOD_PLACEHOLDER_HDRMD5.to_string()),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let mut stats = CacheStats::default();
+            let filename = format!("big-1.0-1.{arch}.rpm");
+            let err = vertical
+                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
+            let cache_dir = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(arch);
+            assert!(!cache_dir.join(&filename).exists());
+            for entry in fs::read_dir(&cache_dir).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(
+                    !name.to_string_lossy().starts_with(".geectl-tmp-"),
+                    "temp file left in the cache dir: {name:?}"
+                );
+            }
+        }
+
+        #[test]
         fn download_dep_404_warms_the_binary_and_retries_once() {
             // A direct file download 404s for a download-on-demand
             // binary nobody has asked for: the daemon fetches
@@ -8243,14 +8496,18 @@ exit 0
                 installonly: false,
                 sysroot: false,
             };
-            let (bytes, warmed) = vertical
+            let DownloadedDep::InMemory(bytes, warmed) = vertical
                 .download_dep(
                     &req,
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
                 )
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("expected an in-memory download");
+            };
             assert_eq!(bytes, b"fake glibc rpm".to_vec());
             assert_eq!(warmed.as_deref(), Some("abc"));
             assert_eq!(
@@ -8325,14 +8582,18 @@ exit 0
                 installonly: false,
                 sysroot: false,
             };
-            let (bytes, warmed) = vertical
+            let DownloadedDep::InMemory(bytes, warmed) = vertical
                 .download_dep(
                     &req,
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
                 )
-                .unwrap();
+                .unwrap()
+            else {
+                panic!("expected an in-memory download");
+            };
             assert_eq!(bytes, b"fake glibc rpm".to_vec());
             assert_eq!(warmed.as_deref(), Some("abc"));
             assert_eq!(
@@ -8410,6 +8671,7 @@ exit 0
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -8474,6 +8736,7 @@ exit 0
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -8533,10 +8796,256 @@ exit 0
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ServerError);
             assert!(http.get_calls().is_empty());
+        }
+
+        #[test]
+        fn download_dep_cap_error_streams_instead_of_refusing() {
+            // A direct download over the transport cap does not
+            // refuse: the dep streams to a temp file in the given
+            // directory, and the caller owns the temp file from there.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"streamed payload");
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_cap_error(&download_url)
+                .with_get_to_file(&download_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let downloaded = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap();
+            let DownloadedDep::Streamed(tmp, warmed) = downloaded else {
+                panic!("expected a streamed download");
+            };
+            assert_eq!(warmed, None);
+            assert!(tmp.starts_with(dir.path()));
+            assert_eq!(fs::read(&tmp).unwrap(), rpm);
+        }
+
+        #[test]
+        fn download_dep_stream_failure_deletes_the_temp_file() {
+            // The stream fails mid-download: the error propagates,
+            // and no partial temp file is left in the directory.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_cap_error(&download_url)
+                .with_get_to_file_error_after_write(
+                    &download_url,
+                    b"partial rpm",
+                    ErrorKind::NetworkError,
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let err = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NetworkError);
+            for entry in fs::read_dir(dir.path()).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(
+                    !name.to_string_lossy().starts_with(".geectl-tmp-"),
+                    "temp file left in the directory: {name:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn download_dep_stream_409_returns_without_retry() {
+            // A 409 from the server reports `AlreadyExists` without
+            // creating the file: the streamed download returns it
+            // instead of retrying with the next temp name. Retrying
+            // a 409 would end in a misleading exhaustion error, and
+            // the retry loop must not spin on an error that never
+            // created a file.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_cap_error(&download_url)
+                .with_get_to_file_error_after_write(
+                    &download_url,
+                    b"partial rpm",
+                    ErrorKind::AlreadyExists,
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let err = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+            assert_eq!(http.get_to_file_calls().len(), 1);
+            for entry in fs::read_dir(dir.path()).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(
+                    !name.to_string_lossy().starts_with(".geectl-tmp-"),
+                    "temp file left in the directory: {name:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn download_dep_stream_temp_name_collision_retries_with_the_next_name() {
+            // The first temp name is already taken by another
+            // downloader: the streamed download retries with the
+            // next name instead of failing, and leaves the file it
+            // did not create alone.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"streamed payload");
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_cap_error(&download_url)
+                .with_get_to_file_error_sequence(&download_url, &[ErrorKind::AlreadyExists])
+                .with_get_to_file(&download_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let downloaded = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap();
+            let DownloadedDep::Streamed(tmp, warmed) = downloaded else {
+                panic!("expected a streamed download");
+            };
+            assert_eq!(warmed, None);
+            assert_eq!(http.get_to_file_calls().len(), 2);
+            assert_eq!(
+                tmp.file_name().unwrap().to_string_lossy(),
+                format!(".geectl-tmp-{}-1", std::process::id())
+            );
+            assert_eq!(fs::read(&tmp).unwrap(), rpm);
+            // The collided name is still there: the retry must not
+            // delete a file it did not create.
+            let collided = dir
+                .path()
+                .join(format!(".geectl-tmp-{}-0", std::process::id()));
+            assert!(collided.exists());
         }
 
         #[test]
