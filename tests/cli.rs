@@ -1138,6 +1138,36 @@ fn remote_list_projects_with_half_set_credentials_fails_with_config_error() {
     assert_eq!(value["error"]["code"], "config_error");
 }
 
+#[test]
+fn remote_list_staging_projects_with_half_set_credentials_fails_with_config_error() {
+    // The staging read needs credentials, so it fails fast like the
+    // other credentialed reads.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "list-staging-projects", "openSUSE:Factory"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_staging_project_with_half_set_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "staging-project", "openSUSE:Factory", "A"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
 // --- unconfigured credentialed read (issue #108) ---
 //
 // With nothing configured the credentialed read goes out without

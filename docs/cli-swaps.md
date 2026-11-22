@@ -39,6 +39,8 @@ what is specific to that group.
 | `osc release [SOURCEPROJECT SOURCEPACKAGE]` | `remote release-package` | One command per library operation. `-r` is `--repository`, `-a` is `--arch`; `--target-project` / `--target-repository` / `--set-release` / `--no-delay` keep their names |
 | `osc release [SOURCEPROJECT]` | `remote release-project` | One command per library operation; same flag mapping as `release-package` |
 | `osc ls /` | `remote list-projects` | Same listing, named as a leaf under `remote` |
+| (no osc command) | `remote list-staging-projects PROJECT` | New surface: osc has no staging read (`osc staging` is not a command in this osc); the library reads `/staging/<workflow>/staging_projects` |
+| (no osc command) | `remote staging-project PROJECT NAME` | Same; the one-project read |
 
 ## `request` — submit requests (issue #73)
 

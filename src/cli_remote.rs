@@ -43,6 +43,9 @@
 //! (`name:` + `project:`) and `whois` (`login:`). `list-projects`
 //! carries no header either: the query names no project, package,
 //! or term to echo, so the table is the whole rendering.
+//! `list-staging-projects` echoes the workflow project (`project:`);
+//! `staging-project` echoes the workflow project and the staging
+//! name (`project:` + `staging:`).
 //!
 //! The group's mutations follow the
 //! CLI-wide rule: dry-run by default, the global `--live` performs
@@ -72,7 +75,8 @@ use geectl::obs::{
     AggregateOptions, CreatePackageOptions, DeleteProjectOptions, DryRun, FilePatch,
     FilePatchStatus, HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus,
     PackageMatch, PackageMeta, Person, ProjectMatch, ProjectMeta, ReleaseOptions, Repository,
-    RevisionPatch, RevisionRange, SourceFile, FACTORY_PROJECT, OBS_API_BASE,
+    RevisionPatch, RevisionRange, SourceFile, StagedRequest, StagingProject, StagingReadOptions,
+    FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -110,6 +114,32 @@ pub enum RemoteCommand {
     },
     /// List the top-level projects on the instance.
     ListProjects,
+    /// List the staging projects of a workflow project.
+    ListStagingProjects {
+        /// The workflow project the staging projects belong to.
+        project: String,
+        /// Leave out the staged, untracked, and obsolete request
+        /// lists.
+        #[arg(long)]
+        no_requests: bool,
+        /// Leave out the overall state of each staging project.
+        #[arg(long)]
+        no_status: bool,
+    },
+    /// Show one staging project of a workflow project.
+    StagingProject {
+        /// The workflow project the staging project belongs to.
+        project: String,
+        /// The staging project name.
+        name: String,
+        /// Leave out the staged, untracked, and obsolete request
+        /// lists.
+        #[arg(long)]
+        no_requests: bool,
+        /// Leave out the overall state of the staging project.
+        #[arg(long)]
+        no_status: bool,
+    },
     /// Show the commit history of a package.
     PackageLog {
         /// The project the package lives in.
@@ -530,6 +560,45 @@ pub fn run_remote(
                 "projects": projects,
             });
             Ok((payload, render_project_names(&projects)))
+        }
+        RemoteCommand::ListStagingProjects {
+            project,
+            no_requests,
+            no_status,
+        } => {
+            let options = StagingReadOptions {
+                requests: !no_requests,
+                status: !no_status,
+            };
+            let projects = client.list_staging_projects(&project, options)?;
+            let text = with_header(
+                &format!("project: {project}"),
+                render_staging_projects(&projects),
+            );
+            let payload = json!({
+                "project": project,
+                "projects": projects.iter().map(staging_project_json).collect::<Vec<_>>(),
+            });
+            Ok((payload, text))
+        }
+        RemoteCommand::StagingProject {
+            project,
+            name,
+            no_requests,
+            no_status,
+        } => {
+            let options = StagingReadOptions {
+                requests: !no_requests,
+                status: !no_status,
+            };
+            let staging = client.staging_project(&project, &name, options)?;
+            let text = with_header(
+                &format!("project: {project} staging: {name}"),
+                render_staging_projects(std::slice::from_ref(&staging)),
+            );
+            let mut payload = staging_project_json(&staging);
+            payload["project"] = json!(project);
+            Ok((payload, text))
         }
         RemoteCommand::PackageLog {
             project,
@@ -1846,6 +1915,36 @@ fn project_match_json(match_: &ProjectMatch) -> Value {
     })
 }
 
+fn staged_request_json(request: &StagedRequest) -> Value {
+    json!({
+        "id": request.id,
+        "type": request.request_type,
+        "creator": request.creator,
+        "state": request.state,
+        "package": request.package,
+        "superseded_by": request.superseded_by,
+    })
+}
+
+fn staging_project_json(project: &StagingProject) -> Value {
+    json!({
+        "name": project.name,
+        "state": project.state,
+        "staged_requests": project
+            .staged_requests
+            .as_ref()
+            .map(|requests| requests.iter().map(staged_request_json).collect::<Vec<_>>()),
+        "untracked_requests": project
+            .untracked_requests
+            .as_ref()
+            .map(|requests| requests.iter().map(staged_request_json).collect::<Vec<_>>()),
+        "obsolete_requests": project
+            .obsolete_requests
+            .as_ref()
+            .map(|requests| requests.iter().map(staged_request_json).collect::<Vec<_>>()),
+    })
+}
+
 fn project_meta_json(meta: &ProjectMeta) -> Value {
     json!({
         "name": meta.name,
@@ -2155,6 +2254,60 @@ fn render_project_matches(term: &str, matches: &[ProjectMatch]) -> String {
         })
         .collect();
     render_table(&["NAME", "TITLE"], &rows)
+}
+
+/// Render staging projects: one section per project, with the state
+/// on the name line and the staged, untracked, and obsolete request
+/// lists as tables. A list the read did not ask for is absent, never
+/// an empty table; an asked-for list with no requests reads `none`.
+fn render_staging_projects(projects: &[StagingProject]) -> String {
+    if projects.is_empty() {
+        return "no staging projects".to_string();
+    }
+    let mut sections: Vec<String> = Vec::new();
+    for project in projects {
+        let mut lines = vec![match &project.state {
+            Some(state) => format!("name: {} state: {}", project.name, state),
+            None => format!("name: {}", project.name),
+        }];
+        render_staged_requests(&mut lines, "staged", &project.staged_requests);
+        render_staged_requests(&mut lines, "untracked", &project.untracked_requests);
+        render_staged_requests(&mut lines, "obsolete", &project.obsolete_requests);
+        sections.push(lines.join("\n"));
+    }
+    sections.join("\n")
+}
+
+fn render_staged_requests(
+    lines: &mut Vec<String>,
+    label: &str,
+    requests: &Option<Vec<StagedRequest>>,
+) {
+    match requests {
+        None => {}
+        Some(requests) if requests.is_empty() => {
+            lines.push(format!("{label}: none"));
+        }
+        Some(requests) => {
+            lines.push(format!("{label}:"));
+            let rows: Vec<Vec<String>> = requests
+                .iter()
+                .map(|request| {
+                    vec![
+                        request.id.to_string(),
+                        request.request_type.clone(),
+                        request.creator.clone(),
+                        request.state.clone(),
+                        request.package.clone().unwrap_or_else(|| "-".to_string()),
+                    ]
+                })
+                .collect();
+            lines.push(render_table(
+                &["ID", "TYPE", "CREATOR", "STATE", "PACKAGE"],
+                &rows,
+            ));
+        }
+    }
 }
 
 fn render_owners(owners: &[Owner]) -> String {
@@ -3223,6 +3376,88 @@ mod tests {
         assert_eq!(lines[1], "dry_run: true");
         assert!(lines[2].starts_with("dry-run: would remove"));
         assert_eq!(lines[3], "remove repository standard from project P");
+    }
+
+    #[test]
+    fn list_staging_projects_parses_project_and_option_flags() {
+        let command = parse(&[
+            "geectl",
+            "remote",
+            "list-staging-projects",
+            "openSUSE:Factory",
+            "--no-requests",
+        ]);
+        assert!(matches!(
+            command,
+            RemoteCommand::ListStagingProjects {
+                project,
+                no_requests: true,
+                no_status: false,
+            } if project == "openSUSE:Factory"
+        ));
+    }
+
+    #[test]
+    fn staging_project_parses_project_name_and_option_flags() {
+        let command = parse(&[
+            "geectl",
+            "remote",
+            "staging-project",
+            "openSUSE:Factory",
+            "A",
+            "--no-status",
+        ]);
+        assert!(matches!(
+            command,
+            RemoteCommand::StagingProject {
+                project,
+                name,
+                no_requests: false,
+                no_status: true,
+            } if project == "openSUSE:Factory" && name == "A"
+        ));
+    }
+
+    #[test]
+    fn staging_project_json_and_text_carry_state_and_requests() {
+        let project = StagingProject {
+            name: "openSUSE:Factory:Staging:A".to_string(),
+            state: Some("acceptable".to_string()),
+            staged_requests: Some(vec![StagedRequest {
+                id: 123456,
+                request_type: "submit".to_string(),
+                creator: "alice".to_string(),
+                state: "new".to_string(),
+                package: Some("vim".to_string()),
+                superseded_by: None,
+            }]),
+            untracked_requests: Some(vec![]),
+            obsolete_requests: None,
+        };
+        let payload = staging_project_json(&project);
+        assert_eq!(payload["name"], "openSUSE:Factory:Staging:A");
+        assert_eq!(payload["state"], "acceptable");
+        assert_eq!(payload["staged_requests"][0]["id"], 123456);
+        assert_eq!(payload["untracked_requests"], json!([]));
+        assert_eq!(payload["obsolete_requests"], serde_json::Value::Null);
+        let text = render_staging_projects(std::slice::from_ref(&project));
+        for field in [
+            "openSUSE:Factory:Staging:A",
+            "acceptable",
+            "123456",
+            "submit",
+            "alice",
+            "vim",
+        ] {
+            assert!(text.contains(field), "staging text misses {field}:\n{text}");
+        }
+        assert!(text.contains("untracked: none"));
+        assert!(!text.contains("obsolete"));
+    }
+
+    #[test]
+    fn staging_projects_renders_empty_list() {
+        assert_eq!(render_staging_projects(&[]), "no staging projects");
     }
 
     #[test]
