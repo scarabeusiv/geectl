@@ -332,8 +332,8 @@ pub struct BuildRecord {
     pub plan: Option<EnginePlan>,
 }
 
-/// The result of `build-shell`: the command's exit code and its
-/// captured output as data.
+/// The result of `build-shell`: the in-container command's exit
+/// code and its captured output as data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShellResult {
     pub exit_code: i32,
@@ -3615,7 +3615,10 @@ impl<'a> LocalBuild<'a> {
 
     /// Open a shell in the build container for a built root: the
     /// engine's `--shell-cmd` path with the given commands joined by
-    /// ` && `. The root must exist and carry a marker; a missing
+    /// ` && `. The commands are shell fragments executed inside the
+    /// build container, not on the host: they are joined into one
+    /// `--shell-cmd` string and the engine runs it in the container.
+    /// The root must exist and carry a marker; a missing
     /// root is `NotAGeectlBuildRoot`. The shell is scripted only: a
     /// command array, no TTY, a bounded timeout, stdout/stderr
     /// captured as data in the result — never attached, never
@@ -5490,6 +5493,38 @@ exit 0
                 .unwrap();
             assert!(!log.truncated);
             assert_eq!(log.lines, vec!["first".to_string(), "second".to_string()]);
+        }
+
+        #[test]
+        fn build_shell_joins_commands_into_one_shell_fragment() {
+            // Two commands reach the engine as one `--shell-cmd`
+            // string joined by ` && `: a shell fragment for the
+            // container, not two host commands.
+            let dir = TempDir::new();
+            let (engine, argv_log) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            vertical.build(&req).unwrap();
+            let shell = vertical
+                .build_shell(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["echo a".to_string(), "echo b".to_string()],
+                    60,
+                )
+                .unwrap();
+            assert_eq!(shell.exit_code, 0);
+            assert!(shell.stdout.contains("shell output: echo a && echo b"));
+            let argv = fs::read_to_string(&argv_log).unwrap();
+            let shell_argv = argv.lines().last().unwrap();
+            assert!(shell_argv.contains("--shell-cmd echo a && echo b"));
         }
 
         #[test]
