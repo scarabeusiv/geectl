@@ -126,17 +126,6 @@ const DRAIN_JOIN_TIMEOUT_SECS: u64 = 2;
 /// uncapped read is asked for — a verbose build's whole log must
 /// never be read into memory twice over (see `read_log_tail`).
 const LOG_TAIL_CAP_BYTES: u64 = 4 * 1024 * 1024;
-/// How much of an RPM's head is read at a time to locate its
-/// header (bytes): the lead (96) plus both headers fit in one
-/// chunk for a normal RPM, but a real main header can be far
-/// larger (glibc's ends past 64 KiB) — so the probe grows a chunk
-/// at a time until the header is found, up to the cap below. A
-/// fixed-size probe rejects real RPMs; see `rpm_hdrmd5`.
-const RPM_HEADER_PROBE_CHUNK_BYTES: usize = 64 * 1024;
-/// The most of an RPM's head the header probe reads (bytes): a
-/// file whose header does not fit is not a well-formed RPM for
-/// this check.
-const RPM_HEADER_PROBE_CAP_BYTES: usize = 4 * 1024 * 1024;
 /// The hdrmd5 a download-on-demand binary carries in buildinfo in
 /// place of the real header digest: the file has not been fetched
 /// into the repository yet, so the pool has no real digest for it.
@@ -3245,70 +3234,60 @@ fn last_lines(log: &str, n: usize) -> Vec<&str> {
 /// what the backend puts in the buildinfo: the name is misleading,
 /// the payload is included (verified against real Tumbleweed RPMs).
 /// The file is lead (96 bytes) + signature header + header + payload.
+///
+/// The digest needs only the main-header *offset*, which the
+/// signature header's prologue declares — so the probe reads the
+/// 112-byte prologue, seeks to the main header, and streams the
+/// rest through the hasher. No header store is buffered: a real
+/// main header can be megabytes (kernel-obs-build's main-header
+/// store is 5,503,288 bytes), and a signature store can be just
+/// as large, so a probe that buffers the header up to a cap
+/// rejects real RPMs. The header length is validated against the file
+/// length instead: a file truncated inside its header still fails
+/// correctly, its digest never matching the expected hdrmd5.
 fn rpm_hdrmd5(path: &Path) -> Result<String, String> {
-    // The header offset lives in the first bytes; read only enough
-    // to find it, then stream the rest through the hasher — a
-    // planted multi-hundred-MB cache file must never be read whole.
-    // The probe grows a chunk at a time until the header is found:
-    // a real main header can be hundreds of KiB (glibc's ends past
-    // 64 KiB), so a fixed-size probe rejects real RPMs. The hash
-    // continues from where the probe stopped, so no seek is needed.
-    // A file genuinely truncated inside its header still fails
-    // correctly: its digest will not match the expected hdrmd5.
+    use std::io::{Seek, SeekFrom};
     let mut file = File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut probe: Vec<u8> = Vec::new();
-    let header_start = loop {
-        match rpm_header_start(&probe) {
-            Ok(start) => break start,
-            Err(e) => {
-                if probe.len() >= RPM_HEADER_PROBE_CAP_BYTES {
-                    // The header was not found within the probe
-                    // cap. Two parse errors are probe-length-
-                    // dependent, so they say the header exceeds
-                    // the cap instead: "truncated RPM header"
-                    // (the header extends past the bytes probed
-                    // so far, including a prologue cut off within
-                    // the last 16 bytes of the probe) and
-                    // "malformed RPM signature header (header
-                    // past end of file)" (the signature header
-                    // alone is so large the main header starts
-                    // past the probe). The other parse errors
-                    // (bad magic, malformed headers) are reported
-                    // as-is — they do not depend on how much was
-                    // probed. A file smaller than the cap that is
-                    // genuinely truncated inside its header still
-                    // fails correctly: the probe hits EOF first
-                    // and the truncated error is returned below.
-                    // Past the cap that guarantee does not hold —
-                    // the cap branch returns before EOF is ever
-                    // read — so a larger file whose header claims
-                    // past EOF gets the over-cap message instead;
-                    // the refusal is the same either way.
-                    return Err(
-                        if e == "truncated RPM header"
-                            || e == "malformed RPM signature header (header past end of file)"
-                        {
-                            format!(
-                                "RPM header exceeds the {} MiB probe cap",
-                                RPM_HEADER_PROBE_CAP_BYTES / (1024 * 1024)
-                            )
-                        } else {
-                            e
-                        },
-                    );
-                }
-                let n = (&mut file)
-                    .take(RPM_HEADER_PROBE_CHUNK_BYTES as u64)
-                    .read_to_end(&mut probe)
-                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-                if n == 0 {
-                    return Err(e);
-                }
-            }
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+        .len();
+    // The lead (96) plus the signature header's 16-byte prologue:
+    // the prologue declares the signature header's length, which
+    // is all the offset needs. A file shorter than that is not an
+    // RPM at all.
+    let mut prologue = [0u8; 112];
+    file.read_exact(&mut prologue).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            "file too short to be an RPM".to_string()
+        } else {
+            format!("cannot read {}: {e}", path.display())
         }
-    };
+    })?;
+    let header_start = rpm_header_start(&prologue, file_len)?;
+    // The main header's own prologue: its length must fit in the
+    // file, or the file is truncated inside its header.
+    let mut main_prologue = [0u8; 16];
+    file.seek(SeekFrom::Start(header_start as u64))
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    file.read_exact(&mut main_prologue).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            "truncated RPM header".to_string()
+        } else {
+            format!("cannot read {}: {e}", path.display())
+        }
+    })?;
+    let (header_len, _) =
+        rpm_header_len(&main_prologue).ok_or_else(|| "malformed RPM header".to_string())?;
+    if header_start
+        .checked_add(header_len)
+        .is_none_or(|end| end as u64 > file_len)
+    {
+        return Err("truncated RPM header".to_string());
+    }
+    file.seek(SeekFrom::Start(header_start as u64))
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut ctx = md5::Context::new();
-    ctx.consume(&probe[header_start..]);
     let mut chunk = [0u8; 8192];
     loop {
         match file.read(&mut chunk) {
@@ -3320,42 +3299,26 @@ fn rpm_hdrmd5(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", ctx.compute()))
 }
 
-/// The offset of the main header in an RPM file: lead (96 bytes) +
-/// the signature header. Lead magic `ED AB EE DB`, then the
-/// signature header (magic `8E AD E8`, 8-byte aligned). Every slice
-/// is bounds-checked: a corrupt cache file must error, never panic.
-fn rpm_header_start(bytes: &[u8]) -> Result<usize, String> {
-    if bytes.len() < 96 + 16 {
-        return Err("file too short to be an RPM".to_string());
-    }
-    if bytes[0..4] != [0xed, 0xab, 0xee, 0xdb] {
+/// The offset of the main header in an RPM file, from the lead
+/// and the signature header's prologue alone: lead magic
+/// `ED AB EE DB`, then the signature header (magic `8E AD E8`,
+/// 8-byte aligned). The signature header's store is never read —
+/// only its declared length is used — so a store of any size is
+/// fine. `file_len` is the file's length: the main header must
+/// start inside the file. Every slice is bounds-checked: a corrupt
+/// cache file must error, never panic.
+fn rpm_header_start(prologue: &[u8; 112], file_len: u64) -> Result<usize, String> {
+    if prologue[0..4] != [0xed, 0xab, 0xee, 0xdb] {
         return Err("not an RPM file (bad lead magic)".to_string());
     }
     let sig_start = 96;
-    let (sig_len, _) = rpm_header_len(&bytes[sig_start..])
+    let (sig_len, _) = rpm_header_len(&prologue[sig_start..])
         .ok_or_else(|| "malformed RPM signature header".to_string())?;
     let header_start = sig_start
         .checked_add(sig_len)
         .ok_or_else(|| "malformed RPM signature header (size overflows)".to_string())?;
-    if header_start > bytes.len() {
+    if header_start as u64 > file_len {
         return Err("malformed RPM signature header (header past end of file)".to_string());
-    }
-    // Fewer than 16 bytes left means the main header's prologue
-    // is cut off — by the probe cap as well as by EOF — so this
-    // is a truncation, not a malformation: the cap branch above
-    // relabels it as over-cap, and a genuinely short file still
-    // says truncated. A bad magic with a full prologue present
-    // stays "malformed RPM header".
-    if bytes.len() - header_start < 16 {
-        return Err("truncated RPM header".to_string());
-    }
-    let (header_len, _) =
-        rpm_header_len(&bytes[header_start..]).ok_or_else(|| "malformed RPM header".to_string())?;
-    if header_start
-        .checked_add(header_len)
-        .is_none_or(|end| end > bytes.len())
-    {
-        return Err("truncated RPM header".to_string());
     }
     Ok(header_start)
 }
@@ -5924,7 +5887,7 @@ mod tests {
         let dir = TempDir::new();
         let payload = vec![0xabu8; 200 * 1024];
         let bytes = make_rpm(&payload);
-        assert!(bytes.len() > RPM_HEADER_PROBE_CHUNK_BYTES);
+        assert!(bytes.len() > 64 * 1024);
         let path = dir.path().join("big-1.0-1.x86_64.rpm");
         fs::write(&path, &bytes).unwrap();
         let expected = format!("{:x}", md5::compute(&bytes[112..]));
@@ -6026,56 +5989,68 @@ mod tests {
         let dir = TempDir::new();
         let path = dir.path().join("not-an-rpm.rpm");
         fs::write(&path, b"hello").unwrap();
-        assert!(rpm_hdrmd5(&path).is_err());
+        let err = rpm_hdrmd5(&path).unwrap_err();
+        assert!(err.contains("file too short to be an RPM"), "got: {err}");
         let mut bytes = vec![0u8; 96];
         bytes[0..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
         fs::write(&path, &bytes).unwrap();
-        assert!(rpm_hdrmd5(&path).is_err());
+        let err = rpm_hdrmd5(&path).unwrap_err();
+        assert!(err.contains("file too short to be an RPM"), "got: {err}");
+        // A full prologue with bad lead magic names the magic,
+        // not the length.
+        let bytes = vec![0u8; 112];
+        fs::write(&path, &bytes).unwrap();
+        let err = rpm_hdrmd5(&path).unwrap_err();
+        assert!(
+            err.contains("not an RPM file (bad lead magic)"),
+            "got: {err}"
+        );
     }
 
     #[test]
-    fn rpm_hdrmd5_names_an_over_cap_header_instead_of_truncated() {
-        // A main header larger than the probe cap is not a
-        // "truncated RPM header": the file is not truncated, the
-        // header merely exceeds the cap. The diagnosis is distinct;
-        // the refusal is the same.
+    fn rpm_hdrmd5_accepts_a_main_header_past_four_mib() {
+        // The fixture carries a 5,503,288 byte main-header store,
+        // the size measured from kernel-obs-build-7.3.5-1.1.x86_64.rpm,
+        // so its header ends at offset 5,503,416 — past the old 4 MiB
+        // probe cap, which refused it as "RPM header exceeds the probe
+        // cap" and failed the e2e build. The offset comes from the
+        // signature prologue and the length is checked against the
+        // file length, so no header store is buffered and the digest
+        // covers it.
         let dir = TempDir::new();
-        let bytes = make_rpm_with_header_store(RPM_HEADER_PROBE_CAP_BYTES + 1024, b"payload");
+        let bytes = make_rpm_with_header_store(5_503_288, b"payload");
         let path = dir.path().join("huge-header-1.0-1.x86_64.rpm");
         fs::write(&path, &bytes).unwrap();
-        let err = rpm_hdrmd5(&path).unwrap_err();
-        assert!(err.contains("probe cap"), "got: {err}");
-        assert!(!err.contains("truncated"), "got: {err}");
-        // And a file genuinely truncated inside its header
-        // still says truncated: same header shape, cut short
-        // of its end, well under the cap.
+        let expected = format!("{:x}", md5::compute(&bytes[112..]));
+        assert_eq!(rpm_hdrmd5(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn rpm_hdrmd5_accepts_a_signature_header_past_four_mib() {
+        // A signature store past the old 4 MiB cap: the main header
+        // starts past it, but the offset comes from the signature
+        // prologue, so the store is never read.
+        let dir = TempDir::new();
+        let bytes = make_rpm_with_sig_store(5 * 1024 * 1024, b"payload");
+        let path = dir.path().join("huge-sig-header-1.0-1.x86_64.rpm");
+        fs::write(&path, &bytes).unwrap();
+        // 96 lead + 16 signature prologue + 5 MiB store.
+        let header_start = 96 + 16 + 5 * 1024 * 1024;
+        let expected = format!("{:x}", md5::compute(&bytes[header_start..]));
+        assert_eq!(rpm_hdrmd5(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn rpm_hdrmd5_still_rejects_a_truncated_header() {
+        // A file genuinely truncated inside its header still says
+        // truncated: same header shape, cut short of its end.
+        let dir = TempDir::new();
         let mut short = make_rpm_with_header_store(1000, b"payload");
         short.truncate(500);
         let path = dir.path().join("short-header-1.0-1.x86_64.rpm");
         fs::write(&path, &short).unwrap();
         let err = rpm_hdrmd5(&path).unwrap_err();
         assert!(err.contains("truncated"), "got: {err}");
-        // And a signature header alone larger than the cap says
-        // over-cap too: the main header starts past the probe, so
-        // the "header past end of file" diagnosis is an artifact
-        // of the cap, not of the file.
-        let bytes = make_rpm_with_sig_store(RPM_HEADER_PROBE_CAP_BYTES, b"payload");
-        let path = dir.path().join("huge-sig-header-1.0-1.x86_64.rpm");
-        fs::write(&path, &bytes).unwrap();
-        let err = rpm_hdrmd5(&path).unwrap_err();
-        assert!(err.contains("probe cap"), "got: {err}");
-        assert!(!err.contains("truncated"), "got: {err}");
-        // And a main header starting within the last 16 bytes of
-        // the probe: its prologue is cut off by the cap, so the
-        // "malformed RPM header" diagnosis is a cap artifact too.
-        // The store puts the main header 8 bytes before the cap.
-        let bytes = make_rpm_with_sig_store(RPM_HEADER_PROBE_CAP_BYTES - 120, b"payload");
-        let path = dir.path().join("header-at-cap-edge-1.0-1.x86_64.rpm");
-        fs::write(&path, &bytes).unwrap();
-        let err = rpm_hdrmd5(&path).unwrap_err();
-        assert!(err.contains("probe cap"), "got: {err}");
-        assert!(!err.contains("truncated"), "got: {err}");
-        assert!(!err.contains("malformed"), "got: {err}");
     }
 
     #[test]
