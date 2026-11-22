@@ -674,6 +674,7 @@ fn remote_help_lists_every_command() {
         "undelete-project",
         "aggregate-package",
         "release-package",
+        "release-project",
         "list-projects",
     ] {
         assert!(
@@ -1522,6 +1523,49 @@ fn remote_release_package_dry_run_ignores_half_set_credentials() {
     assert_eq!(value["dry_run"], true);
     assert_eq!(value["project"], "home:alice");
     assert_eq!(value["package"], "vim");
+    assert_eq!(value["repository"], "standard");
+    assert_eq!(value["architecture"], "x86_64");
+    assert_eq!(value["target_project"], "openSUSE:Factory");
+    assert_eq!(value["target_repository"], "standard");
+    assert_eq!(value["set_release"], "1.0");
+    assert_eq!(value["no_delay"], true);
+}
+
+#[test]
+fn remote_release_project_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "release-project",
+            "home:alice",
+            "--repository",
+            "standard",
+            "--arch",
+            "x86_64",
+            "--target-project",
+            "openSUSE:Factory",
+            "--target-repository",
+            "standard",
+            "--set-release",
+            "1.0",
+            "--no-delay",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "home:alice");
     assert_eq!(value["repository"], "standard");
     assert_eq!(value["architecture"], "x86_64");
     assert_eq!(value["target_project"], "openSUSE:Factory");
