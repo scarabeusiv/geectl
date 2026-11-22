@@ -364,6 +364,105 @@ impl GiteaPullRequestState {
     }
 }
 
+/// A Gitea access level a caller grants: read, write, or admin.
+/// The request-side permission — only these three are grantable.
+/// The server reports two more (`owner`, `none`) that no grant
+/// names, so they live on the response side
+/// ([`GiteaAccessMode`]) only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GiteaAccess {
+    Read,
+    Write,
+    Admin,
+}
+
+impl GiteaAccess {
+    /// The wire string for this level, for dry-run plans and
+    /// error messages.
+    fn as_str(self) -> &'static str {
+        match self {
+            GiteaAccess::Read => "read",
+            GiteaAccess::Write => "write",
+            GiteaAccess::Admin => "admin",
+        }
+    }
+}
+
+/// The access mode the server reports for a collaborator or a
+/// team: the three grantable levels, plus `owner` (the repo or
+/// org owner) and `none` (no access), plus any mode a newer
+/// server reports, kept verbatim instead of failing the parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GiteaAccessMode {
+    None,
+    Read,
+    Write,
+    Admin,
+    Owner,
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for GiteaAccessMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "none" => GiteaAccessMode::None,
+            "read" => GiteaAccessMode::Read,
+            "write" => GiteaAccessMode::Write,
+            "admin" => GiteaAccessMode::Admin,
+            "owner" => GiteaAccessMode::Owner,
+            other => GiteaAccessMode::Unknown(other.to_string()),
+        })
+    }
+}
+
+impl GiteaAccessMode {
+    /// Whether this reported mode grants at least the requested
+    /// level: the modes order none < read < write < admin <
+    /// owner, and a mode a newer server reports cannot be
+    /// ordered, so it grants nothing.
+    fn grants_at_least(&self, level: GiteaAccess) -> bool {
+        let rank = match self {
+            GiteaAccessMode::None => 0,
+            GiteaAccessMode::Read => 1,
+            GiteaAccessMode::Write => 2,
+            GiteaAccessMode::Admin => 3,
+            GiteaAccessMode::Owner => 4,
+            GiteaAccessMode::Unknown(_) => -1,
+        };
+        let want = match level {
+            GiteaAccess::Read => 1,
+            GiteaAccess::Write => 2,
+            GiteaAccess::Admin => 3,
+        };
+        rank >= want
+    }
+}
+
+/// A collaborator's permission on a repository, as the server
+/// reports it: the access mode, the role name, and the user.
+/// Only the fields the permission read needs are modelled.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaCollaboratorPermission {
+    /// The access mode the user holds on the repository.
+    pub permission: GiteaAccessMode,
+    /// The role name the server reports for the permission.
+    #[serde(default)]
+    pub role_name: String,
+    /// The user the permission belongs to.
+    pub user: GiteaOwner,
+}
+
+/// The body of `PUT /api/v1/repos/{owner}/{repo}/collaborators/{user}`:
+/// the access level to grant.
+#[derive(Debug, Serialize)]
+struct AddCollaboratorRequest {
+    permission: GiteaAccess,
+}
 /// Options for `repo_create`: the repo is public and takes the
 /// server's default branch unless told otherwise.
 #[derive(Debug, Clone, Default)]
@@ -941,6 +1040,204 @@ impl<'a> GiteaClient<'a> {
             ));
         }
         Ok(Some(created))
+    }
+
+    /// List a repository's collaborators (`GET
+    /// /api/v1/repos/{owner}/{repo}/collaborators`): the users
+    /// with access to the repo. Paginates internally and is
+    /// bounded like `repo_list`. The entries carry logins only —
+    /// the access level of each collaborator comes from
+    /// `collaborator_permission`, not from this list.
+    pub fn collaborator_list(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<GiteaOwner>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        self.list_paged::<GiteaOwner>(
+            &["api", "v1", "repos", owner, repo, "collaborators"],
+            &[],
+            &format!("collaborators of {owner}/{repo}"),
+            "the list is bounded at 500 entries",
+        )
+    }
+
+    /// Read one collaborator's permission (`GET
+    /// /api/v1/repos/{owner}/{repo}/collaborators/{user}/permission`):
+    /// the access mode the user holds on the repo. This is the
+    /// effective access, not membership: a user who is not a
+    /// collaborator still reads — `read` on a public repository,
+    /// `none` on a private one — so it cannot tell whether the
+    /// user is a collaborator at all.
+    pub fn collaborator_permission(
+        &self,
+        owner: &str,
+        repo: &str,
+        user: &str,
+    ) -> Result<GiteaCollaboratorPermission, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_gitea_name(user, "collaborator")?;
+        let url = build_url(
+            &self.base,
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "collaborators",
+                user,
+                "permission",
+            ],
+            &[],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_collaborator_permission(&body, owner, repo, user)
+    }
+
+    /// Whether a user is a collaborator on a repository (`GET
+    /// /api/v1/repos/{owner}/{repo}/collaborators/{user}`): 204
+    /// when they are, 404 when they are not. The permission read
+    /// cannot answer this: it reports the effective access, which
+    /// reads even for a non-collaborator.
+    pub fn collaborator_is_collaborator(
+        &self,
+        owner: &str,
+        repo: &str,
+        user: &str,
+    ) -> Result<bool, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_gitea_name(user, "collaborator")?;
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "repos", owner, repo, "collaborators", user],
+            &[],
+        );
+        match self.http.get_with(&url, &self.credentials) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Add a collaborator (`PUT
+    /// /api/v1/repos/{owner}/{repo}/collaborators/{user}`) with
+    /// the given access level, and return the permission the
+    /// server reports afterwards. The PUT answers 204 with no
+    /// body, so the grant is verified by re-reading the
+    /// permission — like the fork re-reads the fork — and a
+    /// server that records less than asked for fails here instead
+    /// of reporting success. Access is hierarchical: a user who
+    /// already holds more (an org owner reads back `owner`)
+    /// satisfies the grant, and the returned permission says so.
+    /// DryRun-guarded like `repo_create`: the guard runs before
+    /// any server read, and the result is `None` in dry-run.
+    /// `force` is the confirmation for an admin grant: without
+    /// it an admin grant is refused client-side (`InvalidInput`
+    /// naming force) before any server read. A dry-run plan
+    /// needs no force.
+    pub fn collaborator_add(
+        &self,
+        owner: &str,
+        repo: &str,
+        user: &str,
+        permission: GiteaAccess,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaCollaboratorPermission>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_gitea_name(user, "collaborator")?;
+        if !dry_run.allow(&format!(
+            "add collaborator {user} to {owner}/{repo} with {} access",
+            permission.as_str()
+        )) {
+            return Ok(None);
+        }
+        if permission == GiteaAccess::Admin && !force {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to add collaborator {user} to {owner}/{repo} with admin access without force: granting admin access is a privilege grant; pass force to confirm"
+                ),
+            ));
+        }
+        let request = AddCollaboratorRequest { permission };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea collaborator-add request: {err}"),
+            )
+        })?;
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "repos", owner, repo, "collaborators", user],
+            &[],
+        );
+        self.http.put_json_with(&url, &body, &self.credentials)?;
+        let granted = self.collaborator_permission(owner, repo, user)?;
+        if !granted.permission.grants_at_least(permission) {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea collaborator permission for {user} on {owner}/{repo}: the server granted {:?}, not {} access or more",
+                    granted.permission,
+                    permission.as_str()
+                ),
+            ));
+        }
+        Ok(Some(granted))
+    }
+
+    /// Remove a collaborator (`DELETE
+    /// /api/v1/repos/{owner}/{repo}/collaborators/{user}`) and
+    /// return the removed login. Membership is read first: a
+    /// user who is not a collaborator answers 404 there, so the
+    /// remove refuses with `NotFound` naming the user before any
+    /// delete runs — like `repo_delete` reads the repo first. The
+    /// permission read cannot be the pre-check: it reports the
+    /// effective access, which reads even for a non-collaborator.
+    /// `force` is the confirmation: without it the remove is
+    /// refused client-side (`InvalidInput` naming force) before
+    /// any server read. A dry-run plan needs no force.
+    pub fn collaborator_remove(
+        &self,
+        owner: &str,
+        repo: &str,
+        user: &str,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<Option<String>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_gitea_name(user, "collaborator")?;
+        if !dry_run.allow(&format!("remove collaborator {user} from {owner}/{repo}")) {
+            return Ok(None);
+        }
+        if !force {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to remove collaborator {user} from {owner}/{repo} without force: removing access is destructive; pass force to confirm"
+                ),
+            ));
+        }
+        if !self.collaborator_is_collaborator(owner, repo, user)? {
+            return Err(GeectlError::new(
+                ErrorKind::NotFound,
+                format!("collaborator {user} not found on {owner}/{repo}"),
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "repos", owner, repo, "collaborators", user],
+            &[],
+        );
+        self.http.delete(&url, &self.credentials)?;
+        Ok(Some(user.to_string()))
     }
 
     /// List a repository's branches (`GET
@@ -1610,6 +1907,43 @@ fn parse_pull_request(
             format!(
                 "unexpected Gitea pull-request response for {owner}/{repo}#{number}: the server answered for pull request {}",
                 parsed.number
+            ),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Parse a collaborator permission out of a response body. A body
+/// that is not a permission is a server error naming the user and
+/// the repo, never a silent empty value — the caller asked for
+/// this user's permission. A body that names another user is a
+/// server error too: the callers (the add verification, the
+/// remove pre-read) treat the read as the requested user, so a
+/// response for another user must fail here instead of being
+/// verified or deleted as the requested one. Gitea logins are
+/// case-insensitive, so the comparison canonicalizes case on
+/// both sides.
+fn parse_collaborator_permission(
+    body: &str,
+    owner: &str,
+    repo: &str,
+    user: &str,
+) -> Result<GiteaCollaboratorPermission, GeectlError> {
+    let parsed: GiteaCollaboratorPermission =
+        serde_json::from_str(body).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea collaborator permission response for {user} on {owner}/{repo}: {err}"
+                ),
+            )
+        })?;
+    if !parsed.user.login.eq_ignore_ascii_case(user) {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected Gitea collaborator permission response for {user} on {owner}/{repo}: the server answered for {}",
+                parsed.user.login
             ),
         ));
     }
@@ -4497,5 +4831,353 @@ mod tests {
             "attempt lines: {:?}",
             lines.lock().unwrap().clone()
         );
+    }
+
+    /// A collaborator-permission JSON body, shaped like Gitea
+    /// 1.24.7 answers: the mode, the role name, and the user,
+    /// with an unknown field to prove it is ignored.
+    fn collaborator_permission_json(user: &str, permission: &str) -> String {
+        let role = match permission {
+            "read" => "Read",
+            "write" => "Write",
+            "admin" => "Admin",
+            "owner" => "Owner",
+            _ => "Read",
+        };
+        format!(
+            r#"{{"permission": "{permission}", "role_name": "{role}", "user": {{"login": "{user}", "future_field": 1}}, "future_field": "tolerated"}}"#
+        )
+    }
+
+    /// A collaborator-list JSON body out of login names.
+    fn collaborator_list_json(users: &[&str]) -> String {
+        let entries: Vec<String> = users
+            .iter()
+            .map(|user| format!(r#"{{"login": "{user}", "future_field": 1}}"#))
+            .collect();
+        format!("[{}]", entries.join(","))
+    }
+
+    #[test]
+    fn collaborator_list_returns_the_collaborators() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators?page=1&limit=50",
+            &collaborator_list_json(&["fbui", "lbsobolewski"]),
+        );
+        let users = client(&http).collaborator_list("pool", "systemd").unwrap();
+        assert_eq!(
+            users.iter().map(|u| u.login.as_str()).collect::<Vec<_>>(),
+            vec!["fbui", "lbsobolewski"]
+        );
+    }
+
+    #[test]
+    fn collaborator_list_empty_list_is_empty() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators?page=1&limit=50",
+            "null",
+        );
+        let users = client(&http).collaborator_list("pool", "systemd").unwrap();
+        assert!(users.is_empty());
+    }
+
+    #[test]
+    fn collaborator_permission_parses_the_mode() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui/permission",
+            &collaborator_permission_json("fbui", "write"),
+        );
+        let permission = client(&http)
+            .collaborator_permission("pool", "systemd", "fbui")
+            .unwrap();
+        assert_eq!(permission.permission, GiteaAccessMode::Write);
+        assert_eq!(permission.user.login, "fbui");
+    }
+
+    #[test]
+    fn collaborator_permission_for_another_user_is_a_server_error() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui/permission",
+            &collaborator_permission_json("lbsobolewski", "write"),
+        );
+        let err = client(&http)
+            .collaborator_permission("pool", "systemd", "fbui")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn collaborator_is_collaborator_reports_membership() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui",
+            "",
+        );
+        assert!(client(&http)
+            .collaborator_is_collaborator("pool", "systemd", "fbui")
+            .unwrap());
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui",
+            ErrorKind::NotFound,
+        );
+        assert!(!client(&http)
+            .collaborator_is_collaborator("pool", "systemd", "fbui")
+            .unwrap());
+    }
+
+    #[test]
+    fn collaborator_add_puts_the_permission_and_verifies_it() {
+        let http = FakeHttp::new()
+            .with_put(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui",
+                "",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui/permission",
+                &collaborator_permission_json("fbui", "write"),
+            );
+        let granted = client(&http)
+            .collaborator_add(
+                "pool",
+                "systemd",
+                "fbui",
+                GiteaAccess::Write,
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run add returns the permission");
+        assert_eq!(granted.permission, GiteaAccessMode::Write);
+        assert_eq!(
+            http.put_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui".to_string(),
+                r#"{"permission":"write"}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn collaborator_add_more_access_than_asked_satisfies_the_grant() {
+        // An org owner reads back `owner` for any grant: the
+        // grant holds, and the returned permission says so.
+        let http = FakeHttp::new()
+            .with_put(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui",
+                "",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui/permission",
+                &collaborator_permission_json("fbui", "owner"),
+            );
+        let granted = client(&http)
+            .collaborator_add(
+                "pool",
+                "systemd",
+                "fbui",
+                GiteaAccess::Write,
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run add returns the permission");
+        assert_eq!(granted.permission, GiteaAccessMode::Owner);
+    }
+
+    #[test]
+    fn collaborator_add_less_than_asked_is_a_server_error() {
+        let http = FakeHttp::new()
+            .with_put(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui",
+                "",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui/permission",
+                &collaborator_permission_json("fbui", "read"),
+            );
+        let err = client(&http)
+            .collaborator_add(
+                "pool",
+                "systemd",
+                "fbui",
+                GiteaAccess::Write,
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn collaborator_add_dry_run_plans_and_puts_nothing() {
+        let http = FakeHttp::new();
+        let planned = client(&http)
+            .collaborator_add(
+                "pool",
+                "systemd",
+                "fbui",
+                GiteaAccess::Write,
+                false,
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert!(planned.is_none());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn collaborator_add_admin_refuses_without_force() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .collaborator_add(
+                "pool",
+                "systemd",
+                "fbui",
+                GiteaAccess::Admin,
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn collaborator_add_admin_with_force_puts_the_permission() {
+        let http = FakeHttp::new()
+            .with_put(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui",
+                "",
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui/permission",
+                &collaborator_permission_json("fbui", "admin"),
+            );
+        let granted = client(&http)
+            .collaborator_add(
+                "pool",
+                "systemd",
+                "fbui",
+                GiteaAccess::Admin,
+                true,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run admin add returns the permission");
+        assert_eq!(granted.permission, GiteaAccessMode::Admin);
+    }
+
+    #[test]
+    fn collaborator_add_admin_dry_run_plans_and_puts_nothing() {
+        let http = FakeHttp::new();
+        let planned = client(&http)
+            .collaborator_add(
+                "pool",
+                "systemd",
+                "fbui",
+                GiteaAccess::Admin,
+                false,
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert!(planned.is_none());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn collaborator_add_refuses_an_invalid_user_name() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .collaborator_add(
+                "pool",
+                "systemd",
+                "has space",
+                GiteaAccess::Write,
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn collaborator_remove_dry_run_plans_and_deletes_nothing() {
+        let http = FakeHttp::new();
+        let dry_run = DryRun::new(true);
+        // Planning a remove needs no force: the refusal guards the
+        // live remove, not the plan.
+        let result = client(&http)
+            .collaborator_remove("pool", "systemd", "fbui", false, &dry_run)
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: remove collaborator fbui from pool/systemd".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn collaborator_remove_refuses_an_invalid_repo_name() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .collaborator_remove("pool", "has space", "fbui", true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn collaborator_remove_reads_then_deletes() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui",
+                "",
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui",
+                "",
+            );
+        let removed = client(&http)
+            .collaborator_remove("pool", "systemd", "fbui", true, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run remove returns the login");
+        assert_eq!(removed, "fbui");
+        assert_eq!(
+            http.delete_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn collaborator_remove_refuses_without_force() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .collaborator_remove("pool", "systemd", "fbui", false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.delete_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn collaborator_remove_missing_collaborator_is_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/collaborators/fbui",
+            ErrorKind::NotFound,
+        );
+        let err = client(&http)
+            .collaborator_remove("pool", "systemd", "fbui", true, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(http.delete_calls().is_empty());
     }
 }
