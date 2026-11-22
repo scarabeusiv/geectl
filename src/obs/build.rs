@@ -1574,7 +1574,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
 /// `<arch>` per architecture, and one `<path>` per rebuild source.
 /// Values are escaped, so a value carrying XML syntax cannot break
 /// out of the element.
-fn repository_element(repository: &Repository) -> String {
+pub(crate) fn repository_element(repository: &Repository) -> String {
     let mut out = String::new();
     out.push_str("<repository name=\"");
     out.push_str(&xml_escape(&repository.name));
@@ -1601,7 +1601,7 @@ fn repository_element(repository: &Repository) -> String {
 /// add`, which requires `--arch` and `--path`. A repository with no
 /// path builds against nothing, so it is not addable through this
 /// operation.
-fn validate_repository(repository: &Repository) -> Result<(), GeectlError> {
+pub(crate) fn validate_repository(repository: &Repository) -> Result<(), GeectlError> {
     if !valid_obs_name(&repository.name) {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
