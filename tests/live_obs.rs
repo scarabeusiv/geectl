@@ -73,7 +73,7 @@ use geectl::obs::{
     AggregateOptions, BranchOptions, BuildLogQuery, ChangeDevelPayload, CopyOptions,
     CopyProjectOptions, CreatePackageOptions, DeletePayload, DeleteProjectOptions, DeleteTarget,
     DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision, MaintenanceBranchOptions,
-    MaintenanceIncidentPayload, ObsClient, PackageDiffStatus, ReleaseOptions, Request,
+    MaintenanceIncidentPayload, ObsClient, PackageDiffStatus, ReleaseOptions, Repository, Request,
     RequestAction, RequestSearch, RequestState, ResultsQuery, ReviewState, ReviewTarget,
     RevisionRange, SourceUpdate, SrFiling, SrPayload,
 };
@@ -4849,6 +4849,108 @@ fn live_list_repositories_reads_back_the_added_repo() {
     assert_eq!(repos[0].paths[0].1, "standard");
 }
 
+/// Add a repository through the library, verified by re-listing
+/// (the borrow-map batch-5 `:24` case): `new-repo` with two
+/// architectures and two paths reads back with its name,
+/// architectures, and paths. Adding the same repository again is an
+/// error, not a no-op.
+#[test]
+fn live_add_repository_round_trips() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let target_one = create_path_target(&authed, &base);
+    let target_two = create_path_target(&authed, &base);
+    let repository = Repository {
+        name: "new-repo".to_string(),
+        arch: vec!["x86_64".to_string(), "aarch64".to_string()],
+        paths: vec![
+            (target_one.clone(), "standard".to_string()),
+            (target_two.clone(), "standard".to_string()),
+        ],
+    };
+    assert!(
+        authed
+            .add_repository(&source_project, &repository, false, &DryRun::new(false))
+            .expect("add a repository on the live instance"),
+        "adding a new repository reports a change"
+    );
+    let client = live_client(&base);
+    let repos = client
+        .list_repositories(&source_project)
+        .expect("repository list after adding a repository");
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0], repository);
+    let err = authed
+        .add_repository(&source_project, &repository, false, &DryRun::new(false))
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+}
+
+/// Remove a repository through the library, verified by re-listing
+/// (the borrow-map batch-5 `:45` case): removing `standard` empties
+/// the list, and removing a repository that is not there is not an
+/// error and writes nothing.
+#[test]
+fn live_remove_repository_round_trips() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let path_target = create_path_target(&authed, &base);
+    let repository = Repository {
+        name: "standard".to_string(),
+        arch: vec!["x86_64".to_string()],
+        paths: vec![(path_target, "standard".to_string())],
+    };
+    assert!(
+        authed
+            .add_repository(&source_project, &repository, false, &DryRun::new(false))
+            .expect("add a repository on the live instance"),
+        "adding a new repository reports a change"
+    );
+    let client = live_client(&base);
+    assert_eq!(
+        client
+            .list_repositories(&source_project)
+            .expect("repository list after adding a repository")
+            .len(),
+        1,
+        "the added repository must list back before it is removed"
+    );
+    assert!(
+        authed
+            .remove_repository(&source_project, "standard", &DryRun::new(false))
+            .expect("remove a repository on the live instance"),
+        "removing an existing repository reports a change"
+    );
+    assert!(
+        client
+            .list_repositories(&source_project)
+            .expect("repository list after removing a repository")
+            .is_empty(),
+        "removing the only repository empties the list"
+    );
+    assert!(
+        !authed
+            .remove_repository(&source_project, "does-not-exist", &DryRun::new(false))
+            .expect("removing a missing repository is not an error"),
+        "removing a missing repository reports no change"
+    );
+    assert!(
+        client
+            .list_repositories(&source_project)
+            .expect("repository list after removing a missing repository")
+            .is_empty(),
+        "the list stays empty after removing a missing repository"
+    );
+}
+
 /// A project meta document for `project` with a single repository
 /// `repo` / `arch` and no path: it builds against nothing.
 fn project_meta_with_bare_repo(project: &str, repo: &str, arch: &str) -> String {
@@ -4897,9 +4999,11 @@ fn set_project_config(base: &str, project: &str, config: &str) {
 
 /// Replace the project meta of `project` on the live instance
 /// (PUT /source/<project>/_meta with the admin credentials). The
-/// library has no repository-add operation (a mutation, outside this
-/// batch's reads-only scope), so the harness writes the meta
-/// directly, the same way it POSTs the accept `changestate`.
+/// harness still writes whole meta documents for fixture setup
+/// (including the `add_repository` helper used by the older live
+/// tests); the two new add/remove live tests above go through the
+/// library operations instead, the same way it POSTs the accept
+/// `changestate`.
 fn set_project_meta(base: &str, project: &str, meta: &str) {
     let http = Box::leak(Box::new(
         UreqClient::new(Timeout::default()).expect("default timeout is valid"),

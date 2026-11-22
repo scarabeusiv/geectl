@@ -1,6 +1,8 @@
 use super::build_url;
+use super::parse_status_ok;
 use super::valid_obs_filename;
 use super::valid_obs_name;
+use super::DryRun;
 use super::ObsClient;
 use super::Repository;
 use crate::auth::Credentials;
@@ -10,7 +12,9 @@ use crate::xml::find_tag_end;
 use crate::xml::skip_xml_prolog;
 use crate::xml::xml_child_elements;
 use crate::xml::xml_elements;
+use crate::xml::xml_escape;
 use crate::xml::xml_unescape;
+use crate::xml::XmlDoc;
 
 /// The build-results matrix for a project: one entry per
 /// repository/architecture cell, plus the state hash for polling.
@@ -1426,6 +1430,166 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
     Ok(repositories)
 }
 
+/// Render a `<repository>` element for `repository`: its name, one
+/// `<arch>` per architecture, and one `<path>` per rebuild source.
+/// Values are escaped, so a value carrying XML syntax cannot break
+/// out of the element.
+fn repository_element(repository: &Repository) -> String {
+    let mut out = String::new();
+    out.push_str("<repository name=\"");
+    out.push_str(&xml_escape(&repository.name));
+    out.push_str("\">");
+    for arch in &repository.arch {
+        out.push_str("<arch>");
+        out.push_str(&xml_escape(arch));
+        out.push_str("</arch>");
+    }
+    for (project, repo) in &repository.paths {
+        out.push_str("<path project=\"");
+        out.push_str(&xml_escape(project));
+        out.push_str("\" repository=\"");
+        out.push_str(&xml_escape(repo));
+        out.push_str("\"/>");
+    }
+    out.push_str("</repository>");
+    out
+}
+
+/// Validate a repository for adding: the name and every architecture
+/// and path component must be an OBS name, and the repository must
+/// carry at least one architecture and one path — like `osc repo
+/// add`, which requires `--arch` and `--path`. A repository with no
+/// path builds against nothing, so it is not addable through this
+/// operation.
+fn validate_repository(repository: &Repository) -> Result<(), GeectlError> {
+    if !valid_obs_name(&repository.name) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OBS repository name: {:?}", repository.name),
+        ));
+    }
+    if repository.arch.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "invalid OBS repository {:?}: no architectures",
+                repository.name
+            ),
+        ));
+    }
+    for arch in &repository.arch {
+        if !valid_obs_name(arch) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS architecture name: {arch:?}"),
+            ));
+        }
+    }
+    if repository.paths.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OBS repository {:?}: no paths", repository.name),
+        ));
+    }
+    for (project, repo) in &repository.paths {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        if !valid_obs_name(repo) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS repository name: {repo:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Add `repository` to the project meta document `doc`: a
+/// `<repository>` element appended after the existing children, and a
+/// publish-disable entry when `disable_publish` is set. A repository
+/// with the same name already there is an error, not a replacement —
+/// like `osc repo add`, which refuses a duplicate. Unknown elements
+/// survive untouched: the edit only appends.
+fn add_repository_to_meta(
+    doc: &mut XmlDoc,
+    repository: &Repository,
+    disable_publish: bool,
+) -> Result<(), GeectlError> {
+    if doc.has_element_with_attr("repository", "name", &repository.name) {
+        return Err(GeectlError::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "repository {:?} already exists in project meta",
+                repository.name
+            ),
+        ));
+    }
+    doc.append_element(&repository_element(repository))?;
+    if disable_publish {
+        set_publish_disabled(doc, &repository.name)?;
+    }
+    Ok(())
+}
+
+/// Remove the repository named `name` from the project meta document
+/// `doc`, along with its publish-disable entry when one is set.
+/// Returns true when anything was removed: a repository that is not
+/// there is not an error, like `osc repo remove`, which tolerates a
+/// nonexistent name.
+fn remove_repository_from_meta(doc: &mut XmlDoc, name: &str) -> Result<bool, GeectlError> {
+    let removed = doc.remove_elements_with_attr("repository", "name", name);
+    let publish_removed = clear_publish_disabled(doc, name)?;
+    Ok(removed || publish_removed)
+}
+
+/// Ensure the project meta document `doc` carries a publish-disable
+/// entry for the repository named `name`: `<publish><disable
+/// repository="name"/></publish>`, added to an existing `<publish>`
+/// when there is one. An entry already there is left alone.
+fn set_publish_disabled(doc: &mut XmlDoc, name: &str) -> Result<(), GeectlError> {
+    let Some(publish) = doc.child("publish") else {
+        return doc.replace_or_insert_element(
+            "publish",
+            &format!(
+                "<publish><disable repository=\"{}\"/></publish>",
+                xml_escape(name)
+            ),
+        );
+    };
+    let mut publish_doc = XmlDoc::parse(&publish)?;
+    if publish_doc.has_element_with_attr("disable", "repository", name) {
+        return Ok(());
+    }
+    publish_doc.append_element(&format!("<disable repository=\"{}\"/>", xml_escape(name)))?;
+    doc.replace_or_insert_element("publish", &publish_doc.render())
+}
+
+/// Drop the publish-disable entries for the repository named `name`
+/// from the project meta document `doc`. True when an entry was
+/// dropped. A `<publish>` left with no content at all is dropped
+/// altogether, so removing the last disabled repository leaves no
+/// empty flag section behind. A comment is content, so a commented
+/// section survives.
+fn clear_publish_disabled(doc: &mut XmlDoc, name: &str) -> Result<bool, GeectlError> {
+    let Some(publish) = doc.child("publish") else {
+        return Ok(false);
+    };
+    let mut publish_doc = XmlDoc::parse(&publish)?;
+    if !publish_doc.remove_elements_with_attr("disable", "repository", name) {
+        return Ok(false);
+    }
+    if publish_doc.has_content() {
+        doc.replace_or_insert_element("publish", &publish_doc.render())?;
+    } else {
+        doc.remove_elements("publish");
+    }
+    Ok(true)
+}
+
 /// Parse a `<directory>...</directory>` document into the `name`
 /// attributes of its `<entry>` children. A document that is not a
 /// directory is a server error, never an empty list: an empty
@@ -2254,6 +2418,150 @@ impl<'a> ObsClient<'a> {
         let url = build_url(&self.base, &["public", "source", project, "_meta"], &[]);
         let body = self.http.get_with(&url, &Credentials::None)?;
         parse_repositories(&body)
+    }
+
+    /// Add `repository` to `project` (`PUT /source/<project>/_meta`
+    /// with the project meta edited in place): the repository's name,
+    /// architectures, and the repositories it builds against. A
+    /// repository with the same name already there is an error, not a
+    /// no-op — like `osc repo add`, which refuses a duplicate. With
+    /// `disable_publish`, the added repository is also publish
+    /// disabled. Requires OBS Basic credentials. In dry-run the
+    /// addition is recorded in the plan and nothing is written — the
+    /// guard runs before the credentials check, like
+    /// [`ObsClient::create_project`]. Returns true when the
+    /// repository was added.
+    pub fn add_repository(
+        &self,
+        project: &str,
+        repository: &Repository,
+        disable_publish: bool,
+        dry_run: &DryRun,
+    ) -> Result<bool, GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        validate_repository(repository)?;
+        let mut plan = format!("add repository {} to project {project}", repository.name);
+        if disable_publish {
+            plan.push_str(" with publishing disabled");
+        }
+        // The dry-run guard: in dry-run the addition is recorded in
+        // the plan and nothing is added — not even the credentials
+        // check runs.
+        if !dry_run.allow(&plan) {
+            return Ok(false);
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot add a repository without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let mut doc = self.read_project_meta_doc(project)?;
+        add_repository_to_meta(&mut doc, repository, disable_publish)?;
+        self.put_project_meta(project, &doc.render())?;
+        Ok(true)
+    }
+
+    /// Remove the repository named `name` from `project` (`PUT
+    /// /source/<project>/_meta` with the project meta edited in
+    /// place), along with its publish-disable entry when one is set.
+    /// A repository that is not there is not an error — like
+    /// `osc repo remove`, which tolerates a nonexistent name — and
+    /// nothing is written then, unless a stale publish-disable entry
+    /// for it remains: that is removed too, and the write happens.
+    /// Requires OBS Basic credentials. In dry-run the removal is
+    /// recorded in the plan and nothing is written — the guard runs
+    /// before the credentials check. Returns true when anything was
+    /// removed: the repository, or its publish-disable entry when the
+    /// repository itself is already gone.
+    pub fn remove_repository(
+        &self,
+        project: &str,
+        name: &str,
+        dry_run: &DryRun,
+    ) -> Result<bool, GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        if !valid_obs_name(name) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS repository name: {name:?}"),
+            ));
+        }
+        if !dry_run.allow(&format!("remove repository {name} from project {project}")) {
+            return Ok(false);
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot remove a repository without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        }
+        let mut doc = self.read_project_meta_doc(project)?;
+        if !remove_repository_from_meta(&mut doc, name)? {
+            return Ok(false);
+        }
+        self.put_project_meta(project, &doc.render())?;
+        Ok(true)
+    }
+
+    /// Read the project meta of `project` as an editable document.
+    /// The fetched document must be a `<project>` document: a 200
+    /// with another root (a `<status>` error document, a package
+    /// meta) is a server error, not a document to edit and PUT back
+    /// — the same fail-closed rule `parse_repositories` applies to
+    /// the same response.
+    fn read_project_meta_doc(&self, project: &str) -> Result<XmlDoc, GeectlError> {
+        let url = build_url(&self.base, &["source", project, "_meta"], &[]);
+        let meta = self.http.get_with(&url, &self.credentials)?;
+        let doc = XmlDoc::parse(&meta)?;
+        if doc.root_name() != "project" {
+            let preview = crate::debug::format_body_preview(&meta);
+            let received = if preview.is_empty() {
+                "<empty response>"
+            } else {
+                preview.as_str()
+            };
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS project meta response: not a <project> document; received: {received}"
+                ),
+            ));
+        }
+        Ok(doc)
+    }
+
+    /// PUT the project meta of `project` back to the server, and fail
+    /// closed when the server does not answer `<status code="ok"/>`.
+    fn put_project_meta(&self, project: &str, rendered: &str) -> Result<(), GeectlError> {
+        let url = build_url(&self.base, &["source", project, "_meta"], &[]);
+        let body = self.http.put(&url, rendered, &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            let preview = crate::debug::format_body_preview(&body);
+            let received = if preview.is_empty() {
+                "<empty response>"
+            } else {
+                preview.as_str()
+            };
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS project meta response for project {project}; received: {received}"
+                ),
+            ))
+        }
     }
 }
 
@@ -4306,5 +4614,478 @@ mod tests {
         let client = ObsClient::new(&http);
         assert!(client.list_repositories("bad/project").is_err());
         assert!(http.get_calls().is_empty());
+    }
+
+    const PROJECT_META: &str = "<project name=\"test:factory\"><title>Test factory</title><description>A test project</description><repository name=\"standard\"><arch>x86_64</arch><arch>i586</arch><path project=\"openSUSE.org:openSUSE:Tumbleweed\" repository=\"standard\"/></repository></project>";
+
+    const PROJECT_META_WITH_PUBLISH: &str = "<project name=\"test:factory\"><title>Test factory</title><publish><disable repository=\"standard\"/></publish><repository name=\"standard\"><arch>x86_64</arch><path project=\"openSUSE.org:openSUSE:Tumbleweed\" repository=\"standard\"/></repository></project>";
+
+    fn new_repo() -> Repository {
+        Repository {
+            name: "new-repo".to_string(),
+            arch: vec!["x86_64".to_string(), "aarch64".to_string()],
+            paths: vec![
+                ("test:factory".to_string(), "standard".to_string()),
+                ("test:devel".to_string(), "standard".to_string()),
+            ],
+        }
+    }
+
+    #[test]
+    fn add_repository_puts_the_edited_meta() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                PROJECT_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .add_repository("test:factory", &new_repo(), false, &DryRun::new(false))
+            .unwrap());
+        // One PUT, to the meta URL, with the credentials, carrying the
+        // old repository plus the new one — and nothing else changed.
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].0,
+            "https://api.opensuse.org/source/test:factory/_meta"
+        );
+        assert!(puts[0].2);
+        let repos = parse_repositories(&puts[0].1).unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].name, "standard");
+        assert_eq!(repos[1], new_repo());
+        assert!(puts[0].1.contains("<title>Test factory</title>"));
+        assert!(puts[0]
+            .1
+            .contains("<description>A test project</description>"));
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/test:factory/_meta".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn add_repository_duplicate_is_an_error_without_a_put() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/_meta",
+            PROJECT_META,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let repo = Repository {
+            name: "standard".to_string(),
+            arch: vec!["x86_64".to_string()],
+            paths: vec![("test:factory".to_string(), "standard".to_string())],
+        };
+        let err = client
+            .add_repository("test:factory", &repo, false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert!(err.context.contains("already exists"), "{}", err.context);
+        // The meta was read, but nothing was written.
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn add_repository_with_disable_publish_adds_the_flag() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                PROJECT_META_WITH_PUBLISH,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .add_repository("test:factory", &new_repo(), true, &DryRun::new(false))
+            .unwrap());
+        let body = &http.put_calls()[0].1;
+        // The existing disable entry survives, and the new one joins it
+        // in the same <publish> element.
+        assert!(body.contains("<disable repository=\"standard\"/>"));
+        assert!(body.contains("<disable repository=\"new-repo\"/>"));
+        assert_eq!(body.matches("<publish>").count(), 1);
+    }
+
+    #[test]
+    fn add_repository_without_disable_publish_leaves_publish_alone() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                PROJECT_META_WITH_PUBLISH,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .add_repository("test:factory", &new_repo(), false, &DryRun::new(false))
+            .unwrap());
+        let body = &http.put_calls()[0].1;
+        // The existing disable entry survives, and no new one appears.
+        assert!(body.contains("<disable repository=\"standard\"/>"));
+        assert_eq!(body.matches("<disable").count(), 1);
+    }
+
+    #[test]
+    fn add_repository_dry_run_records_the_plan_and_writes_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(!client
+            .add_repository("test:factory", &new_repo(), false, &dry_run)
+            .unwrap());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: add repository new-repo to project test:factory".to_string()]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+        // With publishing disabled, the plan says so.
+        let dry_run = DryRun::new(true);
+        assert!(!client
+            .add_repository("test:factory", &new_repo(), true, &dry_run)
+            .unwrap());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: add repository new-repo to project test:factory with publishing disabled"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn add_repository_rejects_invalid_input_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(false);
+        assert_eq!(
+            client
+                .add_repository("bad/project", &new_repo(), false, &dry_run)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        let mut bad_name = new_repo();
+        bad_name.name = "bad/name".to_string();
+        let mut no_arch = new_repo();
+        no_arch.arch = vec![];
+        let mut bad_arch = new_repo();
+        bad_arch.arch = vec!["bad/arch".to_string()];
+        let mut no_paths = new_repo();
+        no_paths.paths = vec![];
+        let mut bad_path_project = new_repo();
+        bad_path_project.paths = vec![("bad/project".to_string(), "standard".to_string())];
+        let mut bad_path_repo = new_repo();
+        bad_path_repo.paths = vec![("test:factory".to_string(), "bad/repo".to_string())];
+        for repo in [
+            bad_name,
+            no_arch,
+            bad_arch,
+            no_paths,
+            bad_path_project,
+            bad_path_repo,
+        ] {
+            assert_eq!(
+                client
+                    .add_repository("test:factory", &repo, false, &dry_run)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidInput,
+                "repository {repo:?} must be rejected"
+            );
+        }
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn add_repository_without_credentials_is_a_config_error() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .add_repository("test:factory", &new_repo(), false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn add_repository_non_ok_put_is_a_server_error() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                PROJECT_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                "<status code=\"error\"><summary>nope</summary></status>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .add_repository("test:factory", &new_repo(), false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("nope"), "{}", err.context);
+    }
+
+    #[test]
+    fn remove_repository_puts_the_edited_meta() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                PROJECT_META_WITH_PUBLISH,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .remove_repository("test:factory", "standard", &DryRun::new(false))
+            .unwrap());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        // No repositories left, and the publish section went with the
+        // last disabled repository — no empty flag section remains.
+        assert!(parse_repositories(&puts[0].1).unwrap().is_empty());
+        assert!(!puts[0].1.contains("<publish"));
+        assert!(!puts[0].1.contains("<repository"));
+        assert!(puts[0].1.contains("<title>Test factory</title>"));
+    }
+
+    #[test]
+    fn remove_repository_keeps_other_repos_and_publish_entries() {
+        let meta = "<project name=\"test:factory\"><title>Test factory</title><publish><disable repository=\"standard\"/><disable repository=\"ports\"/></publish><repository name=\"standard\"><arch>x86_64</arch></repository><repository name=\"ports\"><arch>aarch64</arch></repository></project>";
+        let http = FakeHttp::new()
+            .with_get("https://api.opensuse.org/source/test:factory/_meta", meta)
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .remove_repository("test:factory", "ports", &DryRun::new(false))
+            .unwrap());
+        let body = &http.put_calls()[0].1;
+        let repos = parse_repositories(body).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, "standard");
+        assert!(body.contains("<disable repository=\"standard\"/>"));
+        assert!(!body.contains("<disable repository=\"ports\"/>"));
+    }
+
+    #[test]
+    fn remove_repository_missing_name_is_ok_false_without_a_put() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/_meta",
+            PROJECT_META,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(!client
+            .remove_repository("test:factory", "does-not-exist", &DryRun::new(false))
+            .unwrap());
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn remove_repository_dry_run_records_the_plan_and_writes_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(!client
+            .remove_repository("test:factory", "standard", &dry_run)
+            .unwrap());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: remove repository standard from project test:factory".to_string()
+            ]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn remove_repository_rejects_invalid_input_and_missing_credentials_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(false);
+        assert_eq!(
+            client
+                .remove_repository("bad/project", "standard", &dry_run)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            client
+                .remove_repository("test:factory", "bad/name", &dry_run)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert!(http.get_calls().is_empty());
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .remove_repository("test:factory", "standard", &dry_run)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ConfigError
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn repository_element_escapes_values() {
+        let repo = Repository {
+            name: "a&b".to_string(),
+            arch: vec!["x86_64".to_string()],
+            paths: vec![("p&q".to_string(), "r\"s".to_string())],
+        };
+        assert_eq!(
+            repository_element(&repo),
+            "<repository name=\"a&amp;b\"><arch>x86_64</arch><path project=\"p&amp;q\" repository=\"r&quot;s\"/></repository>"
+        );
+    }
+
+    #[test]
+    fn add_repository_to_meta_keeps_unknown_elements() {
+        let mut doc = XmlDoc::parse(
+            "<project name=\"test:factory\"><title>T</title><!-- a note --><lock><disable/></lock><repository name=\"standard\"><arch>x86_64</arch></repository></project>",
+        )
+        .unwrap();
+        add_repository_to_meta(&mut doc, &new_repo(), false).unwrap();
+        let rendered = doc.render();
+        assert!(rendered.contains("<!-- a note -->"));
+        assert!(rendered.contains("<lock><disable/></lock>"));
+        assert!(rendered.contains("<repository name=\"standard\">"));
+        assert!(rendered.contains("<repository name=\"new-repo\">"));
+        // A duplicate is an error and the document is unchanged.
+        assert!(add_repository_to_meta(&mut doc, &new_repo(), false).is_err());
+        assert_eq!(rendered, doc.render());
+    }
+
+    #[test]
+    fn publish_disable_round_trip_through_the_meta_edit() {
+        // Adding with the flag, then removing the repository, leaves
+        // no publish section behind.
+        let mut doc =
+            XmlDoc::parse("<project name=\"test:factory\"><title>T</title></project>").unwrap();
+        add_repository_to_meta(&mut doc, &new_repo(), true).unwrap();
+        let rendered = doc.render();
+        assert!(rendered.contains("<publish><disable repository=\"new-repo\"/></publish>"));
+        assert!(remove_repository_from_meta(&mut doc, "new-repo").unwrap());
+        assert_eq!(
+            doc.render(),
+            "<project name=\"test:factory\"><title>T</title></project>"
+        );
+        // Removing again reports no change.
+        assert!(!remove_repository_from_meta(&mut doc, "new-repo").unwrap());
+    }
+
+    #[test]
+    fn set_publish_disabled_is_idempotent() {
+        let mut doc = XmlDoc::parse(
+            "<project name=\"p\"><publish><disable repository=\"x\"/></publish></project>",
+        )
+        .unwrap();
+        set_publish_disabled(&mut doc, "x").unwrap();
+        assert_eq!(doc.render().matches("<disable").count(), 1);
+        set_publish_disabled(&mut doc, "y").unwrap();
+        assert_eq!(doc.render().matches("<disable").count(), 2);
+    }
+
+    #[test]
+    fn add_repository_wrong_root_meta_is_a_server_error_without_a_put() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/_meta",
+            "<package name=\"pkg\" project=\"test:factory\"><title>P</title></package>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .add_repository("test:factory", &new_repo(), false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn add_repository_status_error_document_is_a_server_error() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/_meta",
+            "<status code=\"404\"><summary>unknown project</summary></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .add_repository("test:factory", &new_repo(), false, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn remove_repository_wrong_root_meta_is_a_server_error_without_a_put() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/_meta",
+            "<package name=\"pkg\" project=\"test:factory\"><title>P</title></package>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .remove_repository("test:factory", "standard", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn remove_repository_stale_publish_entry_only_reports_a_change() {
+        // No repository named "ghost", but a publish-disable entry for
+        // it: removing it still writes, and the emptied publish
+        // section goes with it.
+        let meta = "<project name=\"test:factory\"><title>Test factory</title><publish><disable repository=\"ghost\"/></publish><repository name=\"standard\"><arch>x86_64</arch></repository></project>";
+        let http = FakeHttp::new()
+            .with_get("https://api.opensuse.org/source/test:factory/_meta", meta)
+            .with_put(
+                "https://api.opensuse.org/source/test:factory/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .remove_repository("test:factory", "ghost", &DryRun::new(false))
+            .unwrap());
+        let body = &http.put_calls()[0].1;
+        assert!(!body.contains("<publish"));
+        assert!(body.contains("<repository name=\"standard\">"));
+    }
+
+    #[test]
+    fn remove_repository_keeps_a_commented_publish_section() {
+        let mut doc = XmlDoc::parse(
+            "<project name=\"p\"><publish><!-- keep me --><disable repository=\"x\"/></publish><repository name=\"x\"><arch>x86_64</arch></repository></project>",
+        )
+        .unwrap();
+        assert!(remove_repository_from_meta(&mut doc, "x").unwrap());
+        let rendered = doc.render();
+        assert!(rendered.contains("<!-- keep me -->"));
+        assert!(rendered.contains("<publish>"));
+        assert!(!rendered.contains("<disable"));
+        assert!(!rendered.contains("<repository"));
     }
 }

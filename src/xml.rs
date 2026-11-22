@@ -1,5 +1,5 @@
 //! Minimal XML document editing for the small documents geectl
-//! rewrites in place: a package `_meta` and a `_link`.
+//! rewrites in place: a package `_meta`, a project `_meta`, and a `_link`.
 //!
 //! The editor is `pub(crate)`: XML never leaves the library. Callers
 //! work with typed values; the edited document is only ever PUT back
@@ -108,6 +108,16 @@ fn element_name(entry: &str) -> Option<&str> {
         return None;
     }
     Some(&after_open[..end])
+}
+
+/// The value of attribute `attr` on the open tag of the child element
+/// `entry`, or None when the entry is not an element (a comment, a
+/// processing instruction, or text) or the attribute is absent. The
+/// open tag ends at the first `>` outside a quoted value, so a `>`
+/// inside a value cannot end it early.
+fn child_open_tag_attr(entry: &str, attr: &str) -> Option<String> {
+    let (end, _) = scan_tag(entry, 0)?;
+    find_attr(&entry[..end], attr)
 }
 
 /// Find attribute `name` in a tag's text (an open tag without its
@@ -435,6 +445,11 @@ impl XmlDoc {
         find_attr(&self.root_open, name)
     }
 
+    /// The root element name, e.g. `project`.
+    pub(crate) fn root_name(&self) -> &str {
+        &self.root_name
+    }
+
     /// Set attribute `name` on the root element to `value`, replacing
     /// it when it is already there. The value range is computed first
     /// and replaced in place; the root open tag is never cloned.
@@ -506,6 +521,17 @@ impl XmlDoc {
             .any(|child| element_name(child).is_some())
     }
 
+    /// True when any child is not whitespace-only text: an element, a
+    /// comment, a processing instruction, or text with content.
+    /// Callers use this to decide whether an emptied section is
+    /// really empty: whitespace-only children carry no content to
+    /// preserve.
+    pub(crate) fn has_content(&self) -> bool {
+        self.children
+            .iter()
+            .any(|child| element_name(child).is_some() || !child.trim().is_empty())
+    }
+
     /// Remove attribute `name` from the root element, when it is
     /// there. The whitespace before the attribute goes with it, so
     /// the tag stays well-formed.
@@ -545,6 +571,60 @@ impl XmlDoc {
             .retain(|child| element_name(child) != Some(name));
     }
 
+    /// True when a child element named `name` carries attribute `attr`
+    /// with value `value`. Opaque entries are never elements, so they
+    /// never match.
+    pub(crate) fn has_element_with_attr(&self, name: &str, attr: &str, value: &str) -> bool {
+        self.children.iter().any(|child| {
+            element_name(child) == Some(name)
+                && child_open_tag_attr(child, attr).as_deref() == Some(value)
+        })
+    }
+
+    /// Remove the child elements named `name` whose attribute `attr`
+    /// equals `value`. True when anything was removed. Other elements
+    /// with the same name survive, as do opaque entries.
+    pub(crate) fn remove_elements_with_attr(
+        &mut self,
+        name: &str,
+        attr: &str,
+        value: &str,
+    ) -> bool {
+        let before = self.children.len();
+        self.children.retain(|child| {
+            !(element_name(child) == Some(name)
+                && child_open_tag_attr(child, attr).as_deref() == Some(value))
+        });
+        self.children.len() != before
+    }
+
+    /// Append `xml` as a new child element, after the existing
+    /// children. `xml` must be a single element; anything else is an
+    /// error, so a bad fragment can never be rendered. A self-closing
+    /// root gains children, so it stops being self-closing.
+    pub(crate) fn append_element(&mut self, xml: &str) -> Result<(), GeectlError> {
+        // A prolog-prefixed fragment would embed the prolog
+        // mid-document: `parse` skips it, but the raw string is what
+        // gets appended. Reject it here instead.
+        if xml.trim_start().starts_with("<?") {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("not a single element: {xml:?}"),
+            ));
+        }
+        // Only the validation matters: the raw fragment is appended,
+        // so the document keeps its own formatting.
+        let _parsed = XmlDoc::parse(xml).map_err(|_| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("not a single element: {xml:?}"),
+            )
+        })?;
+        self.children.push(xml.trim().to_string());
+        self.self_closing = false;
+        Ok(())
+    }
+
     /// Replace the child element named `name` with `xml`, or append
     /// `xml` when there is no such element. `xml` must be a single
     /// element with that name; anything else is an error, so a bad
@@ -559,6 +639,16 @@ impl XmlDoc {
         name: &str,
         xml: &str,
     ) -> Result<(), GeectlError> {
+        // A prolog-prefixed fragment would embed the prolog
+        // mid-document: `parse` skips it, but the raw string is what
+        // gets stored. Reject it here instead — the same guard as
+        // `append_element`.
+        if xml.trim_start().starts_with("<?") {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("not a single <{name}> element: {xml:?}"),
+            ));
+        }
         let parsed = XmlDoc::parse(xml).map_err(|_| {
             GeectlError::new(
                 ErrorKind::InvalidInput,
@@ -997,6 +1087,67 @@ mod tests {
     }
 
     #[test]
+    fn has_element_with_attr_matches_name_and_value() {
+        let doc = XmlDoc::parse(META).unwrap();
+        assert!(doc.has_element_with_attr("person", "userid", "alice"));
+        assert!(doc.has_element_with_attr("person", "role", "maintainer"));
+        assert!(!doc.has_element_with_attr("person", "userid", "bob"));
+        assert!(!doc.has_element_with_attr("person", "missing", "alice"));
+        assert!(!doc.has_element_with_attr("devel", "userid", "alice"));
+        // A `name=` inside an earlier attribute's value must not match.
+        let doc = XmlDoc::parse(
+            "<project><repository description=\"name=x\" name=\"standard\"/></project>",
+        )
+        .unwrap();
+        assert!(doc.has_element_with_attr("repository", "name", "standard"));
+        assert!(!doc.has_element_with_attr("repository", "name", "x"));
+    }
+
+    #[test]
+    fn remove_elements_with_attr_drops_only_the_matching_ones() {
+        let mut doc = XmlDoc::parse(
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch></repository><repository name=\"ports\"><arch>aarch64</arch></repository></project>",
+        )
+        .unwrap();
+        assert!(doc.remove_elements_with_attr("repository", "name", "ports"));
+        assert_eq!(
+            doc.render(),
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch></repository></project>"
+        );
+        // Removing an absent name reports false and changes nothing.
+        assert!(!doc.remove_elements_with_attr("repository", "name", "ports"));
+        assert!(!doc.remove_elements_with_attr("repository", "name", "missing"));
+        assert!(doc.remove_elements_with_attr("repository", "name", "standard"));
+        assert_eq!(doc.render(), "<project name=\"p\"></project>");
+    }
+
+    #[test]
+    fn append_element_adds_a_child_and_uncloses_a_self_closing_root() {
+        let mut doc = XmlDoc::parse("<project name=\"p\"/>").unwrap();
+        assert!(doc.self_closing);
+        doc.append_element("<repository name=\"standard\"><arch>x86_64</arch></repository>")
+            .unwrap();
+        assert!(!doc.self_closing);
+        assert_eq!(
+            doc.render(),
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch></repository></project>"
+        );
+        // Appending again adds a second element, it does not replace.
+        doc.append_element("<repository name=\"ports\"><arch>aarch64</arch></repository>")
+            .unwrap();
+        assert_eq!(doc.render().matches("<repository").count(), 2);
+        // A fragment that is not a single element is rejected.
+        assert!(doc.append_element("not xml").is_err());
+        assert!(doc.append_element("<a/><b/>").is_err());
+        assert!(doc.append_element("<repository>").is_err());
+        // A prolog-prefixed fragment is rejected too: it would embed
+        // the prolog mid-document.
+        assert!(doc
+            .append_element("<?xml version=\"1.0\"?><repository name=\"x\"/>")
+            .is_err());
+    }
+
+    #[test]
     fn set_root_attr_replaces_and_appends() {
         let mut doc = XmlDoc::parse(META).unwrap();
         doc.set_root_attr("project", "test:target");
@@ -1044,6 +1195,11 @@ mod tests {
             .is_err());
         assert!(doc.replace_or_insert_element("build", "not xml").is_err());
         assert!(doc.replace_or_insert_element("build", "<build>").is_err());
+        // A prolog-prefixed fragment is rejected too: it would embed
+        // the prolog mid-document.
+        assert!(doc
+            .replace_or_insert_element("build", "<?xml version=\"1.0\"?><build><disable/></build>")
+            .is_err());
     }
 
     #[test]

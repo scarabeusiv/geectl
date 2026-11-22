@@ -457,8 +457,13 @@ whether a package built, what blocked it, and what came out:
   public API.
 - `list_repositories` reads the project's repositories (names,
   architectures, the repositories they build against) from the
-  project meta. Repository add and remove are mutations and out of
-  this batch's reads-only scope, so they are not here.
+  project meta. `add_repository` adds one (name, architectures, and
+  the repositories it builds against, with an optional
+  publish-disable flag), refusing a duplicate name;
+  `remove_repository` removes one, tolerating a missing name
+  (nothing is written unless a stale publish-disable entry for it
+  remains). Both edit the project meta in place and PUT it back, so
+  unknown elements survive the edit; both take the dry-run guard.
 
 All of the build reads are typed: no public method takes or returns
 raw XML — except `check_constraints`, whose constraints document is
@@ -490,7 +495,8 @@ Credentials: the public reads (devel project, devel version, file
 and directory reads, meta, link target, project diff, repository list)
 need none; the package log, the open-SR search, the package and project
 search, the owner search, and reading a person, plus the filing POST,
-superseding, deleting, creating, and uploading, and every `/build` read,
+superseding, deleting, creating, and uploading, repository add and
+remove, and every `/build` read,
 and every request read and act (show, log, search, state change,
 review, comment, diff) need OBS Basic and fail loudly without them —
 except the package log, which reads with whatever credentials the client
