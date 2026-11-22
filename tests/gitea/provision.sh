@@ -133,7 +133,10 @@ echo "Gitea is up."
 # are `read:repository`, repo create is `write:repository` +
 # `write:user`. The global pull-request search reads the issues
 # search endpoint, which the server gates on `read:issue` (403
-# without it). Scopes are recorded per phase here — do not widen
+# without it). Phase 3 (permissions management, #132) adds
+# `write:admin`: the collaborator and team live tests create a second
+# user through `POST /api/v1/admin/users`, which the server gates on
+# that scope. Scopes are recorded per phase here — do not widen
 # them silently.
 echo "Creating the test user and token ..."
 $CONTAINER exec -u git "$CONTAINER_NAME" \
@@ -146,7 +149,7 @@ TOKEN_OUTPUT="$($CONTAINER exec -u git "$CONTAINER_NAME" \
     gitea admin user generate-access-token \
     --username "$GITEA_USER" \
     --token-name geectl-live \
-    --scopes read:user,read:repository,read:issue,write:repository,write:user,write:organization)"
+    --scopes read:user,read:repository,read:issue,write:repository,write:user,write:organization,write:admin)"
 TOKEN="$(printf '%s' "$TOKEN_OUTPUT" | sed -n 's/^Access token was successfully created: //p')"
 if [ -z "$TOKEN" ]; then
     # The raw output is withheld on purpose: it may contain the

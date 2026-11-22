@@ -39,7 +39,10 @@
 use geectl::auth::{resolve_gitea_bearer_for_url, AuthProvider, Credentials, EnvGiteaAuth};
 use geectl::debug::Debug;
 use geectl::error::ErrorKind;
-use geectl::gitea::{ForkRepoOptions, GiteaClient, GiteaPullRequestState, RepoCreateOptions};
+use geectl::gitea::{
+    ForkRepoOptions, GiteaAccess, GiteaAccessMode, GiteaClient, GiteaPullRequestState,
+    RepoCreateOptions, TeamCreateOptions,
+};
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::DryRun;
 
@@ -1512,6 +1515,395 @@ fn gitea_pull_request_search_round_trip() {
     );
     let _ = repo_guard.delete();
 }
+
+/// A username unique to this run, for the second user the
+/// collaborator and team tests create. Shorter than
+/// `unique_repo_name`: Gitea caps usernames at 39 characters.
+fn unique_user_name() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time is after the epoch")
+        .as_secs();
+    format!(
+        "geectl-user-{}-{secs}-{}",
+        std::process::id(),
+        unique_counter()
+    )
+}
+
+/// Create a second user through the raw admin API and return its
+/// login. The token needs `write:admin` (provision.sh). The
+/// password is generated per user: the instance is disposable and
+/// destroyed with the run, so the credential dies with it.
+fn create_user_raw(http: &UreqClient, base: &str, name: &str) -> String {
+    let password = format!(
+        "geectl-live-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is after the epoch")
+            .as_secs(),
+        unique_counter()
+    );
+    let body = serde_json::json!({
+        "username": name,
+        "email": format!("{name}@test.invalid"),
+        "password": password,
+        "must_change_password": false,
+    })
+    .to_string();
+    let created = http
+        .post_json(&format!("{base}/api/v1/admin/users"), &body)
+        .expect("POST /api/v1/admin/users on the Gitea instance");
+    let created: serde_json::Value =
+        serde_json::from_str(&created).expect("POST /api/v1/admin/users returns valid JSON");
+    created["login"]
+        .as_str()
+        .expect("the created user has a login")
+        .to_string()
+}
+
+/// Create an organization through the raw API and return its name.
+/// Org creation is not a phase-1 operation, so the setup stays raw;
+/// the assertions then go through the typed operations. The token
+/// needs `write:organization` (provision.sh).
+fn create_org_raw(http: &UreqClient, base: &str) -> String {
+    let org = unique_org_name();
+    let body = serde_json::json!({ "username": org }).to_string();
+    let created = http
+        .post_json(&format!("{base}/api/v1/orgs"), &body)
+        .expect("POST /api/v1/orgs on the Gitea instance");
+    let created: serde_json::Value =
+        serde_json::from_str(&created).expect("POST /api/v1/orgs returns valid JSON");
+    assert_eq!(
+        created["username"].as_str(),
+        Some(org.as_str()),
+        "POST /api/v1/orgs did not return the created organization; body: {created}"
+    );
+    org
+}
+
+/// Create a repository in an organization through the raw API.
+/// The typed create has no org target, so the setup stays raw.
+fn create_org_repo_raw(http: &UreqClient, base: &str, org: &str, name: &str) {
+    let body = serde_json::json!({
+        "name": name,
+        "private": false,
+    })
+    .to_string();
+    http.post_json(&format!("{base}/api/v1/orgs/{org}/repos"), &body)
+        .expect("POST /api/v1/orgs/{org}/repos on the Gitea instance");
+}
+
+#[test]
+fn gitea_collaborator_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let user = gitea_user();
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &user, &repo);
+    create_repo_raw(&http, &base, &repo);
+    let other = unique_user_name();
+    create_user_raw(&http, &base, &other);
+    // The owner is not a collaborator: the list starts empty.
+    assert!(client
+        .collaborator_list(&user, &repo)
+        .expect("typed collaborator_list lists the collaborators")
+        .is_empty());
+    // Add with write access, and the permission reads back.
+    let added = client
+        .collaborator_add(
+            &user,
+            &repo,
+            &other,
+            GiteaAccess::Write,
+            false,
+            &DryRun::new(false),
+        )
+        .expect("typed collaborator_add adds the collaborator")
+        .expect("a non-dry-run add returns the permission");
+    assert_eq!(added.permission, GiteaAccessMode::Write);
+    assert_eq!(added.user.login, other);
+    let permission = client
+        .collaborator_permission(&user, &repo, &other)
+        .expect("typed collaborator_permission reads the permission");
+    assert_eq!(permission.permission, GiteaAccessMode::Write);
+    // The collaborator now shows in the list; changing the grant
+    // to read shows on the next read.
+    assert!(client
+        .collaborator_list(&user, &repo)
+        .expect("typed collaborator_list lists the collaborators")
+        .iter()
+        .any(|u| u.login == other));
+    let changed = client
+        .collaborator_add(
+            &user,
+            &repo,
+            &other,
+            GiteaAccess::Read,
+            false,
+            &DryRun::new(false),
+        )
+        .expect("typed collaborator_add changes the grant")
+        .expect("a non-dry-run add returns the permission");
+    assert_eq!(changed.permission, GiteaAccessMode::Read);
+    // Remove, and the collaborator is gone from the list and the
+    // permission read.
+    let removed = client
+        .collaborator_remove(&user, &repo, &other, true, &DryRun::new(false))
+        .expect("typed collaborator_remove removes the collaborator")
+        .expect("a non-dry-run remove returns the login");
+    assert_eq!(removed, other);
+    assert!(client
+        .collaborator_list(&user, &repo)
+        .expect("typed collaborator_list lists the collaborators")
+        .is_empty());
+    // The permission read reports the effective access, which is
+    // read for anyone on a public repository — so a removed
+    // collaborator still reads, but no longer with write access.
+    let after = client
+        .collaborator_permission(&user, &repo, &other)
+        .expect("the permission read after a remove");
+    assert!(
+        !after.permission.grants_at_least(GiteaAccess::Write),
+        "a removed collaborator must not keep write access; got {:?}",
+        after.permission
+    );
+    // Removing again refuses: the membership pre-check answers
+    // 404 for a user who is not a collaborator.
+    let err = client
+        .collaborator_remove(&user, &repo, &other, true, &DryRun::new(false))
+        .expect_err("removing a non-collaborator must fail");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "removing a non-collaborator must map to NotFound; got {err:?}"
+    );
+}
+
+#[test]
+fn gitea_collaborator_dry_run_plans_and_adds_nothing() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let user = gitea_user();
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &user, &repo);
+    create_repo_raw(&http, &base, &repo);
+    let other = unique_user_name();
+    create_user_raw(&http, &base, &other);
+    let planned = client
+        .collaborator_add(
+            &user,
+            &repo,
+            &other,
+            GiteaAccess::Write,
+            false,
+            &DryRun::new(true),
+        )
+        .expect("a dry-run collaborator_add plans");
+    assert!(planned.is_none());
+    assert!(
+        client
+            .collaborator_list(&user, &repo)
+            .expect("typed collaborator_list lists the collaborators")
+            .is_empty(),
+        "a dry-run add must not add the collaborator"
+    );
+}
+
+#[test]
+fn gitea_team_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let org = create_org_raw(&http, &base);
+    // Create the team with write access, and it reads back with
+    // the same name, org, and permission.
+    let team = client
+        .team_create(
+            &org,
+            "geectl-live-team",
+            &TeamCreateOptions {
+                permission: Some(GiteaAccess::Write),
+                ..Default::default()
+            },
+            false,
+            &DryRun::new(false),
+        )
+        .expect("typed team_create creates the team")
+        .expect("a non-dry-run create returns the team");
+    assert_eq!(team.name, "geectl-live-team");
+    assert_eq!(
+        team.organization
+            .as_ref()
+            .expect("a created team names its organization")
+            .name,
+        org
+    );
+    // The server reports `none` as the top-level permission for a
+    // write team; the grant lives per unit in `units_map`.
+    assert_eq!(team.permission, GiteaAccessMode::None);
+    assert!(!team.units_map.is_empty());
+    assert!(
+        team.units_map
+            .values()
+            .all(|m| *m == GiteaAccessMode::Write),
+        "the created team must grant write on every unit; got {:?}",
+        team.units_map
+    );
+    assert!(client
+        .team_list(&org)
+        .expect("typed team_list lists the org teams")
+        .iter()
+        .any(|t| t.id == team.id));
+    let read = client
+        .team_get(team.id)
+        .expect("typed team_get reads the team");
+    assert_eq!(read.id, team.id);
+    assert_eq!(read.name, "geectl-live-team");
+    // A member, then a repository: both read back through the
+    // typed operations.
+    let other = unique_user_name();
+    create_user_raw(&http, &base, &other);
+    let member = client
+        .team_add_member(team.id, &other, true, &DryRun::new(false))
+        .expect("typed team_add_member adds the member")
+        .expect("a non-dry-run add returns the member");
+    assert_eq!(member.login, other);
+    assert!(client
+        .team_list_members(team.id)
+        .expect("typed team_list_members lists the team members")
+        .iter()
+        .any(|u| u.login == other));
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &org, &repo);
+    create_org_repo_raw(&http, &base, &org, &repo);
+    let added = client
+        .team_add_repo(team.id, &org, &repo, true, &DryRun::new(false))
+        .expect("typed team_add_repo adds the repository")
+        .expect("a non-dry-run add returns the repo");
+    assert_eq!(added.full_name, format!("{org}/{repo}"));
+    assert!(client
+        .team_list_repos(team.id)
+        .expect("typed team_list_repos lists the team repos")
+        .iter()
+        .any(|r| r.full_name == format!("{org}/{repo}")));
+    // Remove the repo, then the member, then the team: each
+    // removal reads back empty.
+    let removed_repo = client
+        .team_remove_repo(team.id, &org, &repo, true, &DryRun::new(false))
+        .expect("typed team_remove_repo removes the repository")
+        .expect("a non-dry-run remove returns the full name");
+    assert_eq!(removed_repo, format!("{org}/{repo}"));
+    assert!(client
+        .team_list_repos(team.id)
+        .expect("typed team_list_repos lists the team repos")
+        .is_empty());
+    let removed_member = client
+        .team_remove_member(team.id, &other, true, &DryRun::new(false))
+        .expect("typed team_remove_member removes the member")
+        .expect("a non-dry-run remove returns the login");
+    assert_eq!(removed_member, other);
+    assert!(client
+        .team_list_members(team.id)
+        .expect("typed team_list_members lists the team members")
+        .is_empty());
+    let deleted = client
+        .team_delete(team.id, true, &DryRun::new(false))
+        .expect("typed team_delete deletes the team")
+        .expect("a non-dry-run delete returns the name");
+    assert_eq!(deleted, "geectl-live-team");
+    // The org keeps its Owners team, so the list is never
+    // empty — the check is that the deleted team is gone.
+    assert!(client
+        .team_list(&org)
+        .expect("typed team_list lists the org teams")
+        .iter()
+        .all(|t| t.id != team.id));
+}
+
+#[test]
+fn gitea_team_create_dry_run_plans_and_creates_nothing() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let org = create_org_raw(&http, &base);
+    let planned = client
+        .team_create(
+            &org,
+            "geectl-live-team",
+            &TeamCreateOptions::default(),
+            false,
+            &DryRun::new(true),
+        )
+        .expect("a dry-run team_create plans");
+    assert!(planned.is_none());
+    // Every org holds its Owners team, so the list is never
+    // empty — the check is that no team of the planned name
+    // exists.
+    assert!(
+        client
+            .team_list(&org)
+            .expect("typed team_list lists the org teams")
+            .iter()
+            .all(|t| t.name != "geectl-live-team"),
+        "a dry-run create must not create the team"
+    );
+}
+
+#[test]
+fn gitea_team_create_defaults_to_read() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let org = create_org_raw(&http, &base);
+    // Default options, non-dry-run: the permission must be sent
+    // (the server defaults an omitted permission to none), and
+    // the team reads back granting read on every unit. The name
+    // pins the server's team-name rule: dots and underscores
+    // pass, spaces do not.
+    let team = client
+        .team_create(
+            &org,
+            "geectl.live_team",
+            &TeamCreateOptions::default(),
+            false,
+            &DryRun::new(false),
+        )
+        .expect("typed team_create creates the team with default options")
+        .expect("a non-dry-run create returns the team");
+    assert_eq!(team.permission, GiteaAccessMode::None);
+    assert!(!team.units_map.is_empty());
+    assert_eq!(team.units_map.len(), team.units.len());
+    assert!(
+        team.units_map.values().all(|m| *m == GiteaAccessMode::Read),
+        "the default team must grant read on every unit; got {:?}",
+        team.units_map
+    );
+    let deleted = client
+        .team_delete(team.id, true, &DryRun::new(false))
+        .expect("typed team_delete deletes the team")
+        .expect("a non-dry-run delete returns the name");
+    assert_eq!(deleted, "geectl.live_team");
+}
+
 
 #[cfg(test)]
 mod tests {
