@@ -78,7 +78,7 @@ use geectl::obs::{
     DeleteTarget, DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision,
     MaintenanceBranchOptions, MaintenanceIncidentPayload, NamedRole, ObsClient, PackageDiffStatus,
     ReleaseOptions, Repository, Request, RequestAction, RequestSearch, RequestState, ResultsQuery,
-    ReviewState, ReviewTarget, RevisionRange, SourceUpdate, SrFiling, SrPayload,
+    ReviewState, ReviewTarget, RevisionRange, RoleGrant, SourceUpdate, SrFiling, SrPayload,
     StagingReadOptions,
 };
 
@@ -6020,6 +6020,216 @@ fn live_set_package_meta_writes_and_reads_back() {
         read_back.description.as_deref(),
         Some("Created by the geectl live test; the instance is destroyed after the run.")
     );
+}
+
+/// Granting and removing a project role round-trips through the
+/// live server.
+#[test]
+fn live_role_add_and_remove_project_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let user = live_username();
+    client
+        .role_add_project(
+            &project,
+            &RoleGrant::person(&user, "bugowner"),
+            &DryRun::new(false),
+        )
+        .expect("grant the bugowner role on the live instance");
+    let meta = client
+        .project_meta(&project)
+        .expect("read the project meta on the live instance");
+    assert!(
+        meta.persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "bugowner"),
+        "the bugowner grant reads back"
+    );
+    client
+        .role_remove_project(
+            &project,
+            &RoleGrant::person(&user, "bugowner"),
+            true,
+            &DryRun::new(false),
+        )
+        .expect("remove the bugowner role on the live instance");
+    let meta = client
+        .project_meta(&project)
+        .expect("read the project meta back from the server");
+    assert!(
+        !meta
+            .persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "bugowner"),
+        "the bugowner removal reads back"
+    );
+}
+
+/// Granting and removing a package role round-trips through the live
+/// server, including removing the last package maintainer: the
+/// project maintainers still cover the package.
+#[test]
+fn live_role_add_and_remove_package_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let user = live_username();
+    client
+        .role_add_package(
+            &project,
+            &package,
+            &RoleGrant::person(&user, "reviewer"),
+            &DryRun::new(false),
+        )
+        .expect("grant the reviewer role on the live instance");
+    let meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta on the live instance");
+    assert!(
+        meta.persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "reviewer"),
+        "the reviewer grant reads back"
+    );
+    client
+        .role_remove_package(
+            &project,
+            &package,
+            &RoleGrant::person(&user, "reviewer"),
+            true,
+            &DryRun::new(false),
+        )
+        .expect("remove the reviewer role on the live instance");
+    let meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta back from the server");
+    assert!(
+        !meta
+            .persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "reviewer"),
+        "the reviewer removal reads back"
+    );
+    client
+        .role_add_package(
+            &project,
+            &package,
+            &RoleGrant::person(&user, "maintainer"),
+            &DryRun::new(false),
+        )
+        .expect("grant the maintainer role on the live instance");
+    let meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta on the live instance");
+    assert!(
+        meta.persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "maintainer"),
+        "the maintainer grant reads back"
+    );
+    client
+        .role_remove_package(
+            &project,
+            &package,
+            &RoleGrant::person(&user, "maintainer"),
+            true,
+            &DryRun::new(false),
+        )
+        .expect("remove the last package maintainer on the live instance");
+    let meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta back from the server");
+    assert!(
+        !meta
+            .persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "maintainer"),
+        "the maintainer removal reads back"
+    );
+}
+
+/// Removing the last maintainer of a project is refused, even with
+/// force: the project would have no maintainer left.
+#[test]
+fn live_role_remove_project_refuses_the_last_maintainer() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let meta = client
+        .project_meta(&project)
+        .expect("read the project meta on the live instance");
+    let person_maintainers: Vec<String> = meta
+        .persons
+        .iter()
+        .filter(|entry| entry.role == "maintainer")
+        .map(|entry| entry.name.clone())
+        .collect();
+    let group_maintainers: Vec<String> = meta
+        .groups
+        .iter()
+        .filter(|entry| entry.role == "maintainer")
+        .map(|entry| entry.name.clone())
+        .collect();
+    assert!(
+        !person_maintainers.is_empty() || !group_maintainers.is_empty(),
+        "the live project has a maintainer"
+    );
+    // Exactly one maintainer stays: the keeper, whose removal is
+    // refused below. The keeper is the first person maintainer, or
+    // the first group maintainer when no person holds the role.
+    for person in person_maintainers.iter().skip(1) {
+        client
+            .role_remove_project(
+                &project,
+                &RoleGrant::person(person, "maintainer"),
+                true,
+                &DryRun::new(false),
+            )
+            .expect("remove a person maintainer on the live instance");
+    }
+    let skip_groups = if person_maintainers.is_empty() { 1 } else { 0 };
+    for group in group_maintainers.iter().skip(skip_groups) {
+        client
+            .role_remove_project(
+                &project,
+                &RoleGrant::group(group, "maintainer"),
+                true,
+                &DryRun::new(false),
+            )
+            .expect("remove a group maintainer on the live instance");
+    }
+    let err = if let Some(person) = person_maintainers.first() {
+        client
+            .role_remove_project(
+                &project,
+                &RoleGrant::person(person, "maintainer"),
+                true,
+                &DryRun::new(false),
+            )
+            .unwrap_err()
+    } else {
+        let group = group_maintainers.first().unwrap();
+        client
+            .role_remove_project(
+                &project,
+                &RoleGrant::group(group, "maintainer"),
+                true,
+                &DryRun::new(false),
+            )
+            .unwrap_err()
+    };
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert!(err.context.contains("last maintainer"), "{}", err.context);
 }
 
 /// Updating package meta from the spec writes the spec's Summary,
