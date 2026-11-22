@@ -88,13 +88,17 @@ credentials this way. (The API-key credential, when it lands, uses
 the same pattern: `GEECTL_OBS_APIKEY_<ALIAS>`.)
 
 A half-configured credential pair (a username with no password source,
-or the reverse) is handled per group: `request` swallows it in dry-run
-(a preview never needs credentials; the dropped error goes to the
-debug channel), while `branch`, `remote`, `build`, and `maintenance`
-fail fast on it before any work, in dry-run too — a dry run that
-cannot be performed live is not a useful preview. A live run resolves
-credentials up front in all groups, and so does every read except
-`build list-repositories`, a public read that never touches them.
+or the reverse) is handled per group. `branch`, `maintenance`, and
+`service` fail fast on it before any work — `branch` and `maintenance`
+in dry-run too, since a dry run that cannot be performed live is not a
+useful preview (`service` has no dry-run; both commands are reads).
+`request` swallows it in dry-run (a preview never needs credentials;
+the dropped error goes to the debug channel). `remote` and `build`
+resolve credentials per command instead: the public reads (see
+Credentials in `docs/architecture.md`) never touch them, so a half-set
+env must not break them, and neither does a dry-run `remote` mutation
+preview; every other command in those groups fails fast on a half-set
+pair up front.
 
 ## Top level
 

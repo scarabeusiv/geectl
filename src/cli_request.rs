@@ -28,10 +28,8 @@
 //! the dropped error goes to the debug channel and to stderr as a
 //! warning), so a request preview
 //! never needs credentials at all. A live run — and every read —
-//! still resolves credentials up front and fails fast. The other
-//! groups differ deliberately: they fail fast on a half-configured
-//! pair even in dry-run (see `cli_branch`, `cli_remote`,
-//! `cli_build`, `maintenance`).
+//! still resolves credentials up front and fails fast. How the other
+//! groups handle a half-configured pair is stated in `docs/cli.md`.
 //!
 //! Text output echoes the query coordinates in one header line per
 //! command: the request id for the single-request reads and the

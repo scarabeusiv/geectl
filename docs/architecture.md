@@ -294,9 +294,7 @@ on, not part of it.
 
 Remote reads: the read surface for inspecting what the distribution
 holds, all typed — no method takes or returns raw XML. The public
-reads (`ObsClient::cat`, `list_files`, `list_packages`,
-`project_meta`, `package_meta`, `link_target`, `project_diff`) need
-no credentials. `cat` reads one file at a revision (`rev`); the
+reads (see Credentials below) need no credentials. `cat` reads one file at a revision (`rev`); the
 directory listings (`list_files`, `list_packages`) are the server's
 own `<directory>` documents. `package_log` reads the package history
 (newest first — the server lists oldest first, so the log is
@@ -500,7 +498,8 @@ fileinfo. A malformed document is a server error, never an empty
 result.
 
 Credentials: the public reads (devel project, devel version, file
-and directory reads, meta, link target, project diff, repository list)
+and directory reads, meta, link target, project diff (without
+annotation), package diff, revision patch, repository list)
 need none; the package log, the open-SR search, the package and project
 search, the owner search, and reading a person, plus the filing POST,
 superseding, deleting, creating, and uploading, repository add and

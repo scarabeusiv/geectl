@@ -164,7 +164,9 @@ key (`GEECTL_GITEA_SSH_KEY`). The `*_FILE` form names a file whose
 whole content is the secret — the mounted-secret shape. A
 half-configured pair, both secret sources set, or a malformed value
 fails at startup as a config error naming the variable, never the
-value, so a bad credential never reaches a request.
+value, for any command that resolves credentials, so a bad credential never reaches a request. Which commands never resolve credentials is stated in the Credentials
+paragraph in `docs/architecture.md`; the dry-run handling is stated in
+`docs/cli.md`.
 
 Rationale: an agent's credentials arrive as environment variables or
 mounted secrets, not as interactive input. Failing at startup — with
