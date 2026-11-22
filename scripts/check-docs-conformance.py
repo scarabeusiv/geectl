@@ -51,7 +51,10 @@ Rules (the doc convention this script enforces):
    prose (``run the test `debug_on_records` ``) does not. The plural
    ``tests`` and the no-space ``test`` form are caught the same way:
    they are misspelled citations, so they fail rather than being
-   silently ignored. Line numbers are ASCII digits only, at most
+   silently ignored. Citation keywords match case-insensitively
+   (``Test`` is a citation), and a word ending in ``test``
+   (``latest``) is not one: the keyword needs a word boundary
+   before it. Line numbers are ASCII digits only, at most
    seven of them; a non-ASCII digit or a longer run does not parse.
    A range in a citation may span at most 1000 lines; a wider
    range does not parse. ``emit sites `path:L1,L2,...` `` covers
@@ -69,7 +72,12 @@ Rules (the doc convention this script enforces):
    the code emits whatever path the request has) and pure-number
    tokens of five or more digits (a request id: the doc's
    ``1398977`` and the test's ``42`` are the same shape, different
-   instances). Every other token must appear as a whole token in
+   instances). A token is tested for the instance-value class with
+   trailing sentence punctuation stripped (``,``, ``)``, ``.``,
+   ``;``, ``:``); the equality test itself still compares whole
+   tokens, so ``1398977,`` is an instance value while ``new,`` must
+   match ``new,`` literally. Every other token must appear as a
+   whole token in
    ONE cited line: a fragment whose tokens are split across two
    cited lines does not verify (the lines are checked separately,
    never pooled). Whole-token matching is what catches the drift
@@ -105,14 +113,16 @@ Rules (the doc convention this script enforces):
 7. A missing doc file is a failure: the design doc is a required
    record on main. (Branches predating the doc rebase onto main
    before merging; the check does not silently pass on its absence.)
-8. Pin threshold: exactly one threshold governs pinning — a fragment
-   with fewer than three whitespace-separated tokens never pins.
-   Two tokens (a bare prefix plus one word, e.g. ``http: GET``)
-   match unrelated lines by traversal order, so such an example is
-   illustrative, not a missing citation. The threshold applies to
-   both the verbatim and the normalized search, and only to pinning:
-   a cited example's fragments are still verified against their
-   cited line whatever their length (rule 5).
+8. Pin threshold: exactly one threshold governs pinning — three
+   tokens. The verbatim search counts raw whitespace-separated
+   tokens; the normalized search counts normalized tokens (after
+   instance values are dropped). Two tokens (a bare prefix plus one
+   word, e.g. ``http: GET``) match unrelated lines by traversal
+   order, so such an example is illustrative, not a missing
+   citation. The threshold applies to both the verbatim and the
+   normalized search, and only to pinning: a cited example's
+   fragments are still verified against their cited line whatever
+   their length (rule 5).
 
 When this script reports a failure, the fix direction follows the
 which-side-is-right rule: decide first whether the doc or the code
@@ -147,7 +157,7 @@ SPAN_RE = re.compile(r"`([^`]+)`", re.DOTALL)
 # Line numbers are ASCII digits only ([0-9], never \d): \d also
 # matches non-ASCII decimal digits, so a citation a human reads as
 # non-numeric would silently mean another line.
-TEST_CITE_RE = re.compile(r"test `([^`]+):([0-9,\-]+)`")
+TEST_CITE_RE = re.compile(r"\btest `([^`]+):([0-9,\-]+)`", re.IGNORECASE)
 # Only `test `...` ` text that looks like a citation — it carries a
 # `:` — is an unparsable citation: a bare path such as
 # `src/http.rs` is prose, and ordinary prose such as
@@ -156,14 +166,24 @@ TEST_CITE_RE = re.compile(r"test `([^`]+):([0-9,\-]+)`")
 # instead of being silently ignored. (A `:` without a digit run,
 # e.g. `src/x.rs:abc`, is still a citation attempt and still fails:
 # requiring a digit here would silently ignore it.)
-ANY_TEST_CITE_RE = re.compile(r"tests?\s*`[^`]*:[^`]*`")
-EMIT_CITE_RE = re.compile(r"emit sites `([^`]+):([0-9,]+)`")
+ANY_TEST_CITE_RE = re.compile(r"\btests?\s*`[^`]*:[^`]*`", re.IGNORECASE)
+EMIT_CITE_RE = re.compile(r"emit sites `([^`]+):([0-9,]+)`", re.IGNORECASE)
 # Any `emit sites `...` ` text: matches that fail EMIT_CITE_RE are
 # unparsable emit specs and must fail, never be silently ignored.
-ANY_EMIT_CITE_RE = re.compile(r"emit sites `[^`]+`")
+ANY_EMIT_CITE_RE = re.compile(r"emit sites `[^`]+`", re.IGNORECASE)
 PLACEHOLDER_RE = re.compile(r"<[^<>]*>")
 ID_TOKEN_RE = re.compile(r"^[0-9]{5,}$")
 COUNTER_TOKEN_RE = re.compile(r"^[0-9]+/[0-9]+s?$")
+
+# Trailing sentence punctuation, stripped only for the instance-value
+# class test: a doc token such as ``1398977,`` is an instance value,
+# while ``new,`` still has to match ``new,`` literally.
+INSTANCE_PUNCT = ",).;:"
+
+
+def _instance_form(token):
+    """Token with trailing sentence punctuation stripped."""
+    return token.rstrip(INSTANCE_PUNCT)
 
 
 # A citation range may span at most this many lines: a wider range
@@ -408,7 +428,7 @@ def token_check(fragment, cited_lines):
     tokens = [
         t
         for t in fragment.split()
-        if not t.startswith("/") and not ID_TOKEN_RE.match(t)
+        if not t.startswith("/") and not ID_TOKEN_RE.match(_instance_form(t))
     ]
     if not tokens:
         # Every token is an instance value, so this fragment pins
@@ -444,15 +464,16 @@ def normalize_token(token):
 
     Paths and >=5-digit ids are dropped (same instance-value classes
     as the cited-line check). A counter token (``3/30s``, ``1/4``,
-    with a trailing ``:``, ``)`` or ``,`` stripped first) becomes the
+    with trailing sentence punctuation stripped first) becomes the
     single placeholder ``<counter>``. Every other token — including
     bare status codes such as ``500`` — is kept verbatim.
     """
     if token.startswith("/"):
         return None
-    if ID_TOKEN_RE.match(token):
+    form = _instance_form(token)
+    if ID_TOKEN_RE.match(form):
         return None
-    if COUNTER_TOKEN_RE.match(token.rstrip(":),")):
+    if COUNTER_TOKEN_RE.match(form):
         return "<counter>"
     return token
 
@@ -474,10 +495,11 @@ def normalized_search(root, fragment):
     A fragment counts as pinned only when exactly one line matches:
     a generic shape matching several lines is ambiguous, not a pin,
     and the caller treats that as illustrative, never as a failure
-    naming an arbitrary one.
+    naming an arbitrary one. A fragment with fewer than three
+    normalized tokens never pins (rule 8).
     """
     want = normalize_tokens(fragment)
-    if not want:
+    if len(want) < 3:
         return []
     matches = []
     for base in ("src", "tests"):

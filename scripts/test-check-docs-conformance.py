@@ -67,6 +67,44 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertTrue(any("1 verified" in line for line in summary))
 
+    def test_cited_id_with_trailing_comma_passes(self):
+        """A cited id carrying sentence punctuation is an instance value."""
+        doc = (
+            DOC_HEAD
+            + "- Accept check (`decision: request 1398977, still new, re-issuing\n"
+            + "  accepted`; test `src/obs/request.rs:10`).\n"
+            + DOC_TAIL
+        )
+        files = {
+            "src/obs/request.rs": "\n".join(
+                ["", "", "", "", "", "", "", "", "",
+                 '    "decision: request 42 still new, re-issuing accepted".to_string(),']
+            )
+            + "\n"
+        }
+        failures, _ = self.run_check(doc, files)
+        self.assertEqual(failures, [])
+
+    def test_trailing_comma_still_fails_equality(self):
+        """Punctuation stripping is class-test only: `new,` must match `new,`."""
+        doc = (
+            DOC_HEAD
+            + "- Accept check (`decision: request 1398977, still new, re-issuing\n"
+            + "  accepted`; test `src/obs/request.rs:10`).\n"
+            + DOC_TAIL
+        )
+        files = {
+            "src/obs/request.rs": "\n".join(
+                ["", "", "", "", "", "", "", "", "",
+                 '    "decision: request 42 still new re-issuing accepted".to_string(),']
+            )
+            + "\n"
+        }
+        failures, _ = self.run_check(doc, files)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("'new,'", failures[0])
+
+
     def test_wrong_word_fails(self):
         """Doc says 'accept', test pins 'accepted': the token is missing."""
         doc = (
@@ -463,6 +501,17 @@ class CheckTests(unittest.TestCase):
         failures, _ = self.run_check(doc, {})
         self.assertEqual(failures, [])
 
+    def test_word_ending_in_test_is_not_a_citation(self):
+        """Prose ending in `test` (`latest`) does not steal a citation."""
+        doc = (
+            DOC_HEAD
+            + "- Note (see the latest `src/x.rs:1`).\n"
+            + DOC_TAIL
+        )
+        failures, _ = self.run_check(doc, {"src/x.rs": "x\n"})
+        self.assertEqual(failures, [])
+
+
     def test_cite_range_cap(self):
         """A range wider than the cap does not parse."""
         self.assertIsNone(checker.parse_cite_lines("1-2000000"))
@@ -527,6 +576,26 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("no citation", failures[0])
         self.assertIn("src/http.rs:1", failures[0])
+
+    def test_normalized_two_token_fragment_never_pins(self):
+        """A fragment with fewer than three normalized tokens never pins.
+
+        Four raw tokens, but only two survive normalization (the path
+        and the id are instance values), so the normalized search must
+        not pin it.
+        """
+        doc = (
+            DOC_HEAD
+            + "- Attempt (`http: GET /source/foo 1398977`).\n"
+            + DOC_TAIL
+        )
+        files = {
+            "src/http.rs": '    "http: GET /zzz 42".to_string(),\n'
+        }
+        failures, summary = self.run_check(doc, files)
+        self.assertEqual(failures, [])
+        self.assertTrue(any("illustrative" in line for line in summary))
+
 
     def test_counter_normalized_pin(self):
         """A probe counter differing (3/30s vs 1/30s) is still a pin."""
@@ -660,6 +729,19 @@ class CheckTests(unittest.TestCase):
         failures, _ = self.run_check(doc, {})
         self.assertEqual(len(failures), 1)
         self.assertIn("unparsable", failures[0])
+
+    def test_capital_test_citation_verifies(self):
+        """A capital `Test` is a citation, not prose."""
+        doc = (
+            DOC_HEAD
+            + "- Check (`decision: alpha bravo`; Test `src/x.rs:1`).\n"
+            + DOC_TAIL
+        )
+        files = {"src/x.rs": '    "decision: alpha bravo".to_string(),\n'}
+        failures, summary = self.run_check(doc, files)
+        self.assertEqual(failures, [])
+        self.assertTrue(any("1 verified" in line for line in summary))
+
 
     def test_instance_only_fragment_is_illustrative(self):
         """A fragment of only instance values pins nothing."""
