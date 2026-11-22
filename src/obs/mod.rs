@@ -121,6 +121,7 @@ pub(crate) mod types;
 
 pub(crate) use self::branch::build_link_meta;
 pub use self::build::BinaryFile;
+pub use self::build::BuildDep;
 pub use self::build::BuildHistoryEntry;
 pub use self::build::BuildInfo;
 pub use self::build::BuildLogQuery;
@@ -132,6 +133,7 @@ pub use self::build::JobHistoryEntry;
 pub use self::build::JobStatus;
 pub use self::build::PackageBuildStatus;
 pub use self::build::PackageDeps;
+pub use self::build::PreinstallImage;
 pub use self::build::ProvidedBy;
 pub use self::build::ResultsQuery;
 pub use self::client::ObsClient;

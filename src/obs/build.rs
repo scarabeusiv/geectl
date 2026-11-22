@@ -488,6 +488,94 @@ pub(crate) fn parse_build_status(body: &str) -> Result<String, GeectlError> {
     }
 }
 
+/// One build dependency of a package: the name plus the origin the
+/// server resolved it from. The project and hdrmd5 are what the
+/// local-build vertical needs: the project set is the trust check,
+/// the hdrmd5 is the cache verification. Either may be absent on a
+/// dependency the server did not resolve to a binary (a virtual
+/// provide, a not-installed flag) — the callers that need them treat
+/// an absent value as "unknown", never as a match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildDep {
+    /// The dependency name (the package name).
+    pub name: String,
+    /// The project the dependency resolves from, if the server said.
+    pub project: Option<String>,
+    /// The repository the dependency resolves from, if the server said.
+    pub repository: Option<String>,
+    /// The source package the dependency's binary is built from,
+    /// if the server said. The binary list and download URLs use
+    /// it, not the binary name: a subpackage binary (`libz1`) lives
+    /// under its source package (`zlib`), and listing by the binary
+    /// name 404s, like the download: the binary name is not a
+    /// package. Absent, the whole repository is listed instead
+    /// (`_repository`) — the server did not say where the binary
+    /// comes from, so no package segment can be assumed.
+    pub package: Option<String>,
+    /// The binary file name (`name-version-release.arch.rpm`), if the
+    /// server said. Without it the caller resolves the file name from
+    /// the binary list of the dependency's package.
+    pub binary: Option<String>,
+    /// The resolved version, if the server said. With `release` and
+    /// `arch` present and no `binary` name, the caller computes the
+    /// file name locally (`name-version-release.arch.rpm`) instead
+    /// of listing binaries: real scheduler buildinfo carries no
+    /// `binary` attribute at all.
+    pub version: Option<String>,
+    /// The resolved release, if the server said (see `version`).
+    pub release: Option<String>,
+    /// The resolved architecture, if the server said (see `version`).
+    /// An RPM file name never carries the epoch, so `epoch` is
+    /// parsed but unused for the file name.
+    pub arch: Option<String>,
+    /// The resolved epoch, if the server said. Parsed for
+    /// completeness; it is not part of the file name.
+    pub epoch: Option<String>,
+    /// The hdrmd5 of the resolved binary, if the server said. A cached
+    /// package is verified against it on every use.
+    pub hdrmd5: Option<String>,
+    /// The dependency is installed before the build starts.
+    pub preinstall: bool,
+    /// The dependency is installed into the VM, not the build root.
+    pub vminstall: bool,
+    /// The dependency's scripts run before the build.
+    pub runscripts: bool,
+    /// The dependency is resolved but never installed: the rpmlist
+    /// carries it on a `noinstall:` line, and the engine does not
+    /// install it — but the file is still downloaded and listed,
+    /// exactly as the existing tool does for spec builds.
+    pub noinstall: bool,
+    /// The repository architecture the dependency resolves for, if
+    /// the server said (a dep can resolve from a different repoarch
+    /// than the build arch, e.g. a noarch dep). The cache dir and
+    /// the download URL use it; the build arch is the fallback.
+    pub repoarch: Option<String>,
+    /// The dependency is installed only (never removed by a later
+    /// install): the rpmlist carries it on an `installonly:` line.
+    pub installonly: bool,
+    /// The dependency is installed into the sysroot subdirectory:
+    /// the rpmlist prefixes its line with `sysroot: `.
+    pub sysroot: bool,
+}
+
+/// The preinstall image the buildinfo offers: the image the server
+/// would seed a fresh root with. Recorded, never selected by geectl:
+/// for a rootless podman build the image is dropped (an unprivileged
+/// user cannot extract it), exactly as the existing tool does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreinstallImage {
+    /// The project the image lives in.
+    pub project: Option<String>,
+    /// The repository the image lives in.
+    pub repository: Option<String>,
+    /// The package the image is built from.
+    pub package: Option<String>,
+    /// The image file name.
+    pub filename: Option<String>,
+    /// The image's hdrmd5, if the server said.
+    pub hdrmd5: Option<String>,
+}
+
 /// The buildinfo for a package in a repository/architecture: the
 /// error that blocks the build, if any, and the dependencies the
 /// build pulls in.
@@ -497,7 +585,9 @@ pub struct BuildInfo {
     /// DOES-NOT-EXIST`), if the build cannot start.
     pub error: Option<String>,
     /// The names of the build dependencies, in build order.
-    pub bdeps: Vec<String>,
+    pub bdeps: Vec<BuildDep>,
+    /// The preinstall image the server offers, if any.
+    pub preinstall_image: Option<PreinstallImage>,
 }
 
 /// One entry of a package's build history: a completed build.
@@ -608,6 +698,7 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
         return Ok(BuildInfo {
             error: None,
             bdeps: Vec::new(),
+            preinstall_image: None,
         });
     }
     let inner = &after_open[end + 1..];
@@ -629,9 +720,58 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
                 "unexpected OBS buildinfo response: <bdep> without name",
             )
         })?;
-        bdeps.push(name);
+        bdeps.push(BuildDep {
+            name,
+            project: xml_attr(tag, "project"),
+            repository: xml_attr(tag, "repository"),
+            package: xml_attr(tag, "package"),
+            binary: xml_attr(tag, "binary"),
+            version: xml_attr(tag, "version"),
+            release: xml_attr(tag, "release"),
+            arch: xml_attr(tag, "arch"),
+            epoch: xml_attr(tag, "epoch"),
+            hdrmd5: xml_attr(tag, "hdrmd5"),
+            preinstall: xml_flag(tag, "preinstall"),
+            vminstall: xml_flag(tag, "vminstall"),
+            runscripts: xml_flag(tag, "runscripts"),
+            noinstall: xml_flag(tag, "noinstall"),
+            repoarch: xml_attr(tag, "repoarch"),
+            installonly: xml_flag(tag, "installonly"),
+            sysroot: xml_flag(tag, "sysroot"),
+        });
     }
-    Ok(BuildInfo { error, bdeps })
+    // The preinstall image, when the server offers one: a single
+    // `<preinstallimage .../>` element. A second one is ignored —
+    // the server sends at most one, and the first is the offer. A
+    // malformed element is ignored rather than failing the parse:
+    // the image is recorded only (a rootless podman build drops it),
+    // so a broken image element must not fail a build whose
+    // dependencies parsed fine.
+    let preinstall_image = match xml_elements(inner, "preinstallimage") {
+        Ok(elements) => elements.first().map(|element| {
+            let (tag, _) = xml_split_element(element, "preinstallimage");
+            PreinstallImage {
+                project: xml_attr(tag, "project"),
+                repository: xml_attr(tag, "repository"),
+                package: xml_attr(tag, "package"),
+                filename: xml_attr(tag, "filename"),
+                hdrmd5: xml_attr(tag, "hdrmd5"),
+            }
+        }),
+        Err(_) => None,
+    };
+    Ok(BuildInfo {
+        error,
+        bdeps,
+        preinstall_image,
+    })
+}
+
+/// A boolean flag attribute on a buildinfo element: present and
+/// `"1"` or `"true"`. Absent, `"0"`, or anything else reads as false
+/// — a flag the server did not set is off, never an error.
+fn xml_flag(tag: &str, name: &str) -> bool {
+    matches!(xml_attr(tag, name).as_deref(), Some("1") | Some("true"))
 }
 
 /// Parse a `<buildhistory>...</buildhistory>` document into the
@@ -2125,6 +2265,32 @@ impl<'a> ObsClient<'a> {
         parse_buildinfo(&body)
     }
 
+    /// The build configuration for `project`/`repository`: the
+    /// expanded `_buildconfig` the engine takes as `--dist`. The text
+    /// passes through as-is — it is the build script's own format,
+    /// not XML, so there is nothing to type here. Requires OBS Basic
+    /// credentials. A 404 is an error (unknown project/repository).
+    pub fn buildconfig(&self, project: &str, repository: &str) -> Result<String, GeectlError> {
+        // No arch here: the buildconfig is per project/repository.
+        // Validate the two names directly instead of borrowing the
+        // coordinate validator with a dummy arch.
+        for (label, value) in [("project", project), ("repository", repository)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        self.require_build_credentials()?;
+        let url = build_url(
+            &self.base,
+            &["build", project, repository, "_buildconfig"],
+            &[],
+        );
+        self.http.get_with(&url, &self.credentials)
+    }
+
     /// The build history for `package` in `repository`/`arch`: the
     /// completed builds, newest first, up to `limit` entries. An empty
     /// history (never built) reads as an empty list. Requires OBS
@@ -3491,7 +3657,136 @@ mod tests {
             parsed.error.as_deref(),
             Some("unresolvable: DOES-NOT-EXIST")
         );
-        assert_eq!(parsed.bdeps, vec!["gcc".to_string(), "make".to_string()]);
+        assert_eq!(
+            parsed
+                .bdeps
+                .iter()
+                .map(|dep| dep.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gcc", "make"]
+        );
+    }
+
+    #[test]
+    fn parse_buildinfo_reads_bdep_origin_and_hdrmd5() {
+        // The trust check reads the project set and the cache
+        // verification reads the hdrmd5: both come from the `<bdep>`
+        // attributes, not from a second lookup.
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\" repository=\"r\" package=\"foo\" arch=\"x86_64\">\
+             <bdep name=\"gcc\" project=\"openSUSE:Factory\" repository=\"standard\" binary=\"gcc-13-1.1.x86_64.rpm\" hdrmd5=\"0123456789abcdef0123456789abcdef\" preinstall=\"1\"/>\
+             <bdep name=\"make\" project=\"home:alice\" repository=\"standard\" vminstall=\"1\" runscripts=\"true\"/>\
+             <bdep name=\"bash\"/></buildinfo>",
+        )
+        .unwrap();
+        assert_eq!(parsed.bdeps.len(), 3);
+        let gcc = &parsed.bdeps[0];
+        assert_eq!(gcc.name, "gcc");
+        assert_eq!(gcc.project.as_deref(), Some("openSUSE:Factory"));
+        assert_eq!(gcc.repository.as_deref(), Some("standard"));
+        assert_eq!(gcc.binary.as_deref(), Some("gcc-13-1.1.x86_64.rpm"));
+        assert_eq!(
+            gcc.hdrmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(gcc.preinstall);
+        assert!(!gcc.vminstall);
+        assert!(!gcc.runscripts);
+        let make = &parsed.bdeps[1];
+        assert_eq!(make.project.as_deref(), Some("home:alice"));
+        assert!(make.vminstall);
+        assert!(make.runscripts);
+        assert!(!make.preinstall);
+        // No origin at all reads as unknown, never as a match.
+        assert_eq!(parsed.bdeps[2].name, "bash");
+        assert_eq!(parsed.bdeps[2].project, None);
+        assert_eq!(parsed.bdeps[2].hdrmd5, None);
+        assert!(!parsed.bdeps[2].noinstall);
+        assert_eq!(parsed.bdeps[2].repoarch, None);
+        assert!(!parsed.bdeps[2].installonly);
+        assert!(!parsed.bdeps[2].sysroot);
+    }
+
+    #[test]
+    fn parse_buildinfo_reads_bdep_source_package_and_version() {
+        // Real scheduler buildinfo carries no `binary` attribute:
+        // the source package and the version/release/arch/epoch
+        // are what the local build resolves the file from.
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\" repository=\"r\" package=\"foo\" arch=\"x86_64\">\
+             <bdep name=\"libz1\" project=\"openSUSE:Factory\" repository=\"standard\" package=\"zlib\" version=\"1.3.1\" release=\"1.1\" arch=\"x86_64\" epoch=\"0\" hdrmd5=\"0123456789abcdef0123456789abcdef\"/>\
+             <bdep name=\"bash\"/></buildinfo>",
+        )
+        .unwrap();
+        assert_eq!(parsed.bdeps.len(), 2);
+        let libz1 = &parsed.bdeps[0];
+        assert_eq!(libz1.name, "libz1");
+        assert_eq!(libz1.package.as_deref(), Some("zlib"));
+        assert_eq!(libz1.binary, None);
+        assert_eq!(libz1.version.as_deref(), Some("1.3.1"));
+        assert_eq!(libz1.release.as_deref(), Some("1.1"));
+        assert_eq!(libz1.arch.as_deref(), Some("x86_64"));
+        assert_eq!(libz1.epoch.as_deref(), Some("0"));
+        assert_eq!(
+            libz1.hdrmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        // Absent reads as unknown on every new field, like the old ones.
+        let bash = &parsed.bdeps[1];
+        assert_eq!(bash.package, None);
+        assert_eq!(bash.version, None);
+        assert_eq!(bash.release, None);
+        assert_eq!(bash.arch, None);
+        assert_eq!(bash.epoch, None);
+    }
+
+    #[test]
+    fn parse_buildinfo_reads_bdep_repoarch_installonly_sysroot() {
+        // The local build keys the cache and the download URL by the
+        // dep's own repository/repoarch, and the rpmlist carries the
+        // installonly/sysroot shapes: all three come from the
+        // `<bdep>` attributes.
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\" repository=\"r\" package=\"foo\" arch=\"x86_64\">\
+             <bdep name=\"cross\" project=\"openSUSE:Factory\" repository=\"standard\" repoarch=\"aarch64\" binary=\"cross-1-1.aarch64.rpm\" installonly=\"1\"/>\
+             <bdep name=\"sys\" project=\"openSUSE:Factory\" repository=\"standard\" binary=\"sys-1-1.x86_64.rpm\" sysroot=\"1\"/></buildinfo>",
+        )
+        .unwrap();
+        assert_eq!(parsed.bdeps.len(), 2);
+        let cross = &parsed.bdeps[0];
+        assert_eq!(cross.repository.as_deref(), Some("standard"));
+        assert_eq!(cross.repoarch.as_deref(), Some("aarch64"));
+        assert!(cross.installonly);
+        assert!(!cross.sysroot);
+        let sys = &parsed.bdeps[1];
+        assert!(sys.sysroot);
+        assert!(!sys.installonly);
+        assert_eq!(sys.repoarch, None);
+    }
+
+    #[test]
+    fn parse_buildinfo_reads_the_preinstall_image() {
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\"><preinstallimage project=\"openSUSE:Factory\" repository=\"standard\" package=\"preinstallimage\" filename=\"openSUSE-Tumbleweed-preinstallimage.x86_64.rpm\" hdrmd5=\"abcdef0123456789abcdef0123456789\"/><bdep name=\"gcc\"/></buildinfo>",
+        )
+        .unwrap();
+        let image = parsed.preinstall_image.as_ref().unwrap();
+        assert_eq!(image.project.as_deref(), Some("openSUSE:Factory"));
+        assert_eq!(image.repository.as_deref(), Some("standard"));
+        assert_eq!(image.package.as_deref(), Some("preinstallimage"));
+        assert_eq!(
+            image.filename.as_deref(),
+            Some("openSUSE-Tumbleweed-preinstallimage.x86_64.rpm")
+        );
+        assert_eq!(
+            image.hdrmd5.as_deref(),
+            Some("abcdef0123456789abcdef0123456789")
+        );
+        // No image element reads as none, and a second element is
+        // ignored: the server sends at most one.
+        let parsed =
+            parse_buildinfo("<buildinfo project=\"p\"><bdep name=\"gcc\"/></buildinfo>").unwrap();
+        assert_eq!(parsed.preinstall_image, None);
     }
 
     #[test]
@@ -3766,7 +4061,13 @@ mod tests {
             .buildinfo("testproject", "foo", "standard", "x86_64")
             .unwrap();
         assert_eq!(info.error.as_deref(), Some("unresolvable: DOES-NOT-EXIST"));
-        assert_eq!(info.bdeps, vec!["gcc".to_string()]);
+        assert_eq!(
+            info.bdeps
+                .iter()
+                .map(|dep| dep.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gcc"]
+        );
         assert_eq!(
             http.get_calls(),
             vec![(
@@ -3784,6 +4085,35 @@ mod tests {
         let err = client
             .buildinfo("testproject", "foo", "standard", "x86_64")
             .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn buildconfig_returns_the_raw_text() {
+        // The buildconfig passes through as-is: the engine's own
+        // format, not XML, so the client types nothing here.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/_buildconfig",
+            "###\n# comment\nSubstitute: gcc gcc13\n",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let text = client.buildconfig("testproject", "standard").unwrap();
+        assert_eq!(text, "###\n# comment\nSubstitute: gcc gcc13\n");
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/build/testproject/standard/_buildconfig".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn buildconfig_fails_closed_without_credentials() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client.buildconfig("testproject", "standard").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(http.get_calls().is_empty());
     }

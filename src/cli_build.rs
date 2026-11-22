@@ -948,7 +948,7 @@ fn buildinfo_payload(
         "repository": repository,
         "arch": arch,
         "error": info.error,
-        "bdeps": info.bdeps,
+        "bdeps": info.bdeps.iter().map(|dep| dep.name.as_str()).collect::<Vec<_>>(),
     })
 }
 
@@ -963,7 +963,7 @@ fn render_buildinfo_text(info: &BuildInfo) -> String {
         lines.push("no dependencies".to_string());
     } else {
         lines.push("dependencies:".to_string());
-        lines.extend(info.bdeps.iter().cloned());
+        lines.extend(info.bdeps.iter().map(|dep| dep.name.clone()));
     }
     lines.join("\n")
 }
@@ -1388,7 +1388,7 @@ fn render_repositories_text(repositories: &[Repository]) -> String {
 mod tests {
     use super::*;
     use clap::FromArgMatches;
-    use geectl::obs::{BuildResult, PackageBuildStatus};
+    use geectl::obs::{BuildDep, BuildResult, PackageBuildStatus};
 
     /// The clap `Command` for the `build` group, built from the
     /// `Subcommand` derive: there is no `CommandFactory` for a
@@ -1717,6 +1717,7 @@ mod tests {
         let blocked = BuildInfo {
             error: Some("unresolvable: DOES-NOT-EXIST".to_string()),
             bdeps: vec![],
+            preinstall_image: None,
         };
         assert!(render_buildinfo_text(&blocked).contains("error: unresolvable: DOES-NOT-EXIST"));
         assert_eq!(
@@ -1725,7 +1726,47 @@ mod tests {
         );
         let clean = BuildInfo {
             error: None,
-            bdeps: vec!["gcc".to_string(), "make".to_string()],
+            bdeps: vec![
+                BuildDep {
+                    name: "gcc".to_string(),
+                    project: None,
+                    repository: None,
+                    package: None,
+                    binary: None,
+                    version: None,
+                    release: None,
+                    arch: None,
+                    epoch: None,
+                    hdrmd5: None,
+                    preinstall: false,
+                    vminstall: false,
+                    runscripts: false,
+                    noinstall: false,
+                    repoarch: None,
+                    installonly: false,
+                    sysroot: false,
+                },
+                BuildDep {
+                    name: "make".to_string(),
+                    project: None,
+                    repository: None,
+                    package: None,
+                    binary: None,
+                    version: None,
+                    release: None,
+                    arch: None,
+                    epoch: None,
+                    hdrmd5: None,
+                    preinstall: false,
+                    vminstall: false,
+                    runscripts: false,
+                    noinstall: false,
+                    repoarch: None,
+                    installonly: false,
+                    sysroot: false,
+                },
+            ],
+            preinstall_image: None,
         };
         let text = render_buildinfo_text(&clean);
         assert!(text.contains("no blocking error"));
