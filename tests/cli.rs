@@ -2209,6 +2209,27 @@ fn top_help_lists_the_gitea_group() {
 }
 
 #[test]
+fn pull_request_help_lists_both_subcommands() {
+    let out = geectl().args(["pull-request", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    for name in ["show", "search"] {
+        assert!(text.contains(name), "pull-request --help misses {name}");
+    }
+}
+
+#[test]
+fn top_help_lists_the_pull_request_group() {
+    let out = geectl().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("pull-request"),
+        "top --help misses the pull-request group"
+    );
+}
+
+#[test]
 fn build_results_without_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
@@ -2226,6 +2247,46 @@ fn build_results_without_credentials_fails_with_config_error() {
         .as_str()
         .unwrap()
         .contains("GEECTL_OBS_USERNAME"));
+}
+
+#[test]
+fn pull_request_show_obs_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "show", "obs:123"])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; an `obs:` read needs OBS Basic
+    // credentials and fails loudly without them.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
+}
+
+#[test]
+fn pull_request_show_gitea_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "show", "gitea:openSUSE/geectl#122"])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; a `gitea:` read needs the Bearer token
+    // and fails loudly without it.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_GITEA_TOKEN"));
 }
 
 #[test]
@@ -2372,7 +2433,7 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 17 blocks (top level, 8 groups, 8 leaves) — a
+    // The docs carry 19 blocks (top level, 9 groups, 9 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
     // groups and one leaf each — and the count assertion guards the
@@ -2382,8 +2443,8 @@ fn docs_help_blocks_match_the_binary() {
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-        17,
-        "docs/cli.md should carry 17 --help blocks (top level, 8 groups, 8 leaves);          update this count when a block is deliberately added or removed"
+        19,
+        "docs/cli.md should carry 19 --help blocks (top level, 9 groups, 9 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();

@@ -2,7 +2,7 @@
 
 The command reference for the geectl binary: one subcommand per
 operation, grouped under a top-level noun (`remote`, `request`,
-`branch`, `build`, `maintenance`, `service`, `gitea`), plus `version`
+`branch`, `build`, `maintenance`, `service`, `gitea`, `pull-request`), plus `version`
 and `config`.
 Every `--help` block below is the real output of the built binary
 (`geectl 0.2.1`); run `geectl --help` or `geectl <group> --help` for
@@ -107,17 +107,18 @@ Geeko Controller — a machine-first CLI for agents (OBS + src.opensuse.org)
 Usage: geectl [OPTIONS] [COMMAND]
 
 Commands:
-  version      Print version information as the result payload
-  config       Inspect or initialise the config file
-  remote       Remote reads and mutations: inspect what the distribution holds, and change it
-  request      Read and act on OBS submit requests, and file new ones
-  branch       Branch, copy, and link packages
-  build        Build-status commands: results, logs, histories, binaries
-  local-build  Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, and `spec-cleaner`
-  maintenance  Maintenance operations: maintained-instances listing and maintenance branching
-  service      Service reads: list a package's services and their run state
-  gitea        Gitea operations: repository and branch reads and mutations on the configured instance
-  help         Print this message or the help of the given subcommand(s)
+  version       Print version information as the result payload
+  config        Inspect or initialise the config file
+  remote        Remote reads and mutations: inspect what the distribution holds, and change it
+  request       Read and act on OBS submit requests, and file new ones
+  branch        Branch, copy, and link packages
+  build         Build-status commands: results, logs, histories, binaries
+  local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, and `spec-cleaner`
+  maintenance   Maintenance operations: maintained-instances listing and maintenance branching
+  service       Service reads: list a package's services and their run state
+  gitea         Gitea operations: repository and branch reads and mutations on the configured instance
+  pull-request  Read pull requests: OBS submit requests and Gitea pull requests as one surface
+  help          Print this message or the help of the given subcommand(s)
 
 Options:
       --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
@@ -563,6 +564,42 @@ Options:
           Print help
 ```
 
+## `pull-request` — unified pull-request reads
+
+```
+Read pull requests: OBS submit requests and Gitea pull requests as one surface
+
+Usage: geectl pull-request [OPTIONS] <COMMAND>
+
+Commands:
+  show    Show one pull request: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+  search  Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no `--backend` both arms run; `--backend` scopes to one
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Show one pull request: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+
+Usage: geectl pull-request show [OPTIONS] <REFERENCE>
+
+Arguments:
+  <REFERENCE>  The pull-request handle: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
 ## Common tasks
 
 ```sh
@@ -599,6 +636,11 @@ geectl service state openSUSE:Factory vim
 geectl gitea repo-get pool systemd
 geectl gitea branch-head pool systemd factory
 geectl gitea repo-create vim --private
+
+# Pull requests (OBS + Gitea as one surface)
+geectl pull-request show obs:1398977
+geectl pull-request show gitea:openSUSE/geectl#122
+geectl pull-request search --backend gitea --state open
 ```
 
 The `request file` flags above are illustrative — run

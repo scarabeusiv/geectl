@@ -10,6 +10,7 @@ mod cli_branch;
 mod cli_build;
 mod cli_gitea;
 mod cli_local_build;
+mod cli_pull_request;
 mod cli_remote;
 mod cli_request;
 mod cli_service;
@@ -135,6 +136,12 @@ enum Command {
         #[command(subcommand)]
         command: cli_gitea::GiteaCommand,
     },
+    /// Read pull requests: OBS submit requests and Gitea pull
+    /// requests as one surface.
+    PullRequest {
+        #[command(subcommand)]
+        command: cli_pull_request::PullRequestCommand,
+    },
 }
 
 /// The `config` subcommands.
@@ -188,6 +195,9 @@ fn run(
         }
         Some(Command::Service { command }) => cli_service::run_service(command, debug)?,
         Some(Command::Gitea { command }) => cli_gitea::run_gitea(command, debug, cli.live)?,
+        Some(Command::PullRequest { command }) => {
+            cli_pull_request::run_pull_request(command, debug)?
+        }
     };
     Ok(match format {
         Format::Json => payload.to_string(),
