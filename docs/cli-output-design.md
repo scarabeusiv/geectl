@@ -6,7 +6,7 @@ Status: debug channel implemented (#51 closed); text rendering implemented (PR #
 Depends on: the OBS command surface in the CLI (see §2); #23 (git vs
 OBS abstraction — the command tree must not split by backend).
 
-Verified against main `afdf6f6`: `src/main.rs` is a thin CLI
+Verified against main `f0c6e3a`: `src/main.rs` is a thin CLI
 over the library; global `--format` flag (json default, text alternative)
 plus the debug flags (`--debug`, `--debug-body`); text renderers exist
 for every command; the debug channel exists (global flags,
