@@ -4594,14 +4594,33 @@ impl<'a> LocalBuild<'a> {
     }
 }
 
+/// Capabilities the service container keeps: file ownership and
+/// modes, user and group changes, file capabilities, device
+/// nodes. Every other capability is dropped.
+const SERVICE_CONTAINER_CAPS: &str = "CHOWN,DAC_OVERRIDE,FOWNER,FSETID,SETGID,SETUID,SETFCAP,MKNOD";
+
+/// Memory cap for the service container, for RAM and for RAM
+/// plus swap together.
+const SERVICE_CONTAINER_MEMORY: &str = "4g";
+
+/// Process cap for the service container.
+const SERVICE_CONTAINER_PIDS_LIMIT: &str = "1024";
+
 /// One ephemeral container for a service run, a precommit, or a
 /// `spec-cleaner` invocation: started detached on `sleep` so the
 /// steps run as `podman exec` calls in the same container, stopped
 /// on drop. The `sleep` duration bounds a container orphaned by a
 /// killed client: it exits on its own when the budget lapses. The
-/// container carries the runner version as `OSC_VERSION` (the
+/// container runs as root: the package install needs root, and a
+/// non-root service user cannot write the bind-mounted source
+/// directory. Capabilities are dropped except the install set,
+/// new privileges are denied, and memory and process counts are
+/// capped; the network stays open — `download_url` fetches over
+/// it. The container carries the runner version as `OSC_VERSION` (the
 /// value is the geectl version); the `OBS_SERVICE_*` variables
-/// stay unset — a local run carries no project context. The
+/// stay unset — a local run carries no project context. No CPU cap
+/// is set: the wall-clock timeout already bounds CPU time, and a
+/// fixed CPU count does not scale portably across hosts. The
 /// `--mount` form splits on `,`, so a `,` in the source path
 /// misparses the mount.
 struct ServiceContainer {
@@ -4637,6 +4656,18 @@ impl ServiceContainer {
             "--rm",
             "--name",
             &name,
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            SERVICE_CONTAINER_CAPS,
+            "--security-opt",
+            "no-new-privileges",
+            "--memory",
+            SERVICE_CONTAINER_MEMORY,
+            "--memory-swap",
+            SERVICE_CONTAINER_MEMORY,
+            "--pids-limit",
+            SERVICE_CONTAINER_PIDS_LIMIT,
             "-e",
             &osc_version,
             "--mount",
@@ -8747,6 +8778,50 @@ exit 0
                 mount_pos < image_pos,
                 "mount flag follows the image name: {run_line}"
             );
+        }
+
+        #[test]
+        fn service_container_run_carries_hardening_flags() {
+            // The container runs hardened: capabilities dropped
+            // except the install set, no new privileges, memory
+            // and process counts capped.
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.ran.len(), 1);
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            let run_line = log.lines().find(|l| l.starts_with("run "));
+            let Some(run_line) = run_line else {
+                panic!("no run call in log: {log}");
+            };
+            let image_pos = run_line
+                .find(DEFAULT_IMAGE)
+                .expect("run line carries no image");
+            for flag in [
+                "--cap-drop ALL",
+                "--cap-add CHOWN,DAC_OVERRIDE,FOWNER,FSETID,SETGID,SETUID,SETFCAP,MKNOD",
+                "--security-opt no-new-privileges",
+                "--memory 4g",
+                "--memory-swap 4g",
+                "--pids-limit 1024",
+            ] {
+                assert!(run_line.contains(flag), "run line lacks {flag}: {run_line}");
+                assert!(
+                    run_line.find(flag).unwrap() < image_pos,
+                    "flag {flag} follows the image name: {run_line}"
+                );
+            }
         }
 
         #[test]
