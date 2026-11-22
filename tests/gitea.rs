@@ -39,7 +39,7 @@
 use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth};
 use geectl::debug::Debug;
 use geectl::error::ErrorKind;
-use geectl::gitea::{ForkRepoOptions, GiteaClient};
+use geectl::gitea::{ForkRepoOptions, GiteaClient, RepoCreateOptions};
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::DryRun;
 
@@ -284,6 +284,78 @@ fn create_repo_raw(http: &UreqClient, base: &str, name: &str) -> String {
         .to_string()
 }
 
+/// Create a repository through the typed phase-2 operation and
+/// return the created repo. A live create always returns `Some`.
+/// The default branch is named explicitly: the branch tests commit
+/// onto it, so it must be the branch the repo records.
+fn create_repo_typed(
+    client: &GiteaClient,
+    name: &str,
+    default_branch: &str,
+) -> geectl::gitea::GiteaRepository {
+    client
+        .repo_create(
+            name,
+            &RepoCreateOptions {
+                private: false,
+                description: None,
+                default_branch: Some(default_branch.to_string()),
+            },
+            &DryRun::new(false),
+        )
+        .expect("typed repo_create creates the repository")
+        .expect("a non-dry-run create returns the repo")
+}
+
+/// The address of a repository on the live instance, for the raw
+/// setup helpers — base URL + owner + repo in one value, so the
+/// helpers stay under clippy's argument limit.
+struct RepoAddr<'a> {
+    base: &'a str,
+    owner: &'a str,
+    repo: &'a str,
+}
+
+/// Create a file (and its commit) through the raw contents API
+/// and return the commit SHA. `new_branch` creates the branch from
+/// `branch` instead of committing onto it — the branch-creation
+/// setup the branch tests use, since branch creation itself is a
+/// phase-4 operation. Raw setup, like `create_repo_raw`: the
+/// assertions then go through the typed operations.
+fn create_commit_raw(
+    http: &UreqClient,
+    at: &RepoAddr,
+    path: &str,
+    content: &str,
+    branch: &str,
+    new_branch: Option<&str>,
+) -> String {
+    use base64::Engine as _;
+    let mut body = serde_json::json!({
+        "message": format!("add {path}"),
+        "content": base64::engine::general_purpose::STANDARD.encode(content),
+        "branch": branch,
+    });
+    if let Some(new_branch) = new_branch {
+        body["new_branch"] = serde_json::Value::String(new_branch.to_string());
+    }
+    let created = http
+        .post_json(
+            &format!(
+                "{}/api/v1/repos/{}/{}/contents/{path}",
+                at.base, at.owner, at.repo
+            ),
+            &body.to_string(),
+        )
+        .expect("POST the contents API on the Gitea instance");
+    let created: serde_json::Value =
+        serde_json::from_str(&created).expect("POST the contents API returns valid JSON");
+    created["commit"]["sha"]
+        .as_str()
+        .expect("the contents API returns the commit SHA")
+        .to_string()
+}
+
 /// An organization name unique to this run. Shorter than
 /// `unique_repo_name`: Gitea caps usernames at 39 characters, and
 /// `geectl-live-<pid>-<nanos>` can exceed it.
@@ -381,6 +453,277 @@ fn gitea_repo_delete_removes_the_repo() {
         ErrorKind::NotFound,
         "deleting a missing repository must map to NotFound; got {err:?}"
     );
+}
+
+#[test]
+fn gitea_repo_list_forms() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    // The osc `git-repo-list.feature` forms, against the real
+    // layout: the org form lists the populated mirror (among
+    // whatever the org holds — the org is shared across the
+    // parallel live tests), the user form lists the token owner's
+    // repos, and the combined form lists the user's repos first,
+    // then the org's.
+    let org_repos = client
+        .repo_list(None, Some("pool"))
+        .expect("typed repo_list lists the pool org");
+    // Contains, not exact equality: the org is shared mutable
+    // state across the parallel live tests, and a future test
+    // creating a pool repo must not break this one. The mirror is
+    // the only pool repo today.
+    assert!(
+        org_repos.iter().any(|r| r.full_name == "pool/systemd"),
+        "the pool org's repository list must contain the mirror repo; got {} repos",
+        org_repos.len()
+    );
+    // Fork the mirror so the user owns a repo to list: a re-run
+    // reuses the existing fork (same assertions hold).
+    let forked = fork_live(&client, "pool", "systemd", &ForkRepoOptions::default());
+    assert_eq!(forked.full_name, format!("{}/systemd", gitea_user()));
+    let user_repos = client
+        .repo_list(Some(&gitea_user()), None)
+        .expect("typed repo_list lists the user");
+    let user_names: Vec<&str> = user_repos.iter().map(|r| r.full_name.as_str()).collect();
+    // The check is hoisted out of the assert so the failure
+    // message is a static string: no repository name reaches the
+    // log on failure. (CodeQL's cleartext-logging flagged the
+    // names in the message, and the count form was still flagged.)
+    let has_fork = user_names.contains(&forked.full_name.as_str());
+    assert!(has_fork, "the user's repository list must contain the fork");
+    // Both: the user's repos first, then the org's.
+    let both = client
+        .repo_list(Some(&gitea_user()), Some("pool"))
+        .expect("typed repo_list lists user and org");
+    let both_names: Vec<&str> = both.iter().map(|r| r.full_name.as_str()).collect();
+    let user_at = both_names
+        .iter()
+        .position(|n| *n == forked.full_name.as_str())
+        .expect("the combined list contains the user's fork");
+    let org_at = both_names
+        .iter()
+        .position(|n| *n == "pool/systemd")
+        .expect("the combined list contains the org repo");
+    assert!(
+        user_at < org_at,
+        "the combined list must name the user's repos before the org's; got {} repos",
+        both_names.len()
+    );
+    // Neither filter: the token owner's own repos — the same list
+    // the user form returns for the token owner, modulo other
+    // tests' repos created between the two calls (contains, not
+    // equality).
+    let own = client
+        .repo_list(None, None)
+        .expect("typed repo_list lists the token owner's repos");
+    let own_names: Vec<&str> = own.iter().map(|r| r.full_name.as_str()).collect();
+    assert!(
+        own_names.contains(&forked.full_name.as_str()),
+        "the owner's repository list must contain the fork; got {} repos",
+        own_names.len()
+    );
+}
+
+#[test]
+fn gitea_repo_create_round_trip_and_collision() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let created = create_repo_typed(&client, &repo, "factory");
+    assert_eq!(created.full_name, format!("{}/{repo}", gitea_user()));
+    assert_eq!(created.name, repo);
+    assert_eq!(created.default_branch, "factory");
+    assert!(
+        created.parent.is_none(),
+        "a freshly created repository is not a fork; body: {created:?}"
+    );
+    // The creation shows up on the server: the repo reads back,
+    // and the owner's list contains it.
+    let read = client
+        .repo_get(&gitea_user(), &repo)
+        .expect("typed repo_get reads the created repository");
+    assert_eq!(read.full_name, created.full_name);
+    let own = client
+        .repo_list(None, None)
+        .expect("typed repo_list lists the token owner's repos");
+    assert!(
+        own.iter().any(|r| r.full_name == created.full_name),
+        "the owner's repository list must contain the created repo"
+    );
+    // Creating the same name again is a collision, not a second
+    // repo.
+    let err = client
+        .repo_create(&repo, &RepoCreateOptions::default(), &DryRun::new(false))
+        .expect_err("creating a repository of an existing name must fail");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::AlreadyExists,
+        "creating a repository of an existing name must be AlreadyExists; got {err:?}"
+    );
+    // Clean up: the created repo is removed again.
+    let deleted = delete_live(&client, &gitea_user(), &repo);
+    assert_eq!(deleted, repo);
+}
+
+#[test]
+fn gitea_repo_create_dry_run_plans_and_creates_nothing() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let planned = client
+        .repo_create(&repo, &RepoCreateOptions::default(), &DryRun::new(true))
+        .expect("a dry-run create records the plan");
+    assert_eq!(planned, None, "a dry-run create returns no repo");
+    // And nothing was created on the server.
+    let err = client
+        .repo_get(&gitea_user(), &repo)
+        .expect_err("the dry-run create must not create the repository");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "the dry-run create must not create the repository; got {err:?}"
+    );
+}
+
+#[test]
+fn gitea_branch_read_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    create_repo_typed(&client, &repo, "factory");
+    // The first commit creates the default branch; the second
+    // commit creates a branch off it; the third proves a slashed
+    // branch name travels through the encoded segment.
+    let factory_sha = create_commit_raw(
+        &http,
+        &RepoAddr {
+            base: &base,
+            owner: &gitea_user(),
+            repo: &repo,
+        },
+        "README.md",
+        "phase-2 live test\n",
+        "factory",
+        None,
+    );
+    let slfo_sha = create_commit_raw(
+        &http,
+        &RepoAddr {
+            base: &base,
+            owner: &gitea_user(),
+            repo: &repo,
+        },
+        "SLFO.md",
+        "phase-2 live test\n",
+        "factory",
+        Some("slfo-main"),
+    );
+    let feature_sha = create_commit_raw(
+        &http,
+        &RepoAddr {
+            base: &base,
+            owner: &gitea_user(),
+            repo: &repo,
+        },
+        "FEATURE.md",
+        "phase-2 live test\n",
+        "factory",
+        Some("feature/x"),
+    );
+    // The branch list carries all three, with their head commits.
+    let branches = client
+        .branch_list(&gitea_user(), &repo)
+        .expect("typed branch_list lists the branches");
+    let mut names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["factory", "feature/x", "slfo-main"]);
+    let head_of = |name: &str| {
+        branches
+            .iter()
+            .find(|b| b.name == name)
+            .expect("the branch is listed")
+            .commit
+            .id
+            .clone()
+    };
+    assert_eq!(head_of("factory"), factory_sha);
+    assert_eq!(head_of("slfo-main"), slfo_sha);
+    assert_eq!(head_of("feature/x"), feature_sha);
+    // The single-branch read agrees with the list, including the
+    // commit message — and the head is the same SHA the contents
+    // API returned on creation, which is the sync-verification
+    // comparison the filer will make.
+    let factory = client
+        .branch_get(&gitea_user(), &repo, "factory")
+        .expect("typed branch_get reads the default branch");
+    assert_eq!(factory.commit.id, factory_sha);
+    // Gitea stores the commit message with a trailing newline, so
+    // the comparison trims it — the message itself is the pin.
+    assert_eq!(factory.commit.message.trim_end(), "add README.md");
+    assert_eq!(
+        client
+            .branch_head(&gitea_user(), &repo, "factory")
+            .expect("typed branch_head reads the default branch head"),
+        factory_sha
+    );
+    let slfo = client
+        .branch_get(&gitea_user(), &repo, "slfo-main")
+        .expect("typed branch_get reads the slfo branch");
+    assert_eq!(slfo.commit.id, slfo_sha);
+    assert_eq!(
+        client
+            .branch_head(&gitea_user(), &repo, "slfo-main")
+            .expect("typed branch_head reads the slfo branch head"),
+        slfo_sha
+    );
+    // The slashed branch reads back through the encoded segment.
+    let feature = client
+        .branch_get(&gitea_user(), &repo, "feature/x")
+        .expect("typed branch_get reads the slashed branch");
+    assert_eq!(feature.commit.id, feature_sha);
+    assert_eq!(
+        client
+            .branch_head(&gitea_user(), &repo, "feature/x")
+            .expect("typed branch_head reads the slashed branch head"),
+        feature_sha
+    );
+    // A missing branch maps to NotFound, and so does a missing repo.
+    let err = client
+        .branch_get(&gitea_user(), &repo, "leap-16.0")
+        .expect_err("a missing branch must not return a value");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "a missing branch must map to NotFound; got {err:?}"
+    );
+    let err = client
+        .branch_list(&gitea_user(), "geectl-live-no-such-repo")
+        .expect_err("a missing repository must not list branches");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "a missing repository must map to NotFound; got {err:?}"
+    );
+    // Clean up: the created repo is removed again, so the live
+    // runs do not grow the token owner's repository list.
+    let deleted = delete_live(&client, &gitea_user(), &repo);
+    assert_eq!(deleted, repo);
 }
 
 #[test]
