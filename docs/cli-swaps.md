@@ -31,6 +31,7 @@ what is specific to that group.
 | (no osc command) | `remote upload-file` | New surface: a raw file upload is API-only in osc (`osc api -X PUT -T FILE <path>`); the local file is read from `--from`, `--binary` uploads bytes |
 | (no osc command) | `remote create-project` | New surface: osc has no project-create command; projects are created through `meta -e` — the library creates the server meta directly |
 | `osc rmkpac [--scmsync SCMSYNC] [--force] PROJECT PACKAGE` | `remote create-package` | One command per library operation. `--scmsync` / `--force` select the options form of the creation |
+| `osc rdelete [-m TEXT] PROJECT PACKAGE` | `remote delete-package` | One command per library operation; osc's `-m` is dropped — the package delete carries no comment |
 | `osc ls /` | `remote list-projects` | Same listing, named as a leaf under `remote` |
 
 ## `request` — submit requests (issue #73)

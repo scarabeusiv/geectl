@@ -668,6 +668,7 @@ fn remote_help_lists_every_command() {
         "upload-file",
         "create-project",
         "create-package",
+        "delete-package",
         "list-projects",
     ] {
         assert!(
@@ -1336,6 +1337,30 @@ fn remote_create_package_dry_run_ignores_half_set_credentials() {
         assert_eq!(value["project"], "home:alice");
         assert_eq!(value["package"], "vim");
     }
+}
+
+#[test]
+fn remote_delete_package_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "delete-package", "home:alice", "vim", "--force"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "home:alice");
+    assert_eq!(value["package"], "vim");
+    assert_eq!(value["force"], true);
 }
 
 #[test]
