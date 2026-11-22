@@ -13,6 +13,7 @@ use super::ObsClient;
 use super::PackageMeta;
 use super::ProjectMeta;
 use super::Repository;
+use super::RoleGrant;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::xml::skip_xml_prolog;
@@ -82,6 +83,128 @@ fn validate_roles(persons: &[NamedRole], groups: &[NamedRole]) -> Result<(), Gee
         }
     }
     Ok(())
+}
+
+/// The roles the server grants on projects and packages.
+const LOCAL_ROLES: [&str; 5] = ["maintainer", "bugowner", "reviewer", "downloader", "reader"];
+
+/// Validate a role for a direct grant on `what`: it must be one of
+/// the local roles the server grants on projects and packages.
+fn validate_role(role: &str, what: &str) -> Result<(), GeectlError> {
+    if LOCAL_ROLES.contains(&role) {
+        Ok(())
+    } else {
+        Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "invalid OBS role {role:?} for {what}; roles are {}",
+                LOCAL_ROLES.join(", ")
+            ),
+        ))
+    }
+}
+
+/// Validate the grantees of a role change in `grant`: at least one
+/// of `person` and `group` must name someone, and every name must be
+/// a valid OBS name. Returns the grantee phrase for the dry-run plan.
+fn grantee_phrase(grant: &RoleGrant) -> Result<String, GeectlError> {
+    for (label, name) in [
+        ("person", grant.person.as_deref()),
+        ("group", grant.group.as_deref()),
+    ] {
+        if let Some(name) = name {
+            if !valid_obs_name(name) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {name:?}"),
+                ));
+            }
+        }
+    }
+    match (grant.person.as_deref(), grant.group.as_deref()) {
+        (Some(person), Some(group)) => Ok(format!("person {person} and group {group}")),
+        (Some(person), None) => Ok(format!("person {person}")),
+        (None, Some(group)) => Ok(format!("group {group}")),
+        (None, None) => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "a role change names no person or group: name a person or a group",
+        )),
+    }
+}
+
+/// Add the role in `grant` for its person and/or group to the role
+/// lists. A pair already present stays where it is; a missing pair
+/// is appended.
+fn add_role_to_lists(
+    persons: &[NamedRole],
+    groups: &[NamedRole],
+    grant: &RoleGrant,
+) -> (Vec<NamedRole>, Vec<NamedRole>) {
+    let role = grant.role.as_str();
+    let mut persons = persons.to_vec();
+    let mut groups = groups.to_vec();
+    if let Some(name) = grant.person.as_deref() {
+        if !persons
+            .iter()
+            .any(|entry| entry.name == name && entry.role == role)
+        {
+            persons.push(NamedRole {
+                name: name.to_string(),
+                role: role.to_string(),
+            });
+        }
+    }
+    if let Some(name) = grant.group.as_deref() {
+        if !groups
+            .iter()
+            .any(|entry| entry.name == name && entry.role == role)
+        {
+            groups.push(NamedRole {
+                name: name.to_string(),
+                role: role.to_string(),
+            });
+        }
+    }
+    (persons, groups)
+}
+
+/// Remove the role in `grant` for its person and/or group from the
+/// role lists. A pair that is not present is an error, never a
+/// silent no-op.
+fn remove_role_from_lists(
+    persons: &[NamedRole],
+    groups: &[NamedRole],
+    grant: &RoleGrant,
+    what: &str,
+) -> Result<(Vec<NamedRole>, Vec<NamedRole>), GeectlError> {
+    let role = grant.role.as_str();
+    let mut persons = persons.to_vec();
+    let mut groups = groups.to_vec();
+    if let Some(name) = grant.person.as_deref() {
+        if !persons
+            .iter()
+            .any(|entry| entry.name == name && entry.role == role)
+        {
+            return Err(GeectlError::new(
+                ErrorKind::NotFound,
+                format!("person {name} with role {role} not found on {what}"),
+            ));
+        }
+        persons.retain(|entry| !(entry.name == name && entry.role == role));
+    }
+    if let Some(name) = grant.group.as_deref() {
+        if !groups
+            .iter()
+            .any(|entry| entry.name == name && entry.role == role)
+        {
+            return Err(GeectlError::new(
+                ErrorKind::NotFound,
+                format!("group {name} with role {role} not found on {what}"),
+            ));
+        }
+        groups.retain(|entry| !(entry.name == name && entry.role == role));
+    }
+    Ok((persons, groups))
 }
 
 /// Validate the repositories of a project meta write: each name,
@@ -310,8 +433,22 @@ impl<'a> ObsClient<'a> {
         }
         let url = build_url(&self.base, &["source", project, "_meta"], &[]);
         let body = self.http.get_with(&url, &self.credentials)?;
-        let current = parse_project_meta(&body)?;
-        let mut doc = XmlDoc::parse(&body)?;
+        self.write_project_meta(project, &body, meta)
+    }
+
+    /// Edit a fetched project meta document in place and PUT it back
+    /// when anything changed: the shared core of
+    /// `set_project_meta` and the role operations, which read the
+    /// meta once and write from the same snapshot.
+    fn write_project_meta(
+        &self,
+        project: &str,
+        body: &str,
+        meta: &ProjectMeta,
+    ) -> Result<(), GeectlError> {
+        let url = build_url(&self.base, &["source", project, "_meta"], &[]);
+        let current = parse_project_meta(body)?;
+        let mut doc = XmlDoc::parse(body)?;
         // The document as fetched, for the no-change check below:
         // comparing parsed documents (not rendered text) means a
         // prolog in the fetched meta, or a reorder from an edit that
@@ -342,7 +479,7 @@ impl<'a> ObsClient<'a> {
             set_roles(&mut doc, &meta.persons, &meta.groups)?;
         }
         if current.repositories != meta.repositories {
-            refuse_unmodeled_repositories(&body)?;
+            refuse_unmodeled_repositories(body)?;
             doc.remove_elements("repository");
             for repository in &meta.repositories {
                 doc.append_element(&repository_element(repository))?;
@@ -415,7 +552,9 @@ impl<'a> ObsClient<'a> {
 
     /// Edit a fetched package meta document in place and PUT it back
     /// when anything changed: the shared core of
-    /// `set_package_meta` and `update_package_meta_from_spec`.
+    /// `set_package_meta`, `update_package_meta_from_spec`, and the
+    /// package role operations, which read the meta once and write
+    /// from the same snapshot.
     fn write_package_meta(
         &self,
         project: &str,
@@ -544,6 +683,261 @@ impl<'a> ObsClient<'a> {
         meta.title = parsed.title;
         meta.url = parsed.url;
         meta.description = parsed.description;
+        self.write_package_meta(project, package, &body, &meta)
+    }
+
+    /// Read the project meta through the authenticated source route
+    /// (`GET /source/<project>/_meta`), returning the fetched body
+    /// with the parsed meta: the role operations write from the same
+    /// snapshot they read, so a change between the read and the write
+    /// cannot be overwritten.
+    fn read_project_meta(&self, project: &str) -> Result<(String, ProjectMeta), GeectlError> {
+        let url = build_url(&self.base, &["source", project, "_meta"], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        let meta = parse_project_meta(&body)?;
+        Ok((body, meta))
+    }
+
+    /// Read the package meta through the authenticated source route
+    /// (`GET /source/<project>/<package>/_meta`), returning the
+    /// fetched body with the parsed meta: the role operations write
+    /// from the same snapshot they read, so a change between the read
+    /// and the write cannot be overwritten.
+    fn read_package_meta(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<(String, PackageMeta), GeectlError> {
+        let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        let meta = parse_package_meta(&body)?;
+        Ok((body, meta))
+    }
+
+    /// Grant the role in `grant` to its person and/or group on project `project`
+    /// (direct grant: read the project meta, add the role, write it
+    /// back). The role in `grant` must be one of the local roles the server
+    /// grants on projects and packages: maintainer, bugowner,
+    /// reviewer, downloader, reader. A pair already present is left
+    /// alone, so granting a role that is already held writes
+    /// nothing. Requires credentials; without them the call fails
+    /// loudly before any request. In dry-run the grant is recorded
+    /// in the plan and nothing is written — the guard runs before
+    /// the credentials check, like `create_package`.
+    ///
+    /// An agent grants a role directly when the grant needs no
+    /// review: the request-based `file_add_role` asks for a role
+    /// instead.
+    pub fn role_add_project(
+        &self,
+        project: &str,
+        grant: &RoleGrant,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        let role = grant.role.as_str();
+        validate_role(role, &format!("project {project}"))?;
+        let grantees = grantee_phrase(grant)?;
+        if !dry_run.allow(&format!(
+            "add {role} role for {grantees} on project {project}"
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("cannot add a role on project {project} without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"),
+            ));
+        }
+        let (body, mut meta) = self.read_project_meta(project)?;
+        let (persons, groups) = add_role_to_lists(&meta.persons, &meta.groups, grant);
+        meta.persons = persons;
+        meta.groups = groups;
+        self.write_project_meta(project, &body, &meta)
+    }
+
+    /// Grant the role in `grant` to its person and/or group on package `package`
+    /// in project `project` (direct grant: read the package meta,
+    /// add the role, write it back). Same terms as
+    /// [`ObsClient::role_add_project`].
+    ///
+    /// An agent grants a package role directly when the grant needs
+    /// no review: the request-based `file_add_role` asks for a role
+    /// instead.
+    pub fn role_add_package(
+        &self,
+        project: &str,
+        package: &str,
+        grant: &RoleGrant,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let role = grant.role.as_str();
+        validate_role(role, &format!("package {project}/{package}"))?;
+        let grantees = grantee_phrase(grant)?;
+        if !dry_run.allow(&format!(
+            "add {role} role for {grantees} on package {project}/{package}"
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("cannot add a role on package {project}/{package} without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"),
+            ));
+        }
+        let (body, mut meta) = self.read_package_meta(project, package)?;
+        let (persons, groups) = add_role_to_lists(&meta.persons, &meta.groups, grant);
+        meta.persons = persons;
+        meta.groups = groups;
+        self.write_package_meta(project, package, &body, &meta)
+    }
+
+    /// Remove the role in `grant` from its person and/or group on project
+    /// `project` (direct removal: read the project meta, remove the
+    /// role, write it back). Force-confirmed: without `force` the
+    /// call refuses — removing access is destructive. A pair that is
+    /// not present is an error, never a silent no-op. Removing the
+    /// last maintainer is refused even with force: grant a maintainer
+    /// role to someone else first, or ask an administrator to restore
+    /// one — a project with no maintainer leaves a non-admin user
+    /// unable to write it. The zero-maintainer state itself is
+    /// reachable only by writing the project meta directly with
+    /// [`ObsClient::set_project_meta`], which this guard does not
+    /// block. Requires credentials;
+    /// without them the call fails loudly before any request. In
+    /// dry-run the removal is recorded in the plan and nothing is
+    /// written — the guard runs before the credentials check, like
+    /// `create_package`.
+    ///
+    /// An agent removes a role directly when the removal needs no
+    /// review.
+    pub fn role_remove_project(
+        &self,
+        project: &str,
+        grant: &RoleGrant,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        let role = grant.role.as_str();
+        validate_role(role, &format!("project {project}"))?;
+        let grantees = grantee_phrase(grant)?;
+        if !force {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("refusing to remove {role} role for {grantees} from project {project} without force: removing access is destructive; pass force to confirm"),
+            ));
+        }
+        if !dry_run.allow(&format!(
+            "remove {role} role for {grantees} from project {project}"
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("cannot remove a role on project {project} without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"),
+            ));
+        }
+        let (body, mut meta) = self.read_project_meta(project)?;
+        let (persons, groups) = remove_role_from_lists(
+            &meta.persons,
+            &meta.groups,
+            grant,
+            &format!("project {project}"),
+        )?;
+        if meta
+            .persons
+            .iter()
+            .chain(meta.groups.iter())
+            .any(|entry| entry.role == "maintainer")
+            && !persons
+                .iter()
+                .chain(groups.iter())
+                .any(|entry| entry.role == "maintainer")
+        {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("refusing to remove the last maintainer of project {project}: the project would have no maintainer left; grant a maintainer role to someone else first"),
+            ));
+        }
+        meta.persons = persons;
+        meta.groups = groups;
+        self.write_project_meta(project, &body, &meta)
+    }
+
+    /// Remove the role in `grant` from its person and/or group on package
+    /// `package` in project `project` (direct removal: read the
+    /// package meta, remove the role, write it back). Same terms as
+    /// [`ObsClient::role_remove_project`], except removing the last
+    /// package maintainer is allowed: the project maintainers still
+    /// cover the package.
+    ///
+    /// An agent removes a package role directly when the removal
+    /// needs no review.
+    pub fn role_remove_package(
+        &self,
+        project: &str,
+        package: &str,
+        grant: &RoleGrant,
+        force: bool,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let role = grant.role.as_str();
+        validate_role(role, &format!("package {project}/{package}"))?;
+        let grantees = grantee_phrase(grant)?;
+        if !force {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("refusing to remove {role} role for {grantees} from package {project}/{package} without force: removing access is destructive; pass force to confirm"),
+            ));
+        }
+        if !dry_run.allow(&format!(
+            "remove {role} role for {grantees} from package {project}/{package}"
+        )) {
+            return Ok(());
+        }
+        if !self.has_basic() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("cannot remove a role on package {project}/{package} without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"),
+            ));
+        }
+        let (body, mut meta) = self.read_package_meta(project, package)?;
+        let (persons, groups) = remove_role_from_lists(
+            &meta.persons,
+            &meta.groups,
+            grant,
+            &format!("package {project}/{package}"),
+        )?;
+        meta.persons = persons;
+        meta.groups = groups;
         self.write_package_meta(project, package, &body, &meta)
     }
 
@@ -1081,5 +1475,554 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_add_project_adds_a_group_role_and_keeps_the_person() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PROJECT_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        assert!(client
+            .role_add_project(
+                "home:scarabeus_iv",
+                &RoleGrant::group("editors", "reviewer"),
+                &DryRun::new(false)
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(puts[0]
+            .1
+            .contains("<person userid=\"alice\" role=\"maintainer\"/>"));
+        assert!(puts[0]
+            .1
+            .contains("<group groupid=\"editors\" role=\"reviewer\"/>"));
+        assert!(puts[0].1.contains("<title>Old title</title>"));
+        assert!(puts[0].1.contains("<lock><enable/></lock>"));
+    }
+
+    #[test]
+    fn role_add_project_granting_a_role_already_held_writes_nothing() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PROJECT_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        assert!(client
+            .role_add_project(
+                "home:scarabeus_iv",
+                &RoleGrant::person("alice", "maintainer"),
+                &DryRun::new(false)
+            )
+            .is_ok());
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn role_add_project_rejects_a_role_outside_the_local_roles() {
+        let http = FakeHttp::new();
+        let client = project_client(&http);
+        let err = client
+            .role_add_project(
+                "home:scarabeus_iv",
+                &RoleGrant::person("alice", "admin"),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context
+                .contains("roles are maintainer, bugowner, reviewer, downloader, reader"),
+            "{}",
+            err.context
+        );
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_add_project_rejects_an_invalid_role_before_the_missing_grantee() {
+        let http = FakeHttp::new();
+        let client = project_client(&http);
+        let err = client
+            .role_add_project(
+                "home:scarabeus_iv",
+                &RoleGrant {
+                    person: None,
+                    group: None,
+                    role: "admin".to_string(),
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("invalid OBS role"), "{}", err.context);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_add_project_rejects_a_grant_with_no_grantee() {
+        let http = FakeHttp::new();
+        let client = project_client(&http);
+        let err = client
+            .role_add_project(
+                "home:scarabeus_iv",
+                &RoleGrant {
+                    person: None,
+                    group: None,
+                    role: "maintainer".to_string(),
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains("no person or group"),
+            "{}",
+            err.context
+        );
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_add_project_dry_run_records_the_grant_and_sends_nothing() {
+        let http = FakeHttp::new();
+        let client = project_client(&http);
+        let dry = DryRun::new(true);
+        assert!(client
+            .role_add_project(
+                "home:scarabeus_iv",
+                &RoleGrant::group("editors", "reviewer"),
+                &dry
+            )
+            .is_ok());
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec![
+                "[dry-run] would: add reviewer role for group editors on project home:scarabeus_iv"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn role_add_package_adds_a_person_and_a_group_role() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                PACKAGE_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        assert!(client
+            .role_add_package(
+                "home:scarabeus_iv",
+                "foo",
+                &RoleGrant::new(Some("bob"), Some("editors"), "reviewer"),
+                &DryRun::new(false)
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(puts[0]
+            .1
+            .contains("<person userid=\"alice\" role=\"maintainer\"/>"));
+        assert!(puts[0]
+            .1
+            .contains("<person userid=\"bob\" role=\"reviewer\"/>"));
+        assert!(puts[0]
+            .1
+            .contains("<group groupid=\"editors\" role=\"reviewer\"/>"));
+        assert!(puts[0].1.contains("<title>Old title</title>"));
+        assert!(puts[0].1.contains("<lock><enable/></lock>"));
+    }
+
+    #[test]
+    fn role_remove_project_removes_the_role_and_keeps_the_rest() {
+        const TWO_MAINTAINERS: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><person userid=\"alice\" role=\"maintainer\"/><person userid=\"bob\" role=\"maintainer\"/><group groupid=\"editors\" role=\"bugowner\"/></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                TWO_MAINTAINERS,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        assert!(client
+            .role_remove_project(
+                "home:scarabeus_iv",
+                &RoleGrant::person("bob", "maintainer"),
+                true,
+                &DryRun::new(false)
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(puts[0]
+            .1
+            .contains("<person userid=\"alice\" role=\"maintainer\"/>"));
+        assert!(!puts[0].1.contains("bob"));
+        assert!(puts[0]
+            .1
+            .contains("<group groupid=\"editors\" role=\"bugowner\"/>"));
+        assert!(puts[0].1.contains("<title>Old title</title>"));
+    }
+
+    #[test]
+    fn role_remove_project_refuses_without_force() {
+        let http = FakeHttp::new();
+        let client = project_client(&http);
+        let err = client
+            .role_remove_project(
+                "home:scarabeus_iv",
+                &RoleGrant::person("alice", "maintainer"),
+                false,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("without force"), "{}", err.context);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_remove_project_dry_run_without_force_errors() {
+        let http = FakeHttp::new();
+        let client = project_client(&http);
+        let dry = DryRun::new(true);
+        let err = client
+            .role_remove_project(
+                "home:scarabeus_iv",
+                &RoleGrant::person("alice", "maintainer"),
+                false,
+                &dry,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("without force"), "{}", err.context);
+        assert!(dry.plan().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_remove_project_refuses_a_pair_that_is_not_present() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PROJECT_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let err = client
+            .role_remove_project(
+                "home:scarabeus_iv",
+                &RoleGrant::person("carol", "reviewer"),
+                true,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(
+            err.context
+                .contains("not found on project home:scarabeus_iv"),
+            "{}",
+            err.context
+        );
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn role_remove_project_refuses_removing_the_last_maintainer() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PROJECT_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let err = client
+            .role_remove_project(
+                "home:scarabeus_iv",
+                &RoleGrant::person("alice", "maintainer"),
+                true,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("last maintainer"), "{}", err.context);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn role_remove_package_allows_removing_the_last_package_maintainer() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                PACKAGE_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/foo/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        assert!(client
+            .role_remove_package(
+                "home:scarabeus_iv",
+                "foo",
+                &RoleGrant::person("alice", "maintainer"),
+                true,
+                &DryRun::new(false)
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(!puts[0].1.contains("alice"));
+        assert!(puts[0].1.contains("<title>Old title</title>"));
+        assert!(puts[0].1.contains("<lock><enable/></lock>"));
+    }
+
+    #[test]
+    fn role_remove_package_dry_run_records_the_removal_and_sends_nothing() {
+        let http = FakeHttp::new();
+        let client = project_client(&http);
+        let dry = DryRun::new(true);
+        assert!(client
+            .role_remove_package(
+                "home:scarabeus_iv",
+                "foo",
+                &RoleGrant::person("alice", "maintainer"),
+                true,
+                &dry
+            )
+            .is_ok());
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: remove maintainer role for person alice from package home:scarabeus_iv/foo"
+                .to_string()]
+        );
+    }
+
+    #[test]
+    fn role_remove_package_dry_run_without_force_errors() {
+        let http = FakeHttp::new();
+        let client = project_client(&http);
+        let dry = DryRun::new(true);
+        let err = client
+            .role_remove_package(
+                "home:scarabeus_iv",
+                "foo",
+                &RoleGrant::person("alice", "maintainer"),
+                false,
+                &dry,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("without force"), "{}", err.context);
+        assert!(dry.plan().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_add_project_requires_credentials() {
+        let http = FakeHttp::new();
+        use crate::auth::Credentials;
+        let client = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let err = client
+            .role_add_project(
+                "home:scarabeus_iv",
+                &RoleGrant::person("alice", "maintainer"),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_add_package_requires_credentials() {
+        let http = FakeHttp::new();
+        use crate::auth::Credentials;
+        let client = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let err = client
+            .role_add_package(
+                "home:scarabeus_iv",
+                "foo",
+                &RoleGrant::person("alice", "maintainer"),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_remove_project_requires_credentials() {
+        let http = FakeHttp::new();
+        use crate::auth::Credentials;
+        let client = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let err = client
+            .role_remove_project(
+                "home:scarabeus_iv",
+                &RoleGrant::person("alice", "maintainer"),
+                true,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_remove_package_requires_credentials() {
+        let http = FakeHttp::new();
+        use crate::auth::Credentials;
+        let client = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let err = client
+            .role_remove_package(
+                "home:scarabeus_iv",
+                "foo",
+                &RoleGrant::person("alice", "maintainer"),
+                true,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn role_remove_project_refuses_removing_the_last_group_maintainer() {
+        const GROUP_MAINTAINER: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><group groupid=\"editors\" role=\"maintainer\"/></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                GROUP_MAINTAINER,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let err = client
+            .role_remove_project(
+                "home:scarabeus_iv",
+                &RoleGrant::group("editors", "maintainer"),
+                true,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("last maintainer"), "{}", err.context);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn role_remove_project_removing_a_non_maintainer_role_with_one_maintainer_succeeds() {
+        const MAINTAINER_AND_BUGOWNER: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><person userid=\"alice\" role=\"maintainer\"/><person userid=\"bob\" role=\"bugowner\"/></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                MAINTAINER_AND_BUGOWNER,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        assert!(client
+            .role_remove_project(
+                "home:scarabeus_iv",
+                &RoleGrant::person("bob", "bugowner"),
+                true,
+                &DryRun::new(false)
+            )
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert!(puts[0]
+            .1
+            .contains("<person userid=\"alice\" role=\"maintainer\"/>"));
+        assert!(!puts[0].1.contains("bob"));
+    }
+
+    #[test]
+    fn role_remove_project_refuses_removing_both_maintainers_in_one_call() {
+        const PERSON_AND_GROUP_MAINTAINERS: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><person userid=\"alice\" role=\"maintainer\"/><group groupid=\"editors\" role=\"maintainer\"/></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PERSON_AND_GROUP_MAINTAINERS,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let err = client
+            .role_remove_project(
+                "home:scarabeus_iv",
+                &RoleGrant::new(Some("alice"), Some("editors"), "maintainer"),
+                true,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("last maintainer"), "{}", err.context);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn role_remove_project_refuses_a_missing_pair_without_a_partial_write() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PROJECT_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let err = client
+            .role_remove_project(
+                "home:scarabeus_iv",
+                &RoleGrant::new(Some("alice"), Some("editors"), "maintainer"),
+                true,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(err.context.contains("not found"), "{}", err.context);
+        assert!(http.put_calls().is_empty());
     }
 }

@@ -242,6 +242,7 @@ pub use self::types::Repository;
 pub use self::types::RevisionPatch;
 pub use self::types::RevisionRange;
 pub use self::types::RevisionSpec;
+pub use self::types::RoleGrant;
 pub use self::types::ServiceCode;
 pub use self::types::ServiceState;
 pub use self::types::SourceFile;

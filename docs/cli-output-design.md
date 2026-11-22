@@ -80,7 +80,7 @@ what "one coherent channel" means.
   `change_state` consuming its 60 s budget would otherwise leave no
   visible trace.
 - **Library decision points** (the ones that change what happens
-  next): the supersede-all filing decision (`decision: filing for foo; superseding open submit request(s) 1398492 with the new request`; test `src/obs/payload.rs:3789`), dedup checks (`decision: open maintenance_incident request(s) 1399001 already target openSUSE:Maintenance for foo; refusing to file`; test `src/obs/payload.rs:3876`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1050`),
+  next): the supersede-all filing decision (`decision: filing for foo; superseding open submit request(s) 1398492 with the new request`; test `src/obs/payload.rs:3789`), dedup checks (`decision: open maintenance_incident request(s) 1399001 already target openSUSE:Maintenance for foo; refusing to file`; test `src/obs/payload.rs:3876`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1084`),
   endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:3196` vs
   `decision: read via /source (authenticated)`; test `src/http.rs:3279`), and the accept-state check
   before a retried `change_state` (`decision: request 1398977 still new, re-issuing

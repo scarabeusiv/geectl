@@ -387,6 +387,40 @@ pub struct NamedRole {
     pub role: String,
 }
 
+/// A role grant or removal: a person and/or a group with a role.
+/// At least one of `person` and `group` names someone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleGrant {
+    /// User login, when the role is granted to or removed from a person.
+    pub person: Option<String>,
+    /// Group id, when the role is granted to or removed from a group.
+    pub group: Option<String>,
+    /// Role: one of the local roles the server grants on projects
+    /// and packages.
+    pub role: String,
+}
+
+impl RoleGrant {
+    /// A grant for a person and a group with the same role.
+    pub fn new(person: Option<&str>, group: Option<&str>, role: &str) -> Self {
+        RoleGrant {
+            person: person.map(str::to_string),
+            group: group.map(str::to_string),
+            role: role.to_string(),
+        }
+    }
+
+    /// A grant for one person.
+    pub fn person(name: &str, role: &str) -> Self {
+        RoleGrant::new(Some(name), None, role)
+    }
+
+    /// A grant for one group.
+    pub fn group(name: &str, role: &str) -> Self {
+        RoleGrant::new(None, Some(name), role)
+    }
+}
+
 /// A repository in a project meta.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
