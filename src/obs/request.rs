@@ -2529,13 +2529,12 @@ impl<'a> ObsClient<'a> {
     ///   without it (`PostRequestMissingParameter`), and the model
     ///   requires it to be a positive number. The library always
     ///   sends it.
-    /// - Allowed from `new`, `review`, and `declined`. Refused from a
-    ///   final state: `accepted` cannot change state at all, and a
-    ///   final state cannot move to another final state, so
-    ///   `accepted`, `superseded`, or `revoked` -> `superseded` is
-    ///   refused. The library does not pre-check the old request's
-    ///   state, so the server stays the authority on the transition
-    ///   and its 403 is surfaced as-is.
+    /// - Allowed from `new`, `review`, and `declined`. Refused from
+    ///   `accepted`, `superseded`, or `revoked`: `accepted` cannot
+    ///   change state at all, and `superseded` or `revoked` cannot
+    ///   move to another final state. The library does not pre-check
+    ///   the old request's state, so the server stays the authority
+    ///   on the transition and its 403 is surfaced as-is.
     /// - The server does NOT verify that `superseded_by` points at a
     ///   real request — it only checks the number is positive. The
     ///   ordering guarantee (the new request exists first) belongs to
@@ -2873,8 +2872,9 @@ impl<'a> ObsClient<'a> {
     /// - The server does not pre-check here, and neither does the
     ///   library: the server stays the authority on the transition,
     ///   and its 403 is surfaced as-is. A request in `accepted`
-    ///   cannot change state at all, and a final state cannot move to
-    ///   another final state.
+    ///   cannot change state at all, and `superseded` or `revoked`
+    ///   cannot move to another final state; a `declined` request
+    ///   can still be revoked or superseded by its creator.
     /// - Accepting requires write permission on the target, and the
     ///   server can forbid self-accept outright (the
     ///   `OBS:CreatorCannotAcceptOwnRequests` attribute, set on the
