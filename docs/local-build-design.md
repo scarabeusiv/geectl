@@ -70,7 +70,7 @@ a git clone, or any dir with a spec), `repo` (explicit name, e.g.
 Options: `--clean`, `--flavor` (multibuild), `--release N`,
 `--trust-all-projects` (see trust), `--refresh-image`, `--timeout SECS`,
 `--alternative-project` (fetch project), `--root` (build root),
-`--noinit`, `--keep-rpms <dir>` (`-k`), `--prefer-packages <dir>` (`-p`).
+`--noinit`, `--preinstall-image`, `--keep-rpms <dir>` (`-k`), `--prefer-packages <dir>` (`-p`).
 No other options in v1: no `--jobs`/`--threads` tuning, no `--with`/
 `--without`, no `--define` — the full option matrix stays out.
 
@@ -113,14 +113,21 @@ The existing tool's invocation, from `osc` `build.py`:
 - Built files are collected from `<root>/.build.packages` (RPMS/SRPMS).
   On failure the wrapper prints the exit code, the root path, and suggests
   `--clean` / wipe. Geectl returns all three as data, not prose.
-- The preinstall image, when the buildinfo carries one, seeds the root;
-  an unprivileged user cannot extract it (chroot/device nodes), so the
-  wrapper drops it when building as a user unless the container
-  preinstallimage flag is given. Geectl records the buildinfo's
-  preinstall image filename in the build record but does not pass it
-  to the engine: a rootless podman build drops the image, exactly as
-  the existing tool does. Geectl does not select or build images
-  itself.
+- The preinstall image, when the buildinfo carries one and
+  `--preinstall-image` is set, seeds a fresh root: the image
+  downloads into the pkg cache (streamed, magic-checked — the
+  buildinfo digest is a synthetic image id, not a content digest),
+  and its `.info` file downloads alongside it. The covered
+  dependencies get no download and no `<name> <file>` line, but
+  keep their place in the install lists, and the rpmlist carries
+  the image lines for the engine. Any image failure drops the
+  image and the build proceeds from plain deps. The image is
+  fetched with a single GET and never retried, so a
+  download-on-demand repository serves no image. A root whose init
+  already ran never selects an image. Without the flag the offer
+  is parsed and never used: the engine extracts it with bsdtar
+  `--chroot` plus device nodes, which fail as a non-root user.
+  Geectl does not build images itself.
 - The engine is an external dependency: geectl checks for the `build`
   binary at startup of the operation and fails closed with
   `NoBuildEngine` (naming how to install it) when absent. The engine

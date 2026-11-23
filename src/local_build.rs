@@ -197,11 +197,17 @@ pub struct BuildRequest {
     /// A build root of its own, instead of the derived cache-dir
     /// root. Parallel builds of the same package do not share one.
     pub root: Option<PathBuf>,
-    /// Skip the root initialization: the engine starts the build
-    /// immediately in the existing root, installing nothing. Needs
-    /// an initialized root (a previous build wrote the rpmlist and
+    /// Skip the root initialization: start the build
+    /// immediately in the existing root. Needs an initialized
+    /// root (a previous build wrote the rpmlist and
     /// buildconfig there).
     pub noinit: bool,
+    /// Use the preinstall image when the buildinfo offers one:
+    /// `--preinstall-image`. Off by default: the engine extracts
+    /// the image with bsdtar `--chroot` plus device nodes, which
+    /// fail as a non-root user, so a rootless build never selects
+    /// the image. Only set it when the engine runs as root.
+    pub preinstall_image: bool,
     /// Copy the built RPMs into this directory on a green build;
     /// the directory is created when missing.
     pub keep_rpms: Option<PathBuf>,
@@ -220,8 +226,8 @@ pub struct BuildRequest {
 impl BuildRequest {
     /// A request with the defaults: no flavor, no clean, no
     /// release, no trust flag, no refresh, no alternative project,
-    /// no custom root, init on, no keep/prefer dirs, the default
-    /// timeout, a real build.
+    /// no custom root, init on, no keep/prefer dirs, no
+    /// preinstall image, the default timeout, a real build.
     pub fn new(source_dir: PathBuf, project: &str, repo: &str, arch: &str) -> Self {
         BuildRequest {
             source_dir,
@@ -236,6 +242,7 @@ impl BuildRequest {
             alternative_project: None,
             root: None,
             noinit: false,
+            preinstall_image: false,
             keep_rpms: None,
             prefer_packages: None,
             timeout_secs: DEFAULT_BUILD_TIMEOUT_SECS,
@@ -416,8 +423,8 @@ pub struct BuildRecord {
     pub root_reused: bool,
     pub cache: CacheStats,
     pub eviction: EvictionReport,
-    /// The preinstall image filename the server offered, if any.
-    /// Dropped for a rootless podman build, never installed.
+    /// The preinstall image filename the build seeded the root
+    /// with, if an image was selected for this build.
     pub preinstall_image: Option<String>,
     /// The foreign `home:` projects `--trust-all-projects` accepted
     /// for this build (empty otherwise): the override is recorded
@@ -963,6 +970,14 @@ pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
             "--noinit and --prefer-packages conflict: no deps are installed without initialization",
         ));
     }
+    // `--noinit` installs nothing, so `--preinstall-image` would be
+    // a silent no-op: refuse the combination instead.
+    if req.noinit && req.preinstall_image {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--noinit and --preinstall-image conflict: no deps are installed without initialization",
+        ));
+    }
     // A custom root is a user directory, not a cache dir: `--clean`
     // wipes it, so it must be a geectl root (marker) or empty — the
     // same rule `build-wipe` enforces. A path naming a file is not
@@ -1289,12 +1304,21 @@ impl<'a> LocalBuild<'a> {
         // carry a `binary` attribute) and by dep name (deps without
         // one are resolved from the binary list only later, so their
         // file names are not known yet — a name prefix protects them
-        // until then).
-        let current_dep_files: Vec<String> = info
+        // until then). The offered preinstall image and its `.info`
+        // file are protected by file name as well: they share the
+        // pkg cache dirs, and evicting the image this build is
+        // about to use would force a re-download.
+        let mut current_dep_files: Vec<String> = info
             .bdeps
             .iter()
             .filter_map(|dep| dep.binary.clone())
             .collect();
+        if let Some(image) = &info.preinstall_image {
+            if let Some(filename) = &image.filename {
+                current_dep_files.push(filename.clone());
+                current_dep_files.push(PREINSTALL_INFO_FILENAME.to_string());
+            }
+        }
         let current_dep_names: Vec<String> =
             info.bdeps.iter().map(|dep| dep.name.clone()).collect();
         let eviction = self.evict(
@@ -1309,10 +1333,11 @@ impl<'a> LocalBuild<'a> {
         // `--noinit` skips that: the engine installs nothing, so
         // the root's existing rpmlist and buildconfig (checked
         // above) are reused as-is and nothing is downloaded.
-        let cache = if req.noinit {
-            CacheStats::default()
+        let (cache, used_preinstall) = if req.noinit {
+            (CacheStats::default(), None)
         } else {
-            let (cache, rpmlist) = self.prepare_deps(req, &info)?;
+            let (cache, rpmlist, used_preinstall) =
+                self.prepare_deps(req, &info, &root, &package)?;
             let rpmlist_path = root.join(RPMLIST);
             write_atomic(&rpmlist_path, rpmlist.as_bytes()).map_err(|e| {
                 GeectlError::new(
@@ -1330,7 +1355,7 @@ impl<'a> LocalBuild<'a> {
                     ),
                 )
             })?;
-            cache
+            (cache, used_preinstall)
         };
         let rpmlist_path = root.join(RPMLIST);
         let buildconfig_path = root.join(BUILDCONFIG);
@@ -1372,9 +1397,7 @@ impl<'a> LocalBuild<'a> {
             root_reused,
             cache,
             eviction,
-            info.preinstall_image
-                .as_ref()
-                .and_then(|i| i.filename.clone()),
+            used_preinstall,
             trusted_foreign_projects,
             outcome,
         )?;
@@ -2458,9 +2481,308 @@ impl<'a> LocalBuild<'a> {
         dep.repoarch.as_deref().unwrap_or(req.arch.as_str())
     }
 
+    /// Select the preinstall image the buildinfo offers, for a fresh
+    /// root only, and only when `--preinstall-image` is set: the
+    /// engine extracts the image with bsdtar `--chroot` plus device
+    /// nodes, and both fail as a non-root user, so a rootless build
+    /// never selects the image (the existing tool drops it for the
+    /// same reason). Downloads the image (streamed, never buffered:
+    /// it is a base-system tarball) and its `.info` file into the
+    /// pkg cache, magic-checks the tarball (the buildinfo digest is
+    /// a synthetic image id, not a content digest), and returns
+    /// what `prepare_deps` needs. Any failure drops the image and
+    /// the build proceeds from plain deps: the image is an
+    /// optimization, and a bad image must never fail a build whose
+    /// deps are fine. A root whose init already ran and the
+    /// `_preinstallimage` package itself never select an image; a
+    /// `--noinit` build never reaches here (`prepare_deps` is
+    /// skipped under `--noinit`).
+    fn prepare_preinstall_image(
+        &self,
+        req: &BuildRequest,
+        info: &crate::obs::BuildInfo,
+        root: &Path,
+        package: &str,
+        stats: &mut CacheStats,
+    ) -> Result<Option<PreinstallImageUse>, GeectlError> {
+        if !req.preinstall_image {
+            self.debug.emit(
+                "local-build: preinstall image skipped: --preinstall-image is not set; the image is used only when the engine runs as root",
+            );
+            return Ok(None);
+        }
+        if !preinstall_image_applies(req.clean, root) {
+            self.debug.emit(
+                "local-build: preinstall image skipped: the root already ran init, and the image seeds fresh roots only",
+            );
+            return Ok(None);
+        }
+        if package == PREINSTALL_IMAGE_PACKAGE {
+            self.debug.emit(
+                "local-build: preinstall image skipped: the package being built is the preinstall image itself",
+            );
+            return Ok(None);
+        }
+        let Some(offered) = &info.preinstall_image else {
+            return Ok(None);
+        };
+        let Some(filename) = offered.filename.as_deref().filter(|f| !f.is_empty()) else {
+            self.debug
+                .emit("local-build: preinstall image skipped: the buildinfo offers no file name");
+            return Ok(None);
+        };
+        let Some(image_package) = offered.package.as_deref().filter(|p| !p.is_empty()) else {
+            self.debug
+                .emit("local-build: preinstall image skipped: the buildinfo offers no package");
+            return Ok(None);
+        };
+        // The covered names are the rpmlist tokens: a name that is
+        // not a single path component, or that carries whitespace
+        // or `<`, `>`, `&`, cannot appear on a `<name>
+        // preinstallimage` line. Such a name is left out of the
+        // covered set, so its dep stays a plain dep instead of
+        // vanishing from the install.
+        let mut binaries = Vec::new();
+        for name in &offered.binaries {
+            if validate_path_component("preinstall image binary", name).is_ok()
+                && !name.chars().any(char::is_whitespace)
+                && !name.contains(['<', '>', '&'])
+            {
+                binaries.push(name.clone());
+            } else {
+                self.debug.emit(&format!(
+                    "local-build: preinstall image binary {name:?} is not a usable rpmlist token; keeping it as a plain dep"
+                ));
+            }
+        }
+        if binaries.is_empty() {
+            self.debug
+                .emit("local-build: preinstall image skipped: it covers no usable binary");
+            return Ok(None);
+        }
+        if offered.project.is_none() || offered.repository.is_none() {
+            self.debug.emit(
+                "local-build: preinstall image names no project or repository; using the build's",
+            );
+        }
+        let project = offered.project.as_deref().unwrap_or(req.fetch_project());
+        let repo = offered.repository.as_deref().unwrap_or(req.repo.as_str());
+        let arch = req.arch.as_str();
+        for (label, value) in [
+            ("preinstall image project", project),
+            ("preinstall image repository", repo),
+        ] {
+            if let Err(e) = validate_path_component(label, value) {
+                self.debug
+                    .emit(&format!("local-build: {e}; dropping the preinstall image"));
+                return Ok(None);
+            }
+        }
+        if let Err(e) = validate_path_component("preinstall image file", filename) {
+            self.debug
+                .emit(&format!("local-build: {e}; dropping the preinstall image"));
+            return Ok(None);
+        }
+        let dir = self
+            .cache_dir
+            .join("pkg")
+            .join(project)
+            .join(repo)
+            .join(arch);
+        if let Err(e) = fs::create_dir_all(&dir) {
+            self.debug.emit(&format!(
+                "local-build: cannot create package cache {}; dropping the preinstall image ({e})",
+                dir.display()
+            ));
+            return Ok(None);
+        }
+        // The per-file download/write path takes the
+        // project-repo-arch lock (blocking, briefly): eviction takes
+        // the same lock while deleting that dir's pkg files, so a
+        // delete can never race a download's atomic rename — the
+        // same lock `ensure_cached` holds for a dep.
+        let _pkg_lock = match self.acquire_pkg_lock(project, repo, arch) {
+            Ok(lock) => lock,
+            Err(e) => {
+                self.debug.emit(&format!(
+                    "local-build: cannot lock the preinstall image cache dir ({e}); dropping the preinstall image"
+                ));
+                return Ok(None);
+            }
+        };
+        let path = dir.join(filename);
+        let info_path = dir.join(PREINSTALL_INFO_FILENAME);
+        // The image is keyed by file name: the server names the
+        // file `_preinstallimage.<hdrmd5>`, so the name carries the
+        // image id and a hit is the same image the server offers
+        // now.
+        let fresh_download: bool;
+        if path.exists() && file_is_tarball(&path) {
+            stats.pkg_hits += 1;
+            touch(&path);
+            fresh_download = false;
+        } else {
+            if path.exists() {
+                self.debug.emit(&format!(
+                    "local-build cache: preinstall image {filename} failed its tarball check; re-downloading"
+                ));
+                let _ = fs::remove_file(&path);
+            }
+            stats.pkg_misses += 1;
+            fresh_download =
+                self.download_preinstall_image(project, image_package, repo, arch, filename, &path);
+            if !fresh_download {
+                return Ok(None);
+            }
+        }
+        // The `.info` file is tied to the image download: a fresh
+        // image gets a fresh info file; a cache hit reuses the info
+        // file cached with that image (same image, same info), and
+        // fetches it once when it is absent — an earlier run may
+        // have failed that download while the image itself landed.
+        // A failed or empty info download drops only the
+        // `preinstallimageinfo:` line — the engine ignores that
+        // line, and the image itself is unaffected.
+        let info_path = if fresh_download {
+            self.fetch_preinstall_info(project, image_package, repo, arch, &info_path)
+        } else if info_path.exists() {
+            touch(&info_path);
+            Some(info_path)
+        } else {
+            self.fetch_preinstall_info(project, image_package, repo, arch, &info_path)
+        };
+        // The digest falls back to the file name when the server did
+        // not send one, or sent one that is not a plain token: the
+        // file name carries the image id, and the digest lands
+        // inside brackets in the `preinstallimagesource:` line.
+        let hdrmd5 = offered
+            .hdrmd5
+            .as_deref()
+            .filter(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric()))
+            .unwrap_or(filename);
+        Ok(Some(PreinstallImageUse {
+            filename: filename.to_string(),
+            path,
+            info_path,
+            binaries,
+            source: format!("{project}/{repo}/{image_package} [{hdrmd5}]"),
+        }))
+    }
+
+    /// Fetch the preinstall image `.info` file into the pkg cache.
+    /// One GET; an empty or failed download drops only the
+    /// `preinstallimageinfo:` line — the engine ignores that line,
+    /// and the image itself is unaffected.
+    fn fetch_preinstall_info(
+        &self,
+        project: &str,
+        image_package: &str,
+        repo: &str,
+        arch: &str,
+        info_path: &Path,
+    ) -> Option<PathBuf> {
+        match self
+            .obs
+            .download_binary(project, image_package, repo, arch, PREINSTALL_INFO_FILENAME)
+        {
+            Ok(bytes) if bytes.is_empty() => {
+                self.debug.emit(
+                    "local-build: preinstall image info file is empty; continuing without it",
+                );
+                None
+            }
+            Ok(bytes) => match write_atomic(info_path, &bytes) {
+                Ok(()) => {
+                    touch(info_path);
+                    Some(info_path.to_path_buf())
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(info_path);
+                    self.debug.emit(&format!(
+                        "local-build: preinstall image info file could not be written ({e}); continuing without it"
+                    ));
+                    None
+                }
+            },
+            Err(e) => {
+                self.debug.emit(&format!(
+                    "local-build: preinstall image info file download failed ({e}); continuing without it"
+                ));
+                None
+            }
+        }
+    }
+
+    /// Stream the preinstall image into the pkg cache. One GET, to a
+    /// temp file in the cache dir, magic-checked, then atomically
+    /// renamed: a corrupt stream never becomes a cached image. No
+    /// retry: a download-on-demand repository serves no image, so
+    /// those builds proceed from plain deps.
+    /// Returns whether the image is now cached and usable; any
+    /// failure is a dropped image, never a build failure.
+    fn download_preinstall_image(
+        &self,
+        project: &str,
+        package: &str,
+        repo: &str,
+        arch: &str,
+        filename: &str,
+        path: &Path,
+    ) -> bool {
+        // The temp file lives next to the destination: the atomic
+        // rename needs both on one filesystem.
+        let Some(dir) = path.parent() else {
+            self.debug.emit(&format!(
+                "local-build: preinstall image path {} has no parent directory; dropping the image",
+                path.display()
+            ));
+            return false;
+        };
+        let tmp = match fresh_temp_path(dir) {
+            Ok(tmp) => tmp,
+            Err(e) => {
+                self.debug.emit(&format!(
+                    "local-build: cannot allocate a temp file for the preinstall image download ({e}); dropping the image"
+                ));
+                return false;
+            }
+        };
+        if let Err(e) = self
+            .obs
+            .download_binary_to_file(project, package, repo, arch, filename, &tmp)
+        {
+            let _ = fs::remove_file(&tmp);
+            self.debug.emit(&format!(
+                "local-build: preinstall image download failed ({e}); dropping the image"
+            ));
+            return false;
+        }
+        if !file_is_tarball(&tmp) {
+            let _ = fs::remove_file(&tmp);
+            self.debug.emit(&format!(
+                "local-build: downloaded preinstall image {filename} failed its tarball check; dropping the image"
+            ));
+            return false;
+        }
+        match fs::rename(&tmp, path) {
+            Ok(()) => {
+                touch(path);
+                true
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                self.debug.emit(&format!(
+                    "local-build: cannot place preinstall image {filename} ({e}); dropping the image"
+                ));
+                false
+            }
+        }
+    }
+
     /// Prepare the resolved deps: each one lands in the pkg cache
     /// (hdrmd5-verified on every use) and the rpmlist names it for
-    /// the engine. Returns the cache statistics and the rpmlist text.
+    /// the engine. Returns the cache statistics, the rpmlist text,
+    /// and the preinstall image filename the build used, if any.
     /// A dep the server resolved without a binary name is resolved
     /// from the binary list of its package; a dep with no installable
     /// file refuses (fail closed, naming the dep). Every dep is
@@ -2470,13 +2792,24 @@ impl<'a> LocalBuild<'a> {
     /// build types), and the rpmlist references the file, so it must
     /// exist. The `noinstall:` and `installonly:` lines are emitted
     /// only when non-empty, and a sysroot dep's line carries the
-    /// `sysroot: ` prefix.
+    /// `sysroot: ` prefix. A dep the offered image covers keeps its
+    /// place in the install lists (see `prepare_preinstall_image`):
+    /// the engine installs it from the image, and the rpmlist
+    /// carries the image lines.
     fn prepare_deps(
         &self,
         req: &BuildRequest,
         info: &crate::obs::BuildInfo,
-    ) -> Result<(CacheStats, String), GeectlError> {
+        root: &Path,
+        package: &str,
+    ) -> Result<(CacheStats, String, Option<String>), GeectlError> {
         let mut stats = CacheStats::default();
+        let preinstall_image =
+            self.prepare_preinstall_image(req, info, root, package, &mut stats)?;
+        let covered: std::collections::HashSet<&str> = preinstall_image
+            .as_ref()
+            .map(|image| image.binaries.iter().map(String::as_str).collect())
+            .unwrap_or_default();
         let mut lines: Vec<String> = Vec::new();
         let mut preinstall: Vec<String> = Vec::new();
         let mut vminstall: Vec<String> = Vec::new();
@@ -2500,6 +2833,18 @@ impl<'a> LocalBuild<'a> {
             if dep.installonly {
                 installonly.push(dep.name.clone());
             }
+            // A dep the image covers is installed from the image,
+            // not downloaded: it keeps its place in the install
+            // lists above (the existing tool computes those lists
+            // once, at parse time, and only filters the dep list),
+            // but it gets no download and no `<name> <file>` line.
+            // The engine's `preinstall_image_filter` removes the
+            // covered names from the preinstall/vminstall lists
+            // after extracting the image; runscripts still runs
+            // them from the image content.
+            if covered.contains(dep.name.as_str()) {
+                continue;
+            }
             let filename = match &dep.binary {
                 Some(binary) => binary.clone(),
                 None => self.resolve_dep_filename(req, dep)?,
@@ -2511,10 +2856,23 @@ impl<'a> LocalBuild<'a> {
                 lines.push(format!("{} {}", dep.name, cached.display()));
             }
         }
-        // The rpmlist shape: one `<name> <file>` line per dep, then
-        // the install lists. The preinstall image lines are absent
-        // on purpose: a rootless podman build drops the image,
-        // exactly as the existing tool does.
+        // The rpmlist shape: one `<name> <file>` line per dep, the
+        // preinstall image lines when an image was selected, then
+        // the install lists.
+        let mut used_image = None;
+        if let Some(image) = &preinstall_image {
+            // One line per offered binary, as the existing tool
+            // emits them; the engine filters by list membership.
+            for name in &image.binaries {
+                lines.push(format!("{name} preinstallimage"));
+            }
+            lines.push(format!("preinstallimage: {}", image.path.display()));
+            lines.push(format!("preinstallimagesource: {}", image.source));
+            if let Some(info_path) = &image.info_path {
+                lines.push(format!("preinstallimageinfo: {}", info_path.display()));
+            }
+            used_image = Some(image.filename.clone());
+        }
         lines.push(format!("preinstall: {}", preinstall.join(" ")));
         lines.push(format!("vminstall: {}", vminstall.join(" ")));
         lines.push(format!("runscripts: {}", runscripts.join(" ")));
@@ -2524,7 +2882,7 @@ impl<'a> LocalBuild<'a> {
         if !installonly.is_empty() {
             lines.push(format!("installonly: {}", installonly.join(" ")));
         }
-        Ok((stats, lines.join("\n") + "\n"))
+        Ok((stats, lines.join("\n") + "\n", used_image))
     }
 
     /// Resolve a dep's binary file name. The scheduler's buildinfo
@@ -3908,6 +4266,103 @@ fn touch(path: &Path) {
     if let Ok(file) = File::open(path) {
         let _ = file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
     }
+}
+
+/// The preinstall image's `.info` file name: the manifest the
+/// server serves next to the image, listing one
+/// `<hdrmd5> <binary-name>` line per binary the image covers.
+const PREINSTALL_INFO_FILENAME: &str = "preinstallimage.info";
+
+/// The package a preinstall image is built from: building it
+/// repackages the previously built image, so no image is ever
+/// selected for it.
+const PREINSTALL_IMAGE_PACKAGE: &str = "_preinstallimage";
+
+/// The preinstall image selected for this build: the cached image
+/// file, the covered dependency names, and the source string for
+/// the rpmlist lines. Built by `prepare_preinstall_image`;
+/// `prepare_deps` skips the covered deps' downloads and writes
+/// the lines.
+struct PreinstallImageUse {
+    /// The image file name as offered (the cache key).
+    filename: String,
+    /// The cached image file's path.
+    path: PathBuf,
+    /// The cached `.info` file's path, when it was downloaded.
+    info_path: Option<PathBuf>,
+    /// The covered dependency names, validated as rpmlist tokens.
+    binaries: Vec<String>,
+    /// `project/repository/package [hdrmd5]`, the
+    /// `preinstallimagesource:` line's value.
+    source: String,
+}
+
+/// Whether `prefix` (the first bytes of a file) is a tarball the
+/// engine can extract: zstd, xz, gzip, or plain tar (`ustar` at
+/// offset 257). The buildinfo digest is a synthetic image id, not
+/// a content digest, so the magic is the only content check the
+/// image gets — it keeps a truncated download or an error page out
+/// of the engine's hands. The size floor lives in
+/// `file_is_tarball`, not here: the prefix alone cannot tell a
+/// truncated body from a short one.
+fn is_tarball_prefix(prefix: &[u8]) -> bool {
+    if prefix.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        return true;
+    }
+    if prefix.starts_with(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) {
+        return true;
+    }
+    if prefix.starts_with(&[0x1f, 0x8b]) {
+        return true;
+    }
+    prefix.len() >= 262 && &prefix[257..262] == b"ustar"
+}
+
+/// Read the first bytes of `path` and check the tarball magic. An
+/// unreadable file reads as not-a-tarball: the caller treats it as
+/// a failed image, never as a build failure. A single `read` may
+/// short-read, so the buffer is filled before the magic is
+/// checked; and a file under 1024 bytes is never an image (a
+/// tarball is at least two 512-byte blocks, and a real
+/// base-system image is megabytes), so a tiny body with valid
+/// magic — a gzipped error page — is rejected here instead of
+/// reaching the engine.
+fn file_is_tarball(path: &Path) -> bool {
+    let Ok(len) = fs::metadata(path).map(|m| m.len()) else {
+        return false;
+    };
+    if len < 1024 {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut read = 0;
+    while read < buf.len() {
+        match std::io::Read::read(&mut file, &mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(_) => return false,
+        }
+    }
+    is_tarball_prefix(&buf[..read])
+}
+
+/// Whether the preinstall image applies to this root: the existing
+/// tool's gate, not the root-reused marker. The image seeds a root
+/// whose init has not run yet: a clean build, or a root with
+/// neither `installed-pkg` nor `.build/init_buildsystem.data` (the
+/// engine writes both during init, under its root — the build
+/// root's `.mount`, which `engine_argv` passes as `--root`). A
+/// root whose previous build died before init still takes the
+/// image; a root populated by another tool, which carries the init
+/// markers but no geectl marker, does not.
+fn preinstall_image_applies(clean: bool, root: &Path) -> bool {
+    let engine_root = root.join(".mount");
+    clean
+        || (!engine_root.join("installed-pkg").exists()
+            && !engine_root.join(".build/init_buildsystem.data").exists())
 }
 
 /// One path component under the cache dir: a single name, never a
@@ -8017,6 +8472,9 @@ if [ -n "$spec" ]; then
   pkg=$(basename "$spec" .spec)
   mkdir -p "$root/.build.packages/RPMS"
   touch "$root/.build.packages/RPMS/$pkg-1.0-1.{arch}.rpm"
+  # A completed init leaves these behind: the image gate reads them.
+  mkdir -p "$root/installed-pkg" "$root/.build"
+  touch "$root/.build/init_buildsystem.data"
   if [ -n "$logfile" ]; then printf 'build log\nfinished "build %s.spec"\n' "$pkg" > "$logfile"; fi
 fi
 "#,
@@ -8128,6 +8586,79 @@ exit 0
             }
         }
 
+        /// The buildinfo with a preinstall image offer: the same deps
+        /// as `buildinfo_ok`, plus an image covering glibc and pre.
+        fn buildinfo_with_image() -> String {
+            format!(
+            "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+            <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\" vminstall=\"1\" installonly=\"1\"/>\
+            <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\" noinstall=\"1\"/>\
+            <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\" runscripts=\"1\"/>\
+            <bdep name=\"helper\" project=\"testproject\" repository=\"standard\"/>\
+            <preinstallimage project=\"testproject\" repository=\"standard\" package=\"_preinstallimage\" filename=\"_preinstallimage.abc123\" hdrmd5=\"abc123\"><binary>glibc</binary><binary>pre</binary></preinstallimage>\
+            </buildinfo>",
+            arch = host_arch()
+        )
+        }
+
+        /// A fake preinstall image: zstd magic plus zeros. The magic is
+        /// what the cache check reads; the rest is filler. Sized past
+        /// the 1024-byte floor in `file_is_tarball`.
+        fn fake_image_bytes() -> Vec<u8> {
+            let mut bytes = vec![0x28, 0xb5, 0x2f, 0xfd];
+            bytes.resize(2048, 0);
+            bytes
+        }
+
+        /// The image buildinfo with three unusable binary names in
+        /// the offer: one carries whitespace, one carries `&`, one
+        /// carries `<`. All three are rejected by the rpmlist-token
+        /// validation.
+        fn buildinfo_with_bad_binary_image() -> String {
+            format!(
+            "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+            <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\" vminstall=\"1\" installonly=\"1\"/>\
+            <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\" noinstall=\"1\"/>\
+            <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\" runscripts=\"1\"/>\
+            <bdep name=\"helper\" project=\"testproject\" repository=\"standard\"/>\
+            <preinstallimage project=\"testproject\" repository=\"standard\" package=\"_preinstallimage\" filename=\"_preinstallimage.abc123\" hdrmd5=\"abc123\"><binary>glibc</binary><binary>pre</binary><binary>bad name</binary><binary>a&amp;b</binary><binary>a&lt;b</binary></preinstallimage>\
+            </buildinfo>",
+            arch = host_arch()
+        )
+        }
+
+        /// The image buildinfo with a digest that is not a plain
+        /// token: the source line falls back to the file name.
+        fn buildinfo_with_bad_digest_image() -> String {
+            format!(
+            "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\n            <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\" vminstall=\"1\" installonly=\"1\"/>\n            <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\" noinstall=\"1\"/>\n            <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\" runscripts=\"1\"/>\n            <bdep name=\"helper\" project=\"testproject\" repository=\"standard\"/>\n            <preinstallimage project=\"testproject\" repository=\"standard\" package=\"_preinstallimage\" filename=\"_preinstallimage.abc123\" hdrmd5=\"bad digest\"><binary>glibc</binary><binary>pre</binary></preinstallimage>\n            </buildinfo>",
+                arch = host_arch()
+            )
+        }
+
+        /// The `.info` file for the fake image: one line per covered
+        /// binary. The build does not parse it; it is served so the
+        /// `preinstallimageinfo:` line has a file behind it.
+        fn fake_image_info() -> &'static str {
+            "abc123 glibc\nabc123 pre\n"
+        }
+
+        /// The download URL of the fake image.
+        fn image_url() -> String {
+            format!(
+            "https://api.opensuse.org/build/testproject/standard/{}/_preinstallimage/_preinstallimage.abc123",
+            host_arch()
+        )
+        }
+
+        /// The download URL of the fake `.info` file.
+        fn image_info_url() -> String {
+            format!(
+            "https://api.opensuse.org/build/testproject/standard/{}/_preinstallimage/preinstallimage.info",
+            host_arch()
+        )
+        }
+
         /// Build the full stubbed setup: buildinfo + buildconfig +
         /// dep downloads + binary list for the binary-less dep.
         /// Returns the client and the http recorder (the client
@@ -8179,6 +8710,85 @@ exit 0
 
             fn client(&self) -> ObsClient<'_> {
                 ObsClient::with_credentials(&self.http, basic_credentials()).unwrap()
+            }
+            /// Serve the image buildinfo only: the image download
+            /// fails, so the image is dropped.
+            fn with_preinstall_image_buildinfo_only(mut self) -> Self {
+                self.http = self
+                    .http
+                    .with_get(&buildinfo_url(), &buildinfo_with_image());
+                self
+            }
+
+            /// Serve the image buildinfo plus the image and info files.
+            fn with_preinstall_image(mut self) -> Self {
+                let image = fake_image_bytes();
+                self.http = self
+                    .http
+                    .with_get(&buildinfo_url(), &buildinfo_with_image())
+                    .with_get_to_file(&image_url(), &image)
+                    .with_get_bytes(&image_info_url(), fake_image_info().as_bytes());
+                self
+            }
+
+            /// Serve the image buildinfo plus the image, but no info
+            /// file: the info download fails, the image is still used.
+            fn with_preinstall_image_no_info(mut self) -> Self {
+                let image = fake_image_bytes();
+                self.http = self
+                    .http
+                    .with_get(&buildinfo_url(), &buildinfo_with_image())
+                    .with_get_to_file(&image_url(), &image);
+                self
+            }
+
+            /// Serve the image buildinfo plus garbage bytes for the
+            /// image: the magic check fails, the image is dropped.
+            fn with_preinstall_image_bad_magic(mut self) -> Self {
+                self.http = self
+                    .http
+                    .with_get(&buildinfo_url(), &buildinfo_with_image())
+                    .with_get_to_file(&image_url(), b"this is not a tarball at all");
+                self
+            }
+
+            /// Serve the image buildinfo plus the image and an empty
+            /// `.info` file: the info line is dropped, the image is
+            /// still used.
+            fn with_preinstall_image_empty_info(mut self) -> Self {
+                let image = fake_image_bytes();
+                self.http = self
+                    .http
+                    .with_get(&buildinfo_url(), &buildinfo_with_image())
+                    .with_get_to_file(&image_url(), &image)
+                    .with_get_bytes(&image_info_url(), b"");
+                self
+            }
+
+            /// Serve the image buildinfo plus the image, with three
+            /// unusable binary names in the offer (whitespace, `&`,
+            /// `<`): they stay plain deps and get no rpmlist line.
+            fn with_preinstall_image_bad_binary(mut self) -> Self {
+                let image = fake_image_bytes();
+                self.http = self
+                    .http
+                    .with_get(&buildinfo_url(), &buildinfo_with_bad_binary_image())
+                    .with_get_to_file(&image_url(), &image)
+                    .with_get_bytes(&image_info_url(), fake_image_info().as_bytes());
+                self
+            }
+
+            /// Serve the image buildinfo with a digest that is not a
+            /// plain token, plus the image and its `.info` file: the
+            /// source line falls back to the file name.
+            fn with_preinstall_image_bad_digest(mut self) -> Self {
+                let image = fake_image_bytes();
+                self.http = self
+                    .http
+                    .with_get(&buildinfo_url(), &buildinfo_with_bad_digest_image())
+                    .with_get_to_file(&image_url(), &image)
+                    .with_get_bytes(&image_info_url(), fake_image_info().as_bytes());
+                self
             }
         }
 
@@ -8277,6 +8887,20 @@ exit 0
             let err = validate_build_request(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(err.to_string().contains("--clean and --noinit conflict"));
+        }
+
+        #[test]
+        fn validate_build_request_rejects_noinit_with_preinstall_image() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.noinit = true;
+            req.preinstall_image = true;
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err
+                .to_string()
+                .contains("--noinit and --preinstall-image conflict"));
         }
 
         #[test]
@@ -10785,6 +11409,518 @@ fi
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn tarball_magic_accepts_the_four_formats_and_rejects_garbage() {
+            assert!(is_tarball_prefix(&[0x28, 0xb5, 0x2f, 0xfd, 0, 0]));
+            assert!(is_tarball_prefix(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]));
+            assert!(is_tarball_prefix(&[0x1f, 0x8b, 0x08, 0]));
+            let mut tar = vec![0u8; 300];
+            tar[257..262].copy_from_slice(b"ustar");
+            assert!(is_tarball_prefix(&tar));
+            // Garbage, empty, and a short prefix that only looks
+            // like the start of a magic.
+            assert!(!is_tarball_prefix(b"not a tarball at all"));
+            assert!(!is_tarball_prefix(&[]));
+            assert!(!is_tarball_prefix(&[0x28, 0xb5]));
+            assert!(!is_tarball_prefix(&tar[..200]));
+        }
+
+        #[test]
+        fn file_is_tarball_rejects_files_under_the_floor() {
+            let dir = TempDir::new();
+            let tiny = dir.path().join("tiny.gz");
+            let mut bytes = vec![0x1f, 0x8b];
+            bytes.resize(100, 0);
+            fs::write(&tiny, &bytes).unwrap();
+            assert!(!file_is_tarball(&tiny));
+            let big = dir.path().join("big.gz");
+            let mut bytes = vec![0x1f, 0x8b];
+            bytes.resize(2048, 0);
+            fs::write(&big, &bytes).unwrap();
+            assert!(file_is_tarball(&big));
+            assert!(!file_is_tarball(&dir.path().join("missing")));
+        }
+
+        #[test]
+        fn stub_build_uses_the_preinstall_image_for_a_fresh_root() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(
+                record.preinstall_image.as_deref(),
+                Some("_preinstallimage.abc123")
+            );
+            // glibc and pre are covered: never downloaded, listed as
+            // image-supplied; ownpkg and helper still download, plus
+            // the image itself.
+            assert_eq!(record.cache.pkg_misses, 3);
+            assert_eq!(record.cache.pkg_hits, 0);
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(rpmlist.contains("glibc preinstallimage"));
+            assert!(rpmlist.contains("pre preinstallimage"));
+            assert!(!rpmlist.contains("glibc-2.38"));
+            assert!(!rpmlist.contains("pre-1.0"));
+            assert!(rpmlist.contains("ownpkg-1.0-1."));
+            assert!(rpmlist.contains("helper-1.0-1."));
+            assert!(rpmlist.contains("preinstallimage: "));
+            assert!(rpmlist.contains("_preinstallimage.abc123"));
+            assert!(rpmlist
+                .contains("preinstallimagesource: testproject/standard/_preinstallimage [abc123]"));
+            assert!(rpmlist.contains("preinstallimageinfo: "));
+            assert!(rpmlist.contains("preinstallimage.info"));
+            // Covered deps keep their place in the install lists
+            // (the existing tool computes those lists once, at parse
+            // time): the engine's filter removes them from
+            // preinstall/vminstall after extracting the image.
+            assert!(rpmlist.contains("preinstall: pre"));
+            assert!(rpmlist.contains("vminstall: glibc"));
+            assert!(rpmlist.contains("runscripts: pre"));
+            assert!(rpmlist.contains("installonly: glibc"));
+            assert!(rpmlist.contains("noinstall: ownpkg"));
+            // The image and its info file are cached.
+            let pkg_dir = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch());
+            assert!(pkg_dir.join("_preinstallimage.abc123").exists());
+            assert!(pkg_dir.join("preinstallimage.info").exists());
+        }
+
+        #[test]
+        fn stub_build_second_run_reuses_the_root_and_drops_the_image() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let first = vertical.build(&req).unwrap();
+            assert_eq!(
+                first.preinstall_image.as_deref(),
+                Some("_preinstallimage.abc123")
+            );
+            let second = vertical.build(&req).unwrap();
+            assert!(second.root_reused);
+            assert_eq!(second.preinstall_image, None);
+            // glibc and pre were never downloaded in the first run:
+            // they are the two misses now; ownpkg and helper hit
+            // the cache.
+            assert_eq!(second.cache.pkg_misses, 2);
+            assert_eq!(second.cache.pkg_hits, 2);
+            let rpmlist = fs::read_to_string(second.root_path.join(RPMLIST)).unwrap();
+            assert!(!rpmlist.contains("preinstallimage: "));
+            assert!(!rpmlist.contains(" preinstallimage"));
+            assert!(rpmlist.contains("glibc-2.38-1."));
+            assert!(rpmlist.contains("preinstall: pre"));
+        }
+
+        #[test]
+        fn stub_build_skips_the_preinstall_image_without_the_flag() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(record.preinstall_image, None);
+            assert_eq!(record.cache.pkg_misses, 4);
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(!rpmlist.contains("preinstallimage: "));
+            assert!(!rpmlist.contains(" preinstallimage"));
+            assert!(rpmlist.contains("glibc-2.38-1."));
+            assert!(rpmlist.contains("preinstall: pre"));
+        }
+
+        #[test]
+        fn preinstall_image_empty_info_file_drops_only_the_info_line() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image_empty_info();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(
+                record.preinstall_image.as_deref(),
+                Some("_preinstallimage.abc123")
+            );
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(rpmlist.contains("preinstallimage: "));
+            assert!(!rpmlist.contains("preinstallimageinfo: "));
+        }
+
+        #[test]
+        fn preinstall_image_bad_binary_names_stay_plain_deps() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image_bad_binary();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(
+                record.preinstall_image.as_deref(),
+                Some("_preinstallimage.abc123")
+            );
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(rpmlist.contains("glibc preinstallimage"));
+            assert!(rpmlist.contains("pre preinstallimage"));
+            assert!(!rpmlist.contains("bad name preinstallimage"));
+            assert!(!rpmlist.contains("a&b preinstallimage"));
+            assert!(!rpmlist.contains("a<b preinstallimage"));
+            assert!(!rpmlist.contains("a&lt;b preinstallimage"));
+        }
+
+        #[test]
+        fn preinstall_image_bad_digest_falls_back_to_the_filename() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image_bad_digest();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(
+                record.preinstall_image.as_deref(),
+                Some("_preinstallimage.abc123")
+            );
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(rpmlist.contains(
+                "preinstallimagesource: testproject/standard/_preinstallimage [_preinstallimage.abc123]"
+            ));
+            assert!(!rpmlist.contains("[bad digest]"));
+        }
+
+        #[test]
+        fn preinstall_image_cache_hit_without_info_retries_the_info_file() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            // The image is already cached, but the `.info` file is
+            // absent: an earlier run failed that download while the
+            // image itself landed. The build fetches the info file
+            // once instead of omitting the line forever.
+            let pkg_dir = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch());
+            fs::create_dir_all(&pkg_dir).unwrap();
+            fs::write(pkg_dir.join("_preinstallimage.abc123"), fake_image_bytes()).unwrap();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(
+                record.preinstall_image.as_deref(),
+                Some("_preinstallimage.abc123")
+            );
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(rpmlist.contains("preinstallimageinfo:"));
+            assert!(pkg_dir.join("preinstallimage.info").exists());
+            // The image was a cache hit, not a re-download.
+            let calls = setup.http.get_to_file_calls();
+            assert!(!calls.iter().any(|(url, _)| url == &image_url()));
+        }
+
+        #[test]
+        fn preinstall_image_download_failure_builds_from_plain_deps() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image_buildinfo_only();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(record.preinstall_image, None);
+            // 4 deps plus the failed image fetch: the image lookup
+            // missed, even though the download did not land.
+            assert_eq!(record.cache.pkg_misses, 5);
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(!rpmlist.contains("preinstallimage"));
+            assert!(rpmlist.contains("glibc-2.38-1."));
+            assert!(rpmlist.contains("preinstall: pre"));
+        }
+
+        #[test]
+        fn preinstall_image_with_bad_magic_builds_from_plain_deps() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image_bad_magic();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(record.preinstall_image, None);
+            // The bad download is dropped, never cached.
+            let pkg_dir = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch());
+            assert!(!pkg_dir.join("_preinstallimage.abc123").exists());
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(!rpmlist.contains("preinstallimage"));
+        }
+
+        #[test]
+        fn preinstall_image_without_info_file_still_seeds_the_root() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image_no_info();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(
+                record.preinstall_image.as_deref(),
+                Some("_preinstallimage.abc123")
+            );
+            let rpmlist = fs::read_to_string(record.root_path.join(RPMLIST)).unwrap();
+            assert!(rpmlist.contains("preinstallimage: "));
+            assert!(!rpmlist.contains("preinstallimageinfo:"));
+        }
+
+        #[test]
+        fn corrupt_cached_preinstall_image_is_redownloaded() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            // A corrupt image already in the cache: garbage bytes
+            // under the offered file name.
+            let pkg_dir = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch());
+            fs::create_dir_all(&pkg_dir).unwrap();
+            fs::write(
+                pkg_dir.join("_preinstallimage.abc123"),
+                b"not a tarball at all",
+            )
+            .unwrap();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(
+                record.preinstall_image.as_deref(),
+                Some("_preinstallimage.abc123")
+            );
+            let cached = fs::read(pkg_dir.join("_preinstallimage.abc123")).unwrap();
+            assert_eq!(cached, fake_image_bytes());
+        }
+
+        #[test]
+        fn build_evicts_old_pkg_files_but_keeps_the_offered_image() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new().with_preinstall_image();
+            let client = setup.client();
+            let vertical =
+                vertical(&client, dir.path(), engine, podman).with_cache_cap_bytes(1024 * 1024);
+            // The offered image, already cached and old (an eviction
+            // candidate without the file-name protection), plus an
+            // old dep file that must evict.
+            let pkg_dir = dir
+                .path()
+                .join("cache")
+                .join("pkg")
+                .join("testproject")
+                .join("standard")
+                .join(host_arch());
+            fs::create_dir_all(&pkg_dir).unwrap();
+            let mut image = fake_image_bytes();
+            image.resize(2 * 1024 * 1024, 0);
+            fs::write(pkg_dir.join("_preinstallimage.abc123"), &image).unwrap();
+            let old = pkg_dir.join("old-1.0-1.x86_64.rpm");
+            fs::write(&old, vec![0u8; 2 * 1024 * 1024]).unwrap();
+            let two_days_ago = SystemTime::now() - Duration::from_secs(2 * 86400);
+            for path in [pkg_dir.join("_preinstallimage.abc123"), old.clone()] {
+                let file = File::open(&path).unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(two_days_ago))
+                    .unwrap();
+                drop(file);
+            }
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(
+                record.preinstall_image.as_deref(),
+                Some("_preinstallimage.abc123")
+            );
+            assert!(pkg_dir.join("_preinstallimage.abc123").exists());
+            assert!(!old.exists());
+            // The image was a cache hit, not a re-download: eviction
+            // protected it, the build did not fetch it again.
+            let calls = setup.http.get_to_file_calls();
+            assert!(!calls.iter().any(|(url, _)| url == &image_url()));
+        }
+
+        #[test]
+        fn prepare_preinstall_image_skips_the_image_package_itself() {
+            let dir = TempDir::new();
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+            let root = dir.path().join("root");
+            let info = crate::obs::BuildInfo {
+                error: None,
+                bdeps: vec![],
+                urls: HashMap::new(),
+                preinstall_image: Some(crate::obs::PreinstallImage {
+                    project: Some("testproject".to_string()),
+                    repository: Some("standard".to_string()),
+                    package: Some("_preinstallimage".to_string()),
+                    filename: Some("_preinstallimage.abc123".to_string()),
+                    hdrmd5: Some("abc123".to_string()),
+                    binaries: vec!["glibc".to_string()],
+                }),
+            };
+            let mut stats = CacheStats::default();
+            let used = vertical
+                .prepare_preinstall_image(&req, &info, &root, "_preinstallimage", &mut stats)
+                .unwrap();
+            assert!(used.is_none());
+            // A root that already ran init skips the image the same
+            // way.
+            fs::create_dir_all(root.join(".mount/installed-pkg")).unwrap();
+            let used = vertical
+                .prepare_preinstall_image(&req, &info, &root, "foo", &mut stats)
+                .unwrap();
+            assert!(used.is_none());
+        }
+
+        #[test]
+        fn preinstall_image_applies_matches_the_existing_tools_gate() {
+            let dir = TempDir::new();
+            let root = dir.path().join("root");
+            fs::create_dir_all(&root).unwrap();
+            assert!(preinstall_image_applies(false, &root));
+            // The markers live under the engine root (`.mount`).
+            fs::create_dir_all(root.join(".mount/installed-pkg")).unwrap();
+            assert!(!preinstall_image_applies(false, &root));
+            fs::remove_dir_all(root.join(".mount/installed-pkg")).unwrap();
+            fs::create_dir_all(root.join(".mount/.build")).unwrap();
+            fs::write(root.join(".mount/.build/init_buildsystem.data"), b"").unwrap();
+            assert!(!preinstall_image_applies(false, &root));
+            assert!(preinstall_image_applies(true, &root));
+        }
+
+        #[test]
+        fn prepare_preinstall_image_skips_an_offer_without_a_file_or_package() {
+            let dir = TempDir::new();
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.preinstall_image = true;
+            let root = dir.path().join("root");
+            let mut stats = CacheStats::default();
+            let no_filename = crate::obs::BuildInfo {
+                error: None,
+                bdeps: vec![],
+                urls: HashMap::new(),
+                preinstall_image: Some(crate::obs::PreinstallImage {
+                    project: Some("testproject".to_string()),
+                    repository: Some("standard".to_string()),
+                    package: Some("_preinstallimage".to_string()),
+                    filename: None,
+                    hdrmd5: Some("abc123".to_string()),
+                    binaries: vec!["glibc".to_string()],
+                }),
+            };
+            let used = vertical
+                .prepare_preinstall_image(&req, &no_filename, &root, "foo", &mut stats)
+                .unwrap();
+            assert!(used.is_none());
+            let no_package = crate::obs::BuildInfo {
+                error: None,
+                bdeps: vec![],
+                urls: HashMap::new(),
+                preinstall_image: Some(crate::obs::PreinstallImage {
+                    project: Some("testproject".to_string()),
+                    repository: Some("standard".to_string()),
+                    package: None,
+                    filename: Some("_preinstallimage.abc123".to_string()),
+                    hdrmd5: Some("abc123".to_string()),
+                    binaries: vec!["glibc".to_string()],
+                }),
+            };
+            let used = vertical
+                .prepare_preinstall_image(&req, &no_package, &root, "foo", &mut stats)
+                .unwrap();
+            assert!(used.is_none());
         }
 
         #[test]

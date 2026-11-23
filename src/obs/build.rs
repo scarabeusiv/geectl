@@ -709,9 +709,11 @@ pub struct BuildDep {
 }
 
 /// The preinstall image the buildinfo offers: the image the server
-/// would seed a fresh root with. Recorded, never selected by geectl:
-/// for a rootless podman build the image is dropped (an unprivileged
-/// user cannot extract it), exactly as the existing tool does.
+/// would seed a fresh root with. Selected for a fresh root only,
+/// and only when `--preinstall-image` is set: the covered
+/// dependencies get no download and no `<name> <file>` line, and
+/// the engine seeds the root from the image instead (see
+/// `local_build::prepare_deps`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreinstallImage {
     /// The project the image lives in.
@@ -724,6 +726,11 @@ pub struct PreinstallImage {
     pub filename: Option<String>,
     /// The image's hdrmd5, if the server said.
     pub hdrmd5: Option<String>,
+    /// The binaries the image covers, in the order the server
+    /// listed them: a dep whose name is here gets no download and
+    /// no `<name> <file>` line; it keeps its place in the install
+    /// lists and is installed from the image instead.
+    pub binaries: Vec<String>,
 }
 
 /// The buildinfo for a package in a repository/architecture: the
@@ -901,18 +908,30 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
     // `<preinstallimage .../>` element. A second one is ignored —
     // the server sends at most one, and the first is the offer. A
     // malformed element is ignored rather than failing the parse:
-    // the image is recorded only (a rootless podman build drops it),
-    // so a broken image element must not fail a build whose
-    // dependencies parsed fine.
+    // the image is an optimization, so a broken image element must
+    // not fail a build whose dependencies parsed fine. The covered
+    // binaries are the `<binary>` children, in server order; a
+    // malformed child list reads as no covered binaries, which
+    // drops the image (nothing is covered, so it buys nothing).
     let preinstall_image = match xml_elements(inner, "preinstallimage") {
         Ok(elements) => elements.first().map(|element| {
-            let (tag, _) = xml_split_element(element, "preinstallimage");
+            let (tag, inner) = xml_split_element(element, "preinstallimage");
+            let binaries = xml_elements(inner, "binary")
+                .map(|children| {
+                    children
+                        .iter()
+                        .map(|child| xml_split_element(child, "binary").1.trim().to_string())
+                        .filter(|name| !name.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
             PreinstallImage {
                 project: xml_attr(tag, "project"),
                 repository: xml_attr(tag, "repository"),
                 package: xml_attr(tag, "package"),
                 filename: xml_attr(tag, "filename"),
                 hdrmd5: xml_attr(tag, "hdrmd5"),
+                binaries,
             }
         }),
         Err(_) => None,
@@ -5142,6 +5161,45 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn parse_buildinfo_reads_the_preinstall_image_binaries() {
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\"><preinstallimage project=\"openSUSE:Factory\" repository=\"standard\" package=\"preinstallimage\" filename=\"_preinstallimage.abc123\" hdrmd5=\"abc123\"><binary>glibc</binary><binary>bash</binary></preinstallimage><bdep name=\"gcc\"/></buildinfo>",
+        )
+        .unwrap();
+        let image = parsed.preinstall_image.as_ref().unwrap();
+        assert_eq!(
+            image.binaries,
+            vec!["glibc".to_string(), "bash".to_string()]
+        );
+        // A self-closing element carries no binaries, and a second
+        // element is ignored: the first is the offer.
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\"><preinstallimage project=\"openSUSE:Factory\" repository=\"standard\" package=\"preinstallimage\" filename=\"_preinstallimage.abc123\"/><preinstallimage project=\"q\"><binary>other</binary></preinstallimage></buildinfo>",
+        )
+        .unwrap();
+        let image = parsed.preinstall_image.as_ref().unwrap();
+        assert!(image.binaries.is_empty());
+        // Whitespace around a name and an empty child are not names.
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\"><preinstallimage project=\"openSUSE:Factory\"><binary> glibc </binary><binary></binary><binary>bash</binary></preinstallimage></buildinfo>",
+        )
+        .unwrap();
+        let image = parsed.preinstall_image.as_ref().unwrap();
+        assert_eq!(
+            image.binaries,
+            vec!["glibc".to_string(), "bash".to_string()]
+        );
+        // A malformed child list (an unclosed `<binary>`) reads as
+        // no binaries: the offer stands, but it covers nothing.
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\"><preinstallimage project=\"openSUSE:Factory\"><binary>glibc</binary><binary>pre</preinstallimage></buildinfo>",
+        )
+        .unwrap();
+        let image = parsed.preinstall_image.as_ref().unwrap();
+        assert!(image.binaries.is_empty());
     }
 
     #[test]

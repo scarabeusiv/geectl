@@ -133,6 +133,13 @@ pub enum LocalBuildCommand {
         /// buildconfig there).
         #[arg(long)]
         noinit: bool,
+        /// Use the preinstall image when the buildinfo offers one.
+        /// Off by default: the engine extracts the image with
+        /// bsdtar `--chroot` plus device nodes, which fail as a
+        /// non-root user, so a rootless build never selects the
+        /// image. Only set it when the engine runs as root.
+        #[arg(long)]
+        preinstall_image: bool,
         /// Save the built RPMs into this directory (created when
         /// missing) on a green build.
         #[arg(long, short = 'k')]
@@ -327,6 +334,7 @@ pub fn run_local_build(
             alternative_project,
             root,
             noinit,
+            preinstall_image,
             keep_rpms,
             prefer_packages,
             timeout_secs,
@@ -354,6 +362,7 @@ pub fn run_local_build(
             build_req.alternative_project = alternative_project.clone();
             build_req.root = root.clone();
             build_req.noinit = noinit;
+            build_req.preinstall_image = preinstall_image;
             build_req.keep_rpms = keep_rpms.clone();
             build_req.prefer_packages = prefer_packages.clone();
             build_req.timeout_secs = timeout_secs;
@@ -1009,6 +1018,7 @@ mod tests {
             "--root",
             "/tmp/custom-root",
             "--noinit",
+            "--preinstall-image",
             "--keep-rpms",
             "/tmp/keep",
             "--prefer-packages",
@@ -1018,6 +1028,7 @@ mod tests {
                 alternative_project,
                 root,
                 noinit,
+                preinstall_image,
                 keep_rpms,
                 prefer_packages,
                 ..
@@ -1025,6 +1036,7 @@ mod tests {
                 assert_eq!(alternative_project.as_deref(), Some("openSUSE:Factory"));
                 assert_eq!(root, Some(PathBuf::from("/tmp/custom-root")));
                 assert!(noinit);
+                assert!(preinstall_image);
                 assert_eq!(keep_rpms, Some(PathBuf::from("/tmp/keep")));
                 assert_eq!(prefer_packages, Some(PathBuf::from("/tmp/prefer")));
             }
