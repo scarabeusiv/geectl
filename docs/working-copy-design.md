@@ -1,13 +1,13 @@
 # geectl working-copy layer — design
 
 Issue: https://github.com/scarabeusiv/geectl/issues/17
-Status: design. The layer is blocked until the Gitea ops surface exists (see "Git-backed commit").
+Status: implemented.
 Depends on: https://github.com/scarabeusiv/geectl/issues/20 (Gitea ops surface), https://github.com/scarabeusiv/geectl/issues/112 (unified pull-request surface), https://github.com/scarabeusiv/geectl/issues/19 (services layer), https://github.com/scarabeusiv/geectl/issues/153 (changelog layer).
 
 ## The layer, up front
 
-The 9 local-state operations (`checkout`, `update`, `status`, `diff`,
-`add`/`rm`/`addremove`, `commit`, `changelog`, `mkpac`, `pull`) are one design
+The 10 local-state operations (`checkout`, `update`, `status`, `diff`,
+`add`/`rm`/`addremove`, `commit`, `changelog`, `mkpac`, `pull`, `resolve`) are one design
 decision, not nine API calls: geectl keeps a working copy, and the working
 copy is a git repository.
 
@@ -26,25 +26,34 @@ the two commit-protocol calls (see "Commit protocol").
 
 | Operation | API calls | Local state |
 |---|---|---|
-| `checkout` | OBS-native: `list_packages` (project form) or `list_files` + `cat` per file + `package_meta`. Git-backed: `package_meta` (to read the scmsync URL) + clone. | Writes files to `<dir>/<project>/<package>/`. Git-backed package: real clone of the Gitea repository. OBS-native package: synthesized repository whose root commit holds the base revision content; a brand-new package synthesizes a root commit over the empty tree. Records `apiurl`, `project`, `package`, `backend` (`obs` \| `git`), `base_rev`, `base_srcmd5` in the checkout's git config (`geectl.*`). No credentials, ever. |
-| `update` | OBS-native: `list_files` at latest rev (or `rev=`), `cat` for changed files. Git-backed: fetch from the Gitea remote. | Rebase. OBS-native: the new base becomes the new root commit and local commits rebase onto it. Git-backed: local commits rebase onto the synced HEAD. Git merges text changes; real conflicts stay in the tree as merge conflicts. No local commit is lost. Downloads stream to disk; no size refusal. |
-| `status` | `list_files` (remote listing, for `?` vs `A` disambiguation) | Compares the working tree and the index against the base commit. Same single-letter vocabulary as the existing tool (`A`/`M`/`D`/`?`/`!`/`C`/`R`, blank for clean). The mapping from git states to letters is the layer's own, pinned by the layer's tests. There is no `S` status: files are never skipped for size. |
-| `diff` | None for local diff; `project_diff` for remote-vs-remote | Local git diff of the working tree against the base commit. Binary files report "binary, no diff" as a structured result, not a failure. Remote-vs-remote diff reuses `project_diff`. |
+| `checkout` | OBS-native: `list_packages` (project form) or `list_files` + `cat` per file + `package_meta`. Git-backed: `package_meta` (to read the scmsync URL) + clone (the `#branch` fragment names the branch to check out and is stripped before the clone, since git does not understand it). | Writes files to `<dir>/<project>/<package>/`. A `:` in a project or package name becomes `_` in the directory name (a Windows path cannot hold `:`); the recorded project and package keep the real names. A `:` in a file name is not sanitized — the file keeps its server name — so on Windows such a file cannot be created and the checkout fails there. Git-backed package: real clone of the Gitea repository. OBS-native package: synthesized repository whose root commit holds the base revision content; a brand-new package synthesizes a root commit over the empty tree. Records `apiurl`, `project`, `package`, `backend` (`obs` \| `git`), `base-rev`, `base-srcmd5` in the checkout's git config (`geectl.*`). No OBS credentials; a git-backed checkout clones with the configured Gitea token when one is set. The token is scoped to the configured Gitea instance (`http.<gitea-url>.extraHeader`): git sends it only to that instance, never to whatever host a scmsync URL names. |
+| `update` | OBS-native: `list_files` at latest rev (or `rev=`), `cat` for every file in the listing (the full tree is needed for the new base commit). Git-backed: fetch from the Gitea remote. | Rebase. OBS-native: the new base becomes the new root commit and local commits rebase onto it. Git-backed: local commits rebase onto the synced HEAD. Git merges text changes; real conflicts stay in the tree as merge conflicts. No local commit is lost. Downloads stream to disk; no size refusal. |
+| `status` | None | Compares the working tree and the index against the base commit. Same single-letter vocabulary as the existing tool (`A`/`M`/`D`/`?`/`!`/`C`/`R`, blank for clean). The mapping from git states to letters is the layer's own, pinned by the layer's tests. There is no `S` status: files are never skipped for size. |
+| `diff` | None for local diff; `project_diff` for remote-vs-remote | Local git diff of the staged index against the base commit plus the unstaged worktree against the index — the two halves together, so a staged-only change shows. Binary files appear as git's `Binary files … differ` line in the diff text, not a failure. Remote-vs-remote diff reuses `project_diff`. |
 | `add` / `rm` / `addremove` | None (local intent only) | Stage into the index: `add` stages, `rm` removes from index and working tree. `addremove` is `status` + add of `?` + rm of `!`. `commit` sends the full file list derived from the base plus the staged diff. |
 | `commit` | `commit_filelist` (validate, then final) + staged file PUTs (`rev=repository`) + `open_requests_for_package` (report after) | Requires base rev == upstream rev, else `WorkingCopyOutdated`. One revision per commit, exactly (see protocol). Services run before commit, hard gate: a failing service run blocks the commit. Dispatches on the recorded backend kind (see "Git-backed commit"). Refreshes the base at the new rev: OBS-native, the new server revision becomes the new root commit and the committed local commits' content is in it, their separate identities gone; git-backed, the pushed HEAD is the new base. |
 | `changelog` | None pre-commit; validate after filing reads `request diff` | `changelog validate` + `changelog generate` (see "`changelog`"). Runs pre-commit in the hard gate, pre-file, and after filing. |
 | `mkpac` | `create_package` (exists) + `checkout` | No new operation. |
-| `pull` | Expanded directory read (`list_files` with expand) + `update` | Only for linked packages with a baserev and a clean WC (same gates as the existing tool: refuse on local changes, refuse on non-expanded links, refuse without baserev). Rebases link-target changes into the WC, like `update`. |
+| `pull` | Expanded directory read (`list_files` with expand) + expanded file downloads + `update` | Only for linked packages with a baserev and a clean WC: no uncommitted changes and no untracked files (local commits are rebased, not refused), refuse without baserev. Rebases link-target changes into the WC, like `update`. The expanded listing never carries `_link` (the server's expanded tree excludes it): pull fetches `_link` through the unexpanded route and rewrites its baserev to the target's latest srcmd5. |
+| `resolve` | None (local git only) | Stage the resolved files and continue a stopped rebase. A successful continue adopts the new base — OBS-native from the new root commit's message, git-backed from the rebase target — on disk and in the checkout. Unstaged edits are stashed around the continue and restored after; a failed restore strands them in the stash (named in the error) with the base already adopted. |
 
 ## The base record
 
 The authoritative base for content is the base commit: the root commit
 for OBS-native checkouts, the synced HEAD for git-backed checkouts. The
-git config records the OBS-side coordinates (`base_rev`, `base_srcmd5`)
+git config records the OBS-side coordinates (`geectl.base-rev`, `geectl.base-srcmd5`)
 for server reads. The OBS revision and the git SHA are two different base
 identities: the git SHA is the checkout's base, the OBS srcmd5 names the
 same base on the server side. If the recorded coordinates disagree with
-the base commit, the checkout is `WorkingCopyInconsistent`.
+the base commit, the record is healed from the base commit: the commit is
+the source of truth, and the record is re-read from it on every open, so
+an update stopped mid-rebase still resolves against the new base. That
+healing is OBS-native only: a git-backed checkout records the base in
+config, not in a root commit. `resolve` adopts the new base after a
+successful continue on both backends — OBS-native from the new root
+commit's message, git-backed from the rebase target — so the record
+never keeps pointing at the old base after the rebase finishes. A root
+commit that is not a `geectl base …` commit is `WorkingCopyInconsistent`.
 
 ## Commit protocol
 
@@ -61,7 +70,11 @@ A plain file PUT is its own revision; the commit is finalized by
   sends the full file list (name + md5); the server answers `error=missing`
   with the files it does not have yet; the client stages those with
   `rev=repository`; the final call creates exactly one revision, then runs
-  server-side services unless `noservice`.
+  server-side services unless `noservice`. A validate pass with a complete
+  file list also creates a revision: the server commits whenever nothing
+  is missing, and `withvalidate` only adds the SHA validation — so the
+  sequence runs exactly one validate pass, and the final pass reports
+  anything still missing itself (a stage that raced is retried, bounded).
 
 So the layer needs two library additions (small, typed, no raw XML out):
 
@@ -71,8 +84,9 @@ So the layer needs two library additions (small, typed, no raw XML out):
   (name + md5 + optional `sha256:` hash), `comment`, `user`, and the link
   flags (`keeplink`, `repairlink`, `linkrev`, `noservice`,
   `withvalidate` for the first pass). Returns the new revision + file list,
-  or the `missing` list. The SHA256 hash challenge is part of this method,
-  not caller logic.
+  or the `missing` list. The SHA256 hash challenge is parsed by this
+  method and answered by the caller, which holds the file content: the
+  final pass carries the digest.
 
 Commit sequence (mirrors the existing tool's `Package.commit`, with the
 local service gate added and the parts geectl does not do left out):
@@ -81,7 +95,9 @@ nothing to do; run the service gate (see "Services before commit");
 validate pass (`withvalidate=1`) → stage missing files
 (`rev=repository`) → final pass → one revision → poll until the
 server-side services settle → single base refresh → report open requests
-for the package. The file list sent to `commitfilelist` is the full list
+for the package. A validate pass that answers with a revision already
+committed: no final pass runs, and the settle poll and base refresh run on
+that revision. The file list sent to `commitfilelist` is the full list
 derived from the base commit plus the staged diff; deletions are expressed
 by omission from the list. If the response carries
 `<serviceinfo code="running">`, poll the directory until it settles
@@ -94,18 +110,16 @@ error naming `branch_package` — the agent decides).
 
 ## Git-backed commit
 
-The layer does not ship until the Gitea ops surface exists. When it lands,
-`commit` dispatches on the recorded backend kind (OBS `commitfilelist` vs
-git flow via the Gitea ops surface) behind the same operation; the agent's
-call does not change. No refusal exists for git-backed checkouts: the
-layer ships only after the Gitea ops surface lands.
-
-Open question: sync freshness on git-backed commit — whether `commit`
-polls until the Gitea mirror is synced (bounded 60 s) or refuses on a
-stale sync. That question belongs to the Gitea ops design
-(https://github.com/scarabeusiv/geectl/issues/20;
-`docs/gitea-ops-design.md`, landing with the Gitea ops surface); it is
-not settled here.
+`commit` dispatches on the recorded backend kind (OBS `commitfilelist`
+vs git flow via the Gitea ops surface) behind the same operation; the
+agent's call does not change. On a git-backed checkout, `commit` pushes
+with the git binary through the working-copy `Git` wrapper, takes the
+pushed head SHA, and polls the OBS side (`_scmsync.obsinfo` `commit:`)
+until the synced commit matches, bounded 60 s, then reports. The
+synthesized commit is authored with the checkout's repo-local identity
+(`geectl <geectl@localhost>`), not the user's configured git identity,
+and is pushed as such. The push authenticates with the configured Gitea
+token, scoped to the Gitea instance the same way as the clone.
 
 ## Services before commit
 
@@ -115,7 +129,11 @@ and covers the services the services layer (issue #19) defines for a
 pre-commit gate. The gate applies to both commit paths (OBS
 `commitfilelist` and the git flow). Server-side services still run after
 `commitfilelist` (polled until settled, above); the local run does not
-replace them.
+replace them. What the gate changes in a tracked file is staged into the
+index after the gate, so the commit sends it; new files are never staged
+by this, and unstaged changes to other files are not staged. A file the
+gate changed is staged whole, including any pre-existing unstaged edit
+to the same file, so that edit is sent with the commit.
 
 ## `changelog`
 
@@ -170,8 +188,11 @@ changes the call the agent makes:
   in the checkout at checkout time, for routing writes — never for
   choosing a different read path.
 - No git-mode refusals copied from the existing tool. The layer operates
-  on the checkout through git; the binding (git binary vs library) is an
-  implementation choice, not settled here.
+  on the checkout through git, via a small `Git` wrapper around the git
+  binary (argv-only, no shell). The wrapper passes
+  `-c commit.gpgsign=false -c core.autocrlf=false -c protocol.ext.allow=never`:
+  no signing, no line-ending conversion — the working copy holds the
+  server bytes exactly on every platform — and no `ext::` transport.
 
 ## Conflicts, DryRun, errors
 
@@ -180,8 +201,13 @@ changes the call the agent makes:
   conflict, `status` shows `C`, and the error names the files. The agent
   edits the file, then runs `resolve`, which stages the resolved files
   (the git equivalent of marking resolved); the agent owns the content —
-  the layer does not verify the merge. `commit` refuses while any file is
-  conflicted.
+  the layer does not verify the merge. When the resolutions are already
+  staged, `resolve` continues the rebase directly. Unrelated unstaged edits are
+  stashed around the rebase continue (git refuses to continue with a
+  dirty worktree) and restored afterwards, so they stay unstaged; when
+  the continue fails and the stashed edits cannot be restored, the error
+  names the stash they stay in.
+  `commit` refuses while any file is conflicted.
 - **DryRun:** same convention as the rest of the library — the DryRun guard
   runs before the credentials check. `checkout` in DryRun lists what would
   be downloaded, writes nothing. `update`/`commit` print the plan (files
@@ -192,7 +218,8 @@ changes the call the agent makes:
   (not a geectl checkout), `WorkingCopyOutdated` (base rev != upstream rev
   at commit), `WorkingCopyInconsistent` (checkout not in a usable state,
   or the recorded base coordinates disagree with the base commit),
-  `FileConflict` (merge conflict left in the tree), `NothingToCommit`.
+  `FileConflict` (merge conflict left in the tree), `NothingToCommit`,
+  `NoGit` (the git binary is not installed).
   Each with the remediation in the message; exit codes per kind, one exit
   path.
 - **Size limit / large files:** none. Files over the transport cap stream
@@ -200,8 +227,7 @@ changes the call the agent makes:
 
 ## Test story (from the 36-test spec)
 
-Proposed — the layer is unimplemented; the cases below are the transfers
-to adopt, with the git remapping stated. The counts are osc's, not
+The cases below are the transfers adopted, with the git remapping stated. The counts are osc's, not
 geectl's.
 
 Transfers to the layer's tests: `test_commit.py` (16) — the commit
@@ -228,9 +254,8 @@ untouched.
 
 ## Open points
 
-1. **Git-backed commit sync freshness:** poll until synced (bounded 60 s)
-   vs refuse — Gitea ops design decision 3, open.
-2. **Git binding:** git binary vs library — implementation choice, open.
-3. **Filing** waits on the working copy (unified pull-request surface,
-   issue #112, step 6: labels); the working copy waits on the Gitea ops
-   surface.
+1. **Filing** waits on the working copy (unified pull-request surface,
+   issue #112, step 6: labels); the working copy is implemented.
+2. **Pre-commit changelog validation** is a follow-up after the
+   `changelog` layer lands; the service gate is the commit gate until
+   then.

@@ -264,7 +264,8 @@ and `ObsClient::copy_project` copy a package or a whole project
 its meta from the source meta and PUTting a `_link`;
 `ObsClient::repair_link` repairs a broken link the same way, by
 editing the `_link` itself — the server repairs links only in its
-commit path, which a library without a working copy never takes;
+commit path, which the working-copy commit takes; a direct
+`repair_link` never triggers a server-side repair;
 `ObsClient::set_link_rev` pins or unpins a link revision, for one
 package or a whole project; `ObsClient::link_to_branch` converts a
 link into a branch and `ObsClient::detach_branch` detaches one;
