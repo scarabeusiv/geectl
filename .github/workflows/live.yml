@@ -10,8 +10,9 @@
 #
 # This job is INDEPENDENT and does NOT gate PRs: it is not a required
 # status check. When it regresses, it is fixed independently. It runs
-# on every pull request, weekly (Mondays 06:00 UTC, the same slot as
-# the freshness workflow), and on demand.
+# on every pull request, on every push to main, weekly
+# (Mondays 06:00 UTC, the same slot as the freshness workflow),
+# and on demand.
 #
 # A second OBS instance (port 3001) is provisioned alongside the
 # first, for the cross-instance copy test in
@@ -32,6 +33,8 @@
 name: live
 
 on:
+  push:
+    branches: [main]
   pull_request:
   schedule:
     # Weekly, Mondays 06:00 UTC.
