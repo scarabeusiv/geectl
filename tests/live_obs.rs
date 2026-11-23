@@ -91,7 +91,9 @@ use geectl::obs::{
     RequestSearch, RequestState, ResultsQuery, ReviewState, ReviewTarget, RevisionRange,
     RevisionSpec, RoleGrant, SourceUpdate, SrFiling, SrPayload, StagingReadOptions,
 };
-use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus};
+use geectl::pull_request::{
+    OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus, SubmitTarget,
+};
 use geectl::working_copy;
 
 /// A temp dir under the system temp dir, removed on drop. The name
@@ -7831,6 +7833,176 @@ fn live_working_copy_checkout_edit_commit_update() {
             .expect("status after update")
             .is_empty(),
         "the working copy is clean after the update"
+    );
+}
+
+/// Submit from a working copy files a real request on the live
+/// instance: checkout, edit, commit, then submit through the
+/// uniform client — the handle comes back and the server holds a
+/// submit request from the branch to the target.
+#[test]
+fn live_working_copy_submit_files_a_request() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, target_project, package) = setup_branch(&client);
+    let spec = format!("{package}.spec");
+    let v1 = "Name: geectl-live-pkg\nVersion: 1.0\n";
+    let v2 = "Name: geectl-live-pkg\nVersion: 2.0\n";
+    client
+        .upload_file(&source_project, &package, &spec, v1, &DryRun::new(false))
+        .expect("upload the v1 spec to the live instance");
+    let dir = TempDir::new();
+    let mut wc = working_copy::checkout(
+        &client,
+        &source_project,
+        &package,
+        None,
+        dir.path(),
+        None,
+        &DryRun::new(false),
+    )
+    .expect("checkout the package")
+    .expect("checkout is live, not a dry run");
+    std::fs::write(wc.root.join(&spec), v2).expect("edit the spec");
+    working_copy::add(&wc, std::slice::from_ref(&spec), &DryRun::new(false))
+        .expect("stage the edit");
+    working_copy::commit(
+        &mut wc,
+        &client,
+        &Config::default(),
+        "Update to version 2",
+        false,
+        None,
+        &DryRun::new(false),
+    )
+    .expect("commit the edit")
+    .expect("commit is live, not a dry run");
+    let target = SubmitTarget::Obs(live_payload(
+        &source_project,
+        &package,
+        &target_project,
+        "2.0",
+    ));
+    let pr_client = PullRequestClient::new(Some(&client), None);
+    let submitted = pr_client
+        .submit(&target, &DryRun::new(false))
+        .expect("submit from the working copy")
+        .expect("live submit returns a handle");
+    let PullRequestRef::Obs(id) = submitted.reference else {
+        panic!(
+            "an OBS submit must return an obs: handle, got {}",
+            submitted.reference
+        );
+    };
+    assert!(
+        submitted.superseded.is_empty(),
+        "a first filing supersedes nothing"
+    );
+    let request = client
+        .show_request(&id.to_string())
+        .expect("read back the filed request");
+    let (source, _, target, _, _) = submit_action(&request);
+    assert_eq!(source, source_project);
+    assert_eq!(target, Some(target_project.as_str()));
+}
+
+/// The same filing through the CLI binary, `--live`: checkout,
+/// edit, commit through the library, then `pull-request submit`
+/// from the checkout directory — the binary's flag validation,
+/// freshness gate and filing run end to end, and the server holds
+/// the request.
+#[test]
+fn live_pull_request_submit_cli_files_a_request() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (source_project, target_project, package) = setup_branch(&client);
+    let spec = format!("{package}.spec");
+    let v1 = "Name: geectl-live-pkg\nVersion: 1.0\n";
+    let v2 = "Name: geectl-live-pkg\nVersion: 2.0\n";
+    client
+        .upload_file(&source_project, &package, &spec, v1, &DryRun::new(false))
+        .expect("upload the v1 spec to the live instance");
+    let dir = TempDir::new();
+    let mut wc = working_copy::checkout(
+        &client,
+        &source_project,
+        &package,
+        None,
+        dir.path(),
+        None,
+        &DryRun::new(false),
+    )
+    .expect("checkout the package")
+    .expect("checkout is live, not a dry run");
+    std::fs::write(wc.root.join(&spec), v2).expect("edit the spec");
+    working_copy::add(&wc, std::slice::from_ref(&spec), &DryRun::new(false))
+        .expect("stage the edit");
+    working_copy::commit(
+        &mut wc,
+        &client,
+        &Config::default(),
+        "Update to version 2",
+        false,
+        None,
+        &DryRun::new(false),
+    )
+    .expect("commit the edit")
+    .expect("commit is live, not a dry run");
+    let payload = live_payload(&source_project, &package, &target_project, "2.0");
+    let username =
+        std::env::var("GEECTL_LIVE_OBS_USERNAME").unwrap_or_else(|_| "Admin".to_string());
+    let password =
+        std::env::var("GEECTL_LIVE_OBS_PASSWORD").unwrap_or_else(|_| "opensuse".to_string());
+    let out = Command::new(env!("CARGO_BIN_EXE_geectl"))
+        .current_dir(&wc.root)
+        .args([
+            "--live",
+            "pull-request",
+            "submit",
+            "--target-project",
+            &target_project,
+            "--description",
+            payload.description(),
+            "--changes-entry",
+            payload.changes_entry(),
+        ])
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env("GEECTL_OBS_URL", &base)
+        .env("GEECTL_OBS_USERNAME", &username)
+        .env("GEECTL_OBS_PASSWORD", &password)
+        .env("GEECTL_DEBUG", "1")
+        .env_remove("GEECTL_FORMAT")
+        .output()
+        .expect("run the geectl binary");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let reference = value["reference"].as_str().expect("a filed handle");
+    let id = reference.strip_prefix("obs:").expect("an obs: handle");
+    assert_eq!(value["superseded"], serde_json::json!([]));
+    assert_eq!(value["dry_run"], false);
+    let request = client
+        .show_request(id)
+        .expect("read back the filed request");
+    let (source, _, target, _, _) = submit_action(&request);
+    assert_eq!(source, source_project);
+    assert_eq!(target, Some(target_project.as_str()));
+    // The filed request carries the payload's description, and the
+    // debug channel carries the filing decision.
+    assert_eq!(request.description.as_str(), payload.description());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("decision:"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

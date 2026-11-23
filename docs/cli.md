@@ -674,6 +674,7 @@ Commands:
   decline                Decline a pull request. On OBS this changes the request state to declined; on Gitea it closes the pull request. Dry-run by default; mutates only with `--live`
   withdraw               Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with `--live`
   reopen                 Reopen a pull request. On OBS this changes a declined request back to `new`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with `--live`
+  submit                 File a submission from the working copy in the current directory: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one. The checkout's backend decides; the other arm's flags are refused. Dry-run by default; mutates only with `--live`
   help                   Print this message or the help of the given subcommand(s)
 
 Options:

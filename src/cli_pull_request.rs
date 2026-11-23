@@ -8,8 +8,12 @@
 //!
 //! Reads are always live; the act leaves (`approve`,
 //! `request-changes`, `comment`, `cancel-review-request`,
-//! `merge`, `decline`, `withdraw`, `reopen`) are dry-run by
-//! default and mutate only with the global `--live`.
+//! `merge`, `decline`, `withdraw`, `reopen`, `submit`) are
+//! dry-run by default and mutate only with the global `--live`.
+//! `submit` files from the working copy in the current directory:
+//! an OBS submit request from an OBS-native checkout, a Gitea pull
+//! request from a git-backed one — the checkout's backend decides,
+//! no flag does.
 //! A read or a live act on an arm needs that arm's
 //! credentials — OBS credentials for `obs:` handles, the
 //! Gitea Bearer token for `gitea:` handles — and fails closed
@@ -46,13 +50,17 @@ use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth};
 use geectl::config::{self, DEFAULT_GITEA_URL};
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
-use geectl::gitea::{parse_gitea_repo, GiteaClient, GiteaMergeMethod};
+use geectl::gitea::{
+    parse_gitea_repo, validate_gitea_base, GiteaClient, GiteaMergeMethod, PrCreateOptions,
+};
 use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{DryRun, ObsClient, ReviewTarget, OBS_API_BASE};
+use geectl::obs::{CveId, DryRun, ObsClient, ReviewTarget, SrPayload, OBS_API_BASE};
 use geectl::pull_request::{
     PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint, PullRequestRef,
     PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewComment, ReviewOpinion,
+    SubmitTarget, Submitted,
 };
+use geectl::working_copy::{self, Backend};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -115,6 +123,72 @@ pub enum PullRequestCommand {
         /// `gitea:<owner>/<repo>#<number>`.
         reference: String,
     },
+    /// File a submission from the working copy in the current
+    /// directory: an OBS submit request from an OBS-native
+    /// checkout, a Gitea pull request from a git-backed one. The
+    /// checkout's backend decides; the other arm's flags are
+    /// refused. Dry-run by default; mutates only with `--live`.
+    Submit(SubmitArgs),
+}
+
+/// Arguments for `pull-request submit`: the OBS arm's flags and
+/// the Gitea arm's flags in one set, each arm taking its own.
+/// The required flags are enforced per arm, after the checkout's
+/// backend is known: `--target-project`, `--description` and
+/// `--changes-entry` on OBS; `--base` and `--title` on Gitea.
+#[derive(Debug, Args)]
+pub struct SubmitArgs {
+    /// The project the request targets (the devel project, never
+    /// openSUSE:Factory directly). OBS only; required there.
+    #[arg(long)]
+    target_project: Option<String>,
+    /// The package in the target project. OBS only; the checkout
+    /// package when unset.
+    #[arg(long)]
+    target_package: Option<String>,
+    /// The request description: one headline, then `- ` lines for
+    /// staging, needs, and rebuilds. OBS only; required there.
+    /// Values starting with `-` are taken literally: a description
+    /// may open with a `- ` bullet.
+    #[arg(long, allow_hyphen_values = true)]
+    description: Option<String>,
+    /// The one `.changes` entry for this submission. It must name
+    /// every CVE passed with `--cve`. OBS only; required there.
+    /// Values starting with `-` are taken literally: a `.changes`
+    /// entry starts with `- `.
+    #[arg(long, allow_hyphen_values = true)]
+    changes_entry: Option<String>,
+    /// A CVE this submission claims to fix. Repeatable; each one
+    /// must be named in `--changes-entry`. OBS only.
+    #[arg(long)]
+    cve: Vec<String>,
+    /// Keep the source branch on accept instead of deleting it
+    /// (cleanup is the default). OBS only.
+    #[arg(long)]
+    without_cleanup: bool,
+    /// The repo to open the pull request in (`owner/repo`).
+    /// Gitea only; the checkout's origin remote when unset.
+    #[arg(long)]
+    repo: Option<String>,
+    /// The branch the change comes from. Gitea only; the
+    /// checkout's current branch when unset.
+    #[arg(long)]
+    head: Option<String>,
+    /// The branch the pull request targets. Gitea only; required
+    /// there.
+    #[arg(long)]
+    base: Option<String>,
+    /// The pull request title. Gitea only; required there. Values
+    /// starting with `-` are taken literally.
+    #[arg(long, allow_hyphen_values = true)]
+    title: Option<String>,
+    /// The pull request body. Gitea only. Values starting with `-`
+    /// are taken literally: the body may open with a `- ` bullet.
+    #[arg(long, allow_hyphen_values = true)]
+    body: Option<String>,
+    /// Open the pull request as a draft. Gitea only.
+    #[arg(long)]
+    draft: bool,
 }
 
 /// Arguments shared by `pull-request approve` and `pull-request
@@ -432,6 +506,7 @@ pub fn run_pull_request(
             None,
             |client, reference, dry_run| client.reopen(reference, dry_run),
         ),
+        PullRequestCommand::Submit(args) => submit(args, debug, live),
         PullRequestCommand::Search(args) => {
             // The filters are parsed and validated before any
             // credential resolution, like the handle above.
@@ -567,6 +642,296 @@ fn with_gitea<T>(
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let client = gitea_client(&http, debug)?;
     f(&client)
+}
+
+/// File a submission from the working copy in the current
+/// directory. The checkout opens first (a local read, no
+/// credentials), its backend decides the arm, and the arm's flags
+/// are validated before any credential resolution — like the other
+/// arms validate their handles and targets first. Each arm then
+/// refuses a checkout that is not submittable before filing.
+fn submit(args: SubmitArgs, debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    let wc = if live {
+        working_copy::open(&current_dir()?)
+    } else {
+        working_copy::open_read(&current_dir()?)
+    }?;
+    match wc.backend {
+        Backend::Obs => {
+            let target = obs_submit_target(&args, &wc)?;
+            with_obs(debug, live, |obs| {
+                working_copy::refuse_not_submittable_obs(&wc, obs)?;
+                let client = PullRequestClient::new(Some(obs), None).with_debug(debug.clone());
+                let submitted = client.submit(&target, &dry_run)?;
+                Ok((
+                    submit_payload(&submitted, &dry_run)?,
+                    submit_text(&target, &submitted, &dry_run),
+                ))
+            })
+        }
+        Backend::Git => {
+            // The instance URL comes first (config only, no
+            // credentials): the target build validates the flags
+            // and the origin host against it before any credential
+            // resolution, like the other arms. The token is then
+            // resolved once, alias-aware, and shared by the API
+            // client and the pre-filing fetch, so the two can never
+            // disagree (a plain-vars client against an alias-vars
+            // fetch, or the reverse). The fetch runs only live; in
+            // dry-run the token serves the client alone — a dry-run
+            // Gitea act still needs one to build, like every Gitea
+            // act in this group. That is the asymmetry with the OBS
+            // arm, which prints its dry-run plan with a warning
+            // when credentials fail: the Gitea client fails closed
+            // without a Bearer token, so there is no unauthenticated
+            // client to plan with — the token is a build
+            // requirement, not a live-only one. Lifting that is a
+            // group-wide policy call, not this verb's.
+            let (base, instances) = gitea_instance()?;
+            // The base validates before any credential is resolved:
+            // a configured base with a path is the base's own error,
+            // not a misleading "no token configured".
+            validate_gitea_base(&base)?;
+            let target = git_submit_target(&args, &wc, &base)?;
+            let token = gitea_token_for(&base, &instances)?;
+            let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+            let gitea = GiteaClient::with_base(
+                &http,
+                &base,
+                Credentials::Bearer {
+                    token: token.clone(),
+                },
+            )
+            .map(|client| client.with_debug(debug.clone()))?;
+            let auth = working_copy::GiteaAuth {
+                token: &token,
+                url: &base,
+            };
+            working_copy::refuse_not_submittable_git(&wc, Some(&auth), &dry_run)?;
+            let client = PullRequestClient::new(None, Some(&gitea)).with_debug(debug.clone());
+            let submitted = client.submit(&target, &dry_run)?;
+            Ok((
+                submit_payload(&submitted, &dry_run)?,
+                submit_text(&target, &submitted, &dry_run),
+            ))
+        }
+    }
+}
+
+/// The current directory: the checkout root for `submit`, like
+/// the working-copy leaves.
+fn current_dir() -> Result<std::path::PathBuf, GeectlError> {
+    std::env::current_dir().map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("failed to read the current directory: {e}"),
+        )
+    })
+}
+
+/// The configured Gitea instance URL and the config file's
+/// `[instances]` table, for the alias-aware token resolution.
+/// Config only — no credentials are read here, so the target build
+/// (flag validation, origin-host check) can run before any
+/// credential resolution.
+fn gitea_instance() -> Result<(String, Vec<(String, String)>), GeectlError> {
+    let path = config::config_path()?;
+    let file_config = config::load_config_at(&path)?;
+    let effective = config::effective_config(&file_config)?;
+    let base = effective
+        .config
+        .gitea_url
+        .as_deref()
+        .unwrap_or(DEFAULT_GITEA_URL)
+        .to_string();
+    Ok((base, file_config.instances))
+}
+
+/// The Gitea token for `base`, alias-aware: the matching alias's
+/// variables from `[instances]` when one matches, else the plain
+/// variables (see `resolve_gitea_bearer_for_url`). The one
+/// resolution the submit arm shares between its API client and its
+/// pre-filing fetch. A missing token fails closed with the plain
+/// message; the alias-aware error names the alias variables when
+/// an alias matches.
+fn gitea_token_for(base: &str, instances: &[(String, String)]) -> Result<String, GeectlError> {
+    match EnvGiteaAuth::credentials_for_url(base, base, instances)? {
+        Credentials::Bearer { token } => Ok(token),
+        _ => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            "no Gitea token configured (GEECTL_GITEA_TOKEN or GEECTL_GITEA_TOKEN_FILE)",
+        )),
+    }
+}
+
+/// The OBS filing target from the submit flags: the foreign
+/// (Gitea) flags are refused, the required flags are named, the
+/// CVEs are parsed. The source is the checkout itself.
+fn obs_submit_target(
+    args: &SubmitArgs,
+    wc: &working_copy::WorkingCopy,
+) -> Result<SubmitTarget, GeectlError> {
+    refuse_gitea_flags(args)?;
+    let target_project = args.target_project.as_deref().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--target-project is required to file an OBS submit request",
+        )
+    })?;
+    let description = args.description.as_deref().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--description is required to file an OBS submit request",
+        )
+    })?;
+    let changes_entry = args.changes_entry.as_deref().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--changes-entry is required to file an OBS submit request",
+        )
+    })?;
+    let mut cves = Vec::new();
+    for value in &args.cve {
+        cves.push(CveId::parse(value)?);
+    }
+    let mut payload = SrPayload::new(
+        &wc.project,
+        &wc.package,
+        target_project,
+        args.target_package.as_deref().unwrap_or(&wc.package),
+        description,
+        changes_entry,
+        &cves,
+    )?;
+    if args.without_cleanup {
+        payload = payload.without_cleanup();
+    }
+    Ok(SubmitTarget::Obs(payload))
+}
+
+/// Refuse the Gitea arm's flags on an OBS-native checkout: each
+/// names what applies instead, so the agent sees the OBS spelling.
+fn refuse_gitea_flags(args: &SubmitArgs) -> Result<(), GeectlError> {
+    if args.repo.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--repo does not apply to an OBS-native checkout: an OBS submit request targets a project, not a Gitea repo",
+        ));
+    }
+    if args.head.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--head does not apply to an OBS-native checkout: the request files the checkout as it stands",
+        ));
+    }
+    if args.base.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--base does not apply to an OBS-native checkout: the target is --target-project",
+        ));
+    }
+    if args.title.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--title does not apply to an OBS-native checkout: the request takes --description",
+        ));
+    }
+    if args.body.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--body does not apply to an OBS-native checkout: the request takes --description",
+        ));
+    }
+    if args.draft {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--draft does not apply to an OBS-native checkout: OBS has no draft requests",
+        ));
+    }
+    Ok(())
+}
+
+/// The Gitea filing target from the submit flags: the foreign
+/// (OBS) flags are refused, the required flags are named, the repo
+/// and head default from the checkout (its origin remote, its
+/// current branch).
+fn git_submit_target(
+    args: &SubmitArgs,
+    wc: &working_copy::WorkingCopy,
+    instance_url: &str,
+) -> Result<SubmitTarget, GeectlError> {
+    refuse_obs_flags(args)?;
+    let (owner, repo) = match &args.repo {
+        Some(repo) => parse_gitea_repo(repo)?,
+        None => working_copy::origin_repo(wc, instance_url)?,
+    };
+    let head = match &args.head {
+        Some(head) => head.clone(),
+        None => working_copy::current_branch(wc)?,
+    };
+    let base = args.base.as_deref().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--base is required to open a Gitea pull request",
+        )
+    })?;
+    let title = args.title.as_deref().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--title is required to open a Gitea pull request",
+        )
+    })?;
+    let mut options = PrCreateOptions::new(&head, base, title)?;
+    options.body = args.body.clone();
+    options.draft = args.draft;
+    Ok(SubmitTarget::Gitea {
+        owner,
+        repo,
+        options,
+    })
+}
+
+/// Refuse the OBS arm's flags on a git-backed checkout: each names
+/// what applies instead, so the agent sees the Gitea spelling.
+fn refuse_obs_flags(args: &SubmitArgs) -> Result<(), GeectlError> {
+    if args.target_project.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--target-project does not apply to a git-backed checkout: the pull request goes to --repo",
+        ));
+    }
+    if args.target_package.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--target-package does not apply to a git-backed checkout: the pull request files the whole branch",
+        ));
+    }
+    if args.description.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--description does not apply to a git-backed checkout: the pull request takes --title and --body",
+        ));
+    }
+    if args.changes_entry.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--changes-entry does not apply to a git-backed checkout: OBS-only",
+        ));
+    }
+    if !args.cve.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--cve does not apply to a git-backed checkout: OBS-only",
+        ));
+    }
+    if args.without_cleanup {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--without-cleanup does not apply to a git-backed checkout: OBS-only",
+        ));
+    }
+    Ok(())
 }
 
 /// The review target for an act: `None` when no target flag
@@ -821,6 +1186,74 @@ fn comment_text(
                 comment.id, comment.author, comment.body
             ),
             None => format!("commented on {reference}: {body}"),
+        }
+    }
+}
+
+/// The payload for a submit: the filed handle (`null` in
+/// dry-run), the superseded handles (`null` in dry-run), and
+/// `dry_run`, plus the plan in dry-run.
+fn submit_payload(submitted: &Option<Submitted>, dry_run: &DryRun) -> Result<Value, GeectlError> {
+    let mut payload = json!({
+        "reference": match submitted {
+            Some(submitted) => payload_json(&submitted.reference)?,
+            None => Value::Null,
+        },
+        "superseded": match submitted {
+            Some(submitted) => {
+                let mut items = Vec::new();
+                for reference in &submitted.superseded {
+                    items.push(payload_json(reference)?);
+                }
+                Value::Array(items)
+            }
+            None => Value::Null,
+        },
+        "dry_run": dry_run.enabled(),
+    });
+    add_plan(&mut payload, dry_run);
+    Ok(payload)
+}
+
+/// The text for a submit: in dry-run, what would be filed and
+/// where — the checkout against its target; live, the filed
+/// handle and what it superseded.
+fn submit_text(target: &SubmitTarget, submitted: &Option<Submitted>, dry_run: &DryRun) -> String {
+    if dry_run.enabled() {
+        match target {
+            SubmitTarget::Obs(payload) => format!(
+                "dry-run: would file a submit request for {}/{} to {}",
+                payload.source_project(),
+                payload.source_package(),
+                payload.target_project()
+            ),
+            SubmitTarget::Gitea {
+                owner,
+                repo,
+                options,
+            } => format!(
+                "dry-run: would open a pull request for {owner}/{repo} from {} to {}",
+                options.head, options.base
+            ),
+        }
+    } else {
+        match submitted {
+            Some(submitted) => {
+                let mut text = format!("filed {}", submitted.reference);
+                if !submitted.superseded.is_empty() {
+                    let names: Vec<String> = submitted
+                        .superseded
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
+                    text.push_str(&format!(" (supersedes {})", names.join(", ")));
+                }
+                text
+            }
+            // Unreachable: the library returns `Some` live, `None`
+            // only in dry-run — but the type allows it, so name it
+            // rather than panic.
+            None => "filed the submission".to_string(),
         }
     }
 }
@@ -1642,5 +2075,96 @@ mod tests {
         );
         let text = level_act_text("reopen", "reopened", &reference, &None, None, &dry_run);
         assert_eq!(text, "dry-run: would reopen gitea:openSUSE/geectl#122");
+    }
+
+    fn obs_submit_target_fixture() -> SubmitTarget {
+        SubmitTarget::Obs(
+            SrPayload::new(
+                "home:alice",
+                "foo",
+                "home:devel",
+                "foo",
+                "Update foo",
+                "- Update to 1.1.",
+                &[],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn gitea_submit_target_fixture() -> SubmitTarget {
+        SubmitTarget::Gitea {
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            options: PrCreateOptions::new("feature", "main", "Update foo").unwrap(),
+        }
+    }
+
+    fn obs_submitted_fixture() -> Submitted {
+        Submitted {
+            reference: PullRequestRef::Obs(123),
+            superseded: vec![PullRequestRef::Obs(122)],
+        }
+    }
+
+    fn gitea_submitted_fixture() -> Submitted {
+        Submitted {
+            reference: PullRequestRef::Gitea {
+                owner: "owner".to_string(),
+                repo: "repo".to_string(),
+                number: 7,
+            },
+            superseded: vec![],
+        }
+    }
+
+    #[test]
+    fn submit_json_and_text_agree() {
+        let target = obs_submit_target_fixture();
+        let submitted = Some(obs_submitted_fixture());
+        let dry_run = DryRun::new(false);
+        let payload = submit_payload(&submitted, &dry_run).unwrap();
+        assert_eq!(payload["reference"], "obs:123");
+        assert_eq!(payload["superseded"][0], "obs:122");
+        assert_eq!(payload["dry_run"], false);
+        assert!(payload.get("plan").is_none());
+        let text = submit_text(&target, &submitted, &dry_run);
+        assert_eq!(text, "filed obs:123 (supersedes obs:122)");
+
+        let dry_run = DryRun::new(true);
+        dry_run.allow("file a submit request for home:alice/foo to home:devel");
+        let payload = submit_payload(&None, &dry_run).unwrap();
+        assert_eq!(payload["reference"], serde_json::Value::Null);
+        assert_eq!(payload["superseded"], serde_json::Value::Null);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: file a submit request for home:alice/foo to home:devel"
+        );
+        let text = submit_text(&target, &None, &dry_run);
+        assert_eq!(
+            text,
+            "dry-run: would file a submit request for home:alice/foo to home:devel"
+        );
+    }
+
+    #[test]
+    fn submit_gitea_json_and_text_agree() {
+        let target = gitea_submit_target_fixture();
+        let submitted = Some(gitea_submitted_fixture());
+        let dry_run = DryRun::new(false);
+        let payload = submit_payload(&submitted, &dry_run).unwrap();
+        assert_eq!(payload["reference"], "gitea:owner/repo#7");
+        assert_eq!(payload["superseded"], serde_json::json!([]));
+        assert_eq!(payload["dry_run"], false);
+        let text = submit_text(&target, &submitted, &dry_run);
+        assert_eq!(text, "filed gitea:owner/repo#7");
+
+        let dry_run = DryRun::new(true);
+        let text = submit_text(&target, &None, &dry_run);
+        assert_eq!(
+            text,
+            "dry-run: would open a pull request for owner/repo from feature to main"
+        );
     }
 }

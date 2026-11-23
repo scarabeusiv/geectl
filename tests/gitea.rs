@@ -41,7 +41,7 @@ use geectl::debug::Debug;
 use geectl::error::ErrorKind;
 use geectl::gitea::{
     ForkRepoOptions, GiteaAccess, GiteaAccessMode, GiteaClient, GiteaPullRequestState,
-    RepoCreateOptions, TeamCreateOptions,
+    PrCreateOptions, RepoCreateOptions, TeamCreateOptions,
 };
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::DryRun;
@@ -1542,6 +1542,61 @@ fn gitea_pull_request_read_round_trip() {
         ErrorKind::NotFound,
         "a missing PR must map to NotFound; got {err:?}"
     );
+    let _ = repo_guard.delete();
+}
+
+/// `pr_create` through the typed client opens a real pull request
+/// on the live instance: the number comes back and `pr_get` reads
+/// the PR with the title, body, head and base the options named.
+/// The raw-commit setup is shared with `setup_pull_request`; the
+/// creation itself is the typed call, not the raw helper.
+#[test]
+fn gitea_pr_create_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let repo_guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let user = gitea_user();
+    create_repo_typed(&client, &repo, "main");
+    let at = RepoAddr {
+        base: &base,
+        owner: &user,
+        repo: &repo,
+    };
+    let main_sha = create_commit_raw(&http, &at, "README.md", "live test\n", "main", None);
+    let feature_sha = create_commit_raw(
+        &http,
+        &at,
+        "FEATURE.md",
+        "live test\n",
+        "main",
+        Some("feature"),
+    );
+    let mut options = PrCreateOptions::new("feature", "main", "Add feature").unwrap();
+    options.body = Some("The feature body.".to_string());
+    let created = client
+        .pr_create(&user, &repo, &options, &DryRun::new(false))
+        .expect("typed pr_create opens the PR")
+        .expect("live pr_create returns the PR");
+    assert!(created.number > 0);
+    assert_eq!(created.title, "Add feature");
+    assert_eq!(created.body.as_deref(), Some("The feature body."));
+    assert_eq!(created.state, "open");
+    assert!(!created.draft);
+    assert_eq!(created.head.branch, "feature");
+    assert_eq!(created.head.sha, feature_sha);
+    assert_eq!(created.base.branch, "main");
+    assert_eq!(created.base.sha, main_sha);
+    // pr_get reads it back: the create and the read agree.
+    let read = client
+        .pr_get(&user, &repo, created.number)
+        .expect("typed pr_get reads the created PR");
+    assert_eq!(read.number, created.number);
+    assert_eq!(read.title, "Add feature");
     let _ = repo_guard.delete();
 }
 

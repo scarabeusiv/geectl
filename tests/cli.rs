@@ -3854,6 +3854,7 @@ fn pull_request_help_lists_the_subcommands() {
         "decline",
         "withdraw",
         "reopen",
+        "submit",
     ] {
         assert!(text.contains(name), "pull-request --help misses {name}");
     }
@@ -4005,6 +4006,573 @@ fn pull_request_merge_gitea_with_force_is_invalid_input_without_credentials() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
     assert!(stderr.contains("--force"), "stderr: {stderr}");
+}
+
+/// Run git in `dir`, asserting success.
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap()
+        .status;
+    assert!(
+        status.success(),
+        "git {} failed in {}",
+        args.join(" "),
+        dir.display()
+    );
+}
+
+/// A hand-built OBS-native checkout at `<dir>/checkout`: a root
+/// commit with the base message and the `geectl.*` record, base
+/// rev 1, srcmd5 of all `a`s, apiurl the fixture URL.
+fn obs_submit_checkout(dir: &TempDir, apiurl: &str) -> std::path::PathBuf {
+    let checkout = dir.0.join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    git_in(&checkout, &["init", "--quiet"]);
+    git_in(&checkout, &["config", "--local", "user.name", "geectl"]);
+    git_in(
+        &checkout,
+        &["config", "--local", "user.email", "geectl@localhost"],
+    );
+    std::fs::write(checkout.join("foo.spec"), "Name: foo\n").unwrap();
+    git_in(&checkout, &["add", "-A"]);
+    git_in(
+        &checkout,
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "geectl base 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ],
+    );
+    for (key, value) in [
+        ("geectl.apiurl", apiurl),
+        ("geectl.project", "home:alice"),
+        ("geectl.package", "foo"),
+        ("geectl.backend", "obs"),
+        ("geectl.base-rev", "1"),
+        ("geectl.base-srcmd5", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    ] {
+        git_in(&checkout, &["config", "--local", key, value]);
+    }
+    checkout
+}
+
+/// A hand-built git-backed checkout at `<dir>/checkout`: branch
+/// `main`, origin `https://src.opensuse.org/owner/repo` — the
+/// default instance, so the origin host matches — base the head
+/// commit. The shape a real `checkout` records.
+fn git_submit_checkout(dir: &TempDir) -> std::path::PathBuf {
+    let checkout = dir.0.join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    git_in(&checkout, &["init", "--quiet", "-b", "main"]);
+    git_in(&checkout, &["config", "--local", "user.name", "geectl"]);
+    git_in(
+        &checkout,
+        &["config", "--local", "user.email", "geectl@localhost"],
+    );
+    std::fs::write(checkout.join("foo.spec"), "Name: foo\n").unwrap();
+    git_in(&checkout, &["add", "-A"]);
+    git_in(&checkout, &["commit", "--quiet", "-m", "initial"]);
+    let head = String::from_utf8(
+        Command::new("git")
+            .current_dir(&checkout)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let head = head.trim().to_string();
+    git_in(
+        &checkout,
+        &[
+            "config",
+            "--local",
+            "remote.origin.url",
+            "https://src.opensuse.org/owner/repo",
+        ],
+    );
+    for (key, value) in [
+        ("geectl.apiurl", "https://api.opensuse.org"),
+        ("geectl.project", "home:alice"),
+        ("geectl.package", "foo"),
+        ("geectl.backend", "git"),
+        ("geectl.base-rev", head.as_str()),
+        ("geectl.base-srcmd5", ""),
+    ] {
+        git_in(&checkout, &["config", "--local", key, value]);
+    }
+    checkout
+}
+
+#[test]
+fn pull_request_submit_obs_dry_run_prints_plan() {
+    let dir = TempDir::new();
+    let addr = serve_once(
+        "<directory name=\"foo\" rev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" vrev=\"1\">\
+        <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+        </directory>",
+    );
+    let checkout = obs_submit_checkout(&dir, &format!("http://{addr}"));
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--target-project",
+            "home:devel",
+            "--description",
+            "Update foo",
+            "--changes-entry",
+            "- Update to 1.1.",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    // A dry-run submit on OBS prints without credentials: the
+    // plan names no acting user, and the only network read is the
+    // base revision for the freshness check.
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], serde_json::Value::Null);
+    assert_eq!(value["superseded"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: file submit request for foo to home:devel"
+    );
+}
+
+#[test]
+fn pull_request_submit_obs_text_dry_run_prints_plan() {
+    let dir = TempDir::new();
+    let addr = serve_once(
+        "<directory name=\"foo\" rev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" vrev=\"1\">\
+        <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+        </directory>",
+    );
+    let checkout = obs_submit_checkout(&dir, &format!("http://{addr}"));
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "--format",
+            "text",
+            "pull-request",
+            "submit",
+            "--target-project",
+            "home:devel",
+            "--description",
+            "Update foo",
+            "--changes-entry",
+            "- Update to 1.1.",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would file a submit request for home:alice/foo to home:devel"
+    );
+}
+
+#[test]
+fn pull_request_submit_gitea_dry_run_prints_plan() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--base",
+            "main",
+            "--title",
+            "Update foo",
+        ])
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    // A dry-run submit on Gitea prints with a token configured
+    // (the client needs one to build); the token is never sent —
+    // the dry-run plan does not fetch, and pr_create posts nothing.
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], serde_json::Value::Null);
+    assert_eq!(value["superseded"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: create pull request in owner/repo from main to main"
+    );
+}
+
+#[test]
+fn pull_request_submit_gitea_text_dry_run_prints_plan() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "--format",
+            "text",
+            "pull-request",
+            "submit",
+            "--base",
+            "main",
+            "--title",
+            "Update foo",
+        ])
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would open a pull request for owner/repo from main to main"
+    );
+}
+
+#[test]
+fn pull_request_submit_obs_with_repo_is_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = obs_submit_checkout(&dir, "https://api.opensuse.org");
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--target-project",
+            "home:devel",
+            "--description",
+            "Update foo",
+            "--changes-entry",
+            "- Update to 1.1.",
+            "--repo",
+            "owner/repo",
+        ])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; --repo does not apply to an
+    // OBS-native checkout. The refusal precedes credential
+    // resolution and any network read, so no fixture is needed.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--repo"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_submit_gitea_with_target_project_is_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--target-project",
+            "home:devel",
+            "--base",
+            "main",
+            "--title",
+            "Update foo",
+        ])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; --target-project does not apply to a
+    // git-backed checkout. The refusal precedes credential
+    // resolution, so it fires without a token.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--target-project"), "stderr: {stderr}");
+}
+
+/// A submit invocation that must fail with InvalidInput (exit 2):
+/// the args, and the substring the error must name. Every case
+/// runs without credentials and without a fixture: the refusal
+/// precedes credential resolution and any network read.
+fn assert_submit_invalid_input(
+    dir: &TempDir,
+    checkout: &std::path::Path,
+    args: &[&str],
+    needle: &str,
+) {
+    let out = geectl_isolated(dir)
+        .current_dir(checkout)
+        .args(["pull-request", "submit"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "args: {args:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid_input"),
+        "args: {args:?} stderr: {stderr}"
+    );
+    assert!(stderr.contains(needle), "args: {args:?} stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_submit_obs_missing_required_flags_are_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = obs_submit_checkout(&dir, "https://api.opensuse.org");
+    // Each required flag missing in turn; the other two present.
+    assert_submit_invalid_input(
+        &dir,
+        &checkout,
+        &[
+            "--description",
+            "Update foo",
+            "--changes-entry",
+            "- Update to 1.1.",
+        ],
+        "--target-project",
+    );
+    assert_submit_invalid_input(
+        &dir,
+        &checkout,
+        &[
+            "--target-project",
+            "home:devel",
+            "--changes-entry",
+            "- Update to 1.1.",
+        ],
+        "--description",
+    );
+    assert_submit_invalid_input(
+        &dir,
+        &checkout,
+        &[
+            "--target-project",
+            "home:devel",
+            "--description",
+            "Update foo",
+        ],
+        "--changes-entry",
+    );
+}
+
+#[test]
+fn pull_request_submit_gitea_missing_required_flags_are_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    assert_submit_invalid_input(&dir, &checkout, &["--title", "Update foo"], "--base");
+    assert_submit_invalid_input(&dir, &checkout, &["--base", "main"], "--title");
+}
+
+#[test]
+fn pull_request_submit_obs_foreign_flags_are_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = obs_submit_checkout(&dir, "https://api.opensuse.org");
+    let base = [
+        "--target-project",
+        "home:devel",
+        "--description",
+        "Update foo",
+        "--changes-entry",
+        "- Update to 1.1.",
+    ];
+    for (flag, value) in [
+        ("--repo", "owner/repo"),
+        ("--head", "feature"),
+        ("--base", "main"),
+        ("--title", "Update foo"),
+        ("--body", "The body."),
+    ] {
+        let mut args: Vec<&str> = base.to_vec();
+        args.push(flag);
+        args.push(value);
+        assert_submit_invalid_input(&dir, &checkout, &args, flag);
+    }
+    let mut args: Vec<&str> = base.to_vec();
+    args.push("--draft");
+    assert_submit_invalid_input(&dir, &checkout, &args, "--draft");
+}
+
+#[test]
+fn pull_request_submit_gitea_foreign_flags_are_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    let base = ["--base", "main", "--title", "Update foo"];
+    for (flag, value) in [
+        ("--target-project", "home:devel"),
+        ("--target-package", "foo"),
+        ("--description", "Update foo"),
+        ("--changes-entry", "- Update to 1.1."),
+        ("--cve", "CVE-2026-1234"),
+    ] {
+        let mut args: Vec<&str> = base.to_vec();
+        args.push(flag);
+        args.push(value);
+        assert_submit_invalid_input(&dir, &checkout, &args, flag);
+    }
+    let mut args: Vec<&str> = base.to_vec();
+    args.push("--without-cleanup");
+    assert_submit_invalid_input(&dir, &checkout, &args, "--without-cleanup");
+}
+
+#[test]
+fn pull_request_submit_gitea_foreign_host_is_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    // The fixture origin is the default instance; point it at a
+    // foreign host instead: same owner/repo shape, wrong instance.
+    git_in(
+        &checkout,
+        &[
+            "config",
+            "--local",
+            "remote.origin.url",
+            "https://codeberg.org/owner/repo",
+        ],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--base",
+            "main",
+            "--title",
+            "Update foo",
+        ])
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; the origin host is not the configured
+    // instance. The refusal precedes any filing, so the token is
+    // never sent anywhere.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("not the configured Gitea instance"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("pass --repo"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_submit_gitea_alias_token_dry_run_prints_plan() {
+    let dir = TempDir::new();
+    // A custom instance under an alias: the token lives only in
+    // the alias variable, never in the plain one. The origin host
+    // matches the alias instance.
+    let config_dir = dir.0.join("geectl");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[instances]\ncustom = \"https://gitea.example.org\"\n",
+    )
+    .unwrap();
+    let checkout = git_submit_checkout(&dir);
+    git_in(
+        &checkout,
+        &[
+            "config",
+            "--local",
+            "remote.origin.url",
+            "https://gitea.example.org/owner/repo",
+        ],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--base",
+            "main",
+            "--title",
+            "Update foo",
+        ])
+        .env("GEECTL_GITEA_URL", "https://gitea.example.org")
+        .env("GEECTL_GITEA_TOKEN_CUSTOM", "alias-token")
+        .output()
+        .unwrap();
+    // The alias token resolves for the client and the fetch alike:
+    // one resolution, shared. The dry-run plan prints; nothing is
+    // sent to the instance.
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: create pull request in owner/repo from main to main"
+    );
+}
+
+#[test]
+fn pull_request_submit_gitea_base_with_path_reports_the_base() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    // The origin host matches the configured base; the base itself
+    // is malformed (a path), and no token is configured at all.
+    git_in(
+        &checkout,
+        &[
+            "config",
+            "--local",
+            "remote.origin.url",
+            "https://host/owner/repo",
+        ],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--base",
+            "main",
+            "--title",
+            "Update foo",
+        ])
+        .env("GEECTL_GITEA_URL", "https://host/evil")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The base validates first: the error names the base, never
+    // the missing token.
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("Gitea base URL"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("no Gitea token configured"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
