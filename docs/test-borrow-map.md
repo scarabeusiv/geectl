@@ -666,6 +666,13 @@ Valid service run, `source_validator` gate (gate 2), `precommit`,
 `test_conf.py`, `test_deletefiles.py`, `test_update.py` — `_service` file
 handling, not the run operation).
 
+Comment handling in `_service` files is also new-from-scratch
+(#218): no osc test or fixture carries a comment in a `_service`
+file (no `<!--` in any behave feature or unit test, no
+`changesgenerate` anywhere in the suite), and osc reads `_service`
+XML through ElementTree (`xml_fromstring`), which skips comments
+natively — there is no adoptable comment case. Counts unchanged.
+
 ## Batch 9 — Gitea operations
 
 **Direct adoptions: 15 (2 unit + 13 behave). Surveyed in full
