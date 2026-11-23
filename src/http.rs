@@ -64,6 +64,19 @@ pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum response body accepted: 10 MiB. A body over this fails with
 /// `ServerError` instead of growing the process without bound.
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum number of redirects a mirror download follows: the
+/// download mirror answers one redirect to its backing store, and a
+/// chain longer than this is a loop or a misconfiguration, never a
+/// mirror. A chain past the limit is a mirror failure (the caller
+/// falls back to the API), not a build failure.
+pub const MAX_MIRROR_REDIRECTS: usize = 5;
+/// Maximum streamed mirror RPM accepted: 1 GiB. A dep RPM over this
+/// is not downloaded from the mirror at all — the mirror attempt
+/// fails and the caller falls back to the API, which streams
+/// uncapped — so the cap never breaks a build, it only bounds what
+/// a hostile mirror can make geectl write to disk. 1 GiB is far
+/// above any published dep RPM and far below the cache volume.
+pub const MAX_MIRROR_RPM_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Bounded timeouts for a request. All three are always set; there is
 /// no "no timeout" state.
@@ -327,6 +340,34 @@ pub trait HttpClient {
         Err(GeectlError::new(
             ErrorKind::InternalError,
             "this HTTP client cannot stream downloads to disk",
+        ))
+    }
+    /// GET a URL and stream the response body to a file, following a
+    /// bounded redirect chain: the mirror-download counterpart of
+    /// [`HttpClient::get_to_file`]. Unlike `get_to_file` it is
+    /// single-shot — no retries, no backoff — and it follows up to
+    /// [`MAX_MIRROR_REDIRECTS`] redirects, staying on the same
+    /// scheme (see [`resolve_mirror_redirect`]) and never sending
+    /// credentials past the first hop, because the caller's
+    /// credentials are the mirror's to keep, not the redirect
+    /// target's. The body is capped at `max_bytes`: a body over the
+    /// cap fails with `ServerError` instead of filling the disk, and
+    /// the caller falls back to its other source. The file is
+    /// created exclusively, like `get_to_file`, and a failure
+    /// mid-stream leaves a partial file for the caller to delete.
+    /// The default implementation refuses: a client that only reads
+    /// text cannot stream downloads. [`UreqClient`] overrides it.
+    fn get_to_file_mirror(
+        &self,
+        url: &str,
+        credentials: &Credentials,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<u64, GeectlError> {
+        let _ = (url, credentials, path, max_bytes);
+        Err(GeectlError::new(
+            ErrorKind::InternalError,
+            "this HTTP client cannot stream mirror downloads to disk",
         ))
     }
     fn post(&self, url: &str, body: &str, credentials: &Credentials)
@@ -831,6 +872,136 @@ impl UreqClient {
         Err(last_error.unwrap_or_else(|| {
             GeectlError::new(ErrorKind::InternalError, "GET failed without an error")
         }))
+    }
+
+    /// One mirror download attempt: a single GET with no retries,
+    /// no backoff. A 3xx reports its `Location` for the caller to
+    /// follow (see `get_to_file_mirror`); a 2xx streams the body to
+    /// `path`, capped at `max_bytes`; any other status maps like a
+    /// GET status, returned at once. The file is created
+    /// exclusively, like `get_to_file`, and a failure mid-stream
+    /// leaves a partial file for the caller to delete. A
+    /// `Content-Length` over the cap fails before the file is
+    /// created; a body that grows past the cap fails mid-stream.
+    /// No `Accept` header: the bytes are a file, not an XML
+    /// document.
+    fn mirror_attempt(
+        &self,
+        url: &str,
+        credentials: &Credentials,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<MirrorHop, GeectlError> {
+        // Credentials never travel over cleartext http, except to a
+        // loopback host. The mirror call passes none in production,
+        // and `get_to_file_mirror` strips them after the first hop
+        // anyway — the guard still runs per hop, so a credentialed
+        // first hop over plain http fails here instead of leaking.
+        require_credentials_transport(url, credentials)?;
+        let request = self.apply_auth(self.agent.get(url), credentials)?;
+        match request.call() {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if resp.status().is_redirection() {
+                    let Some(location) =
+                        resp.headers().get("location").and_then(|v| v.to_str().ok())
+                    else {
+                        return Err(GeectlError::new(
+                            ErrorKind::ServerError,
+                            format!(
+                                "mirror at {} redirected without a Location header",
+                                sanitize_url_for_error(url),
+                            ),
+                        ));
+                    };
+                    return Ok(MirrorHop::Redirect(location.to_string()));
+                }
+                if !resp.status().is_success() {
+                    let body = read_error_body(resp.into_body().into_reader());
+                    let safe_url = sanitize_url_for_error(url);
+                    return match status_action_with_body(status, &safe_url, &body) {
+                        StatusAction::Return(err) | StatusAction::Retry(err) => Err(err),
+                    };
+                }
+                if let Some(content_length) = resp
+                    .headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    if content_length > max_bytes {
+                        return Err(GeectlError::new(
+                            ErrorKind::ServerError,
+                            format!(
+                                "mirror download of {} exceeds the {max_bytes}-byte cap (Content-Length: {content_length})",
+                                sanitize_url_for_error(url),
+                            ),
+                        ));
+                    }
+                }
+                let mut file = std::fs::File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map_err(|e| download_io_error(DownloadIoPhase::Create, path, &e))?;
+                // Copy in a loop, not `io::copy`: a read failure is
+                // the network, a write failure is the disk, and the
+                // two must not share one error kind — the same loop
+                // as `get_to_file`, plus the size cap: a body that
+                // grows past the cap fails mid-stream, leaving a
+                // partial file for the caller to delete.
+                let mut reader = resp.into_body().into_reader();
+                let mut buf = [0u8; 65536];
+                let mut bytes: u64 = 0;
+                loop {
+                    let n = match reader.read(&mut buf) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            return Err(download_io_error(DownloadIoPhase::Read, path, &e));
+                        }
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    if bytes + n as u64 > max_bytes {
+                        return Err(GeectlError::new(
+                            ErrorKind::ServerError,
+                            format!(
+                                "mirror download of {} exceeds the {max_bytes}-byte cap",
+                                sanitize_url_for_error(url),
+                            ),
+                        ));
+                    }
+                    file.write_all(&buf[..n])
+                        .map_err(|e| download_io_error(DownloadIoPhase::Write, path, &e))?;
+                    bytes += n as u64;
+                }
+                file.sync_all()
+                    .map_err(|e| download_io_error(DownloadIoPhase::Sync, path, &e))?;
+                Ok(MirrorHop::Downloaded(bytes))
+            }
+            Err(ureq::Error::Tls(msg)) => Err(GeectlError::new(
+                ErrorKind::TlsError,
+                format!("TLS error: {msg}"),
+            )),
+            Err(ureq::Error::Rustls(e)) => Err(GeectlError::new(
+                ErrorKind::TlsError,
+                format!("TLS error: {e}"),
+            )),
+            Err(ureq::Error::Pem(e)) => Err(GeectlError::new(
+                ErrorKind::TlsError,
+                format!("TLS error: {e}"),
+            )),
+            Err(ureq::Error::Timeout(_)) => Err(GeectlError::new(
+                ErrorKind::Timeout,
+                format!("request to {} timed out", sanitize_url_for_error(url)),
+            )),
+            Err(ureq::Error::Io(e)) => {
+                Err(GeectlError::new(ErrorKind::NetworkError, e.to_string()))
+            }
+            Err(e) => Err(GeectlError::new(ErrorKind::ServerError, e.to_string())),
+        }
     }
 
     /// Emit one HTTP attempt line for a retried method: method,
@@ -1560,6 +1731,202 @@ pub fn sanitize_url_for_error(url: &str) -> String {
     out
 }
 
+/// Split a URL into (scheme, authority, path): the authority is
+/// the part between `://` and the first `/` (or the end). None when
+/// the URL has no scheme separator — a relative reference, not a
+/// URL this helper can classify.
+fn split_url(url: &str) -> Option<(&str, &str, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    Some((scheme, &rest[..authority_end], &rest[authority_end..]))
+}
+
+/// The host of a URL's authority: a bracketed IPv6 host without its
+/// brackets, or the part before the first `:` (the port). Empty when
+/// the authority names no host (an unbracketed IPv6 literal, or an
+/// authority that is only a port).
+fn url_authority_host(authority: &str) -> &str {
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        return match bracketed.split_once(']') {
+            Some((inside, rest)) if rest.is_empty() || rest.starts_with(':') => inside,
+            _ => "",
+        };
+    }
+    authority.split(':').next().unwrap_or("")
+}
+
+/// True when a mirror host is public: not empty, not `localhost`,
+/// and not a literal loopback, link-local, or private IP. DNS names
+/// are taken at face value: only literal IP hosts are classified, a
+/// name that resolves to a private address is not caught here.
+fn mirror_host_is_public(host: &str) -> bool {
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let non_public = match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_private(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unicast_link_local() || v6.is_unique_local()
+            }
+        };
+        if non_public {
+            return false;
+        }
+    }
+    true
+}
+
+/// True when a URL is a usable published-repo mirror base: `https`
+/// only (the scheme is lowercased first, so `HTTPS://` counts), no
+/// userinfo, no query, no fragment, and a host that is not
+/// loopback, link-local, or private. A mirror URL comes from the
+/// buildinfo the OBS server sent, so a project's `<path url>` can
+/// point anywhere — without this check geectl would issue requests
+/// to loopback or internal addresses from the developer's machine,
+/// and a plain-`http` mirror would let an on-path attacker
+/// substitute the package. DNS names are taken at face value: only
+/// literal IP hosts are classified, a name that resolves to a
+/// private address is not caught here.
+pub(crate) fn valid_mirror_url(url: &str) -> bool {
+    let url = url.trim();
+    if url.is_empty()
+        || url
+            .chars()
+            .any(|c| c.is_ascii_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    let Some((scheme, authority, _)) = split_url(url) else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    if url.contains('?') || url.contains('#') {
+        return false;
+    }
+    if authority.contains('@') {
+        return false;
+    }
+    mirror_host_is_public(url_authority_host(authority))
+}
+
+/// Resolve one mirror redirect `Location` against the URL that
+/// produced it. An absolute target must keep the current scheme —
+/// a mirror base is `https`-only, so in production this is
+/// `https` to `https`; the loop never downgrades to `http` and
+/// never upgrades either — with no userinfo, query, or fragment,
+/// a non-empty host, and a host that is public like a mirror base
+/// (see `valid_mirror_url`) or the host the chain is already on:
+/// a redirect to a loopback, link-local, or private host is
+/// refused, so the chain cannot step off the public host the
+/// starting URL was validated on. A relative target resolves
+/// against the
+/// current URL (an absolute path against the authority, a bare
+/// name against the current directory). None when the target
+/// breaks any of those rules: the redirect is refused and the
+/// caller falls back. A protocol-relative target (`//host/path`)
+/// names a new host without a scheme to check, so it is refused
+/// too.
+pub(crate) fn resolve_mirror_redirect(current: &str, location: &str) -> Option<String> {
+    let location = location.trim();
+    if location.is_empty()
+        || location
+            .chars()
+            .any(|c| c.is_ascii_whitespace() || c.is_control())
+        || location.starts_with("//")
+    {
+        return None;
+    }
+    let (scheme, authority, path) = split_url(current)?;
+    if let Some((loc_scheme, loc_rest)) = location.split_once("://") {
+        if !loc_scheme.eq_ignore_ascii_case(scheme) {
+            return None;
+        }
+        if loc_rest.contains('?') || loc_rest.contains('#') {
+            return None;
+        }
+        let authority_end = loc_rest.find('/').unwrap_or(loc_rest.len());
+        let loc_authority = &loc_rest[..authority_end];
+        if loc_authority.contains('@') || loc_authority.is_empty() {
+            return None;
+        }
+        // The target host is re-validated like a mirror base: a
+        // mirror that redirects to a loopback, link-local, or
+        // private host would otherwise bypass the SSRF guard the
+        // starting URL passed. A target on the host the chain is
+        // already on is allowed as-is — the local test servers
+        // redirect across ports on 127.0.0.1, and the chain never
+        // leaves the host it started on.
+        let loc_host = url_authority_host(loc_authority);
+        if !mirror_host_is_public(loc_host)
+            && !loc_host.eq_ignore_ascii_case(url_authority_host(authority))
+        {
+            return None;
+        }
+        return Some(location.to_string());
+    }
+    if location.starts_with('/') {
+        return Some(format!("{scheme}://{authority}{location}"));
+    }
+    let dir = match path.rfind('/') {
+        Some(index) => &path[..=index],
+        None => "/",
+    };
+    Some(format!("{scheme}://{authority}{dir}{location}"))
+}
+
+/// One mirror attempt: the body landed in the file, or the server
+/// redirected elsewhere.
+pub(crate) enum MirrorHop {
+    Downloaded(u64),
+    Redirect(String),
+}
+
+/// Follow a mirror redirect chain: call `attempt` on the starting
+/// URL, and on a redirect resolve the target (see
+/// [`resolve_mirror_redirect`]) and try again, up to
+/// [`MAX_MIRROR_REDIRECTS`] redirects. An attempt error ends the
+/// chain at once — mirror attempts are single-shot, there is no
+/// retry budget to spend — and a chain past the limit is a mirror
+/// failure, not a build failure: the caller falls back to its
+/// other source.
+pub(crate) fn follow_mirror_redirects(
+    start_url: &str,
+    mut attempt: impl FnMut(&str) -> Result<MirrorHop, GeectlError>,
+) -> Result<u64, GeectlError> {
+    let mut current = start_url.to_string();
+    let mut redirects = 0usize;
+    loop {
+        match attempt(&current)? {
+            MirrorHop::Downloaded(bytes) => return Ok(bytes),
+            MirrorHop::Redirect(location) => {
+                if redirects >= MAX_MIRROR_REDIRECTS {
+                    return Err(GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!(
+                            "mirror redirect chain exceeds the {MAX_MIRROR_REDIRECTS}-redirect limit at {}",
+                            sanitize_url_for_error(&current),
+                        ),
+                    ));
+                }
+                current = resolve_mirror_redirect(&current, &location).ok_or_else(|| {
+                    GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!(
+                            "mirror at {} redirected to an invalid target: {}",
+                            sanitize_url_for_error(&current),
+                            sanitize_url_for_error(&location),
+                        ),
+                    )
+                })?;
+                redirects += 1;
+            }
+        }
+    }
+}
+
 /// Refuse a redirect response: automatic redirects are disabled, so
 /// a 3xx is an error, not a body. The Location is named (sanitized —
 /// it can carry userinfo) so the caller can see where the server
@@ -1878,6 +2245,30 @@ impl HttpClient for UreqClient {
             file.sync_all()
                 .map_err(|e| download_io_error(DownloadIoPhase::Sync, path, &e))?;
             Ok(bytes)
+        })
+    }
+
+    fn get_to_file_mirror(
+        &self,
+        url: &str,
+        credentials: &Credentials,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<u64, GeectlError> {
+        // Credentials belong to the mirror, not to wherever it
+        // points: only the first hop carries them, later hops send
+        // none, so a redirect can never smuggle them to another
+        // host. The trait documents the rule; this is where it is
+        // enforced.
+        let mut first_hop = true;
+        follow_mirror_redirects(url, |current| {
+            let hop_credentials = if first_hop {
+                first_hop = false;
+                credentials
+            } else {
+                &Credentials::None
+            };
+            self.mirror_attempt(current, hop_credentials, path, max_bytes)
         })
     }
 
@@ -3152,6 +3543,276 @@ mod tests {
             redact_authorization(&first)
         );
         assert_eq!(target.request(), None);
+    }
+
+    #[test]
+    fn mirror_redirect_is_followed_to_the_target_file() {
+        // The mirror download follows a 302: the redirector answers
+        // 302 to the target, the target serves the bytes, and they
+        // land in the file. This is the test the old `get_bytes`
+        // mirror path would have failed — every fetch ended in
+        // `redirect_error` before the API fallback — because the
+        // redirect target sees the request and the file holds its
+        // body. The client is built with a Bearer seam, but the
+        // mirror call passes no credentials, so no Authorization
+        // header reaches either hop.
+        let target = LoopbackServer::serve("mirror-rpm-bytes");
+        let redirect = LoopbackServer::serve_redirect(&target.url());
+        let client = UreqClient::with_auth(
+            Timeout::default(),
+            Some(Box::new(FixedAuth(Credentials::Bearer {
+                token: "tok3n".to_string(),
+            }))),
+        )
+        .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("geectl-mirror-redirect-{}.rpm", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let written = client
+            .get_to_file_mirror(
+                &redirect.url(),
+                &Credentials::None,
+                &path,
+                MAX_MIRROR_RPM_BYTES,
+            )
+            .unwrap();
+        assert_eq!(written, "mirror-rpm-bytes".len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), b"mirror-rpm-bytes");
+        let _ = std::fs::remove_file(&path);
+        let first = redirect.request().expect("redirector recorded the request");
+        assert!(
+            first.starts_with("GET /test HTTP/1.1\r\n"),
+            "redirector saw a different request; request: {}",
+            redact_authorization(&first)
+        );
+        assert_eq!(target.authorization(), None);
+    }
+
+    #[test]
+    fn mirror_redirect_carries_credentials_only_to_the_first_hop() {
+        // Credentials belong to the mirror, not to wherever it
+        // points: the redirector sees the Bearer the call passed,
+        // the target sees none.
+        let target = LoopbackServer::serve("mirror-rpm-bytes");
+        let redirect = LoopbackServer::serve_redirect(&target.url());
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "geectl-mirror-redirect-auth-{}.rpm",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let written = client
+            .get_to_file_mirror(
+                &redirect.url(),
+                &Credentials::Bearer {
+                    token: "mirror-first-hop".to_string(),
+                },
+                &path,
+                MAX_MIRROR_RPM_BYTES,
+            )
+            .unwrap();
+        assert_eq!(written, "mirror-rpm-bytes".len() as u64);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            redirect.authorization().as_deref(),
+            Some("Bearer mirror-first-hop")
+        );
+        assert_eq!(target.authorization(), None);
+    }
+
+    #[test]
+    fn mirror_download_is_single_shot_on_a_5xx() {
+        // A mirror 500 is attempted exactly once: no retries, no
+        // backoff — the caller falls back to the API instead of
+        // paying three attempts with 1/2/4 s backoff per dep.
+        let server = CountingServer::serve_status("boom", 500);
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("geectl-mirror-5xx-{}.rpm", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let err = client
+            .get_to_file_mirror(
+                &server.url(),
+                &Credentials::None,
+                &path,
+                MAX_MIRROR_RPM_BYTES,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(!path.exists());
+        assert_eq!(server.hits(), 1);
+    }
+
+    #[test]
+    fn mirror_download_refuses_a_body_over_the_cap() {
+        // A Content-Length over the cap fails before the file is
+        // created: a hostile mirror cannot make geectl write past
+        // the cap to disk.
+        let data = vec![b'a'; 100];
+        let client = UreqClient::new(Timeout::default()).unwrap();
+        let (port, server) = serve_bytes_once(data);
+        let url = format!("http://127.0.0.1:{port}/pkg.rpm");
+        let path =
+            std::env::temp_dir().join(format!("geectl-mirror-over-cap-{}.rpm", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let err = client
+            .get_to_file_mirror(&url, &Credentials::None, &path, 10)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("cap"), "{err:?}");
+        assert!(!path.exists());
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn valid_mirror_url_accepts_and_rejects() {
+        assert!(valid_mirror_url("https://mirror.example.com/repos/"));
+        assert!(valid_mirror_url("HTTPS://mirror.example.com/repos/"));
+        assert!(valid_mirror_url("https://example.com:8443/x"));
+        assert!(valid_mirror_url(
+            "https://download.opensuse.org/tumbleweed/repo/oss/"
+        ));
+        assert!(!valid_mirror_url("http://mirror.example.com/repos/"));
+        assert!(!valid_mirror_url("container://example.com/"));
+        assert!(!valid_mirror_url("https://user:pass@mirror.example.com/"));
+        assert!(!valid_mirror_url("https://mirror.example.com/?x=1"));
+        assert!(!valid_mirror_url("https://mirror.example.com/#frag"));
+        assert!(!valid_mirror_url("https://127.0.0.1/x"));
+        assert!(!valid_mirror_url("https://localhost/x"));
+        assert!(!valid_mirror_url("https://LOCALHOST:8443/x"));
+        assert!(!valid_mirror_url("https://10.0.0.1/x"));
+        assert!(!valid_mirror_url("https://192.168.1.1/x"));
+        assert!(!valid_mirror_url("https://172.16.0.1/x"));
+        assert!(!valid_mirror_url("https://169.254.1.1/x"));
+        assert!(!valid_mirror_url("https://[::1]/x"));
+        assert!(!valid_mirror_url("https://[fe80::1]/x"));
+        assert!(!valid_mirror_url("https://[fc00::1]/x"));
+        assert!(!valid_mirror_url(""));
+        assert!(!valid_mirror_url("mirror.example.com/x"));
+        assert!(!valid_mirror_url("https:///x"));
+    }
+
+    #[test]
+    fn mirror_redirect_resolution_keeps_the_scheme() {
+        // An absolute target must keep the current scheme, with no
+        // userinfo, query, or fragment; a relative target resolves
+        // against the current URL.
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://cdn.example.com/a/b.rpm"
+            ),
+            Some("https://cdn.example.com/a/b.rpm".to_string())
+        );
+        assert_eq!(
+            resolve_mirror_redirect("https://mirror.example.com/a/b.rpm", "/x.rpm"),
+            Some("https://mirror.example.com/x.rpm".to_string())
+        );
+        assert_eq!(
+            resolve_mirror_redirect("https://mirror.example.com/a/b.rpm", "c.rpm"),
+            Some("https://mirror.example.com/a/c.rpm".to_string())
+        );
+        assert_eq!(
+            resolve_mirror_redirect("http://127.0.0.1:1/test", "http://127.0.0.1:2/test"),
+            Some("http://127.0.0.1:2/test".to_string())
+        );
+        // An absolute target to a non-public host is refused even
+        // when the scheme matches: the starting URL passed the
+        // public-host guard, and the redirect must not step off it.
+        // The loopback case above stays allowed only because the
+        // target is the host the chain is already on.
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://127.0.0.1/a/b.rpm"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://10.0.0.1/a/b.rpm"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://192.168.1.1/a/b.rpm"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://169.254.1.1/a/b.rpm"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://[::1]/a/b.rpm"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://[fc00::1]/a/b.rpm"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://localhost/a/b.rpm"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "http://cdn.example.com/a/b.rpm"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect("http://127.0.0.1:1/test", "https://127.0.0.1:2/test"),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://user:pass@cdn.example.com/a/b.rpm"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://cdn.example.com/a/b.rpm?x=1"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "https://cdn.example.com/a/b.rpm#frag"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect(
+                "https://mirror.example.com/a/b.rpm",
+                "//cdn.example.com/a/b.rpm"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_mirror_redirect("https://mirror.example.com/a/b.rpm", ""),
+            None
+        );
     }
 
     #[test]

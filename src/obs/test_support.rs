@@ -3,7 +3,7 @@ use super::SrPayload;
 use crate::auth::Credentials;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
-use crate::http::{HttpClient, MAX_BODY_BYTES};
+use crate::http::{follow_mirror_redirects, HttpClient, MirrorHop, MAX_BODY_BYTES};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -36,6 +36,11 @@ pub(crate) struct FakeHttp {
     get_to_file_error_writes: RefCell<HashMap<String, Vec<u8>>>,
     get_to_file_error_sequences: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     get_to_file_calls: RefCell<Vec<(String, bool)>>,
+    mirror_files: RefCell<HashMap<String, Vec<u8>>>,
+    mirror_redirects: RefCell<HashMap<String, String>>,
+    mirror_errors: RefCell<HashMap<String, ErrorKind>>,
+    mirror_error_writes: RefCell<HashMap<String, Vec<u8>>>,
+    mirror_calls: RefCell<Vec<(String, bool)>>,
     get_bytes_calls: RefCell<Vec<(String, bool)>>,
     post_calls: RefCell<Vec<(String, String, bool)>>,
     delete_calls: RefCell<Vec<(String, bool)>>,
@@ -72,6 +77,11 @@ impl FakeHttp {
             get_to_file_error_writes: RefCell::new(HashMap::new()),
             get_to_file_error_sequences: RefCell::new(HashMap::new()),
             get_to_file_calls: RefCell::new(Vec::new()),
+            mirror_files: RefCell::new(HashMap::new()),
+            mirror_redirects: RefCell::new(HashMap::new()),
+            mirror_errors: RefCell::new(HashMap::new()),
+            mirror_error_writes: RefCell::new(HashMap::new()),
+            mirror_calls: RefCell::new(Vec::new()),
             get_bytes_calls: RefCell::new(Vec::new()),
             post_calls: RefCell::new(Vec::new()),
             delete_calls: RefCell::new(Vec::new()),
@@ -196,6 +206,59 @@ impl FakeHttp {
         self
     }
 
+    /// Answer mirror downloads of `url` with `body`: the bytes the
+    /// fake writes to the destination file. The mirror twin of
+    /// `with_get_to_file`, for the single-shot redirect-following
+    /// mirror download.
+    pub(crate) fn with_mirror_file(self, url: &str, body: &[u8]) -> Self {
+        self.mirror_files
+            .borrow_mut()
+            .insert(url.to_string(), body.to_vec());
+        self
+    }
+
+    /// Answer mirror downloads of `url` with a redirect to
+    /// `location`: the fake follows it through the same
+    /// redirect-resolution as the real client, so a test can model
+    /// the 302 a download mirror answers with.
+    pub(crate) fn with_mirror_redirect(self, url: &str, location: &str) -> Self {
+        self.mirror_redirects
+            .borrow_mut()
+            .insert(url.to_string(), location.to_string());
+        self
+    }
+
+    /// Answer mirror downloads of `url` with this error: models a
+    /// mirror 404, 5xx, or transport failure, answered once — the
+    /// mirror download never retries, so the error is returned at
+    /// once.
+    pub(crate) fn with_mirror_error(self, url: &str, kind: ErrorKind) -> Self {
+        self.mirror_errors
+            .borrow_mut()
+            .insert(url.to_string(), kind);
+        self
+    }
+
+    /// Answer mirror downloads of `url` with this error after
+    /// writing `body` first: models a mirror stream that fails
+    /// mid-download, leaving a partial file for the caller to
+    /// delete. The mirror twin of
+    /// `with_get_to_file_error_after_write`.
+    pub(crate) fn with_mirror_error_after_write(
+        self,
+        url: &str,
+        body: &[u8],
+        kind: ErrorKind,
+    ) -> Self {
+        self.mirror_error_writes
+            .borrow_mut()
+            .insert(url.to_string(), body.to_vec());
+        self.mirror_errors
+            .borrow_mut()
+            .insert(url.to_string(), kind);
+        self
+    }
+
     pub(crate) fn with_post_error(self, url: &str, kind: ErrorKind) -> Self {
         self.post_errors
             .borrow_mut()
@@ -301,6 +364,13 @@ impl FakeHttp {
 
     pub(crate) fn get_to_file_calls(&self) -> Vec<(String, bool)> {
         self.get_to_file_calls.borrow().clone()
+    }
+
+    /// The mirror downloads in order (url, authed): one entry per
+    /// hop, so a test can assert a redirect was followed (two
+    /// entries) or a dead mirror was tried once (one entry).
+    pub(crate) fn mirror_calls(&self) -> Vec<(String, bool)> {
+        self.mirror_calls.borrow().clone()
     }
 
     pub(crate) fn post_calls(&self) -> Vec<(String, String, bool)> {
@@ -558,6 +628,109 @@ impl HttpClient for FakeHttp {
         Ok(body.len() as u64)
     }
 
+    fn get_to_file_mirror(
+        &self,
+        url: &str,
+        credentials: &Credentials,
+        path: &std::path::Path,
+        max_bytes: u64,
+    ) -> Result<u64, GeectlError> {
+        // The redirect chain runs through the same
+        // `follow_mirror_redirects` as the real client, so a canned
+        // redirect is resolved by the same rules (same scheme, no
+        // userinfo, query, or fragment) and the same hop limit.
+        // Each hop records its call, like `get_to_file` — and like
+        // the real client, only the first hop records credentials.
+        let mut first_hop = true;
+        follow_mirror_redirects(url, |current| {
+            let authed = if first_hop {
+                first_hop = false;
+                !matches!(credentials, Credentials::None)
+            } else {
+                false
+            };
+            self.mirror_calls
+                .borrow_mut()
+                .push((current.to_string(), authed));
+            if let Some(kind) = self.mirror_errors.borrow().get(current).copied() {
+                if let Some(partial) = self.mirror_error_writes.borrow().get(current).cloned() {
+                    // A stream that fails mid-download leaves a
+                    // partial file for the caller to delete, like
+                    // the real client: created exclusively, so a
+                    // pre-existing destination is an error, not a
+                    // truncation.
+                    let mut file = std::fs::File::options()
+                        .write(true)
+                        .create_new(true)
+                        .open(path)
+                        .map_err(|e| {
+                            let kind = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                                ErrorKind::AlreadyExists
+                            } else {
+                                ErrorKind::InternalError
+                            };
+                            GeectlError::new(
+                                kind,
+                                format!("cannot create download file {}: {e}", path.display()),
+                            )
+                        })?;
+                    std::io::Write::write_all(&mut file, &partial).map_err(|e| {
+                        GeectlError::new(
+                            ErrorKind::InternalError,
+                            format!("cannot write download file {}: {e}", path.display()),
+                        )
+                    })?;
+                }
+                return Err(GeectlError::new(
+                    kind,
+                    format!("canned mirror error for {current}"),
+                ));
+            }
+            if let Some(location) = self.mirror_redirects.borrow().get(current).cloned() {
+                return Ok(MirrorHop::Redirect(location));
+            }
+            let body = self
+                .mirror_files
+                .borrow()
+                .get(current)
+                .cloned()
+                .ok_or_else(|| {
+                    GeectlError::new(
+                        ErrorKind::NetworkError,
+                        format!("no canned mirror response for {current}"),
+                    )
+                })?;
+            if body.len() as u64 > max_bytes {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("mirror download of {current} exceeds the {max_bytes}-byte cap"),
+                ));
+            }
+            let mut file = std::fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| {
+                    let kind = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        ErrorKind::AlreadyExists
+                    } else {
+                        ErrorKind::InternalError
+                    };
+                    GeectlError::new(
+                        kind,
+                        format!("cannot create download file {}: {e}", path.display()),
+                    )
+                })?;
+            std::io::Write::write_all(&mut file, &body).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot write download file {}: {e}", path.display()),
+                )
+            })?;
+            Ok(MirrorHop::Downloaded(body.len() as u64))
+        })
+    }
+
     fn post(
         &self,
         url: &str,
@@ -791,4 +964,34 @@ pub(crate) fn payload() -> SrPayload {
 
 pub(crate) fn search_without_states() -> RequestSearch {
     RequestSearch::new().states(Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mirror_file_over_the_cap_is_refused() {
+        // A canned mirror body over the caller's cap fails instead
+        // of landing in the file: the cap is enforced in the fake
+        // the same way as in the real client.
+        let http =
+            FakeHttp::new().with_mirror_file("https://mirror.example.com/pkg.rpm", &[b'a'; 100]);
+        let path = std::env::temp_dir().join(format!(
+            "geectl-fake-mirror-over-cap-{}.rpm",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let err = http
+            .get_to_file_mirror(
+                "https://mirror.example.com/pkg.rpm",
+                &Credentials::None,
+                &path,
+                10,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.context.contains("cap"), "{err:?}");
+        assert!(!path.exists());
+    }
 }

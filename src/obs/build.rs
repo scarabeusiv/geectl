@@ -746,11 +746,20 @@ pub struct BuildInfo {
     /// The preinstall image the server offers, if any.
     pub preinstall_image: Option<PreinstallImage>,
     /// The published-repo mirror URL per (project, repository),
-    /// from the buildinfo `<path>` elements: the verbatim `url`
-    /// attribute, e.g. `https://download.opensuse.org/tumbleweed/repo/oss/`.
-    /// A repo without a `url` has no entry — the dep fetch falls
-    /// back to the API for it.
+    /// from the buildinfo `<path>` elements: the `url` attribute,
+    /// e.g. `https://download.opensuse.org/tumbleweed/repo/oss/`,
+    /// kept only when it passes [`crate::http::valid_mirror_url`]
+    /// (public `https`, no userinfo, query, or fragment). A repo
+    /// without a `url` has no entry — the dep fetch falls back to
+    /// the API for it.
     pub urls: HashMap<(String, String), String>,
+    /// The `<path>` elements skipped while parsing: malformed
+    /// (no project or repository) or carrying a mirror URL that
+    /// fails validation. Mirror data is only an optimisation, so a
+    /// broken entry never fails the parse — the dep fetch falls
+    /// back to the API for that repo — but the count is kept so the
+    /// caller can log it.
+    pub skipped_paths: usize,
 }
 
 /// One entry of a package's build history: a completed build.
@@ -863,6 +872,7 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
             bdeps: Vec::new(),
             preinstall_image: None,
             urls: HashMap::new(),
+            skipped_paths: 0,
         });
     }
     let inner = &after_open[end + 1..];
@@ -938,32 +948,36 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
     };
     // The published-repo mirror URLs, from the `<path>` elements:
     // one per (project, repository), keyed by that pair, carrying
-    // the verbatim `url` attribute. A `<path>` without a project or
-    // repository is malformed — the server always names both — so
-    // it fails the parse, the same fail-closed treatment as the
-    // `<path>` handling in project-meta parsing. A `<path>` without
-    // a `url` names a repo that is not published: it carries no
-    // entry, and the dep fetch falls back to the API for it (the
-    // existing tool reads the URL the same way, skipping a path
-    // with no `url`). A later element for the same pair wins, as
-    // in the existing tool's mapping.
+    // the `url` attribute when it passes `valid_mirror_url`
+    // (public `https`, no userinfo, query, or fragment). A `<path>`
+    // without a project or repository is malformed, and a `<path>`
+    // whose URL fails validation names no usable mirror — either
+    // way the entry is skipped and counted, never fatal: mirror
+    // data is only an optimisation, and the dep fetch falls back
+    // to the API for that repo. A `<path>` without a `url` names a
+    // repo that is not published: it carries no entry, and the dep
+    // fetch falls back to the API for it (the existing tool reads
+    // the URL the same way, skipping a path with no `url`). A
+    // later element for the same pair wins, as in the existing
+    // tool's mapping.
     let mut urls = HashMap::new();
+    let mut skipped_paths = 0usize;
     for element in xml_elements(inner, "path")? {
         let (tag, _) = xml_split_element(element, "path");
-        let project = xml_attr_non_empty(tag, "project").ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::ServerError,
-                "unexpected OBS buildinfo response: <path> without project",
-            )
-        })?;
-        let repository = xml_attr_non_empty(tag, "repository").ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::ServerError,
-                "unexpected OBS buildinfo response: <path> without repository",
-            )
-        })?;
+        let Some(project) = xml_attr_non_empty(tag, "project") else {
+            skipped_paths += 1;
+            continue;
+        };
+        let Some(repository) = xml_attr_non_empty(tag, "repository") else {
+            skipped_paths += 1;
+            continue;
+        };
         if let Some(url) = xml_attr(tag, "url").filter(|url| !url.is_empty()) {
-            urls.insert((project, repository), url);
+            if crate::http::valid_mirror_url(&url) {
+                urls.insert((project, repository), url);
+            } else {
+                skipped_paths += 1;
+            }
         }
     }
     Ok(BuildInfo {
@@ -971,6 +985,7 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
         bdeps,
         preinstall_image,
         urls,
+        skipped_paths,
     })
 }
 
@@ -3351,29 +3366,25 @@ impl<'a> ObsClient<'a> {
         self.http.get_to_file(&url, &self.credentials, dest)
     }
 
-    /// Download one file from a published-repo mirror URL, as bytes:
-    /// the verbatim `<path url>` from the buildinfo, with the
-    /// `<arch>/<filename>` suffix appended by the caller. No
-    /// credentials are sent — mirrors are public — and the download
-    /// is capped at 10 MiB by the transport's body limit, like
-    /// [`ObsClient::download_binary`]. A failure is the caller's to
-    /// fall back from, never a reason to fail the build.
-    pub(crate) fn download_mirror_bytes(&self, url: &str) -> Result<Vec<u8>, GeectlError> {
-        self.http.get_bytes(url, &Credentials::None)
-    }
-
     /// Download one file from a published-repo mirror URL, streaming
-    /// the body to `dest` instead of buffering it: the byte-download
-    /// counterpart of [`ObsClient::download_mirror_bytes`], without
-    /// the transport's 10 MiB body cap. Same no-credentials rule; the
-    /// file is created exclusively, and a failure mid-stream leaves a
-    /// partial file for the caller to delete.
+    /// the body to `dest` instead of buffering it: the mirror
+    /// download is always streamed, so a dep RPM is never held in
+    /// memory whole. No credentials are sent — mirrors are public —
+    /// and the download follows the mirror's redirect chain (see
+    /// [`crate::http::HttpClient::get_to_file_mirror`]), single-shot
+    /// with no retries. The body is capped at `max_bytes`: a body
+    /// over the cap fails, and the caller falls back to the API. The
+    /// file is created exclusively, and a failure mid-stream leaves
+    /// a partial file for the caller to delete. A failure is the
+    /// caller's to fall back from, never a reason to fail the build.
     pub(crate) fn download_mirror_to_file(
         &self,
         url: &str,
         dest: &Path,
+        max_bytes: u64,
     ) -> Result<u64, GeectlError> {
-        self.http.get_to_file(url, &Credentials::None, dest)
+        self.http
+            .get_to_file_mirror(url, &Credentials::None, dest, max_bytes)
     }
 
     /// The versions of one binary in `repository`/`arch`: the
@@ -5150,17 +5161,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_buildinfo_rejects_path_without_project_or_repository() {
-        let err = parse_buildinfo(
-            "<buildinfo project=\"p\"><path repository=\"standard\" url=\"https://example.com/\"/></buildinfo>",
+    fn parse_buildinfo_skips_path_without_project_or_repository() {
+        // A malformed `<path>` is skipped and counted, never fatal:
+        // mirror data is only an optimisation, so the buildinfo
+        // still parses and the dep fetch falls back to the API for
+        // that repo.
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\"><path repository=\"standard\" url=\"https://example.com/\"/><bdep name=\"gcc\"/></buildinfo>",
         )
-        .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ServerError);
-        let err = parse_buildinfo(
+        .unwrap();
+        assert!(parsed.urls.is_empty());
+        assert_eq!(parsed.skipped_paths, 1);
+        assert_eq!(parsed.bdeps.len(), 1);
+        let parsed = parse_buildinfo(
             "<buildinfo project=\"p\"><path project=\"openSUSE:Factory\" url=\"https://example.com/\"/></buildinfo>",
         )
-        .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ServerError);
+        .unwrap();
+        assert!(parsed.urls.is_empty());
+        assert_eq!(parsed.skipped_paths, 1);
+    }
+
+    #[test]
+    fn parse_buildinfo_skips_a_mirror_url_that_fails_validation() {
+        // A `<path>` whose URL is not a public https URL names no
+        // usable mirror: the entry is skipped and counted, and a
+        // valid entry for another repo still lands.
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\">\
+             <path project=\"openSUSE:Factory\" repository=\"standard\" url=\"http://mirror.example.com/\"/>\
+             <path project=\"openSUSE:Factory\" repository=\"ports\" url=\"https://user:pass@mirror.example.com/\"/>\
+             <path project=\"openSUSE:Factory\" repository=\"images\" url=\"https://127.0.0.1/\"/>\
+             <path project=\"openSUSE:Factory\" repository=\"good\" url=\"https://download.opensuse.org/tumbleweed/repo/oss/\"/>\
+             </buildinfo>",
+        )
+        .unwrap();
+        assert_eq!(parsed.urls.len(), 1);
+        assert!(parsed
+            .urls
+            .contains_key(&("openSUSE:Factory".to_string(), "good".to_string())));
+        assert_eq!(parsed.skipped_paths, 3);
     }
 
     #[test]

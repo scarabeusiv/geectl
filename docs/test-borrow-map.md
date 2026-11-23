@@ -988,6 +988,11 @@ semantics and the project-set enumeration, not its tests).**
   `osc/grabber.py:36-51` (mirror-group fallback) are the spec reference
   for the URL shape and the any-failure-falls-back rule, not adopted
   tests.
+- The "1 unit test" above counts direct adoptions only, per the
+  table's wording: geectl's own mirror tests (21 in
+  `local_build.rs`, plus the buildinfo-parse and transport tests
+  that pin the mirror rules) are not adopted osc tests and are not
+  counted here.
 
 ## Counts (direct adoptions, de-duplicated)
 

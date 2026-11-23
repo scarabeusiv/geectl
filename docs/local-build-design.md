@@ -100,7 +100,55 @@ The existing tool's invocation, from `osc` `build.py`:
   credentials before the API is tried. Any mirror failure — network
   error, 404, hdrmd5 mismatch — falls back to the API download, which
   keeps its own retry and name-warming behaviour. A repo with no
-  `<path url>` (unpublished, or a local instance) is API-only.
+  `<path url>` (unpublished, or a local instance) is API-only. The
+  mirror rules:
+  - **Scheme and host.** Only public `https` mirror URLs are used
+    (the scheme is lowercased first, so `HTTPS://` counts): plain
+    `http`, userinfo, query, and fragment are rejected, and so are
+    loopback, link-local, and private hosts. The check runs twice —
+    at buildinfo parse (a rejected URL is dropped and counted in
+    `skipped_paths`, logged on the debug channel) and at use, so a
+    directly built buildinfo cannot smuggle one in.
+  - **Digest required.** The mirror is tried only when the buildinfo
+    carries a usable hdrmd5 for the dep. A missing digest, or the
+    download-on-demand placeholder, goes straight to the API, which
+    warms the binary and verifies against the server-computed digest.
+  - **Redirects.** The mirror download follows up to 5 redirects,
+    staying on the same scheme (so `https` to `https` in production,
+    never a downgrade to `http`), with no credentials past the first
+    hop. `download.opensuse.org` answers 302 to its backing store,
+    so without this the mirror path never succeeds.
+  - **Arch segment.** The URL uses the dep's own package arch,
+    falling back to the repo arch only when the dep names none: a
+    noarch dep reads from `noarch/`, not from the repo arch. Arch
+    and file name are percent-encoded like the API path.
+  - **Single-shot, dead-mirror skip.** A mirror attempt is one
+    request with no retries and no backoff, bounded by the
+    transport's timeouts. A health failure (transport, 5xx, timeout,
+    redirect, over-cap) marks the (project, repo) mirror dead for
+    the rest of the build; a per-file failure (404, hdrmd5 mismatch)
+    does not. The attempt runs inside the per-package cache lock,
+    so a dead mirror costs at most one attempt per build, not one
+    per dep.
+  - **Streamed, capped, verified once.** The mirror download streams
+    straight to a temp file — never buffered in memory, never
+    downloaded twice — capped at 1 GiB (over the cap falls back to
+    the API, which streams uncapped, so the cap never breaks a
+    build). The temp file is hdrmd5-verified once, in the mirror
+    download, and lands in the cache without a second hash.
+  - **Integrity limit.** hdrmd5 (MD5 over the header and payload)
+    is the only integrity check on a mirror download: there is no
+    repomd or package-signature check, and MD5 itself is
+    collision-feasible. The digest comes from the buildinfo the
+    trusted OBS server sent, the transport is `https` to a public
+    host, and a body that fails the digest never lands in the cache
+    — but a mirror that serves a different file with a colliding
+    digest is not detected. A stronger check (SHA from trusted
+    metadata, or a signature) is future work, not this change.
+  - **Malformed `<path>`.** A `<path>` without a project or
+    repository is skipped and counted, never fatal: mirror data is
+    only an optimisation, and the dep fetch falls back to the API
+    for that repo.
 - Dep file names resolve from the buildinfo's `<bdep>` attributes:
   the scheduler sends no `binary` attribute, so the file name is computed
   locally as `name-version-release.arch.rpm` from `version`/`release`/`arch`

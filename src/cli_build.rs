@@ -3229,6 +3229,7 @@ mod tests {
             ],
             preinstall_image: None,
             urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
         };
         let text = render_buildinfo_text(&info);
         let info_payload = buildinfo_payload("p", "k", "r", "a", None, &info);
@@ -3374,6 +3375,7 @@ mod tests {
             bdeps: vec![],
             preinstall_image: None,
             urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
         };
         assert!(render_buildinfo_text(&blocked).contains("error: unresolvable: DOES-NOT-EXIST"));
         assert_eq!(
@@ -3424,6 +3426,7 @@ mod tests {
             ],
             preinstall_image: None,
             urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
         };
         let text = render_buildinfo_text(&clean);
         assert!(text.contains("no blocking error"));
