@@ -133,6 +133,7 @@ fn service_json(service: &ServiceDef) -> Value {
                 "value": param.value,
             }))
             .collect::<Vec<_>>(),
+        "comments": service.comments,
     })
 }
 
@@ -146,8 +147,10 @@ fn service_state_json(state: &ServiceState) -> Value {
 }
 
 /// The service list as a table: name, mode, and `name=value`
-/// parameters. `None` means the package has no `_service` file at
-/// all; an empty list means the file defines no services.
+/// parameters. Comments inside a service follow the table as
+/// `comment (<name>):` lines, one per comment. `None` means the
+/// package has no `_service` file at all; an empty list means the
+/// file defines no services.
 fn render_services(services: &Option<Vec<ServiceDef>>) -> String {
     match services {
         None => "no _service file".to_string(),
@@ -176,9 +179,40 @@ fn render_services(services: &Option<Vec<ServiceDef>>) -> String {
                     ]
                 })
                 .collect();
-            render_table(&["NAME", "MODE", "PARAMS"], &rows)
+            let mut text = render_table(&["NAME", "MODE", "PARAMS"], &rows);
+            for service in services {
+                for comment in &service.comments {
+                    // The parser never lists an empty comment, but
+                    // the render skips an empty or whitespace-only
+                    // one anyway: a bare newline with no text would
+                    // be a stray blank line.
+                    if comment.trim().is_empty() {
+                        continue;
+                    }
+                    let rendered = render_comment(&service.name, comment);
+                    text.push('\n');
+                    text.push_str(&rendered);
+                }
+            }
+            text
         }
     }
+}
+
+/// One comment as a line under the table: `comment (<name>): <text>`.
+/// A multi-line comment keeps its lines, indented under the first.
+fn render_comment(name: &str, comment: &str) -> String {
+    let mut lines = comment.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let mut out = format!("comment ({name}): {first}");
+    for line in lines {
+        out.push('\n');
+        out.push_str("  ");
+        out.push_str(line);
+    }
+    out
 }
 
 /// The service state as `key: value` lines: the run code, the two
@@ -286,11 +320,13 @@ mod tests {
                     name: "url".to_string(),
                     value: "https://example.com/foo-1.0.tar.gz".to_string(),
                 }],
+                comments: vec!["fetched upstream\nfrom the mirror".to_string()],
             },
             ServiceDef {
                 name: "set_version".to_string(),
                 mode: "manual".to_string(),
                 params: vec![],
+                comments: vec![],
             },
         ]
     }
@@ -311,8 +347,38 @@ mod tests {
             "https://example.com/foo-1.0.tar.gz"
         );
         assert_eq!(payload["services"][1]["mode"], "manual");
+        assert_eq!(
+            payload["services"][0]["comments"],
+            json!(["fetched upstream\nfrom the mirror"])
+        );
+        assert_eq!(payload["services"][1]["comments"], json!([]));
+        assert!(text.contains("comment (download_url): fetched upstream"));
         assert_eq!(render_services(&Some(vec![])), "no services");
         assert_eq!(render_services(&None), "no _service file");
+    }
+
+    #[test]
+    fn list_renders_multiline_comment_with_indented_continuation() {
+        let services = vec![ServiceDef {
+            name: "download_url".to_string(),
+            mode: String::new(),
+            params: vec![],
+            comments: vec!["first line\nsecond line".to_string()],
+        }];
+        let text = render_services(&Some(services));
+        assert!(text.contains("comment (download_url): first line\n  second line"));
+    }
+
+    #[test]
+    fn list_skips_whitespace_only_comments() {
+        let services = vec![ServiceDef {
+            name: "download_url".to_string(),
+            mode: String::new(),
+            params: vec![],
+            comments: vec!["   ".to_string()],
+        }];
+        let text = render_services(&Some(services));
+        assert!(!text.contains("comment ("));
     }
 
     #[test]
@@ -336,8 +402,9 @@ mod tests {
     }
 
     /// The agreement test: every identifying field the JSON payload
-    /// carries — service name, mode, and `name=value` parameters;
-    /// state code, md5s, and error — appears in the text rendering.
+    /// carries — service name, mode, `name=value` parameters, and
+    /// comments; state code, md5s, and error — appears in the text
+    /// rendering.
     /// The expected fields come from the payload itself, not from
     /// literals repeated from the rendering tests, so a payload field
     /// the text drops fails here.
@@ -367,6 +434,21 @@ mod tests {
                     text.contains(&pair),
                     "list text misses param {pair}:\n{text}"
                 );
+            }
+            for comment in service["comments"]
+                .as_array()
+                .expect("comments is an array")
+            {
+                let comment = comment.as_str().expect("comment is a string");
+                // A multi-line comment renders with its
+                // continuation lines indented, so each line is
+                // checked on its own, not the raw string.
+                for line in comment.lines() {
+                    assert!(
+                        text.contains(line),
+                        "list text misses comment line {line}:\n{text}"
+                    );
+                }
             }
         }
         // Empty mode and empty params render as `-`: the rows pin it
