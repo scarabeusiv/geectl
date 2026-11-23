@@ -89,6 +89,34 @@ if [ -n "${LIVE_CACHE:-}" ]; then
     COMPOSE_FILES+=(-f "$SCRIPT_DIR/docker-compose.cache.yml")
     echo "Frontend build cache enabled (LIVE_CACHE is set)."
 fi
+# CI-only download-on-demand payload cache (see
+# docker-compose.dod-cache.yml): when DOD_CACHE is set, the backend's
+# fixture :full directory is bind-mounted from DOD_CACHE_DIR
+# (default ./dod-cache, next to this file), so the fetched RPMs and
+# the parsed metadata survive the container. Local runs leave
+# DOD_CACHE unset and never load the file, so podman and plain
+# docker runs are unchanged.
+if [ -n "${DOD_CACHE:-}" ]; then
+    COMPOSE_FILES+=(-f "$SCRIPT_DIR/docker-compose.dod-cache.yml")
+    # The bind mount and the fixture script agree on the arch through
+    # FIXTURE_ARCH: default it to the host arch here so a manual run
+    # on any arch mounts the repository the fixture creates, instead
+    # of silently mounting the x86_64 default. The cache directory
+    # defaults to ./dod-cache next to this file.
+    export FIXTURE_ARCH="${FIXTURE_ARCH:-$(uname -m)}"
+# FIXTURE_ARCH flows into chown paths and the :full link target in
+# the backend container below, so it must be a bare arch name:
+# anything else (a slash, a space, a shell metacharacter) would
+# escape the intended path.
+case "$FIXTURE_ARCH" in
+    ''|*[!A-Za-z0-9_]*)
+        echo "FIXTURE_ARCH must match ^[A-Za-z0-9_]+$: got '$FIXTURE_ARCH'" >&2
+        exit 1
+        ;;
+esac
+    export DOD_CACHE_DIR="${DOD_CACHE_DIR:-$SCRIPT_DIR/dod-cache}"
+    echo "Download-on-demand cache enabled (DOD_CACHE is set)."
+fi
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
 BASE_URL="http://127.0.0.1:${FRONTEND_PORT}"
 READINESS_TIMEOUT_SECONDS="${READINESS_TIMEOUT_SECONDS:-600}"

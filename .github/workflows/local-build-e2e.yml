@@ -49,6 +49,12 @@ jobs:
   local-build-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      # Pin the compose command: the fixture prefers `podman compose`
+      # when present, and the runner image ships Podman but no
+      # standalone compose-provider binary — pin here rather than
+      # depending on the runner image's toolset.
+      COMPOSE: "docker compose"
     steps:
       # Pinned to the v7 tag's commit so the action cannot move under us;
       # Dependabot tracks SHA pins and proposes updates.
@@ -105,6 +111,52 @@ jobs:
           # package version. The query fails when the package is absent.
           dpkg-query -W -f='${Version}\n' obs-build
           podman --version
+      # The fixture repository's arch, derived once so the cache key,
+      # the bind mount in tests/live/docker-compose.dod-cache.yml and
+      # the fixture script all agree on it.
+      - name: Set fixture arch
+        run: echo "FIXTURE_ARCH=$(uname -m)" >> "$GITHUB_ENV"
+      # The cache key tracks the live Tumbleweed snapshot: the repomd
+      # checksum changes exactly when the upstream snapshot rotates,
+      # so a rotation saves the refreshed payload under a new key
+      # instead of freezing the cache at the first snapshot. The
+      # download URL is read from the fixture script, so the two
+      # cannot drift apart. The fetch must not fail the job, and a
+      # failed fetch must not restore a stale payload: when the
+      # repomd is unreachable the restore step is skipped and the
+      # run fetches fresh, and nothing is saved under the failed
+      # key.
+      - name: Compute download-on-demand cache key
+        id: dod-cache-key
+        run: |
+          set -euo pipefail
+          dod_url="$(sed -n 's/.*<download [^>]*url="\([^"]*\)".*/\1/p' tests/local_build_e2e/provision-fixture.sh | head -1)"
+          repomd_url="${dod_url:-https://download.opensuse.org/tumbleweed/repo/oss/}repodata/repomd.xml"
+          if repomd_sha="$(curl -fsSL --max-time 60 "$repomd_url" | sha256sum | cut -d' ' -f1)"; then
+            echo "repomd-ok=true" >> "$GITHUB_OUTPUT"
+            echo "key-suffix=$repomd_sha" >> "$GITHUB_OUTPUT"
+          else
+            echo "repomd fetch failed; skipping the download-on-demand cache restore" >&2
+            echo "repomd-ok=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Restore the download-on-demand payload cache: the fixture
+      # repository's fetched RPMs and parsed metadata, bind-mounted
+      # into the backend by tests/live/docker-compose.dod-cache.yml.
+      # An exact-key miss falls back to the newest same-arch entry
+      # below, rechecked in-run by the daemon (the fixture's
+      # recheck wait; a failed recheck leaves the last-known-good
+      # payload, as the fixture notes). Pinned to the v4 tag's commit
+      # so the action cannot move under us; Dependabot tracks SHA pins
+      # and proposes updates.
+      - name: Restore download-on-demand cache
+        if: steps.dod-cache-key.outputs.repomd-ok == 'true'
+        id: dod-cache-restore
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: tests/live/dod-cache
+          key: dod-full-${{ env.FIXTURE_ARCH }}-${{ steps.dod-cache-key.outputs.key-suffix }}-${{ hashFiles('tests/local_build_e2e/provision-fixture.sh', 'tests/live/docker-compose.dod-cache.yml', 'tests/live/provision.sh') }}
+          restore-keys: |
+            dod-full-${{ env.FIXTURE_ARCH }}-
       - name: Provision live OBS instance
         env:
           # Enables the BuildKit GitHub Actions cache for the frontend
@@ -116,6 +168,13 @@ jobs:
           # never writes a doddata entry and the fixture repository
           # never resolves.
           LIVE_ENABLE_DOD: "1"
+          # Enables the download-on-demand payload cache (see
+          # tests/live/docker-compose.dod-cache.yml): the backend's
+          # fixture :full directory is bind-mounted from this
+          # directory, restored by the step above. Local runs leave
+          # it unset and fetch fresh, as before.
+          DOD_CACHE: "1"
+          DOD_CACHE_DIR: ${{ github.workspace }}/tests/live/dod-cache
         run: bash tests/live/provision.sh
       # The development backend does not start the download-on-demand
       # daemon, and the fixture project's repository is
@@ -124,7 +183,7 @@ jobs:
       # resolves. `exec -d` detaches the exec session; the daemon
       # itself runs in the foreground.
       - name: Start the download-on-demand daemon
-        run: docker compose -f tests/live/docker-compose.yml exec -d backend /obs/src/backend/bs_dodup --logfile /srv/obs/log/bs_dodup.log
+        run: $COMPOSE -f tests/live/docker-compose.yml exec -d backend /obs/src/backend/bs_dodup --logfile /srv/obs/log/bs_dodup.log
       # Fail fast when the daemon did not start: `exec -d` returns 0
       # once the process is spawned, so a daemon that dies at once
       # (bad flag, unwritable log, already running) would otherwise
@@ -135,7 +194,7 @@ jobs:
       - name: Check the download-on-demand daemon is running
         run: |
           for attempt in 1 2 3 4 5 6; do
-            if docker compose -f tests/live/docker-compose.yml exec -T backend sh -c 'test -f /srv/obs/run/bs_dodup.lock && ps aux | grep -q "[b]s_dodup"'; then
+            if $COMPOSE -f tests/live/docker-compose.yml exec -T backend sh -c 'test -f /srv/obs/run/bs_dodup.lock && ps aux | grep -q "[b]s_dodup"'; then
               echo "bs_dodup is running (lock file present, process alive)."
               exit 0
             fi
@@ -143,7 +202,7 @@ jobs:
             sleep 5
           done
           echo "bs_dodup did not start: no lock file and live process after 30s" >&2
-          docker compose -f tests/live/docker-compose.yml logs backend | tail -30 >&2
+          $COMPOSE -f tests/live/docker-compose.yml logs backend | tail -30 >&2
           exit 1
       - name: Provision local-build fixture project
         env:
@@ -160,6 +219,39 @@ jobs:
           # of silently skipping, so a broken fixture is visible.
           GEECTL_LIVE_URL: http://127.0.0.1:3000
         run: cargo test --locked --test local_build_e2e
+      # Report the download-on-demand cache: hit or miss, and the
+      # payload the run fetched or reused. This is the measurement
+      # for the cache leg: a cold run shows the fresh fetch volume,
+      # a warm run shows the reuse.
+      - name: Report download-on-demand cache
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "cache-hit: ${{ steps.dod-cache-restore.outputs.cache-hit }}"
+          if [ -d tests/live/dod-cache ]; then
+            echo "payload size: $(du -sh tests/live/dod-cache | cut -f1)"
+            echo "rpm count: $(find tests/live/dod-cache -name '*.rpm' | wc -l)"
+            echo "entries: $(find tests/live/dod-cache -mindepth 1 -maxdepth 1 | wc -l)"
+          else
+            echo "no download-on-demand cache directory"
+          fi
       - name: Tear down live OBS instance
         if: always()
         run: bash tests/live/teardown.sh
+      # Save the download-on-demand payload cache. It runs after the
+      # teardown, so the saved directory is quiescent: the daemon is
+      # stopped and nothing writes into it while it is tarred. It
+      # runs only when the run succeeded, so a failed run never
+      # poisons the cache with a partial fetch — and only when the
+      # repomd fetch succeeded and the restore was not an exact hit:
+      # cache entries are immutable,
+      # so saving under an already-existing key can never persist
+      # anything. A rotation (new repomd suffix) or a cold run is a
+      # miss, and the refreshed payload is saved under the new key.
+      # Pinned to the v4 tag's commit, as above.
+      - name: Save download-on-demand cache
+        if: success() && steps.dod-cache-key.outputs.repomd-ok == 'true' && steps.dod-cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: tests/live/dod-cache
+          key: dod-full-${{ env.FIXTURE_ARCH }}-${{ steps.dod-cache-key.outputs.key-suffix }}-${{ hashFiles('tests/local_build_e2e/provision-fixture.sh', 'tests/live/docker-compose.dod-cache.yml', 'tests/live/provision.sh') }}

@@ -1,0 +1,48 @@
+# CI-only download-on-demand payload cache for the local-build e2e job.
+#
+# This is an override file, loaded only when provision.sh runs with
+# DOD_CACHE set (the `local-build-e2e` workflow sets it). It is NOT
+# loaded by default: local runs (docker or podman) fetch fresh, exactly
+# as before.
+#
+# The backend's fixture repository payload — the parsed metadata
+# (`doddata`), its freshness cookie (`doddata.cookie`) and the fetched
+# RPMs — lives in the backend container at
+# `/srv/obs/build/geectl:e2e/standard/<arch>/:full`. That directory is
+# inside the container's writable layer, so `down -v` destroys it on
+# every run. This file bind-mounts it from DOD_CACHE_DIR on the host
+# (default `./dod-cache`; relative paths resolve against the first
+# compose file's directory, `tests/live/`, where all the compose
+# files live), and the workflow restores and saves that directory in
+# the GitHub Actions cache, so a warm run reuses the payload instead
+# of re-fetching it from download.opensuse.org.
+#
+# The mount uses the long syntax because the project name contains a
+# colon (`geectl:e2e`), which the short `source:target` syntax cannot
+# express. Only the `:full` directory is mounted, not the whole build
+# tree: the scheduler's own state (buildinfo, repoinfo, job state)
+# lives beside it and is rebuilt from the fresh database every run,
+# while everything under `:full` is owned by the download-on-demand
+# daemon and the scheduler's DoD handling.
+#
+# What a stale cache can and cannot serve: the scheduler removes RPMs
+# the on-disk metadata no longer lists, which reconciles the payload
+# directory against that metadata — but the metadata itself is only
+# as current as the daemon's last recheck. The daemon fetches the
+# live repomd on its recheck and compares it with the stored cookie,
+# re-fetching and re-parsing when the upstream moved; the fixture
+# script waits for one such recheck before the buildinfo poll, so a
+# run never consumes a payload the daemon has not revalidated since
+# the fixture was created. The cache key also tracks the live
+# snapshot (the repomd checksum), so a rotation saves the refreshed
+# payload under a new key. A failed run does not save the cache (the
+# workflow saves only on success, and only when the restore was not
+# an exact hit), so a partial fetch never poisons it; a cache miss
+# fetches fresh, exactly as before.
+
+services:
+  backend:
+    volumes:
+      - type: bind
+        source: ${DOD_CACHE_DIR:-./dod-cache}
+        target: /srv/obs/build/geectl:e2e/standard/${FIXTURE_ARCH:-x86_64}/:full
