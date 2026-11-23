@@ -844,8 +844,9 @@ fn xml_element_end(inner: &str, start: usize, name: &str) -> Option<usize> {
             scan = pos + 1;
             continue;
         }
-        if after.starts_with("<!--") {
-            // Comment: skip to `-->`, not to the first `>`: a `>`
+        if after.starts_with("!--") {
+            // Comment (`after` is past the `<`, so the marker is
+            // `!--`): skip to `-->`, not to the first `>`: a `>`
             // inside a comment does not end it.
             let end = after.find("-->")?;
             scan = pos + 1 + end + 3;
@@ -919,8 +920,9 @@ pub(crate) fn xml_child_elements<'a>(
             // was stripped by the caller, so nothing may close here.
             return Err(stray_close());
         }
-        if after_lt.starts_with("<!--") {
-            // Comment: skip to `-->`, not to the first `>`.
+        if after_lt.starts_with("!--") {
+            // Comment (`after_lt` is past the `<`, so the marker
+            // is `!--`): skip to `-->`, not to the first `>`.
             let Some(end) = after_lt.find("-->") else {
                 return Err(unterminated());
             };
@@ -1469,6 +1471,24 @@ mod tests {
         assert!(xml_child_elements("</package>", "package").is_err());
         assert!(xml_child_elements("<></>", "package").is_err());
         assert!(xml_child_elements("<package name=\"a\"/><></>", "package").is_err());
+    }
+
+    #[test]
+    fn xml_child_elements_skips_comments_carrying_markup() {
+        // A comment is skipped to `-->`, not to the first `>`: a
+        // comment carrying an element — including a closing tag for
+        // the element being scanned — is opaque text, never a child
+        // and never a close.
+        let inner = "<package name=\"a\"><!-- <package name=\"x\">y</package> --><pkgdep>z</pkgdep></package><package name=\"b\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found[0].contains("name=\"a\""));
+        assert!(found[0].contains("pkgdep"));
+        assert!(found[1].contains("name=\"b\""));
+        // A comment carrying only a `>` is skipped whole as well.
+        let inner = "<!-- a > b --><package name=\"a\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 1);
     }
 
     #[test]

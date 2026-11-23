@@ -413,6 +413,20 @@ mod tests {
 </services>
 "#;
 
+    /// A comment inside a service element, carrying a commented-out
+    /// parameter: ignored, valid parse. Mirrors the spec-cleaner
+    /// `_service` file, where `obs_scm` carries
+    /// `<!-- <param name="changesgenerate">enable</param> -->`.
+    const SV_COMMENT_IN_SERVICE: &str = r#"<services>
+  <service name="obs_scm" mode="manual">
+    <param name="url">https://github.com/openSUSE/spec-cleaner.git</param>
+    <param name="scm">git</param>
+    <!-- <param name="changesgenerate">enable</param> -->
+    <param name="versionformat">@PARENT_TAG@+git.%h</param>
+  </service>
+</services>
+"#;
+
     /// A directory listing with a `_service` entry, no serviceinfo.
     const DIR_WITH_SERVICE: &str = r#"<directory name="foo"><entry name="_service" md5="aaa" size="1" mtime="1"/><entry name="foo.spec" md5="bbb" size="2" mtime="1"/></directory>"#;
 
@@ -541,6 +555,55 @@ mod tests {
     #[test]
     fn prolog_comments_and_stray_text_are_ignored() {
         let services = parse_services(SV_PROLOG_COMMENT).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].name, "download_url");
+    }
+
+    #[test]
+    fn comment_inside_a_service_is_ignored() {
+        // The commented-out parameter is not a parameter: the
+        // service parses with the three live parameters only.
+        let services = parse_services(SV_COMMENT_IN_SERVICE).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].name, "obs_scm");
+        assert_eq!(services[0].mode, "manual");
+        assert_eq!(
+            services[0].params,
+            vec![
+                ServiceParam {
+                    name: "url".to_string(),
+                    value: "https://github.com/openSUSE/spec-cleaner.git".to_string(),
+                },
+                ServiceParam {
+                    name: "scm".to_string(),
+                    value: "git".to_string(),
+                },
+                ServiceParam {
+                    name: "versionformat".to_string(),
+                    value: "@PARENT_TAG@+git.%h".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn comment_only_content_and_comment_before_the_root_parse() {
+        // A file carrying only comments besides the services, a
+        // service carrying only a comment, and a comment before the
+        // root element: all parse normally.
+        let services = parse_services("<services><!-- only a comment --></services>").unwrap();
+        assert!(services.is_empty());
+        let services = parse_services(
+            "<services><service name=\"download_url\" mode=\"manual\"><!-- only a comment --></service></services>",
+        )
+        .unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].name, "download_url");
+        assert!(services[0].params.is_empty());
+        let services = parse_services(
+            "<!-- <service name=\"download_url\" mode=\"manual\"/> --><services><service name=\"download_url\" mode=\"manual\"/></services>",
+        )
+        .unwrap();
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].name, "download_url");
     }
