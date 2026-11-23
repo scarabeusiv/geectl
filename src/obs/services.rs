@@ -949,6 +949,20 @@ mod tests {
     }
 
     #[test]
+    fn cdata_sections_do_not_fail_the_parse() {
+        // A CDATA section inside a service is character data, not
+        // a comment: a `>` or `<!--` inside it must not fail the
+        // file, and its content is not listed as a comment.
+        let services = parse_services(
+            r#"<services><service name="download_url" mode="manual"><![CDATA[ a > <!-- ]]><param name="host">example.com</param></service></services>"#,
+        )
+        .unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].params.len(), 1);
+        assert!(services[0].comments.is_empty());
+    }
+
+    #[test]
     fn comments_nested_in_children_are_not_service_comments() {
         // A comment inside a parameter, or inside another child
         // element, belongs to that element: only direct-child

@@ -903,6 +903,14 @@ fn xml_element_end(inner: &str, start: usize, name: &str) -> Option<usize> {
             scan = pos + 1 + end + 2;
             continue;
         }
+        if let Some(cdata) = after.strip_prefix("![CDATA[") {
+            // CDATA section: opaque character data, skipped to
+            // `]]>` — a `>` or `<!--` inside it is content, not
+            // markup.
+            let rel = cdata.find("]]>")?;
+            scan = pos + 1 + "![CDATA[".len() + rel + 3;
+            continue;
+        }
         if after.starts_with('!') {
             // Other markup (e.g. a doctype): skip to `>`.
             let end = after.find('>')?;
@@ -1011,6 +1019,16 @@ pub(crate) fn xml_child_elements<'a>(
                 return Err(unterminated());
             };
             offset = tag_start + 1 + end + 2;
+            continue;
+        }
+        if let Some(cdata) = after_lt.strip_prefix("![CDATA[") {
+            // CDATA section: opaque character data, skipped to
+            // `]]>` — a `>` or `<!--` inside it is content, not
+            // markup.
+            let Some(rel) = cdata.find("]]>") else {
+                return Err(unterminated());
+            };
+            offset = tag_start + 1 + "![CDATA[".len() + rel + 3;
             continue;
         }
         if after_lt.starts_with('!') {
@@ -1174,6 +1192,16 @@ pub(crate) fn xml_direct_comments(text: &str) -> Vec<&str> {
                 break;
             };
             offset = tag_start + 1 + end + 2;
+            continue;
+        }
+        if let Some(cdata) = after_lt.strip_prefix("![CDATA[") {
+            // CDATA section: opaque character data, skipped to
+            // `]]>` — a `>` or `<!--` inside it is content, not
+            // markup, and never a collected comment.
+            let Some(rel) = cdata.find("]]>") else {
+                break;
+            };
+            offset = tag_start + 1 + "![CDATA[".len() + rel + 3;
             continue;
         }
         if after_lt.starts_with('!') {
@@ -1710,6 +1738,26 @@ mod tests {
         assert!(xml_child_elements("</package>", "package").is_err());
         assert!(xml_child_elements("<></>", "package").is_err());
         assert!(xml_child_elements("<package name=\"a\"/><></>", "package").is_err());
+    }
+
+    #[test]
+    fn xml_child_elements_skips_cdata_sections() {
+        // A CDATA section is opaque character data: a `>` or a
+        // `<!--` inside it neither ends a tag nor opens a comment,
+        // and its content is never a collected comment.
+        let inner = "<![CDATA[ a > <!-- ]]><package name=\"p\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 1);
+        let inner = "<a><![CDATA[ a > <!-- ]]></a><package name=\"p\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            xml_direct_comments("<![CDATA[ a > <!-- ]]><!-- real -->"),
+            vec![" real "]
+        );
+        // An unterminated CDATA section fails the file, like an
+        // unterminated comment.
+        assert!(xml_child_elements("<a><![CDATA[ never closed</a>", "package").is_err());
     }
 
     #[test]
