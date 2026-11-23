@@ -943,6 +943,39 @@ semantics, not its tests).**
 - The new tests are written from scratch against the mocked HTTP
   shape: the CLI stub-server test pins the request target, the unit
   tests pin the payload and the header.
+## Gap batch 3 — Repository shape in the meta write (#157 OCR follow-ups)
+
+**Direct adoptions: 0. No reference test pins any of the nine
+behaviours; the fixes are pinned by the source model instead.**
+
+- The reference `repo add` flow (`osc/commands/repo_add.py`) PUTs
+  the whole project meta back without validating the repositories
+  already in it: it loads the meta, refuses only a duplicate name for
+  the repository being added, appends it, and calls `to_api`. That is
+  why a meta write validates only the repositories it changes.
+- The reference download model
+  (`osc/obs_api/repository_download.py`) holds `archfilter`/`master`/
+  `pubkey` as singular optionals, and its releasetarget model
+  (`osc/obs_api/repository_releasetarget.py`) types `repository` as
+  required while `trigger` is optional — the shape the two parsers
+  and the validator follow.
+- The server `DownloadRepository` model (open-build-service
+  `src/api/app/models/download_repository.rb`) validates download
+  arch presence + case-insensitive uniqueness, url scheme, and
+  repotype inclusion, with no format validation on
+  sslfingerprint/archfilter/pubkey.
+- No full-shape write scenario exists in the reference suite: the
+  only behave scenario that PUTs project meta
+  (`behave/features/linkpac.feature:48`) carries no `<repository>`
+  at all, and no scenario mentions `download` or `releasetarget`;
+  the `repo add` scenario (`behave/features/repo.feature:24`)
+  covers arch + path only.
+
+Counts unchanged: 0 new adoptions. Live issue #40 counts 125 behave /
+116 unit / 241 total (verified live 2026-11-23); the map's Counts
+table in this tree still records #40 as 231 (125 + 106) — that gap
+predates this PR (the #217/#232/#207 adoptions are recorded in #40
+but not in this tree's map) and is not changed by it.
 
 ## Batch 11 — prjconf
 
@@ -1050,6 +1083,7 @@ scheduler entries.**
 | Gap batch 2, wave 3 (#175, #176) | 0 | 0 | 0 |
 | Gap batch 3 — buildconfig --alternative-project (#252) | 0 (+spec ref) | 0 | 0 (+spec) |
 | Gap batch 3 — local-build log (#178) | 0 | 0 | 0 |
+| Gap batch 3 — Repository shape in the meta write (#157 OCR follow-ups) | 0 (+source pins) | 0 | 0 (+pins) |
 | 11 prjconf | 0 | 0 | 0 |
 | 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
 | 13 mirror-first dep fetch | 1 | 0 | 1 |
