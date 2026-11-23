@@ -272,6 +272,7 @@ Commands:
   file                         File a submit request: source package to a devel project, superseding every open submit request for the package from the same user
   refile                       File a submit request and supersede an old one with it, plus every other open submit request for the package from the same user: the new request is filed first, and only then is each open one superseded pointing at it
   supersede                    Supersede one request with another existing one. A mutation that needs `--live`: the library's raw supersede has no dry-run, so without `--live` this command refuses — use `request refile --supersede` for the dry-runnable flow
+  file-add-role                File an add-role request: grant a person or a group a role on a project or a package
   file-change-devel            File a change-devel request: change a package's devel project
   file-delete                  File a delete request: delete a package, a repository, or a whole project
   file-maintenance-incident    File a maintenance incident request: ask the maintenance team to start a maintenance incident from a maintenance update

@@ -64,10 +64,10 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    AcceptInfo, ChangeDevelPayload, CveId, DeletePayload, DeleteTarget, DryRun, FiledRequest,
-    MaintenanceIncidentPayload, ObsClient, Request, RequestAction, RequestComment, RequestHistory,
-    RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewState, ReviewTarget,
-    SrFiling, SrPayload, OBS_API_BASE,
+    AcceptInfo, AddRolePayload, ChangeDevelPayload, CveId, DeletePayload, DeleteTarget, DryRun,
+    FiledRequest, MaintenanceIncidentPayload, ObsClient, Request, RequestAction, RequestComment,
+    RequestHistory, RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewState,
+    ReviewTarget, SrFiling, SrPayload, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 
@@ -323,6 +323,33 @@ pub enum RequestCommand {
         old_id: String,
         /// The existing request superseding it.
         new_id: String,
+    },
+    /// File an add-role request: grant a person or a group a role on
+    /// a project or a package.
+    FileAddRole {
+        /// The project the role is granted on.
+        #[arg(long)]
+        target_project: String,
+        /// The package the role is granted on; omit for a
+        /// project-level grant.
+        #[arg(long)]
+        target_package: Option<String>,
+        /// The person granted the role.
+        #[arg(long, requires = "person_role")]
+        person: Option<String>,
+        /// The role granted to the person.
+        #[arg(long, requires = "person")]
+        person_role: Option<String>,
+        /// The group granted the role.
+        #[arg(long, requires = "group_role")]
+        group: Option<String>,
+        /// The role granted to the group.
+        #[arg(long, requires = "group")]
+        group_role: Option<String>,
+        /// The request description. Values starting with `-` are
+        /// taken literally: a description may open with a `- ` bullet.
+        #[arg(long, allow_hyphen_values = true)]
+        description: String,
     },
     /// File a change-devel request: change a package's devel project.
     FileChangeDevel {
@@ -880,6 +907,60 @@ pub fn run(
                 Ok((filed, text))
             })
         }
+        RequestCommand::FileAddRole {
+            target_project,
+            target_package,
+            person,
+            person_role,
+            group,
+            group_role,
+            description,
+        } => {
+            let payload = AddRolePayload::new(
+                &target_project,
+                target_package.as_deref(),
+                person.as_deref().zip(person_role.as_deref()),
+                group.as_deref().zip(group_role.as_deref()),
+                &description,
+            )?;
+            let target = match &target_package {
+                Some(package) => format!("{target_project}/{package}"),
+                None => target_project.clone(),
+            };
+            let mut grantees = Vec::new();
+            if let (Some(name), Some(role)) = (&person, &person_role) {
+                grantees.push(format!("person {name} as {role}"));
+            }
+            if let (Some(name), Some(role)) = (&group, &group_role) {
+                grantees.push(format!("group {name} as {role}"));
+            }
+            let grantees = grantees.join(" and ");
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            with_client(debug, live, |client| {
+                let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
+                let id = filing.file_add_role(&payload)?;
+                let filed = filed_payload(&id, &dry_run, |id| {
+                    json!({
+                        "id": id.map(request_id_json).unwrap_or(Value::Null),
+                        "target_project": target_project,
+                        "target_package": target_package,
+                        "person": person
+                            .as_ref()
+                            .zip(person_role.as_ref())
+                            .map(|(name, role)| json!({"name": name, "role": role}))
+                            .unwrap_or(Value::Null),
+                        "group": group
+                            .as_ref()
+                            .zip(group_role.as_ref())
+                            .map(|(name, role)| json!({"name": name, "role": role}))
+                            .unwrap_or(Value::Null),
+                        "description": description,
+                    })
+                });
+                let text = file_add_role_text(id.as_deref(), &target, &grantees);
+                Ok((filed, text))
+            })
+        }
         RequestCommand::FileDelete {
             target_project,
             package,
@@ -956,6 +1037,16 @@ fn file_change_devel_text(
         None => format!(
             "dry-run: would file change-devel request for {source_project}/{source_package} to {target_project}/{target_package}"
         ),
+    }
+}
+
+/// The filing text for `file-add-role`: the filed (or would-file)
+/// request id, the grantees, and the target. The description is long
+/// free text and stays JSON-only.
+fn file_add_role_text(id: Option<&str>, target: &str, grantees: &str) -> String {
+    match id {
+        Some(id) => format!("filed add-role request {id} for {grantees} on {target}"),
+        None => format!("dry-run: would file add-role request for {grantees} on {target}"),
     }
 }
 
@@ -2856,6 +2947,81 @@ mod tests {
         ])
         .expect_err("package and repository conflict");
         assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn clap_parses_the_add_role_flags() {
+        let cli = TestCli::try_parse_from([
+            "geectl",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--target-package",
+            "bar",
+            "--person",
+            "alice",
+            "--person-role",
+            "maintainer",
+            "--group",
+            "factory-maintainers",
+            "--group-role",
+            "maintainer",
+            "--description",
+            "Grant roles on bar",
+        ])
+        .expect("file-add-role parses");
+        match cli.command {
+            RequestCommand::FileAddRole {
+                target_project,
+                target_package,
+                person,
+                person_role,
+                group,
+                group_role,
+                description,
+            } => {
+                assert_eq!(target_project, "foo");
+                assert_eq!(target_package.as_deref(), Some("bar"));
+                assert_eq!(person.as_deref(), Some("alice"));
+                assert_eq!(person_role.as_deref(), Some("maintainer"));
+                assert_eq!(group.as_deref(), Some("factory-maintainers"));
+                assert_eq!(group_role.as_deref(), Some("maintainer"));
+                assert_eq!(description, "Grant roles on bar");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_refuses_a_person_without_a_role() {
+        let err = TestCli::try_parse_from([
+            "geectl",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--person",
+            "alice",
+            "--description",
+            "Grant a role",
+        ])
+        .expect_err("a person without a role must not parse");
+        assert!(err.to_string().contains("required"));
+    }
+
+    #[test]
+    fn clap_refuses_a_role_without_a_group() {
+        let err = TestCli::try_parse_from([
+            "geectl",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--group-role",
+            "maintainer",
+            "--description",
+            "Grant a role",
+        ])
+        .expect_err("a role without a group must not parse");
+        assert!(err.to_string().contains("required"));
     }
 
     #[test]

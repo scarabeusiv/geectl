@@ -1291,6 +1291,324 @@ fn request_file_change_devel_dry_run_text_names_source_and_target() {
 }
 
 #[test]
+fn request_file_add_role_dry_run_names_the_grantee() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--target-package",
+            "bar",
+            "--person",
+            "alice",
+            "--person-role",
+            "maintainer",
+            "--description",
+            "Grant alice the maintainer role on bar",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["id"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    assert_plan_non_empty(&value);
+    assert_eq!(value["target_project"], "foo");
+    assert_eq!(value["target_package"], "bar");
+    assert_eq!(
+        value["person"],
+        json!({"name": "alice", "role": "maintainer"})
+    );
+    assert_eq!(value["group"], serde_json::Value::Null);
+    assert_eq!(
+        value["description"],
+        "Grant alice the maintainer role on bar"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("[dry-run]"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn request_file_add_role_group_only_dry_run_names_the_group() {
+    // Project-level grant: no package, group only.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--group",
+            "factory-maintainers",
+            "--group-role",
+            "reviewer",
+            "--description",
+            "Grant the group the reviewer role on foo",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["id"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    assert_plan_non_empty(&value);
+    assert_eq!(value["target_project"], "foo");
+    assert_eq!(value["target_package"], serde_json::Value::Null);
+    assert_eq!(value["person"], serde_json::Value::Null);
+    assert_eq!(
+        value["group"],
+        json!({"name": "factory-maintainers", "role": "reviewer"})
+    );
+    assert_eq!(
+        value["description"],
+        "Grant the group the reviewer role on foo"
+    );
+}
+
+#[test]
+fn request_file_add_role_person_and_group_dry_run_names_both() {
+    // Person and group together carry the same role: the server
+    // keeps one role per action.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--target-package",
+            "bar",
+            "--person",
+            "alice",
+            "--person-role",
+            "maintainer",
+            "--group",
+            "factory-maintainers",
+            "--group-role",
+            "maintainer",
+            "--description",
+            "Grant roles on bar",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_plan_non_empty(&value);
+    assert_eq!(
+        value["person"],
+        json!({"name": "alice", "role": "maintainer"})
+    );
+    assert_eq!(
+        value["group"],
+        json!({"name": "factory-maintainers", "role": "maintainer"})
+    );
+}
+
+#[test]
+fn request_file_add_role_dry_run_text_names_the_grantee_and_target() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "request",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--target-package",
+            "bar",
+            "--person",
+            "alice",
+            "--person-role",
+            "maintainer",
+            "--description",
+            "Grant alice the maintainer role on bar",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would file add-role request for person alice as maintainer on foo/bar"
+    );
+}
+
+#[test]
+fn request_file_add_role_refuses_different_roles() {
+    // The payload refuses a person and a group with different
+    // roles before any credential resolution, like the invalid
+    // search filters: the server keeps one role per action.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--target-package",
+            "bar",
+            "--person",
+            "alice",
+            "--person-role",
+            "maintainer",
+            "--group",
+            "factory-maintainers",
+            "--group-role",
+            "reviewer",
+            "--description",
+            "Grant roles on bar",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn request_file_add_role_refuses_no_grantee() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--description",
+            "Grant a role",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn request_file_add_role_live_against_closed_port_fails_with_network_error() {
+    // `--live` flows through main.rs into the filing: with
+    // credentials set and the base URL on a closed loopback port,
+    // the dedup search fails with a network error instead of
+    // silently dry-running.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "request",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--person",
+            "alice",
+            "--person-role",
+            "maintainer",
+            "--description",
+            "Grant a role",
+        ])
+        .env("GEECTL_OBS_URL", "http://127.0.0.1:1")
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "network_error");
+}
+
+#[test]
+fn request_file_add_role_live_with_half_configured_credentials_fails_fast() {
+    // A live run resolves credentials up front: a username without
+    // a password source fails before any filing work.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .args([
+            "--live",
+            "request",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--person",
+            "alice",
+            "--person-role",
+            "maintainer",
+            "--description",
+            "Grant a role",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let err = error_of(&out);
+    assert!(err["error"]["code"].as_str() == Some("config_error"));
+    assert!(
+        err["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("GEECTL_OBS_USERNAME is set but no password source is"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn request_file_add_role_dry_run_with_half_configured_credentials_prints_plan() {
+    // A dry run never touches the server, so the half-configured
+    // credential set above must not fail it.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .args([
+            "request",
+            "file-add-role",
+            "--target-project",
+            "foo",
+            "--person",
+            "alice",
+            "--person-role",
+            "maintainer",
+            "--description",
+            "Grant a role",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_plan_non_empty(&value);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("[dry-run]"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn request_file_maintenance_incident_dry_run_text_names_the_release_project() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
