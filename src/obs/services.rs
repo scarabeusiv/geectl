@@ -95,12 +95,19 @@ fn skip_document_misc(mut text: &str) -> Option<&str> {
     }
 }
 
+/// The render width for a comment's HTML-to-text conversion, in
+/// columns. Finite, so `html2text` never sizes an allocation or
+/// arithmetic by `usize::MAX`; well above any realistic comment,
+/// so prose and long words stay unwrapped in practice.
+const COMMENT_RENDER_WIDTH: usize = 4096;
+
 /// Convert an HTML fragment to plain text: a comment in a stored
 /// `_service` file is markup (a commented-out element, a prose
 /// note), and the typed view carries its text, not the tags.
-/// The render is unwrapped: the width is the stored payload, not
-/// terminal output, so a long comment stays one line and a long
-/// word is never split. Link footnotes are off
+/// The render width is `COMMENT_RENDER_WIDTH`: the stored
+/// payload is not terminal output, so a comment within the width
+/// stays one line and a long word is never split. Link footnotes
+/// are off
 /// (`plain_no_decorate`): a comment naming a link keeps the link
 /// text, not a footnote block. The output is otherwise
 /// `html2text`'s plain text as rendered: links keep their text in
@@ -114,7 +121,7 @@ fn skip_document_misc(mut text: &str) -> Option<&str> {
 /// the input is an in-memory slice.)
 fn html_to_plaintext(html: &str) -> String {
     let rendered = html2text::config::plain_no_decorate()
-        .string_from_read(html.as_bytes(), usize::MAX)
+        .string_from_read(html.as_bytes(), COMMENT_RENDER_WIDTH)
         .unwrap_or_default();
     // Terminal control characters are stripped: comment text comes
     // from untrusted `_service` files, and the render is printed
@@ -988,6 +995,45 @@ mod tests {
         assert!(!services[0].comments[0].contains('\n'));
         assert!(services[0].comments[0].starts_with("This is a very long prose comment"));
         assert_eq!(services[0].comments[1], long_word);
+    }
+
+    #[test]
+    fn comment_rich_markup_renders_at_a_finite_width() {
+        // A table, preformatted text, nested lists, and a
+        // blockquote render without the unbounded-width
+        // allocation: the conversion is bounded, and the content
+        // still comes through as text.
+        let services = parse_services(
+            r#"<services><service name="download_url" mode="manual"><!-- <table><tr><td>alpha</td><td>beta</td></tr></table> --><!-- <pre>line1
+line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> --><!-- <blockquote>quoted</blockquote> --></service></services>"#,
+        )
+        .unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].comments.len(), 4);
+        assert!(services[0].comments[0].contains("alpha"));
+        assert!(services[0].comments[0].contains("beta"));
+        assert!(services[0].comments[1].contains("line1"));
+        assert!(services[0].comments[1].contains("line2"));
+        assert!(services[0].comments[2].contains("one"));
+        assert!(services[0].comments[2].contains("inner"));
+        assert!(services[0].comments[2].contains("two"));
+        assert!(services[0].comments[3].contains("quoted"));
+    }
+
+    #[test]
+    fn comment_prose_wraps_within_the_finite_width() {
+        // Prose longer than the render width wraps: the stored
+        // text carries a newline, which an unbounded width would
+        // not produce. The length cap keeps the first 4096
+        // characters, so the wrap must land inside them.
+        let prose = "word ".repeat(1600);
+        let body = format!(
+            "<services><service name=\"download_url\" mode=\"manual\"><!-- {prose} --></service></services>"
+        );
+        let services = parse_services(&body).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].comments.len(), 1);
+        assert!(services[0].comments[0].contains('\n'));
     }
 
     #[test]
