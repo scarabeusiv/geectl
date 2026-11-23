@@ -1533,7 +1533,12 @@ impl<'a> LocalBuild<'a> {
     }
 
     /// The trust check: the `<bdep project="…">` set must contain
-    /// only non-`home:` projects and the caller's own `home:`. The
+    /// only non-`home:` projects and the caller's own `home:`, which
+    /// comes from the Basic credentials' username. With a Bearer
+    /// token (or no credentials) the caller's own `home:` is
+    /// unknown — the OBS API has no whoami endpoint to resolve it
+    /// from — so every `home:` project is treated as foreign and
+    /// the refusal says so. The
     /// build project itself is excluded from the set: a dep
     /// resolving from the project being built is the build's own
     /// output, not a foreign origin — the existing tool's
@@ -1595,6 +1600,21 @@ impl<'a> LocalBuild<'a> {
                 foreign.join(", ")
             ));
             return Ok(foreign);
+        }
+        // With non-Basic credentials the caller's own home: is
+        // unknown: a Bearer token carries no username, and the OBS
+        // API has no whoami endpoint to resolve one from, so the
+        // projects cannot be told apart from a foreign home: — say
+        // so, instead of telling the user to pass the broad flag
+        // for their own home.
+        if own_home.is_none() {
+            return Err(GeectlError::new(
+                ErrorKind::UntrustedProject,
+                format!(
+                    "build pulls dependencies from home: project(s): {}; the caller's own home: project cannot be determined from the configured credentials (only Basic username/password credentials carry a username), so they are treated as foreign; pass --trust-all-projects to trust them, or authenticate with a username and password so the caller's own home: is recognized",
+                    foreign.join(", ")
+                ),
+            ));
         }
         Err(GeectlError::new(
             ErrorKind::UntrustedProject,
@@ -8208,6 +8228,45 @@ fi
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(err.to_string().contains("dependency project"));
             assert!(!err.to_string().contains('\x1b'));
+        }
+
+        #[test]
+        fn build_with_bearer_credentials_says_the_own_home_is_unknown() {
+            // A Bearer token carries no username, and the OBS API
+            // has no whoami endpoint, so the caller's own home:
+            // cannot be determined: a dep from the caller's own
+            // home: is refused as foreign, and the refusal says
+            // why instead of telling the user to pass the broad
+            // flag for their own home.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                        arch = host_arch()
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n");
+            let client = ObsClient::with_credentials(
+                &http,
+                Credentials::Bearer {
+                    token: "test-token".to_string(),
+                },
+            )
+            .unwrap();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::UntrustedProject);
+            assert!(err.to_string().contains("home:scarabeus_iv"));
+            assert!(err.to_string().contains("cannot be determined"));
+            assert!(err.to_string().contains("--trust-all-projects"));
         }
 
         #[test]
