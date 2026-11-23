@@ -1227,6 +1227,96 @@ fn remote_unreachable_server_fails_with_network_error() {
     assert!(value["error"]["remediation"].is_string());
 }
 
+#[test]
+fn remote_owners_for_package_needs_credentials() {
+    // No credentials configured: the credential gate fires before
+    // any request, so no server is needed.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "owners-for-package", "vim"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_owners_for_package_rejects_an_invalid_name() {
+    // An invalid OBS name is rejected by the library before any HTTP
+    // call — and before the credential gate — so no credentials (and
+    // no server) are needed.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "owners-for-package", "foo/bar"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(value["error"]["message"].is_string());
+    assert!(value["error"]["remediation"].is_string());
+}
+
+#[test]
+fn remote_owners_for_package_json_reports_package_and_owners() {
+    let addr = serve_once(
+        "<collection matches=\"2\"><owner rootproject=\"openSUSE:Factory\" project=\"devel:languages:python\" package=\"foo\"><person name=\"Admin\" role=\"maintainer\"/><person name=\"scarabeus_iv\" role=\"bugowner\"/><group name=\"factory-maintainers\" role=\"maintainer\"/></owner><owner rootproject=\"openSUSE:Factory\" project=\"openSUSE:Factory\"><person name=\"Admin\" role=\"maintainer\"/></owner></collection>",
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "owners-for-package", "foo"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "secret")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["package"], "foo");
+    assert_eq!(value["owners"].as_array().unwrap().len(), 2);
+    assert_eq!(value["owners"][0]["root_project"], "openSUSE:Factory");
+    assert_eq!(value["owners"][0]["project"], "devel:languages:python");
+    assert_eq!(value["owners"][0]["package"], "foo");
+}
+
+#[test]
+fn remote_owners_for_package_text_mode_opens_with_the_package_header() {
+    let addr = serve_once(
+        "<collection matches=\"2\"><owner rootproject=\"openSUSE:Factory\" project=\"devel:languages:python\" package=\"foo\"><person name=\"Admin\" role=\"maintainer\"/><person name=\"scarabeus_iv\" role=\"bugowner\"/><group name=\"factory-maintainers\" role=\"maintainer\"/></owner><owner rootproject=\"openSUSE:Factory\" project=\"openSUSE:Factory\"><person name=\"Admin\" role=\"maintainer\"/></owner></collection>",
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "remote", "owners-for-package", "foo"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "secret")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("package: foo\n"), "{stdout}");
+    assert!(
+        stdout.contains("openSUSE:Factory devel:languages:python foo: persons: Admin (maintainer), scarabeus_iv (bugowner); groups: factory-maintainers (maintainer)"),
+        "{stdout}"
+    );
+}
+
 // --- remote-read success-path fixture tests ---
 
 /// A one-shot HTTP fixture: serves a single canned response to the
