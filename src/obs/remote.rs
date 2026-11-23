@@ -1619,11 +1619,19 @@ fn validate_search_term(term: &str) -> Result<&str, GeectlError> {
 /// `userid`). None when the response is not a collection at all, or
 /// when a `matches` count is present but does not parse: an
 /// unexpected response is an error, never an empty list. An owner
-/// element without its `rootproject` or `project` attribute is
-/// skipped, not an error: only the collection envelope itself is
-/// validated here. The `matches` count is not required: the owner
-/// search renders a collection either way, and refusing on a missing
-/// count would refuse a valid empty answer.
+/// element without its `project` attribute is skipped, not an error:
+/// only the collection envelope itself is validated here. A missing
+/// or empty `rootproject` reads as an empty root project: the
+/// server's owner template assigns `rootproject` unconditionally
+/// (unlike `package`, which it emits only when present), so a
+/// missing attribute is a malformed element, not a distinct
+/// root-project state — and the real Container response carries
+/// `rootproject=""` for real owners, so dropping them would
+/// under-report the search. `project` is the owner's identity (an
+/// element without it is skipped); `rootproject` is provenance only.
+/// The `matches` count
+/// is not required: the owner search renders a collection either way,
+/// and refusing on a missing count would refuse a valid empty answer.
 pub(crate) fn parse_owners(body: &str) -> Option<Vec<Owner>> {
     if !body.contains("<collection") {
         return None;
@@ -1633,12 +1641,17 @@ pub(crate) fn parse_owners(body: &str) -> Option<Vec<Owner>> {
     }
     let mut owners = Vec::new();
     for (element, inner) in elements(body, "owner").ok()? {
-        let (Some(root_project), Some(project)) = (
-            tag_attr(&element, "rootproject"),
-            tag_attr(&element, "project"),
-        ) else {
+        let Some(project) = tag_attr(&element, "project") else {
             continue;
         };
+        // A missing or empty `rootproject` reads as an empty root
+        // project: the server assigns the attribute unconditionally,
+        // so missing is a malformed element, not a distinct state —
+        // and `tag_attr` maps an empty value to None, so the two
+        // read the same here anyway. The real Container response
+        // carries `rootproject=""` for real owners; skipping them
+        // would under-report the search.
+        let root_project = tag_attr(&element, "rootproject").unwrap_or_default();
         let package = tag_attr(&element, "package").map(|value| xml_unescape(&value));
         let mut persons = Vec::new();
         for (person_element, _) in elements(&inner, "person").ok()? {
@@ -10000,6 +10013,71 @@ mod tests {
                 true
             )]
         );
+    }
+
+    #[test]
+    fn owners_for_package_empty_rootproject_parses() {
+        // The real Container response carries rootproject="": an
+        // empty root project is still a present attribute, so the
+        // owner parses with an empty root project.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/owner?package=foo",
+            "<collection matches=\"1\"><owner rootproject=\"\" project=\"openSUSE:Factory\" package=\"foo\"><person name=\"Admin\" role=\"maintainer\"/></owner></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let owners = client.owners_for_package("foo").unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].root_project, "");
+        assert_eq!(owners[0].project, "openSUSE:Factory");
+    }
+
+    #[test]
+    fn owners_for_package_server_400_is_empty() {
+        // The server 400s a package-only search when no owner root
+        // project contains the package: that is no owners, not
+        // invalid input.
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/search/owner?package=foo",
+            ErrorKind::InvalidInput,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.owners_for_package("foo").unwrap().is_empty());
+    }
+
+    #[test]
+    fn owners_for_package_server_404_is_empty() {
+        // The server 404s when the OBS:OwnerRootProject attribute
+        // type itself is absent: again no owners, not a failed
+        // lookup.
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/search/owner?package=foo",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.owners_for_package("foo").unwrap().is_empty());
+    }
+
+    #[test]
+    fn owners_for_package_empty_collection_is_empty() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/owner?package=foo",
+            "<collection matches=\"0\"></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.owners_for_package("foo").unwrap().is_empty());
+    }
+
+    #[test]
+    fn owners_for_binary_server_400_stays_an_error() {
+        // The 400-to-empty mapping is package-only: the binary
+        // search keeps the fail-closed mapping.
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/search/owner?binary=python3.11",
+            ErrorKind::InvalidInput,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client.owners_for_binary("python3.11").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]
