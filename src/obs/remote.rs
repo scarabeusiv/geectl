@@ -12,6 +12,9 @@ use super::tag_attr;
 use super::valid_obs_filename;
 use super::valid_obs_name;
 use super::AggregateOptions;
+use super::CommitFileEntry;
+use super::CommitFilelistOptions;
+use super::CommitFilelistResponse;
 use super::CreatePackageOptions;
 use super::DeletePackageOptions;
 use super::DeleteProjectOptions;
@@ -569,6 +572,176 @@ pub(crate) fn parse_revision(body: &str) -> Option<u64> {
         return Some(number);
     }
     None
+}
+
+/// Whether the body is a staged-upload answer: a `<revision>` element
+/// whose `rev` attribute is the literal `repository`. Any other body
+/// (a numbered revision, a status document) is not a staged answer.
+fn staged_revision_ok(body: &str) -> bool {
+    let Some(pos) = body.find("<revision") else {
+        return false;
+    };
+    let after_tag = &body[pos + "<revision".len()..];
+    let Some(first) = after_tag.chars().next() else {
+        return false;
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return false;
+    }
+    let Some(end) = after_tag.find('>') else {
+        return false;
+    };
+    tag_attr(&after_tag[..end], "rev").as_deref() == Some("repository")
+}
+
+/// Parse a `commitfilelist` answer (`<directory>` with `<entry name
+/// md5 hash .../>` children and an optional `<serviceinfo
+/// code="running">`). The body must be a `<directory>` document: a
+/// body that is not one is an error, never an empty answer. The
+/// `error` attribute names the shape: absent means the call
+/// succeeded (final pass: `rev` carries the new revision);
+/// `"missing"` means the listed entries are the files the server
+/// does not have yet; any other value is a server error. Entries
+/// carrying `hash="new"` are the sha256 challenge: the caller
+/// resends the list with `hash="sha256:..."` on those entries. An
+/// `<entry>` without a `name` attribute is malformed, not skippable.
+fn parse_commitfilelist_response(body: &str) -> Result<CommitFilelistResponse, GeectlError> {
+    let body = body.trim();
+    // A malformed answer still fails closed, but the error carries a
+    // bounded preview of what was received, so the failure is
+    // diagnosable instead of a bare "not a directory document". The
+    // preview is the debug channel's redacting preview: credential
+    // values are masked, binary bodies are never dumped, and the text
+    // is capped at DEBUG_BODY_CAP bytes.
+    let malformed = || {
+        let preview = crate::debug::format_body_preview(body);
+        let received = if preview.is_empty() {
+            "<empty response>".to_string()
+        } else {
+            preview
+        };
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected OBS commitfilelist response: not a <directory> document; received: {received}"
+            ),
+        )
+    };
+    // The server may emit an XML prolog (`<?xml version="1.0"?>`)
+    // before the directory element; skip it. The prolog must
+    // terminate (`?>`) — an unterminated prolog is malformed, not a
+    // missing directory.
+    let body = if let Some(after) = body.strip_prefix("<?xml") {
+        let first = after.chars().next();
+        if !matches!(first, Some(c) if c.is_whitespace() || c == '?') {
+            return Err(malformed());
+        }
+        let Some(end) = after.find("?>") else {
+            return Err(malformed());
+        };
+        after[end + 2..].trim_start()
+    } else {
+        body
+    };
+    let Some(after_open) = body.strip_prefix("<directory") else {
+        return Err(malformed());
+    };
+    // The tag name must end here: `<directorylisting>` is not a
+    // directory element. The next character is whitespace, `/`, or `>`.
+    let Some(first) = after_open.chars().next() else {
+        return Err(malformed());
+    };
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return Err(malformed());
+    }
+    // The opening tag ends at the first `>`.
+    let Some(end) = after_open.find('>') else {
+        return Err(malformed());
+    };
+    let open_tag = &after_open[..end];
+    let error = tag_attr(open_tag, "error");
+    if let Some(error) = &error {
+        if error != "missing" {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS commitfilelist response: unexpected 'error' attribute: {error:?}"
+                ),
+            ));
+        }
+    }
+    let rev = match tag_attr(open_tag, "rev") {
+        Some(value) => Some(value.parse::<u64>().map_err(|_| malformed())?),
+        None => None,
+    };
+    let srcmd5 = tag_attr(open_tag, "srcmd5").map(|value| xml_unescape(&value));
+    if open_tag.trim_end().ends_with('/') {
+        // Self-closing `<directory .../>`: no children, so no missing
+        // files and no service state.
+        return Ok(CommitFilelistResponse {
+            rev,
+            srcmd5,
+            missing: Vec::new(),
+            hash_challenge: Vec::new(),
+            service_running: false,
+        });
+    }
+    let inner = &after_open[end + 1..];
+    let Some(close) = inner.find("</directory>") else {
+        return Err(malformed());
+    };
+    // Nothing but whitespace may follow the closing tag.
+    if !inner[close + "</directory>".len()..].trim().is_empty() {
+        return Err(malformed());
+    }
+    let inner = &inner[..close];
+    let mut missing = Vec::new();
+    let mut hash_challenge = Vec::new();
+    let mut rest = inner;
+    while let Some(pos) = rest.find("<entry") {
+        let after_tag = &rest[pos + "<entry".len()..];
+        let Some(first) = after_tag.chars().next() else {
+            return Err(malformed());
+        };
+        if !(first.is_whitespace() || first == '/' || first == '>') {
+            rest = &after_tag[1..];
+            continue;
+        }
+        let Some(end) = after_tag.find('>') else {
+            return Err(malformed());
+        };
+        let element = &after_tag[..end];
+        let Some(name) = tag_attr(element, "name").map(|value| xml_unescape(&value)) else {
+            return Err(malformed());
+        };
+        if tag_attr(element, "hash").as_deref() == Some("new") {
+            hash_challenge.push(name.clone());
+        }
+        if error.as_deref() == Some("missing") {
+            missing.push(name);
+        }
+        rest = &after_tag[end + 1..];
+    }
+    // A running server-side service run is reported on the answer's
+    // `<serviceinfo>`: the caller polls the directory until it
+    // settles before refreshing the base.
+    let service_running = match inner.find("<serviceinfo") {
+        Some(pos) => {
+            let after_tag = &inner[pos + "<serviceinfo".len()..];
+            let Some(end) = after_tag.find('>') else {
+                return Err(malformed());
+            };
+            tag_attr(&after_tag[..end], "code").as_deref() == Some("running")
+        }
+        None => false,
+    };
+    Ok(CommitFilelistResponse {
+        rev,
+        srcmd5,
+        missing,
+        hash_challenge,
+        service_running,
+    })
 }
 
 /// Parse an OBS source directory listing (`<directory>...</directory>`
@@ -1969,6 +2142,267 @@ impl<'a> ObsClient<'a> {
                 format!("unexpected OBS upload response for file {project}/{package}/{filename}"),
             )),
         }
+    }
+
+    /// Stage file `filename` into package `package` in project
+    /// `project` without creating a revision (`PUT
+    /// /source/<project>/<package>/<filename>?rev=repository`).
+    /// The staged file waits in the file store until a
+    /// `commitfilelist` final pass creates exactly one revision
+    /// from the full file list. The text counterpart of
+    /// [`ObsClient::put_file_staged_bytes`]: same validation, same
+    /// dry-run guard, same staged answer — but the content is text.
+    /// Returns `Some(())` live, `None` in dry-run. Success is the
+    /// backend's `<revision rev="repository">` document, not a
+    /// `<status code="ok"/>`: any other body is a server error,
+    /// never success.
+    pub fn put_file_staged(
+        &self,
+        project: &str,
+        package: &str,
+        filename: &str,
+        content: &str,
+        dry_run: &DryRun,
+    ) -> Result<Option<()>, GeectlError> {
+        self.put_file_staged_inner(project, package, filename, dry_run, |url| {
+            self.http.put_file(url, content, &self.credentials)
+        })
+    }
+
+    /// Stage file `filename` with binary `content` without creating
+    /// a revision. The byte counterpart of
+    /// [`ObsClient::put_file_staged`]: same validation, same dry-run
+    /// guard, same staged answer — but the content is bytes, so a
+    /// binary file (a tarball) stages instead of failing the UTF-8
+    /// check a text stage would hit.
+    pub fn put_file_staged_bytes(
+        &self,
+        project: &str,
+        package: &str,
+        filename: &str,
+        content: &[u8],
+        dry_run: &DryRun,
+    ) -> Result<Option<()>, GeectlError> {
+        self.put_file_staged_inner(project, package, filename, dry_run, |url| {
+            self.http.put_bytes(url, content, &self.credentials)
+        })
+    }
+
+    /// The shared staged-PUT: validation, the dry-run guard, the
+    /// credentials check, the `?rev=repository` PUT, and the staged
+    /// answer check. The caller supplies only the PUT itself (text
+    /// or bytes).
+    fn put_file_staged_inner(
+        &self,
+        project: &str,
+        package: &str,
+        filename: &str,
+        dry_run: &DryRun,
+        put: impl FnOnce(&str) -> Result<String, GeectlError>,
+    ) -> Result<Option<()>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !valid_obs_filename(filename) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS filename: {filename:?}"),
+            ));
+        }
+        // The dry-run guard: in dry-run the stage is recorded in the
+        // plan and nothing is staged — not even the credentials
+        // check runs. Without this, a dry-run caller invoking the
+        // stage directly would mutate the server.
+        if !dry_run.allow(&format!(
+            "stage file {project}/{package}/{filename} (rev=repository)"
+        )) {
+            return Ok(None);
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot stage a file without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let url = build_url(
+            &self.base,
+            &["source", project, package, filename],
+            &[("rev", "repository")],
+        );
+        let body = put(&url)?;
+        if staged_revision_ok(&body) {
+            Ok(Some(()))
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS staged-upload response for file {project}/{package}/{filename}"
+                ),
+            ))
+        }
+    }
+
+    /// Send the file list for package `package` in project
+    /// `project` (`POST /source/<project>/<package>?cmd=
+    /// commitfilelist`): the commit-protocol call. The body is the
+    /// full file list (`<directory>` with one `<entry>` per file,
+    /// name + md5, sorted by name); the answer is the missing list,
+    /// the sha256 challenge, or the new revision — see
+    /// [`CommitFilelistResponse`]. The caller drives the sequence:
+    /// validate pass (`withvalidate=1`), answer a sha256 challenge
+    /// by resending with `hash="sha256:..."`, stage the missing
+    /// files, final pass. A validate pass with nothing missing
+    /// commits: the answer then carries the landed revision and no
+    /// final pass runs. The final pass reports files still missing
+    /// instead of committing, so a stage that raced is retried
+    /// (bounded). Returns `None` in dry-run. The user defaults to
+    /// the OBS Basic username on the client.
+    pub fn commit_filelist(
+        &self,
+        project: &str,
+        package: &str,
+        files: &[CommitFileEntry],
+        options: &CommitFilelistOptions,
+        dry_run: &DryRun,
+    ) -> Result<Option<CommitFilelistResponse>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        for file in files {
+            if !valid_obs_filename(&file.name) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS filename: {:?} ", file.name),
+                ));
+            }
+        }
+        // The dry-run guard runs before the credentials check: in
+        // dry-run the call is recorded in the plan and nothing is
+        // sent — not even the credentials check runs.
+        if !dry_run.allow(&format!("commit file list for {project}/{package}")) {
+            return Ok(None);
+        }
+        let user = match &options.user {
+            Some(user) => user.clone(),
+            None => match &self.credentials {
+                Credentials::Basic { username, .. } => username.clone(),
+                _ => {
+                    return Err(GeectlError::new(
+                        ErrorKind::ConfigError,
+                        "cannot commit a file list without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                    ));
+                }
+            },
+        };
+        let mut sorted: Vec<&CommitFileEntry> = files.iter().collect();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut body = String::from("<directory>");
+        for file in sorted {
+            body.push_str(&format!(
+                "<entry name=\"{}\" md5=\"{}\"",
+                xml_escape(&file.name),
+                xml_escape(&file.md5)
+            ));
+            if let Some(sha256) = &file.sha256 {
+                body.push_str(&format!(" hash=\"sha256:{}\"", xml_escape(sha256)));
+            }
+            body.push_str(" />");
+        }
+        body.push_str("</directory>");
+        let mut query: Vec<(&str, &str)> = vec![("cmd", "commitfilelist")];
+        let comment = options.comment.as_str();
+        query.push(("comment", comment));
+        query.push(("user", &user));
+        if options.validate {
+            query.push(("withvalidate", "1"));
+        }
+        if options.keeplink {
+            query.push(("keeplink", "1"));
+        }
+        let linkrev;
+        if let Some(linkrev_value) = &options.linkrev {
+            linkrev = linkrev_value.clone();
+            query.push(("linkrev", &linkrev));
+        }
+        if options.repairlink {
+            query.push(("repairlink", "1"));
+        }
+        if options.noservice {
+            query.push(("noservice", "1"));
+        }
+        let url = build_url(&self.base, &["source", project, package], &query);
+        let response = self.http.post(&url, &body, &self.credentials)?;
+        parse_commitfilelist_response(&response).map(Some)
+    }
+
+    /// Read the revision of package `package` in project `project`
+    /// (`GET /public/source/<project>/<package>`): the revision
+    /// number, the versioned revision, and the source md5. A public
+    /// read: no credentials. The commit gate reads this: the
+    /// checkout's base revision must equal the server's latest
+    /// revision, else the checkout is outdated.
+    pub(crate) fn directory_rev(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<DirectoryRev, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let url = build_url(&self.base, &["public", "source", project, package], &[]);
+        let body = self.http.get_with(&url, &Credentials::None)?;
+        parse_directory_rev(&body)
+    }
+
+    /// List the files of package `package` in project `project` at
+    /// revision `rev` (`GET /public/source/<project>/<package>?rev=…`):
+    /// the revision-carrying form of
+    /// [`ObsClient::directory_listing`], for reading a pinned base.
+    /// `None` reads the latest revision.
+    pub(crate) fn directory_listing_rev(
+        &self,
+        project: &str,
+        package: &str,
+        rev: Option<&RevisionSpec>,
+    ) -> Result<DirectoryListing, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if let Some(RevisionSpec::Rev(0)) = rev {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "invalid revision: 0",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        let rev_text;
+        if let Some(rev) = rev {
+            rev_text = rev.to_string();
+            query.push(("rev", &rev_text));
+        }
+        let url = build_url(&self.base, &["public", "source", project, package], &query);
+        let body = self.http.get_with(&url, &Credentials::None)?;
+        parse_directory(&body)
     }
 
     /// GET a public directory listing (`/public/source/...`) and
@@ -5826,6 +6260,360 @@ mod tests {
         assert_eq!(puts[0].1, "Name: foo\n");
         // The upload PUT carried the credentials.
         assert!(puts[0].2);
+    }
+
+    #[test]
+    fn put_file_staged_puts_with_rev_repository_and_accepts_the_staged_answer() {
+        // test_commit.py test_simple: the staged PUT carries
+        // ?rev=repository and the server answers <revision
+        // rev="repository">.
+        let http = FakeHttp::new().with_put(
+            "https://api.opensuse.org/source/home:alice/foo/foo.spec?rev=repository",
+            "<revision rev=\"repository\">\n  <srcmd5>empty</srcmd5>\n</revision>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .put_file_staged(
+                    "home:alice",
+                    "foo",
+                    "foo.spec",
+                    "Name: foo\n",
+                    &DryRun::new(false)
+                )
+                .unwrap(),
+            Some(())
+        );
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].0,
+            "https://api.opensuse.org/source/home:alice/foo/foo.spec?rev=repository"
+        );
+        assert_eq!(puts[0].1, "Name: foo\n");
+        assert!(puts[0].2);
+    }
+
+    #[test]
+    fn put_file_staged_refuses_a_numbered_revision_answer() {
+        // A staged PUT that answers with a real revision created one:
+        // the stage did not stage. That is a server error, never
+        // success.
+        let http = FakeHttp::new().with_put(
+            "https://api.opensuse.org/source/home:alice/foo/foo.spec?rev=repository",
+            "<revision rev=\"1\" vrev=\"1\" srcmd5=\"abc\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .put_file_staged(
+                "home:alice",
+                "foo",
+                "foo.spec",
+                "Name: foo\n",
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn put_file_staged_bytes_stages_binary_content() {
+        let http = FakeHttp::new().with_put_bytes(
+            "https://api.opensuse.org/source/home:alice/foo/blob.tar.gz?rev=repository",
+            "<revision rev=\"repository\">\n  <srcmd5>empty</srcmd5>\n</revision>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .put_file_staged_bytes(
+                    "home:alice",
+                    "foo",
+                    "blob.tar.gz",
+                    &[0, 1, 2, 3],
+                    &DryRun::new(false)
+                )
+                .unwrap(),
+            Some(())
+        );
+        let puts = http.put_bytes_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].1, vec![0, 1, 2, 3]);
+        assert!(puts[0].2);
+    }
+
+    #[test]
+    fn put_file_staged_dry_run_plans_and_puts_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .put_file_staged(
+                    "home:alice",
+                    "foo",
+                    "foo.spec",
+                    "Name: foo\n",
+                    &DryRun::new(true)
+                )
+                .unwrap(),
+            None
+        );
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn commit_filelist_validate_pass_returns_the_missing_list() {
+        // test_commit.py test_simple: the validate pass posts the
+        // sorted file list with withvalidate=1 and the server
+        // answers error="missing" with the files it lacks.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=&user=scarabeus_iv&withvalidate=1",
+            "<directory error=\"missing\" name=\"foo\">\n  <entry md5=\"382588b92f5976de693f44c4d6df27b7\" name=\"nochange\" />\n</directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let mut options = CommitFilelistOptions::new("");
+        options.validate = true;
+        let answer = client
+            .commit_filelist(
+                "home:alice",
+                "foo",
+                &[
+                    CommitFileEntry::new("foo", "0d62ceea6020d75154078a20d8c9f9ba"),
+                    CommitFileEntry::new("nochange", "382588b92f5976de693f44c4d6df27b7"),
+                ],
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.missing, vec!["nochange".to_string()]);
+        assert!(answer.hash_challenge.is_empty());
+        assert_eq!(answer.rev, None);
+        assert!(!answer.service_running);
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(
+            posts[0].0,
+            "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=&user=scarabeus_iv&withvalidate=1"
+        );
+        // The body is the sorted file list: foo before nochange.
+        assert_eq!(
+            posts[0].1,
+            "<directory><entry name=\"foo\" md5=\"0d62ceea6020d75154078a20d8c9f9ba\" /><entry name=\"nochange\" md5=\"382588b92f5976de693f44c4d6df27b7\" /></directory>"
+        );
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn commit_filelist_sha256_challenge_names_the_files() {
+        // test_commit.py test_added_missing2_sha256: the validate
+        // answer carries hash="new" on the challenged entry.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=&user=scarabeus_iv&withvalidate=1",
+            "<directory error=\"missing\" name=\"foo\">\n  <entry md5=\"14758f1afd44c09b7992073ccf00b43d\" name=\"bar\" hash=\"new\"/>\n</directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let mut options = CommitFilelistOptions::new("");
+        options.validate = true;
+        let answer = client
+            .commit_filelist(
+                "home:alice",
+                "foo",
+                &[CommitFileEntry::new(
+                    "bar",
+                    "14758f1afd44c09b7992073ccf00b43d",
+                )],
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.missing, vec!["bar".to_string()]);
+        assert_eq!(answer.hash_challenge, vec!["bar".to_string()]);
+    }
+
+    #[test]
+    fn commit_filelist_final_pass_returns_rev_srcmd5_and_service_state() {
+        // test_commit.py test_simple: the final pass (no
+        // withvalidate) answers the committed directory with the new
+        // revision; a running service run is reported on it.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=&user=scarabeus_iv",
+            "<directory name=\"foo\" rev=\"2\" srcmd5=\"2df1eacfe03a3bec2112529e7f4dc39a\" vrev=\"2\">\n  <entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" />\n  <serviceinfo code=\"running\" />\n</directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let answer = client
+            .commit_filelist(
+                "home:alice",
+                "foo",
+                &[CommitFileEntry::new(
+                    "foo",
+                    "0d62ceea6020d75154078a20d8c9f9ba",
+                )],
+                &CommitFilelistOptions::new(""),
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.rev, Some(2));
+        assert_eq!(
+            answer.srcmd5,
+            Some("2df1eacfe03a3bec2112529e7f4dc39a".to_string())
+        );
+        assert!(answer.missing.is_empty());
+        assert!(answer.service_running);
+    }
+
+    #[test]
+    fn commit_filelist_keeplink_passes_the_flag() {
+        // test_commit.py test_expand: a commit of an expanded linked
+        // package passes keeplink=1.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=&user=scarabeus_iv&keeplink=1",
+            "<directory name=\"foo\" rev=\"2\" srcmd5=\"2df1eacfe03a3bec2112529e7f4dc39a\" vrev=\"2\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let mut options = CommitFilelistOptions::new("");
+        options.keeplink = true;
+        let answer = client
+            .commit_filelist(
+                "home:alice",
+                "foo",
+                &[CommitFileEntry::new(
+                    "foo",
+                    "0d62ceea6020d75154078a20d8c9f9ba",
+                )],
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.rev, Some(2));
+    }
+
+    #[test]
+    fn commit_filelist_unexpected_error_attribute_is_a_server_error() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=&user=scarabeus_iv&withvalidate=1",
+            "<directory error=\"other\" name=\"foo\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let mut options = CommitFilelistOptions::new("");
+        options.validate = true;
+        let err = client
+            .commit_filelist(
+                "home:alice",
+                "foo",
+                &[CommitFileEntry::new(
+                    "foo",
+                    "0d62ceea6020d75154078a20d8c9f9ba",
+                )],
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn commit_filelist_malformed_answer_is_a_server_error() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=&user=scarabeus_iv&withvalidate=1",
+            "garbage",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let mut options = CommitFilelistOptions::new("");
+        options.validate = true;
+        let err = client
+            .commit_filelist(
+                "home:alice",
+                "foo",
+                &[CommitFileEntry::new(
+                    "foo",
+                    "0d62ceea6020d75154078a20d8c9f9ba",
+                )],
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn commit_filelist_dry_run_plans_and_posts_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let mut options = CommitFilelistOptions::new("");
+        options.validate = true;
+        assert_eq!(
+            client
+                .commit_filelist(
+                    "home:alice",
+                    "foo",
+                    &[CommitFileEntry::new(
+                        "foo",
+                        "0d62ceea6020d75154078a20d8c9f9ba",
+                    )],
+                    &options,
+                    &DryRun::new(true)
+                )
+                .unwrap(),
+            None
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn commit_filelist_without_credentials_fails_closed() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .commit_filelist(
+                "home:alice",
+                "foo",
+                &[CommitFileEntry::new(
+                    "foo",
+                    "0d62ceea6020d75154078a20d8c9f9ba",
+                )],
+                &CommitFilelistOptions::new(""),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+    }
+
+    #[test]
+    fn directory_rev_reads_rev_vrev_and_srcmd5() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo",
+            "<directory name=\"foo\" rev=\"42\" srcmd5=\"ffffffffffffffffffffffffffffffff\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client.directory_rev("home:alice", "foo").unwrap(),
+            (
+                Some("42".to_string()),
+                Some("1".to_string()),
+                Some("ffffffffffffffffffffffffffffffff".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn directory_listing_rev_reads_a_pinned_revision() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo?rev=41",
+            "<directory name=\"foo\" rev=\"41\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>",
+        );
+        let client = ObsClient::new(&http);
+        let listing = client
+            .directory_listing_rev("home:alice", "foo", Some(&RevisionSpec::Rev(41)))
+            .unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "foo");
+        assert_eq!(
+            listing.srcmd5,
+            Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string())
+        );
     }
 
     #[test]
