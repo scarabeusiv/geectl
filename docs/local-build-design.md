@@ -67,7 +67,9 @@ into the build container is not specified here.
 a git clone, or any dir with a spec), `repo` (explicit name, e.g.
 `standard`), `arch` (explicit; must equal the host arch — see scope).
 Options: `--clean`, `--flavor` (multibuild), `--release N`,
-`--trust-all-projects` (see trust), `--refresh-image`, `--timeout SECS`.
+`--trust-all-projects` (see trust), `--refresh-image`, `--timeout SECS`,
+`--alternative-project` (fetch project), `--root` (build root),
+`--noinit`, `--keep-rpms <dir>` (`-k`), `--prefer-packages <dir>` (`-p`).
 No other options in v1: no `--jobs`/`--threads` tuning, no `--with`/
 `--without`, no `--define` — the full option matrix stays out.
 
@@ -305,7 +307,7 @@ build time (see Cache layout).
 
 Usage is reported by `cache_usage` (`total_bytes` with per-area
 `pkg_bytes`, `sccache_bytes`, `roots_bytes`, `image_bytes`), and the
-build record carries `cache` (pkg hits/misses, sccache hits); eviction
+build record carries `cache` (pkg hits/misses/preferred, sccache hits); eviction
 adds an `eviction` object to every build record:
 
 - `ran` (bool), `cap_bytes`, `low_water_bytes`, `bytes_before`,
@@ -351,16 +353,34 @@ adds an `eviction` object to every build record:
   with a fake "Architecture is not included" error. One invocation builds
   one flavor; the
   caller loops over flavors.
+- **Debug flags.** `--alternative-project` fetches the buildinfo, the
+  buildconfig, and the deps from another project; the root stays keyed
+  by the package's own project. `--root` builds in a given directory
+  instead of the derived cache-dir root; the sccache store lives inside
+  the root, so two roots never share a tar. `--noinit` starts the build
+  immediately in the existing root and refuses on a fresh one; it
+  conflicts with `--clean`. `--keep-rpms <dir>` saves the built RPMs
+  there on a green build. `--prefer-packages <dir>` uses a dep file from
+  the dir instead of downloading it, hdrmd5-verified, failing closed on
+  a mismatch; an explicit prefer file wins over the pkg cache too, so a
+  rebuilt RPM is picked up on the next run. `--noinit` takes no
+  `--prefer-packages` (nothing is installed); with
+  `--alternative-project` it changes only the trust check, not the
+  installed dep set or buildconfig. A `--root` build sits outside the
+  cache-dir cap, eviction, and prune, and `build-log`/`build-wipe`/
+  `build-shell` do not see it. `--clean` on a custom root refuses
+  unless the root carries the geectl marker or is empty.
 - **Verdict contract.** Success is exit code 0 **and** the log's
   `<host> finished "build <spec>"` line **and** the RPMs present — a
   build result is stated only after it has been read.
   The result is typed JSON: `verdict` (green/failed), `exit_code`,
-  `log_path`, `rpms` (paths), `rpmlint` (errors/warnings/badness, read
+  `log_path`, `rpms` (paths), `kept_rpms` (paths copied to the keep
+  dir), `rpmlint` (errors/warnings/badness, read
   from the end of the log — badness over the project threshold is
   reported, not hidden, because the server build aborts on it), `checks`
   (%check/ctest pass counts when parseable), `image_digest`,
   `engine_version`, `root_path`, `root_reused` (bool), cache stats
-  (pkg cache hits/misses, sccache hits). Stdout carries only this payload
+  (pkg cache hits/misses/preferred, sccache hits). Stdout carries only this payload
   (R11); the full log stays on disk at `log_path` and is never dumped to
   stdout — `build-log` re-reads it.
 - **Trust: no prompts, ever (R1).** The op enumerates the `<bdep
@@ -430,10 +450,9 @@ packages lives in the working-copy layer (#17), not here.
   this design, it is a different decision.
 - The full option matrix: `--icecream`/distcc, `--jobs`/`--threads`
   tuning, `--with`/`--without`, `--define`, `--linksources`,
-  `--baselibs`, `--debuginfo`, `--oldpackages`, `--prefer` (beyond the
-  pkg cache), `--target`, `--preload`, `--noinit` (except as the engine
-  needs it internally). If an agent need for one is proven, it is a new
-  decision with its own justification, not a quiet addition.
+  `--baselibs`, `--debuginfo`, `--oldpackages`, `--target`, `--preload`.
+  If an agent need for one is proven, it is a new decision with its own
+  justification, not a quiet addition.
 - Build-root management beyond the container: no persistent root
   registry; root garbage collection is the Eviction policy (automatic
   at build start, plus `build-prune`) and nothing beyond that; no

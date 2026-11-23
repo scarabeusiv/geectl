@@ -789,6 +789,17 @@ Batch in brackets:
   secret. Secret printers (`config --dump-full`, `config pass`) — no tests
   found; not adopted regardless.
 
+## Batch 10 — local-build flag parity
+
+**Direct adoptions: 0. Spec reference: `osc/build.py` (the flag
+semantics, not its tests).**
+
+- `tests/test_build.py` (2 tests — filename-glob only, nothing about
+  `--alternative-project`, `--root`, `--noinit`, `-k`/`-p`): nothing
+  to adopt.
+- `behave/features/build.feature` (3 scenarios — local buildroot/chroot,
+  out of scope for v1 by design): nothing to adopt.
+
 ## Counts (direct adoptions, de-duplicated)
 
 | Batch | Unit | Behave | Total |
@@ -802,6 +813,7 @@ Batch in brackets:
 | 7 maintenance requests | 0 (counted in 2/4) | 0 (counted in 2/4) | 0 (+gaps) |
 | 8 services | 0 | 1 | 1 |
 | 9 Gitea ops | 2 | 13 | 15 |
+| 10 local-build flag parity | 0 (+spec ref) | 0 | 0 (+spec) |
 | **Total adopted** | **105** | **120** | **225** |
 
 Surveyed base: 272 behave scenarios + 707 unit tests = 979 items;
