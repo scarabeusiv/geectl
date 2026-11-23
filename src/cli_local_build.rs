@@ -1,15 +1,15 @@
 //! `local-build` — the podman build vertical's command group: build
 //! a package in the container, run its `_service` services, the
-//! precommit gate, and `spec-cleaner`.
+//! precommit gate, `spec-cleaner`, and wipe a build root.
 //!
 //! Thin like `service` and `build`: the flags mirror the library
 //! parameters, the JSON payload carries the typed record, and the
 //! text renderer prints the same values in a human-readable form.
-//! The service leaves make no server calls, so no credentials
-//! resolve there: a half-set credential env never breaks a local
-//! run. The build leaf fetches buildinfo/buildconfig on a live run,
-//! so it resolves the endpoint's credentials; its dry run touches
-//! nothing and resolves none.
+//! The service leaves and the wipe leaf make no server calls, so
+//! no credentials resolve there: a half-set credential env never
+//! breaks a local run. The build leaf fetches buildinfo/buildconfig
+//! on a live run, so it resolves the endpoint's credentials; its
+//! dry run touches nothing and resolves none.
 //!
 //! Mutations are gated on the global `--live`: without it, each
 //! command prints the plan only (the library dry run) and touches
@@ -26,11 +26,11 @@ use clap::Subcommand;
 use geectl::auth::{Credentials, EnvObsAuth};
 use geectl::config;
 use geectl::debug::Debug;
-use geectl::error::GeectlError;
+use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::local_build::{
     validate_build_request, BuildRecord, BuildRequest, LocalBuild, PrecommitRecord, ServiceRunMode,
-    ServiceRunRecord, ServiceRunRequest, SpecCleanerResult,
+    ServiceRunRecord, ServiceRunRequest, SpecCleanerResult, WipeOutcome,
 };
 use geectl::obs::{ObsClient, OBS_API_BASE};
 use serde_json::{json, Value};
@@ -118,6 +118,38 @@ pub enum LocalBuildCommand {
         /// Timeout in seconds for the whole run.
         #[arg(long, default_value_t = 3600)]
         timeout_secs: u64,
+    },
+    /// Wipe a build root: delete its contents (the lock file
+    /// stays). A mutation: dry-run is the default (only the
+    /// plan is printed); `--live` performs the wipe. There is
+    /// no force flag: the marker check and the in-use lock are
+    /// safety invariants, never bypassed.
+    Wipe {
+        /// The repository the root was built for. Required
+        /// unless `--root` names the root directly.
+        #[arg(required_unless_present = "root")]
+        repo: Option<String>,
+        /// The architecture the root was built for. Required
+        /// unless `--root` names the root directly.
+        #[arg(required_unless_present = "root")]
+        arch: Option<String>,
+        /// The source directory (spec + sources); the package
+        /// comes from the spec file in it, like the build.
+        /// Required unless `--root` names the root directly.
+        #[arg(required_unless_present = "root")]
+        spec: Option<PathBuf>,
+        /// The OBS project the package belongs to. Required
+        /// unless `--root` names the root directly.
+        #[arg(long, required_unless_present = "root")]
+        project: Option<String>,
+        /// The multibuild flavor; required when the source
+        /// carries a `_multibuild` file.
+        #[arg(long)]
+        flavor: Option<String>,
+        /// The root to wipe, named directly. Conflicts with
+        /// the coordinates: when set, the root is wiped as named.
+        #[arg(long, conflicts_with_all = ["repo", "arch", "spec", "project", "flavor"])]
+        root: Option<PathBuf>,
     },
 }
 
@@ -305,6 +337,57 @@ pub fn run_local_build(
             });
             Ok((payload, text))
         }
+        LocalBuildCommand::Wipe {
+            repo,
+            arch,
+            spec,
+            project,
+            flavor,
+            root,
+        } => {
+            let outcome = match (&root, &repo, &arch, &spec, &project) {
+                (Some(root), _, _, _, _) => vertical.wipe_named_root(root, !live)?,
+                (None, Some(repo), Some(arch), Some(spec), Some(project)) => {
+                    vertical.wipe_source_root(spec, project, repo, arch, &flavor, !live)?
+                }
+                // Unreachable: clap requires the coordinates
+                // unless --root is set — kept as a defensive
+                // error rather than an unwrap.
+                (None, _, _, _, _) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "wipe needs the repository, architecture, source directory and project, or --root",
+                    ));
+                }
+            };
+            let header = match &root {
+                Some(root) => format!("root: {}", root.display()),
+                None => match (&spec, &project, &repo, &arch, &flavor) {
+                    (Some(spec), Some(project), Some(repo), Some(arch), Some(flavor)) => format!(
+                        "spec: {} project: {project} repo: {repo} arch: {arch} flavor: {flavor}",
+                        spec.display()
+                    ),
+                    (Some(spec), Some(project), Some(repo), Some(arch), None) => format!(
+                        "spec: {} project: {project} repo: {repo} arch: {arch}",
+                        spec.display()
+                    ),
+                    // Unreachable: same clap guarantee as above.
+                    _ => String::new(),
+                },
+            };
+            let text = with_header(&header, render_wipe(&outcome));
+            let payload = json!({
+                "spec": spec,
+                "project": project,
+                "repo": repo,
+                "arch": arch,
+                "flavor": flavor,
+                "root": root,
+                "dry_run": !live,
+                "outcome": outcome,
+            });
+            Ok((payload, text))
+        }
     }
 }
 
@@ -476,6 +559,34 @@ fn render_build(record: &BuildRecord) -> String {
             ));
         }
         lines.join("\n")
+    }
+}
+
+/// A wipe as text: the dry-run plan, or the performed wipe. The
+/// plan names the entry count and bytes the wipe would delete; a
+/// root without the marker reports that there is nothing to wipe
+/// instead of failing the plan — the live wipe refuses it, like
+/// the build refuses an unknown root. A corrupt marker fails the
+/// plan outright: only a missing marker reports the absence.
+fn render_wipe(outcome: &WipeOutcome) -> String {
+    if outcome.dry_run {
+        if outcome.existed {
+            format!(
+                "would wipe {} entries ({} bytes) at {}",
+                outcome.entries,
+                outcome.bytes,
+                outcome.root.display()
+            )
+        } else {
+            format!("no geectl build root at {}", outcome.root.display())
+        }
+    } else {
+        format!(
+            "wiped {} entries ({} bytes) at {}",
+            outcome.entries,
+            outcome.bytes,
+            outcome.root.display()
+        )
     }
 }
 
@@ -663,6 +774,107 @@ mod tests {
             "home:foo",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn wipe_parses_coordinates_and_root() {
+        match parse(&[
+            "geectl",
+            "local-build",
+            "wipe",
+            "standard",
+            "x86_64",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--flavor",
+            "lib",
+        ]) {
+            LocalBuildCommand::Wipe {
+                repo,
+                arch,
+                spec,
+                project,
+                flavor,
+                root,
+            } => {
+                assert_eq!(repo.as_deref(), Some("standard"));
+                assert_eq!(arch.as_deref(), Some("x86_64"));
+                assert_eq!(spec, Some(PathBuf::from("/tmp/pkg")));
+                assert_eq!(project.as_deref(), Some("home:foo"));
+                assert_eq!(flavor.as_deref(), Some("lib"));
+                assert_eq!(root, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match parse(&["geectl", "local-build", "wipe", "--root", "/tmp/root"]) {
+            LocalBuildCommand::Wipe {
+                root,
+                repo,
+                arch,
+                spec,
+                project,
+                flavor,
+            } => {
+                assert_eq!(root, Some(PathBuf::from("/tmp/root")));
+                assert_eq!(repo, None);
+                assert_eq!(arch, None);
+                assert_eq!(spec, None);
+                assert_eq!(project, None);
+                assert_eq!(flavor, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // --root conflicts with the coordinates.
+        assert!(Cli::try_parse_from([
+            "geectl",
+            "local-build",
+            "wipe",
+            "standard",
+            "x86_64",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--root",
+            "/tmp/root",
+        ])
+        .is_err());
+        // Without --root the coordinates are required.
+        assert!(Cli::try_parse_from(["geectl", "local-build", "wipe"]).is_err());
+    }
+
+    #[test]
+    fn render_wipe_reports_plan_and_outcome() {
+        let planned = WipeOutcome {
+            root: PathBuf::from("/tmp/root"),
+            existed: true,
+            dry_run: true,
+            entries: 3,
+            bytes: 42,
+        };
+        assert_eq!(
+            render_wipe(&planned),
+            "would wipe 3 entries (42 bytes) at /tmp/root"
+        );
+        let missing = WipeOutcome {
+            root: PathBuf::from("/tmp/root"),
+            existed: false,
+            dry_run: true,
+            entries: 0,
+            bytes: 0,
+        };
+        assert_eq!(render_wipe(&missing), "no geectl build root at /tmp/root");
+        let wiped = WipeOutcome {
+            root: PathBuf::from("/tmp/root"),
+            existed: true,
+            dry_run: false,
+            entries: 3,
+            bytes: 42,
+        };
+        assert_eq!(
+            render_wipe(&wiped),
+            "wiped 3 entries (42 bytes) at /tmp/root"
+        );
     }
 
     fn dry_run_record() -> ServiceRunRecord {

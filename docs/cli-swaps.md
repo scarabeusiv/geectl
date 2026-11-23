@@ -150,7 +150,7 @@ with no osc counterpart.
 | `osc restartbuild [PROJECT [PACKAGE]]` | `build restart-build PROJECT PACKAGE REPOSITORY ARCH` | Same mapping; per-package only, no project-wide form |
 | `osc abortbuild [PROJECT [PACKAGE]]` | `build abort-build PROJECT PACKAGE REPOSITORY ARCH` | Same mapping; per-package only, no project-wide form |
 
-No geectl equivalent (coverage gaps, not deviations): `chroot` / `wipe` /
+No geectl equivalent (coverage gaps, not deviations): `chroot` /
 `lbl` — local build; out of scope (issue #43, podman vertical).
 `build build-status`, `build job-status`, `build
 fileinfo`, `build dependson`, `build check-constraints`, `build
@@ -162,6 +162,7 @@ only via `osc api`).
 | osc | geectl | Why |
 |---|---|---|
 | `build` | `local-build build DIRECTORY --project PROJECT --repo REPOSITORY` | One operation per the design: the run-mode service run, the precommit gate, then the engine build in one invocation; project and repo are explicit coordinates, arch defaults to the host arch; `--arch`, `--clean`, `--flavor`, `--release`, `--trust-all-projects`, `--refresh-image`, `--timeout-secs` are the only options in v1 |
+| `osc wipe [REPOSITORY ARCH]` (alias of `build`, sets `--wipe`) | `local-build wipe REPOSITORY ARCH SPEC --project PROJECT` | Wipes the root the build's own coordinates name; the package comes from the spec file in the source directory, like the build; `--root` names the root directly instead of the coordinates; no force flag — the marker check and the in-use lock are safety invariants |
 
 ## `maintenance` — maintained instances + branching (issue #69)
 

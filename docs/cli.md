@@ -113,7 +113,7 @@ Commands:
   request       Read and act on OBS submit requests, and file new ones
   branch        Branch, copy, and link packages
   build         Build-status commands: results, logs, histories, binaries, buildconfig
-  local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, and `spec-cleaner`
+  local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, and wipe a build root
   maintenance   Maintenance operations: maintained-instances listing and maintenance branching
   service       Service reads: list a package's services and their run state
   gitea         Gitea operations: repository and branch reads and mutations on the configured instance
@@ -424,7 +424,7 @@ Options:
 ## `local-build` — podman build vertical
 
 ```
-Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, and `spec-cleaner`
+Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, and wipe a build root
 
 Usage: geectl local-build [OPTIONS] <COMMAND>
 
@@ -433,6 +433,7 @@ Commands:
   precommit     The precommit gate: the `precommit`-mode service run, then `pre_checkin.sh` when the source directory carries one
   spec-cleaner  Run `spec-cleaner` on a spec in the container
   build         Build the package in the container: the run-mode service run, the precommit gate, then the engine build
+  wipe          Wipe a build root: delete its contents (the lock file stays). A mutation: dry-run is the default (only the plan is printed); `--live` performs the wipe. There is no force flag: the marker check and the in-use lock are safety invariants, never bypassed
   help          Print this message or the help of the given subcommand(s)
 
 Options:

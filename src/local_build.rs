@@ -209,6 +209,27 @@ impl BuildRequest {
     }
 }
 
+/// The outcome of a build-root wipe: the root and whether it
+/// carried the build-root marker. In dry-run nothing is wiped and
+/// `existed` reports whether a live wipe would find a root there.
+/// `entries`/`bytes` are the plan: what the wipe deletes (live) or
+/// would delete (dry-run), counted recursively, excluding the lock
+/// file that stays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct WipeOutcome {
+    /// The root that was wiped, or would be wiped in dry-run.
+    pub root: PathBuf,
+    /// Whether the root carried the build-root marker.
+    pub existed: bool,
+    /// Whether this was a dry run (nothing wiped).
+    pub dry_run: bool,
+    /// Entries deleted (live) or to delete (dry-run), excluding
+    /// the lock file.
+    pub entries: usize,
+    /// Total bytes of regular files among `entries`.
+    pub bytes: u64,
+}
+
 /// The rpmlint summary read from the end of the build log. The
 /// errors/warnings come from rpmlint's own summary line when the log
 /// carries one; the badness is best-effort (the sum of the `Badness:`
@@ -578,6 +599,25 @@ pub struct RootMarker {
     /// any. An image digest is superseded only once a newer digest
     /// has a successful build behind it.
     pub last_success_digest: Option<String>,
+}
+
+/// The coordinates a source-derived wipe expects the root's marker
+/// to carry. A named-root wipe has none: any marker that parses
+/// proves the root.
+struct ExpectedMarker<'a> {
+    project: &'a str,
+    package: &'a str,
+    repo: &'a str,
+    arch: &'a str,
+    flavor: &'a Option<String>,
+}
+
+/// The wipe plan: what the wipe deletes (live) or would delete
+/// (dry-run). Entries are counted recursively, excluding the lock
+/// file that stays; bytes sum the regular files among them.
+struct WipePlan {
+    entries: usize,
+    bytes: u64,
 }
 
 /// The image sidecar: when each image was last pulled, so the 7-day
@@ -1380,12 +1420,238 @@ impl<'a> LocalBuild<'a> {
         Ok(marker)
     }
 
+    /// Canonicalize `path`, falling back to the nearest existing
+    /// ancestor when the path itself does not exist yet: the
+    /// ancestor canonicalizes, the remainder re-appends. A
+    /// build-roots base under a fresh cache may not exist, and a
+    /// bare `absolute()` would keep a `/tmp` symlink unresolved on
+    /// macOS, breaking the containment comparison.
+    fn canonicalize_or_absolute(path: &Path) -> PathBuf {
+        if let Ok(canonical) = fs::canonicalize(path) {
+            return canonical;
+        }
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                let base = Self::canonicalize_or_absolute(parent);
+                match path.file_name() {
+                    Some(name) => base.join(name),
+                    None => base,
+                }
+            }
+            _ => std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+        }
+    }
+
+    /// Read and parse the root marker. Missing marker: `None`.
+    /// Present but unparsable: fail closed — a corrupt marker
+    /// proves nothing about the directory, and wiping on the
+    /// strength of a planted file would trust it.
+    fn read_root_marker(root: &Path) -> Result<Option<RootMarker>, GeectlError> {
+        let path = root.join(ROOT_MARKER);
+        // The marker must be a regular file: a symlink to a valid
+        // marker elsewhere would authorize the wipe on borrowed
+        // identity.
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.file_type().is_file() => {
+                return Err(GeectlError::new(
+                    ErrorKind::NotAGeectlBuildRoot,
+                    format!(
+                        "build root marker {} is not a regular file; refusing to wipe an unverified directory",
+                        path.display()
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot read build root marker {}: {e}", path.display()),
+                ));
+            }
+        };
+        match serde_json::from_str::<RootMarker>(&text) {
+            Ok(marker) => Ok(Some(marker)),
+            Err(e) => Err(GeectlError::new(
+                ErrorKind::NotAGeectlBuildRoot,
+                format!(
+                    "build root marker {} is corrupt ({}); refusing to wipe an unverified directory",
+                    path.display(),
+                    e
+                ),
+            )),
+        }
+    }
+
+    /// Whether the marker carries the coordinates a
+    /// source-derived wipe expects.
+    fn marker_matches(marker: &RootMarker, expected: &ExpectedMarker) -> bool {
+        marker.project == expected.project
+            && marker.package == expected.package
+            && marker.repo == expected.repo
+            && marker.arch == expected.arch
+            && marker.flavor == *expected.flavor
+    }
+
+    /// Read the root's marker and, for a source-derived root,
+    /// check it against the expected coordinates. Missing marker:
+    /// `false`. Corrupt marker or coordinate mismatch: fail closed
+    /// with `NotAGeectlBuildRoot` — the directory is unverified.
+    fn check_marker(
+        root: &Path,
+        expected: Option<&ExpectedMarker<'_>>,
+    ) -> Result<bool, GeectlError> {
+        let marker = match Self::read_root_marker(root)? {
+            Some(marker) => marker,
+            None => return Ok(false),
+        };
+        if let Some(expected) = expected {
+            if !Self::marker_matches(&marker, expected) {
+                return Err(GeectlError::new(
+                    ErrorKind::NotAGeectlBuildRoot,
+                    format!(
+                        "build root marker at {} does not match {} / {} / {} / {} / {}; refusing to wipe an unverified directory",
+                        root.join(ROOT_MARKER).display(),
+                        expected.project,
+                        expected.package,
+                        expected.repo,
+                        expected.arch,
+                        expected.flavor.as_deref().unwrap_or("<none>")
+                    ),
+                ));
+            }
+        }
+        Ok(true)
+    }
+
+    /// The root's device + inode, for the post-lock identity
+    /// re-check. Unix only: elsewhere there is no stable pair to
+    /// compare, so the marker re-check alone guards the lock race.
+    #[cfg(unix)]
+    fn root_identity(root: &Path) -> Result<(u64, u64), GeectlError> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(root).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot stat build root {}: {e}", root.display()),
+            )
+        })?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    /// Refuse a wipe across a device boundary: the root must not
+    /// be a mount point, and no entry inside it may live on
+    /// another device. A mount inside the root would be deleted
+    /// with the root's contents, and a root that is itself a mount
+    /// point is not a build root's directory. Counts entries and
+    /// sums regular-file bytes for the plan on the way. Symlinks
+    /// are never followed: their own device is the parent's, and
+    /// they count as one entry. The device comparison is Unix
+    /// only: without `dev` there is no boundary to check, so the
+    /// check is a no-op elsewhere and the count still runs. A bind
+    /// mount of the same filesystem shares the device, so it is
+    /// invisible here: only cross-device mounts are caught.
+    fn inspect_wipe_plan(root: &Path) -> Result<WipePlan, GeectlError> {
+        let mut plan = WipePlan {
+            entries: 0,
+            bytes: 0,
+        };
+        #[cfg(unix)]
+        let root_dev = {
+            use std::os::unix::fs::MetadataExt;
+            let meta = fs::symlink_metadata(root).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot stat build root {}: {e}", root.display()),
+                )
+            })?;
+            if let Some(parent) = root.parent() {
+                let parent_meta = fs::symlink_metadata(parent).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot stat {}: {e}", parent.display()),
+                    )
+                })?;
+                if parent_meta.dev() != meta.dev() {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "build root {} is a mount point; refusing to wipe",
+                            root.display()
+                        ),
+                    ));
+                }
+            }
+            meta.dev()
+        };
+        let mut stack: Vec<(PathBuf, bool)> = vec![(root.to_path_buf(), true)];
+        while let Some((dir, top)) = stack.pop() {
+            let entries = fs::read_dir(&dir).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot list build root {}: {e}", dir.display()),
+                )
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot list build root {}: {e}", dir.display()),
+                    )
+                })?;
+                let path = entry.path();
+                // The lock file stays, so it is not part of the plan.
+                if top && path.file_name().is_some_and(|n| n == ROOT_LOCK) {
+                    continue;
+                }
+                let meta = fs::symlink_metadata(&path).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot stat {}: {e}", path.display()),
+                    )
+                })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.dev() != root_dev {
+                        return Err(GeectlError::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "entry {} is on a different device (mount boundary); refusing to wipe",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+                plan.entries += 1;
+                if meta.is_file() {
+                    plan.bytes += meta.len();
+                } else if meta.file_type().is_dir() {
+                    stack.push((path, false));
+                }
+            }
+        }
+        Ok(plan)
+    }
+
     /// Remove everything inside the root (for `--clean`), keeping
     /// the root directory itself. The marker is rewritten by the
     /// caller. The lock file is NOT removed: the caller holds its
     /// flock for the whole build, and deleting the file would leave
     /// the lock on an unlinked inode — a second build could then
     /// create a fresh lock file and run in the same root.
+    ///
+    /// Deletion never follows symlinks: each entry's type is
+    /// checked with `symlink_metadata` at removal time, and a
+    /// symlink is unlinked, never traversed — an entry swapped for
+    /// a symlink after the listing is unlinked, not followed. The
+    /// lock only excludes cooperating geectl builds and wipes; a
+    /// hostile local writer with access to the root could still
+    /// swap entries, but the swap can only delete entries inside
+    /// the root, never traverse out of it.
     fn wipe_root_contents(&self, root: &Path) -> Result<(), GeectlError> {
         let entries = fs::read_dir(root).map_err(|e| {
             GeectlError::new(
@@ -1404,7 +1670,15 @@ impl<'a> LocalBuild<'a> {
             if path.file_name().is_some_and(|n| n == ROOT_LOCK) {
                 continue;
             }
-            if path.is_dir() {
+            let file_type = fs::symlink_metadata(&path)
+                .map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot stat {}: {e}", path.display()),
+                    )
+                })?
+                .file_type();
+            if file_type.is_dir() {
                 fs::remove_dir_all(&path).map_err(|e| {
                     GeectlError::new(
                         ErrorKind::InternalError,
@@ -1438,6 +1712,23 @@ impl<'a> LocalBuild<'a> {
     /// with the holder named.
     fn acquire_root_lock(&self, root: &Path, package: &str) -> Result<BuildLock, GeectlError> {
         let path = root.join(ROOT_LOCK);
+        // The lock file is opened with create(true) and then
+        // written: a planted symlink here would truncate and
+        // overwrite the link's target. Refuse a lock path that is
+        // not a regular file. (Checked before opening; a swap
+        // between the check and the open is the same residual race
+        // the wipe documents for the lock.)
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if !meta.file_type().is_file() {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "build root lock {} is not a regular file; refusing to lock",
+                        path.display()
+                    ),
+                ));
+            }
+        }
         // No truncate: the holder line is rewritten after the lock
         // is held (seek + write + set_len). Truncating on open
         // would let a refused caller wipe the holder's line before
@@ -4290,42 +4581,294 @@ impl<'a> LocalBuild<'a> {
         validate_cache_components(project, repo, arch, flavor)?;
         validate_path_component("package", package)?;
         let root = self.root_path(project, package, repo, arch, flavor);
-        let marker_path = root.join(ROOT_MARKER);
-        if !marker_path.exists() {
+        let expected = ExpectedMarker {
+            project,
+            package,
+            repo,
+            arch,
+            flavor,
+        };
+        self.wipe_root_at(&root, package, Some(&expected), false)
+            .map(|_| ())
+    }
+
+    /// Wipe the build root for the source in `source_dir`: the
+    /// package comes from the spec file in it, like the build, and
+    /// the root is the one the build's own coordinates name. No
+    /// host mounts exist under a root (the engine's mounts live
+    /// inside the container), so there is nothing to unmount.
+    /// There is no force flag: the two guards a force could
+    /// bypass (the marker check, the in-use lock) are both safety
+    /// invariants.
+    pub fn wipe_source_root(
+        &self,
+        source_dir: &Path,
+        project: &str,
+        repo: &str,
+        arch: &str,
+        flavor: &Option<String>,
+        dry_run: bool,
+    ) -> Result<WipeOutcome, GeectlError> {
+        let source_dir = std::path::absolute(source_dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot resolve source directory {}: {e}",
+                    source_dir.display()
+                ),
+            )
+        })?;
+        let spec = find_spec(&source_dir)?;
+        let package = spec
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !valid_obs_name(&package) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "spec file name {:?} is not a valid package name",
+                    spec.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            ));
+        }
+        // The package is a cache-dir component too (see above).
+        validate_path_component("package", &package)?;
+        let flavors = multibuild_flavors(&source_dir)?;
+        if let Some(flavors) = &flavors {
+            match flavor {
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::MultibuildFlavorRequired,
+                        format!(
+                            "package {package} is multibuild; pass one flavor ({})",
+                            flavors.join(", ")
+                        ),
+                    ));
+                }
+                Some(flavor) if !flavors.iter().any(|f| f == flavor) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "unknown multibuild flavor {flavor:?} for {package}; known flavors: {}",
+                            flavors.join(", ")
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        validate_cache_components(project, repo, arch, flavor)?;
+        let root = self.root_path(project, &package, repo, arch, flavor);
+        let expected = ExpectedMarker {
+            project,
+            package: &package,
+            repo,
+            arch,
+            flavor,
+        };
+        self.wipe_root_at(&root, &package, Some(&expected), dry_run)
+    }
+
+    /// Wipe the build root at `root`, named directly: the marker must
+    /// be present and parse (never wipe an unknown directory) and
+    /// the root must not be locked by another build. The package
+    /// for the lock's holder line comes from the root's own marker
+    /// when it parses, else the root's own file name. A root with
+    /// no file name (`/`) is refused outright.
+    pub fn wipe_named_root(&self, root: &Path, dry_run: bool) -> Result<WipeOutcome, GeectlError> {
+        let root = std::path::absolute(root).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot resolve build root {}: {e}", root.display()),
+            )
+        })?;
+        let holder = fs::read_to_string(root.join(ROOT_MARKER))
+            .ok()
+            .and_then(|text| serde_json::from_str::<RootMarker>(&text).ok())
+            .map(|marker| marker.package)
+            .or_else(|| root.file_name().map(|n| n.to_string_lossy().to_string()))
+            .ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot wipe {}; a root needs a file name", root.display()),
+                )
+            })?;
+        self.wipe_root_at(&root, &holder, None, dry_run)
+    }
+
+    /// Wipe the root at `root`, returning the outcome with the
+    /// plan (entries, bytes). The root as named is reported in the
+    /// outcome; the checks and the wipe itself run on the
+    /// canonicalized path, so a symlinked root is judged by its
+    /// target. A live wipe refuses a root without a valid marker
+    /// (`NotAGeectlBuildRoot`); a dry run reports the absence
+    /// instead and touches nothing. A marker that does not parse,
+    /// or (for a source-derived root) does not match the
+    /// coordinates the root was derived from, refuses in both
+    /// modes: the directory is unverified, and the plan must not
+    /// claim it would be wiped.
+    ///
+    /// The lock excludes cooperating geectl builds and wipes
+    /// only. After the lock, the root's identity (device + inode,
+    /// Unix) and the marker are re-verified: an eviction may have
+    /// deleted the root in between (the lock open recreates an
+    /// empty directory — see `acquire_root_lock`), and wiping that
+    /// empty directory would report success for a root that is
+    /// already gone; a replaced directory would wipe the wrong
+    /// tree. The dry-run plan takes no lock, so it is advisory: a
+    /// root held by a running build still plans, and the live wipe
+    /// refuses it with `BuildRootInUse`.
+    fn wipe_root_at(
+        &self,
+        root: &Path,
+        holder: &str,
+        expected: Option<&ExpectedMarker<'_>>,
+        dry_run: bool,
+    ) -> Result<WipeOutcome, GeectlError> {
+        let absent = || WipeOutcome {
+            root: root.to_path_buf(),
+            existed: false,
+            dry_run,
+            entries: 0,
+            bytes: 0,
+        };
+        let canonical = match fs::canonicalize(root) {
+            Ok(path) => path,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if dry_run {
+                    return Ok(absent());
+                }
+                return Err(GeectlError::new(
+                    ErrorKind::NotAGeectlBuildRoot,
+                    format!(
+                        "no geectl build root at {}; refusing to wipe an unknown directory",
+                        root.display()
+                    ),
+                ));
+            }
+            Err(e) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot resolve build root {}: {e}", root.display()),
+                ));
+            }
+        };
+        if !canonical.is_dir() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a directory; refusing to wipe",
+                    canonical.display()
+                ),
+            ));
+        }
+        if canonical.file_name().is_none() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot wipe {}; a root needs a file name",
+                    canonical.display()
+                ),
+            ));
+        }
+        let base = Self::canonicalize_or_absolute(&self.cache_dir.join("build-roots"));
+        if canonical == base || !canonical.starts_with(&base) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "build root {} is outside the build-roots cache {}; refusing to wipe",
+                    canonical.display(),
+                    base.display()
+                ),
+            ));
+        }
+        // A build root is exactly one leaf below the cache:
+        // `build-roots/<project>/<package>/<repo>-<arch>[-<flavor>]`.
+        // A named root higher up (a project or package directory)
+        // would wipe a whole subtree on one planted marker.
+        let depth = canonical
+            .strip_prefix(&base)
+            .map(|rest| rest.components().count())
+            .unwrap_or(0);
+        if depth != 3 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "build root {} is not a single build root under {}; refusing to wipe",
+                    canonical.display(),
+                    base.display()
+                ),
+            ));
+        }
+        if !Self::check_marker(&canonical, expected)? {
+            if dry_run {
+                return Ok(absent());
+            }
             return Err(GeectlError::new(
                 ErrorKind::NotAGeectlBuildRoot,
                 format!(
                     "no geectl build root at {}; refusing to wipe an unknown directory",
-                    root.display()
+                    canonical.display()
                 ),
             ));
         }
-        let _lock = self.acquire_root_lock(&root, package).map_err(|e| {
+        let plan = Self::inspect_wipe_plan(&canonical)?;
+        if dry_run {
+            return Ok(WipeOutcome {
+                root: root.to_path_buf(),
+                existed: true,
+                dry_run,
+                entries: plan.entries,
+                bytes: plan.bytes,
+            });
+        }
+        #[cfg(unix)]
+        let identity = Self::root_identity(&canonical)?;
+        let _lock = self.acquire_root_lock(&canonical, holder).map_err(|e| {
             if e.kind() == ErrorKind::BuildInProgress {
                 GeectlError::new(
                     ErrorKind::BuildRootInUse,
-                    format!("cannot wipe build root {}: {e}", root.display()),
+                    format!("cannot wipe build root {}: {e}", canonical.display()),
                 )
             } else {
                 e
             }
         })?;
-        // The marker was checked before the lock; re-check after
-        // it: an eviction may have deleted the root in between (the
-        // lock open recreates an empty directory — see
-        // `acquire_root_lock`), and wiping that empty directory
-        // would report success for a root that is already gone.
-        if !marker_path.exists() {
+        #[cfg(unix)]
+        {
+            let now = Self::root_identity(&canonical)?;
+            if now != identity {
+                return Err(GeectlError::new(
+                    ErrorKind::NotAGeectlBuildRoot,
+                    format!(
+                        "build root {} changed while locking; refusing to wipe",
+                        canonical.display()
+                    ),
+                ));
+            }
+        }
+        if !Self::check_marker(&canonical, expected)? {
             return Err(GeectlError::new(
                 ErrorKind::NotAGeectlBuildRoot,
                 format!(
                     "no geectl build root at {}; refusing to wipe an unknown directory",
-                    root.display()
+                    canonical.display()
                 ),
             ));
         }
-        self.wipe_root_contents(&root)?;
-        Ok(())
+        // Re-inspect after the lock: the pre-lock plan is stale
+        // once the lock is held, and a mount created in between
+        // must refuse the wipe rather than be deleted with it.
+        let plan = Self::inspect_wipe_plan(&canonical)?;
+        self.wipe_root_contents(&canonical)?;
+        Ok(WipeOutcome {
+            root: root.to_path_buf(),
+            existed: true,
+            dry_run,
+            entries: plan.entries,
+            bytes: plan.bytes,
+        })
     }
 
     /// Read a build log: the last `tail` lines, or the whole log when
@@ -6936,6 +7479,431 @@ exit 0
             drop(lock);
             // The lock file survives the wipe and is usable again.
             assert!(vertical.acquire_root_lock(&root, "foo").is_ok());
+        }
+
+        /// A valid marker for the wipe fixture coordinates.
+        fn valid_marker() -> RootMarker {
+            RootMarker {
+                project: "testproject".to_string(),
+                package: "foo".to_string(),
+                repo: "standard".to_string(),
+                arch: host_arch().to_string(),
+                flavor: None,
+                image_digest: None,
+                engine_version: None,
+                created_unix: 0,
+                last_build_unix: 0,
+                last_success_digest: None,
+            }
+        }
+
+        /// The root for the wipe tests: `cache/build-roots/<project>/        /// <package>/<repo>-<arch>`, with the marker and one stale
+        /// file in it. The source carries the spec the package name
+        /// comes from.
+        fn wipe_fixture(dir: &TempDir) -> (PathBuf, PathBuf) {
+            let root = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("standard-{}", host_arch()));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join(ROOT_MARKER),
+                serde_json::to_string(&valid_marker()).unwrap(),
+            )
+            .unwrap();
+            fs::write(root.join("stale-output"), b"stale").unwrap();
+            let source = write_source(dir.path(), "foo.spec");
+            (root, source)
+        }
+
+        #[test]
+        fn wipe_source_root_wipes_a_marked_root() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, source) = wipe_fixture(&dir);
+            let outcome = vertical
+                .wipe_source_root(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(outcome.root, root);
+            assert!(outcome.existed);
+            assert!(!outcome.dry_run);
+            assert!(!root.join("stale-output").exists());
+            assert!(!root.join(ROOT_MARKER).exists());
+            // A wiped root is no longer a build root: a second wipe
+            // refuses it.
+            let err = vertical
+                .wipe_source_root(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+        }
+
+        #[test]
+        fn wipe_source_root_dry_run_wipes_nothing() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, source) = wipe_fixture(&dir);
+            let outcome = vertical
+                .wipe_source_root(&source, "testproject", "standard", host_arch(), &None, true)
+                .unwrap();
+            assert_eq!(outcome.root, root);
+            assert!(outcome.existed);
+            assert!(outcome.dry_run);
+            assert!(root.join("stale-output").exists());
+            assert!(root.join(ROOT_MARKER).exists());
+            // A dry run on an unknown root reports the absence
+            // instead of failing the plan.
+            let outcome = vertical
+                .wipe_source_root(
+                    &source,
+                    "otherproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    true,
+                )
+                .unwrap();
+            assert!(!outcome.existed);
+            assert!(outcome.dry_run);
+        }
+
+        #[test]
+        fn wipe_named_root_wipes_by_path_and_reads_the_marker() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, _) = wipe_fixture(&dir);
+            // The marker carries the package: the lock file the wipe
+            // leaves behind names it in the holder line.
+            let marker = RootMarker {
+                project: "testproject".to_string(),
+                package: "foo".to_string(),
+                repo: "standard".to_string(),
+                arch: host_arch().to_string(),
+                flavor: None,
+                image_digest: None,
+                engine_version: None,
+                created_unix: 0,
+                last_build_unix: 0,
+                last_success_digest: None,
+            };
+            fs::write(
+                root.join(ROOT_MARKER),
+                serde_json::to_string(&marker).unwrap(),
+            )
+            .unwrap();
+            let outcome = vertical.wipe_named_root(&root, false).unwrap();
+            assert_eq!(outcome.root, root);
+            assert!(outcome.existed);
+            assert!(!root.join("stale-output").exists());
+            let holder = fs::read_to_string(root.join(ROOT_LOCK)).unwrap();
+            assert!(holder.contains("package=foo"), "holder: {holder}");
+            // A corrupt marker refuses the wipe: the directory is
+            // unverified, and no holder fallback resurrects it.
+            // The stale file survives the refusal.
+            fs::write(root.join(ROOT_MARKER), b"not json").unwrap();
+            fs::write(root.join("stale-output"), b"stale").unwrap();
+            let err = vertical.wipe_named_root(&root, false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+            assert!(root.join("stale-output").exists());
+            let err = vertical.wipe_named_root(&root, true).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+            // A root without the marker refuses the wipe.
+            let err = vertical
+                .wipe_named_root(
+                    &dir.path().join("cache").join("build-roots").join("nobody"),
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+        }
+
+        #[test]
+        fn wipe_source_root_refuses_a_marker_that_does_not_match() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, source) = wipe_fixture(&dir);
+            // A marker for another project: the root is not the
+            // one the coordinates name.
+            let mut marker = valid_marker();
+            marker.project = "otherproject".to_string();
+            fs::write(
+                root.join(ROOT_MARKER),
+                serde_json::to_string(&marker).unwrap(),
+            )
+            .unwrap();
+            let err = vertical
+                .wipe_source_root(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+            assert!(root.join("stale-output").exists());
+            // The dry run refuses too: the plan must not claim an
+            // unverified directory would be wiped.
+            let err = vertical
+                .wipe_source_root(&source, "testproject", "standard", host_arch(), &None, true)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+            // Every coordinate field mismatches the same way.
+            let mutators: [fn(&mut RootMarker); 4] = [
+                |m| m.package = "bar".to_string(),
+                |m| m.repo = "other".to_string(),
+                |m| m.arch = "sparc64".to_string(),
+                |m| m.flavor = Some("lib".to_string()),
+            ];
+            for mutate in mutators {
+                let mut marker = valid_marker();
+                mutate(&mut marker);
+                fs::write(
+                    root.join(ROOT_MARKER),
+                    serde_json::to_string(&marker).unwrap(),
+                )
+                .unwrap();
+                let err = vertical
+                    .wipe_source_root(
+                        &source,
+                        "testproject",
+                        "standard",
+                        host_arch(),
+                        &None,
+                        false,
+                    )
+                    .unwrap_err();
+                assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+            }
+        }
+
+        #[test]
+        fn wipe_root_contents_unlinks_symlinks_without_traversing() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, source) = wipe_fixture(&dir);
+            // Symlink entries pointing outside the root: the wipe
+            // unlinks the links, never the targets.
+            let outside_file = dir.path().join("outside-file");
+            fs::write(&outside_file, b"outside").unwrap();
+            std::os::unix::fs::symlink(&outside_file, root.join("link-file")).unwrap();
+            let outside_dir = dir.path().join("outside-dir");
+            fs::create_dir_all(&outside_dir).unwrap();
+            fs::write(outside_dir.join("kept"), b"kept").unwrap();
+            std::os::unix::fs::symlink(&outside_dir, root.join("link-dir")).unwrap();
+            // A symlink nested in a subdirectory, pointing outside.
+            let sub = root.join("sub");
+            fs::create_dir_all(&sub).unwrap();
+            std::os::unix::fs::symlink(&outside_file, sub.join("nested-link")).unwrap();
+            // The plan counts every entry once: the marker, the
+            // stale file, both links, the subdirectory and the
+            // nested link. Symlinks count as entries with no bytes.
+            let marker_bytes = fs::read(root.join(ROOT_MARKER)).unwrap().len() as u64;
+            let outcome = vertical
+                .wipe_source_root(&source, "testproject", "standard", host_arch(), &None, true)
+                .unwrap();
+            assert_eq!(outcome.entries, 6);
+            assert_eq!(outcome.bytes, marker_bytes + 5);
+            vertical
+                .wipe_source_root(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    false,
+                )
+                .unwrap();
+            assert!(fs::symlink_metadata(root.join("link-file")).is_err());
+            assert!(fs::symlink_metadata(root.join("link-dir")).is_err());
+            assert!(fs::symlink_metadata(sub.join("nested-link")).is_err());
+            assert!(!root.join("sub").exists());
+            assert!(!root.join(ROOT_MARKER).exists());
+            assert_eq!(fs::read_to_string(&outside_file).unwrap(), "outside");
+            assert_eq!(
+                fs::read_to_string(outside_dir.join("kept")).unwrap(),
+                "kept"
+            );
+        }
+
+        #[test]
+        fn wipe_named_root_refuses_roots_outside_the_cache() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            // A valid marker planted outside the cache: the marker
+            // alone never proves a root.
+            let outside = dir.path().join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(
+                outside.join(ROOT_MARKER),
+                serde_json::to_string(&valid_marker()).unwrap(),
+            )
+            .unwrap();
+            fs::write(outside.join("kept"), b"kept").unwrap();
+            let err = vertical.wipe_named_root(&outside, false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(outside.join("kept").exists());
+            // The same root reached through a symlink inside the
+            // cache: containment judges the target, not the link.
+            let link = dir.path().join("cache").join("build-roots").join("link");
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let err = vertical.wipe_named_root(&link, false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(outside.join("kept").exists());
+        }
+
+        #[test]
+        fn wipe_named_root_refuses_a_root_with_no_file_name() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let err = vertical.wipe_named_root(Path::new("/"), false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn wipe_plan_counts_entries_and_bytes() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, source) = wipe_fixture(&dir);
+            let marker_bytes = fs::read(root.join(ROOT_MARKER)).unwrap().len() as u64;
+            // The lock file stays, so it is not part of the plan.
+            fs::write(root.join(ROOT_LOCK), b"pid=1 started=0 package=foo\n").unwrap();
+            let outcome = vertical
+                .wipe_source_root(&source, "testproject", "standard", host_arch(), &None, true)
+                .unwrap();
+            assert!(outcome.existed);
+            // The marker plus the one stale file.
+            assert_eq!(outcome.entries, 2);
+            assert_eq!(outcome.bytes, marker_bytes + 5);
+            assert!(root.join("stale-output").exists());
+        }
+
+        #[test]
+        fn wipe_named_root_refuses_a_project_or_package_level_root() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, _) = wipe_fixture(&dir);
+            // One valid marker planted at the project level must
+            // not buy a whole-subtree wipe.
+            let project_dir = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject");
+            fs::write(
+                project_dir.join(ROOT_MARKER),
+                serde_json::to_string(&valid_marker()).unwrap(),
+            )
+            .unwrap();
+            let err = vertical.wipe_named_root(&project_dir, false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(root.join("stale-output").exists());
+            // Same at the package level.
+            let package_dir = project_dir.join("foo");
+            fs::write(
+                package_dir.join(ROOT_MARKER),
+                serde_json::to_string(&valid_marker()).unwrap(),
+            )
+            .unwrap();
+            let err = vertical.wipe_named_root(&package_dir, false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(root.join("stale-output").exists());
+        }
+
+        #[test]
+        fn wipe_refuses_a_lock_file_symlink() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, _) = wipe_fixture(&dir);
+            // A planted lock symlink to a victim file: the wipe
+            // must refuse before the lock open can truncate it.
+            let victim = dir.path().join("victim");
+            fs::write(&victim, b"victim").unwrap();
+            std::os::unix::fs::symlink(&victim, root.join(ROOT_LOCK)).unwrap();
+            let err = vertical.wipe_named_root(&root, false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "victim");
+            assert!(root.join("stale-output").exists());
+        }
+
+        #[test]
+        fn wipe_refuses_a_marker_symlink() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, _) = wipe_fixture(&dir);
+            // A marker symlink to a valid marker elsewhere: the
+            // wipe must refuse on borrowed identity.
+            let elsewhere = dir.path().join("elsewhere-marker");
+            fs::write(&elsewhere, serde_json::to_string(&valid_marker()).unwrap()).unwrap();
+            fs::remove_file(root.join(ROOT_MARKER)).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, root.join(ROOT_MARKER)).unwrap();
+            let err = vertical.wipe_named_root(&root, false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+            assert!(root.join("stale-output").exists());
+            let err = vertical.wipe_named_root(&root, true).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
         }
 
         #[test]
@@ -9917,7 +10885,11 @@ exit 0
                 .join("foo")
                 .join(format!("standard-{}", host_arch()));
             fs::create_dir_all(&root).unwrap();
-            fs::write(root.join(ROOT_MARKER), "{\"project\":\"testproject\"}").unwrap();
+            fs::write(
+                root.join(ROOT_MARKER),
+                serde_json::to_string(&valid_marker()).unwrap(),
+            )
+            .unwrap();
             let lock_file = File::options()
                 .read(true)
                 .write(true)
