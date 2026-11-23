@@ -611,10 +611,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("set project meta of {project}")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot set project meta without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot set project meta without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(&self.base, &["source", project, "_meta"], &[]);
@@ -730,10 +730,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("set package meta of {project}/{package}")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot set package meta without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot set package meta without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
@@ -856,10 +856,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot update package meta from spec without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot update package meta from spec without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let spec = match spec {
@@ -939,10 +939,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                format!("cannot add a role on project {project} without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"),
+                format!("cannot add a role on project {project} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"),
             ));
         }
         let (body, mut meta) = self.read_project_meta(project)?;
@@ -983,10 +983,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                format!("cannot add a role on package {project}/{package} without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"),
+                format!("cannot add a role on package {project}/{package} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"),
             ));
         }
         let (body, mut meta) = self.read_package_meta(project, package)?;
@@ -1042,10 +1042,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                format!("cannot remove a role on project {project} without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"),
+                format!("cannot remove a role on project {project} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"),
             ));
         }
         let (body, mut meta) = self.read_project_meta(project)?;
@@ -1114,10 +1114,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                format!("cannot remove a role on package {project}/{package} without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"),
+                format!("cannot remove a role on package {project}/{package} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"),
             ));
         }
         let (body, mut meta) = self.read_package_meta(project, package)?;

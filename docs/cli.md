@@ -70,9 +70,11 @@ local = "http://127.0.0.1:3001"
 ```sh
 GEECTL_OBS_USERNAME_MYLOVEINSTANCE=... GEECTL_OBS_PASSWORD_MYLOVEINSTANCE=...
 GEECTL_OBS_USERNAME_LOCAL=... GEECTL_OBS_PASSWORD_FILE_LOCAL=/run/secrets/local-password
+GEECTL_OBS_APIKEY_MYLOVEINSTANCE=...   # a token instead of the pair
 ```
 
-The plain `GEECTL_OBS_USERNAME` / `GEECTL_OBS_PASSWORD` (or
+The plain `GEECTL_OBS_APIKEY` (or `..._APIKEY_FILE`) or
+`GEECTL_OBS_USERNAME` / `GEECTL_OBS_PASSWORD` (or
 `..._PASSWORD_FILE`) apply to the configured instance; a call to
 another instance resolves the alias whose configured URL matches
 it (same scheme, host, and effective port — `https://host` and
@@ -96,7 +98,8 @@ resolve credentials per command instead: the public reads (see
 Credentials in `docs/architecture.md`) never touch them, so a half-set
 env must not break them, and neither does a dry-run `remote` mutation
 preview; every other command in those groups fails fast on a half-set
-pair up front.
+pair up front. Setting both a token and a Basic pair for one instance
+is a configuration error at the same resolution points.
 
 ## Top level
 

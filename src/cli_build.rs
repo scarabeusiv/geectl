@@ -375,7 +375,7 @@ impl ResultsQueryArgs {
 /// Run one `build` subcommand: build the OBS client from the
 /// effective config and credentials, call the library operation, and
 /// return the `(payload, text)` pair. Every build command except
-/// `list-repositories` requires OBS Basic credentials and fails
+/// `list-repositories` requires OBS credentials and fails
 /// loudly without them (the library's `require_build_credentials`),
 /// except that the three control mutations resolve no credentials
 /// in dry-run, like the `remote` mutations.
@@ -1291,7 +1291,7 @@ fn write_downloaded(output: &PathBuf, bytes: &[u8]) -> Result<(), GeectlError> {
 /// environment.
 /// The configured OBS base URL and the config file's `[instances]`
 /// table, for credential resolution (see
-/// [`auth::resolve_obs_basic_for_url`]).
+/// [`auth::resolve_obs_for_url`]).
 fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;

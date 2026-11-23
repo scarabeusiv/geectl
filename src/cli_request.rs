@@ -1287,7 +1287,7 @@ fn act(
 /// Build the OBS client from the effective config and the
 /// environment credentials for the configured base URL (resolved
 /// for the URL from its instance alias — see
-/// `auth::resolve_obs_basic_for_url`), wiring the debug sink
+/// `auth::resolve_obs_for_url`), wiring the debug sink
 /// through. The client borrows the transport, so both live in this
 /// scope and the caller runs inside it.
 ///

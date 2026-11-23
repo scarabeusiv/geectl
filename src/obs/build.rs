@@ -2467,12 +2467,12 @@ impl<'a> ObsClient<'a> {
     /// would 401 — a failed lookup must fail closed, never read as
     /// "no build state".
     fn require_build_credentials(&self) -> Result<(), GeectlError> {
-        if self.has_basic() {
+        if self.has_auth() {
             return Ok(());
         }
         Err(GeectlError::new(
             ErrorKind::ConfigError,
-            "reading build state requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            "reading build state requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
         ))
     }
 
@@ -2521,7 +2521,7 @@ impl<'a> ObsClient<'a> {
     /// [`ObsClient::wait_for_results`] does not treat that absence as
     /// settled: it keeps polling until the package appears or the
     /// deadline passes.
-    /// Requires OBS Basic credentials. That is a client policy, not
+    /// Requires OBS credentials. That is a client policy, not
     /// something the endpoint forces: the endpoint allows anonymous
     /// reads when the instance permits them, so without credentials
     /// the call fails closed instead of reading anonymously.
@@ -2657,7 +2657,7 @@ impl<'a> ObsClient<'a> {
     /// log (404): the package was never built, or the package/project
     /// does not exist — the server answers 404 for both, so the caller
     /// checks the package exists when the distinction matters.
-    /// Requires OBS Basic credentials. The log is capped by the
+    /// Requires OBS credentials. The log is capped by the
     /// transport's body limit, like every read.
     pub fn build_log(
         &self,
@@ -2704,7 +2704,7 @@ impl<'a> ObsClient<'a> {
     /// (`succeeded`, `failed`, `unresolvable`, ...), or None when the
     /// package has no status: the server answers `code="unknown"`
     /// with 200 when nothing is known, and 404 when the
-    /// package/project does not exist. Requires OBS Basic credentials.
+    /// package/project does not exist. Requires OBS credentials.
     pub fn build_status(
         &self,
         project: &str,
@@ -2736,7 +2736,7 @@ impl<'a> ObsClient<'a> {
     }
 
     /// The running build job for `package` in `repository`/`arch`,
-    /// or None when no job is running. Requires OBS Basic credentials.
+    /// or None when no job is running. Requires OBS credentials.
     /// A 404 is an error (unknown project/package): unlike the log and
     /// the status, a missing job reads as an empty jobstatus element,
     /// not a 404, so a 404 here names something that does not exist.
@@ -2762,7 +2762,7 @@ impl<'a> ObsClient<'a> {
     /// blocking the build, if any, and the dependencies the build
     /// pulls in. An unresolvable build surfaces its missing
     /// dependencies as the error, as a comma-separated list. Requires
-    /// OBS Basic credentials. A 404 is an error (unknown
+    /// OBS credentials. A 404 is an error (unknown
     /// project/package): a buildinfo with no error and no dependencies
     /// reads as an empty document, not a 404.
     pub fn buildinfo(
@@ -2912,11 +2912,11 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
                 format!(
-                    "cannot {cmd} package {project}/{package} without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"
+                    "cannot {cmd} package {project}/{package} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
                 ),
             ));
         }
@@ -2970,7 +2970,7 @@ impl<'a> ObsClient<'a> {
     /// The build history for `package` in `repository`/`arch`: the
     /// completed builds, newest first, up to `limit` entries. An empty
     /// history (never built) reads as an empty list. Requires OBS
-    /// Basic credentials. A 404 is an error (unknown project/package).
+    /// credentials. A 404 is an error (unknown project/package).
     pub fn build_history(
         &self,
         project: &str,
@@ -3003,7 +3003,7 @@ impl<'a> ObsClient<'a> {
     /// it to check a green build is from the
     /// current source revision, not a stale rebuild: match the entry's
     /// `srcmd5` against the package's current revision. An empty
-    /// history reads as an empty list. Requires OBS Basic credentials.
+    /// history reads as an empty list. Requires OBS credentials.
     /// A 404 is an error (unknown project/repository/architecture).
     pub fn job_history(
         &self,
@@ -3059,7 +3059,7 @@ impl<'a> ObsClient<'a> {
     /// empty list. A 404 is an error (the package or project does not
     /// exist), never an empty list: a misspelled package must not read
     /// as "nothing built".
-    /// Requires OBS Basic credentials. A multibuild flavor travels as
+    /// Requires OBS credentials. A multibuild flavor travels as
     /// `pkg:flavor`.
     pub fn list_binaries(
         &self,
@@ -3085,7 +3085,7 @@ impl<'a> ObsClient<'a> {
     /// a build artifact by name (`rpmlint.log`). The download is
     /// capped at 10 MiB by the transport's body limit, like every
     /// read: a file larger than 10 MiB is an error, not a truncated
-    /// download. Requires OBS Basic credentials. A 404 is an error
+    /// download. Requires OBS credentials. A 404 is an error
     /// (the file does not exist).
     pub fn download_binary(
         &self,
@@ -3152,7 +3152,7 @@ impl<'a> ObsClient<'a> {
     /// fetch completes) and reports the name it stored it under;
     /// a direct file download of a binary nobody has asked for 404s.
     /// A binary the repository does not carry is reported with an
-    /// `error`, not a 404. Requires OBS Basic credentials.
+    /// `error`, not a 404. Requires OBS credentials.
     pub fn binary_versions(
         &self,
         project: &str,
@@ -3244,7 +3244,7 @@ impl<'a> ObsClient<'a> {
     /// each of them. The reverse of [`ObsClient::dependson`]: each
     /// entry's `dependencies` are the packages depending on the
     /// queried package, not the queried package's own dependencies.
-    /// Requires OBS Basic credentials. A 404 is an error (unknown
+    /// Requires OBS credentials. A 404 is an error (unknown
     /// project/repository/architecture).
     pub fn whatdependson(
         &self,
@@ -3334,7 +3334,7 @@ impl<'a> ObsClient<'a> {
     /// repository with the same name already there is an error, not a
     /// no-op — like `osc repo add`, which refuses a duplicate. With
     /// `disable_publish`, the added repository is also publish
-    /// disabled. Requires OBS Basic credentials. In dry-run the
+    /// disabled. Requires OBS credentials. In dry-run the
     /// addition is recorded in the plan and nothing is written — the
     /// guard runs before the credentials check, like
     /// [`ObsClient::create_project`]. Returns true when the
@@ -3363,10 +3363,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&plan) {
             return Ok(false);
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot add a repository without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot add a repository without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let mut doc = self.read_project_meta_doc(project)?;
@@ -3382,7 +3382,7 @@ impl<'a> ObsClient<'a> {
     /// `osc repo remove`, which tolerates a nonexistent name — and
     /// nothing is written then, unless a stale publish-disable entry
     /// for it remains: that is removed too, and the write happens.
-    /// Requires OBS Basic credentials. In dry-run the removal is
+    /// Requires OBS credentials. In dry-run the removal is
     /// recorded in the plan and nothing is written — the guard runs
     /// before the credentials check. Returns true when anything was
     /// removed: the repository, or its publish-disable entry when the
@@ -3408,10 +3408,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("remove repository {name} from project {project}")) {
             return Ok(false);
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot remove a repository without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot remove a repository without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let mut doc = self.read_project_meta_doc(project)?;

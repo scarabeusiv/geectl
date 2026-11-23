@@ -1522,7 +1522,7 @@ pub fn run_remote(
 }
 
 /// The OBS base URL and the config file's `[instances]` table, for
-/// credential resolution (see [`auth::resolve_obs_basic_for_url`]).
+/// credential resolution (see [`auth::resolve_obs_for_url`]).
 /// Credentials are NOT resolved here: they resolve per command in
 /// `run_remote` (see `docs/cli.md` for which commands those are).
 /// Here the dry-run mutations need none either, but the library proves
@@ -3124,7 +3124,7 @@ fn resolve_whois_login(
         None => credentials.username().map(str::to_string).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ConfigError,
-                "remote whois with no login needs OBS Basic credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "remote whois with no login needs OBS Basic credentials (unset the OBS API key first, then set GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
             )
         }),
     }

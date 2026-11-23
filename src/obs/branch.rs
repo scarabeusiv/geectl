@@ -421,10 +421,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(None);
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot branch a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot branch a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let mut query: Vec<(&str, &str)> = vec![("cmd", "branch")];
@@ -541,10 +541,10 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot fork a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot fork a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let mut query: Vec<(&str, &str)> = vec![("cmd", "fork"), ("scmsync", scmsync)];
@@ -797,9 +797,9 @@ impl<'a> ObsClient<'a> {
                 skipped_files: 0,
             });
         }
-        if !target.has_basic() {
+        if !target.has_auth() {
             // The plain variables are never forwarded to the target
-            // (see `resolve_obs_basic_for_url`), so the error must
+            // (see `resolve_obs_for_url`), so the error must
             // name the alias setup for the target — naming the plain
             // ones would send the user in a circle: set them, and the
             // resolver refuses to forward them. The library has no
@@ -809,7 +809,7 @@ impl<'a> ObsClient<'a> {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
                 format!(
-                    "no credentials configured for {}; add an [instances] entry for it in the config file and set GEECTL_OBS_USERNAME_<ALIAS> and GEECTL_OBS_PASSWORD[_FILE]_<ALIAS> for that alias — the source instance's credentials are never forwarded to the target",
+                    "no credentials configured for {}; add an [instances] entry for it in the config file and set GEECTL_OBS_APIKEY[_FILE]_<ALIAS>, or GEECTL_OBS_USERNAME_<ALIAS> and GEECTL_OBS_PASSWORD[_FILE]_<ALIAS> for that alias — the source instance's credentials are never forwarded to the target",
                     target.base,
                 ),
             ));
@@ -1018,10 +1018,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot copy a project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot copy a project without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let mut query: Vec<(&str, &str)> = vec![("cmd", "copy"), ("oproject", source_project)];
@@ -1078,10 +1078,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(plan_action) {
             return Ok(None);
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot copy a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot copy a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(
@@ -1169,10 +1169,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&action) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot set a devel project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot set a devel project without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
@@ -1284,10 +1284,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot link a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot link a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let source_url = build_url(
@@ -1548,10 +1548,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("repair link {project}/{package}")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot repair a link without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot repair a link without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let directory_url = build_url(
@@ -1746,10 +1746,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&plan) {
             return Ok(None);
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot set a link revision without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot set a link revision without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let link_url = build_url(&self.base, &["source", project, package, "_link"], &[]);
@@ -1817,10 +1817,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&plan) {
             return Ok(Vec::new());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot set a link revision without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot set a link revision without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(&self.base, &["source", project], &[]);
@@ -2030,10 +2030,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("convert link {project}/{package} to a branch")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot convert a link to a branch without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot convert a link to a branch without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(
@@ -2099,10 +2099,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(None);
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot detach a branch without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot detach a branch without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let options = CopyOptions {

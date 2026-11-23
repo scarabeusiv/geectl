@@ -876,9 +876,10 @@ impl<'a> PullRequestClient<'a> {
                 // the comments and take the newest one by the
                 // acting user with this text — the server appends
                 // in order, so the newest match is the one just
-                // posted. add_comment required Basic credentials,
-                // so the acting user is known here.
-                let author = obs.credentials().username().unwrap_or_default();
+                // posted. add_comment required credentials; with
+                // a username the acting user is known here, with
+                // an API token the match is by body alone.
+                let author = obs.credentials().username();
                 let comments = obs.list_comments(&id.to_string()).map_err(|err| {
                     GeectlError::new(
                         ErrorKind::ServerError,
@@ -890,7 +891,10 @@ impl<'a> PullRequestClient<'a> {
                 comments
                     .iter()
                     .rev()
-                    .find(|comment| comment.body == body && comment.who == author)
+                    .find(|comment| {
+                        comment.body == body
+                            && author.is_none_or(|author| comment.who == author)
+                    })
                     .map(|comment| ReviewComment {
                         id: comment.id,
                         author: comment.who.clone(),
@@ -901,9 +905,14 @@ impl<'a> PullRequestClient<'a> {
                     .ok_or_else(|| {
                         GeectlError::new(
                             ErrorKind::ServerError,
-                            format!(
-                                "re-read of the comments on submit request {id} after commenting found no comment by {author} with the posted text"
-                            ),
+                            match author {
+                                Some(author) => format!(
+                                    "re-read of the comments on submit request {id} after commenting found no comment by {author} with the posted text"
+                                ),
+                                None => format!(
+                                    "re-read of the comments on submit request {id} after commenting found no comment with the posted text"
+                                ),
+                            },
                         )
                     })
                     .map(Some)
@@ -1263,10 +1272,10 @@ impl<'a> PullRequestClient<'a> {
     }
 
     /// The review target for an OBS act: the caller's target when
-    /// it names one, else the acting user from the OBS
-    /// credentials. No target and no usable credentials is a
-    /// configuration error naming the missing credentials, not a
-    /// review acted on as nobody.
+    /// it names one, else the acting user from the OBS Basic
+    /// credentials. No target and no username is a configuration
+    /// error naming the missing credentials, not a review acted on
+    /// as nobody: an API token carries no username.
     fn resolve_obs_target(
         &self,
         obs: &ObsClient,
@@ -1279,7 +1288,7 @@ impl<'a> PullRequestClient<'a> {
             Some(user) => ReviewTarget::new(Some(user), None, None, None),
             None => Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot approve or request changes on a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot approve or request changes on a submit request without a review target or an OBS username — an API token carries no username (pass a target, or unset the OBS API key first and set GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
             )),
         }
     }
@@ -1523,7 +1532,7 @@ fn matches_query(summary: &PullRequestSummary, query: &PullRequestSearch) -> boo
 fn missing_obs_arm() -> GeectlError {
     GeectlError::new(
         ErrorKind::ConfigError,
-        "cannot read an OBS pull request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+        "cannot read an OBS pull request without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
     )
 }
 
@@ -2612,6 +2621,63 @@ mod tests {
     }
 
     #[test]
+    fn comment_obs_re_read_with_bearer_token_matches_by_body() {
+        // A token carries no username, so the re-read matches the
+        // posted comment by body alone: the newest comment with the
+        // posted text wins, whoever wrote it.
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/comments/request/1398977",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/comments/request/1398977",
+                r#"<comments><comment id="7" who="someone_else" when="2026-11-22T19:52:58Z">Looks good.</comment></comments>"#,
+            );
+        let obs = ObsClient::with_credentials(
+            &http,
+            Credentials::Bearer {
+                token: "tok3n".to_string(),
+            },
+        )
+        .unwrap();
+        let comment = act_client(Some(&obs), None)
+            .comment(&obs_ref(), "Looks good.", None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(comment.id, 7);
+        assert_eq!(comment.author, "someone_else");
+        assert_eq!(comment.body, "Looks good.");
+    }
+
+    #[test]
+    fn comment_obs_re_read_with_bearer_token_without_a_match_is_a_server_error() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/comments/request/1398977",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/comments/request/1398977",
+                r#"<comments><comment id="7" who="someone_else" when="2026-11-22T19:52:58Z">Something else.</comment></comments>"#,
+            );
+        let obs = ObsClient::with_credentials(
+            &http,
+            Credentials::Bearer {
+                token: "tok3n".to_string(),
+            },
+        )
+        .unwrap();
+        let err = act_client(Some(&obs), None)
+            .comment(&obs_ref(), "Looks good.", None, &DryRun::new(false))
+            .expect_err("a re-read with no matching comment must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err
+            .to_string()
+            .contains("found no comment with the posted text"));
+    }
+
+    #[test]
     fn comment_obs_dry_run_posts_nothing() {
         let http = FakeHttp::new().with_post(
             "https://api.opensuse.org/comments/request/1398977",
@@ -2827,7 +2893,24 @@ mod tests {
             .approve(&obs_ref(), None, Some("Looks good."), &DryRun::new(false))
             .expect_err("an approve without credentials must fail closed");
         assert_eq!(err.kind(), ErrorKind::ConfigError);
-        assert!(err.to_string().contains("OBS credentials"));
+        assert!(err.to_string().contains("OBS username"));
+    }
+
+    #[test]
+    fn approve_obs_with_bearer_token_and_no_target_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(
+            &http,
+            Credentials::Bearer {
+                token: "tok3n".to_string(),
+            },
+        )
+        .unwrap();
+        let err = act_client(Some(&obs), None)
+            .approve(&obs_ref(), None, Some("Looks good."), &DryRun::new(false))
+            .expect_err("an approve with a token and no target must fail closed");
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.to_string().contains("OBS username"));
     }
 
     #[test]

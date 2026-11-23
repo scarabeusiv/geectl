@@ -182,10 +182,10 @@ impl<'a> ObsClient<'a> {
             &["source"],
             &self.branch_query(package, options, true),
         );
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "listing maintained instances requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "listing maintained instances requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let body = self.http.post(&url, "", &self.credentials)?;
@@ -231,10 +231,10 @@ impl<'a> ObsClient<'a> {
             &["source"],
             &self.branch_query(package, options, false),
         );
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "branching a maintained package requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "branching a maintained package requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let body = self.http.post(&url, "", &self.credentials)?;

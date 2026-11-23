@@ -194,10 +194,10 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS project name: {workflow_project:?}"),
             ));
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "listing staging projects requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "listing staging projects requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(
@@ -235,10 +235,10 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS project name: {name:?}"),
             ));
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "reading a staging project requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "reading a staging project requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(

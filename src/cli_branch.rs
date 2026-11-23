@@ -175,8 +175,9 @@ pub struct CopyPackageArgs {
     /// configured one. The target's credentials come from the
     /// instance alias matching that URL in the config file's
     /// `[instances]` table
-    /// (`GEECTL_OBS_USERNAME_<ALIAS>` / `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>`;
-    /// see `auth::resolve_obs_basic_for_url`) and the copy fails
+    /// (`GEECTL_OBS_APIKEY[_FILE]_<ALIAS>` or
+    /// `GEECTL_OBS_USERNAME_<ALIAS>` / `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>`;
+    /// see `auth::resolve_obs_for_url`) and the copy fails
     /// clearly when none are configured — the source instance's
     /// credentials are never forwarded to the target. The copy is
     /// client-side and always expanded; `--keep-link` and the
@@ -390,7 +391,7 @@ fn obs_client<'a>(http: &'a dyn HttpClient, debug: &Debug) -> Result<ObsClient<'
 /// that instance's own credentials, resolved by URL from the
 /// environment (the matching instance alias's variables, else a clear error naming them —
 /// the source instance's credentials are never forwarded to the
-/// target; see `auth::resolve_obs_basic_for_url`). The base URL is
+/// target; see `auth::resolve_obs_for_url`). The base URL is
 /// validated here, so a malformed `--to-apiurl` fails fast — in
 /// dry-run too, before any read.
 fn target_client<'a>(

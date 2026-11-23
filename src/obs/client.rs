@@ -11,9 +11,10 @@ use crate::http::HttpClient;
 /// and the remote reads (file and directory reads, history, meta,
 /// search, owners, person, link target, project diff).
 ///
-/// The client holds the HTTP client and the OBS Basic credentials
-/// (resolved by the caller through geectl's auth surface, e.g.
-/// `EnvObsAuth`). The public reads need no credentials; the
+/// The client holds the HTTP client and the OBS credentials — an
+/// API token (Bearer) or a username/password pair (Basic) —
+/// resolved by the caller through geectl's auth surface, e.g.
+/// `EnvObsAuth`. The public reads need no credentials; the
 /// credentialed reads and the filing POST need them and fail loudly
 /// without them.
 pub struct ObsClient<'a> {
@@ -48,29 +49,32 @@ impl<'a> ObsClient<'a> {
         })
     }
 
-    /// A client with OBS Basic credentials (for the authenticated
+    /// A client with OBS credentials (for the authenticated
     /// endpoints: the open-SR search and filing a submit request).
-    /// Accepts `Credentials::Basic` and `Credentials::None`; a Bearer
-    /// token or an SSH key cannot authenticate OBS and is refused.
+    /// Accepts `Credentials::Basic`, `Credentials::Bearer`, and
+    /// `Credentials::None`; an SSH key cannot authenticate OBS and
+    /// is refused.
     pub fn with_credentials(
         http: &'a dyn HttpClient,
         credentials: Credentials,
     ) -> Result<Self, GeectlError> {
         match &credentials {
-            Credentials::None | Credentials::Basic { .. } => Ok(ObsClient {
-                http,
-                base: OBS_API_BASE.to_string(),
-                credentials,
-                debug: Debug::disabled(),
-            }),
-            Credentials::Bearer { .. } | Credentials::SshKey { .. } => Err(GeectlError::new(
+            Credentials::None | Credentials::Basic { .. } | Credentials::Bearer { .. } => {
+                Ok(ObsClient {
+                    http,
+                    base: OBS_API_BASE.to_string(),
+                    credentials,
+                    debug: Debug::disabled(),
+                })
+            }
+            Credentials::SshKey { .. } => Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "OBS accepts Basic credentials only; a Bearer token or SSH key cannot authenticate it",
+                "OBS accepts Basic credentials or a Bearer token; an SSH key cannot authenticate it",
             )),
         }
     }
 
-    /// A client for a custom OBS API base with OBS Basic credentials.
+    /// A client for a custom OBS API base with OBS credentials.
     pub fn with_base_and_credentials(
         http: &'a dyn HttpClient,
         base: &str,
@@ -78,15 +82,17 @@ impl<'a> ObsClient<'a> {
     ) -> Result<Self, GeectlError> {
         validate_base(base)?;
         match &credentials {
-            Credentials::None | Credentials::Basic { .. } => Ok(ObsClient {
-                http,
-                base: base.trim_end_matches('/').to_string(),
-                credentials,
-                debug: Debug::disabled(),
-            }),
-            Credentials::Bearer { .. } | Credentials::SshKey { .. } => Err(GeectlError::new(
+            Credentials::None | Credentials::Basic { .. } | Credentials::Bearer { .. } => {
+                Ok(ObsClient {
+                    http,
+                    base: base.trim_end_matches('/').to_string(),
+                    credentials,
+                    debug: Debug::disabled(),
+                })
+            }
+            Credentials::SshKey { .. } => Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "OBS accepts Basic credentials only; a Bearer token or SSH key cannot authenticate it",
+                "OBS accepts Basic credentials or a Bearer token; an SSH key cannot authenticate it",
             )),
         }
     }
@@ -106,9 +112,14 @@ impl<'a> ObsClient<'a> {
         &self.credentials
     }
 
-    /// True when OBS Basic credentials are configured.
-    pub(crate) fn has_basic(&self) -> bool {
-        matches!(self.credentials, Credentials::Basic { .. })
+    /// True when OBS credentials are configured: a Basic pair or
+    /// an API token. Operations that need the acting username
+    /// check [`Credentials::username`] themselves.
+    pub(crate) fn has_auth(&self) -> bool {
+        matches!(
+            self.credentials,
+            Credentials::Basic { .. } | Credentials::Bearer { .. }
+        )
     }
 }
 
@@ -120,9 +131,10 @@ mod tests {
     use crate::obs::test_support::{basic_credentials, FakeHttp};
 
     #[test]
-    fn with_credentials_rejects_bearer_and_ssh_key() {
-        // OBS accepts Basic only: a Bearer token or SSH key cannot
-        // authenticate it, so it is refused at construction.
+    fn with_credentials_rejects_ssh_key_only() {
+        // An SSH key cannot authenticate an HTTP request, so it is
+        // refused at construction. Basic, Bearer, and None are
+        // accepted.
         let http = FakeHttp::new();
         assert!(ObsClient::with_credentials(
             &http,
@@ -130,7 +142,7 @@ mod tests {
                 token: "tok3n".to_string()
             }
         )
-        .is_err());
+        .is_ok());
         assert!(ObsClient::with_credentials(
             &http,
             Credentials::SshKey {
@@ -138,7 +150,6 @@ mod tests {
             }
         )
         .is_err());
-        // Basic and None are accepted.
         assert!(ObsClient::with_credentials(&http, basic_credentials()).is_ok());
         assert!(ObsClient::with_credentials(&http, Credentials::None).is_ok());
     }

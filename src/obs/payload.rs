@@ -2134,6 +2134,7 @@ impl<'a> SrFiling<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Credentials;
     use crate::debug::Debug;
     use crate::error::ErrorKind;
     use crate::obs::build_url;
@@ -2846,6 +2847,26 @@ mod tests {
         let dry = DryRun::new(false);
         let filing = SrFiling::new(&obs, &dry);
         assert!(filing.file(&payload()).is_err());
+    }
+
+    #[test]
+    fn file_live_with_bearer_token_fails_closed_before_any_write() {
+        // A token carries no username, so the supersede-all lookup
+        // refuses before any request: no search GET, no filing POST.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(
+            &http,
+            Credentials::Bearer {
+                token: "tok3n".to_string(),
+            },
+        )
+        .unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.file(&payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
     }
 
     fn refile_http() -> FakeHttp {

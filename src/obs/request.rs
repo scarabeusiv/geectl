@@ -2594,10 +2594,10 @@ impl<'a> ObsClient<'a> {
         package: &str,
     ) -> Result<Vec<String>, GeectlError> {
         let url = self.search_url(package)?;
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "checking for open submit requests requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "checking for open submit requests requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let body = self.http.get_with(&url, &self.credentials)?;
@@ -2625,7 +2625,7 @@ impl<'a> ObsClient<'a> {
         let Some(username) = self.credentials.username() else {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "checking for open submit requests requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "checking for open submit requests requires an OBS username — an API token carries no username (unset the OBS API key first, then set GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
             ));
         };
         let url = self.search_url(package)?;
@@ -2728,10 +2728,10 @@ impl<'a> ObsClient<'a> {
             &["search", "request"],
             &[("match", &match_expr)],
         );
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "checking for open requests requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "checking for open requests requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let body = self.http.get_with(&url, &self.credentials)?;
@@ -2797,11 +2797,11 @@ impl<'a> ObsClient<'a> {
         query: &[(&str, &str)],
         kind: &str,
     ) -> Result<String, GeectlError> {
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
                 format!(
-                    "cannot file a {kind} request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)"
+                    "cannot file a {kind} request without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
                 ),
             ));
         }
@@ -2855,10 +2855,10 @@ impl<'a> ObsClient<'a> {
                 format!("cannot supersede submit request {old_id} with itself"),
             ));
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot supersede a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot supersede a submit request without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(
@@ -2906,10 +2906,10 @@ impl<'a> ObsClient<'a> {
         package: &str,
     ) -> Result<Vec<String>, GeectlError> {
         let url = self.package_requests_search_url(project, package)?;
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "searching for requests involving a package requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "searching for requests involving a package requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let body = self.http.get_with(&url, &self.credentials)?;
@@ -2999,10 +2999,10 @@ impl<'a> ObsClient<'a> {
     /// its history and parse it in full.
     fn fetch_request(&self, id: &str) -> Result<Request, GeectlError> {
         let id = validate_request_id(id)?;
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot read a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot read a submit request without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(
@@ -3244,10 +3244,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot change a submit request's state without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot change a submit request's state without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let mut query: Vec<(&str, &str)> = vec![("cmd", "changestate"), ("newstate", state_name)];
@@ -3427,10 +3427,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot add a review to a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot add a review to a submit request without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let mut query: Vec<(&str, &str)> = vec![("cmd", "addreview")];
@@ -3533,10 +3533,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot change the state of a review on a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot change the state of a review on a submit request without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let mut query: Vec<(&str, &str)> =
@@ -3580,10 +3580,10 @@ impl<'a> ObsClient<'a> {
     /// recognise in full is a server error.
     pub fn list_comments(&self, id: &str) -> Result<Vec<RequestComment>, GeectlError> {
         let id = validate_request_id(id)?;
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot list a submit request's comments without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot list a submit request's comments without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(&self.base, &["comments", "request", &id.to_string()], &[]);
@@ -3631,10 +3631,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("comment on submit request {id}")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot comment on a submit request without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot comment on a submit request without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let parent_string;
@@ -3675,10 +3675,10 @@ impl<'a> ObsClient<'a> {
     /// still only reading.
     pub fn request_diff(&self, id: &str, view_xml: bool) -> Result<String, GeectlError> {
         let id = validate_request_id(id)?;
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot read a submit request's diff without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot read a submit request's diff without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let mut query: Vec<(&str, &str)> = vec![("cmd", "diff")];
@@ -3708,10 +3708,10 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot search submit requests without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot search submit requests without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let limit_param = search.limit_value().map(|limit| limit.to_string());
@@ -3743,6 +3743,7 @@ impl<'a> ObsClient<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Credentials;
     use crate::debug::Debug;
     use crate::error::ErrorKind;
     use crate::obs::test_support::{basic_credentials, payload, search_without_states, FakeHttp};
@@ -4093,6 +4094,44 @@ mod tests {
         let err = client.open_own_target_request_ids("foo").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn open_own_target_request_ids_with_bearer_token_fails_closed() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(
+            &http,
+            Credentials::Bearer {
+                token: "tok3n".to_string(),
+            },
+        )
+        .unwrap();
+        let err = client.open_own_target_request_ids("foo").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.to_string().contains("OBS username"));
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn open_target_request_ids_with_bearer_token_searches() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let url = client.search_url("foo").unwrap();
+        let http = FakeHttp::new().with_get(
+            &url,
+            "<collection matches=\"2\"><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"1398493\" creator=\"someone_else\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+        );
+        let client = ObsClient::with_credentials(
+            &http,
+            Credentials::Bearer {
+                token: "tok3n".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            client.open_target_request_ids("foo").unwrap(),
+            vec!["1398492".to_string(), "1398493".to_string()]
+        );
     }
 
     const REQUEST1_XML: &str = r#"<request creator="creator" id="42">

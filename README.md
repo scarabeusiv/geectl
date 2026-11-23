@@ -69,15 +69,20 @@ only — never from a config file, never prompted, never logged.
 
 | Service | Credential | Variables |
 | ------- | ---------- | --------- |
-| OBS | username + password (Basic auth; OBS has no API key) | `GEECTL_OBS_USERNAME` + `GEECTL_OBS_PASSWORD`, or `GEECTL_OBS_PASSWORD_FILE` |
+| OBS | API token (Bearer) or username + password (Basic auth) | `GEECTL_OBS_APIKEY` or `GEECTL_OBS_APIKEY_FILE`, or `GEECTL_OBS_USERNAME` + `GEECTL_OBS_PASSWORD` (or `GEECTL_OBS_PASSWORD_FILE`) |
 | Gitea | API token (Bearer) | `GEECTL_GITEA_TOKEN`, or `GEECTL_GITEA_TOKEN_FILE` — per instance, `GEECTL_GITEA_TOKEN_<ALIAS>` (see below) |
 | Gitea | SSH private key (git operations) | `GEECTL_GITEA_SSH_KEY` |
 
 The `*_FILE` variables name a file whose whole content is the secret
 (trailing newlines are trimmed); they are how a mounted secret (e.g.
 a container secret) is used. Setting both a variable and its `_FILE`
-form is an error, as is a half-configured pair. A malformed value fails
+form is an error, as is a half-configured pair or setting both a token
+and a Basic pair for one instance. A malformed value fails
 at startup as a config error naming the variable, never the value.
+
+OBS does not issue personal API tokens yet; the client accepts one so
+it works when the server ships it — until then a token login fails
+with a 401.
 
 Credentials are stored per API URL: a second instance gets one line in
 the config file's `[instances]` table (alias → URL) and its own

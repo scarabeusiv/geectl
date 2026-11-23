@@ -11,7 +11,7 @@
 //! `merge`, `decline`, `withdraw`, `reopen`) are dry-run by
 //! default and mutate only with the global `--live`.
 //! A read or a live act on an arm needs that arm's
-//! credentials — OBS Basic credentials for `obs:` handles, the
+//! credentials — OBS credentials for `obs:` handles, the
 //! Gitea Bearer token for `gitea:` handles — and fails closed
 //! naming them when they are missing. `search` with no `--backend`
 //! runs both arms, OBS first then Gitea, so it needs both sets of
@@ -495,7 +495,7 @@ pub fn run_pull_request(
 /// Build the OBS client from the effective config and the
 /// environment credentials for the configured base URL (resolved
 /// for the URL from its instance alias — see
-/// `auth::resolve_obs_basic_for_url`), wiring the debug sink
+/// `auth::resolve_obs_for_url`), wiring the debug sink
 /// through. The client borrows the transport, so both live in this
 /// scope and the caller runs inside it. Reads pass `live` as true
 /// and fail fast on a credential resolution error; an act in

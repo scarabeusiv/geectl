@@ -86,24 +86,30 @@ to encode.
 
 ## Auth (`src/auth.rs`, `src/http.rs`)
 
-OBS Basic credentials come from `EnvObsAuth` (per-URL, via
+OBS credentials — an API token (Bearer) or a username/password
+pair (Basic) — come from `EnvObsAuth` (per-URL, via
 `credentials_for_url` — not an `AuthProvider`): the matching
-instance alias's variables (`GEECTL_OBS_USERNAME_<ALIAS>` and
-friends), else the plain `GEECTL_OBS_USERNAME` +
-`GEECTL_OBS_PASSWORD` or `GEECTL_OBS_PASSWORD_FILE` when the URL is
-the configured default. Gitea Bearer <redacted> credentials come from
+instance alias's variables (`GEECTL_OBS_APIKEY[_FILE]_<ALIAS>` or
+`GEECTL_OBS_USERNAME_<ALIAS>` and friends), else the plain
+`GEECTL_OBS_APIKEY` or `GEECTL_OBS_APIKEY_FILE`, or
+`GEECTL_OBS_USERNAME` + `GEECTL_OBS_PASSWORD` or
+`GEECTL_OBS_PASSWORD_FILE` when the URL is the configured default.
+OBS does not issue personal API tokens yet (upstream
+https://github.com/openSUSE/open-build-service/issues/20322); the
+client accepts a token so it works when the server ships it, and
+until then a token login fails with a 401. Gitea Bearer <redacted> credentials come from
 `EnvGiteaAuth` the same way (per-URL, via `credentials_for_url`):
 the matching alias's variables (`GEECTL_GITEA_TOKEN_<ALIAS>`),
 else the plain `GEECTL_GITEA_TOKEN` or
 `GEECTL_GITEA_TOKEN_FILE` when the URL is the configured default.
 When an alias matches but its variables are unset and the URL is
-also the default, the plain variables apply. The default's token
-is never forwarded to another instance. Credentials are otherwise
+also the default, the plain variables apply. The default's
+credentials are never forwarded to another instance. Credentials are otherwise
 resolved by providers implementing the `AuthProvider` trait
 (`src/auth.rs`): `EnvGiteaAuth` (the plain single-URL path) and
 `GiteaSshKey` (the SSH private key from `GEECTL_GITEA_SSH_KEY`).
 Unconfigured resolves to `Credentials::None`; a half-configured
-pair, both secret
+pair, both credential types set for one instance, both secret
 sources set, or a malformed value is a `ConfigError` naming the
 source, never the value. The SSH key must be a PEM private key in a
 file mode 0600 or stricter (unix).
@@ -503,12 +509,12 @@ search, the owner search, and reading a person, plus the filing POST,
 superseding, deleting, creating, and uploading, repository add and
 remove, and every `/build` read,
 and every request read and act (show, log, search, state change,
-review, comment, diff) need OBS Basic and fail loudly without them —
+review, comment, diff) need OBS credentials and fail loudly without them —
 except the package log, the top-level project listing, and the
 `_project` service reads, which read with whatever credentials the
 client carries and fail on the server's 401/403 instead of refusing
-up front. OBS accepts Basic only —
-a Bearer token or SSH key is refused at client construction. No
+up front. OBS accepts Basic credentials or a Bearer token —
+an SSH key is refused at client construction. No
 credential is stored here, and no request carries one over cleartext
 http except to a loopback host (the transport guard in `http.rs`).
 

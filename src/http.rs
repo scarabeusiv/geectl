@@ -240,7 +240,7 @@ fn download_io_error(phase: DownloadIoPhase, path: &Path, e: &std::io::Error) ->
 /// `post_text`, and `delete` take explicit credentials, for callers
 /// that resolve them
 /// per request (e.g. the OBS operations, which read public endpoints
-/// without credentials and authenticated endpoints with OBS Basic).
+/// without credentials and authenticated endpoints with OBS credentials).
 /// `get` and `get_with` ask for `application/xml`: the API answers
 /// XML, and a path the WebUI also serves (the owner search proved it)
 /// would otherwise come back as an HTML page. `get_bytes` sends no

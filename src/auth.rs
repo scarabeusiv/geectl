@@ -12,7 +12,10 @@
 //! run (see the design doc and `crate::config`).
 //!
 //! Credential types covered:
-//! - OBS: username/password (Basic auth) — OBS has no API key.
+//! - OBS: API token (Bearer) or username/password (Basic auth).
+//!   The server accepts Basic today; token support is upstream
+//!   work, so a configured token is sent as `Authorization: Bearer <token>`;
+//!   the server rejects it until that lands.
 //! - Gitea: API token (Bearer), plus SSH keys for git operations.
 //!
 //! [`NoAuth`] is the only provider that supplies no credentials.
@@ -191,6 +194,13 @@ pub const OBS_PASSWORD_VAR: &str = "GEECTL_OBS_PASSWORD";
 /// is the OBS password. Set exactly one of this and
 /// [`OBS_PASSWORD_VAR`].
 pub const OBS_PASSWORD_FILE_VAR: &str = "GEECTL_OBS_PASSWORD_FILE";
+/// Environment variable holding the OBS API token (Bearer). Set
+/// exactly one of this and [`OBS_APIKEY_FILE_VAR`].
+pub const OBS_APIKEY_VAR: &str = "GEECTL_OBS_APIKEY";
+/// Environment variable holding the path to a file whose whole content
+/// is the OBS API token. Set exactly one of this and
+/// [`OBS_APIKEY_VAR`].
+pub const OBS_APIKEY_FILE_VAR: &str = "GEECTL_OBS_APIKEY_FILE";
 /// Environment variable holding the Gitea API token (Bearer). Set
 /// exactly one of this and [`GITEA_TOKEN_FILE_VAR`].
 pub const GITEA_TOKEN_VAR: &str = "GEECTL_GITEA_TOKEN";
@@ -427,6 +437,64 @@ fn resolve_obs_basic_with(
     }
 }
 
+/// Resolve the OBS API token (Bearer) from the environment.
+///
+/// Sources (at most one): `GEECTL_OBS_APIKEY`, or
+/// `GEECTL_OBS_APIKEY_FILE` (a file whose whole content is the token).
+/// Returns [`Credentials::None`] when neither is set. Both set is a
+/// `ConfigError`: the source must be unambiguous. A malformed token
+/// fails here, as `ConfigError` naming the variable.
+pub fn resolve_obs_bearer(
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    resolve_obs_bearer_with(OBS_APIKEY_VAR, OBS_APIKEY_FILE_VAR, vars, read_file)
+}
+
+/// The same resolution as [`resolve_obs_bearer`], but from the named
+/// variables: the plain names for the configured instance, the
+/// alias names (`GEECTL_OBS_APIKEY_<ALIAS>` and friends) for one
+/// other instance. The error messages name the variables actually
+/// read, so an alias misconfiguration points at the alias names.
+fn resolve_obs_bearer_with(
+    apikey_var: &str,
+    apikey_file_var: &str,
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    let token = vars(apikey_var);
+    let token_file = vars(apikey_file_var);
+    if token.is_some() && token_file.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("both {apikey_var} and {apikey_file_var} are set; set exactly one"),
+        ));
+    }
+    let token_from_file = token_file.is_some();
+    let token = if let Some(token) = token {
+        Some(token)
+    } else if let Some(file) = token_file {
+        Some(read_secret_file(Path::new(&file), read_file)?)
+    } else {
+        None
+    };
+    match token {
+        None => Ok(Credentials::None),
+        Some(token) => {
+            // Each field names its own source on failure: a bad token
+            // must not be attributed to the env variable when it came
+            // from the file (or vice versa).
+            let token_source = if token_from_file {
+                apikey_file_var
+            } else {
+                apikey_var
+            };
+            let token = validate_bearer_token(&token).map_err(|e| config_error(token_source, e))?;
+            Ok(Credentials::Bearer { token })
+        }
+    }
+}
+
 /// Split an API base URL into (scheme, host, explicit port): the
 /// scheme and host lowercased, the port the explicit one when the URL
 /// carries one. `http` and `https` only; a missing scheme, a missing
@@ -536,15 +604,15 @@ pub fn alias_for_url<'a>(
 
 /// The credential variable names for one instance alias: the alias
 /// as written in the config, uppercased (env vars are conventionally
-/// uppercase). The API-key pattern (`GEECTL_OBS_APIKEY_<ALIAS>`) is
-/// reserved for the future API-key credential; it is named here so
-/// the pattern extends cleanly, not implemented.
-pub fn obs_alias_vars(alias: &str) -> (String, String, String) {
+/// uppercase). Basic first, then the API-key pair.
+pub fn obs_alias_vars(alias: &str) -> (String, String, String, String, String) {
     let upper = alias.to_ascii_uppercase();
     (
         format!("{OBS_USERNAME_VAR}_{upper}"),
         format!("{OBS_PASSWORD_VAR}_{upper}"),
         format!("{OBS_PASSWORD_FILE_VAR}_{upper}"),
+        format!("{OBS_APIKEY_VAR}_{upper}"),
+        format!("{OBS_APIKEY_FILE_VAR}_{upper}"),
     )
 }
 
@@ -577,7 +645,7 @@ pub fn resolve_obs_basic_for_url(
     read_file: FileReader<'_>,
 ) -> Result<Credentials, GeectlError> {
     if let Some(alias) = alias_for_url(url, instances)? {
-        let (username_var, password_var, password_file_var) = obs_alias_vars(alias);
+        let (username_var, password_var, password_file_var, _, _) = obs_alias_vars(alias);
         let alias_set = vars(&username_var).is_some()
             || vars(&password_var).is_some()
             || vars(&password_file_var).is_some();
@@ -619,6 +687,173 @@ pub fn resolve_obs_basic_for_url(
         vars,
         read_file,
     )
+}
+
+/// Resolve one scope's OBS credentials: an API token when any token
+/// variable is set, a Basic pair when any Basic variable is set,
+/// [`Credentials::None`] when neither is. Both kinds set is a
+/// `ConfigError`: the credential source must be unambiguous, the
+/// same rule as both password sources set.
+fn resolve_obs_scope(
+    apikey_var: &str,
+    apikey_file_var: &str,
+    username_var: &str,
+    password_var: &str,
+    password_file_var: &str,
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    let token_set = vars(apikey_var).is_some() || vars(apikey_file_var).is_some();
+    let basic_set = vars(username_var).is_some()
+        || vars(password_var).is_some()
+        || vars(password_file_var).is_some();
+    if token_set && basic_set {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "both an OBS API key ({apikey_var} or {apikey_file_var}) and Basic credentials ({username_var} and {password_var} or {password_file_var}) are set; set exactly one credential type"
+            ),
+        ));
+    }
+    if token_set {
+        return resolve_obs_bearer_with(apikey_var, apikey_file_var, vars, read_file);
+    }
+    if basic_set {
+        return resolve_obs_basic_with(
+            username_var,
+            password_var,
+            password_file_var,
+            vars,
+            read_file,
+        );
+    }
+    Ok(Credentials::None)
+}
+
+/// The plain-variable scope: the same token-or-Basic rule from the
+/// plain variable names.
+fn resolve_obs_plain(
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    resolve_obs_scope(
+        OBS_APIKEY_VAR,
+        OBS_APIKEY_FILE_VAR,
+        OBS_USERNAME_VAR,
+        OBS_PASSWORD_VAR,
+        OBS_PASSWORD_FILE_VAR,
+        vars,
+        read_file,
+    )
+}
+
+/// Resolve OBS credentials — an API token (Bearer) or a
+/// username/password pair (Basic) — for one API URL.
+///
+/// Precedence, in order:
+/// 1. The matching alias's variables win when any of them is set —
+///    resolved strictly from that set: a token when any token
+///    variable is set, a Basic pair when any Basic variable is
+///    set. Both kinds set for one alias is a `ConfigError`.
+///    The alias is the one whose configured URL matches this URL
+///    under [`same_api_url`].
+/// 2. Otherwise the plain variables apply when the URL is the
+///    configured default (`default_url`, compared with
+///    [`same_api_url`]): one configured URL works exactly as before.
+/// 3. Otherwise — a different URL, credentials configured for the
+///    default, none for this URL — a `ConfigError` naming what to
+///    set: the alias variables when an alias matches this URL, or
+///    the `[instances]` entry to add when none does. The default's
+///    credentials are never forwarded to another instance.
+///
+/// When nothing is configured at all the result is [`Credentials::None`]:
+/// public reads and dry runs need no credentials.
+pub fn resolve_obs_for_url(
+    url: &str,
+    default_url: &str,
+    instances: &[(String, String)],
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    if let Some(alias) = alias_for_url(url, instances)? {
+        let (username_var, password_var, password_file_var, apikey_var, apikey_file_var) =
+            obs_alias_vars(alias);
+        let alias_set = vars(&username_var).is_some()
+            || vars(&password_var).is_some()
+            || vars(&password_file_var).is_some()
+            || vars(&apikey_var).is_some()
+            || vars(&apikey_file_var).is_some();
+        if alias_set {
+            return resolve_obs_scope(
+                &apikey_var,
+                &apikey_file_var,
+                &username_var,
+                &password_var,
+                &password_file_var,
+                vars,
+                read_file,
+            );
+        }
+        // No alias variables set: the URL may still be the
+        // configured default, which takes the plain variables.
+        if same_api_url(url, default_url)? {
+            return resolve_obs_plain(vars, read_file);
+        }
+        return resolve_obs_unmatched_url(
+            url,
+            &format!(
+                "instance alias '{alias}' matches this URL — set {apikey_var} (or {apikey_file_var}), or {username_var} and {password_var} (or {password_file_var})"
+            ),
+            vars,
+            read_file,
+        );
+    }
+    if same_api_url(url, default_url)? {
+        return resolve_obs_plain(vars, read_file);
+    }
+    // The example is rendered by the TOML serializer, not
+    // `Debug`: `Debug` renders control characters as `\u{...}`,
+    // which TOML rejects, so the copied example would not parse.
+    let example = toml::Value::String(url.to_string());
+    resolve_obs_unmatched_url(
+        url,
+        &format!(
+            "no instance alias matches it; add an [instances] entry for it in the config file (e.g. [instances] myinstance = {example}) and set GEECTL_OBS_APIKEY[_FILE]_<ALIAS>, or GEECTL_OBS_USERNAME_<ALIAS> and GEECTL_OBS_PASSWORD[_FILE]_<ALIAS> for that alias"
+        ),
+        vars,
+        read_file,
+    )
+}
+
+/// The fallback when neither alias nor plain variables apply to
+/// this URL: `None` when nothing is configured at all, else a
+/// `ConfigError` naming what to set (`guidance` — the alias
+/// variables when an alias matches, the `[instances]` entry to add
+/// when none does). The plain credentials, when configured, belong
+/// to the default instance and are never forwarded.
+fn resolve_obs_unmatched_url(
+    url: &str,
+    guidance: &str,
+    vars: VarLookup<'_>,
+    read_file: FileReader<'_>,
+) -> Result<Credentials, GeectlError> {
+    match resolve_obs_plain(vars, read_file) {
+        Ok(Credentials::None) => Ok(Credentials::None),
+        Ok(_) => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "no credentials configured for {url}; {guidance} — the credentials configured for the default instance are never forwarded to another instance"
+            ),
+        )),
+        // A half-configured plain pair, or both credential types
+        // set, errors about the plain variables — but for a
+        // different URL those are not the ones to fix, so the
+        // error carries the guidance too.
+        Err(err) => Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("{} — for {url}, {guidance}", err.context),
+        )),
+    }
 }
 
 /// The fallback when neither alias nor plain variables apply to
@@ -917,13 +1152,14 @@ pub(crate) fn snapshot_env(names: &[&str]) -> Result<HashMap<String, String>, Ge
     Ok(map)
 }
 
-/// OBS Basic auth from the process environment. See
-/// [`resolve_obs_basic`] for the variables and the rules.
+/// OBS credentials from the process environment. See
+/// [`resolve_obs_for_url`] for the variables and the rules.
 pub struct EnvObsAuth;
 
 impl EnvObsAuth {
-    /// OBS Basic credentials for one API URL from the process
-    /// environment. See [`resolve_obs_basic_for_url`] for the
+    /// OBS credentials for one API URL from the process
+    /// environment: an API token (Bearer) or a username/password
+    /// pair (Basic). See [`resolve_obs_for_url`] for the
     /// precedence and the fail-clear rule. `instances` is the
     /// config file's `[instances]` table: the alias variables for
     /// the matching alias are snapshotted alongside the plain ones,
@@ -937,16 +1173,21 @@ impl EnvObsAuth {
             OBS_USERNAME_VAR.to_string(),
             OBS_PASSWORD_VAR.to_string(),
             OBS_PASSWORD_FILE_VAR.to_string(),
+            OBS_APIKEY_VAR.to_string(),
+            OBS_APIKEY_FILE_VAR.to_string(),
         ];
         if let Some(alias) = alias_for_url(url, instances)? {
-            let (username_var, password_var, password_file_var) = obs_alias_vars(alias);
+            let (username_var, password_var, password_file_var, apikey_var, apikey_file_var) =
+                obs_alias_vars(alias);
             names.push(username_var);
             names.push(password_var);
             names.push(password_file_var);
+            names.push(apikey_var);
+            names.push(apikey_file_var);
         }
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let env = snapshot_env(&refs)?;
-        resolve_obs_basic_for_url(
+        resolve_obs_for_url(
             url,
             default_url,
             instances,
@@ -1590,6 +1831,55 @@ mod tests {
     }
 
     #[test]
+    fn obs_bearer_resolves_from_env() {
+        let map = vars(&[(OBS_APIKEY_VAR, "tok3n")]);
+        let creds = resolve_obs_bearer(&lookup(&map), &reader(&empty_files())).unwrap();
+        assert!(matches!(creds, Credentials::Bearer { ref token } if token == "tok3n"));
+    }
+
+    #[test]
+    fn obs_bearer_resolves_token_from_file() {
+        let map = vars(&[(OBS_APIKEY_FILE_VAR, "/run/secrets/obs-token")]);
+        let files = files(&[("/run/secrets/obs-token", "file-token\r\n")]);
+        let creds = resolve_obs_bearer(&lookup(&map), &reader(&files)).unwrap();
+        assert!(matches!(creds, Credentials::Bearer { ref token } if token == "file-token"));
+    }
+
+    #[test]
+    fn obs_bearer_unconfigured_is_none() {
+        let map = vars(&[]);
+        let creds = resolve_obs_bearer(&lookup(&map), &reader(&empty_files())).unwrap();
+        assert!(matches!(creds, Credentials::None));
+    }
+
+    #[test]
+    fn obs_bearer_both_token_sources_is_config_error() {
+        let map = vars(&[
+            (OBS_APIKEY_VAR, "a"),
+            (OBS_APIKEY_FILE_VAR, "/run/secrets/obs-token"),
+        ]);
+        let err = resolve_obs_bearer(&lookup(&map), &reader(&empty_files())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains(OBS_APIKEY_VAR));
+    }
+
+    #[test]
+    fn obs_bearer_empty_token_is_config_error() {
+        let map = vars(&[(OBS_APIKEY_VAR, "   ")]);
+        let err = resolve_obs_bearer(&lookup(&map), &reader(&empty_files())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains(OBS_APIKEY_VAR));
+    }
+
+    #[test]
+    fn obs_bearer_unreadable_token_file_is_config_error() {
+        let map = vars(&[(OBS_APIKEY_FILE_VAR, "/run/secrets/missing")]);
+        let err = resolve_obs_bearer(&lookup(&map), &reader(&empty_files())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("/run/secrets/missing"));
+    }
+
+    #[test]
     fn basic_empty_password_is_rejected() {
         // An empty password is never a real credential: fail fast here
         // instead of sending "user:" and getting a 401 at the first
@@ -1847,6 +2137,8 @@ mod tests {
                 "GEECTL_OBS_USERNAME_MYINSTANCE".to_string(),
                 "GEECTL_OBS_PASSWORD_MYINSTANCE".to_string(),
                 "GEECTL_OBS_PASSWORD_FILE_MYINSTANCE".to_string(),
+                "GEECTL_OBS_APIKEY_MYINSTANCE".to_string(),
+                "GEECTL_OBS_APIKEY_FILE_MYINSTANCE".to_string(),
             )
         );
     }
@@ -2138,5 +2430,102 @@ mod tests {
             matches!(creds, Credentials::Basic { ref username, ref password }
             if username == "target-user" && password == "target-secret")
         );
+    }
+
+    #[test]
+    fn obs_token_alias_vars_win_over_plain_vars_for_their_url() {
+        let map = vars(&[
+            (OBS_USERNAME_VAR, "plain-user"),
+            (OBS_PASSWORD_VAR, "plain-secret"),
+            ("GEECTL_OBS_APIKEY_EXAMPLE", "alias-token"),
+        ]);
+        let creds = resolve_obs_for_url(
+            "https://api.example.org",
+            "https://api.opensuse.org",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::Bearer { ref token } if token == "alias-token"));
+    }
+
+    #[test]
+    fn obs_token_plain_token_for_default_url() {
+        let map = vars(&[(OBS_APIKEY_VAR, "plain-token")]);
+        let creds = resolve_obs_for_url(
+            "https://api.opensuse.org",
+            "https://api.opensuse.org",
+            &instances(&[]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap();
+        assert!(matches!(creds, Credentials::Bearer { ref token } if token == "plain-token"));
+    }
+
+    #[test]
+    fn obs_token_and_basic_both_set_for_one_alias_is_config_error() {
+        let map = vars(&[
+            ("GEECTL_OBS_APIKEY_EXAMPLE", "alias-token"),
+            ("GEECTL_OBS_USERNAME_EXAMPLE", "alias-user"),
+            ("GEECTL_OBS_PASSWORD_EXAMPLE", "alias-secret"),
+        ]);
+        let err = resolve_obs_for_url(
+            "https://api.example.org",
+            "https://api.opensuse.org",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("GEECTL_OBS_APIKEY_EXAMPLE"));
+        assert!(err.context.contains("GEECTL_OBS_USERNAME_EXAMPLE"));
+        assert!(!err.context.contains("alias-token"));
+        assert!(!err.context.contains("alias-secret"));
+    }
+
+    #[test]
+    fn obs_token_alias_defined_but_unset_names_the_alias_token_var() {
+        let map = vars(&[(OBS_APIKEY_VAR, "plain-token")]);
+        let err = resolve_obs_for_url(
+            "https://api.example.org",
+            "https://api.opensuse.org",
+            &instances(&[("example", "https://api.example.org")]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("GEECTL_OBS_APIKEY_EXAMPLE"),
+            "alias token var name missing from the error"
+        );
+        // The default's token never leaks into the message.
+        assert!(!err.context.contains("plain-token"));
+    }
+
+    #[test]
+    fn obs_token_unmatched_url_names_the_alias_token_var() {
+        let map = vars(&[(OBS_APIKEY_VAR, "plain-token")]);
+        let err = resolve_obs_for_url(
+            "https://api.example.org",
+            "https://api.opensuse.org",
+            &instances(&[]),
+            &lookup(&map),
+            &reader(&empty_files()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("GEECTL_OBS_APIKEY[_FILE]_<ALIAS>"),
+            "alias token var form missing from the error"
+        );
+        assert!(
+            err.context.contains("[instances]"),
+            "instances entry missing from the error"
+        );
+        assert!(!err.context.contains("plain-token"));
     }
 }

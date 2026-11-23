@@ -1570,10 +1570,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("delete package {project}/{package}")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot delete a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot delete a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         if !force {
@@ -1638,10 +1638,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("create project {project}")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot create a project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot create a project without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let meta = format!(
@@ -1744,10 +1744,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("create package {project}/{package}")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot create a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot create a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let meta = format!(
@@ -1821,10 +1821,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("upload file {project}/{package}/{filename}")) {
             return Ok(None);
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot upload a file without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot upload a file without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(&self.base, &["source", project, package, filename], &[]);
@@ -1877,10 +1877,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("upload file {project}/{package}/{filename}")) {
             return Ok(None);
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot upload a file without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot upload a file without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(&self.base, &["source", project, package, filename], &[]);
@@ -2394,10 +2394,10 @@ impl<'a> ObsClient<'a> {
     /// list.
     pub fn search_packages(&self, term: &str) -> Result<Vec<PackageMatch>, GeectlError> {
         let term = validate_search_term(term)?;
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "searching packages requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "searching packages requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let match_expr = format!(
@@ -2424,10 +2424,10 @@ impl<'a> ObsClient<'a> {
     /// is an error, never an empty list.
     pub fn search_projects(&self, term: &str) -> Result<Vec<ProjectMatch>, GeectlError> {
         let term = validate_search_term(term)?;
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "searching projects requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "searching projects requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let match_expr = format!(
@@ -2463,10 +2463,10 @@ impl<'a> ObsClient<'a> {
         userid: &str,
     ) -> Result<Vec<ProjectMatch>, GeectlError> {
         let userid = validate_search_term(userid)?;
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "searching projects by person requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "searching projects by person requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let match_expr = format!("person/@userid='{userid}'");
@@ -2497,10 +2497,10 @@ impl<'a> ObsClient<'a> {
     /// whether a bulk migration is worth proposing.
     pub fn count_scmsync_projects(&self, url_prefix: &str) -> Result<u32, GeectlError> {
         let url_prefix = validate_search_term(url_prefix)?;
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "counting scmsync projects requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "counting scmsync projects requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let match_expr = format!("starts-with(scmsync,'{url_prefix}')");
@@ -2532,10 +2532,10 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "searching owners requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "searching owners requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(
@@ -2562,10 +2562,10 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS binary name: {binary:?}"),
             ));
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "searching owners requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "searching owners requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(&self.base, &["search", "owner"], &[("binary", binary)]);
@@ -2606,10 +2606,10 @@ impl<'a> ObsClient<'a> {
     /// request. An unknown login is an error, never an empty person.
     pub fn whois(&self, login: &str) -> Result<Person, GeectlError> {
         validate_login(login)?;
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "reading a person requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "reading a person requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(&self.base, &["person", login], &[]);
@@ -2959,10 +2959,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("delete link of {project}/{package}")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot delete the link of a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot delete the link of a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         self.delete_file(project, package, "_link")
@@ -3018,10 +3018,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&plan) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot delete a project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot delete a project without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         // The server deletes a non-empty project without complaint,
@@ -3097,10 +3097,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("restore deleted package {project}/{package}")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot restore a deleted package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot restore a deleted package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(
@@ -3147,10 +3147,10 @@ impl<'a> ObsClient<'a> {
         if !dry_run.allow(&format!("restore deleted project {project}")) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot restore a deleted project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot restore a deleted project without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let url = build_url(&self.base, &["source", project], &[("cmd", "undelete")]);
@@ -3240,10 +3240,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot aggregate a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot aggregate a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         let source_url = build_url(
@@ -3378,10 +3378,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot release a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot release a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         self.release(
@@ -3422,10 +3422,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot release a project without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot release a project without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         self.release(&[project], options, &format!("release project {project}"))
@@ -3522,10 +3522,10 @@ impl<'a> ObsClient<'a> {
         )) {
             return Ok(());
         }
-        if !self.has_basic() {
+        if !self.has_auth() {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
-                "cannot create a package without OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+                "cannot create a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
         // A project managed in git creates its own packages through
@@ -7692,6 +7692,28 @@ mod tests {
         assert_eq!(
             http.get_calls(),
             vec![("https://api.opensuse.org/person/Admin".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn whois_sends_the_bearer_token() {
+        let http =
+            FakeHttp::new().with_get("https://api.opensuse.org/person/Admin", PERSON_FIXTURE);
+        let client = ObsClient::with_credentials(
+            &http,
+            Credentials::Bearer {
+                token: "tok3n".to_string(),
+            },
+        )
+        .unwrap();
+        let person = client.whois("Admin").unwrap();
+        assert_eq!(person.login, "Admin");
+        assert_eq!(
+            http.get_bearer_tokens(),
+            vec![(
+                "https://api.opensuse.org/person/Admin".to_string(),
+                Some("tok3n".to_string())
+            )]
         );
     }
 

@@ -65,8 +65,9 @@ pub struct Config {
     /// table, sorted by alias: `(alias, url)` pairs, e.g.
     /// `myloveinstance = "https://api.opensuse.org"`. The alias
     /// names the instance's credential variables
-    /// (`GEECTL_OBS_USERNAME_<ALIAS>` and friends — see
-    /// [`crate::auth::resolve_obs_basic_for_url`] — and
+    /// (`GEECTL_OBS_APIKEY[_FILE]_<ALIAS>` or
+    /// `GEECTL_OBS_USERNAME_<ALIAS>` and friends — see
+    /// [`crate::auth::resolve_obs_for_url`] — and
     /// `GEECTL_GITEA_TOKEN[_FILE]_<ALIAS>` — see
     /// [`crate::auth::resolve_gitea_bearer_for_url`]); the table
     /// itself carries no secret, only the alias → URL mapping. The
@@ -821,7 +822,8 @@ pub const CONFIG_TEMPLATE: &str = r#"# geectl configuration — endpoint URLs, t
 #
 # Credentials are NEVER stored here. Pass them via the environment
 # (or mounted secret files):
-#   OBS:   GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD
+#   OBS:   GEECTL_OBS_APIKEY (or GEECTL_OBS_APIKEY_FILE)
+#          or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD
 #          (or GEECTL_OBS_PASSWORD_FILE)
 #   Gitea: GEECTL_GITEA_TOKEN (or GEECTL_GITEA_TOKEN_FILE)
 #          GEECTL_GITEA_SSH_KEY for git operations
