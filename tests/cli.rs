@@ -1533,6 +1533,84 @@ fn remote_list_files_rev_carries_rev_in_the_payload_and_keeps_the_text_table() {
 }
 
 #[test]
+fn remote_devel_project_target_project_carries_the_target_in_payload_and_text() {
+    // The fixture answers the one request whatever its path is; the
+    // library unit tests pin the meta read, and the live tests pin
+    // the pair on a non-Factory project. This pins the CLI half:
+    // `--target-project` reaches the payload and the header, and the
+    // default stays Factory.
+    let body = "<package name=\"foo\" project=\"test:factory\"><devel project=\"test:devel\" package=\"foo\"/></package>";
+    let dir = TempDir::new();
+    let addr = serve_once(body);
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "devel-project",
+            "foo",
+            "--target-project",
+            "test:factory",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["project"], "test:factory");
+    assert_eq!(value["package"], "foo");
+    assert_eq!(value["devel_project"], "test:devel");
+    assert_eq!(value["devel_package"], "foo");
+    let addr = serve_once(body);
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "devel-project",
+            "foo",
+            "--target-project",
+            "test:factory",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.lines().next(),
+        Some("project: test:factory package: foo"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("devel project: test:devel package: foo"),
+        "{stdout}"
+    );
+    // The default target is Factory.
+    let addr = serve_once(body);
+    let out = geectl_isolated(&dir)
+        .args(["remote", "devel-project", "foo"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["project"], "openSUSE:Factory");
+}
+
+#[test]
 fn remote_list_packages_json_mode_renders_the_payload() {
     let addr = serve_once("<directory><entry name=\"curl\"/><entry name=\"vim\"/></directory>");
     let dir = TempDir::new();

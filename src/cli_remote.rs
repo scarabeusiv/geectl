@@ -17,8 +17,9 @@
 //! swaps table (see `docs/cli-swaps.md`): one
 //! command per library operation instead of osc's overloaded commands,
 //! explicit project/package arguments everywhere (no working-copy
-//! context) — except `devel-project`, which is Factory-only
-//! and takes only the package — and one flag name per concept.
+//! context) — except `devel-project`, whose target project is an
+//! option (`--target-project`, default Factory) rather than a
+//! positional — and one flag name per concept.
 //!
 //! Two diffs differ from osc by mechanism, not just by name. osc
 //! `rdiff` is a server-side diff; geectl's `revision-patch` and
@@ -434,11 +435,15 @@ pub enum RemoteCommand {
         /// The new package.
         new_package: String,
     },
-    /// Show the devel project and devel package of a package on
-    /// Factory, when it has one.
+    /// Show the devel project and devel package of a package,
+    /// when it has one.
     DevelProject {
         /// The package to look up.
         package: String,
+        /// The target project the package lives in (default:
+        /// openSUSE:Factory).
+        #[arg(long)]
+        target_project: Option<String>,
     },
     /// Add a repository to a project. A mutation: dry-run is the
     /// default (only the plan is printed); `--live` performs the
@@ -1207,11 +1212,15 @@ pub fn run_remote(
             };
             Ok((payload, text))
         }
-        RemoteCommand::DevelProject { package } => {
-            // Factory-only by design (see the swaps table): the
-            // library op takes the project explicitly since #77.
-            let devel = client.devel_project(FACTORY_PROJECT, &package)?;
-            Ok(devel_project_result(&package, devel))
+        RemoteCommand::DevelProject {
+            package,
+            target_project,
+        } => {
+            // The library op takes the project explicitly since
+            // #77; the CLI defaults it to Factory (issue #174).
+            let target = target_project.as_deref().unwrap_or(FACTORY_PROJECT);
+            let devel = client.devel_project(target, &package)?;
+            Ok(devel_project_result(target, &package, devel))
         }
         RemoteCommand::DiffPackages {
             old_project,
@@ -3053,8 +3062,13 @@ fn link_target_result(
     )
 }
 
-fn devel_project_result(package: &str, devel: Option<(String, String)>) -> (Value, String) {
+fn devel_project_result(
+    target: &str,
+    package: &str,
+    devel: Option<(String, String)>,
+) -> (Value, String) {
     let payload = json!({
+        "project": target,
         "package": package,
         "devel_project": devel.as_ref().map(|(project, _)| project),
         "devel_package": devel.as_ref().map(|(_, devel_package)| devel_package),
@@ -3065,7 +3079,10 @@ fn devel_project_result(package: &str, devel: Option<(String, String)>) -> (Valu
         }
         None => "no devel project".to_string(),
     };
-    (payload, with_header(&format!("package: {package}"), text))
+    (
+        payload,
+        with_header(&format!("project: {target} package: {package}"), text),
+    )
 }
 
 /// Keep only exact-name matches when `exact` is set; otherwise the
@@ -3761,6 +3778,33 @@ mod tests {
         assert!(
             matches!(parsed, RemoteCommand::ListFiles { rev: Some(ref r), .. } if r == "0123456789abcdef0123456789abcdef")
         );
+    }
+
+    #[test]
+    fn devel_project_parses_optional_target_project() {
+        let parsed = parse(&["geectl", "remote", "devel-project", "vim"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::DevelProject {
+                target_project: None,
+                ..
+            }
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "devel-project",
+            "vim",
+            "--target-project",
+            "test:factory",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::DevelProject {
+                target_project: Some(ref target),
+                ..
+            } if target == "test:factory"
+        ));
     }
 
     #[test]
@@ -6115,16 +6159,39 @@ mod tests {
 
     #[test]
     fn devel_project_result_carries_pair_or_none_line() {
-        let (payload, text) =
-            devel_project_result("vim", Some(("editors".to_string(), "vim".to_string())));
+        let (payload, text) = devel_project_result(
+            "openSUSE:Factory",
+            "vim",
+            Some(("editors".to_string(), "vim".to_string())),
+        );
+        assert_eq!(payload["project"], "openSUSE:Factory");
         assert_eq!(payload["package"], "vim");
         assert_eq!(payload["devel_project"], "editors");
         assert_eq!(payload["devel_package"], "vim");
-        assert_eq!(text, "package: vim\ndevel project: editors package: vim");
-        let (payload, text) = devel_project_result("vim", None);
+        assert_eq!(
+            text,
+            "project: openSUSE:Factory package: vim\ndevel project: editors package: vim"
+        );
+        let (payload, text) = devel_project_result("openSUSE:Factory", "vim", None);
+        assert_eq!(payload["project"], "openSUSE:Factory");
         assert_eq!(payload["devel_project"], Value::Null);
         assert_eq!(payload["devel_package"], Value::Null);
-        assert_eq!(text, "package: vim\nno devel project");
+        assert_eq!(
+            text,
+            "project: openSUSE:Factory package: vim\nno devel project"
+        );
+        // A non-Factory target is the query coordinate, not the
+        // answer: the header carries it so two runs cannot be
+        // confused in text mode.
+        let (_, text) = devel_project_result(
+            "test:factory",
+            "vim",
+            Some(("test:devel".to_string(), "vim".to_string())),
+        );
+        assert_eq!(
+            text,
+            "project: test:factory package: vim\ndevel project: test:devel package: vim"
+        );
     }
 
     #[test]

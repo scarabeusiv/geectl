@@ -215,7 +215,7 @@ Commands:
   link-target                    Show the link target of a package, when it is a link
   project-diff                   Diff two projects, package by package. Computed client-side: the library lists both projects and reads every file of every differing package, so a large diff issues many requests and a differing binary file fails the call
   diff-packages                  Diff two packages, file by file. Computed client-side: the library diffs the two file lists and cats each changed file, so a differing binary file fails the call
-  devel-project                  Show the devel project and devel package of a package on Factory, when it has one
+  devel-project                  Show the devel project and devel package of a package, when it has one
   repo-add                       Add a repository to a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the addition
   repo-remove                    Remove a repository from a project. A mutation: dry-run is the default (only the plan is printed); `--live` performs the removal. A repository that is not there is not an error
   upload-file                    Upload a file into a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the upload. The local file is read from `--from`; `--binary` uploads bytes instead of text
