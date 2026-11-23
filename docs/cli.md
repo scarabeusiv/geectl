@@ -290,7 +290,7 @@ without evaluating trust.
 
 - `geectl service list <PROJECT> <PACKAGE>` — List the services defined in a package's `_service` file.
 - `geectl service state <PROJECT> <PACKAGE>` — Show the last service run state of a package.
-- `geectl service trigger <PROJECT> <PACKAGE>` — Trigger a server-side run of a package's services; key flags: --service <SERVICE>
+- `geectl service trigger <PROJECT> <PACKAGE>` — Trigger a server-side run of a package's services; key flags: --service <SERVICE>. The trigger only queues the run; check the outcome with `service state`.
 
 ## `gitea` — Gitea operations
 
