@@ -3380,6 +3380,21 @@ fn package_diff_status(status: PackageDiffStatus) -> &'static str {
 /// Render rows as a space-aligned table with a header row. Widths are
 /// the widest value in the printed set, in characters.
 fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    // Server text reaches the terminal through these tables, and
+    // `xml_unescape` decodes numeric references such as `&#27;`
+    // into real control characters: strip them from every cell
+    // before measuring or printing, so a crafted name cannot move
+    // the cursor or inject terminal sequences. JSON output is
+    // unaffected — it escapes structurally.
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.chars().filter(|c| !c.is_control()).collect())
+                .collect()
+        })
+        .collect();
+    let rows: &[Vec<String>] = &rows;
     let mut widths: Vec<usize> = headers
         .iter()
         .map(|header| header.chars().count())
@@ -5930,6 +5945,28 @@ mod tests {
             ],
         );
         assert_eq!(text, "NAME      SIZE\na         1\nlong-name 22");
+    }
+
+    #[test]
+    fn table_strips_control_characters_from_cells() {
+        // An escape sequence smuggled in through a server string
+        // must not reach the terminal: the ESC goes, the printable
+        // remainder stays.
+        let text = render_table(&["NAME"], &[vec!["a\x1b[31mred".to_string()]]);
+        assert_eq!(text, "NAME\na[31mred");
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+    }
+
+    #[test]
+    fn list_scmsync_projects_render_strips_control_characters() {
+        let list = ScmsyncProjectList {
+            projects: vec!["home:alice\x1b[31m".to_string()],
+            matches: 1,
+            offset: 0,
+        };
+        let text = render_scmsync_projects("https://github.com/openSUSE/", &list);
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+        assert!(text.contains("home:alice[31m"));
     }
 
     #[test]
