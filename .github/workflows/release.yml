@@ -114,11 +114,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Both legs pinned, not floating: a latest rollover must
-          # never ship the two arches from different OS baselines.
+          # All legs pinned, not floating: a latest rollover must
+          # never ship the arches from different OS baselines.
           - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
           # Native arm64 runner: no cross toolchain to maintain.
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          # Native Windows runner, pinned like the Ubuntu legs: no
+          # cross toolchain to maintain.
+          - { os: windows-2025, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -135,6 +138,8 @@ jobs:
       # freshcrab release derivation.
       - name: Derive the release toolchain from Cargo.toml
         id: toolchain
+        # sed needs bash: the Windows runner defaults to PowerShell.
+        shell: bash
         run: |
           toolchain=$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"/\1/p' Cargo.toml | head -1)
           test -n "$toolchain" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
@@ -160,11 +165,14 @@ jobs:
           target="${{ matrix.target }}"
           stage="dist-$target"
           mkdir -p "$stage"
-          cp "target/$target/release/geectl" "$stage/"
+          # The Windows binary carries the .exe suffix.
+          bin="geectl"
+          if [[ "$target" == *windows* ]]; then bin="geectl.exe"; fi
+          cp "target/$target/release/$bin" "$stage/"
           cp LICENSE README.md "$stage/"
           out="geectl-${version}-${target}.tar.gz"
-          tar -czf "$out" -C "$stage" geectl LICENSE README.md
-          shasum -a 256 "$out" > "$out.sha256"
+          tar -czf "$out" -C "$stage" "$bin" LICENSE README.md
+          sha256sum "$out" > "$out.sha256"
           echo "asset=$out" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -202,13 +210,13 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          # Completeness gate: the matrix has two legs (x86_64,
-          # aarch64). A skipped or cancelled leg must never publish a
-          # single-arch release, so the tarball count and the checksum
-          # coverage are asserted before anything is attested or
-          # published.
+          # Completeness gate: the matrix has three legs (x86_64,
+          # aarch64, Windows). A skipped or cancelled leg must never
+          # publish a partial release, so the tarball count and the
+          # checksum coverage are asserted before anything is attested
+          # or published.
           count=$(find . -maxdepth 1 -type f -name 'geectl-*.tar.gz' | wc -l)
-          test "$count" = "2" || { echo "expected 2 tarballs, found $count" >&2; exit 1; }
+          test "$count" = "3" || { echo "expected 3 tarballs, found $count" >&2; exit 1; }
           cat ./*.sha256 > SHA256SUMS
           shasum -a 256 -c SHA256SUMS
           for t in geectl-*.tar.gz; do
