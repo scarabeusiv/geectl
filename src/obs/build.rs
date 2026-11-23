@@ -2117,11 +2117,13 @@ const DOWNLOAD_REPOTYPES: [&str; 7] =
     ["rpmmd", "susetags", "deb", "arch", "mdk", "registry", "apk"];
 
 /// A url carries a scheme when it starts with a URI scheme
-/// (RFC 3986: a letter followed by letters, digits, `+`, `-`, or
-/// `.`), then a colon, then at least one character, and holds no
-/// control characters. Deliberately not the server's check: the
-/// server accepts a bare `x:` and rejects a legal `svn+ssh:` scheme,
-/// while this check follows the scheme syntax in both directions.
+/// (RFC 3986: a letter followed by letters, digits, `+`, or `-`),
+/// then a colon, then at least one character, and holds no control
+/// characters. A `.` is excluded: no scheme uses one, and a dot in
+/// that position is a host:port typo like `example.com:8080`.
+/// Deliberately not the server's check: the server accepts a bare
+/// `x:` and rejects a legal `svn+ssh:` scheme, while this check
+/// follows the scheme syntax in both directions.
 fn has_url_scheme(url: &str) -> bool {
     let Some(colon) = url.find(':') else {
         return false;
@@ -2135,7 +2137,7 @@ fn has_url_scheme(url: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphabetic())
         && scheme
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-'))
         && !rest.is_empty()
         && url.chars().all(|c| !c.is_control())
 }
@@ -6607,6 +6609,8 @@ mod tests {
         assert!(has_url_scheme("https://example.com"));
         assert!(has_url_scheme("svn+ssh://example.com/repo"));
         assert!(has_url_scheme("git+https://example.com/repo.git"));
+        assert!(!has_url_scheme("example.com:8080/path"));
+        assert!(!has_url_scheme("example.com:8080"));
         assert!(!has_url_scheme("x:"));
         assert!(!has_url_scheme("http:"));
         assert!(!has_url_scheme("1http://example.com"));
