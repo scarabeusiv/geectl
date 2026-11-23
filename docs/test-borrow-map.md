@@ -274,6 +274,11 @@ classification + rdiff API params; exact CLI stdout text is osc-specific):
   `osc api /build/:prj/:repo/:arch/:pkg/:file.rpm` — no tests found in the
   surveyed files, except `osc maintainer` and `updatepacmetafromspec`,
   which appear only in the unsupported-git refusal scenario.
+- `remote owners`, `owners-for-binary`, `owners-for-package` — the
+  owner-search leaves, mapping onto osc's `owner()`
+  (`mode="package"`, `osc/core.py:5315`) and `osc maintainer`. No osc
+  test covers them (see the gap above); written from scratch, no test
+  adoption, counts unchanged.
 - SKIP in this batch: `tests/test_core_package.py` (14 tests, in-memory
   Package identity/ordering + `.osc` path resolution), `tests/test_models.py`
   (29 tests, osc's internal `BaseModel` framework — no OBS behaviour),

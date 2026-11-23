@@ -49,6 +49,7 @@ what is specific to that group.
 | (no osc command) | `remote staging-project PROJECT NAME` | Same; the one-project read |
 | `osc search -i LOGIN --project` | `remote search-projects-by-person LOGIN` | Same search: the projects a person is involved in, by login |
 | `osc whois [USER ...]` (aliases `who`, `user`) | `remote whois [LOGIN]` | Same read; the bare form defaults to the authenticated user, like osc's configured-user default |
+| `osc maintainer` (owner search, `osc/core.py` `owner()`) | `remote owners PROJECT PACKAGE`, `remote owners-for-binary BINARY`, `remote owners-for-package PACKAGE` | One leaf per owner-search form: project/package, binary, and package-only; the package-only form searches the owner root projects, so a package in none of them returns no owners |
 | (no osc command) | `remote count-scmsync-projects URL-PREFIX` | New surface: the scmsync-prefix project count is API-only in osc |
 
 ## `request` — submit requests (issue #73)
