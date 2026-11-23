@@ -1184,6 +1184,13 @@ impl<'a> LocalBuild<'a> {
                 format!("build cannot start: {error}"),
             ));
         }
+        // Dep fields are server data: validate them before the trust
+        // check, so a project name carrying control characters or an
+        // ANSI escape never reaches the terminal through the
+        // `UntrustedProject` error or the debug line.
+        for dep in &info.bdeps {
+            validate_dep(dep)?;
+        }
         self.check_trust(req.fetch_project(), &info, req.trust_all_projects)?;
         let buildconfig = self.obs.buildconfig(req.fetch_project(), &req.repo)?;
 
@@ -3489,6 +3496,9 @@ fn touch(path: &Path) {
 /// NUL, empty) needs this separate check — without it a flavor of
 /// `../../x` (or a `..` project/repo) would escape the cache dir,
 /// and a `build --clean` would wipe an arbitrary directory.
+/// Control characters are rejected too: an ANSI escape rides on
+/// ESC, so a server-supplied name carrying one must fail here,
+/// never reach the terminal.
 fn validate_path_component(label: &str, value: &str) -> Result<(), GeectlError> {
     if value.is_empty()
         || value == "."
@@ -3496,6 +3506,7 @@ fn validate_path_component(label: &str, value: &str) -> Result<(), GeectlError> 
         || value.contains('/')
         || value.contains('\\')
         || value.contains('\0')
+        || value.chars().any(|c| c.is_control())
     {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
@@ -8151,6 +8162,37 @@ fi
             assert_eq!(err.kind(), ErrorKind::UntrustedProject);
             assert!(err.to_string().contains("home:someoneelse"));
             assert!(err.to_string().contains("--trust-all-projects"));
+        }
+
+        #[test]
+        fn build_rejects_an_escape_sequence_project_before_the_trust_check() {
+            // A project name carrying an ANSI escape (as a numeric
+            // character reference, the only way one survives the
+            // buildinfo parse) must fail in `validate_dep`, not reach
+            // the terminal through the `UntrustedProject` error or
+            // the debug line: validation runs before `check_trust`.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"glibc\" project=\"home:evil&#27;[2J\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                        arch = host_arch()
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n");
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("dependency project"));
+            assert!(!err.to_string().contains('\x1b'));
         }
 
         #[test]
