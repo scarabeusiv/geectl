@@ -177,7 +177,7 @@ directory's `.env` only.
 - `geectl remote create-token --operation <OPERATION>` — Create an operation-scoped trigger token for the authenticated user; key flags: --project <PROJECT>, --package <PACKAGE>, --description <DESCRIPTION>
 - `geectl remote delete-package <PROJECT> <PACKAGE>` — Delete a package; key flags: --force, --message <MESSAGE>
 - `geectl remote delete-link <PROJECT> <PACKAGE>` — Delete a `_link` file from a package.
-- `geectl remote delete-file <PROJECT> <PACKAGE> <FILE>` — Delete a file from a package.
+- `geectl remote delete-file <PROJECT> <PACKAGE> <FILE>` — Delete a file from a package. The delete is not idempotent: deleting a file that is already gone is refused by the server (NotFound). The server records the delete with the fixed comment `removed <file>`; there is no `--message` option, unlike `delete-package` — the asymmetry is intentional.
 - `geectl remote delete-project <PROJECT>` — Delete a project; key flags: --recursive, --force, --comment <COMMENT>
 - `geectl remote undelete-package <PROJECT> <PACKAGE>` — Restore a deleted package.
 - `geectl remote undelete-project <PROJECT>` — Restore a deleted project.

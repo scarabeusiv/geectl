@@ -663,7 +663,7 @@ pub enum RemoteCommand {
     /// here issues the same delete as `delete-link`. Deleting a file
     /// that is already gone is refused by the server (NotFound). The
     /// server records the delete with the fixed comment
-    /// `removed <file>`.
+    /// `removed <file>`; there is no `--message` option, unlike `delete-package` — the asymmetry is intentional.
     DeleteFile {
         /// The project the package lives in.
         project: String,
