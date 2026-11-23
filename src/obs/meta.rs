@@ -563,7 +563,6 @@ impl<'a> ObsClient<'a> {
             ));
         }
         validate_roles(&meta.persons, &meta.groups)?;
-        validate_repositories(&meta.repositories)?;
         if !dry_run.allow(&format!("set project meta of {project}")) {
             return Ok(());
         }
@@ -621,6 +620,11 @@ impl<'a> ObsClient<'a> {
             set_roles(&mut doc, &meta.persons, &meta.groups)?;
         }
         if current.repositories != meta.repositories {
+            // Validation runs here, on what will actually be
+            // written: a write that leaves the repositories alone
+            // must not fail on pre-existing server values outside
+            // the modeled enumerations.
+            validate_repositories(&meta.repositories)?;
             refuse_unmodeled_repositories(body)?;
             doc.remove_elements("repository");
             for repository in &meta.repositories {
@@ -1570,6 +1574,28 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_title_change_ignores_an_invalid_pre_existing_rebuild_value() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" rebuild=\"bogus\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(META).unwrap();
+        meta.title = Some("New title".to_string());
+        assert!(client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.put_calls().len(), 1);
+        assert!(http.put_calls()[0].1.contains("rebuild=\"bogus\""));
     }
 
     #[test]
