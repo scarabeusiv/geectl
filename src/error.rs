@@ -178,7 +178,7 @@ impl ErrorKind {
                 "wait for the running build to finish, then retry"
             }
             ErrorKind::UntrustedProject => {
-                "only the caller's own home: project and non-home: projects are trusted; a foreign home: project needs the user's decision"
+                "only the caller's own home: project and non-home: projects are trusted; a foreign home: project's packages run code in the build root; pass --trust-all-projects to allow them"
             }
             ErrorKind::MultibuildFlavorRequired => {
                 "pass one flavor; one invocation builds one flavor"

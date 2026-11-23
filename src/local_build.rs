@@ -176,11 +176,13 @@ pub struct BuildRequest {
     /// `BUILD_RELEASE`, which removes the local-only
     /// `python-bytecode-inconsistent-mtime` artifact).
     pub release: Option<String>,
-    /// Trust packages from all projects: skip the foreign-`home:`
-    /// refusal for the dep set the buildinfo enumerates — the build
-    /// proceeds with those deps, and the accepted foreign projects
-    /// are reported on the debug channel. Without it, a foreign
-    /// `home:` dep refuses with `UntrustedProject`.
+    /// Allow build dependencies from other users' `home:` projects
+    /// (their packages run code in the build root): skip the
+    /// foreign-`home:` refusal for the dep set the buildinfo
+    /// enumerates — the build proceeds with those deps, and the
+    /// accepted foreign projects are reported on the debug channel.
+    /// Without it, a foreign `home:` dep refuses with
+    /// `UntrustedProject`.
     pub trust_all_projects: bool,
     /// Force an image pull even when the local image is fresh.
     pub refresh_image: bool,

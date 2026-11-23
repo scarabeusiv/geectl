@@ -109,7 +109,9 @@ pub enum LocalBuildCommand {
         /// The release number, passed through to the engine.
         #[arg(long)]
         release: Option<String>,
-        /// Trust packages from all projects.
+        /// Allow build dependencies from other users' `home:`
+        /// projects (their packages run code in the build root).
+        /// Without this such builds are refused.
         #[arg(long)]
         trust_all_projects: bool,
         /// Force an image pull even when the local image is fresh.
