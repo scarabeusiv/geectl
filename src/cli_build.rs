@@ -1670,9 +1670,11 @@ fn buildconfig_result(project: &str, repository: &str, config: String) -> (Value
     (payload, config)
 }
 
-/// Buildinfo as JSON: the blocking error plus the dependencies, each
-/// with the project it resolves from (`null` when the server did not
-/// say — a virtual provide or a not-installed flag).
+/// Buildinfo as JSON: the blocking error plus the dependency names
+/// (`bdeps`, strings, so existing consumers keep reading names)
+/// and the project each resolves from in the parallel
+/// `bdep_projects` array, aligned by index (`null` when the server
+/// did not say — a virtual provide or a not-installed flag).
 fn buildinfo_payload(
     project: &str,
     package: &str,
@@ -1691,12 +1693,12 @@ fn buildinfo_payload(
         "bdeps": info
             .bdeps
             .iter()
-            .map(|dep| {
-                json!({
-                    "name": dep.name,
-                    "project": dep.project,
-                })
-            })
+            .map(|dep| dep.name.clone())
+            .collect::<Vec<_>>(),
+        "bdep_projects": info
+            .bdeps
+            .iter()
+            .map(|dep| dep.project.clone())
             .collect::<Vec<_>>(),
     })
 }
@@ -2851,13 +2853,22 @@ mod tests {
             )),
             "buildinfo text misses the error:\n{text}"
         );
-        for dep in info_payload["bdeps"].as_array().expect("bdeps is an array") {
-            let name = dep["name"].as_str().expect("dep name is a string");
+        let bdeps = info_payload["bdeps"].as_array().expect("bdeps is an array");
+        let projects = info_payload["bdep_projects"]
+            .as_array()
+            .expect("bdep_projects is an array");
+        assert_eq!(
+            bdeps.len(),
+            projects.len(),
+            "bdeps and bdep_projects stay aligned by index"
+        );
+        for (dep, project) in bdeps.iter().zip(projects) {
+            let name = dep.as_str().expect("dep name is a string");
             assert!(
                 text.contains(name),
                 "buildinfo text misses dep {name}:\n{text}"
             );
-            if let Some(project) = dep["project"].as_str() {
+            if let Some(project) = project.as_str() {
                 assert!(
                     text.contains(project),
                     "buildinfo text misses dep project {project}:\n{text}"
@@ -3032,9 +3043,13 @@ mod tests {
         assert!(text.contains("make"));
         // A dep without a project renders bare, and its payload
         // project is null: the server did not resolve it to a binary.
+        // `bdeps` stays strings; the projects ride the parallel
+        // `bdep_projects` array, aligned by index.
         let payload = buildinfo_payload("p", "k", "r", "a", None, &clean);
-        assert_eq!(payload["bdeps"][0]["project"], "openSUSE:Factory");
-        assert!(payload["bdeps"][1]["project"].is_null());
+        assert_eq!(payload["bdeps"][0], "gcc");
+        assert_eq!(payload["bdeps"][1], "make");
+        assert_eq!(payload["bdep_projects"][0], "openSUSE:Factory");
+        assert!(payload["bdep_projects"][1].is_null());
     }
 
     #[test]
