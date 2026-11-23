@@ -154,6 +154,8 @@ while true; do
         $COMPOSE -f "$compose_file" exec -T backend sh -c 'ps aux | grep "[b]s_sched" || echo "scheduler process not running"' >&2 || true
         $COMPOSE -f "$compose_file" exec -T backend sh -c 'tail -40 /srv/obs/log/scheduler_x86_64.crit.log 2>&1' >&2 || true
         $COMPOSE -f "$compose_file" exec -T backend sh -c 'ls -la /srv/obs/dods/ 2>&1' >&2 || true
+        $COMPOSE -f "$compose_file" exec -T backend sh -c "ls -lad /srv/obs/build/$PROJECT/$REPO/$ARCH/ 2>&1" >&2 || true
+        $COMPOSE -f "$compose_file" exec -T backend sh -c "ls -lad /srv/obs/dod-cache 2>&1" >&2 || true
         $COMPOSE -f "$compose_file" exec -T backend sh -c "ls /srv/obs/build/$PROJECT/$REPO/$ARCH/:full/ 2>&1 | head -20" >&2 || true
         $COMPOSE -f "$compose_file" exec -T backend sh -c "cat /srv/obs/build/$PROJECT/$REPO/$ARCH/:full/doddata.cookie 2>&1" >&2 || true
         $COMPOSE -f "$compose_file" exec -T backend sh -c 'tail -40 /srv/obs/log/bs_dodup.log 2>&1' >&2 || true
@@ -199,10 +201,12 @@ while true; do
         compose_file="$REPO_ROOT/tests/live/docker-compose.yml"
         if [ -f "$compose_file" ]; then
             echo "--- fixture diagnostics (backend container) ---" >&2
-             -f "$compose_file" exec -T backend sh -c 'ps aux | grep "[b]s_dodup" || echo "dodup process not running"' >&2 || true
-             -f "$compose_file" exec -T backend sh -c 'ls -la /srv/obs/dods/ 2>&1' >&2 || true
-             -f "$compose_file" exec -T backend sh -c "ls /srv/obs/build/$PROJECT/$REPO/$ARCH/:full/ 2>&1 | head -20" >&2 || true
-             -f "$compose_file" exec -T backend sh -c 'tail -40 /srv/obs/log/bs_dodup.log 2>&1' >&2 || true
+            $COMPOSE -f "$compose_file" exec -T backend sh -c 'ps aux | grep "[b]s_dodup" || echo "dodup process not running"' >&2 || true
+            $COMPOSE -f "$compose_file" exec -T backend sh -c 'ls -la /srv/obs/dods/ 2>&1' >&2 || true
+            $COMPOSE -f "$compose_file" exec -T backend sh -c "ls -lad /srv/obs/build/$PROJECT/$REPO/$ARCH/ 2>&1" >&2 || true
+            $COMPOSE -f "$compose_file" exec -T backend sh -c "ls -lad /srv/obs/dod-cache 2>&1" >&2 || true
+            $COMPOSE -f "$compose_file" exec -T backend sh -c "ls /srv/obs/build/$PROJECT/$REPO/$ARCH/:full/ 2>&1 | head -20" >&2 || true
+            $COMPOSE -f "$compose_file" exec -T backend sh -c 'tail -40 /srv/obs/log/bs_dodup.log 2>&1' >&2 || true
         fi
         exit 1
     fi
