@@ -212,7 +212,7 @@ Commands:
   count-scmsync-projects         Count the projects syncing from a git URL prefix
   owners                         Show the owners of a package (project/package scope)
   owners-for-binary              Show the owners of a binary package
-  owners-for-package             Show the owners of a package by name alone, across projects
+  owners-for-package             Show the owners of a package by name alone, in the owner root projects
   maintainers                    Show the maintainers of a package
   whois                          Show a user's full name, email, and account state. Without a login, the authenticated user
   link-target                    Show the link target of a package, when it is a link

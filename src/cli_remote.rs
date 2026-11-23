@@ -388,7 +388,7 @@ pub enum RemoteCommand {
         /// The binary package name.
         binary: String,
     },
-    /// Show the owners of a package by name alone, across projects.
+    /// Show the owners of a package by name alone, in the owner root projects.
     OwnersForPackage {
         /// The package name.
         package: String,

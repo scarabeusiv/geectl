@@ -3437,8 +3437,8 @@ impl<'a> ObsClient<'a> {
         self.owner_search(&[("binary", binary)], &format!("binary {binary:?}"))
     }
 
-    /// The owners of package `package`, across projects (`GET
-    /// /search/owner?package=...`). Requires credentials; an
+    /// The owners of package `package`, in the owner root projects
+    /// (`GET /search/owner?package=...`). Requires credentials; an
     /// unexpected response is an error, never an empty list. A 400 or
     /// 404 from the server means no owner root project holds the
     /// package, so that is an empty list, not invalid input: the
