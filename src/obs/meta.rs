@@ -284,6 +284,18 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
         // Self-closing `<repository .../>`: no children to check.
         return Ok(found);
     }
+    // A comment or processing instruction inside the repository is
+    // content the render drops: the typed model carries no opaque
+    // entries, so a rewrite would delete it silently.
+    if text_has_unquoted(inner, "<!--") {
+        push_finding(&mut found, "XML comments in <repository>".to_string());
+    }
+    if text_has_unquoted(inner, "<?") {
+        push_finding(
+            &mut found,
+            "processing instructions in <repository>".to_string(),
+        );
+    }
     let doc = XmlDoc::parse(&format!("<repository{open_tag}>{inner}</repository>"))?;
     for child in doc.child_names() {
         if !matches!(
@@ -377,6 +389,35 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
         }
     }
     Ok(found)
+}
+
+/// True when `text` carries `marker` outside a quoted attribute
+/// value: inside quotes the marker is literal text, outside it the
+/// marker starts a comment or a processing instruction.
+fn text_has_unquoted(text: &str, marker: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if text[i..].starts_with(marker) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Record a refusal reason once: the same dropped piece named twice
@@ -1442,6 +1483,47 @@ mod tests {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"\"><arch>x86_64</arch></repository></project>";
         let err = parse_project_meta(META).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_comment_inside_a_repository() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><!-- a note --><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_comment_inside_a_download() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><!-- a note --></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_processing_instruction_inside_a_repository(
+    ) {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><?pi data?><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_keeps_a_comment_outside_the_repositories() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><!-- a note --><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(META).unwrap();
+        meta.repositories = vec![replacement_repository()];
+        assert!(client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.put_calls().len(), 1);
+        assert!(http.put_calls()[0].1.contains("<!-- a note -->"));
     }
 
     #[test]
