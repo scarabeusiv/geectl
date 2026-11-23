@@ -3433,6 +3433,53 @@ fn link_target(doc: &XmlDoc) -> Result<(String, String), GeectlError> {
     Ok((link_project, link_package))
 }
 
+/// How long pull waits for a directory read to return a revision:
+/// a read can come back without a `rev`. Separate from the
+/// commit/service-settle poll budget by design: the pull wait is
+/// its own budget, tuned independently.
+const PULL_REVISION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long pull waits between revision reads.
+const PULL_REVISION_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Re-run `fetch` until it returns a revision: a directory read can
+/// come back without a `rev`. Only a missing revision retries — a
+/// fetch failure, and a missing anything else once a revision is
+/// present, fail at once. Bounded by `timeout`: after it is spent
+/// the error names the package and the wait, so a genuinely broken
+/// link is not masked as a transient.
+fn wait_for_revision<T>(
+    mut fetch: impl FnMut() -> Result<(T, Option<String>), GeectlError>,
+    project: &str,
+    package: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<(T, String), GeectlError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (value, rev) = fetch()?;
+        if let Some(rev) = rev {
+            return Ok((value, rev));
+        }
+        if Instant::now() >= deadline {
+            // A sub-second budget still names a nonzero wait:
+            // `as_secs` reads 0 for one.
+            let budget = if timeout >= Duration::from_secs(1) {
+                format!("{} seconds", timeout.as_secs())
+            } else {
+                format!("{} milliseconds", timeout.as_millis())
+            };
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "the server did not return a revision for {project}/{package} within {budget}"
+                ),
+            ));
+        }
+        std::thread::sleep(interval);
+    }
+}
+
 /// The dry-run plan for a pull: the link baserev it would move to,
 /// and the files the expanded listing would add, change, or delete.
 fn record_pull_plan(
@@ -3448,16 +3495,17 @@ fn record_pull_plan(
             format!("the server did not return a source md5 for {link_project}/{link_package}"),
         )
     })?;
-    let (own_rev, _, own_srcmd5) = client.directory_rev(&wc.project, &wc.package)?;
-    let own_rev = own_rev.ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::ServerError,
-            format!(
-                "the server did not return a revision for {}/{}",
-                wc.project, wc.package
-            ),
-        )
-    })?;
+    let ((_, own_srcmd5), own_rev) = wait_for_revision(
+        || {
+            client
+                .directory_rev(&wc.project, &wc.package)
+                .map(|(rev, vrev, srcmd5)| ((vrev, srcmd5), rev))
+        },
+        &wc.project,
+        &wc.package,
+        PULL_REVISION_TIMEOUT,
+        PULL_REVISION_INTERVAL,
+    )?;
     let own_srcmd5 = own_srcmd5.ok_or_else(|| {
         GeectlError::new(
             ErrorKind::ServerError,
@@ -3484,7 +3532,9 @@ fn record_pull_plan(
 /// local commits onto it. The working copy must be clean, and the
 /// package must link another package with a baserev. A successful
 /// pull updates this checkout's recorded base, on disk and in the
-/// struct. Returns `None` in dry-run.
+/// struct. Returns `None` in dry-run. A directory read that comes
+/// back without a revision is waited for (bounded); only the
+/// missing revision retries.
 pub fn pull(
     wc: &mut WorkingCopy,
     client: &ObsClient,
@@ -3538,16 +3588,17 @@ pub fn pull(
     // unexpanded revision — storing the expanded srcmd5 would make
     // every commit after a pull refuse as outdated. The expanded
     // listing below is only for building the new base tree.
-    let (own_rev, _, own_srcmd5) = client.directory_rev(&wc.project, &wc.package)?;
-    let own_rev = own_rev.ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::ServerError,
-            format!(
-                "the server did not return a revision for {}/{}",
-                wc.project, wc.package
-            ),
-        )
-    })?;
+    let ((_, own_srcmd5), own_rev) = wait_for_revision(
+        || {
+            client
+                .directory_rev(&wc.project, &wc.package)
+                .map(|(rev, vrev, srcmd5)| ((vrev, srcmd5), rev))
+        },
+        &wc.project,
+        &wc.package,
+        PULL_REVISION_TIMEOUT,
+        PULL_REVISION_INTERVAL,
+    )?;
     let own_srcmd5 = own_srcmd5.ok_or_else(|| {
         GeectlError::new(
             ErrorKind::ServerError,
@@ -3570,15 +3621,27 @@ pub fn pull(
             stash_remaining: false,
         }));
     }
-    let (listing, (expanded_rev, _, _)) =
-        client.directory_listing_expanded(&wc.project, &wc.package)?;
+    // The expanded listing can come back without a revision: wait
+    // for it, like the own-revision read above.
+    let (listing, expanded_rev) = wait_for_revision(
+        || {
+            client
+                .directory_listing_expanded(&wc.project, &wc.package)
+                .map(|(listing, (rev, _, _))| (listing, rev))
+        },
+        &wc.project,
+        &wc.package,
+        PULL_REVISION_TIMEOUT,
+        PULL_REVISION_INTERVAL,
+    )?;
     // The expanded downloads are pinned to the expanded
     // listing's revision, like the update path pins to its
     // listing's revision: an unpinned pull would download files
-    // the listing never named, so a listing without a revision
-    // (or with an unparsable one) errors instead of pulling.
+    // the listing never named, so a listing with an unparsable
+    // revision errors instead of pulling.
     let pinned = expanded_rev
-        .and_then(|rev| rev.parse::<u64>().ok())
+        .parse::<u64>()
+        .ok()
         .map(RevisionSpec::Rev)
         .ok_or_else(|| {
             GeectlError::new(
@@ -7119,6 +7182,69 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_revision_retries_until_a_revision_appears() {
+        let mut attempts = 0;
+        let (value, rev) = wait_for_revision(
+            || -> Result<(i32, Option<String>), GeectlError> {
+                attempts += 1;
+                Ok(if attempts < 3 {
+                    (attempts, None)
+                } else {
+                    (attempts, Some("7".to_string()))
+                })
+            },
+            "home:alice",
+            "foo",
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(value, 3);
+        assert_eq!(rev, "7");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn wait_for_revision_errors_after_the_budget_is_spent() {
+        let err = wait_for_revision(
+            || Ok::<((), Option<String>), GeectlError>(((), None)),
+            "home:alice",
+            "foo",
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        let message = err.to_string();
+        assert!(
+            message.contains("did not return a revision for home:alice/foo"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
+    fn wait_for_revision_does_not_retry_a_fetch_failure() {
+        // A fetch failure fails at once: only a missing revision
+        // retries, so one attempt is all a failing fetch gets.
+        let mut attempts = 0;
+        let err = wait_for_revision(
+            || -> Result<((), Option<String>), GeectlError> {
+                attempts += 1;
+                Err(GeectlError::new(ErrorKind::ServerError, "boom"))
+            },
+            "home:alice",
+            "foo",
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        let message = err.to_string();
+        assert!(message.contains("boom"), "message: {message}");
+    }
+
+    #[test]
     fn pull_moves_the_link_and_keeps_the_unexpanded_base() {
         let http = pull_http();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -7203,17 +7329,19 @@ mod tests {
     }
 
     #[test]
-    fn pull_refuses_an_expanded_listing_without_a_revision() {
-        // The expanded downloads are pinned to the expanded
-        // listing's revision, like the update path: a listing
-        // without one errors instead of pulling unpinned.
-        let http = pull_http().with_get(
+    fn pull_retries_an_expanded_listing_without_a_revision() {
+        // The expanded listing can come back without a revision:
+        // the first read has none, the retry reads it, and the
+        // pull completes instead of failing on the first read.
+        // Once the sequence is spent the canned listing answers.
+        let no_rev = format!(
+            "<directory name=\"foo\" srcmd5=\"{EXPANDED_SRCMD5}\" vrev=\"1\">\
+            <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047303\" name=\"bar.spec\" size=\"10\" />\
+            </directory>"
+        );
+        let http = pull_http().with_get_sequence(
             "https://api.opensuse.org/source/home:alice/foo?expand=1",
-            &format!(
-                "<directory name=\"foo\" srcmd5=\"{EXPANDED_SRCMD5}\" vrev=\"1\">\
-                <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047303\" name=\"bar.spec\" size=\"10\" />\
-                </directory>"
-            ),
+            &[&no_rev],
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dir = TempDirGuard::new("pull-no-rev");
@@ -7228,13 +7356,65 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let err = pull(&mut wc, &client, &DryRun::new(false)).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ServerError);
-        let message = err.to_string();
-        assert!(
-            message.contains("did not return a revision"),
-            "message: {message}"
+        let report = pull(&mut wc, &client, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.updated);
+        assert_eq!(report.new_baserev, TARGET_SRCMD5);
+        // The expanded listing was read twice — the missing
+        // revision, then the retry.
+        let expanded_reads = http
+            .get_calls()
+            .into_iter()
+            .filter(|(url, _)| url == "https://api.opensuse.org/source/home:alice/foo?expand=1")
+            .count();
+        assert_eq!(expanded_reads, 2);
+        let _ = dir;
+    }
+
+    #[test]
+    fn pull_retries_a_missing_own_revision() {
+        // The checkout reads the link package's directory first, so
+        // the sequence leads with the revision present: the pull's
+        // first own read then comes back without one, and the retry
+        // reads it. Once the sequence is spent the canned directory
+        // answers.
+        let foo_rev1 = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"235ee045c185e683ce770f81607ade06\" mtime=\"1282047302\" name=\"_link\" size=\"95\" />\
+            </directory>"
         );
+        let foo_no_rev = format!("<directory name=\"foo\" srcmd5=\"{SRCMD5_1}\"></directory>");
+        let http = pull_http().with_get_sequence(
+            "https://api.opensuse.org/public/source/home:alice/foo",
+            &[&foo_rev1, &foo_no_rev],
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dir = TempDirGuard::new("pull-own-no-rev");
+        let mut wc = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            None,
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        let report = pull(&mut wc, &client, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.updated);
+        assert_eq!(report.new_baserev, TARGET_SRCMD5);
+        // The checkout read the directory once; the pull read it
+        // twice — the missing revision, then the retry.
+        let own_reads = http
+            .get_calls()
+            .into_iter()
+            .filter(|(url, _)| url == "https://api.opensuse.org/public/source/home:alice/foo")
+            .count();
+        assert_eq!(own_reads, 3);
         let _ = dir;
     }
 
