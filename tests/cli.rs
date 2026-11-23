@@ -2350,6 +2350,208 @@ fn remote_list_scmsync_projects_with_half_set_credentials_fails_with_config_erro
     assert_eq!(value["error"]["code"], "config_error");
 }
 
+#[test]
+fn remote_list_scmsync_projects_with_a_quote_in_the_prefix_fails_with_invalid_input() {
+    // The quote is rejected before any request, even with
+    // credentials configured.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "list-scmsync-projects", "https://example.com/x'"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn remote_list_scmsync_projects_with_limit_zero_fails_with_invalid_input() {
+    // A limit of 0 is rejected before any request, even with
+    // credentials configured.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-scmsync-projects",
+            "--limit",
+            "0",
+            "https://github.com/openSUSE/",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn remote_list_scmsync_projects_reports_the_payload_shape() {
+    let addr = serve_once(
+        "<collection matches=\"2\"><project name=\"home:alice:branches:foo\"/><project name=\"home:alice:branches:bar\"/></collection>",
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-scmsync-projects",
+            "https://github.com/openSUSE/",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["url_prefix"], "https://github.com/openSUSE/");
+    assert_eq!(value["matches"].as_u64(), Some(2));
+    assert_eq!(value["truncated"].as_bool(), Some(false));
+    assert_eq!(
+        value["projects"],
+        serde_json::json!(["home:alice:branches:foo", "home:alice:branches:bar"])
+    );
+}
+
+#[test]
+fn remote_list_scmsync_projects_text_mode_opens_with_the_url_prefix_header() {
+    let addr = serve_once(
+        "<collection matches=\"2\"><project name=\"home:alice:branches:foo\"/><project name=\"home:alice:branches:bar\"/></collection>",
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "list-scmsync-projects",
+            "https://github.com/openSUSE/",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "url-prefix: https://github.com/openSUSE/\nNAME\nhome:alice:branches:foo\nhome:alice:branches:bar"
+    );
+}
+
+#[test]
+fn remote_list_scmsync_projects_empty_result_reports_an_empty_list() {
+    let addr = serve_once("<collection matches=\"0\"/>");
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-scmsync-projects",
+            "https://github.com/openSUSE/",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["url_prefix"], "https://github.com/openSUSE/");
+    assert_eq!(value["matches"].as_u64(), Some(0));
+    assert_eq!(value["truncated"].as_bool(), Some(false));
+    assert_eq!(value["projects"], serde_json::json!([]));
+}
+
+#[test]
+fn remote_list_scmsync_projects_past_the_end_reports_an_empty_page() {
+    // An offset past the last match is an empty page, not an error:
+    // the server's total says 3 matches exist and the page starts
+    // at 5, so the JSON payload carries an empty list with the total.
+    let addr = serve_once("<collection matches=\"3\"/>");
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-scmsync-projects",
+            "--limit",
+            "2",
+            "--offset",
+            "5",
+            "https://github.com/openSUSE/",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["url_prefix"], "https://github.com/openSUSE/");
+    assert_eq!(value["limit"].as_u64(), Some(2));
+    assert_eq!(value["offset"].as_u64(), Some(5));
+    assert_eq!(value["matches"].as_u64(), Some(3));
+    assert_eq!(value["truncated"].as_bool(), Some(false));
+    assert_eq!(value["projects"], serde_json::json!([]));
+}
+
+#[test]
+fn remote_list_scmsync_projects_past_the_end_text_mode_flags_the_empty_page() {
+    // The same past-end page in text mode renders the designed
+    // empty-page line, not a no-matches line and not an error.
+    let addr = serve_once("<collection matches=\"3\"/>");
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "list-scmsync-projects",
+            "--limit",
+            "2",
+            "--offset",
+            "5",
+            "https://github.com/openSUSE/",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no projects on this page"));
+    assert!(stdout.contains("3 matches in total"));
+}
+
 // --- unconfigured credentialed read (issue #108) ---
 //
 // With nothing configured the credentialed read goes out without

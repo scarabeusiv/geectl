@@ -10059,6 +10059,93 @@ mod tests {
     }
 
     #[test]
+    fn list_scmsync_projects_propagates_a_not_found_error() {
+        // A 404 from the search is a NotFound, not a malformed
+        // response: the HTTP status-to-kind mapping lives in
+        // `http.rs`; the leaf propagates the kind unchanged.
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=100&offset=0",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .list_scmsync_projects("https://github.com/openSUSE/", None, None)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn list_scmsync_projects_propagates_a_server_error() {
+        // A 5xx from the search is a ServerError, like the 404
+        // above: the leaf never turns a transport failure into an
+        // empty list.
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=100&offset=0",
+            ErrorKind::ServerError,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .list_scmsync_projects("https://github.com/openSUSE/", None, None)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn list_scmsync_projects_decodes_xml_entities_in_names() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=100&offset=0",
+            "<collection matches=\"1\"><project name=\"home:alice&amp;bob\"/></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .list_scmsync_projects("https://github.com/openSUSE/", None, None)
+                .unwrap(),
+            ScmsyncProjectList {
+                projects: vec!["home:alice&bob".to_string()],
+                matches: 1,
+                offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn list_scmsync_projects_skips_a_project_without_a_name() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=100&offset=0",
+            "<collection matches=\"2\"><project name=\"home:alice:branches:foo\"/><project/></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let list = client
+            .list_scmsync_projects("https://github.com/openSUSE/", None, None)
+            .unwrap();
+        assert_eq!(
+            list,
+            ScmsyncProjectList {
+                projects: vec!["home:alice:branches:foo".to_string()],
+                matches: 2,
+                offset: 0,
+            }
+        );
+        assert!(list.truncated());
+    }
+
+    #[test]
+    fn list_scmsync_projects_without_any_named_project_is_an_error() {
+        // The count says one match but no project parsed: the server
+        // changed shape underneath us, and an empty list here would
+        // hide the result.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=100&offset=0",
+            "<collection matches=\"1\"><project/></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .list_scmsync_projects("https://github.com/openSUSE/", None, None)
+            .is_err());
+    }
+
+    #[test]
     fn list_scmsync_projects_rejects_a_quoted_prefix_without_http() {
         let http = FakeHttp::new();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();

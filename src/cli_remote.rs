@@ -5861,6 +5861,17 @@ mod tests {
     }
 
     #[test]
+    fn list_scmsync_projects_renders_an_empty_list_as_no_projects() {
+        let list = ScmsyncProjectList {
+            projects: vec![],
+            matches: 0,
+            offset: 0,
+        };
+        let text = render_scmsync_projects("https://github.com/openSUSE/", &list);
+        assert_eq!(text, "no projects matching 'https://github.com/openSUSE/'");
+    }
+
+    #[test]
     fn staging_project_json_and_text_carry_state_and_requests() {
         let project = StagingProject {
             name: "openSUSE:Factory:Staging:A".to_string(),
