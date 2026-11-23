@@ -53,15 +53,22 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(300);
 /// Invalid, zero, or unset values fall back to the default.
 const DEFAULT_GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Parse the network git timeout from `GEectl_GIT_NETWORK_TIMEOUT_SECS`:
+/// invalid, zero, or unset values fall back to the default. Split
+/// out of `git_network_timeout` so the parsing is testable: the
+/// cached value cannot be re-read in-process.
+fn parse_git_network_timeout(value: Option<String>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_GIT_NETWORK_TIMEOUT)
+}
+
 fn git_network_timeout() -> Duration {
     static TIMEOUT: OnceLock<Duration> = OnceLock::new();
     *TIMEOUT.get_or_init(|| {
-        std::env::var("GEectl_GIT_NETWORK_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_GIT_NETWORK_TIMEOUT)
+        parse_git_network_timeout(std::env::var("GEectl_GIT_NETWORK_TIMEOUT_SECS").ok())
     })
 }
 
@@ -264,12 +271,13 @@ struct GitOutput {
 /// redirect the call at another repository (or at the update
 /// tree's temporary index), a `GIT_CONFIG_*` would inject config,
 /// and `GIT_SSH_COMMAND`/`GIT_ASKPASS` would hand the transport to
-/// the caller's helpers. The identity and date variables are NOT
-/// scrubbed: the author/committer dates pin deterministic
-/// synthesized commits, and the identity comes from the checkout's
-/// own repo-local config. `extra_env` is applied after the scrub,
-/// so the call's own values (the token header, the temporary
-/// index) win.
+/// the caller's helpers. The identity variables ARE scrubbed, so
+/// the author/committer identity comes from the checkout's own
+/// repo-local config, never the caller's environment. The date
+/// variables are NOT scrubbed: the author/committer dates pin
+/// deterministic synthesized commits. `extra_env` is applied after
+/// the scrub, so the call's own values (the token header, the
+/// temporary index) win.
 const GIT_ENV_SCRUB: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -309,7 +317,9 @@ const GIT_ENV_SCRUB: &[&str] = &[
 /// No signing and no line-ending conversion: the working copy
 /// holds the server bytes exactly on every platform. No hooks:
 /// user hooks must not run on synthesized commits, rebases, or
-/// pushes. `globals` are `git`-level options placed before the
+/// pushes. No color: parsed output (`stash list` and friends)
+/// must never carry ANSI escapes, whatever `color.ui` the user
+/// set. `globals` are `git`-level options placed before the
 /// subcommand (`--literal-pathspecs`); `extra_env` is applied
 /// after the scrub.
 fn git_command(
@@ -328,6 +338,8 @@ fn git_command(
         .arg("protocol.ext.allow=never")
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("color.ui=false")
         .args(globals)
         .arg(subcommand)
         .args(args);
@@ -465,7 +477,9 @@ fn bounded(text: &str) -> String {
 /// overwrite a rebase would do, or a missing repository are
 /// distinct, actionable states — not an internal error. Anything
 /// else stays `InternalError`: the failure is the tool's, not the
-/// caller's or the network's.
+/// caller's or the network's. The HTTP codes match only as tokens
+/// (`http 401`, `error: 401`, `401 unauthorized`): a bare `401` /
+/// `403` digit run also matches a SHA, a file name, or a port.
 fn classify_git_failure(stderr: &str) -> ErrorKind {
     let lower = stderr.to_ascii_lowercase();
     if lower.contains("not a git repository") {
@@ -474,8 +488,16 @@ fn classify_git_failure(stderr: &str) -> ErrorKind {
         || lower.contains("permission denied (publickey)")
         || lower.contains("permission denied, please try again")
         || lower.contains("could not read username")
-        || lower.contains("401")
-        || lower.contains("403")
+        || lower.contains("http 401")
+        || lower.contains("http 403")
+        || lower.contains("status 401")
+        || lower.contains("status 403")
+        || lower.contains("error: 401")
+        || lower.contains("error: 403")
+        || lower.contains("code 401")
+        || lower.contains("code 403")
+        || lower.contains("401 unauthorized")
+        || lower.contains("403 forbidden")
     {
         ErrorKind::AuthFailed
     } else if lower.contains("could not resolve host")
@@ -728,7 +750,7 @@ impl BlobBatch {
                         format!("failed to read blob {sha} from git cat-file: {e}"),
                     )
                 })?;
-                if lf != [b'\n'] {
+                if lf != *b"\n" {
                     return Err(GeectlError::new(
                         ErrorKind::InternalError,
                         format!("git cat-file returned a malformed blob trailer for {sha}"),
@@ -1268,8 +1290,11 @@ pub fn checkout_target(dir: &Path, project: &str, package: &str) -> Result<PathB
 /// `../evil`) would write outside the checkout when downloaded.
 /// The server's own file-name rule is the check, so a legitimate
 /// listing always passes; `\` is refused too, since it separates
-/// paths on Windows.
+/// paths on Windows. Two entries that collide case-insensitively
+/// (`Foo.spec` vs `foo.spec`) are refused too: a case-insensitive
+/// checkout cannot hold both.
 fn check_listing_names(listing: &DirectoryListing) -> Result<(), GeectlError> {
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
     for entry in &listing.entries {
         if !valid_obs_filename(&entry.name) || entry.name.contains('\\') {
             return Err(GeectlError::new(
@@ -1280,6 +1305,21 @@ fn check_listing_names(listing: &DirectoryListing) -> Result<(), GeectlError> {
                 ),
             ));
         }
+        // A case-insensitive checkout (macOS, Windows) cannot hold
+        // both `Foo.spec` and `foo.spec`: the second download
+        // overwrites the first. The fold is Unicode-aware, not
+        // ASCII-only, so it holds for non-ASCII names too.
+        let folded = entry.name.to_lowercase();
+        if let Some(first) = seen.get(&folded) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "file names in the directory listing collide case-insensitively: {first:?} and {:?}",
+                    entry.name
+                ),
+            ));
+        }
+        seen.insert(folded, entry.name.as_str());
     }
     Ok(())
 }
@@ -1939,16 +1979,56 @@ pub fn rm(wc: &WorkingCopy, files: &[String], dry_run: &DryRun) -> Result<Option
     Ok(Some(()))
 }
 
-/// Stage every change in the worktree: new files, modifications,
-/// and deletions. Returns `None` in dry-run.
+/// Stage new files and worktree deletions: `status` + add of
+/// `?` + rm of `!`, as the design doc says. `status` lists
+/// untracked files with `--exclude-standard`, so a file the user
+/// excluded (global excludes, `.gitignore`, `.git/info/exclude`)
+/// is never in the `?` set and is never staged — unlike
+/// `git add -f -A`, which would stage it and the next commit
+/// would ship it to OBS. Tracked files are unaffected by ignore
+/// rules either way. Modifications to tracked files are staged
+/// with `add`, not here. Returns `None` in dry-run.
 pub fn addremove(wc: &WorkingCopy, dry_run: &DryRun) -> Result<Option<()>, GeectlError> {
     if !dry_run.allow(&format!("stage every change in {}", wc.root.display())) {
         return Ok(None);
     }
-    // Forced: `git add -A` honours the user's global excludes,
-    // so an excluded file would be left out of the stage (see
-    // `checkout_obs`).
-    git(&wc.root, "add", &["-f", "-A"], &[])?;
+    let entries = status(wc)?;
+    let untracked: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry.code == StatusCode::Unknown)
+        .map(|entry| entry.path.as_str())
+        .collect();
+    // A staged-new file deleted from the worktree is `Added`,
+    // not `Missing` (the cached diff wins), but it stages as a
+    // deletion all the same, as `git add -A` did: otherwise the
+    // next commit would send a file that no longer exists.
+    // `symlink_metadata`, not `exists`: a broken symlink is
+    // still in the worktree.
+    let missing: Vec<&str> = entries
+        .iter()
+        .filter(|entry| {
+            entry.code == StatusCode::Missing
+                || (entry.code == StatusCode::Added
+                    && wc.root.join(&entry.path).symlink_metadata().is_err())
+        })
+        .map(|entry| entry.path.as_str())
+        .collect();
+    if !untracked.is_empty() {
+        // Literal pathspecs, no `-f`: the paths are the `?` set,
+        // never an ignored file.
+        let mut args = vec!["--"];
+        args.extend(untracked);
+        git_literal(&wc.root, "add", &args, &[])?;
+    }
+    if !missing.is_empty() {
+        // Forced: a missing file with staged changes still stages
+        // as a deletion (the `rm` leaf does the same). The `-f`
+        // cannot stage an ignored file: the `!` set holds tracked
+        // files only, and ignore rules never apply to those.
+        let mut args = vec!["-f", "--"];
+        args.extend(missing);
+        git_literal(&wc.root, "rm", &args, &[])?;
+    }
     Ok(Some(()))
 }
 
@@ -2283,6 +2363,8 @@ fn commit_obs(
                 let content = index_content(wc, name)?;
                 attach_sha256(&mut entries, name, &content);
             }
+            // A staged PUT buffers one whole file in memory:
+            // streaming PUTs need an `ObsClient` API change.
             for name in &answer.missing {
                 let content = index_content(wc, name)?;
                 client.put_file_staged_bytes(&wc.project, &wc.package, name, &content, dry_run)?;
@@ -3487,15 +3569,26 @@ pub fn pull(
         client.directory_listing_expanded(&wc.project, &wc.package)?;
     // The expanded downloads are pinned to the expanded
     // listing's revision, like the update path pins to its
-    // listing's revision.
+    // listing's revision: an unpinned pull would download files
+    // the listing never named, so a listing without a revision
+    // (or with an unparsable one) errors instead of pulling.
     let pinned = expanded_rev
         .and_then(|rev| rev.parse::<u64>().ok())
-        .map(RevisionSpec::Rev);
+        .map(RevisionSpec::Rev)
+        .ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "the server did not return a revision for {}/{}",
+                    wc.project, wc.package
+                ),
+            )
+        })?;
     let tree = build_base_tree(
         client,
         wc,
         &listing,
-        pinned.as_ref(),
+        Some(&pinned),
         Some(&new_baserev),
         true,
     )?;
@@ -3568,8 +3661,10 @@ fn rebase_target(wc: &WorkingCopy) -> Result<Option<String>, GeectlError> {
 }
 
 /// Whether the worktree file `path` still contains conflict
-/// markers: a line starting with `<<<<<<<` or `>>>>>>>`, or a
-/// line that is exactly `=======`. Read as bytes, streamed: the
+/// markers: a line starting with `<<<<<<<` or `>>>>>>>`. A lone
+/// line that is exactly `=======` is not a marker: a conflicted
+/// file that legitimately contains such a line (a separator, a
+/// test fixture) must still resolve. Read as bytes, streamed: the
 /// file may be large, and may not be UTF-8. A missing file holds
 /// no markers (a deletion in a conflict is a resolution).
 fn file_has_conflict_markers(root: &Path, path: &str) -> Result<bool, GeectlError> {
@@ -3597,7 +3692,7 @@ fn file_has_conflict_markers(root: &Path, path: &str) -> Result<bool, GeectlErro
         if line.ends_with(b"\r") {
             line = &line[..line.len() - 1];
         }
-        if line.starts_with(b"<<<<<<<") || line.starts_with(b">>>>>>>") || line == b"=======" {
+        if line.starts_with(b"<<<<<<<") || line.starts_with(b">>>>>>>") {
             return Ok(true);
         }
     }
@@ -4458,6 +4553,44 @@ mod tests {
     }
 
     #[test]
+    fn checkout_refuses_a_case_insensitive_listing_collision() {
+        // `Foo.spec` and `foo.spec` cannot coexist on a
+        // case-insensitive checkout (macOS, Windows): the second
+        // download would overwrite the first, so the listing is
+        // refused before anything is downloaded.
+        let listing = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"Foo.spec\" size=\"10\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+            </directory>"
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &listing,
+            );
+        let dir = TempDirGuard::new("checkout-case-collision");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            None,
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(!dir.path.join("home_alice").join("foo").exists());
+        let _ = dir;
+    }
+
+    #[test]
     fn checkout_sanitizes_colons_in_the_directory_name() {
         // `:` is legal in an OBS name but not in a Windows path:
         // the checkout lands under the sanitized name, and the
@@ -4612,6 +4745,72 @@ mod tests {
         );
         assert_eq!(puts[0].1, b"new file\n".to_vec());
         assert!(puts[0].2);
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_obs_base_refresh_failure_names_the_landed_revision() {
+        // The commit lands revision 2, then the base refresh
+        // fails: a stale `.git/config.lock` makes `git config
+        // --local` refuse the write. The error names the landed
+        // revision: the agent must not retry the commit and land
+        // a second revision.
+        let validate_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv&withvalidate=1";
+        let final_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv";
+        let http = checkout_http()
+            .with_post(
+                validate_url,
+                    "<directory error=\"missing\" name=\"foo\"><entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" name=\"bar.txt\" /></directory>",
+                )
+            .with_post(
+                final_url,
+                &format!("<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\" />"),
+            )
+            .with_put_bytes(
+                "https://api.opensuse.org/source/home:alice/foo/bar.txt?rev=repository",
+                "<revision rev=\"repository\"><srcmd5>empty</srcmd5></revision>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = client
+            .package_requests_search_url("home:alice", "foo")
+            .unwrap();
+        let http = http.with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"42\" /></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "foo.spec", "Name: bar\n");
+        write_file(&wc.root, "bar.txt", "new file\n");
+        add(
+            &wc,
+            &["foo.spec".to_string(), "bar.txt".to_string()],
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::write(wc.root.join(".git").join("config.lock"), "").unwrap();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("the commit landed as revision 2"),
+            "message: {message}"
+        );
+        // The base is unrefreshed in the struct: the commit did
+        // not complete. (On disk the reset already moved HEAD to
+        // the new root before the config write failed, so the
+        // record is stale. That is why the error must name the
+        // landed revision.)
+        assert_eq!(wc.base_rev, "1");
         let _ = dir;
     }
 
@@ -6367,6 +6566,55 @@ mod tests {
         assert_eq!(origin_head, head);
     }
 
+    #[test]
+    fn commit_git_base_record_failure_names_the_pushed_head() {
+        // The push lands, then the base record update fails: a
+        // stale `.git/config.lock` makes `git config --local`
+        // refuse the write. The error names the pushed head: the
+        // agent must not push again.
+        let dir = TempDirGuard::new("git-commit-lock");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The OBS side already synced the pushed head: the poll
+        // finds it on the first read.
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let old_base = wc.base_rev.clone();
+        std::fs::write(wc.root.join(".git").join("config.lock"), "").unwrap();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("the push landed (head {head})")),
+            "message: {message}"
+        );
+        // The base is unrefreshed: the commit did not complete.
+        assert_eq!(open(&wc.root).unwrap().base_rev, old_base);
+        let _ = dir;
+    }
+
     /// Sets an environment variable, restoring the previous value
     /// (or removing it) on drop: a fixed git date must not leak
     /// into later tests.
@@ -6926,6 +7174,42 @@ mod tests {
     }
 
     #[test]
+    fn pull_refuses_an_expanded_listing_without_a_revision() {
+        // The expanded downloads are pinned to the expanded
+        // listing's revision, like the update path: a listing
+        // without one errors instead of pulling unpinned.
+        let http = pull_http().with_get(
+            "https://api.opensuse.org/source/home:alice/foo?expand=1",
+            &format!(
+                "<directory name=\"foo\" srcmd5=\"{EXPANDED_SRCMD5}\" vrev=\"1\">\
+                <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047303\" name=\"bar.spec\" size=\"10\" />\
+                </directory>"
+            ),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dir = TempDirGuard::new("pull-no-rev");
+        let mut wc = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            None,
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        let err = pull(&mut wc, &client, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        let message = err.to_string();
+        assert!(
+            message.contains("did not return a revision"),
+            "message: {message}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
     fn pull_dry_run_refuses_a_git_backed_checkout() {
         let dir = TempDirGuard::new("pull-dry-git");
         let origin = git_origin(&dir.path);
@@ -7407,10 +7691,13 @@ mod tests {
     }
 
     #[test]
-    fn addremove_stages_a_globally_excluded_file() {
-        // `git add -A` honours the excludes, so `addremove`
-        // forces the add: a new file matching the excludes is
-        // still picked up, not silently dropped.
+    fn addremove_skips_a_globally_excluded_file() {
+        // `status` lists untracked files with `--exclude-standard`,
+        // so a file matching the excludes is never in the `?` set:
+        // `addremove` leaves it unstaged, and the next commit
+        // does not ship it to OBS. A non-excluded new file is
+        // staged, and a tracked file deleted from the worktree
+        // stages as a deletion.
         let (dir, wc) = do_checkout(&checkout_http());
         std::fs::write(
             wc.root.join(".git").join("info").join("exclude"),
@@ -7418,9 +7705,14 @@ mod tests {
         )
         .unwrap();
         write_file(&wc.root, "fix.patch", "patch\n");
+        write_file(&wc.root, "new.txt", "new\n");
+        std::fs::remove_file(wc.root.join("foo.tar.gz")).unwrap();
         addremove(&wc, &DryRun::new(false)).unwrap().unwrap();
         let tracked = git(&wc.root, "ls-files", &["-z"], &[]).unwrap();
-        assert!(split_nul(&tracked).contains(&"fix.patch".to_string()));
+        let tracked = split_nul(&tracked);
+        assert!(!tracked.contains(&"fix.patch".to_string()));
+        assert!(tracked.contains(&"new.txt".to_string()));
+        assert!(!tracked.contains(&"foo.tar.gz".to_string()));
         let _ = dir;
     }
 
@@ -7515,6 +7807,45 @@ mod tests {
         assert!(message.contains("foo.spec"), "message: {message}");
         assert!(message.contains("conflict markers"), "message: {message}");
         assert!(rebase_in_progress(&wc).unwrap());
+        let _ = dir;
+    }
+
+    #[test]
+    fn resolve_accepts_a_file_holding_only_a_separator_line() {
+        // A lone `=======` line is not a conflict marker: a
+        // conflicted file that legitimately contains one (a
+        // separator, a test fixture) still resolves.
+        let http = checkout_http()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo?rev=2",
+                &listing_rev2(),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=2",
+                b"Name: server\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=2",
+                b"",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local spec"]);
+        let report = update(&mut wc, &client, Some("2"), None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.conflicts, vec!["foo.spec".to_string()]);
+        assert!(read_file(&wc.root, "foo.spec").contains("<<<<<<<"));
+        // The resolution keeps a lone separator line: no angle
+        // marker is left, so resolve stages it and continues.
+        write_file(&wc.root, "foo.spec", "Name: local\n=======\n");
+        let resolved = resolve(&mut wc, &DryRun::new(false)).unwrap().unwrap();
+        assert_eq!(resolved, vec!["foo.spec".to_string()]);
+        assert!(!rebase_in_progress(&wc).unwrap());
         let _ = dir;
     }
 
@@ -7780,6 +8111,65 @@ mod tests {
         assert_eq!(
             classify_git_failure("fatal: some unknown failure"),
             ErrorKind::InternalError
+        );
+        assert_eq!(
+            classify_git_failure("The requested URL returned error: 401"),
+            ErrorKind::AuthFailed
+        );
+        assert_eq!(
+            classify_git_failure("fatal: unable to access 'https://example.com/': The requested URL returned error: 403"),
+            ErrorKind::AuthFailed
+        );
+        assert_eq!(
+            classify_git_failure("curl: (22) The requested URL returned error: 401 Unauthorized"),
+            ErrorKind::AuthFailed
+        );
+        assert_eq!(
+            classify_git_failure("Received HTTP code 401 from proxy after CONNECT"),
+            ErrorKind::AuthFailed
+        );
+        // A bare `401`/`403` digit run — a SHA, a file name, a
+        // port — is not an auth failure.
+        assert_eq!(
+            classify_git_failure(
+                "fatal: unable to read 401a2b3c4d5e6f7890abcdef1234567890abcdef12"
+            ),
+            ErrorKind::InternalError
+        );
+        assert_eq!(
+            classify_git_failure(
+                "error: pathspec 'fix-403.patch' did not match any file(s) known to git"
+            ),
+            ErrorKind::InternalError
+        );
+    }
+
+    #[test]
+    fn git_network_timeout_parsing_falls_back_to_the_default() {
+        // Unset, invalid, zero, and negative values fall back to
+        // the 300s default; a valid value is used as-is. The
+        // parsing is tested directly: the cached value cannot be
+        // re-read in-process.
+        assert_eq!(parse_git_network_timeout(None), Duration::from_secs(300));
+        assert_eq!(
+            parse_git_network_timeout(Some("abc".to_string())),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_git_network_timeout(Some("0".to_string())),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_git_network_timeout(Some("-5".to_string())),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_git_network_timeout(Some("".to_string())),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_git_network_timeout(Some("60".to_string())),
+            Duration::from_secs(60)
         );
     }
 

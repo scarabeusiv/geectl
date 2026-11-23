@@ -229,7 +229,10 @@ changes the call the agent makes:
   runs before the credentials check. A dry-run resolves no Gitea
   credentials and opens the checkout read-only (`open_read`): the base
   record is read, never rewritten, so a read path cannot heal or move
-  it. `checkout` in DryRun lists what would
+  it. `pull` is the exception on the OBS side: its dry-run plan reads
+  the authed expanded routes, so it resolves OBS credentials even in
+  dry-run; the plan is read-only, so no mutation can happen.
+  `checkout` in DryRun lists what would
   be downloaded, writes nothing. `update`/`commit` print the plan (files
   to PUT, files to delete, the would-be revision is not created) and touch
   neither server nor local state. `add`/`rm` in DryRun are no-ops that

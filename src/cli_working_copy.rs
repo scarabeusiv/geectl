@@ -60,22 +60,30 @@ fn endpoints() -> Result<Endpoints, GeectlError> {
 /// rest read public routes. A leaf that needs credentials and
 /// does not ask for them 401s — `pull` did, until this table
 /// said so. The single source of truth for the credential
-/// wiring, pinned by the `leaf_credential_wiring` test.
+/// wiring, pinned by the `leaf_credential_wiring` test; read
+/// only through `obs_client`, which is the single choke point.
 fn needs_obs_credentials(leaf: &str) -> bool {
     matches!(leaf, "pull" | "commit")
 }
 
-/// An OBS client on `http`: no credentials for reads, the
-/// per-instance OBS credentials for mutations when live (the
-/// CLI-wide rule: a dry-run mutation resolves no credentials).
+/// An OBS client on `http`: the per-instance OBS credentials for
+/// a leaf that needs them, when live. The leaf name is the only
+/// input — `obs_client` does the `needs_obs_credentials` lookup
+/// itself, so the wiring is pinned by the
+/// `leaf_credential_wiring` test by construction. The CLI-wide
+/// rule is that a dry-run resolves no credentials, except `pull`:
+/// its dry-run plan reads the authed expanded routes, and the
+/// plan is read-only, so it resolves credentials in dry-run too
+/// (a dry-run pull without them 401s on exactly the servers the
+/// credential fix was for).
 fn obs_client<'a>(
     http: &'a dyn HttpClient,
     endpoints: &Endpoints,
-    need_credentials: bool,
+    leaf: &str,
     live: bool,
     debug: &Debug,
 ) -> Result<ObsClient<'a>, GeectlError> {
-    let credentials = if need_credentials && live {
+    let credentials = if needs_obs_credentials(leaf) && (live || leaf == "pull") {
         EnvObsAuth::credentials_for_url(
             &endpoints.obs_base,
             &endpoints.obs_base,
@@ -218,13 +226,7 @@ pub fn checkout(
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let endpoints = endpoints()?;
-    let client = obs_client(
-        &http,
-        &endpoints,
-        needs_obs_credentials("checkout"),
-        live,
-        debug,
-    )?;
+    let client = obs_client(&http, &endpoints, "checkout", live, debug)?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     // A dry-run checkout clones nothing: resolving the Gitea
     // token here would resolve credentials for a plan.
@@ -305,13 +307,7 @@ pub fn update(
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let endpoints = endpoints()?;
-    let client = obs_client(
-        &http,
-        &endpoints,
-        needs_obs_credentials("update"),
-        live,
-        debug,
-    )?;
+    let client = obs_client(&http, &endpoints, "update", live, debug)?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     // A dry-run update fetches nothing: resolving the Gitea
     // token here would resolve credentials for a plan.
@@ -570,13 +566,7 @@ pub fn commit(
     }
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let endpoints = endpoints()?;
-    let client = obs_client(
-        &http,
-        &endpoints,
-        needs_obs_credentials("commit"),
-        live,
-        debug,
-    )?;
+    let client = obs_client(&http, &endpoints, "commit", live, debug)?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     // A dry-run commit pushes nothing: resolving the Gitea
     // token here would resolve credentials for a plan.
@@ -653,16 +643,10 @@ fn commit_result(
 pub fn pull(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let endpoints = endpoints()?;
-    // `pull` needs credentials: its reads hit the authed
-    // expanded routes, and without them the pull (and its
-    // dry-run plan) 401s.
-    let client = obs_client(
-        &http,
-        &endpoints,
-        needs_obs_credentials("pull"),
-        live,
-        debug,
-    )?;
+    // `pull` resolves credentials even in dry-run (see
+    // `obs_client`): its plan reads the authed expanded routes,
+    // and the plan is read-only.
+    let client = obs_client(&http, &endpoints, "pull", live, debug)?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
     let mut wc = open_working_copy(live)?;
     let report = working_copy::pull(&mut wc, &client, &dry_run)?;
@@ -964,7 +948,10 @@ mod tests {
     fn leaf_credential_wiring_pins_which_leaves_need_credentials() {
         // `pull` reads the authed expanded routes and `commit`
         // mutates: without credentials both 401. `checkout` and
-        // `update` read public routes only.
+        // `update` read public routes only. `obs_client` is the
+        // single choke point for the table, so this pins the
+        // wiring: a leaf names itself there, and the table
+        // decides.
         assert!(needs_obs_credentials("pull"));
         assert!(needs_obs_credentials("commit"));
         assert!(!needs_obs_credentials("checkout"));
