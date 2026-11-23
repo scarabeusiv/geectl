@@ -313,12 +313,16 @@ against) with per-file unified diffs. `search_packages` and
 `search_projects` match a substring against name, title, and
 description — the search is a substring match, not the exact match
 osc defaults to — and the term must be non-empty and carry no `'`.
-`owners`, `owners_for_binary`, and `owners_for_package` read the owner search, `maintainers`
-filters it to role `maintainer`, and `whois` reads a person. The
-credentialed reads fail loudly without credentials, and an unexpected
-response is an error, never an empty list. A 403 surfaces as
-`AuthFailed` even for the public reads — a search-cap 403 on a public
-read reads as an auth failure, not a missing package. `project_diff`
+`owners`, `owners_for_binary`, and `owners_for_package` read the owner
+search, `maintainers` filters it to role `maintainer`, and `whois`
+reads a person. The credentialed reads fail loudly without
+credentials, and an unexpected response is an error, never an empty
+list — except the package-only search: a 400 or 404 there means no
+owner root project holds the package, so it returns no owners. The
+package search sends no `limit`, so it returns every hit the server
+reports. A 403 surfaces as `AuthFailed` even for the public reads — a
+search-cap 403 on a public read reads as an auth failure, not a
+missing package. `project_diff`
 classifies every package in either project — identical, differs,
 only-in-old, only-in-new — with a per-file unified diff for the
 packages that differ, optionally annotated with the open submit
