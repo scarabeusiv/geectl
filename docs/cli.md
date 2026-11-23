@@ -102,7 +102,7 @@ pair up front.
 ## Top level
 
 ```
-Geeko Controller — a machine-first CLI for agents (OBS + src.opensuse.org)
+Geeko Controller — a CLI for openSUSE packaging workflows (OBS + src.opensuse.org)
 
 Usage: geectl [OPTIONS] [COMMAND]
 

@@ -1,4 +1,4 @@
-//! geectl — Geeko Controller, a machine-first CLI for agents.
+//! geectl — Geeko Controller, a CLI for openSUSE packaging workflows.
 //!
 //! Non-interactive is the only mode: no prompts, no editor, no pager.
 //! Missing required input fails fast with a structured error naming the
@@ -49,7 +49,7 @@ impl Format {
 #[command(
     name = "geectl",
     version,
-    about = "Geeko Controller — a machine-first CLI for agents (OBS + src.opensuse.org)",
+    about = "Geeko Controller — a CLI for openSUSE packaging workflows (OBS + src.opensuse.org)",
     long_about = None
 )]
 struct Cli {

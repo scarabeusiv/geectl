@@ -335,13 +335,13 @@ shape rules above. Six examples pin the shape:
 - **Determinism.** The same invocation must produce the same bytes
   in every context. A tty-sniffing default means `geectl request
   show 5` prints text in a terminal and JSON in a pipe — the same
-  command, different output. For a machine-first tool whose users
-  are agents running it both ways (terminal, CI, scripts), that
+  command, different output. For a tool whose users run it both ways
+  (terminal, CI, scripts), that
   nondeterminism is a bug farm: a script that worked interactively
   breaks in CI, a pasted transcript does not reproduce, tests must
   fake a tty.
-- **The agent is the primary consumer.** JSON default everywhere
-  keeps the agent's parsing unconditional — no "which format did I
+- **Automation is the primary consumer.** JSON default everywhere
+  keeps programmatic parsing unconditional — no "which format did I
   get?" branch.
 - **Humans opt in once.** `--format text` is explicit and cheap;
   shell users who want text always alias it

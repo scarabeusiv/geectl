@@ -3,14 +3,12 @@
 
 # geectl
 
-**Geeko Controller — a machine-first CLI for agents.**
+**Geeko Controller — a CLI for openSUSE packaging workflows.**
 
 geectl drives openSUSE packaging workflows from the command line, built for
-agents, not for interactive use. It talks to the OBS (Open Build Service) API
+automation and scripting, with human-readable text output via `--format text`. It talks to the OBS (Open Build Service) API
 directly (primary goal) and, as a secondary goal, to the src.opensuse.org git
 workflow (Gitea), hiding the backend choice.
-
-It is a pure agentic flow. Human flows already exist and are not disrupted.
 
 ## Usage
 
@@ -102,9 +100,9 @@ The config file (`$XDG_CONFIG_HOME/geectl/config.toml`, default
 credential status (username only for Basic auth, never a secret value);
 `config init` writes the template and refuses to overwrite.
 
-There is no keyring backend: it needs a platform secret service and
-only serves interactive human use, while agents use environment
-variables or mounted secrets. The `AuthProvider` trait is the seam a
+There is no keyring backend: it needs a platform secret service, which
+only serves interactive use. Credentials come from environment variables
+or mounted secrets. The `AuthProvider` trait is the seam a
 keyring provider would plug into.
 
 Credentials are only sent over `https://` (or to a loopback host for

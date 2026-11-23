@@ -1,4 +1,4 @@
-//! geectl — Geeko Controller, a machine-first CLI for agents.
+//! geectl — Geeko Controller, a CLI for openSUSE packaging workflows.
 //!
 //! The library is the core of geectl: the binary is a thin CLI over it, so
 //! tools (e.g. freshcrab) can link the same logic instead of shelling out.
