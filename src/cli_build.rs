@@ -182,6 +182,11 @@ pub enum BuildCommand {
         repository: String,
         /// The architecture the package builds for.
         arch: String,
+        /// Read the buildinfo for another project instead of
+        /// `project`: the dep set the package would build against
+        /// there.
+        #[arg(long)]
+        alternative_project: Option<String>,
     },
     /// Read the build configuration for a project/repository: the
     /// expanded `_buildconfig` text the engine takes as `--dist`.
@@ -578,10 +583,19 @@ pub fn run_build(
             package,
             repository,
             arch,
+            alternative_project,
         } => {
-            let info = client.buildinfo(&project, &package, &repository, &arch)?;
+            let fetch = alternative_project.as_deref().unwrap_or(&project);
+            let info = client.buildinfo(fetch, &package, &repository, &arch)?;
             Ok((
-                buildinfo_payload(&project, &package, &repository, &arch, &info),
+                buildinfo_payload(
+                    &project,
+                    &package,
+                    &repository,
+                    &arch,
+                    alternative_project.as_deref(),
+                    &info,
+                ),
                 with_header(&header, render_buildinfo_text(&info)),
             ))
         }
@@ -856,6 +870,21 @@ fn coordinates_header(command: &BuildCommand) -> String {
                 coords.push(format!("package: {package}"));
             }
         }
+        BuildCommand::Buildinfo {
+            project,
+            package,
+            repository,
+            arch,
+            alternative_project,
+        } => {
+            coords.push(format!("project: {project}"));
+            coords.push(format!("package: {package}"));
+            coords.push(format!("repository: {repository}"));
+            coords.push(format!("arch: {arch}"));
+            if let Some(alt) = alternative_project {
+                coords.push(format!("alternative-project: {alt}"));
+            }
+        }
         BuildCommand::BuildLog {
             project,
             package,
@@ -888,12 +917,6 @@ fn coordinates_header(command: &BuildCommand) -> String {
             arch,
         }
         | BuildCommand::AbortBuild {
-            project,
-            package,
-            repository,
-            arch,
-        }
-        | BuildCommand::Buildinfo {
             project,
             package,
             repository,
@@ -1518,6 +1541,7 @@ fn buildinfo_payload(
     package: &str,
     repository: &str,
     arch: &str,
+    alternative_project: Option<&str>,
     info: &BuildInfo,
 ) -> Value {
     json!({
@@ -1525,6 +1549,7 @@ fn buildinfo_payload(
         "package": package,
         "repository": repository,
         "arch": arch,
+        "alternative_project": alternative_project,
         "error": info.error,
         "bdeps": info.bdeps.iter().map(|dep| dep.name.as_str()).collect::<Vec<_>>(),
     })
@@ -2154,6 +2179,18 @@ mod tests {
             "project: p package: k repository: r arch: a"
         );
         assert_eq!(
+            coordinates_header(&parse_build(&[
+                "buildinfo",
+                "p",
+                "k",
+                "r",
+                "a",
+                "--alternative-project",
+                "openSUSE:Factory"
+            ])),
+            "project: p package: k repository: r arch: a alternative-project: openSUSE:Factory"
+        );
+        assert_eq!(
             coordinates_header(&parse_build(&["build-history", "p", "k", "r", "a"])),
             "project: p package: k repository: r arch: a"
         );
@@ -2649,7 +2686,7 @@ mod tests {
             preinstall_image: None,
         };
         let text = render_buildinfo_text(&info);
-        let info_payload = buildinfo_payload("p", "k", "r", "a", &info);
+        let info_payload = buildinfo_payload("p", "k", "r", "a", None, &info);
         assert!(
             text.contains(&format!(
                 "error: {}",
@@ -2779,7 +2816,7 @@ mod tests {
         };
         assert!(render_buildinfo_text(&blocked).contains("error: unresolvable: DOES-NOT-EXIST"));
         assert_eq!(
-            buildinfo_payload("p", "k", "r", "a", &blocked)["error"],
+            buildinfo_payload("p", "k", "r", "a", None, &blocked)["error"],
             "unresolvable: DOES-NOT-EXIST"
         );
         let clean = BuildInfo {

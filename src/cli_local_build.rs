@@ -115,6 +115,30 @@ pub enum LocalBuildCommand {
         /// Force an image pull even when the local image is fresh.
         #[arg(long)]
         refresh_image: bool,
+        /// Build against another project instead of `project`:
+        /// buildinfo, buildconfig, the trust check, and dep
+        /// resolution use it. The root stays keyed by `project`.
+        #[arg(long)]
+        alternative_project: Option<String>,
+        /// Build in this directory instead of the derived
+        /// cache-dir root.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Skip the root initialization: start the build
+        /// immediately in the existing root. Needs an initialized
+        /// root (a previous build wrote the rpmlist and
+        /// buildconfig there).
+        #[arg(long)]
+        noinit: bool,
+        /// Save the built RPMs into this directory (created when
+        /// missing) on a green build.
+        #[arg(long, short = 'k')]
+        keep_rpms: Option<PathBuf>,
+        /// Prefer RPMs from this directory when installing the
+        /// build root: a dep whose file is there is used instead of
+        /// the cached or downloaded copy.
+        #[arg(long, short = 'p')]
+        prefer_packages: Option<PathBuf>,
         /// Timeout in seconds for the whole run.
         #[arg(long, default_value_t = 3600)]
         timeout_secs: u64,
@@ -267,6 +291,11 @@ pub fn run_local_build(
             release,
             trust_all_projects,
             refresh_image,
+            alternative_project,
+            root,
+            noinit,
+            keep_rpms,
+            prefer_packages,
             timeout_secs,
         } => {
             // One invocation does the whole loop: the run-mode
@@ -289,6 +318,11 @@ pub fn run_local_build(
             build_req.release = release.clone();
             build_req.trust_all_projects = trust_all_projects;
             build_req.refresh_image = refresh_image;
+            build_req.alternative_project = alternative_project.clone();
+            build_req.root = root.clone();
+            build_req.noinit = noinit;
+            build_req.keep_rpms = keep_rpms.clone();
+            build_req.prefer_packages = prefer_packages.clone();
             build_req.timeout_secs = timeout_secs;
             build_req.dry_run = !live;
             validate_build_request(&build_req)?;
@@ -305,16 +339,16 @@ pub fn run_local_build(
             let precommit =
                 vertical.precommit_with_deadline(&directory, timeout_secs, deadline, !live)?;
             let record = vertical.build_with_deadline(&build_req, deadline)?;
-            let header = match &flavor {
-                Some(flavor) => format!(
-                    "directory: {} project: {project} repo: {repo} arch: {arch} flavor: {flavor}",
-                    directory.display()
-                ),
-                None => format!(
-                    "directory: {} project: {project} repo: {repo} arch: {arch}",
-                    directory.display()
-                ),
-            };
+            let mut header = format!(
+                "directory: {} project: {project} repo: {repo} arch: {arch}",
+                directory.display()
+            );
+            if let Some(alt) = &alternative_project {
+                header.push_str(&format!(" alternative-project: {alt}"));
+            }
+            if let Some(flavor) = &flavor {
+                header.push_str(&format!(" flavor: {flavor}"));
+            }
             let text = with_header(
                 &header,
                 format!(
@@ -330,6 +364,10 @@ pub fn run_local_build(
                 "repo": repo,
                 "arch": arch,
                 "flavor": flavor,
+                "alternative_project": alternative_project,
+                "noinit": noinit,
+                "keep_rpms": keep_rpms,
+                "prefer_packages": prefer_packages,
                 "dry_run": !live,
                 "services": services,
                 "precommit": precommit,
@@ -470,9 +508,10 @@ fn render_spec_cleaner(result: &SpecCleanerResult) -> String {
 }
 
 /// A build record as text: the dry-run plan (image, root, repo,
-/// arch, and the engine argv), or the verdict with the exit code,
-/// log path, RPMs, rpmlint and check summaries, image digest,
-/// engine version, root, cache numbers, and eviction.
+/// arch, flavor, the new-flag fields when set, and the engine argv),
+/// or the verdict with the exit code, log path, RPMs, rpmlint and
+/// check summaries, image digest, engine version, root, cache
+/// numbers, and eviction.
 fn render_build(record: &BuildRecord) -> String {
     if record.dry_run {
         match &record.plan {
@@ -486,6 +525,15 @@ fn render_build(record: &BuildRecord) -> String {
                 ];
                 if let Some(flavor) = &plan.flavor {
                     lines.push(format!("flavor: {flavor}"));
+                }
+                if let Some(alt) = &plan.alternative_project {
+                    lines.push(format!("alternative-project: {alt}"));
+                }
+                if let Some(keep) = &plan.keep_rpms {
+                    lines.push(format!("keep-rpms: {}", keep.display()));
+                }
+                if let Some(prefer) = &plan.prefer_packages {
+                    lines.push(format!("prefer-packages: {}", prefer.display()));
                 }
                 lines.join("\n")
             }
@@ -503,6 +551,9 @@ fn render_build(record: &BuildRecord) -> String {
             for rpm in &record.rpms {
                 lines.push(format!("rpm: {}", rpm.display()));
             }
+        }
+        for rpm in &record.kept_rpms {
+            lines.push(format!("kept-rpm: {}", rpm.display()));
         }
         lines.push(format!(
             "rpmlint: {} errors, {} warnings (badness {})",
@@ -527,15 +578,17 @@ fn render_build(record: &BuildRecord) -> String {
         } else {
             lines.push(format!("root: {}", record.root_path.display()));
         }
-        lines.push(format!(
-            "cache: pkg {} hits, {} misses{}",
-            record.cache.pkg_hits,
-            record.cache.pkg_misses,
-            match record.cache.sccache_hits {
-                Some(hits) => format!(", sccache {hits} hits"),
-                None => String::new(),
-            }
-        ));
+        let mut cache = format!(
+            "cache: pkg {} hits, {} misses",
+            record.cache.pkg_hits, record.cache.pkg_misses
+        );
+        if record.cache.pkg_preferred > 0 {
+            cache.push_str(&format!(", {} preferred", record.cache.pkg_preferred));
+        }
+        if let Some(hits) = record.cache.sccache_hits {
+            cache.push_str(&format!(", sccache {hits} hits"));
+        }
+        lines.push(cache);
         if let Some(image) = &record.preinstall_image {
             lines.push(format!("preinstall-image: {image}"));
         }
@@ -709,6 +762,7 @@ mod tests {
                 trust_all_projects,
                 refresh_image,
                 timeout_secs,
+                ..
             } => {
                 assert_eq!(directory, PathBuf::from("/tmp/pkg"));
                 assert_eq!(project, "home:foo");
@@ -761,6 +815,65 @@ mod tests {
                 assert!(trust_all_projects);
                 assert!(refresh_image);
                 assert_eq!(timeout_secs, 60);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match parse(&[
+            "geectl",
+            "local-build",
+            "build",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--repo",
+            "standard",
+            "--alternative-project",
+            "openSUSE:Factory",
+            "--root",
+            "/tmp/custom-root",
+            "--noinit",
+            "--keep-rpms",
+            "/tmp/keep",
+            "--prefer-packages",
+            "/tmp/prefer",
+        ]) {
+            LocalBuildCommand::Build {
+                alternative_project,
+                root,
+                noinit,
+                keep_rpms,
+                prefer_packages,
+                ..
+            } => {
+                assert_eq!(alternative_project.as_deref(), Some("openSUSE:Factory"));
+                assert_eq!(root, Some(PathBuf::from("/tmp/custom-root")));
+                assert!(noinit);
+                assert_eq!(keep_rpms, Some(PathBuf::from("/tmp/keep")));
+                assert_eq!(prefer_packages, Some(PathBuf::from("/tmp/prefer")));
+            }
+            _ => panic!("wrong variant"),
+        }
+        match parse(&[
+            "geectl",
+            "local-build",
+            "build",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--repo",
+            "standard",
+            "-k",
+            "/tmp/keep",
+            "-p",
+            "/tmp/prefer",
+        ]) {
+            LocalBuildCommand::Build {
+                keep_rpms,
+                prefer_packages,
+                ..
+            } => {
+                assert_eq!(keep_rpms, Some(PathBuf::from("/tmp/keep")));
+                assert_eq!(prefer_packages, Some(PathBuf::from("/tmp/prefer")));
             }
             _ => panic!("wrong variant"),
         }
@@ -1020,6 +1133,7 @@ mod tests {
             exit_code: 0,
             log_path: PathBuf::from("/tmp/root/.build.log"),
             rpms: vec![PathBuf::from("/tmp/root/RPMS/foo-1.0-1.x86_64.rpm")],
+            kept_rpms: vec![PathBuf::from("/tmp/keep/foo-1.0-1.x86_64.rpm")],
             rpmlint: RpmlintSummary {
                 errors: 0,
                 warnings: 1,
@@ -1037,6 +1151,7 @@ mod tests {
             cache: CacheStats {
                 pkg_hits: 3,
                 pkg_misses: 0,
+                pkg_preferred: 1,
                 sccache_hits: Some(5),
             },
             eviction: EvictionReport::default(),
@@ -1052,6 +1167,7 @@ mod tests {
             exit_code: 0,
             log_path: PathBuf::from("/tmp/root/.build.log"),
             rpms: vec![],
+            kept_rpms: vec![],
             rpmlint: RpmlintSummary::default(),
             checks: None,
             image_digest: None,
@@ -1068,6 +1184,9 @@ mod tests {
                 repo: "standard".to_string(),
                 arch: "x86_64".to_string(),
                 flavor: None,
+                alternative_project: None,
+                keep_rpms: None,
+                prefer_packages: None,
                 argv: vec![
                     "build".to_string(),
                     "--root=/tmp/root".to_string(),
@@ -1085,11 +1204,22 @@ mod tests {
         assert!(text.contains("root: /tmp/root"));
         assert!(text.contains("repo: standard"));
         assert!(text.contains("arch: x86_64"));
+        let mut flagged = dry_run_build_record();
+        let plan = flagged.plan.as_mut().unwrap();
+        plan.alternative_project = Some("openSUSE:Factory".to_string());
+        plan.keep_rpms = Some(PathBuf::from("/tmp/keep"));
+        plan.prefer_packages = Some(PathBuf::from("/tmp/prefer"));
+        let text = render_build(&flagged);
+        assert!(text.contains("alternative-project: openSUSE:Factory"));
+        assert!(text.contains("keep-rpms: /tmp/keep"));
+        assert!(text.contains("prefer-packages: /tmp/prefer"));
         let mut record = dry_run_build_record();
         record.plan = None;
         assert_eq!(render_build(&record), "no plan");
         let text = render_build(&build_record());
         assert!(text.contains("verdict: green"));
+        assert!(text.contains("kept-rpm: /tmp/keep/foo-1.0-1.x86_64.rpm"));
+        assert!(text.contains("cache: pkg 3 hits, 0 misses, 1 preferred, sccache 5 hits"));
         assert!(text.contains("exit: 0"));
         assert!(text.contains("log: /tmp/root/.build.log"));
         assert!(text.contains("rpm: /tmp/root/RPMS/foo-1.0-1.x86_64.rpm"));
@@ -1098,7 +1228,6 @@ mod tests {
         assert!(text.contains("image: sha256:abc"));
         assert!(text.contains("engine: 20261016"));
         assert!(text.contains("root: /tmp/root (reused)"));
-        assert!(text.contains("cache: pkg 3 hits, 0 misses, sccache 5 hits"));
         assert!(text.contains("preinstall-image: preinstallimage.x86_64.rpm"));
         assert!(!text.contains("eviction:"));
         let mut record = build_record();

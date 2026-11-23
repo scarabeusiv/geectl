@@ -184,6 +184,28 @@ pub struct BuildRequest {
     pub trust_all_projects: bool,
     /// Force an image pull even when the local image is fresh.
     pub refresh_image: bool,
+    /// The alternative project the build runs against: buildinfo,
+    /// buildconfig, the trust check, and dep resolution use it
+    /// instead of `project`. The root and sccache stay keyed by
+    /// `project`: the root is local state, and the engine
+    /// reinstalls the dep set from the fresh rpmlist on every
+    /// non-`--noinit` build.
+    pub alternative_project: Option<String>,
+    /// A build root of its own, instead of the derived cache-dir
+    /// root. Parallel builds of the same package do not share one.
+    pub root: Option<PathBuf>,
+    /// Skip the root initialization: the engine starts the build
+    /// immediately in the existing root, installing nothing. Needs
+    /// an initialized root (a previous build wrote the rpmlist and
+    /// buildconfig there).
+    pub noinit: bool,
+    /// Copy the built RPMs into this directory on a green build;
+    /// the directory is created when missing.
+    pub keep_rpms: Option<PathBuf>,
+    /// Prefer RPMs from this directory when installing the build
+    /// root: a dep whose file is there is used instead of the
+    /// download, hdrmd5-verified when the buildinfo carries one.
+    pub prefer_packages: Option<PathBuf>,
     /// The build timeout in seconds (default 3600): one budget for
     /// the whole build op — the image pull and the engine share it,
     /// so a slow pull leaves less time for the engine.
@@ -193,8 +215,10 @@ pub struct BuildRequest {
 }
 
 impl BuildRequest {
-    /// A request with the defaults: no flavor, no clean, no release,
-    /// no trust flag, no refresh, the default timeout, a real build.
+    /// A request with the defaults: no flavor, no clean, no
+    /// release, no trust flag, no refresh, no alternative project,
+    /// no custom root, init on, no keep/prefer dirs, the default
+    /// timeout, a real build.
     pub fn new(source_dir: PathBuf, project: &str, repo: &str, arch: &str) -> Self {
         BuildRequest {
             source_dir,
@@ -206,9 +230,21 @@ impl BuildRequest {
             release: None,
             trust_all_projects: false,
             refresh_image: false,
+            alternative_project: None,
+            root: None,
+            noinit: false,
+            keep_rpms: None,
+            prefer_packages: None,
             timeout_secs: DEFAULT_BUILD_TIMEOUT_SECS,
             dry_run: false,
         }
+    }
+
+    /// The project the server-side fetches run against: the
+    /// alternative project when one was passed, else the package's
+    /// own project.
+    pub fn fetch_project(&self) -> &str {
+        self.alternative_project.as_deref().unwrap_or(&self.project)
     }
 }
 
@@ -253,13 +289,16 @@ pub struct CheckSummary {
     pub total: u64,
 }
 
-/// Cache statistics for one build: pkg cache hits/misses, and the
-/// sccache hit count when the log carries one (best-effort, None
-/// when the engine reported none).
+/// Cache statistics for one build: pkg cache hits/misses,
+/// preferred-package uses, and the sccache hit count when the log
+/// carries one (best-effort, None when the engine reported none).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct CacheStats {
     pub pkg_hits: u64,
     pub pkg_misses: u64,
+    /// Deps taken from the `--prefer-packages` directory instead of
+    /// downloaded.
+    pub pkg_preferred: u64,
     pub sccache_hits: Option<u64>,
 }
 
@@ -329,6 +368,15 @@ pub struct EnginePlan {
     pub repo: String,
     pub arch: String,
     pub flavor: Option<String>,
+    /// The alternative project the buildinfo was fetched for, when
+    /// `--alternative-project` was passed.
+    pub alternative_project: Option<String>,
+    /// The directory built RPMs are copied to on a green build,
+    /// when `--keep-rpms` was passed.
+    pub keep_rpms: Option<PathBuf>,
+    /// The directory preferred RPMs are taken from, when
+    /// `--prefer-packages` was passed.
+    pub prefer_packages: Option<PathBuf>,
     /// The engine argv, engine binary first, spec last.
     pub argv: Vec<String>,
 }
@@ -345,6 +393,9 @@ pub struct BuildRecord {
     pub log_path: PathBuf,
     /// The built RPMs (empty when the build failed).
     pub rpms: Vec<PathBuf>,
+    /// The built RPMs copied to the `--keep-rpms` directory on a
+    /// green build (empty otherwise).
+    pub kept_rpms: Vec<PathBuf>,
     pub rpmlint: RpmlintSummary,
     pub checks: Option<CheckSummary>,
     /// The resolved image digest, when podman answered.
@@ -764,6 +815,37 @@ pub fn default_cache_dir() -> Result<PathBuf, GeectlError> {
     Ok(PathBuf::from(home).join(".cache").join("geectl"))
 }
 
+/// The custom-root `--clean` gate: a user directory is wiped only
+/// when it is empty or carries the geectl marker. The lock file is
+/// geectl's own and never counts: under the root lock it is normally
+/// present (this build just created it) — an external unlink in
+/// between is possible but harmless, the file is ours either way —
+/// and a stale one at validation time is equally ours. The wipe
+/// skips it too, so the gate and the wipe agree on what "empty"
+/// means. A read failure counts as nonempty (fail closed).
+fn check_clean_custom_root(root: &Path) -> Result<(), GeectlError> {
+    if root.is_dir() {
+        let nonempty = fs::read_dir(root)
+            .map(|mut entries| {
+                entries.any(|entry| match entry {
+                    Ok(entry) => entry.file_name().as_os_str() != ROOT_LOCK,
+                    Err(_) => true,
+                })
+            })
+            .unwrap_or(true);
+        if nonempty && !root.join(ROOT_MARKER).exists() {
+            return Err(GeectlError::new(
+                ErrorKind::NotAGeectlBuildRoot,
+                format!(
+                    "--clean refuses a custom root without the geectl marker: {} is not a geectl build root; drop --clean or build there first",
+                    root.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The request-level checks a build needs before anything runs:
 /// the project and repository names, the cache-dir components, the
 /// host architecture, and a non-zero timeout. Pure input checks —
@@ -783,6 +865,20 @@ pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
             format!("invalid OBS repository name: {:?}", req.repo),
         ));
     }
+    if let Some(alt) = &req.alternative_project {
+        if !valid_obs_name(alt) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {alt:?}"),
+            ));
+        }
+        // The alternative project is a cache-dir component too:
+        // `fetch_project()` feeds the pkg-cache path in
+        // `ensure_cached` (and the API path in
+        // `resolve_dep_filename`), so a `..` here would escape
+        // the cache dir the same way a `..` project would.
+        validate_path_component("alternative project", alt)?;
+    }
     // The path components under the cache dir must be single
     // components: `valid_obs_name` allows `.`, so `..` would
     // pass it and escape the cache dir (a `build --clean` would
@@ -798,6 +894,66 @@ pub fn validate_build_request(req: &BuildRequest) -> Result<(), GeectlError> {
                 std::env::consts::ARCH
             ),
         ));
+    }
+    // `--clean` wipes the root `--noinit` needs to build in.
+    if req.clean && req.noinit {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--clean and --noinit conflict: a wiped root has nothing to build in without initialization",
+        ));
+    }
+    // `--noinit` installs nothing, so `--prefer-packages` would be
+    // a silent no-op: refuse the combination instead.
+    if req.noinit && req.prefer_packages.is_some() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "--noinit and --prefer-packages conflict: no deps are installed without initialization",
+        ));
+    }
+    // A custom root is a user directory, not a cache dir: `--clean`
+    // wipes it, so it must be a geectl root (marker) or empty — the
+    // same rule `build-wipe` enforces. A path naming a file is not
+    // a directory at all. Both fail here, before any fetch or build
+    // work, not after the engine ran.
+    if let Some(root) = &req.root {
+        if root.exists() && !root.is_dir() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "build root {} exists and is not a directory",
+                    root.display()
+                ),
+            ));
+        }
+        if req.clean {
+            check_clean_custom_root(root)?;
+        }
+    }
+    // `--keep-rpms` is written after the build: a path naming a
+    // file would fail there, after the whole engine run.
+    if let Some(dir) = &req.keep_rpms {
+        if dir.exists() && !dir.is_dir() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "keep-rpms directory {} exists and is not a directory",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    // The prefer dir is read during the build: a missing one fails
+    // here, before any service runs or script executes.
+    if let Some(dir) = &req.prefer_packages {
+        if !dir.is_dir() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "prefer-packages directory {} does not exist or is not a directory",
+                    dir.display()
+                ),
+            ));
+        }
     }
     // A zero timeout is an instant timeout, never a build.
     if req.timeout_secs == 0 {
@@ -903,20 +1059,56 @@ impl<'a> LocalBuild<'a> {
         } else {
             self.engine_version()?
         };
-        let root = self.root_path(&req.project, &package, &req.repo, &req.arch, &req.flavor);
+        // A custom root replaces the derived cache-dir root: the
+        // marker, lock, log, rpmlist, buildconfig, and the sccache
+        // store all live under it. It is absolute: the engine runs
+        // with its cwd in the source dir, so a relative root would
+        // resolve against the source dir.
+        let root = match &req.root {
+            Some(dir) => std::path::absolute(dir).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot resolve build root {}: {e}", dir.display()),
+                )
+            })?,
+            None => self.root_path(&req.project, &package, &req.repo, &req.arch, &req.flavor),
+        };
         let log_path = root.join(BUILD_LOG);
         let root_existed = root.join(ROOT_MARKER).exists();
-
         // The dry run stops here: the plan is data, and nothing
         // below it (no fetch, no root, no eviction) is touched.
         if req.dry_run {
+            // The plan records absolute paths, like the root: a
+            // relative keep/prefer dir would resolve against the
+            // invoker's cwd, not the build.
+            let keep_rpms = match &req.keep_rpms {
+                Some(dir) => Some(std::path::absolute(dir).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("cannot resolve keep-rpms directory {}: {e}", dir.display()),
+                    )
+                })?),
+                None => None,
+            };
+            let prefer_packages = match &req.prefer_packages {
+                Some(dir) => Some(std::path::absolute(dir).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "cannot resolve prefer-packages directory {}: {e}",
+                            dir.display()
+                        ),
+                    )
+                })?),
+                None => None,
+            };
             let argv = self.engine_argv(
                 &root,
                 &spec,
                 req,
                 &root.join(RPMLIST),
                 &root.join(BUILDCONFIG),
-                &self.sccache_uri(&req.project, &package, &req.repo, &req.arch, &req.flavor),
+                &self.sccache_uri_for_req(req, &package, &root),
             );
             self.debug.emit(&format!(
                 "local-build dry-run: {} {} {}",
@@ -927,6 +1119,7 @@ impl<'a> LocalBuild<'a> {
                 exit_code: 0,
                 log_path,
                 rpms: Vec::new(),
+                kept_rpms: Vec::new(),
                 rpmlint: RpmlintSummary::default(),
                 checks: None,
                 image_digest: None,
@@ -947,9 +1140,33 @@ impl<'a> LocalBuild<'a> {
                     repo: req.repo.clone(),
                     arch: req.arch.clone(),
                     flavor: req.flavor.clone(),
+                    alternative_project: req.alternative_project.clone(),
+                    keep_rpms,
+                    prefer_packages,
                     argv,
                 }),
             });
+        }
+
+        // `--noinit` builds in the existing root without installing
+        // anything: it needs the rpmlist and buildconfig a previous
+        // build wrote there (the existing tool refuses the same way
+        // when no local buildinfo/buildconfig file exists). The check
+        // sits after the dry-run return: the plan is data and needs
+        // neither file, so a dry run prints it without consulting
+        // the root.
+        if req.noinit {
+            for file in [RPMLIST, BUILDCONFIG] {
+                if !root.join(file).exists() {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "--noinit needs an initialized root: {} is missing; run a normal build first",
+                            root.join(file).display()
+                        ),
+                    ));
+                }
+            }
         }
 
         // The buildinfo fetch is the prerequisite: the dep set, the
@@ -958,15 +1175,15 @@ impl<'a> LocalBuild<'a> {
         // start — fail closed with the server's own text.
         let info = self
             .obs
-            .buildinfo(&req.project, &package, &req.repo, &req.arch)?;
+            .buildinfo(req.fetch_project(), &package, &req.repo, &req.arch)?;
         if let Some(error) = &info.error {
             return Err(GeectlError::new(
                 ErrorKind::ServerError,
                 format!("build cannot start: {error}"),
             ));
         }
-        self.check_trust(&req.project, &info)?;
-        let buildconfig = self.obs.buildconfig(&req.project, &req.repo)?;
+        self.check_trust(req.fetch_project(), &info)?;
+        let buildconfig = self.obs.buildconfig(req.fetch_project(), &req.repo)?;
 
         // The image is resolved before eviction: the current digest
         // is protected, and the record names the digest actually used.
@@ -991,6 +1208,13 @@ impl<'a> LocalBuild<'a> {
         // for the same root refuses immediately with BuildInProgress.
         let _lock = self.acquire_root_lock(&root, &package)?;
         if req.clean {
+            // Re-check under the lock: the validation-time gate
+            // raced the wipe — a marker removed, or files added to
+            // an empty root, in between would be wiped unchecked.
+            // Cache-dir roots are geectl-managed and need no gate.
+            if req.root.is_some() {
+                check_clean_custom_root(&root)?;
+            }
             self.wipe_root_contents(&root)?;
         }
         self.ensure_marker(&root, req, &package, &image, &engine_version)?;
@@ -1014,44 +1238,52 @@ impl<'a> LocalBuild<'a> {
             &current_dep_files,
             &current_dep_names,
             image.digest.as_deref(),
-            Some(&self.sccache_dir(&req.project, &package, &req.repo, &req.arch, &req.flavor)),
+            Some(&self.sccache_dir_for_req(req, &package, &root)),
         )?;
 
         // The deps go into the pkg cache, hdrmd5-verified on every
         // use, then the rpmlist names them for the engine.
-        let (cache, rpmlist) = self.prepare_deps(req, &info)?;
+        // `--noinit` skips that: the engine installs nothing, so
+        // the root's existing rpmlist and buildconfig (checked
+        // above) are reused as-is and nothing is downloaded.
+        let cache = if req.noinit {
+            CacheStats::default()
+        } else {
+            let (cache, rpmlist) = self.prepare_deps(req, &info)?;
+            let rpmlist_path = root.join(RPMLIST);
+            write_atomic(&rpmlist_path, rpmlist.as_bytes()).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot write rpmlist {}: {e}", rpmlist_path.display()),
+                )
+            })?;
+            let buildconfig_path = root.join(BUILDCONFIG);
+            write_atomic(&buildconfig_path, buildconfig.as_bytes()).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!(
+                        "cannot write buildconfig {}: {e}",
+                        buildconfig_path.display()
+                    ),
+                )
+            })?;
+            cache
+        };
         let rpmlist_path = root.join(RPMLIST);
-        write_atomic(&rpmlist_path, rpmlist.as_bytes()).map_err(|e| {
-            GeectlError::new(
-                ErrorKind::InternalError,
-                format!("cannot write rpmlist {}: {e}", rpmlist_path.display()),
-            )
-        })?;
         let buildconfig_path = root.join(BUILDCONFIG);
-        write_atomic(&buildconfig_path, buildconfig.as_bytes()).map_err(|e| {
-            GeectlError::new(
-                ErrorKind::InternalError,
-                format!(
-                    "cannot write buildconfig {}: {e}",
-                    buildconfig_path.display()
-                ),
-            )
-        })?;
 
         // The sccache store is per root: repeat builds of the same
         // root share compiled objects; different roots never do —
         // two concurrent builds of the same package in different
         // roots must not share a tar.
-        let sccache_dir =
-            self.sccache_dir(&req.project, &package, &req.repo, &req.arch, &req.flavor);
+        let sccache_dir = self.sccache_dir_for_req(req, &package, &root);
         fs::create_dir_all(&sccache_dir).map_err(|e| {
             GeectlError::new(
                 ErrorKind::InternalError,
                 format!("cannot create sccache store {}: {e}", sccache_dir.display()),
             )
         })?;
-        let sccache_uri =
-            self.sccache_uri(&req.project, &package, &req.repo, &req.arch, &req.flavor);
+        let sccache_uri = self.sccache_uri_for_req(req, &package, &root);
         let argv = self.engine_argv(
             &root,
             &spec,
@@ -1143,18 +1375,22 @@ impl<'a> LocalBuild<'a> {
             .join(Self::root_name(repo, arch, flavor))
     }
 
-    /// The sccache URI passed to the engine: one tar per build root,
-    /// in the root's store. The engine owns the tar's contents;
-    /// geectl only provides the path and touches the store's mtime.
-    fn sccache_uri(
-        &self,
-        project: &str,
-        package: &str,
-        repo: &str,
-        arch: &str,
-        flavor: &Option<String>,
-    ) -> PathBuf {
-        self.sccache_dir(project, package, repo, arch, flavor)
+    /// The sccache store directory for one build request: under a
+    /// custom `--root` it lives inside the root, so two builds of
+    /// the same package in different roots never share a tar (the
+    /// tar is guarded by its root's lock, and different roots hold
+    /// different locks). Otherwise the derived cache-dir store.
+    fn sccache_dir_for_req(&self, req: &BuildRequest, package: &str, root: &Path) -> PathBuf {
+        match &req.root {
+            Some(_) => root.join("sccache"),
+            None => self.sccache_dir(&req.project, package, &req.repo, &req.arch, &req.flavor),
+        }
+    }
+
+    /// The sccache URI for one build request, matching
+    /// `sccache_dir_for_req`.
+    fn sccache_uri_for_req(&self, req: &BuildRequest, package: &str, root: &Path) -> PathBuf {
+        self.sccache_dir_for_req(req, package, root)
             .join("sccache.tar")
     }
 
@@ -1257,6 +1493,9 @@ impl<'a> LocalBuild<'a> {
         ];
         if req.clean {
             argv.push("--clean".to_string());
+        }
+        if req.noinit {
+            argv.push("--noinit".to_string());
         }
         // The engine passes `--changelog` by default (unless
         // `--no-changelog`): without it the locally built RPMs lack
@@ -2153,7 +2392,7 @@ impl<'a> LocalBuild<'a> {
         ) {
             return Ok(format!("{}-{version}-{release}.{arch}.rpm", dep.name));
         }
-        let project = dep.project.as_deref().unwrap_or(&req.project);
+        let project = dep.project.as_deref().unwrap_or(req.fetch_project());
         let package = dep.package.as_deref().unwrap_or("_repository");
         let files = self.obs.list_binaries(
             project,
@@ -2216,7 +2455,7 @@ impl<'a> LocalBuild<'a> {
         // repo+arch-only key. The lock is the same
         // project-repo-arch lock eviction takes while deleting that
         // dir's pkg files.
-        let project = dep.project.as_deref().unwrap_or(&req.project);
+        let project = dep.project.as_deref().unwrap_or(req.fetch_project());
         let repo = Self::dep_repo(dep, req);
         let arch = Self::dep_arch(dep, req);
         let dir = self
@@ -2240,6 +2479,61 @@ impl<'a> LocalBuild<'a> {
         // the file between the existence check and the verify.
         let _pkg_lock = self.acquire_pkg_lock(project, repo, arch)?;
         let path = dir.join(filename);
+        // Preferred packages win over the cache and the download:
+        // an explicit local file overrides whatever the cache
+        // holds — a rebuilt RPM in the prefer dir is used on the
+        // next run instead of the stale cached copy — and is copied
+        // into the cache instead of downloaded, hdrmd5-verified
+        // when the buildinfo carries one. A preferred file that
+        // fails verification refuses the build rather than falling
+        // back to the cache or the download: installing a different
+        // package than the dep names is silent wrongness, not a
+        // cache miss.
+        if let Some(prefer) = &req.prefer_packages {
+            let candidate = prefer.join(filename);
+            if candidate.is_file() {
+                self.verify_hdrmd5(&candidate, Self::effective_hdrmd5(dep, None))
+                    .map_err(|e| {
+                        GeectlError::new(
+                            ErrorKind::CacheCorrupt,
+                            format!(
+                                "preferred package {} failed its hdrmd5 check ({}); remove it from the prefer dir or fix the buildinfo digest",
+                                candidate.display(),
+                                e.context
+                            ),
+                        )
+                    })?;
+                let tmp = dir.join(format!(".{filename}.preferred"));
+                fs::copy(&candidate, &tmp).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot copy preferred package {}: {e}", candidate.display()),
+                    )
+                })?;
+                // Verify the copy, not just the source: the file
+                // could change between the check and the copy.
+                if let Err(e) = self.verify_hdrmd5(&tmp, Self::effective_hdrmd5(dep, None)) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(GeectlError::new(
+                        ErrorKind::CacheCorrupt,
+                        format!(
+                            "preferred package {} failed its hdrmd5 check after copying ({}); copy discarded",
+                            candidate.display(),
+                            e.context
+                        ),
+                    ));
+                }
+                fs::rename(&tmp, &path).map_err(|e| {
+                    let _ = fs::remove_file(&tmp);
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot place preferred package {}: {e}", path.display()),
+                    )
+                })?;
+                stats.pkg_preferred += 1;
+                return Ok(path);
+            }
+        }
         if path.exists() {
             match self.verify_hdrmd5(&path, Self::effective_hdrmd5(dep, None)) {
                 Ok(()) => {
@@ -2547,8 +2841,17 @@ impl<'a> LocalBuild<'a> {
             ..cache
         };
         let finished = has_finished_line(&log_text, package);
+        // Green is exit code 0, the finished line, and RPMs present:
+        // a `--keep-rpms` copy only ever carries built RPMs, never
+        // stale ones from a previous build in a reused root.
+        let green = !outcome.timed_out && outcome.exit_code == 0 && finished && !rpms.is_empty();
+        let kept_rpms = if green {
+            self.keep_rpms(req, &rpms)?
+        } else {
+            Vec::new()
+        };
         let record = BuildRecord {
-            verdict: if outcome.exit_code == 0 && finished && !rpms.is_empty() {
+            verdict: if green {
                 "green".to_string()
             } else {
                 "failed".to_string()
@@ -2556,6 +2859,7 @@ impl<'a> LocalBuild<'a> {
             exit_code: outcome.exit_code,
             log_path: log_path.to_path_buf(),
             rpms,
+            kept_rpms,
             rpmlint,
             checks,
             image_digest: image.digest.clone(),
@@ -2609,7 +2913,7 @@ impl<'a> LocalBuild<'a> {
         // the store is used on every build, and a package that
         // fails repeatedly must not lose its warm cache to eviction
         // for aging while it is still being built.
-        touch(&self.sccache_dir(&req.project, package, &req.repo, &req.arch, &req.flavor));
+        touch(&self.sccache_dir_for_req(req, package, root));
         if outcome.timed_out {
             // On unix the timeout kills the engine's process group;
             // on Windows only the direct child is killed.
@@ -2638,6 +2942,49 @@ impl<'a> LocalBuild<'a> {
             ));
         }
         Ok(record)
+    }
+
+    /// Copy the built RPMs into the `--keep-rpms` directory
+    /// (created when missing), returning the copied paths. Only
+    /// called on a green build. A copy failure fails the build: the
+    /// caller asked for the RPMs kept, and silently dropping them
+    /// would report a green build whose outputs are not where they
+    /// were asked for.
+    fn keep_rpms(&self, req: &BuildRequest, rpms: &[PathBuf]) -> Result<Vec<PathBuf>, GeectlError> {
+        let Some(dir) = &req.keep_rpms else {
+            return Ok(Vec::new());
+        };
+        let dir = std::path::absolute(dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot resolve keep-rpms directory {}: {e}", dir.display()),
+            )
+        })?;
+        fs::create_dir_all(&dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot create keep-rpms directory {}: {e}", dir.display()),
+            )
+        })?;
+        let mut kept = Vec::new();
+        for rpm in rpms {
+            let Some(name) = rpm.file_name() else {
+                continue;
+            };
+            let dest = dir.join(name);
+            fs::copy(rpm, &dest).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!(
+                        "cannot copy built RPM {} to {}: {e}",
+                        rpm.display(),
+                        dest.display()
+                    ),
+                )
+            })?;
+            kept.push(dest);
+        }
+        Ok(kept)
     }
 }
 
@@ -6936,6 +7283,776 @@ exit 0
             assert!(!dir.path().join("cache").join("build-roots").exists());
             assert!(setup.http.get_calls().is_empty());
             assert!(setup.http.get_bytes_calls().is_empty());
+        }
+
+        #[test]
+        fn validate_build_request_rejects_a_bad_alternative_project() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.alternative_project = Some("bad name!".to_string());
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("invalid OBS project name"));
+        }
+
+        #[test]
+        fn validate_build_request_rejects_a_traversal_alternative_project() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            for alt in ["..", "."] {
+                let mut req =
+                    BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+                req.alternative_project = Some(alt.to_string());
+                let err = validate_build_request(&req).unwrap_err();
+                assert_eq!(err.kind(), ErrorKind::InvalidInput);
+                assert!(
+                    err.to_string().contains("alternative project"),
+                    "got: {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn validate_build_request_rejects_clean_with_noinit() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.clean = true;
+            req.noinit = true;
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("--clean and --noinit conflict"));
+        }
+
+        #[test]
+        fn validate_build_request_rejects_a_missing_prefer_dir() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.prefer_packages = Some(dir.path().join("no-such-dir"));
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("prefer-packages directory"));
+        }
+
+        #[test]
+        fn validate_build_request_rejects_clean_on_a_markerless_custom_root() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let root = dir.path().join("custom-root");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("some-file"), "user data").unwrap();
+            let mut req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            req.root = Some(root.clone());
+            req.clean = true;
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+            assert!(err.to_string().contains("--clean refuses a custom root"));
+            // The marker makes it a geectl root: clean is allowed.
+            fs::write(root.join(ROOT_MARKER), "").unwrap();
+            validate_build_request(&req).unwrap();
+            // An empty root without a marker is allowed too: the
+            // wipe has nothing to destroy.
+            let empty = dir.path().join("empty-root");
+            fs::create_dir_all(&empty).unwrap();
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.root = Some(empty);
+            req.clean = true;
+            validate_build_request(&req).unwrap();
+        }
+
+        #[test]
+        fn check_clean_custom_root_gate() {
+            // The gate the wipe re-checks under the root lock: a
+            // markerless root with user data refuses, a marked one
+            // and an empty one pass, and the lock file never counts
+            // (under the lock it is always present — this build just
+            // created it — and the wipe skips it).
+            let dir = TempDir::new();
+            let root = dir.path().join("custom-root");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("some-file"), "user data").unwrap();
+            let err = check_clean_custom_root(&root).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+            assert!(err.to_string().contains("--clean refuses a custom root"));
+            fs::write(root.join(ROOT_MARKER), "").unwrap();
+            check_clean_custom_root(&root).unwrap();
+            fs::remove_file(root.join(ROOT_MARKER)).unwrap();
+            fs::remove_file(root.join("some-file")).unwrap();
+            check_clean_custom_root(&root).unwrap();
+            // The lock file alone is not user data.
+            fs::write(root.join(ROOT_LOCK), "pid=1 started=0 package=foo\n").unwrap();
+            check_clean_custom_root(&root).unwrap();
+            fs::write(root.join("some-file"), "user data").unwrap();
+            check_clean_custom_root(&root).unwrap_err();
+        }
+
+        #[test]
+        fn validate_build_request_rejects_noinit_with_prefer_packages() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let prefer = dir.path().join("prefer");
+            fs::create_dir_all(&prefer).unwrap();
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.noinit = true;
+            req.prefer_packages = Some(prefer);
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err
+                .to_string()
+                .contains("--noinit and --prefer-packages conflict"));
+        }
+
+        #[test]
+        fn validate_build_request_rejects_a_root_naming_a_file() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let file = dir.path().join("not-a-dir");
+            fs::write(&file, "x").unwrap();
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.root = Some(file);
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("is not a directory"));
+        }
+
+        #[test]
+        fn validate_build_request_rejects_a_keep_dir_naming_a_file() {
+            let dir = TempDir::new();
+            let source = write_source(dir.path(), "foo.spec");
+            let file = dir.path().join("not-a-dir");
+            fs::write(&file, "x").unwrap();
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.keep_rpms = Some(file);
+            let err = validate_build_request(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("is not a directory"));
+        }
+
+        #[test]
+        fn dry_run_plan_carries_the_new_flags() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let root = dir.path().join("custom-root");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(RPMLIST), "").unwrap();
+            fs::write(root.join(BUILDCONFIG), "").unwrap();
+            let prefer = dir.path().join("prefer");
+            fs::create_dir_all(&prefer).unwrap();
+            let keep = dir.path().join("keep");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.dry_run = true;
+            req.alternative_project = Some("openSUSE:Factory".to_string());
+            req.root = Some(root.clone());
+            req.keep_rpms = Some(keep.clone());
+            req.prefer_packages = Some(prefer.clone());
+            let record = vertical.build(&req).unwrap();
+            let plan = record.plan.unwrap();
+            assert_eq!(
+                plan.alternative_project.as_deref(),
+                Some("openSUSE:Factory")
+            );
+            assert_eq!(plan.root, root);
+            assert_eq!(plan.keep_rpms, Some(keep));
+            assert_eq!(plan.prefer_packages, Some(prefer));
+            // The engine builds inside the root's mount dir.
+            assert!(
+                plan.argv
+                    .iter()
+                    .any(|a| a == &format!("--root={}/.mount", root.display())),
+                "argv: {:?}",
+                plan.argv
+            );
+            assert!(
+                plan.argv
+                    .iter()
+                    .any(|a| a == &format!("--sccache-uri={}/sccache/sccache.tar", root.display())),
+                "argv: {:?}",
+                plan.argv
+            );
+            assert!(setup.http.get_calls().is_empty());
+        }
+
+        #[test]
+        fn dry_run_plan_carries_noinit() {
+            // --noinit takes no --prefer-packages, so its argv pin
+            // lives in its own test with an initialized root.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let root = dir.path().join("custom-root");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(RPMLIST), "").unwrap();
+            fs::write(root.join(BUILDCONFIG), "").unwrap();
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.dry_run = true;
+            req.root = Some(root.clone());
+            req.noinit = true;
+            let record = vertical.build(&req).unwrap();
+            let plan = record.plan.unwrap();
+            assert!(plan.argv.iter().any(|a| a == "--noinit"));
+            assert!(
+                plan.argv
+                    .iter()
+                    .any(|a| a == &format!("--root={}/.mount", root.display())),
+                "argv: {:?}",
+                plan.argv
+            );
+        }
+
+        #[test]
+        fn dry_run_noinit_on_a_fresh_root_prints_the_plan() {
+            // The plan is data and needs neither rpmlist nor
+            // buildconfig, so a dry run prints it without consulting
+            // the root; the refusal stays a real-build check.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.dry_run = true;
+            req.root = Some(dir.path().join("fresh-root"));
+            req.noinit = true;
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "dry-run");
+            assert!(record.dry_run);
+            let plan = record.plan.unwrap();
+            assert!(plan.argv.iter().any(|a| a == "--noinit"));
+            assert!(setup.http.get_calls().is_empty());
+        }
+
+        #[test]
+        fn noinit_build_on_a_fresh_root_is_refused() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let root = dir.path().join("fresh-root");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.root = Some(root.clone());
+            req.noinit = true;
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err
+                .to_string()
+                .contains("--noinit needs an initialized root"));
+            assert!(setup.http.get_calls().is_empty());
+            // The refusal fires before the root is created.
+            assert!(!root.exists());
+        }
+
+        /// The Setup registrations with the buildinfo/buildconfig
+        /// served from another project: the dep downloads stay the
+        /// same, only the fetch project moves.
+        fn alt_setup(buildinfo: &str) -> Setup {
+            let arch = host_arch();
+            let http = FakeHttp::new()
+                .with_get(
+                    &format!(
+                        "https://api.opensuse.org/build/openSUSE:Factory/standard/{arch}/foo/_buildinfo"
+                    ),
+                    buildinfo,
+                )
+                .with_get(
+                    "https://api.opensuse.org/build/openSUSE:Factory/standard/_buildconfig",
+                    "Macro: test 1\n",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+                    ),
+                    b"fake glibc rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/home:scarabeus_iv/standard/{arch}/_repository/ownpkg-1.0-1.{arch}.rpm"
+                    ),
+                    b"fake ownpkg rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/pre-1.0-1.{arch}.rpm"
+                    ),
+                    b"fake pre rpm",
+                )
+                .with_get(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/_repository"
+                    ),
+                    &format!(
+                        "<binarylist><binary filename=\"helper-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/><binary filename=\"helper-debuginfo-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/></binarylist>"
+                    ),
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/helper-1.0-1.{arch}.rpm"
+                    ),
+                    b"fake helper rpm",
+                );
+            Setup { http }
+        }
+
+        #[test]
+        fn build_fetches_buildinfo_for_the_alternative_project() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = alt_setup(&buildinfo_ok());
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.alternative_project = Some("openSUSE:Factory".to_string());
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            let calls = setup.http.get_calls();
+            let alt_buildinfo = format!(
+                "https://api.opensuse.org/build/openSUSE:Factory/standard/{}/foo/_buildinfo",
+                host_arch()
+            );
+            assert!(
+                calls.iter().any(|(u, _)| u == &alt_buildinfo),
+                "calls: {calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|(u, _)| u == &buildinfo_url()),
+                "the own project's buildinfo must not be fetched: {calls:?}"
+            );
+        }
+
+        #[test]
+        fn build_resolves_a_project_less_dep_from_the_alternative_project() {
+            // A dep without a `project` carries no origin of its own:
+            // under --alternative-project it resolves from the fetch
+            // project, not the package's own project.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let http = FakeHttp::new()
+                .with_get(
+                    &format!(
+                        "https://api.opensuse.org/build/openSUSE:Factory/standard/{arch}/foo/_buildinfo"
+                    ),
+                    &format!(
+                        "<buildinfo project=\"openSUSE:Factory\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"noproject\" binary=\"noproject-1.0-1.{arch}.rpm\"/>\
+                        </buildinfo>"
+                    ),
+                )
+                .with_get(
+                    "https://api.opensuse.org/build/openSUSE:Factory/standard/_buildconfig",
+                    "Macro: test 1\n",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/openSUSE:Factory/standard/{arch}/_repository/noproject-1.0-1.{arch}.rpm"
+                    ),
+                    b"fake noproject rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.alternative_project = Some("openSUSE:Factory".to_string());
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert!(
+                http.get_bytes_calls()
+                    .iter()
+                    .any(|(u, _)| u.contains("openSUSE:Factory")),
+                "calls: {:?}",
+                http.get_bytes_calls()
+            );
+        }
+
+        /// A buildinfo like `buildinfo_ok` with the glibc dep
+        /// carrying an hdrmd5, for the prefer-dir tests.
+        fn buildinfo_with_glibc_digest(digest: &str) -> String {
+            let arch = host_arch();
+            format!(
+                "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\" hdrmd5=\"{digest}\"/>\
+                <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\"/>\
+                <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\"/>\
+                <bdep name=\"helper\" project=\"testproject\" repository=\"standard\"/>\
+                </buildinfo>"
+            )
+        }
+
+        #[test]
+        fn build_prefers_a_package_from_the_prefer_dir() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let prefer = dir.path().join("prefer");
+            fs::create_dir_all(&prefer).unwrap();
+            let rpm_path = prefer.join(format!("glibc-2.38-1.{}.rpm", host_arch()));
+            fs::write(&rpm_path, make_rpm(b"preferred glibc")).unwrap();
+            let digest = rpm_hdrmd5(&rpm_path).unwrap();
+            let http = FakeHttp::new()
+                .with_get(&buildinfo_url(), &buildinfo_with_glibc_digest(&digest))
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/glibc-2.38-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake glibc rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/home:scarabeus_iv/standard/{}/_repository/ownpkg-1.0-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake ownpkg rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/pre-1.0-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake pre rpm",
+                )
+                .with_get(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository",
+                        host_arch()
+                    ),
+                    &format!(
+                        "<binarylist><binary filename=\"helper-1.0-1.{}.rpm\" size=\"10\" mtime=\"1\"/><binary filename=\"helper-debuginfo-1.0-1.{}.rpm\" size=\"10\" mtime=\"1\"/></binarylist>",
+                        host_arch(),
+                        host_arch()
+                    ),
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/helper-1.0-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake helper rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.prefer_packages = Some(prefer);
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(record.cache.pkg_preferred, 1);
+            assert!(
+                !http
+                    .get_bytes_calls()
+                    .iter()
+                    .any(|(u, _)| u.contains("glibc-2.38-1")),
+                "the preferred dep must not be downloaded: {:?}",
+                http.get_bytes_calls()
+            );
+        }
+
+        #[test]
+        fn build_prefers_a_package_over_a_warm_cache() {
+            // An explicit prefer file overrides the cached copy: a
+            // rebuilt RPM in the prefer dir is used on the next run
+            // instead of the stale cached one.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let rpm_bytes = make_rpm(b"preferred glibc");
+            let prefer = dir.path().join("prefer");
+            fs::create_dir_all(&prefer).unwrap();
+            let rpm_path = prefer.join(format!("glibc-2.38-1.{}.rpm", host_arch()));
+            fs::write(&rpm_path, &rpm_bytes).unwrap();
+            let digest = rpm_hdrmd5(&rpm_path).unwrap();
+            let http = FakeHttp::new()
+                .with_get(&buildinfo_url(), &buildinfo_with_glibc_digest(&digest))
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/glibc-2.38-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    &rpm_bytes,
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/home:scarabeus_iv/standard/{}/_repository/ownpkg-1.0-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake ownpkg rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/pre-1.0-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake pre rpm",
+                )
+                .with_get(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository",
+                        host_arch()
+                    ),
+                    &format!(
+                        "<binarylist><binary filename=\"helper-1.0-1.{}.rpm\" size=\"10\" mtime=\"1\"/><binary filename=\"helper-debuginfo-1.0-1.{}.rpm\" size=\"10\" mtime=\"1\"/></binarylist>",
+                        host_arch(),
+                        host_arch()
+                    ),
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/helper-1.0-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake helper rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            // First build, no prefer: the download is cached.
+            let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            let first = vertical.build(&req).unwrap();
+            assert_eq!(first.verdict, "green");
+            assert_eq!(first.cache.pkg_preferred, 0);
+            // Second build, prefer set: the cached copy is not used.
+            let mut second = BuildRequest::new(source, "testproject", "standard", host_arch());
+            second.prefer_packages = Some(prefer);
+            let record = vertical.build(&second).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(record.cache.pkg_preferred, 1);
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(u, _)| u.contains("glibc-2.38-1"))
+                    .count(),
+                1,
+                "the preferred dep is downloaded once, then preferred: {:?}",
+                http.get_bytes_calls()
+            );
+        }
+
+        #[test]
+        fn build_fails_closed_on_a_preferred_package_with_a_bad_digest() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let prefer = dir.path().join("prefer");
+            fs::create_dir_all(&prefer).unwrap();
+            let rpm_path = prefer.join(format!("glibc-2.38-1.{}.rpm", host_arch()));
+            fs::write(&rpm_path, make_rpm(b"preferred glibc")).unwrap();
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &buildinfo_with_glibc_digest("00000000000000000000000000000000"),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n");
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.prefer_packages = Some(prefer);
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
+            assert!(err.to_string().contains("hdrmd5"), "got: {err}");
+        }
+
+        #[test]
+        fn build_keeps_rpms_in_the_keep_dir() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let keep = dir.path().join("keep");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.keep_rpms = Some(keep.clone());
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            let expected = keep.join(format!("foo-1.0-1.{}.rpm", host_arch()));
+            assert_eq!(record.kept_rpms, vec![expected.clone()]);
+            assert!(expected.is_file());
+        }
+
+        #[test]
+        fn build_keeps_nothing_on_a_failed_build() {
+            // An engine that exits 0 but never writes the finished
+            // line: verdict failed, so nothing is kept.
+            let dir = TempDir::new();
+            let script = dir.path().join("build-stub-nofinish");
+            let argv_log = dir.path().join("engine-argv-nofinish.log");
+            write_script(
+                &script,
+                &format!(
+                    r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "build stub 1.0"; exit 0; fi
+echo "$@" >> "{argv_log}"
+root=""
+logfile=""
+spec=""
+for arg in "$@"; do
+  case "$arg" in
+    --root=*) root="${{arg#--root=}}" ;;
+    --logfile=*) logfile="${{arg#--logfile=}}" ;;
+    *.spec) spec="$arg" ;;
+  esac
+done
+if [ -n "$spec" ]; then
+  pkg=$(basename "$spec" .spec)
+  mkdir -p "$root/.build.packages/RPMS"
+  touch "$root/.build.packages/RPMS/$pkg-1.0-1.{arch}.rpm"
+  if [ -n "$logfile" ]; then printf 'build log\nno finished line\n' > "$logfile"; fi
+fi
+"#,
+                    argv_log = argv_log.display(),
+                    arch = host_arch(),
+                ),
+            );
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), script, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let keep = dir.path().join("keep");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.keep_rpms = Some(keep.clone());
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "failed");
+            assert!(record.kept_rpms.is_empty());
+            assert!(!keep.exists());
+        }
+
+        #[test]
+        fn build_fails_when_a_kept_rpm_cannot_be_copied() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let keep = dir.path().join("keep");
+            // A directory where the RPM would be copied: the copy
+            // fails, and the build fails with it.
+            fs::create_dir_all(keep.join(format!("foo-1.0-1.{}.rpm", host_arch()))).unwrap();
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.keep_rpms = Some(keep);
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InternalError);
+            assert!(
+                err.to_string().contains("cannot copy built RPM"),
+                "got: {err}"
+            );
+        }
+
+        #[test]
+        fn noinit_build_after_a_normal_build_is_green() {
+            let dir = TempDir::new();
+            let (engine, argv_log) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            let first = vertical.build(&req).unwrap();
+            assert_eq!(first.verdict, "green");
+            // Dep prep must not run again: the rpmlist/buildconfig
+            // a sentinel overwrites stay untouched, and nothing is
+            // downloaded a second time.
+            let rpmlist = first.root_path.join(RPMLIST);
+            let buildconfig = first.root_path.join(BUILDCONFIG);
+            fs::write(&rpmlist, "sentinel rpmlist").unwrap();
+            fs::write(&buildconfig, "sentinel buildconfig").unwrap();
+            let downloads_before = setup.http.get_bytes_calls().len();
+            let mut second = BuildRequest::new(source, "testproject", "standard", host_arch());
+            second.noinit = true;
+            let record = vertical.build(&second).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(fs::read_to_string(&rpmlist).unwrap(), "sentinel rpmlist");
+            assert_eq!(
+                fs::read_to_string(&buildconfig).unwrap(),
+                "sentinel buildconfig"
+            );
+            assert_eq!(setup.http.get_bytes_calls().len(), downloads_before);
+            let argv = fs::read_to_string(&argv_log).unwrap();
+            assert!(
+                argv.lines().any(|line| line.contains("--noinit")),
+                "engine argv: {argv}"
+            );
+        }
+
+        #[test]
+        fn clean_build_on_a_marked_custom_root_wipes_under_the_lock() {
+            // A clean build on a marked custom root runs the wipe
+            // under the lock: the marker passes the gate and the
+            // stale file is gone. (The lock exclusion itself is
+            // pinned by the unit test and the empty-root test.)
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let root = dir.path().join("custom-root");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(ROOT_MARKER), "").unwrap();
+            fs::write(root.join("stale-output"), b"stale").unwrap();
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.root = Some(root.clone());
+            req.clean = true;
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert!(!root.join("stale-output").exists());
+        }
+
+        #[test]
+        fn clean_build_on_an_empty_markerless_custom_root_succeeds() {
+            // The under-lock re-check must not refuse an empty
+            // markerless root: the only entry under the lock is the
+            // lock file itself, which never counts. Without the
+            // exclusion this build would refuse on the file the lock
+            // just created.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let root = dir.path().join("custom-root");
+            fs::create_dir_all(&root).unwrap();
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.root = Some(root.clone());
+            req.clean = true;
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
         }
 
         #[test]
