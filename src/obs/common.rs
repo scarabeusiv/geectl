@@ -74,6 +74,17 @@ pub fn valid_obs_filename(name: &str) -> bool {
         && name != "_jobhistory"
 }
 
+/// True when `name` is a deletable OBS source filename. Unlike
+/// [`valid_obs_filename`] — the upload rule, which the server
+/// applies only on upload — a delete accepts any name the server
+/// already holds: only an empty name, a `/` (which would rewrite
+/// the request), and `.`/`..` are rejected. One-character names
+/// (`a`) and dotfiles (`.gitignore`) delete fine; `build_url`
+/// percent-encodes each segment, so traversal stays blocked.
+pub fn valid_obs_filename_for_delete(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && name != "." && name != ".."
+}
+
 /// Split a `project/package` path on `/`, dropping empty segments:
 /// a leading, trailing, or doubled slash contributes no segment, so
 /// `"//"` and `"/////////"` split to nothing and `"a//b"` to
@@ -1664,5 +1675,20 @@ mod tests {
         }
         assert!(valid_obs_filename("foo-1.0-1.x86_64.rpm"));
         assert!(valid_obs_filename("rpmlint.log"));
+    }
+
+    #[test]
+    fn valid_obs_filename_for_delete_accepts_server_names() {
+        // The delete rule is the server's holding, not the upload
+        // rule: one-character names and dotfiles already on the
+        // server delete fine.
+        assert!(valid_obs_filename_for_delete("a"));
+        assert!(valid_obs_filename_for_delete(".gitignore"));
+        assert!(valid_obs_filename_for_delete("foo.spec"));
+        assert!(!valid_obs_filename_for_delete(""));
+        assert!(!valid_obs_filename_for_delete("a/b"));
+        assert!(!valid_obs_filename_for_delete("../x"));
+        assert!(!valid_obs_filename_for_delete("."));
+        assert!(!valid_obs_filename_for_delete(".."));
     }
 }

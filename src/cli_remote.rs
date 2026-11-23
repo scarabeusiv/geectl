@@ -566,7 +566,12 @@ pub enum RemoteCommand {
     /// Delete a file from a package. A mutation: dry-run is the
     /// default (only the plan is printed); `--live` performs the
     /// deletion. The general form of `delete-link`: deleting `_link`
-    /// here issues the same delete as `delete-link`.
+    /// here issues the same delete as `delete-link`. The delete is
+    /// not idempotent: deleting a file that is already gone is
+    /// refused by the server (NotFound). The server records the
+    /// delete with the fixed comment `removed <file>`; there is no
+    /// `--message` option, unlike `delete-package` — the asymmetry
+    /// is intentional.
     DeleteFile {
         /// The project the package lives in.
         project: String,

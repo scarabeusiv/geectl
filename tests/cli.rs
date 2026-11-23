@@ -2634,6 +2634,57 @@ fn remote_delete_file_live_with_half_set_credentials_fails_with_config_error() {
 }
 
 #[test]
+fn remote_delete_file_invalid_name_fails_with_json_error() {
+    // Client-side validation: no server is contacted, so the name
+    // fails in dry-run and live alike; live is the path a user hits.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "delete-file",
+            "home:alice",
+            "vim",
+            "../x",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn remote_delete_file_missing_file_is_not_found() {
+    // The server 404s a delete of a file that is not there: exit 3,
+    // `not_found` on stderr. The loopback server answers one
+    // connection; DELETE is never retried, so one is enough.
+    let addr = serve_once_status(404, "Not Found", "");
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "delete-file",
+            "home:alice",
+            "vim",
+            "missing.spec",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "not_found");
+}
+
+#[test]
 fn remote_set_project_meta_dry_run_ignores_half_set_credentials() {
     // A dry-run mutation preview needs no credentials — the
     // library's dry-run guard runs before its credentials check —

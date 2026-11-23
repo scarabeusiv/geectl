@@ -11,6 +11,7 @@ use super::parse_status_ok;
 use super::quoted_attr_value;
 use super::tag_attr;
 use super::valid_obs_filename;
+use super::valid_obs_filename_for_delete;
 use super::valid_obs_name;
 use super::AggregateOptions;
 use super::CommitFileEntry;
@@ -3745,32 +3746,19 @@ impl<'a> ObsClient<'a> {
     }
 
     /// Delete one file from a package on OBS
-    /// (`DELETE /source/<project>/<package>/<filename>`). This is an
+    /// (`DELETE /source/<project>/<package>/<filename>`), without
+    /// validating the names: the caller validated them. This is an
     /// internal step — detaching a branch whose link target is gone
     /// drops the `_link` — not a public operation, so the caller owns
     /// the dry-run guard. Success is the `<status code="ok"/>` body:
     /// the API discards the backend's revision and reports only
     /// that the delete landed, so no revision is returned.
-    pub(crate) fn delete_source_file(
+    pub(crate) fn delete_file_unchecked(
         &self,
         project: &str,
         package: &str,
         filename: &str,
     ) -> Result<(), GeectlError> {
-        for (label, value) in [("project", project), ("package", package)] {
-            if !valid_obs_name(value) {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    format!("invalid OBS {label} name: {value:?}"),
-                ));
-            }
-        }
-        if !valid_obs_filename(filename) {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!("invalid OBS file name: {filename:?}"),
-            ));
-        }
         let url = build_url(
             &self.base,
             &["source", project, package, filename],
@@ -3801,6 +3789,15 @@ impl<'a> ObsClient<'a> {
     /// `.obscpio` — without deleting the package itself.
     /// Success is the `<status code="ok"/>` body; any other body is
     /// a server error, never success.
+    ///
+    /// The filename rule is the delete rule, not the upload rule:
+    /// any name the server already holds deletes — one-character
+    /// names, dotfiles — only an empty name, a `/`, and `.`/`..`
+    /// are rejected. The server records the delete with the fixed
+    /// comment `removed <file>`; there is no `--message` option,
+    /// unlike `delete-package` — the asymmetry is intentional.
+    /// The delete is not idempotent: deleting a file that is
+    /// already gone is refused by the server ([`ErrorKind::NotFound`]).
     pub fn delete_file(
         &self,
         project: &str,
@@ -3816,7 +3813,7 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        if !valid_obs_filename(filename) {
+        if !valid_obs_filename_for_delete(filename) {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 format!("invalid OBS file name: {filename:?}"),
@@ -3835,7 +3832,7 @@ impl<'a> ObsClient<'a> {
                 "cannot delete a file without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
-        self.delete_source_file(project, package, filename)
+        self.delete_file_unchecked(project, package, filename)
     }
 
     /// Delete the `_link` of package `package` in project `project`
@@ -3874,7 +3871,7 @@ impl<'a> ObsClient<'a> {
                 "cannot delete the link of a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
-        self.delete_source_file(project, package, "_link")
+        self.delete_file_unchecked(project, package, "_link")
     }
 
     /// Delete project `project` on OBS (`DELETE /source/<project>`).
@@ -5451,7 +5448,44 @@ mod tests {
         assert!(client
             .delete_file("test:factory", "pkg", "", &DryRun::new(false))
             .is_err());
+        assert!(client
+            .delete_file("test:factory", "pkg", ".", &DryRun::new(false))
+            .is_err());
+        assert!(client
+            .delete_file("test:factory", "pkg", "..", &DryRun::new(false))
+            .is_err());
         assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_file_accepts_names_the_upload_rule_rejects() {
+        // One-character names and dotfiles already on the server
+        // delete: the upload rule does not apply to deletes.
+        for filename in ["a", ".gitignore"] {
+            let http = FakeHttp::new().with_delete(
+                &format!(
+                    "https://api.opensuse.org/source/test:factory/pkg/{filename}?comment=removed%20{filename}"
+                ),
+                "<status code=\"ok\"/>",
+            );
+            let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+            assert!(client
+                .delete_file("test:factory", "pkg", filename, &DryRun::new(false))
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn delete_file_missing_file_is_not_found() {
+        let http = FakeHttp::new().with_delete_error(
+            "https://api.opensuse.org/source/test:factory/pkg/missing.spec?comment=removed%20missing.spec",
+            ErrorKind::NotFound,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .delete_file("test:factory", "pkg", "missing.spec", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
     #[test]

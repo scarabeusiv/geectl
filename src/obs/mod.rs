@@ -172,6 +172,7 @@ pub(crate) use self::common::tag_attr;
 pub(crate) use self::common::tag_attr_names;
 pub use self::common::valid_attribute_name;
 pub use self::common::valid_obs_filename;
+pub use self::common::valid_obs_filename_for_delete;
 pub use self::common::valid_obs_name;
 pub(crate) use self::common::validate_base;
 pub use self::common::FACTORY_PROJECT;

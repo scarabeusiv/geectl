@@ -24,6 +24,7 @@ pub(crate) struct FakeHttp {
     patches: RefCell<HashMap<String, String>>,
     patch_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     deletes: RefCell<HashMap<String, String>>,
+    delete_errors: RefCell<HashMap<String, ErrorKind>>,
     puts: RefCell<HashMap<String, String>>,
     put_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     get_calls: RefCell<Vec<(String, bool)>>,
@@ -65,6 +66,7 @@ impl FakeHttp {
             patches: RefCell::new(HashMap::new()),
             patch_errors: RefCell::new(HashMap::new()),
             deletes: RefCell::new(HashMap::new()),
+            delete_errors: RefCell::new(HashMap::new()),
             puts: RefCell::new(HashMap::new()),
             put_errors: RefCell::new(HashMap::new()),
             get_calls: RefCell::new(Vec::new()),
@@ -315,6 +317,13 @@ impl FakeHttp {
         self.deletes
             .borrow_mut()
             .insert(url.to_string(), body.to_string());
+        self
+    }
+
+    pub(crate) fn with_delete_error(self, url: &str, kind: ErrorKind) -> Self {
+        self.delete_errors
+            .borrow_mut()
+            .insert(url.to_string(), kind);
         self
     }
 
@@ -837,6 +846,12 @@ impl HttpClient for FakeHttp {
         self.mutation_calls
             .borrow_mut()
             .push(("DELETE".to_string(), url.to_string()));
+        if let Some(kind) = self.delete_errors.borrow().get(url).cloned() {
+            return Err(GeectlError::new(
+                kind,
+                format!("canned DELETE error for {url}"),
+            ));
+        }
         self.deletes.borrow().get(url).cloned().ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::NetworkError,
