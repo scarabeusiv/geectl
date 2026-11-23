@@ -8278,6 +8278,179 @@ fi
         }
 
         #[test]
+        fn build_with_trust_all_projects_and_nothing_foreign_records_nothing() {
+            // The flag with no foreign dep changes nothing: the
+            // build is green and the record lists no accepted
+            // project.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
+                        <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                        arch = host_arch()
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/glibc-2.38-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake glibc rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/home:scarabeus_iv/standard/{}/_repository/ownpkg-1.0-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake ownpkg rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.trust_all_projects = true;
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert!(record.trusted_foreign_projects.is_empty());
+        }
+
+        #[test]
+        fn build_with_trust_all_projects_lists_only_the_foreign_projects() {
+            // A mix of the caller's own home subtree, a foreign
+            // home:, and a non-home: project: only the foreign one
+            // is listed as accepted.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"ownpkg\" project=\"home:scarabeus_iv:branches:foo\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\"/>\
+                        <bdep name=\"glibc\" project=\"home:someoneelse\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
+                        <bdep name=\"make\" project=\"openSUSE:Factory\" repository=\"standard\" binary=\"make-4.4-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                        arch = host_arch()
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/home:scarabeus_iv:branches:foo/standard/{}/_repository/ownpkg-1.0-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake ownpkg rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/home:someoneelse/standard/{}/_repository/glibc-2.38-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake glibc rpm",
+                )
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/openSUSE:Factory/standard/{}/_repository/make-4.4-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake make rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.trust_all_projects = true;
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(record.trusted_foreign_projects, ["home:someoneelse"]);
+        }
+
+        #[test]
+        fn build_treats_a_foreign_branch_subproject_as_foreign() {
+            // `home:someoneelse:branches:foo` is not the caller's
+            // own subtree: without the flag it refuses, with the
+            // flag it is accepted and listed.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"glibc\" project=\"home:someoneelse:branches:foo\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                        arch = host_arch()
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/home:someoneelse:branches:foo/standard/{}/_repository/glibc-2.38-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake glibc rpm",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::UntrustedProject);
+            assert!(err.to_string().contains("home:someoneelse:branches:foo"));
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.trust_all_projects = true;
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            assert_eq!(
+                record.trusted_foreign_projects,
+                ["home:someoneelse:branches:foo"]
+            );
+        }
+
+        #[test]
+        fn build_with_trust_all_projects_still_rejects_a_traversal_project() {
+            // The flag overrides trust, not validation: a `..`
+            // project still fails in `validate_dep`.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new()
+                .with_get(
+                    &buildinfo_url(),
+                    &format!(
+                        "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\
+                        <bdep name=\"evil\" project=\"..\" repository=\"standard\" binary=\"evil-1.0-1.{arch}.rpm\"/>\
+                        </buildinfo>",
+                        arch = host_arch()
+                    ),
+                )
+                .with_get(&buildconfig_url(), "Macro: test 1\n");
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            req.trust_all_projects = true;
+            let err = vertical.build(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("dependency project"));
+        }
+
+        #[test]
         fn build_allows_a_dep_without_a_project() {
             // A dep without a `project` carries no origin to
             // enumerate: it is a virtual provide or a not-installed
