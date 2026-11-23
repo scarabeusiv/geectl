@@ -9,3 +9,11 @@
 # Verbatim upstream files are excluded: their text is not ours to fix.
 [files]
 extend-exclude = ["tests/local_build_e2e/tumbleweed.conf"]
+
+# `ba` is a hex fragment, not a word: the EUC-JP transcoding test in
+# changes.rs spells a CJK code point as `\u{78ba}`, and typos tokenizes
+# the escape's hex digits. Scoped to that file so the allow-list does
+# not silence a real "ba" typo repo-wide.
+[type.euc-jp-fixture]
+extend-glob = ["**/changes.rs"]
+extend-words = { ba = "ba" }
