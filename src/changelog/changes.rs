@@ -356,41 +356,51 @@ fn guess_legacy_encoding(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding>
     Some(detector.guess(None, chardetng::Utf8Detection::Allow))
 }
 
-/// Decode `bytes` with one legacy encoding. Bytes the encoding
-/// cannot represent arrive as U+FFFD in the decoded text itself;
-/// they are kept, not re-decoded as UTF-8.
-fn decode_with(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> String {
-    let (decoded, _, _) = encoding.decode(bytes);
-    decoded.into_owned()
+/// Decode `bytes` with one legacy encoding, reporting whether the
+/// decoder had to substitute U+FFFD for bytes it cannot represent.
+/// The substitution stays in the text (never re-decoded as UTF-8);
+/// the flag lets the caller refuse a lossy write instead of
+/// silently keeping it.
+fn decode_with(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> (String, bool) {
+    let (decoded, _, had_errors) = encoding.decode(bytes);
+    (decoded.into_owned(), had_errors)
 }
 
-/// Decode bytes that mix valid UTF-8 with legacy-encoded bytes.
-/// Fully valid UTF-8 is never re-decoded. Otherwise a line the
-/// guessed encoding decodes cleanly is transcoded whole: that is
-/// the only correct reading when the encoding is multi-byte
-/// (Shift_JIS, EUC-JP, GBK, Big5), since its characters span bytes
-/// that byte-at-a-time slicing would destroy — and a clean decode
-/// is evidence the line is wholly in that encoding. The exception
-/// is a line that itself mixes encodings and happens to decode
+/// Decode bytes that mix valid UTF-8 with legacy-encoded bytes,
+/// reporting whether any byte was substituted with U+FFFD. Fully
+/// valid UTF-8 is never re-decoded. Otherwise a line the guessed
+/// encoding decodes cleanly is transcoded whole: that is the only
+/// correct reading when the encoding is multi-byte (Shift_JIS,
+/// EUC-JP, GBK, Big5), since its characters span bytes that
+/// byte-at-a-time slicing would destroy — and a clean decode is
+/// evidence the line is wholly in that encoding. The exception is
+/// a line that itself mixes encodings and happens to decode
 /// cleanly: it is transcoded whole and loses its UTF-8 half.
 /// A single-byte encoding never reports an error, so a clean decode
 /// vouches for nothing there: the whole-line reading is used only
-/// when the line holds no valid multi-byte UTF-8. Any other line keeps its valid
-/// spans verbatim, and each invalid run is transcoded with the
-/// guessed encoding. A wrong-but-decodable guess keeps that
-/// encoding's interpretation of the invalid run only; the valid
-/// spans are never sacrificed to the guess.
-fn decode_mixed(bytes: &[u8], guessed: &'static encoding_rs::Encoding) -> String {
+/// when the line holds no valid multi-byte UTF-8. Any other line
+/// keeps its valid spans verbatim, and each invalid run is
+/// transcoded with the guessed encoding. A wrong-but-decodable
+/// guess keeps that encoding's interpretation of the invalid run
+/// only; the valid spans are never sacrificed to the guess.
+///
+/// The whole-line trust cannot drop the multi-byte case: legacy
+/// multi-byte bytes routinely contain pairs that are coincidentally
+/// valid UTF-8 (`\xCC\x8F` inside Shift_JIS is U+030F), so "no
+/// valid multi-byte UTF-8" alone would send every pure Shift_JIS
+/// or EUC-JP line down the per-run path and corrupt it.
+fn decode_mixed(bytes: &[u8], guessed: &'static encoding_rs::Encoding) -> (String, bool) {
     // Fully valid UTF-8 is never re-decoded: its bytes can decode
     // cleanly as half-width katakana in Shift_JIS.
     if let Ok(text) = std::str::from_utf8(bytes) {
-        return text.to_string();
+        return (text.to_string(), false);
     }
     let (decoded, _, had_errors) = guessed.decode(bytes);
     if !had_errors && (guessed_can_error(guessed) || !contains_valid_multibyte_utf8(bytes)) {
-        return decoded.into_owned();
+        return (decoded.into_owned(), false);
     }
     let mut out = String::new();
+    let mut had_replacement = false;
     let mut rest = bytes;
     while !rest.is_empty() {
         match std::str::from_utf8(rest) {
@@ -407,15 +417,15 @@ fn decode_mixed(bytes: &[u8], guessed: &'static encoding_rs::Encoding) -> String
                     Some(len) => len,
                     None => rest.len() - valid_up_to,
                 };
-                out.push_str(&decode_with(
-                    &rest[valid_up_to..valid_up_to + skip],
-                    guessed,
-                ));
+                let (decoded, had_errors) =
+                    decode_with(&rest[valid_up_to..valid_up_to + skip], guessed);
+                had_replacement |= had_errors;
+                out.push_str(&decoded);
                 rest = &rest[valid_up_to + skip..];
             }
         }
     }
-    out
+    (out, had_replacement)
 }
 
 /// Whether the guessed encoding can report a decode error at
@@ -435,21 +445,83 @@ fn guessed_can_error(encoding: &'static encoding_rs::Encoding) -> bool {
 /// multi-byte character; ASCII-only and invalid bytes do not count.
 fn contains_valid_multibyte_utf8(bytes: &[u8]) -> bool {
     let mut rest = bytes;
-    loop {
-        match std::str::from_utf8(rest) {
-            Ok(_) => return rest.iter().any(|&byte| byte >= 0x80),
-            Err(err) => {
-                if rest[..err.valid_up_to()].iter().any(|&byte| byte >= 0x80) {
-                    return true;
-                }
-                match err.error_len() {
-                    Some(len) => rest = &rest[err.valid_up_to() + len..],
-                    // A truncated sequence at the end: no complete
-                    // multi-byte character here.
-                    None => return false,
-                }
+    while let Err(err) = std::str::from_utf8(rest) {
+        if rest[..err.valid_up_to()].iter().any(|&byte| byte >= 0x80) {
+            return true;
+        }
+        match err.error_len() {
+            Some(len) => rest = &rest[err.valid_up_to() + len..],
+            // A truncated sequence at the end: no complete
+            // multi-byte character here.
+            None => return false,
+        }
+    }
+    rest.iter().any(|&byte| byte >= 0x80)
+}
+
+/// Strip trailing ASCII whitespace (spaces, tabs, carriage
+/// returns) from one line. Unicode whitespace (NBSP, U+3000) is
+/// content, not trailing whitespace, and a lone `\r` inside a line
+/// is kept — only a trailing `\r` (the CRLF half) goes.
+fn trim_trailing_ascii_whitespace(line: &str) -> &str {
+    line.trim_end_matches([' ', '\t', '\r'])
+}
+
+/// The result of normalizing `.changes` bytes: the normalized text,
+/// plus whether any byte had to be substituted with U+FFFD. A
+/// substitution means the input held bytes no known encoding
+/// decodes, so the normalized text is lossy. `source_encoding`
+/// names the encoding the bytes were decoded from, when one was
+/// guessed or detected (`None` for valid UTF-8).
+pub struct NormalizeReport {
+    pub text: String,
+    pub had_undecodable_bytes: bool,
+    pub source_encoding: Option<&'static str>,
+    /// Whether the source was decoded from a guessed single-byte
+    /// encoding. Such a guess can never report a decode error, so
+    /// a wrong guess silently rewrites the file instead of
+    /// refusing — and no refusal can tell the wrong guess apart
+    /// from a right one: a mostly-UTF-8 file with one corrupt byte
+    /// guesses windows-1252, exactly like a legitimate mixed
+    /// UTF-8 + Latin-1 file, so the `--write` path warns about the
+    /// guess (naming it) instead of refusing.
+    pub guessed_single_byte: bool,
+}
+
+/// Detect UTF-16 without a BOM from the NUL pattern: ASCII-heavy
+/// UTF-16LE carries a NUL at every odd byte, UTF-16BE at every
+/// even byte, and a `.changes` file never holds NULs otherwise —
+/// so a file that is at least a quarter NULs, with the NULs almost
+/// all on one parity, is UTF-16. A file that full of NULs is
+/// unusable as UTF-8 text anyway, so the UTF-16 reading is
+/// preferred over keeping the NULs. chardetng does not reliably
+/// guess BOM-less UTF-16, so this runs before the guess. CJK-only
+/// UTF-16 without a BOM has too few NULs to see and is not
+/// detected.
+fn detect_utf16_without_bom(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let (mut even, mut odd) = (0, 0);
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == 0 {
+            if i % 2 == 0 {
+                even += 1;
+            } else {
+                odd += 1;
             }
         }
+    }
+    let total = even + odd;
+    if total * 4 < bytes.len() {
+        return None;
+    }
+    if odd * 10 >= total * 9 {
+        Some(encoding_rs::UTF_16LE)
+    } else if even * 10 >= total * 9 {
+        Some(encoding_rs::UTF_16BE)
+    } else {
+        None
     }
 }
 
@@ -459,21 +531,78 @@ fn contains_valid_multibyte_utf8(bytes: &[u8]) -> bool {
 /// rewritten by the legacy-encoding guess. A trailing line that
 /// trims to empty is dropped when the input has no trailing
 /// newline, and the trailing-newline state of the input is kept.
+/// A UTF-8 BOM is stripped, and a UTF-16 file (with or without a
+/// BOM) is decoded whole first — it cannot be split on `\n` bytes,
+/// which would cut its characters in half.
 pub fn normalize_changes_content(bytes: &[u8]) -> String {
+    normalize_changes_content_checked(bytes).text
+}
+
+/// [`normalize_changes_content`], also reporting undecodable bytes.
+pub fn normalize_changes_content_checked(bytes: &[u8]) -> NormalizeReport {
+    // A UTF-8 BOM is stripped on every path: it is not `.changes`
+    // content, and keeping it only on the valid-UTF-8 path was
+    // inconsistent with the legacy path stripping it.
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    // A UTF-32 BOM is not UTF-16: `\xFF\xFE\x00\x00` would
+    // otherwise be misread as UTF-16LE below. There is no UTF-32
+    // decoder here, so the file is reported undecodable rather
+    // than mangled.
+    if bytes.starts_with(b"\xFF\xFE\x00\x00") || bytes.starts_with(b"\x00\x00\xFE\xFF") {
+        return NormalizeReport {
+            text: String::from_utf8_lossy(bytes).into_owned(),
+            had_undecodable_bytes: true,
+            source_encoding: None,
+            guessed_single_byte: false,
+        };
+    }
     let guessed = guess_legacy_encoding(bytes);
+    // UTF-16 (BOM or guessed) is decoded whole, before any
+    // bytewise `\n` split; the decoded text is valid UTF-8, so
+    // normalizing it recurses with no legacy guess left. The BOM
+    // bytes are skipped before decoding rather than relying on the
+    // decoder to strip them.
+    let utf16 = if bytes.starts_with(b"\xFF\xFE") {
+        Some((encoding_rs::UTF_16LE, &bytes[2..]))
+    } else if bytes.starts_with(b"\xFE\xFF") {
+        Some((encoding_rs::UTF_16BE, &bytes[2..]))
+    } else if let Some(encoding) = detect_utf16_without_bom(bytes) {
+        Some((encoding, bytes))
+    } else {
+        match guessed {
+            Some(encoding)
+                if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE =>
+            {
+                Some((encoding, bytes))
+            }
+            _ => None,
+        }
+    };
+    if let Some((encoding, input)) = utf16 {
+        let (decoded, _, had_errors) = encoding.decode(input);
+        let mut report = normalize_changes_content_checked(decoded.as_bytes());
+        report.had_undecodable_bytes |= had_errors;
+        report.source_encoding = Some(encoding.name());
+        // UTF-16 was detected, not guessed as a single-byte
+        // encoding; the recursive report already says so.
+        report.guessed_single_byte = false;
+        return report;
+    }
     let trailing_newline = bytes.ends_with(b"\n");
     let mut segments: Vec<&[u8]> = bytes.split(|&byte| byte == b'\n').collect();
     if trailing_newline {
         segments.pop();
     }
+    let mut had_undecodable_bytes = false;
     let mut lines: Vec<String> = segments
         .iter()
         .map(|segment| {
-            let text = match guessed {
+            let (text, had_errors) = match guessed {
                 Some(encoding) => decode_mixed(segment, encoding),
-                None => String::from_utf8_lossy(segment).into_owned(),
+                None => (String::from_utf8_lossy(segment).into_owned(), false),
             };
-            text.trim_end().to_string()
+            had_undecodable_bytes |= had_errors;
+            trim_trailing_ascii_whitespace(&text).to_string()
         })
         .collect();
     if !trailing_newline {
@@ -485,7 +614,12 @@ pub fn normalize_changes_content(bytes: &[u8]) -> String {
     if trailing_newline {
         out.push('\n');
     }
-    out
+    NormalizeReport {
+        text: out,
+        had_undecodable_bytes,
+        source_encoding: guessed.map(|encoding| encoding.name()),
+        guessed_single_byte: guessed.is_some_and(|encoding| !guessed_can_error(encoding)),
+    }
 }
 
 #[cfg(test)]
@@ -640,8 +774,20 @@ mod tests {
     fn decode_with_replaces_undecodable_bytes() {
         // A lone Shift_JIS lead byte decodes with errors in Shift_JIS;
         // the decoder marks it U+FFFD.
-        let out = decode_with(b"\x82", encoding_rs::SHIFT_JIS);
+        let (out, had_errors) = decode_with(b"\x82", encoding_rs::SHIFT_JIS);
         assert_eq!(out, "\u{FFFD}");
+        assert!(had_errors);
+    }
+
+    #[test]
+    fn decode_mixed_reports_an_undecodable_run() {
+        // A valid UTF-8 span plus a lone Shift_JIS lead byte: the
+        // run cannot decode, so the flag reports it.
+        let mut bytes = "Th\u{e9} ".as_bytes().to_vec();
+        bytes.extend_from_slice(b"\x82");
+        let (text, had_errors) = decode_mixed(&bytes, encoding_rs::SHIFT_JIS);
+        assert!(had_errors);
+        assert!(text.contains('\u{FFFD}'));
     }
 
     #[test]
@@ -736,5 +882,178 @@ mod tests {
         // reads it as windows-1252 ‚.
         let normalized = normalize_changes_content(b"\x82");
         assert_eq!(normalized, "‚");
+    }
+
+    #[test]
+    fn normalize_strips_a_utf8_bom_on_both_paths() {
+        // Valid UTF-8 with a BOM, and a legacy file with a BOM:
+        // the BOM is stripped either way.
+        assert_eq!(
+            normalize_changes_content(b"\xEF\xBB\xBF- Update to 2.0\n"),
+            "- Update to 2.0\n"
+        );
+        let mut bytes = b"\xEF\xBB\xBF- Update to 2.0\n- Fix the th".to_vec();
+        bytes.extend_from_slice(b"\xe9\n");
+        assert_eq!(
+            normalize_changes_content(&bytes),
+            "- Update to 2.0\n- Fix the th\u{e9}\n"
+        );
+    }
+
+    #[test]
+    fn normalize_decodes_utf16_with_a_bom() {
+        // UTF-16LE and UTF-16BE with BOMs: decoded whole, not cut
+        // mid-character on `\n` bytes.
+        let text = "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Jane <jane@example.com>\n\n- Update to 2.0\n";
+        let mut le = vec![0xFF, 0xFE];
+        le.extend(text.encode_utf16().flat_map(|unit| unit.to_le_bytes()));
+        assert_eq!(normalize_changes_content(&le), text);
+        let mut be = vec![0xFE, 0xFF];
+        be.extend(text.encode_utf16().flat_map(|unit| unit.to_be_bytes()));
+        assert_eq!(normalize_changes_content(&be), text);
+    }
+
+    #[test]
+    fn normalize_decodes_utf16_without_a_bom() {
+        // No BOM: the detector has to recognize UTF-16LE from the
+        // NUL pattern. A realistic entry carries enough text.
+        let text = "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0 with several words of body text here\n- And a second bullet line to give the detector more to read\n";
+        let bytes: Vec<u8> = text
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        assert_eq!(normalize_changes_content(&bytes), text);
+    }
+
+    #[test]
+    fn normalize_checked_reports_undecodable_bytes() {
+        // A truncated UTF-16 file: the whole-input decode hits the
+        // lone trailing byte, so the report flags it and the text
+        // carries U+FFFD.
+        let mut le = vec![0xFF, 0xFE];
+        le.extend("ab\n".encode_utf16().flat_map(|unit| unit.to_le_bytes()));
+        le.push(0x61);
+        let report = normalize_changes_content_checked(&le);
+        assert!(report.had_undecodable_bytes);
+        assert!(report.text.contains('\u{FFFD}'));
+        let mut be = vec![0xFE, 0xFF];
+        be.extend("ab\n".encode_utf16().flat_map(|unit| unit.to_be_bytes()));
+        be.push(0x61);
+        assert!(normalize_changes_content_checked(&be).had_undecodable_bytes);
+        // Clean input reports nothing, even with a genuine U+FFFD
+        // already in the text: valid UTF-8 is never re-decoded.
+        let clean = normalize_changes_content_checked("a \u{FFFD} b\n".as_bytes());
+        assert!(!clean.had_undecodable_bytes);
+        // Note the limit this pins around, not through: a lone
+        // undecodable byte disables chardetng's multi-byte probers,
+        // so the file-level guess falls back to a single-byte
+        // encoding, which maps every byte without error — the
+        // per-line flag cannot fire there. Refusing on the guess
+        // cannot work either: a corrupt file guesses windows-1252,
+        // exactly like a legitimate mixed UTF-8 + Latin-1 file
+        // (pinned below), so the write path warns about the guess,
+        // naming it, instead of refusing.
+    }
+
+    #[test]
+    fn normalize_checked_reports_utf32_bom_as_undecodable() {
+        // A UTF-32 BOM is not UTF-16: `\xFF\xFE\x00\x00` would
+        // otherwise be misread as UTF-16LE below and the file
+        // silently mangled. Both BOMs report undecodable bytes.
+        let mut le = vec![0xFF, 0xFE, 0x00, 0x00];
+        for ch in "ab\n".chars() {
+            le.extend((ch as u32).to_le_bytes());
+        }
+        assert!(normalize_changes_content_checked(&le).had_undecodable_bytes);
+        let mut be = vec![0x00, 0x00, 0xFE, 0xFF];
+        for ch in "ab\n".chars() {
+            be.extend((ch as u32).to_be_bytes());
+        }
+        assert!(normalize_changes_content_checked(&be).had_undecodable_bytes);
+    }
+
+    #[test]
+    fn normalize_mixed_utf8_with_a_lone_corrupt_byte_still_transcodes() {
+        // PROBE1 shape: a legitimate mixed UTF-8 + Latin-1 file
+        // plus one lone 0x82 byte. The guess is windows-1252 —
+        // the same guess as the mixed file without the corrupt
+        // byte — so no refusal can tell them apart, and the file
+        // still transcodes (the 0x82 becomes U+201A, silently
+        // wrong); the write path warns about the guess instead.
+        let mut input = "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tom\u{e1}s Chv\u{e1}tal <tomas.chvatal@gmail.com>\n\n- Update to 2.0\n\n-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Andr".as_bytes().to_vec();
+        input.extend_from_slice(b"\xe9 Martin <andre@example.com>\n\n- Fix the th\xe9\n");
+        input.extend_from_slice(b"\x82\n");
+        let report = normalize_changes_content_checked(&input);
+        assert!(!report.had_undecodable_bytes);
+        assert_eq!(report.source_encoding, Some("windows-1252"));
+        assert!(report.guessed_single_byte);
+    }
+
+    #[test]
+    fn normalize_shift_jis_with_a_trailing_corrupt_byte_still_transcodes() {
+        // PROBE2 shape: a genuine Shift_JIS body plus one trailing
+        // 0x82 byte. The lone byte disables the multi-byte probers,
+        // so the guess falls back to windows-1252 and the Japanese
+        // body is rewritten as mojibake — but the only refusal rule
+        // that catches this file (a single-byte guess on a file
+        // with valid multi-byte UTF-8) also catches a legitimate
+        // mixed UTF-8 + Latin-1 file, which must keep writing, so
+        // the file still transcodes and the write path warns instead.
+        let mut input = b"-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - ".to_vec();
+        input.extend_from_slice(b"\x8eR\x93c\x91\xbe\x98Y <yamada@example.com>\n\n- \x83e\x83X\x83g\x82\xcc\x8fC\x90\xb3\n");
+        input.push(0x82);
+        let report = normalize_changes_content_checked(&input);
+        assert!(!report.had_undecodable_bytes);
+        assert_eq!(report.source_encoding, Some("windows-1252"));
+        assert!(report.guessed_single_byte);
+    }
+
+    #[test]
+    fn normalize_still_transcodes_a_pure_latin1_file() {
+        // A file wholly in Latin-1 holds no valid multi-byte UTF-8
+        // and guesses a single-byte encoding, so it still
+        // transcodes on the guess — with the flag set, so the write
+        // path warns about it.
+        let mut bytes = b"-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Andr".to_vec();
+        bytes.extend_from_slice(b"\xe9 Martin <andre@example.com>\n\n- Fix the th\xe9\n");
+        let report = normalize_changes_content_checked(&bytes);
+        assert!(!report.had_undecodable_bytes);
+        assert!(report.guessed_single_byte);
+        assert!(report.text.contains("Fix the th\u{e9}"));
+    }
+
+    #[test]
+    fn normalize_keeps_unicode_whitespace_and_lone_carriage_returns() {
+        // `trim_end` used to strip these too: NBSP and U+3000 are
+        // content, and a lone `\r` inside a line is not a line ending.
+        assert_eq!(
+            normalize_changes_content("a\u{00A0}\n".as_bytes()),
+            "a\u{00A0}\n"
+        );
+        assert_eq!(
+            normalize_changes_content("a\u{3000}\n".as_bytes()),
+            "a\u{3000}\n"
+        );
+        assert_eq!(normalize_changes_content(b"a\rb\n"), "a\rb\n");
+        // A trailing `\r` is the CRLF half and still goes.
+        assert_eq!(normalize_changes_content(b"a\r\n"), "a\n");
+        assert_eq!(normalize_changes_content(b"a \r\n"), "a\n");
+    }
+
+    #[test]
+    fn normalize_transcodes_an_euc_jp_entry() {
+        // A second multi-byte legacy encoding, pinned with a body
+        // long enough for the detector to place it.
+        let (body, _, had_errors) =
+            encoding_rs::EUC_JP.encode("\u{30c6}\u{30b9}\u{30c8}\u{306e}\u{4fee}\u{6b63}\u{3068}\u{66f4}\u{65b0}\u{306e}\u{78ba}\u{8a8d}");
+        assert!(!had_errors);
+        let mut input = b"-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Yamada <yamada@example.com>\n\n- ".to_vec();
+        input.extend_from_slice(&body);
+        input.push(b'\n');
+        let normalized = normalize_changes_content(&input);
+        assert_eq!(
+            normalized,
+            "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Yamada <yamada@example.com>\n\n- \u{30c6}\u{30b9}\u{30c8}\u{306e}\u{4fee}\u{6b63}\u{3068}\u{66f4}\u{65b0}\u{306e}\u{78ba}\u{8a8d}\n"
+        );
     }
 }
