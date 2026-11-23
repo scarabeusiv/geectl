@@ -13,6 +13,7 @@ use super::valid_obs_filename;
 use super::valid_obs_name;
 use super::AggregateOptions;
 use super::CreatePackageOptions;
+use super::DeletePackageOptions;
 use super::DeleteProjectOptions;
 use super::DirectoryListing;
 use super::DownloadMaster;
@@ -148,6 +149,61 @@ fn validate_scmsync(scmsync: &str) -> Result<(), GeectlError> {
             ErrorKind::InvalidInput,
             "scmsync must include a fragment with the branch name (e.g. https://example.com/user/repo#main)",
         )),
+    }
+}
+
+/// Validate a delete message: the server records it as the delete
+/// comment, so it must be a single line it can store — empty or
+/// whitespace-only carries nothing, control characters (including
+/// newlines) break the recorded comment, and a multi-KB message
+/// risks a 400/414 on the query string.
+fn validate_delete_message(message: &str) -> Result<(), GeectlError> {
+    if message.trim().is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "delete message must not be empty",
+        ));
+    }
+    if message.len() > 2048 {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "delete message is longer than 2048 bytes",
+        ));
+    }
+    if message.chars().any(char::is_control) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "delete message must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// The option suffix for a package-delete plan line: the set
+/// options, so a dry-run plan reads what the delete would have
+/// done. The message is truncated to its first 80 characters: the
+/// plan is one line, and the full message rides the payload.
+fn delete_package_option_suffix(options: &DeletePackageOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if options.force {
+        parts.push("force".to_string());
+    }
+    if let Some(message) = &options.message {
+        // Messages are validated single-line before the plan is
+        // built, so truncation cuts length only, never a line.
+        const PLAN_MESSAGE_LEN: usize = 80;
+        let shown: String = message.chars().take(PLAN_MESSAGE_LEN).collect();
+        let more = if message.chars().count() > PLAN_MESSAGE_LEN {
+            "…"
+        } else {
+            ""
+        };
+        parts.push(format!("message {shown}{more}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
     }
 }
 
@@ -1543,6 +1599,13 @@ impl<'a> ObsClient<'a> {
     /// (`obsolete_reviews_for_self`) without changing the request's
     /// state.
     ///
+    /// `message` is forwarded as `comment` to the API, recorded on
+    /// the delete like osc's `-m` — the same parameter
+    /// `delete_project` sends. An unset message means the server's
+    /// default. A set message is validated before the dry-run
+    /// guard: empty, longer than 2048 bytes, or containing control
+    /// characters is refused.
+    ///
     /// Success is the `<status code="ok"/>` body: any other body is
     /// a server error, never success. A delete that times out leaves
     /// the state unknown (the package may or may not be gone) — the
@@ -1551,7 +1614,7 @@ impl<'a> ObsClient<'a> {
         &self,
         project: &str,
         package: &str,
-        force: bool,
+        options: &DeletePackageOptions,
         dry_run: &DryRun,
     ) -> Result<(), GeectlError> {
         for (label, value) in [("project", project), ("package", package)] {
@@ -1562,12 +1625,23 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
+        // Validate the message before the dry-run guard, so a
+        // dry-run plan never promises a delete the server would
+        // refuse.
+        if let Some(message) = &options.message {
+            validate_delete_message(message)?;
+        }
         // The dry-run guard: in dry-run the delete is recorded in the
         // plan and nothing is deleted — not even the pre-check search
         // runs, since a dry-run delete has nothing it must read.
         // Without this, a dry-run caller invoking delete directly
-        // would mutate the server.
-        if !dry_run.allow(&format!("delete package {project}/{package}")) {
+        // would mutate the server. The plan names the set options:
+        // a plan that hides them misstates the delete.
+        let plan = format!(
+            "delete package {project}/{package}{}",
+            delete_package_option_suffix(options)
+        );
+        if !dry_run.allow(&plan) {
             return Ok(());
         }
         if !self.has_auth() {
@@ -1576,7 +1650,7 @@ impl<'a> ObsClient<'a> {
                 "cannot delete a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
-        if !force {
+        if !options.force {
             let blocking = self.open_requests_for_package(project, package)?;
             if !blocking.is_empty() {
                 return Err(GeectlError::new(
@@ -1589,8 +1663,11 @@ impl<'a> ObsClient<'a> {
             }
         }
         let mut query: Vec<(&str, &str)> = Vec::new();
-        if force {
+        if options.force {
             query.push(("force", "1"));
+        }
+        if let Some(message) = &options.message {
+            query.push(("comment", message));
         }
         let url = build_url(&self.base, &["source", project, package], &query);
         let body = self.http.delete(&url, &self.credentials)?;
@@ -5784,7 +5861,12 @@ mod tests {
             );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(obs
-            .delete_package("home:scarabeus_iv", "foo", false, &DryRun::new(false))
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions::default(),
+                &DryRun::new(false)
+            )
             .is_ok());
         // The pre-check search ran first, then the DELETE.
         assert_eq!(http.get_calls().len(), 1);
@@ -5868,7 +5950,12 @@ mod tests {
             );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let err = obs
-            .delete_package("home:scarabeus_iv", "foo", false, &DryRun::new(false))
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions::default(),
+                &DryRun::new(false),
+            )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         // The error names the blocking request.
@@ -5886,7 +5973,15 @@ mod tests {
         );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(obs
-            .delete_package("home:scarabeus_iv", "foo", true, &DryRun::new(false))
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions {
+                    force: true,
+                    ..Default::default()
+                },
+                &DryRun::new(false)
+            )
             .is_ok());
         assert!(http.get_calls().is_empty());
         assert_eq!(http.delete_calls().len(), 1);
@@ -5897,11 +5992,241 @@ mod tests {
     }
 
     #[test]
+    fn delete_package_forwards_message_as_comment() {
+        // The message is the server's `comment` parameter, like
+        // osc's `-m` — and it rides alongside force when both
+        // are set.
+        let http = FakeHttp::new().with_delete(
+            "https://api.opensuse.org/source/home:scarabeus_iv/foo?force=1&comment=cleanup",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = DeletePackageOptions {
+            force: true,
+            message: Some("cleanup".to_string()),
+        };
+        assert!(obs
+            .delete_package("home:scarabeus_iv", "foo", &options, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(
+            http.delete_calls()[0].0,
+            "https://api.opensuse.org/source/home:scarabeus_iv/foo?force=1&comment=cleanup"
+        );
+    }
+
+    #[test]
+    fn delete_package_encodes_message_query_characters() {
+        // `&`, `=`, `+`, and a space in the message must reach the
+        // server as one `comment` value, not as extra query pairs:
+        // the query encoder percent-encodes them all.
+        let http = FakeHttp::new().with_delete(
+            "https://api.opensuse.org/source/home:scarabeus_iv/foo?force=1&comment=a%26b%3Dc%2Bd%20e",
+            "<status code=\"ok\" />",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = DeletePackageOptions {
+            force: true,
+            message: Some("a&b=c+d e".to_string()),
+        };
+        assert!(obs
+            .delete_package("home:scarabeus_iv", "foo", &options, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(
+            http.delete_calls()[0].0,
+            "https://api.opensuse.org/source/home:scarabeus_iv/foo?force=1&comment=a%26b%3Dc%2Bd%20e"
+        );
+    }
+
+    #[test]
+    fn delete_package_rejects_empty_message_without_http() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = obs
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions {
+                    force: false,
+                    message: Some(String::new()),
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_package_rejects_whitespace_only_message_without_http() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = obs
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions {
+                    force: false,
+                    message: Some("   ".to_string()),
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_package_rejects_overlong_message_without_http() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = obs
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions {
+                    force: false,
+                    message: Some("x".repeat(2049)),
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_package_accepts_a_2048_byte_message_in_dry_run() {
+        // The cap is 2048 bytes: a message of exactly that length is
+        // accepted, and the plan shows its first 80 characters.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        assert!(obs
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions {
+                    force: false,
+                    message: Some("x".repeat(2048)),
+                },
+                &dry
+            )
+            .is_ok());
+        assert_eq!(
+            dry.plan(),
+            vec![format!(
+                "[dry-run] would: delete package home:scarabeus_iv/foo (message {}…)",
+                "x".repeat(80)
+            )]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_package_rejects_control_characters_in_message_without_http() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        for message in ["clean\nup", "clean\tup"] {
+            let err = obs
+                .delete_package(
+                    "home:scarabeus_iv",
+                    "foo",
+                    &DeletePackageOptions {
+                        force: false,
+                        message: Some(message.to_string()),
+                    },
+                    &DryRun::new(false),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_package_dry_run_truncates_a_long_message_in_the_plan() {
+        // The plan is one line: a message longer than 80 characters
+        // is cut there with an ellipsis, while a message of exactly
+        // 80 characters is shown whole.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        assert!(obs
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions {
+                    force: false,
+                    message: Some("x".repeat(100)),
+                },
+                &dry
+            )
+            .is_ok());
+        assert_eq!(
+            dry.plan(),
+            vec![format!(
+                "[dry-run] would: delete package home:scarabeus_iv/foo (message {}…)",
+                "x".repeat(80)
+            )]
+        );
+        let dry = DryRun::default();
+        assert!(obs
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions {
+                    force: false,
+                    message: Some("x".repeat(80)),
+                },
+                &dry
+            )
+            .is_ok());
+        assert_eq!(
+            dry.plan(),
+            vec![format!(
+                "[dry-run] would: delete package home:scarabeus_iv/foo (message {})",
+                "x".repeat(80)
+            )]
+        );
+        // One character over the cap truncates: the boundary is
+        // exactly 80, not 79 or 81.
+        let dry = DryRun::default();
+        assert!(obs
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions {
+                    force: false,
+                    message: Some("x".repeat(81)),
+                },
+                &dry
+            )
+            .is_ok());
+        assert_eq!(
+            dry.plan(),
+            vec![format!(
+                "[dry-run] would: delete package home:scarabeus_iv/foo (message {}…)",
+                "x".repeat(80)
+            )]
+        );
+    }
+
+    #[test]
     fn delete_package_without_credentials_fails_closed() {
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
         assert!(client
-            .delete_package("home:scarabeus_iv", "foo", false, &DryRun::new(false))
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions::default(),
+                &DryRun::new(false)
+            )
             .is_err());
         assert!(http.get_calls().is_empty());
         assert!(http.delete_calls().is_empty());
@@ -5912,10 +6237,20 @@ mod tests {
         let http = FakeHttp::new();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
-            .delete_package("home:scarabeus_iv", "foo/bar", false, &DryRun::new(false))
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo/bar",
+                &DeletePackageOptions::default(),
+                &DryRun::new(false)
+            )
             .is_err());
         assert!(client
-            .delete_package("", "foo", false, &DryRun::new(false))
+            .delete_package(
+                "",
+                "foo",
+                &DeletePackageOptions::default(),
+                &DryRun::new(false)
+            )
             .is_err());
         assert!(http.get_calls().is_empty());
         assert!(http.delete_calls().is_empty());
@@ -5936,7 +6271,12 @@ mod tests {
             );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let err = obs
-            .delete_package("home:scarabeus_iv", "foo", false, &DryRun::new(false))
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions::default(),
+                &DryRun::new(false),
+            )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
     }
@@ -5946,18 +6286,28 @@ mod tests {
         // A dry-run caller invoking delete directly must not mutate
         // the server: the delete is recorded in the plan, and neither
         // the pre-check search nor the DELETE runs (no canned
-        // responses exist, so either would fail).
+        // responses exist, so either would fail). The options carry
+        // a force flag and a message; the plan names both, and
+        // the assertion below pins that shape.
         let http = FakeHttp::new();
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dry = DryRun::default();
         assert!(obs
-            .delete_package("home:scarabeus_iv", "foo", false, &dry)
+            .delete_package(
+                "home:scarabeus_iv",
+                "foo",
+                &DeletePackageOptions {
+                    force: true,
+                    message: Some("cleanup".to_string()),
+                },
+                &dry
+            )
             .is_ok());
         assert!(http.get_calls().is_empty());
         assert!(http.delete_calls().is_empty());
         assert_eq!(
             dry.plan(),
-            vec!["[dry-run] would: delete package home:scarabeus_iv/foo"]
+            vec!["[dry-run] would: delete package home:scarabeus_iv/foo (force, message cleanup)"]
         );
     }
 

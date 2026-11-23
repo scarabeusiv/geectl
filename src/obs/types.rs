@@ -737,6 +737,18 @@ pub struct DeleteProjectOptions {
     pub comment: Option<String>,
 }
 
+/// Options for [`ObsClient::delete_package`]. All fields are
+/// optional: an unset flag means off, an unset message means the
+/// server's default.
+#[derive(Debug, Clone, Default)]
+pub struct DeletePackageOptions {
+    /// Ignore open submit requests involving the package. The
+    /// server's `force`.
+    pub force: bool,
+    /// A message recorded on the delete. The server's `comment`.
+    pub message: Option<String>,
+}
+
 /// Options for [`ObsClient::aggregate_package`]. All fields are
 /// optional: an unset flag means off, an empty repository map means
 /// no repository mappings.

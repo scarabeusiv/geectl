@@ -63,8 +63,10 @@
 //! itself, not re-rendered. `create-project` and `create-package`
 //! text carries no description (long free text); `delete-project`
 //! text carries no comment (a message, not an identifier);
-//! `create-package` text carries no `force` (a boolean; the dry-run
-//! plan names it when set).
+//! `delete-package` text carries no message (long free text — the
+//! dry-run plan names a truncated message); `create-package` text
+//! carries no `force` (a boolean; the dry-run plan names it when
+//! set).
 //! The JSON payload remains the complete record in every case.
 
 use clap::Subcommand;
@@ -74,11 +76,11 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    valid_obs_name, validate_role, AggregateOptions, CreatePackageOptions, DeleteProjectOptions,
-    DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff,
-    PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch, ProjectMeta,
-    ReleaseOptions, Repository, RevisionPatch, RevisionRange, RevisionSpec, RoleGrant, SourceFile,
-    StagedRequest, StagingProject, StagingReadOptions, FACTORY_PROJECT, OBS_API_BASE,
+    valid_obs_name, validate_role, AggregateOptions, CreatePackageOptions, DeletePackageOptions,
+    DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient,
+    Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch,
+    ProjectMeta, ReleaseOptions, Repository, RevisionPatch, RevisionRange, RevisionSpec, RoleGrant,
+    SourceFile, StagedRequest, StagingProject, StagingReadOptions, FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -517,6 +519,10 @@ pub enum RemoteCommand {
         /// Delete even when open submit requests involve the package.
         #[arg(long)]
         force: bool,
+        /// A message recorded on the delete, sent as the server's
+        /// `comment` query parameter.
+        #[arg(long)]
+        message: Option<String>,
     },
     /// Delete a `_link` file from a package. A mutation: dry-run is
     /// the default (only the plan is printed); `--live` performs the
@@ -1334,9 +1340,14 @@ pub fn run_remote(
             project,
             package,
             force,
+            message,
         } => {
+            let options = DeletePackageOptions {
+                force,
+                message: message.clone(),
+            };
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
-            client.delete_package(&project, &package, force, &dry_run)?;
+            client.delete_package(&project, &package, &options, &dry_run)?;
             let plan = if dry_run.enabled() {
                 Some(dry_run.plan())
             } else {
@@ -1345,7 +1356,7 @@ pub fn run_remote(
             Ok(delete_package_result(
                 &project,
                 &package,
-                force,
+                &options,
                 dry_run.enabled(),
                 plan,
             ))
@@ -1779,22 +1790,25 @@ fn create_package_result(
     )
 }
 
-/// The `delete-package` result: the payload carries `force`; the
-/// text carries it too, in the result line — the dry-run plan does
-/// not name it.
+/// The `delete-package` result: the payload carries `force` and the
+/// message; the text carries the force too, in the result line —
+/// the dry-run plan names the force and a truncated message. The
+/// message is long free text, so the result line leaves it out and
+/// it rides the payload only, like the delete-project comment.
 fn delete_package_result(
     project: &str,
     package: &str,
-    force: bool,
+    options: &DeletePackageOptions,
     dry_run: bool,
     plan: Option<Vec<String>>,
 ) -> (Value, String) {
     let payload = json!({
         "project": project,
         "package": package,
-        "force": force,
+        "force": options.force,
+        "message": options.message,
     });
-    let suffix = if force { " (force)" } else { "" };
+    let suffix = if options.force { " (force)" } else { "" };
     let result_line = if dry_run {
         format!("dry-run: would delete package {package} from project {project}{suffix}")
     } else {
@@ -4105,6 +4119,26 @@ mod tests {
     }
 
     #[test]
+    fn delete_package_parses_message() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "delete-package",
+            "P",
+            "K",
+            "--message",
+            "cleanup",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::DeletePackage {
+                message: Some(message),
+                ..
+            } if message == "cleanup"
+        ));
+    }
+
+    #[test]
     fn delete_link_parses_project_and_package() {
         let parsed = parse(&["geectl", "remote", "delete-link", "P", "K"]);
         assert!(matches!(
@@ -4774,11 +4808,22 @@ mod tests {
 
     #[test]
     fn delete_package_result_carries_force_in_both_formats() {
-        let (payload, text) = delete_package_result("P", "K", true, false, None);
+        let (payload, text) = delete_package_result(
+            "P",
+            "K",
+            &DeletePackageOptions {
+                force: true,
+                message: Some("cleanup".to_string()),
+            },
+            false,
+            None,
+        );
         assert_eq!(payload["project"], "P");
         assert_eq!(payload["package"], "K");
         assert_eq!(payload["force"], true);
+        assert_eq!(payload["message"], "cleanup");
         assert_eq!(payload["dry_run"], false);
+        assert!(!text.contains("cleanup"));
         assert_eq!(
             text,
             "project: P package: K\ndry_run: false\ndeleted package K from project P (force)"
@@ -4786,11 +4831,12 @@ mod tests {
         let (payload, text) = delete_package_result(
             "P",
             "K",
-            false,
+            &DeletePackageOptions::default(),
             true,
             Some(vec!["[dry-run] would: delete package P/K".to_string()]),
         );
         assert_eq!(payload["force"], false);
+        assert_eq!(payload["message"], Value::Null);
         assert_eq!(payload["dry_run"], true);
         assert_eq!(payload["plan"][0], "[dry-run] would: delete package P/K");
         assert_eq!(

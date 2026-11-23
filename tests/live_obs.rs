@@ -76,12 +76,12 @@ use geectl::error::ErrorKind;
 use geectl::http::{sanitize_url_for_error, HttpClient, Timeout, UreqClient};
 use geectl::obs::{
     AddRolePayload, AggregateOptions, BranchOptions, BuildLogQuery, ChangeDevelPayload,
-    CopyOptions, CopyProjectOptions, CreatePackageOptions, DeletePayload, DeleteProjectOptions,
-    DeleteTarget, DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision,
-    MaintenanceBranchOptions, MaintenanceIncidentPayload, NamedRole, ObsClient, PackageDiffStatus,
-    ReleaseOptions, Repository, Request, RequestAction, RequestSearch, RequestState, ResultsQuery,
-    ReviewState, ReviewTarget, RevisionRange, RevisionSpec, RoleGrant, SourceUpdate, SrFiling,
-    SrPayload, StagingReadOptions,
+    CopyOptions, CopyProjectOptions, CreatePackageOptions, DeletePackageOptions, DeletePayload,
+    DeleteProjectOptions, DeleteTarget, DryRun, FilePatchStatus, HistoryEntry, LinkOptions,
+    LinkRevision, MaintenanceBranchOptions, MaintenanceIncidentPayload, NamedRole, ObsClient,
+    PackageDiffStatus, ReleaseOptions, Repository, Request, RequestAction, RequestSearch,
+    RequestState, ResultsQuery, ReviewState, ReviewTarget, RevisionRange, RevisionSpec, RoleGrant,
+    SourceUpdate, SrFiling, SrPayload, StagingReadOptions,
 };
 use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus};
 
@@ -817,7 +817,7 @@ fn live_refile_supersedes_and_deletes_on_server() {
     );
     // The old branch deletes now that its request is closed...
     client
-        .delete_package(&source_a, &package, false, &dry)
+        .delete_package(&source_a, &package, &DeletePackageOptions::default(), &dry)
         .expect("delete the superseded branch");
     assert!(
         !public_path_exists(&base, &format!("{source_a}/{package}")),
@@ -825,7 +825,7 @@ fn live_refile_supersedes_and_deletes_on_server() {
     );
     // ...but the new branch is still guarded while its request is open.
     let err = client
-        .delete_package(&source_b, &package, false, &dry)
+        .delete_package(&source_b, &package, &DeletePackageOptions::default(), &dry)
         .expect_err("deleting a branch with an open request must be refused");
     assert!(
         format!("{err}").contains(&id2),
@@ -885,7 +885,7 @@ fn live_file_supersedes_all_open_srs_on_server() {
     );
     // The old branch deletes now that its request is closed...
     client
-        .delete_package(&source_a, &package, false, &dry)
+        .delete_package(&source_a, &package, &DeletePackageOptions::default(), &dry)
         .expect("delete the superseded branch");
     assert!(
         !public_path_exists(&base, &format!("{source_a}/{package}")),
@@ -893,7 +893,7 @@ fn live_file_supersedes_all_open_srs_on_server() {
     );
     // ...but the new branch is still guarded while its request is open.
     let err = client
-        .delete_package(&source_b, &package, false, &dry)
+        .delete_package(&source_b, &package, &DeletePackageOptions::default(), &dry)
         .expect_err("deleting a branch with an open request must be refused");
     assert!(
         format!("{err}").contains(&id2),
@@ -3522,7 +3522,15 @@ fn live_detach_branch_drops_link_when_target_removed() {
     let client = live_client_authed(&base);
     let (source_project, target_project, package) = setup_link(&client);
     client
-        .delete_package(&source_project, &package, true, &DryRun::new(false))
+        .delete_package(
+            &source_project,
+            &package,
+            &DeletePackageOptions {
+                force: true,
+                ..Default::default()
+            },
+            &DryRun::new(false),
+        )
         .expect("remove the link target on the live instance");
     // Dropping the link reports no revision: the API's file delete
     // answers status-ok, not a revision document.
@@ -3645,7 +3653,15 @@ fn live_undelete_package() {
     let client = live_client_authed(&base);
     let (source_project, package, filename, _) = setup_copy_source(&client);
     client
-        .delete_package(&source_project, &package, true, &DryRun::new(false))
+        .delete_package(
+            &source_project,
+            &package,
+            &DeletePackageOptions {
+                force: true,
+                ..Default::default()
+            },
+            &DryRun::new(false),
+        )
         .expect("delete the package on the live instance");
     client
         .undelete_package(&source_project, &package, &DryRun::new(false))

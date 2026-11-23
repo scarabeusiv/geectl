@@ -223,6 +223,7 @@ pub use self::types::CopyProjectOptions;
 pub use self::types::CreatePackageOptions;
 pub use self::types::CrossInstanceCopyResult;
 pub use self::types::CveId;
+pub use self::types::DeletePackageOptions;
 pub use self::types::DeleteProjectOptions;
 pub(crate) use self::types::DirectoryListing;
 pub use self::types::DownloadMaster;
