@@ -1593,10 +1593,13 @@ pub(crate) fn parse_project_search(body: &str) -> Option<Vec<ProjectMatch>> {
     Some(matches)
 }
 
-/// Validate a search term: non-empty, and without a single quote —
-/// the term goes into a single-quoted XPath string literal, where a
-/// quote would break out of the literal (XPath has no string
-/// escape).
+/// Validate a search term: non-empty, and without a single quote or
+/// a backslash. The term goes into a single-quoted XPath string
+/// literal, where a quote would break out of the literal (XPath has
+/// no string escape). A backslash is literal in XPath, but OBS
+/// reuses the literal as a SQL LIKE pattern, where it escapes the
+/// next character — a trailing backslash escapes the appended `%`
+/// and silently turns a prefix search into an exact match.
 fn validate_search_term(term: &str) -> Result<&str, GeectlError> {
     if term.is_empty() {
         return Err(GeectlError::new(
@@ -1608,6 +1611,12 @@ fn validate_search_term(term: &str) -> Result<&str, GeectlError> {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             format!("search term must not contain a single quote: {term:?}"),
+        ));
+    }
+    if term.contains('\\') {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("search term must not contain a backslash: {term:?}"),
         ));
     }
     Ok(term)
@@ -9882,6 +9891,24 @@ mod tests {
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client.list_scmsync_projects("").is_err());
         assert!(client.list_scmsync_projects("x' or '1'='1").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn list_scmsync_projects_rejects_a_backslash_prefix_without_http() {
+        // A backslash is literal in XPath, but OBS reuses the literal
+        // as a SQL LIKE pattern, where it escapes the next character:
+        // a trailing backslash would escape the appended `%` and
+        // silently change the match, so the term is rejected before
+        // any request.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .list_scmsync_projects("https://example.com/foo\\")
+            .is_err());
+        assert!(client
+            .list_scmsync_projects("https://example.com/fo\\o")
+            .is_err());
         assert!(http.get_calls().is_empty());
     }
 
