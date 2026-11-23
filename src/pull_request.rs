@@ -6,17 +6,17 @@
 //! backends, with a unified status ([`PullRequestStatus`]). This module
 //! carries the handle, the shapes, and the status mappings.
 
+use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
     validate_gitea_name, GiteaClient, GiteaComment, GiteaIssue, GiteaMergeMethod, GiteaPullRequest,
-    GiteaPullRequestRef, GiteaPullRequestState, GiteaReview, GiteaReviewEvent,
+    GiteaPullRequestRef, GiteaPullRequestState, GiteaReview, GiteaReviewEvent, PrCreateOptions,
 };
 use crate::obs::request::{
     validate_request_id, Request, RequestAction, RequestSearch, RequestState, ReviewState,
     ReviewTarget,
 };
-use crate::obs::DryRun;
-use crate::obs::ObsClient;
+use crate::obs::{DryRun, ObsClient, SrFiling, SrPayload};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -718,6 +718,38 @@ impl PullRequestSearch {
     }
 }
 
+/// What to file: a submit request or a Gitea pull request. The
+/// OBS arm carries the whole payload; the Gitea arm carries the
+/// repo with the create options — the options alone name no repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitTarget {
+    /// File an OBS submit request from this payload.
+    Obs(SrPayload),
+    /// Create a Gitea pull request in this repo with these options.
+    Gitea {
+        /// The repo owner.
+        owner: String,
+        /// The repo name.
+        repo: String,
+        /// The pull request to create.
+        options: PrCreateOptions,
+    },
+}
+
+/// A filed submission: the handle, plus the handles it superseded.
+/// The OBS arm supersedes every open submit request for the
+/// package from the authenticated user when it files, so the
+/// caller learns which requests died; the Gitea arm creates
+/// without superseding, so its list is empty. In dry-run there is
+/// no submission at all (`submit` returns `None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submitted {
+    /// The filed submission, by its backend-neutral handle.
+    pub reference: PullRequestRef,
+    /// The handles superseded with it, in supersede order.
+    pub superseded: Vec<PullRequestRef>,
+}
+
 /// The uniform pull-request client: one interface over the OBS and
 /// Gitea clients. An arm is `None` when its credentials are not
 /// configured: a read on that arm fails closed naming the missing
@@ -725,6 +757,7 @@ impl PullRequestSearch {
 pub struct PullRequestClient<'a> {
     obs: Option<&'a ObsClient<'a>>,
     gitea: Option<&'a GiteaClient<'a>>,
+    debug: Debug,
 }
 
 impl<'a> PullRequestClient<'a> {
@@ -733,7 +766,21 @@ impl<'a> PullRequestClient<'a> {
     /// configured; a read on the missing arm fails closed, a read
     /// on the other arm never needs it.
     pub fn new(obs: Option<&'a ObsClient<'a>>, gitea: Option<&'a GiteaClient<'a>>) -> Self {
-        PullRequestClient { obs, gitea }
+        PullRequestClient {
+            obs,
+            gitea,
+            debug: Debug::disabled(),
+        }
+    }
+
+    /// Report the channel's decision lines (the filing supersede
+    /// decisions) to `debug` instead of dropping them. The sink is
+    /// off by default; the caller that owns the debug channel
+    /// passes its sink here, like the backend clients' own
+    /// `with_debug`.
+    pub fn with_debug(mut self, debug: Debug) -> Self {
+        self.debug = debug;
+        self
     }
 
     /// The OBS backend client, when configured.
@@ -1176,6 +1223,58 @@ impl<'a> PullRequestClient<'a> {
                 let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
                 gitea.pr_reopen(owner, repo, *number, dry_run)?;
                 self.status_after_act(reference, dry_run)
+            }
+        }
+    }
+
+    /// File a submission and return the filed handle plus the
+    /// handles it superseded. The OBS arm files the payload —
+    /// superseding every open submit request for the package from
+    /// the authenticated user — and the Gitea arm creates the pull
+    /// request. `None` in dry-run: nothing was filed. The caller
+    /// builds the target from the checkout: the backend kind
+    /// recorded there decides the arm.
+    pub fn submit(
+        &self,
+        target: &SubmitTarget,
+        dry_run: &DryRun,
+    ) -> Result<Option<Submitted>, GeectlError> {
+        match target {
+            SubmitTarget::Obs(payload) => {
+                let obs = self.obs.ok_or_else(missing_obs_arm)?;
+                let filing = SrFiling::new(obs, dry_run).with_debug(self.debug.clone());
+                let filed = filing.file(payload)?;
+                let Some(filed) = filed else {
+                    return Ok(None);
+                };
+                let id = validate_request_id(&filed.id)?;
+                let mut superseded = Vec::new();
+                for id in &filed.superseded {
+                    superseded.push(PullRequestRef::Obs(validate_request_id(id)?));
+                }
+                Ok(Some(Submitted {
+                    reference: PullRequestRef::Obs(id),
+                    superseded,
+                }))
+            }
+            SubmitTarget::Gitea {
+                owner,
+                repo,
+                options,
+            } => {
+                let gitea = self.gitea.ok_or_else(missing_gitea_arm)?;
+                let created = gitea.pr_create(owner, repo, options, dry_run)?;
+                let Some(created) = created else {
+                    return Ok(None);
+                };
+                Ok(Some(Submitted {
+                    reference: PullRequestRef::Gitea {
+                        owner: owner.clone(),
+                        repo: repo.clone(),
+                        number: created.number,
+                    },
+                    superseded: Vec::new(),
+                }))
             }
         }
     }
@@ -3492,5 +3591,137 @@ mod tests {
             .expect_err("a failing merge POST must fail the merge");
         assert_eq!(err.kind(), ErrorKind::ServerError);
         assert!(http.get_calls().is_empty());
+    }
+
+    fn sr_payload() -> SrPayload {
+        SrPayload::new(
+            "home:scarabeus_iv",
+            "foo",
+            "devel:languages:python",
+            "foo",
+            "Update foo to 2.0",
+            "- Update to version 2.0.\n",
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn pr_options() -> PrCreateOptions {
+        PrCreateOptions::new("feature", "main", "Add feature").unwrap()
+    }
+
+    #[test]
+    fn submit_obs_dry_run_files_nothing() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let submitted = act_client(Some(&obs), None)
+            .submit(&SubmitTarget::Obs(sr_payload()), &DryRun::new(true))
+            .unwrap();
+        assert!(submitted.is_none());
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn submit_obs_live_returns_the_handle_and_the_superseded() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let search_url = obs.search_url("foo").unwrap();
+        let http = FakeHttp::new()
+            .with_get(
+                &search_url,
+                "<collection matches=\"1\"><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/1398492?cmd=changestate&newstate=superseded&superseded_by=1400001",
+                "<status code=\"ok\" />",
+            );
+        let obs = obs_client(&http);
+        let submitted = act_client(Some(&obs), None)
+            .submit(&SubmitTarget::Obs(sr_payload()), &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(submitted.reference, PullRequestRef::Obs(1400001));
+        assert_eq!(submitted.superseded, vec![PullRequestRef::Obs(1398492)]);
+    }
+
+    #[test]
+    fn submit_gitea_live_returns_the_handle() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls",
+            PR_JSON,
+        );
+        let gitea = gitea_client(&http);
+        let submitted = act_client(None, Some(&gitea))
+            .submit(
+                &SubmitTarget::Gitea {
+                    owner: "openSUSE".to_string(),
+                    repo: "geectl".to_string(),
+                    options: pr_options(),
+                },
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            submitted.reference,
+            PullRequestRef::Gitea {
+                owner: "openSUSE".to_string(),
+                repo: "geectl".to_string(),
+                number: 122,
+            }
+        );
+        assert!(submitted.superseded.is_empty());
+        assert_eq!(
+            http.post_calls()[0].1,
+            r#"{"head":"feature","base":"main","title":"Add feature","draft":false}"#
+        );
+    }
+
+    #[test]
+    fn submit_gitea_dry_run_files_nothing() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls",
+            PR_JSON,
+        );
+        let gitea = gitea_client(&http);
+        let submitted = act_client(None, Some(&gitea))
+            .submit(
+                &SubmitTarget::Gitea {
+                    owner: "openSUSE".to_string(),
+                    repo: "geectl".to_string(),
+                    options: pr_options(),
+                },
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert!(submitted.is_none());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn submit_without_its_arm_fails_closed() {
+        let http = FakeHttp::new();
+        let obs = obs_client(&http);
+        let err = act_client(Some(&obs), None)
+            .submit(
+                &SubmitTarget::Gitea {
+                    owner: "openSUSE".to_string(),
+                    repo: "geectl".to_string(),
+                    options: pr_options(),
+                },
+                &DryRun::new(false),
+            )
+            .expect_err("a Gitea submit without a Gitea arm must fail");
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        let gitea = gitea_client(&http);
+        let err = act_client(None, Some(&gitea))
+            .submit(&SubmitTarget::Obs(sr_payload()), &DryRun::new(false))
+            .expect_err("an OBS submit without an OBS arm must fail");
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
     }
 }
