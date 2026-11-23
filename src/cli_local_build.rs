@@ -532,6 +532,9 @@ fn render_build(record: &BuildRecord) -> String {
                 if let Some(alt) = &plan.alternative_project {
                     lines.push(format!("alternative-project: {alt}"));
                 }
+                if plan.trust_all_projects {
+                    lines.push("trust-all-projects: true".to_string());
+                }
                 if let Some(keep) = &plan.keep_rpms {
                     lines.push(format!("keep-rpms: {}", keep.display()));
                 }
@@ -1196,6 +1199,7 @@ mod tests {
                 arch: "x86_64".to_string(),
                 flavor: None,
                 alternative_project: None,
+                trust_all_projects: false,
                 keep_rpms: None,
                 prefer_packages: None,
                 argv: vec![
@@ -1220,8 +1224,10 @@ mod tests {
         plan.alternative_project = Some("openSUSE:Factory".to_string());
         plan.keep_rpms = Some(PathBuf::from("/tmp/keep"));
         plan.prefer_packages = Some(PathBuf::from("/tmp/prefer"));
+        plan.trust_all_projects = true;
         let text = render_build(&flagged);
         assert!(text.contains("alternative-project: openSUSE:Factory"));
+        assert!(text.contains("trust-all-projects: true"));
         assert!(text.contains("keep-rpms: /tmp/keep"));
         assert!(text.contains("prefer-packages: /tmp/prefer"));
         let mut record = dry_run_build_record();

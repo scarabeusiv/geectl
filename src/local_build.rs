@@ -373,6 +373,11 @@ pub struct EnginePlan {
     /// The alternative project the buildinfo was fetched for, when
     /// `--alternative-project` was passed.
     pub alternative_project: Option<String>,
+    /// Whether `--trust-all-projects` was passed: the plan records
+    /// the flag, but a dry run evaluates no trust — the live build
+    /// still refuses foreign `home:` deps without it.
+    #[serde(default)]
+    pub trust_all_projects: bool,
     /// The directory built RPMs are copied to on a green build,
     /// when `--keep-rpms` was passed.
     pub keep_rpms: Option<PathBuf>,
@@ -1151,6 +1156,7 @@ impl<'a> LocalBuild<'a> {
                     arch: req.arch.clone(),
                     flavor: req.flavor.clone(),
                     alternative_project: req.alternative_project.clone(),
+                    trust_all_projects: req.trust_all_projects,
                     keep_rpms,
                     prefer_packages,
                     argv,
@@ -7505,6 +7511,7 @@ exit 0
             let keep = dir.path().join("keep");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.dry_run = true;
+            req.trust_all_projects = true;
             req.alternative_project = Some("openSUSE:Factory".to_string());
             req.root = Some(root.clone());
             req.keep_rpms = Some(keep.clone());
@@ -7515,6 +7522,7 @@ exit 0
                 plan.alternative_project.as_deref(),
                 Some("openSUSE:Factory")
             );
+            assert!(plan.trust_all_projects);
             assert_eq!(plan.root, root);
             assert_eq!(plan.keep_rpms, Some(keep));
             assert_eq!(plan.prefer_packages, Some(prefer));
