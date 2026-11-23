@@ -77,6 +77,22 @@ pub enum ErrorKind {
     /// generation was refused (an incomplete draft must not be
     /// written). The context names the findings.
     ValidationFailed,
+    /// The directory is not a geectl working copy (no recorded
+    /// checkout).
+    WorkingCopyNotFound,
+    /// The checkout's base revision is behind the server's latest
+    /// revision at commit time.
+    WorkingCopyOutdated,
+    /// The checkout is not in a usable state, or its recorded base
+    /// coordinates disagree with its base commit.
+    WorkingCopyInconsistent,
+    /// A merge conflict is left in the working tree.
+    FileConflict,
+    /// A commit was requested with nothing to commit.
+    NothingToCommit,
+    /// The git binary is not on PATH. The working copy operates
+    /// through git; without the binary there is no checkout.
+    NoGit,
 }
 
 impl ErrorKind {
@@ -107,6 +123,12 @@ impl ErrorKind {
             ErrorKind::NotAGeectlBuildRoot => "not_a_geectl_build_root",
             ErrorKind::ServiceFailed => "service_failed",
             ErrorKind::ValidationFailed => "validation_failed",
+            ErrorKind::WorkingCopyNotFound => "working_copy_not_found",
+            ErrorKind::WorkingCopyOutdated => "working_copy_outdated",
+            ErrorKind::WorkingCopyInconsistent => "working_copy_inconsistent",
+            ErrorKind::FileConflict => "file_conflict",
+            ErrorKind::NothingToCommit => "nothing_to_commit",
+            ErrorKind::NoGit => "no_git",
         }
     }
 
@@ -141,6 +163,12 @@ impl ErrorKind {
             ErrorKind::NotAGeectlBuildRoot => "the directory is not a geectl build root",
             ErrorKind::ServiceFailed => "a source service failed",
             ErrorKind::ValidationFailed => "the validation failed",
+            ErrorKind::WorkingCopyNotFound => "the directory is not a geectl working copy",
+            ErrorKind::WorkingCopyOutdated => "the checkout's base revision is behind the server",
+            ErrorKind::WorkingCopyInconsistent => "the checkout is not in a usable state",
+            ErrorKind::FileConflict => "a merge conflict is left in the working tree",
+            ErrorKind::NothingToCommit => "there is nothing to commit",
+            ErrorKind::NoGit => "the git binary is not on PATH",
         }
     }
 
@@ -205,6 +233,22 @@ impl ErrorKind {
                 "read the failing service's output in the run record; fix the service or its inputs and retry"
             }
             ErrorKind::ValidationFailed => "fix the findings and retry",
+            ErrorKind::WorkingCopyNotFound => {
+                "run checkout PROJECT PACKAGE first; it creates the checkout under the current directory"
+            }
+            ErrorKind::WorkingCopyOutdated => {
+                "run update to rebase onto the latest base, then retry the commit"
+            }
+            ErrorKind::WorkingCopyInconsistent => {
+                "check the checkout out again into a fresh directory; a fresh checkout replaces repair"
+            }
+            ErrorKind::FileConflict => {
+                "resolve the conflicted files, then run resolve to mark them resolved"
+            }
+            ErrorKind::NothingToCommit => {
+                "stage a change with add first, or check status for what is staged"
+            }
+            ErrorKind::NoGit => "install git and retry",
         }
     }
 
@@ -236,6 +280,14 @@ impl ErrorKind {
             ErrorKind::NotAGeectlBuildRoot => 21,
             ErrorKind::ServiceFailed => 22,
             ErrorKind::ValidationFailed => 24,
+            ErrorKind::WorkingCopyNotFound => 25,
+            ErrorKind::WorkingCopyOutdated => 26,
+            ErrorKind::WorkingCopyInconsistent => 27,
+            ErrorKind::FileConflict => 28,
+            // Exit 29 is unused: it belonged to a removed kind and
+            // is never reused.
+            ErrorKind::NothingToCommit => 30,
+            ErrorKind::NoGit => 31,
         }
     }
 
@@ -266,6 +318,12 @@ impl ErrorKind {
             ErrorKind::NotAGeectlBuildRoot,
             ErrorKind::ServiceFailed,
             ErrorKind::ValidationFailed,
+            ErrorKind::WorkingCopyNotFound,
+            ErrorKind::WorkingCopyOutdated,
+            ErrorKind::WorkingCopyInconsistent,
+            ErrorKind::FileConflict,
+            ErrorKind::NothingToCommit,
+            ErrorKind::NoGit,
         ]
     }
 }
