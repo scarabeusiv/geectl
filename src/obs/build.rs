@@ -1944,6 +1944,7 @@ pub(crate) fn validate_repository(repository: &Repository) -> Result<(), GeectlE
             ),
         ));
     }
+    let mut seen_arches = Vec::new();
     for arch in &repository.arch {
         if !valid_obs_name(arch) {
             return Err(GeectlError::new(
@@ -1951,6 +1952,17 @@ pub(crate) fn validate_repository(repository: &Repository) -> Result<(), GeectlE
                 format!("invalid OBS architecture name: {arch:?}"),
             ));
         }
+        let lower = arch.to_lowercase();
+        if seen_arches.contains(&lower) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "duplicate architecture {arch:?} in repository {:?}",
+                    repository.name
+                ),
+            ));
+        }
+        seen_arches.push(lower);
     }
     if repository.paths.is_empty() {
         return Err(GeectlError::new(
@@ -6597,6 +6609,18 @@ mod tests {
         assert!(!has_url_scheme("example.com/no-scheme"));
         assert!(!has_url_scheme("https://example.com/\u{1}"));
         assert!(!has_url_scheme(""));
+    }
+
+    #[test]
+    fn validate_repository_rejects_duplicate_architectures() {
+        let mut repo = new_repo();
+        repo.arch.push("x86_64".to_string());
+        assert!(validate_repository(&repo).is_err());
+        repo.arch.pop();
+        repo.arch.push("X86_64".to_string());
+        assert!(validate_repository(&repo).is_err());
+        repo.arch.pop();
+        assert!(validate_repository(&repo).is_ok());
     }
 
     #[test]

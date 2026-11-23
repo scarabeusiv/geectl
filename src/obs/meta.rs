@@ -225,6 +225,7 @@ fn validate_repositories(repositories: &[Repository]) -> Result<(), GeectlError>
                 format!("invalid OBS repository name: {:?}", repository.name),
             ));
         }
+        let mut seen_arches = Vec::new();
         for arch in &repository.arch {
             if !valid_obs_name(arch) {
                 return Err(GeectlError::new(
@@ -232,6 +233,17 @@ fn validate_repositories(repositories: &[Repository]) -> Result<(), GeectlError>
                     format!("invalid OBS architecture name: {arch:?}"),
                 ));
             }
+            let lower = arch.to_lowercase();
+            if seen_arches.contains(&lower) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "duplicate architecture {arch:?} in repository {:?}",
+                        repository.name
+                    ),
+                ));
+            }
+            seen_arches.push(lower);
         }
         for (project, repo) in &repository.paths {
             if !valid_obs_name(project) {
@@ -1623,6 +1635,22 @@ mod tests {
         let client = project_client(&http);
         let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
         meta.repositories[0].downloads[0].url = String::new();
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_rejects_duplicate_architectures() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_FULL_REPOSITORY,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories[0].arch.push("X86_64".to_string());
         let err = client
             .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
             .unwrap_err();
