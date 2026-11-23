@@ -90,8 +90,8 @@ use geectl::obs::{
     LinkOptions, LinkRevision, MaintenanceBranchOptions, MaintenanceIncidentPayload, NamedRole,
     ObsClient, PackageDiffStatus, PrjconfFindingKind, ReleaseOptions, ReleaseTarget, Repository,
     RepositoryDownload, Request, RequestAction, RequestSearch, RequestState, ResultsQuery,
-    ReviewState, ReviewTarget, RevisionRange, RevisionSpec, RoleGrant, SourceUpdate, SrFiling,
-    SrPayload, StagingReadOptions,
+    ReviewState, ReviewTarget, RevisionRange, RevisionSpec, RoleGrant, ScmsyncProjectList,
+    SourceUpdate, SrFiling, SrPayload, StagingReadOptions,
 };
 use geectl::pull_request::{
     OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus, SubmitTarget,
@@ -7153,18 +7153,19 @@ fn live_list_scmsync_projects_lists_the_synced_project() {
         .expect("point the project at its git source on the live instance");
     assert_eq!(
         client
-            .list_scmsync_projects(&prefix)
+            .list_scmsync_projects(&prefix, None, None)
             .expect("list scmsync projects on the live instance"),
-        vec![ProjectMatch {
-            name: project.clone(),
-            title: None,
-            description: None,
-        }],
+        ScmsyncProjectList {
+            projects: vec![project.clone()],
+            matches: 1,
+            offset: 0,
+        },
         "exactly the one synced project must be listed"
     );
     assert!(client
-        .list_scmsync_projects("https://live.example-nobody/")
+        .list_scmsync_projects("https://live.example-nobody/", None, None)
         .expect("list scmsync projects for an unused prefix")
+        .projects
         .is_empty());
 }
 

@@ -81,7 +81,8 @@ use geectl::obs::{
     DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient,
     Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch,
     ProjectMeta, ReleaseOptions, Repository, RevisionPatch, RevisionRange, RevisionSpec, RoleGrant,
-    SourceFile, StagedRequest, StagingProject, StagingReadOptions, FACTORY_PROJECT, OBS_API_BASE,
+    ScmsyncProjectList, SourceFile, StagedRequest, StagingProject, StagingReadOptions,
+    FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -380,6 +381,12 @@ pub enum RemoteCommand {
     ListScmsyncProjects {
         /// The git URL prefix to list projects for.
         url_prefix: String,
+        /// At most this many projects (default 100).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Skip this many matching projects (default 0).
+        #[arg(long)]
+        offset: Option<u32>,
     },
     /// Show the owners of a package (project/package scope).
     Owners {
@@ -1168,17 +1175,25 @@ pub fn run_remote(
             });
             Ok((payload, text))
         }
-        RemoteCommand::ListScmsyncProjects { url_prefix } => {
-            let matches = client.list_scmsync_projects(&url_prefix)?;
+        RemoteCommand::ListScmsyncProjects {
+            url_prefix,
+            limit,
+            offset,
+        } => {
+            let list = client.list_scmsync_projects(&url_prefix, limit, offset)?;
             let payload = json!({
                 "url_prefix": url_prefix,
-                "projects": matches.iter().map(project_match_json).collect::<Vec<_>>(),
+                "limit": limit,
+                "offset": offset,
+                "matches": list.matches,
+                "truncated": list.truncated(),
+                "projects": list.projects,
             });
             Ok((
                 payload,
                 with_header(
                     &format!("url-prefix: {url_prefix}"),
-                    render_project_matches(&url_prefix, &matches),
+                    render_scmsync_projects(&url_prefix, &list),
                 ),
             ))
         }
@@ -3605,6 +3620,30 @@ fn render_project_matches(term: &str, matches: &[ProjectMatch]) -> String {
     render_table(&["NAME", "TITLE"], &rows)
 }
 
+/// Render an scmsync project list: the id search carries no title,
+/// so the table is names only. A page shorter than the server's
+/// total names the shortfall, so a caller paging with
+/// `--limit`/`--offset` can see there is more.
+fn render_scmsync_projects(term: &str, list: &ScmsyncProjectList) -> String {
+    if list.projects.is_empty() {
+        return format!("no projects matching '{term}'");
+    }
+    let rows: Vec<Vec<String>> = list
+        .projects
+        .iter()
+        .map(|name| vec![name.clone()])
+        .collect();
+    let mut text = render_table(&["NAME"], &rows);
+    if list.truncated() {
+        text.push_str(&format!(
+            "\nshowing {} of {} matches (use --limit/--offset to page)",
+            list.projects.len(),
+            list.matches
+        ));
+    }
+    text
+}
+
 /// Render staging projects: one section per project, with the state
 /// on the name line and the staged, untracked, and obsolete request
 /// lists as tables. A list the read did not ask for is absent, never
@@ -5753,21 +5792,57 @@ mod tests {
         ]);
         assert!(matches!(
             command,
-            RemoteCommand::ListScmsyncProjects { url_prefix }
-                if url_prefix == "https://github.com/openSUSE/"
+            RemoteCommand::ListScmsyncProjects {
+                url_prefix,
+                limit: None,
+                offset: None,
+            } if url_prefix == "https://github.com/openSUSE/"
         ));
     }
 
     #[test]
-    fn list_scmsync_projects_renders_title_less_matches_as_dash() {
-        // The id search carries no title, so every row renders `-`.
-        let matches = vec![ProjectMatch {
-            name: "home:alice:branches:foo".to_string(),
-            title: None,
-            description: None,
-        }];
-        let text = render_project_matches("https://github.com/openSUSE/", &matches);
-        assert!(text.contains("home:alice:branches:foo -"));
+    fn list_scmsync_projects_parses_limit_and_offset() {
+        let command = parse(&[
+            "geectl",
+            "remote",
+            "list-scmsync-projects",
+            "https://github.com/openSUSE/",
+            "--limit",
+            "2",
+            "--offset",
+            "1",
+        ]);
+        assert!(matches!(
+            command,
+            RemoteCommand::ListScmsyncProjects {
+                limit: Some(2),
+                offset: Some(1),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn list_scmsync_projects_renders_names_only() {
+        // The id search carries no title, so the table is names only.
+        let list = ScmsyncProjectList {
+            projects: vec!["home:alice:branches:foo".to_string()],
+            matches: 1,
+            offset: 0,
+        };
+        let text = render_scmsync_projects("https://github.com/openSUSE/", &list);
+        assert_eq!(text, "NAME\nhome:alice:branches:foo");
+    }
+
+    #[test]
+    fn list_scmsync_projects_render_flags_a_short_page() {
+        let list = ScmsyncProjectList {
+            projects: vec!["home:alice:branches:foo".to_string()],
+            matches: 2,
+            offset: 0,
+        };
+        let text = render_scmsync_projects("https://github.com/openSUSE/", &list);
+        assert!(text.contains("showing 1 of 2 matches"));
     }
 
     #[test]

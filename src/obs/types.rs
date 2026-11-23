@@ -652,6 +652,28 @@ pub struct ProjectMatch {
     pub description: Option<String>,
 }
 
+/// The projects whose scmsync URL starts with a prefix, as listed by
+/// the id search: the project names on the returned page, the
+/// server's total match count, and the page's offset in that total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScmsyncProjectList {
+    /// Project names on this page.
+    pub projects: Vec<String>,
+    /// The server's total match count.
+    pub matches: u32,
+    /// The offset of this page in the server's total: the page holds
+    /// matches `offset..offset + projects.len()`.
+    pub offset: u32,
+}
+
+impl ScmsyncProjectList {
+    /// Whether more matches exist past this page: the page ends
+    /// before the server's total.
+    pub fn truncated(&self) -> bool {
+        self.offset.saturating_add(self.projects.len() as u32) < self.matches
+    }
+}
+
 /// An owner of a package or project: the project (and package, when
 /// the ownership is package-scoped) the person or group owns.
 #[derive(Debug, Clone, PartialEq, Eq)]

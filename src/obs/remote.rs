@@ -43,6 +43,7 @@ use super::RepositoryDownload;
 use super::RevisionPatch;
 use super::RevisionRange;
 use super::RevisionSpec;
+use super::ScmsyncProjectList;
 use super::ServiceCode;
 use super::ServiceState;
 use super::SourceFile;
@@ -3455,12 +3456,19 @@ impl<'a> ObsClient<'a> {
     /// (`GET /search/project/id?match=starts-with(scmsync,'...')`):
     /// the same search the count reads, returning the projects
     /// themselves instead of their number. The id search carries no
-    /// title or description, so the matches carry names only.
-    /// Requires credentials; a malformed response is an error,
-    /// never an empty list. The prefix is validated like a search
-    /// term — it goes into a single-quoted XPath string literal,
-    /// where a quote would break out of the literal (XPath has no
-    /// string escape).
+    /// title or description, so the list carries names only, plus
+    /// the server's total match count. Requires credentials; a
+    /// malformed response is an error, never an empty list. The
+    /// prefix is validated like a search term — it goes into a
+    /// single-quoted XPath string literal, where a quote would break
+    /// out of the literal (XPath has no string escape).
+    ///
+    /// The page is bounded: at most `limit` rows (default 100),
+    /// starting at `offset` (default 0). A limit of 0 is an error.
+    /// `matches` is the server's total, so a page ending before it
+    /// means more matches exist past the page. A page starting at or
+    /// past the total is empty, not an error: zero rows are expected
+    /// once the offset has passed the last match.
     ///
     /// An agent lists scmsync projects to see which projects a git
     /// URL prefix already covers, for example when routing a
@@ -3468,13 +3476,47 @@ impl<'a> ObsClient<'a> {
     pub fn list_scmsync_projects(
         &self,
         url_prefix: &str,
-    ) -> Result<Vec<ProjectMatch>, GeectlError> {
-        let body = self.scmsync_search(url_prefix, None, None, "listing")?;
-        parse_project_search(&body).ok_or_else(|| {
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<ScmsyncProjectList, GeectlError> {
+        const DEFAULT_LIMIT: u32 = 100;
+        if limit == Some(0) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "invalid limit: 0".to_string(),
+            ));
+        }
+        let limit = limit.unwrap_or(DEFAULT_LIMIT);
+        let offset = offset.unwrap_or(0);
+        let body = self.scmsync_search(url_prefix, Some(limit), Some(offset), "listing")?;
+        let total = parse_search_matches(&body).ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
                 format!("unexpected OBS scmsync search response for {url_prefix:?}"),
             )
+        })?;
+        let matches = match parse_project_search(&body) {
+            Some(matches) => matches,
+            // A well-formed page past the last match is empty, not
+            // malformed: the total says how many matches exist, and
+            // the requested offset is at or past it, so zero rows
+            // are expected there. Below the total, zero rows stay
+            // suspicious and error, as before. The collection check
+            // keeps a non-collection body an error even when it
+            // carries a matches count: the total alone does not make
+            // a response well-formed.
+            None if is_search_collection(&body) && offset >= total => Vec::new(),
+            None => {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("unexpected OBS scmsync search response for {url_prefix:?}"),
+                ));
+            }
+        };
+        Ok(ScmsyncProjectList {
+            projects: matches.into_iter().map(|match_| match_.name).collect(),
+            matches: total,
+            offset,
         })
     }
 
@@ -9861,48 +9903,169 @@ mod tests {
     #[test]
     fn list_scmsync_projects_returns_the_matching_project_names() {
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29",
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=100&offset=0",
             "<collection matches=\"2\"><project name=\"home:alice:branches:foo\"/><project name=\"home:alice:branches:bar\"/></collection>",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert_eq!(
             client
-                .list_scmsync_projects("https://github.com/openSUSE/")
+                .list_scmsync_projects("https://github.com/openSUSE/", None, None)
                 .unwrap(),
-            vec![
-                ProjectMatch {
-                    name: "home:alice:branches:foo".to_string(),
-                    title: None,
-                    description: None,
-                },
-                ProjectMatch {
-                    name: "home:alice:branches:bar".to_string(),
-                    title: None,
-                    description: None,
-                },
-            ]
+            ScmsyncProjectList {
+                projects: vec![
+                    "home:alice:branches:foo".to_string(),
+                    "home:alice:branches:bar".to_string(),
+                ],
+                matches: 2,
+                offset: 0,
+            }
         );
     }
 
     #[test]
     fn list_scmsync_projects_returns_an_empty_list_for_no_match() {
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29",
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=100&offset=0",
             "<collection matches=\"0\"/>",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
-        assert!(client
-            .list_scmsync_projects("https://github.com/openSUSE/")
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            client
+                .list_scmsync_projects("https://github.com/openSUSE/", None, None)
+                .unwrap(),
+            ScmsyncProjectList {
+                projects: vec![],
+                matches: 0,
+                offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn list_scmsync_projects_limit_and_offset_ride_the_request() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=2&offset=1",
+            "<collection matches=\"3\"><project name=\"home:alice:branches:foo\"/><project name=\"home:alice:branches:bar\"/></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let list = client
+            .list_scmsync_projects("https://github.com/openSUSE/", Some(2), Some(1))
+            .unwrap();
+        assert_eq!(
+            list,
+            ScmsyncProjectList {
+                projects: vec![
+                    "home:alice:branches:foo".to_string(),
+                    "home:alice:branches:bar".to_string(),
+                ],
+                matches: 3,
+                offset: 1,
+            }
+        );
+        // Offset 1 with limit 2 over 3 matches is the tail page:
+        // 1 + 2 reaches the total, so nothing lies past it.
+        assert!(!list.truncated());
+    }
+
+    #[test]
+    fn list_scmsync_projects_mid_page_is_truncated() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=2&offset=0",
+            "<collection matches=\"3\"><project name=\"home:alice:branches:foo\"/><project name=\"home:alice:branches:bar\"/></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let list = client
+            .list_scmsync_projects("https://github.com/openSUSE/", Some(2), Some(0))
+            .unwrap();
+        assert_eq!(
+            list,
+            ScmsyncProjectList {
+                projects: vec![
+                    "home:alice:branches:foo".to_string(),
+                    "home:alice:branches:bar".to_string(),
+                ],
+                matches: 3,
+                offset: 0,
+            }
+        );
+        // Offset 0 with limit 2 over 3 matches is a mid page: 0 + 2
+        // falls short of the total, so one match lies past it.
+        assert!(list.truncated());
+    }
+
+    #[test]
+    fn list_scmsync_projects_past_the_end_is_an_empty_page() {
+        // An offset past the last match is an empty page, not a
+        // malformed response: the total says 3 matches exist, and
+        // the requested page starts at 5, so zero rows are expected.
+        // The same body at offset 0 stays an error (see the
+        // matches-without-projects test): below the total, zero rows
+        // are genuinely suspicious.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=2&offset=5",
+            "<collection matches=\"3\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let list = client
+            .list_scmsync_projects("https://github.com/openSUSE/", Some(2), Some(5))
+            .unwrap();
+        assert_eq!(
+            list,
+            ScmsyncProjectList {
+                projects: vec![],
+                matches: 3,
+                offset: 5,
+            }
+        );
+        // Offset 5 with 3 matches is past the end: 5 + 0 lies past
+        // the total, so nothing lies past this page either.
+        assert!(!list.truncated());
+    }
+
+    #[test]
+    fn list_scmsync_projects_offset_at_the_total_is_an_empty_page() {
+        // The boundary of the past-end rule: a page starting exactly
+        // at the total holds no rows, so it reads as empty, not as a
+        // malformed response.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=2&offset=3",
+            "<collection matches=\"3\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let list = client
+            .list_scmsync_projects("https://github.com/openSUSE/", Some(2), Some(3))
+            .unwrap();
+        assert_eq!(
+            list,
+            ScmsyncProjectList {
+                projects: vec![],
+                matches: 3,
+                offset: 3,
+            }
+        );
+        assert!(!list.truncated());
+    }
+
+    #[test]
+    fn list_scmsync_projects_limit_zero_is_an_error() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .list_scmsync_projects("https://github.com/openSUSE/", Some(0), None)
+            .unwrap_err();
+        // The kind is the contract: the CLI exits 2 on InvalidInput.
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]
     fn list_scmsync_projects_rejects_a_quoted_prefix_without_http() {
         let http = FakeHttp::new();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
-        assert!(client.list_scmsync_projects("").is_err());
-        assert!(client.list_scmsync_projects("x' or '1'='1").is_err());
+        assert!(client.list_scmsync_projects("", None, None).is_err());
+        assert!(client
+            .list_scmsync_projects("x' or '1'='1", None, None)
+            .is_err());
         assert!(http.get_calls().is_empty());
     }
 
@@ -9916,10 +10079,10 @@ mod tests {
         let http = FakeHttp::new();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
-            .list_scmsync_projects("https://example.com/foo\\")
+            .list_scmsync_projects("https://example.com/foo\\", None, None)
             .is_err());
         assert!(client
-            .list_scmsync_projects("https://example.com/fo\\o")
+            .list_scmsync_projects("https://example.com/fo\\o", None, None)
             .is_err());
         assert!(http.get_calls().is_empty());
     }
@@ -9929,7 +10092,7 @@ mod tests {
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
         assert!(client
-            .list_scmsync_projects("https://github.com/openSUSE/")
+            .list_scmsync_projects("https://github.com/openSUSE/", None, None)
             .is_err());
         assert!(http.get_calls().is_empty());
     }
@@ -9937,24 +10100,24 @@ mod tests {
     #[test]
     fn list_scmsync_projects_response_without_a_count_is_an_error() {
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29",
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=100&offset=0",
             "<collection/>",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
-            .list_scmsync_projects("https://github.com/openSUSE/")
+            .list_scmsync_projects("https://github.com/openSUSE/", None, None)
             .is_err());
     }
 
     #[test]
     fn list_scmsync_projects_response_with_matches_but_no_projects_is_an_error() {
         let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29",
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29&limit=100&offset=0",
             "<collection matches=\"2\"/>",
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
-            .list_scmsync_projects("https://github.com/openSUSE/")
+            .list_scmsync_projects("https://github.com/openSUSE/", None, None)
             .is_err());
     }
 
