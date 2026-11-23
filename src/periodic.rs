@@ -1390,8 +1390,31 @@ mod tests {
         PathBuf::from("/usr/bin/geectl")
     }
 
+    /// The fake home: absolute on every platform. A Unix-style
+    /// `/home/tester` is drive-relative, not absolute, on Windows,
+    /// so the absolute-path checks reject every plan built from it.
     fn home() -> PathBuf {
-        PathBuf::from("/home/tester")
+        if cfg!(windows) {
+            PathBuf::from("C:\\Users\\tester")
+        } else {
+            PathBuf::from("/home/tester")
+        }
+    }
+
+    /// The fake `$XDG_CONFIG_HOME`: absolute on every platform, for
+    /// the same reason as `home`.
+    fn xdg_config_home() -> &'static str {
+        if cfg!(windows) {
+            "C:\\xdg\\config"
+        } else {
+            "/xdg/config"
+        }
+    }
+
+    #[test]
+    fn fixtures_are_absolute_on_every_platform() {
+        assert!(home().is_absolute());
+        assert!(PathBuf::from(xdg_config_home()).is_absolute());
     }
 
     #[test]
@@ -1429,7 +1452,13 @@ mod tests {
         assert!(plist.contains("<string>local-build</string>"));
         assert!(plist.contains("<string>--apply</string>"));
         assert!(plist.contains("<string>io.github.scarabeusiv.geectl.prune</string>"));
-        assert!(plist.contains("<string>/home/tester/Library/Logs/geectl-prune.log</string>"));
+        // The template carries the `/Library/Logs/...` suffix
+        // literally; only the home prefix is substituted.
+        let log = format!(
+            "<string>{}/Library/Logs/geectl-prune.log</string>",
+            home().display()
+        );
+        assert!(plist.contains(&log));
         assert!(plist.contains("<key>Hour</key>\n\t\t<integer>3</integer>"));
         assert!(plist.contains("<key>Minute</key>\n\t\t<integer>0</integer>"));
     }
@@ -1456,21 +1485,23 @@ mod tests {
 
     #[test]
     fn systemd_user_dir_honours_xdg_config_home() {
+        let xdg = xdg_config_home();
+        let xdg_padded = format!("  {xdg}  ");
         assert_eq!(
-            systemd_user_dir(Some("/xdg/config"), &home()).unwrap(),
-            PathBuf::from("/xdg/config/systemd/user")
+            systemd_user_dir(Some(xdg), &home()).unwrap(),
+            PathBuf::from(xdg).join("systemd").join("user")
         );
         assert_eq!(
             systemd_user_dir(Some("   "), &home()).unwrap(),
-            PathBuf::from("/home/tester/.config/systemd/user")
+            home().join(".config").join("systemd").join("user")
         );
         assert_eq!(
             systemd_user_dir(None, &home()).unwrap(),
-            PathBuf::from("/home/tester/.config/systemd/user")
+            home().join(".config").join("systemd").join("user")
         );
         assert_eq!(
-            systemd_user_dir(Some("  /xdg/config  "), &home()).unwrap(),
-            PathBuf::from("/xdg/config/systemd/user")
+            systemd_user_dir(Some(&xdg_padded), &home()).unwrap(),
+            PathBuf::from(xdg).join("systemd").join("user")
         );
         assert!(systemd_user_dir(Some("relative/config"), &home()).is_err());
     }
@@ -1482,11 +1513,19 @@ mod tests {
         assert_eq!(plan.files.len(), 2);
         assert_eq!(
             plan.files[0].path,
-            PathBuf::from("/home/tester/.config/systemd/user/geectl-prune.service")
+            home()
+                .join(".config")
+                .join("systemd")
+                .join("user")
+                .join("geectl-prune.service")
         );
         assert_eq!(
             plan.files[1].path,
-            PathBuf::from("/home/tester/.config/systemd/user/geectl-prune.timer")
+            home()
+                .join(".config")
+                .join("systemd")
+                .join("user")
+                .join("geectl-prune.timer")
         );
         assert!(plan.files[0]
             .content
@@ -1532,42 +1571,30 @@ mod tests {
         let plan = install_plan(PeriodicOs::MacOs, &exe(), &home(), None).unwrap();
         assert_eq!(plan.label, "io.github.scarabeusiv.geectl.prune");
         assert_eq!(plan.files.len(), 1);
-        assert_eq!(
-            plan.files[0].path,
-            PathBuf::from(
-                "/home/tester/Library/LaunchAgents/io.github.scarabeusiv.geectl.prune.plist"
-            )
-        );
+        let plist = home()
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{LAUNCHD_LABEL}.plist"));
+        assert_eq!(plan.files[0].path, plist);
         // Unload first, so a re-install picks up the new plist
         // instead of failing on an already-loaded agent; the
         // unload tolerates a fresh install with nothing loaded.
+        let plist_arg = plist.display().to_string();
         assert_eq!(plan.enable.len(), 2);
         assert_eq!(
             plan.enable[0].argv,
-            vec![
-                "launchctl",
-                "unload",
-                "/home/tester/Library/LaunchAgents/io.github.scarabeusiv.geectl.prune.plist",
-            ]
+            vec!["launchctl", "unload", plist_arg.as_str()]
         );
         assert!(plan.enable[0].tolerate_missing);
         assert_eq!(
             plan.enable[1].argv,
-            vec![
-                "launchctl",
-                "load",
-                "/home/tester/Library/LaunchAgents/io.github.scarabeusiv.geectl.prune.plist",
-            ]
+            vec!["launchctl", "load", plist_arg.as_str()]
         );
         assert!(!plan.enable[1].tolerate_missing);
         assert_eq!(plan.disable.len(), 1);
         assert_eq!(
             plan.disable[0].argv,
-            vec![
-                "launchctl",
-                "unload",
-                "/home/tester/Library/LaunchAgents/io.github.scarabeusiv.geectl.prune.plist",
-            ]
+            vec!["launchctl", "unload", plist_arg.as_str()]
         );
         assert!(plan.disable[0].tolerate_missing);
     }
@@ -1800,13 +1827,19 @@ mod tests {
 
     #[test]
     fn auto_install_marker_path_honours_xdg_config_home() {
+        let xdg = xdg_config_home();
         assert_eq!(
-            auto_install_marker_path(&home(), Some("/xdg/config")).unwrap(),
-            PathBuf::from("/xdg/config/geectl/periodic-auto-install")
+            auto_install_marker_path(&home(), Some(xdg)).unwrap(),
+            PathBuf::from(xdg)
+                .join("geectl")
+                .join("periodic-auto-install")
         );
         assert_eq!(
             auto_install_marker_path(&home(), None).unwrap(),
-            PathBuf::from("/home/tester/.config/geectl/periodic-auto-install")
+            home()
+                .join(".config")
+                .join("geectl")
+                .join("periodic-auto-install")
         );
         assert!(auto_install_marker_path(&home(), Some("relative/xdg")).is_err());
     }

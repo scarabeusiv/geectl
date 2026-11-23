@@ -1,0 +1,5 @@
+# Template files are program inputs: their exact bytes ship into
+# unit files, plists and task XML. Keep them LF on every checkout,
+# or a Windows checkout turns them CRLF and the plist tests pinning
+# `\n` fail.
+packaging/** text eol=lf
