@@ -36,4 +36,10 @@ jobs:
           # the binary); its LGPL-3.0 license does not affect the
           # Apache-2.0 project, so it is allowlisted here. The deny list
           # above is unchanged.
-          allow-dependencies-licenses: 'pkg:githubactions/swatinem/rust-cache'
+          # r-efi 6.0.0 arrives via getrandom 0.4.3 and is licensed
+          # `MIT OR Apache-2.0 OR LGPL-2.1-or-later`: usable under MIT
+          # or Apache-2.0, both allowed, but the action flags it because
+          # one disjunct (LGPL-2.1-or-later) is in the deny list above.
+          # `cargo deny` is green on the same head, so this allowlist
+          # entry is the only change needed.
+          allow-dependencies-licenses: 'pkg:githubactions/swatinem/rust-cache, pkg:cargo/r-efi'
