@@ -2188,6 +2188,55 @@ fn live_review_with_history_reads_back() {
     );
 }
 
+/// Change a review's state through the built binary against the live
+/// instance: the leaf accepts the review, and the state reads back
+/// on the request.
+#[test]
+fn live_change_review_state_cli_round_trips() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let (id, _) = file_live_request(&client, "2.0");
+    let dry = DryRun::new(false);
+    let target = ReviewTarget::new(Some("Admin"), None, None, None)
+        .expect("a review asked of a user is a valid target");
+    client
+        .add_review(&id, &target, "please review", &dry)
+        .expect("ask Admin to review the request on the live instance");
+    let dir = LiveTempDir::new();
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "request",
+            "change-review-state",
+            &id,
+            "accepted",
+            "--user",
+            "Admin",
+            "--comment",
+            "accepted by the geectl live test",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["target_state"], "accepted");
+    assert_eq!(value["review"]["by_user"], "Admin");
+    assert_eq!(value["comment"], "accepted by the geectl live test");
+    assert_eq!(value["dry_run"], false);
+    let request = client
+        .show_request(&id)
+        .expect("read the reviewed request back from the server");
+    assert_eq!(request.reviews.len(), 1);
+    assert_eq!(request.reviews[0].state, ReviewState::Accepted);
+}
+
 /// Commenting on a request through the library, then listing its
 /// comments back: the comment and its threaded reply must be what
 /// was posted.
