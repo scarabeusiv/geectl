@@ -85,11 +85,12 @@ use geectl::http::{sanitize_url_for_error, HttpClient, Timeout, UreqClient};
 use geectl::obs::{
     AddRolePayload, AggregateOptions, BranchOptions, BuildLogQuery, ChangeDevelPayload,
     CopyOptions, CopyProjectOptions, CreatePackageOptions, DeletePackageOptions, DeletePayload,
-    DeleteProjectOptions, DeleteTarget, DryRun, FilePatchStatus, HistoryEntry, LinkOptions,
-    LinkRevision, MaintenanceBranchOptions, MaintenanceIncidentPayload, NamedRole, ObsClient,
-    PackageDiffStatus, PrjconfFindingKind, ReleaseOptions, Repository, Request, RequestAction,
-    RequestSearch, RequestState, ResultsQuery, ReviewState, ReviewTarget, RevisionRange,
-    RevisionSpec, RoleGrant, SourceUpdate, SrFiling, SrPayload, StagingReadOptions,
+    DeleteProjectOptions, DeleteTarget, DownloadMaster, DryRun, FilePatchStatus, HistoryEntry,
+    LinkOptions, LinkRevision, MaintenanceBranchOptions, MaintenanceIncidentPayload, NamedRole,
+    ObsClient, PackageDiffStatus, PrjconfFindingKind, ReleaseOptions, ReleaseTarget, Repository,
+    RepositoryDownload, Request, RequestAction, RequestSearch, RequestState, ResultsQuery,
+    ReviewState, ReviewTarget, RevisionRange, RevisionSpec, RoleGrant, SourceUpdate, SrFiling,
+    SrPayload, StagingReadOptions,
 };
 use geectl::pull_request::{
     OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus, SubmitTarget,
@@ -6295,6 +6296,61 @@ fn live_add_repository_round_trips() {
         .add_repository(&source_project, &repository, false, &DryRun::new(false))
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+}
+
+/// Add a repository carrying the full shape through the library,
+/// verified by re-listing and by reading the project meta: the
+/// download, release target and host system read back unchanged.
+#[test]
+fn live_full_repository_shape_round_trips() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let path_target = create_path_target(&authed, &base);
+    let repository = Repository {
+        name: "full".to_string(),
+        arch: vec!["x86_64".to_string(), "aarch64".to_string()],
+        paths: vec![(path_target.clone(), "standard".to_string())],
+        rebuild: Some("local".to_string()),
+        block: Some("never".to_string()),
+        linkedbuild: Some("all".to_string()),
+        downloads: vec![RepositoryDownload {
+            arch: Some("x86_64".to_string()),
+            url: "https://example.com".to_string(),
+            repotype: Some("rpmmd".to_string()),
+            archfilter: Some("x86_64".to_string()),
+            pubkey: Some("key-material".to_string()),
+            master: Some(DownloadMaster {
+                url: "https://master.example.com".to_string(),
+                sslfingerprint: Some("AB:CD".to_string()),
+            }),
+        }],
+        release_targets: vec![ReleaseTarget {
+            project: path_target.clone(),
+            repository: Some("standard".to_string()),
+            trigger: Some("manual".to_string()),
+        }],
+        hostsystem: vec![(path_target.clone(), "standard".to_string())],
+    };
+    assert!(
+        authed
+            .add_repository(&source_project, &repository, false, &DryRun::new(false))
+            .expect("add a full-shape repository on the live instance"),
+        "adding a new repository reports a change"
+    );
+    let client = live_client(&base);
+    let repos = client
+        .list_repositories(&source_project)
+        .expect("repository list after adding a repository");
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0], repository);
+    let meta = client
+        .project_meta(&source_project)
+        .expect("project meta after adding a repository");
+    assert_eq!(meta.repositories, vec![repository]);
 }
 
 /// Remove a repository through the library, verified by re-listing
