@@ -453,6 +453,26 @@ struct IssueCommentRequest {
     body: String,
 }
 
+/// The body of an issue-labels POST: the label names to add.
+/// The server resolves names itself and answers the full label
+/// list; unknown names are ignored by the server, so the caller
+/// resolves them against the repo labels first.
+#[derive(Serialize)]
+struct IssueLabelsRequest {
+    labels: Vec<String>,
+}
+
+/// A repo label as the labels list answers it: the id the remove
+/// DELETE addresses and the name the add POST takes. Only the
+/// label operations read this shape.
+#[derive(Debug, Clone, Deserialize)]
+struct RepoLabel {
+    /// The label id, unique per repo.
+    id: u64,
+    /// The label name.
+    name: String,
+}
+
 /// The body of a merge POST: the merge style and the merge commit
 /// message. The style is always sent: Gitea requires `Do` — an
 /// empty body answers 422 `[Do]: Required` — so an unset method
@@ -2345,6 +2365,176 @@ impl<'a> GiteaClient<'a> {
         );
         self.http.delete_json_with(&url, &body, &self.credentials)?;
         Ok(Some(cancelled))
+    }
+
+    /// List a repository's labels (`GET
+    /// /api/v1/repos/{owner}/{repo}/labels`): the id and name of
+    /// every label on the repo. Paginates internally and is bounded
+    /// like `repo_list`. The label operations resolve names through
+    /// this read.
+    fn repo_labels(&self, owner: &str, repo: &str) -> Result<Vec<RepoLabel>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        self.list_paged::<RepoLabel>(
+            &["api", "v1", "repos", owner, repo, "labels"],
+            &[],
+            &format!("labels of {owner}/{repo}"),
+            "the list is bounded at 500 entries",
+        )
+    }
+
+    /// Resolve label names against the repo's labels: the named
+    /// labels, in the order given, duplicates removed. A name the
+    /// repo does not carry is an invalid input naming the label and
+    /// the repo: the server would silently ignore it on add and
+    /// answer 422 on remove, so the failure is raised here instead.
+    fn resolve_label_names(
+        &self,
+        owner: &str,
+        repo: &str,
+        labels: &[String],
+    ) -> Result<Vec<RepoLabel>, GeectlError> {
+        let known = self.repo_labels(owner, repo)?;
+        let mut resolved = Vec::with_capacity(labels.len());
+        for name in labels {
+            if resolved.iter().any(|label: &RepoLabel| &label.name == name) {
+                continue;
+            }
+            match known.iter().find(|label| &label.name == name) {
+                Some(label) => resolved.push(label.clone()),
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("unknown Gitea label {name:?} on repository {owner}/{repo}"),
+                    ));
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Add labels to a pull request (`POST
+    /// /api/v1/repos/{owner}/{repo}/issues/{number}/labels`) and
+    /// return the labels on the pull request afterwards: the server
+    /// answers the full list. The labels are named by name; a name
+    /// the repo does not carry is refused before the POST, since the
+    /// server would silently ignore it. DryRun-guarded like
+    /// `pr_review`: the guard runs before the resolve read, and the
+    /// result is `None` in dry-run.
+    pub fn pr_labels_add(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        labels: &[String],
+        dry_run: &DryRun,
+    ) -> Result<Option<Vec<GiteaLabel>>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        if labels.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("no labels to add to pull request {owner}/{repo}#{number}"),
+            ));
+        }
+        if !dry_run.allow(&format!(
+            "add labels {} to pull request {owner}/{repo}#{number}",
+            labels.join(", ")
+        )) {
+            return Ok(None);
+        }
+        let resolved = self.resolve_label_names(owner, repo, labels)?;
+        let request = IssueLabelsRequest {
+            labels: resolved.iter().map(|label| label.name.clone()).collect(),
+        };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea labels request: {err}"),
+            )
+        })?;
+        let url = build_url(
+            &self.base,
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "issues",
+                &number.to_string(),
+                "labels",
+            ],
+            &[],
+        );
+        let response = self.http.post_json_with(&url, &body, &self.credentials)?;
+        let labels: Vec<GiteaLabel> = serde_json::from_str(&response).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected Gitea labels response for pull request {owner}/{repo}#{number}: {err}"
+                ),
+            )
+        })?;
+        Ok(Some(labels))
+    }
+
+    /// Remove labels from a pull request (`DELETE
+    /// /api/v1/repos/{owner}/{repo}/issues/{number}/labels/{id}`,
+    /// one call per label) and return the requested names. The labels
+    /// are named by name and resolved to ids through the repo labels
+    /// first: a name the repo does not carry is refused before any
+    /// DELETE. A label the repo carries but the pull request does
+    /// not is a no-op on the server (204), so no read of the pull
+    /// request is needed, and the name is still reported. DryRun-guarded like
+    /// `pr_review_cancel_request`: the guard runs before the resolve
+    /// read, and the result is `None` in dry-run.
+    pub fn pr_labels_remove(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        labels: &[String],
+        dry_run: &DryRun,
+    ) -> Result<Option<Vec<String>>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_pr_number(number)?;
+        if labels.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("no labels to remove from pull request {owner}/{repo}#{number}"),
+            ));
+        }
+        if !dry_run.allow(&format!(
+            "remove labels {} from pull request {owner}/{repo}#{number}",
+            labels.join(", ")
+        )) {
+            return Ok(None);
+        }
+        let resolved = self.resolve_label_names(owner, repo, labels)?;
+        for label in &resolved {
+            let url = build_url(
+                &self.base,
+                &[
+                    "api",
+                    "v1",
+                    "repos",
+                    owner,
+                    repo,
+                    "issues",
+                    &number.to_string(),
+                    "labels",
+                    &label.id.to_string(),
+                ],
+                &[],
+            );
+            self.http.delete(&url, &self.credentials)?;
+        }
+        Ok(Some(
+            resolved.iter().map(|label| label.name.clone()).collect(),
+        ))
     }
 
     /// Merge a pull request (`POST
@@ -4839,6 +5029,313 @@ mod tests {
             .unwrap();
         assert!(cancelled.is_none());
         assert!(http.delete_json_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_labels_add_posts_names_and_returns_the_list() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/labels?page=1&limit=50",
+                r#"[{"id":1,"name":"bug"},{"id":2,"name":"wontfix"}]"#,
+            )
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels",
+                r#"[{"id":1,"name":"bug"}]"#,
+            );
+        let added = client(&http)
+            .pr_labels_add(
+                "openSUSE",
+                "geectl",
+                122,
+                &["bug".to_string()],
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run add returns the labels");
+        assert_eq!(
+            added,
+            vec![GiteaLabel {
+                name: "bug".to_string()
+            }]
+        );
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/labels?page=1&limit=50"
+                    .to_string(),
+                true
+            )]
+        );
+        assert_eq!(
+            http.post_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels"
+                    .to_string(),
+                r#"{"labels":["bug"]}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn pr_labels_add_dedupes_names() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/labels?page=1&limit=50",
+                r#"[{"id":1,"name":"bug"}]"#,
+            )
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels",
+                r#"[{"id":1,"name":"bug"}]"#,
+            );
+        let added = client(&http)
+            .pr_labels_add(
+                "openSUSE",
+                "geectl",
+                122,
+                &["bug".to_string(), "bug".to_string()],
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run add returns the labels");
+        assert_eq!(added.len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
+        assert_eq!(http.post_calls()[0].1, r#"{"labels":["bug"]}"#);
+    }
+
+    #[test]
+    fn pr_labels_add_unknown_name_is_refused() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/labels?page=1&limit=50",
+            r#"[{"id":1,"name":"bug"}]"#,
+        );
+        let err = client(&http)
+            .pr_labels_add(
+                "openSUSE",
+                "geectl",
+                122,
+                &["no-such-label".to_string()],
+                &DryRun::new(false),
+            )
+            .expect_err("an unknown label name must fail before any POST");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("no-such-label"));
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_labels_add_empty_list_is_refused() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .pr_labels_add("openSUSE", "geectl", 122, &[], &DryRun::new(false))
+            .expect_err("an empty add must fail before any read");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_labels_add_dry_run_reads_and_posts_nothing() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/labels?page=1&limit=50",
+                r#"[{"id":1,"name":"bug"}]"#,
+            )
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels",
+                r#"[{"id":1,"name":"bug"}]"#,
+            );
+        let added = client(&http)
+            .pr_labels_add(
+                "openSUSE",
+                "geectl",
+                122,
+                &["bug".to_string()],
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert!(added.is_none());
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_labels_add_bad_response_is_a_server_error() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/labels?page=1&limit=50",
+                r#"[{"id":1,"name":"bug"}]"#,
+            )
+            .with_post(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels",
+                "not json",
+            );
+        let err = client(&http)
+            .pr_labels_add(
+                "openSUSE",
+                "geectl",
+                122,
+                &["bug".to_string()],
+                &DryRun::new(false),
+            )
+            .expect_err("a malformed labels response is a server error");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn pr_labels_add_zero_number_is_refused() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .pr_labels_add(
+                "openSUSE",
+                "geectl",
+                0,
+                &["bug".to_string()],
+                &DryRun::new(false),
+            )
+            .expect_err("number 0 names no pull request");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_labels_remove_deletes_each_id_and_returns_names() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/labels?page=1&limit=50",
+                r#"[{"id":1,"name":"bug"},{"id":2,"name":"wontfix"}]"#,
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels/1",
+                "",
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels/2",
+                "",
+            );
+        let removed = client(&http)
+            .pr_labels_remove(
+                "openSUSE",
+                "geectl",
+                122,
+                &["bug".to_string(), "wontfix".to_string()],
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run remove returns the names");
+        assert_eq!(removed, vec!["bug".to_string(), "wontfix".to_string()]);
+        assert_eq!(
+            http.delete_calls(),
+            vec![
+                (
+                    "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels/1"
+                        .to_string(),
+                    true
+                ),
+                (
+                    "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels/2"
+                        .to_string(),
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_labels_remove_unknown_name_is_refused() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/labels?page=1&limit=50",
+            r#"[{"id":1,"name":"bug"}]"#,
+        );
+        let err = client(&http)
+            .pr_labels_remove(
+                "openSUSE",
+                "geectl",
+                122,
+                &["no-such-label".to_string()],
+                &DryRun::new(false),
+            )
+            .expect_err("an unknown label name must fail before any DELETE");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_labels_remove_empty_list_is_refused() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .pr_labels_remove("openSUSE", "geectl", 122, &[], &DryRun::new(false))
+            .expect_err("an empty remove must fail before any read");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_labels_remove_dry_run_deletes_nothing() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/labels?page=1&limit=50",
+                r#"[{"id":1,"name":"bug"}]"#,
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels/1",
+                "",
+            );
+        let removed = client(&http)
+            .pr_labels_remove(
+                "openSUSE",
+                "geectl",
+                122,
+                &["bug".to_string()],
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert!(removed.is_none());
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_labels_remove_zero_number_is_refused() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .pr_labels_remove(
+                "openSUSE",
+                "geectl",
+                0,
+                &["bug".to_string()],
+                &DryRun::new(false),
+            )
+            .expect_err("number 0 names no pull request");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_labels_remove_dedupes_names() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/labels?page=1&limit=50",
+                r#"[{"id":1,"name":"bug"}]"#,
+            )
+            .with_delete(
+                "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/labels/1",
+                "",
+            );
+        let removed = client(&http)
+            .pr_labels_remove(
+                "openSUSE",
+                "geectl",
+                122,
+                &["bug".to_string(), "bug".to_string()],
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .expect("a non-dry-run remove returns the names");
+        assert_eq!(removed, vec!["bug".to_string()]);
+        assert_eq!(http.delete_calls().len(), 1);
     }
 
     #[test]
