@@ -1376,7 +1376,13 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
                     .map(|value| xml_unescape(&value))
                     .filter(|value| !value.is_empty())
             };
-            let master = elements(&download_inner, "master")?
+            let master_elements = elements(&download_inner, "master")?;
+            // `<master>`, `<archfilter>` and `<pubkey>` are singular
+            // in the typed model, which keeps the first of each: a
+            // second one is server-accepted state the parse keeps
+            // readable, and the rewrite refuses it instead of
+            // dropping it (see `unmodeled_repository_content`).
+            let master = master_elements
                 .into_iter()
                 .map(
                     |(master_tag, _)| match quoted_attr_value(&master_tag, "url") {

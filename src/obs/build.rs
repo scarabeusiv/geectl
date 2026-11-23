@@ -1917,7 +1917,13 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
                     ));
                 }
             };
-            let master = xml_elements(download_inner, "master")?
+            let master_elements = xml_elements(download_inner, "master")?;
+            // `<master>`, `<archfilter>` and `<pubkey>` are singular
+            // in the typed model, which keeps the first of each: a
+            // second one is server-accepted state the parse keeps
+            // readable, and the rewrite refuses it instead of
+            // dropping it (see `unmodeled_repository_content`).
+            let master = master_elements
                 .into_iter()
                 .map(|master_element| {
                     let (master_tag, _) = xml_split_element(master_element, "master");
@@ -6652,6 +6658,38 @@ mod tests {
             .unwrap_err()
             .context
             .contains("<master> with empty url"));
+    }
+    #[test]
+    fn parse_repositories_keep_the_first_duplicate_download_child() {
+        // `<master>`, `<archfilter>` and `<pubkey>` are singular in
+        // the typed model: the parse keeps the first of each, so a
+        // read never fails on server-accepted state — only a rewrite
+        // refuses the duplicate (see the meta write tests).
+        for (body, child) in [
+            ("<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://a.example.com\"/><master url=\"https://b.example.com\"/></download></repository></project>", "master"),
+            ("<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><archfilter>aarch64</archfilter></download></repository></project>", "archfilter"),
+            ("<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><pubkey>key-one</pubkey><pubkey>key-two</pubkey></download></repository></project>", "pubkey"),
+        ] {
+            for parsed in [
+                parse_repositories(body).unwrap(),
+                parse_project_meta(body).unwrap().repositories,
+            ] {
+                let download = &parsed[0].downloads[0];
+                match child {
+                    "master" => assert_eq!(
+                        download.master.as_ref().unwrap().url,
+                        "https://a.example.com"
+                    ),
+                    "archfilter" => {
+                        assert_eq!(download.archfilter.as_deref(), Some("x86_64"))
+                    }
+                    "pubkey" => {
+                        assert_eq!(download.pubkey.as_deref(), Some("key-one"))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
     }
 
     #[test]
