@@ -2298,6 +2298,9 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
             )));
         }
         download_arches.push(arch.clone());
+        if download.url.is_empty() {
+            return Err(invalid(&format!("download arch {arch:?} has an empty url")));
+        }
         if !has_url_scheme(&download.url) {
             return Err(invalid(&format!(
                 "download arch {arch:?} has a url with no scheme"
@@ -2314,6 +2317,11 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
             )));
         }
         if let Some(master) = &download.master {
+            if master.url.is_empty() {
+                return Err(invalid(&format!(
+                    "download arch {arch:?} has an empty master url"
+                )));
+            }
             if !has_url_scheme(&master.url) {
                 return Err(invalid(&format!(
                     "download arch {arch:?} has a master url with no scheme"
@@ -7400,6 +7408,10 @@ mod tests {
         assert!(validate_repository_settings(&repo).is_err());
         repo.downloads[0].url = "https://example.com/\u{1}".to_string();
         assert!(validate_repository_settings(&repo).is_err());
+        // An empty url is its own fault, not a missing scheme.
+        repo.downloads[0].url = String::new();
+        let err = validate_repository_settings(&repo).unwrap_err();
+        assert!(err.context.contains("has an empty url"), "{}", err.context);
         // A validation error never carries the url itself: it may
         // hold credentials.
         repo.downloads[0].url = "//user:secret@example.com/path".to_string();
@@ -7422,6 +7434,13 @@ mod tests {
             sslfingerprint: None,
         });
         assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads[0].master.as_mut().unwrap().url = String::new();
+        let err = validate_repository_settings(&repo).unwrap_err();
+        assert!(
+            err.context.contains("has an empty master url"),
+            "{}",
+            err.context
+        );
         repo.downloads[0].master.as_mut().unwrap().url =
             "//user:secret@example.com/master".to_string();
         let err = validate_repository_settings(&repo).unwrap_err();

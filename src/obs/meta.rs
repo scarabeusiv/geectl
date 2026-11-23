@@ -1952,6 +1952,7 @@ mod tests {
             .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("has an empty url"), "{}", err.context);
         assert!(http.put_calls().is_empty());
     }
 
