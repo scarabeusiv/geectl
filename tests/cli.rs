@@ -977,6 +977,40 @@ fn serve_once(body: &str) -> std::net::SocketAddr {
     serve_once_status(200, "OK", body)
 }
 
+/// A one-shot HTTP fixture that records the request target: the same
+/// single-connection shape as `serve_once`, for commands whose
+/// behaviour is which URL they hit. The thread is not joined, like
+/// `serve_once`.
+fn serve_once_recording(body: &str) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = body.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        let target = String::from_utf8_lossy(&request)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .to_string();
+        let _ = tx.send(target);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    });
+    (addr, rx)
+}
+
 /// Read one request (headers + body) from a loopback connection:
 /// the body length comes from Content-Length (a request without one
 /// has no body). A single read can return only the headers when the
@@ -3700,6 +3734,116 @@ fn build_help_lists_all_sixteen_subcommands() {
     ] {
         assert!(text.contains(name), "build --help misses {name}");
     }
+}
+
+#[test]
+fn build_buildconfig_help_lists_the_alternative_project_flag() {
+    let out = geectl()
+        .args(["build", "buildconfig", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("--alternative-project <ALTERNATIVE_PROJECT>"),
+        "{text}"
+    );
+    assert!(text.contains("another project instead"), "{text}");
+}
+
+#[test]
+fn build_buildconfig_reads_the_alternative_project() {
+    // The alternative project is the fetch project: the request goes
+    // to the alternative project's `_buildconfig`, while the payload
+    // still names the project the config was read for. The stub
+    // answers whatever it is asked, so the recorded target is the
+    // proof of which project was fetched.
+    let dir = TempDir::new();
+    let (addr, target) = serve_once_recording("Macro: test 1\n");
+    let out = geectl_isolated(&dir)
+        .args([
+            "build",
+            "buildconfig",
+            "testproject",
+            "standard",
+            "--alternative-project",
+            "openSUSE:Factory",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        target
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the stub saw one request"),
+        "/build/openSUSE:Factory/standard/_buildconfig"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["project"], "testproject");
+    assert_eq!(value["repository"], "standard");
+    assert_eq!(value["alternative_project"], "openSUSE:Factory");
+    assert_eq!(value["buildconfig"], "Macro: test 1\n");
+    // Without the flag the same project is fetched, with a null
+    // alternative project.
+    let (addr, target) = serve_once_recording("Macro: test 1\n");
+    let out = geectl_isolated(&dir)
+        .args(["build", "buildconfig", "testproject", "standard"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        target
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the stub saw one request"),
+        "/build/testproject/standard/_buildconfig"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["project"], "testproject");
+    assert_eq!(value["alternative_project"], serde_json::Value::Null);
+    assert_eq!(value["buildconfig"], "Macro: test 1\n");
+}
+
+#[test]
+fn build_buildconfig_rejects_a_bad_alternative_project_before_any_request() {
+    // The name validation runs in the library before any HTTP: with
+    // the base URL on a closed port the failure is invalid_input, not
+    // a network error — no request ever goes out.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "build",
+            "buildconfig",
+            "testproject",
+            "standard",
+            "--alternative-project",
+            "bad name!",
+        ])
+        .env("GEECTL_OBS_URL", "http://127.0.0.1:1")
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
 }
 
 #[test]

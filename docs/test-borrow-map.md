@@ -920,6 +920,30 @@ semantics, not its tests).**
   match over complete package meta files (`/package[<match>]`).
   With a term, the substring match is combined with the devel
   predicate (parenthesised: XPath `and` binds tighter than `or`).
+
+## Gap batch 3 — buildconfig --alternative-project (#252)
+
+**Direct adoptions: 0. Spec reference: `osc/build.py:987-988`,
+`osc/core.py:4813-4818`.**
+
+- No osc test pins the buildconfig operation at all: no behave
+  scenario (`behave/features/` carries no buildconfig feature) and no
+  unit test (`get_buildconfig` is only exercised inside build flows;
+  `tests/test_build.py` covers the trust gate only). `osc buildconfig`
+  itself (`osc/commandline.py:7272`) takes no `--alternative-project`
+  — the flag exists only on `osc build` (`osc/commandline.py:7144`,
+  `:7756`).
+- The wire shape is the spec: the alternative project replaces the
+  project in the path (`osc/build.py:987-988`: `prj =
+  opts.alternative_project`, then `get_buildconfig(apiurl, prj,
+  repo)`), and the endpoint takes no alternative-project query
+  parameter (`osc/core.py:4813-4818`: only the kiwi `path` query).
+  That is the same substitution geectl already does for buildinfo
+  (#213) and for local builds (`fetch_project()`).
+- The new tests are written from scratch against the mocked HTTP
+  shape: the CLI stub-server test pins the request target, the unit
+  tests pin the payload and the header.
+
 ## Batch 11 — prjconf
 
 **Direct adoptions: 0. osc has no prjconf tests.**
@@ -967,6 +991,7 @@ semantics and the project-set enumeration, not its tests).**
 | 9 Gitea ops | 2 | 13 | 15 |
 | 10 local-build flag parity | 0 (+spec ref) | 0 | 0 (+spec) |
 | Gap batch 2, wave 3 (#175, #176) | 0 | 0 | 0 |
+| Gap batch 3 — buildconfig --alternative-project (#252) | 0 (+spec ref) | 0 | 0 (+spec) |
 | 11 prjconf | 0 | 0 | 0 |
 | 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
 | **Total adopted** | **105** | **120** | **225** |

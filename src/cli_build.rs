@@ -208,6 +208,11 @@ pub enum BuildCommand {
         project: String,
         /// The repository to read the build configuration for.
         repository: String,
+        /// Read the build configuration for another project instead
+        /// of `project`: the expanded `_buildconfig` text the engine
+        /// takes as `--dist` there.
+        #[arg(long)]
+        alternative_project: Option<String>,
     },
     /// List the completed builds for a package, newest first.
     BuildHistory {
@@ -722,12 +727,19 @@ pub fn run_build(
         BuildCommand::Buildconfig {
             project,
             repository,
+            alternative_project,
         } => {
-            let config = client.buildconfig(&project, &repository)?;
+            let fetch = alternative_project.as_deref().unwrap_or(&project);
+            let config = client.buildconfig(fetch, &repository)?;
             // No coordinate header on the config itself: the text *is*
             // the build configuration, verbatim (design rule 4) — the
             // coordinates live in the JSON payload.
-            Ok(buildconfig_result(&project, &repository, config))
+            Ok(buildconfig_result(
+                &project,
+                &repository,
+                alternative_project.as_deref(),
+                config,
+            ))
         }
         BuildCommand::BuildHistory {
             project,
@@ -1130,9 +1142,13 @@ fn coordinates_header(command: &BuildCommand) -> String {
         BuildCommand::Buildconfig {
             project,
             repository,
+            alternative_project,
         } => {
             coords.push(format!("project: {project}"));
             coords.push(format!("repository: {repository}"));
+            if let Some(alt) = alternative_project {
+                coords.push(format!("alternative-project: {alt}"));
+            }
         }
         BuildCommand::ListRepositories { project } => {
             coords.push(format!("project: {project}"));
@@ -1661,10 +1677,16 @@ fn render_job_status_text(job: &Option<JobStatus>) -> String {
 
 /// The `buildconfig` result: the payload carries the coordinates and
 /// the config text; the text is the config verbatim.
-fn buildconfig_result(project: &str, repository: &str, config: String) -> (Value, String) {
+fn buildconfig_result(
+    project: &str,
+    repository: &str,
+    alternative_project: Option<&str>,
+    config: String,
+) -> (Value, String) {
     let payload = json!({
         "project": project,
         "repository": repository,
+        "alternative_project": alternative_project,
         "buildconfig": config,
     });
     (payload, config)
@@ -2348,6 +2370,20 @@ mod tests {
                 "openSUSE:Factory"
             ])),
             "project: p package: k repository: r arch: a alternative-project: openSUSE:Factory"
+        );
+        assert_eq!(
+            coordinates_header(&parse_build(&["buildconfig", "p", "r"])),
+            "project: p repository: r"
+        );
+        assert_eq!(
+            coordinates_header(&parse_build(&[
+                "buildconfig",
+                "p",
+                "r",
+                "--alternative-project",
+                "openSUSE:Factory"
+            ])),
+            "project: p repository: r alternative-project: openSUSE:Factory"
         );
         assert_eq!(
             coordinates_header(&parse_build(&["build-history", "p", "k", "r", "a"])),
@@ -3706,9 +3742,26 @@ mod tests {
             BuildCommand::Buildconfig {
                 project,
                 repository,
+                alternative_project,
             } => {
                 assert_eq!(project, "p");
                 assert_eq!(repository, "r");
+                assert_eq!(alternative_project, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse_build(&[
+            "buildconfig",
+            "p",
+            "r",
+            "--alternative-project",
+            "openSUSE:Factory",
+        ]) {
+            BuildCommand::Buildconfig {
+                alternative_project,
+                ..
+            } => {
+                assert_eq!(alternative_project.as_deref(), Some("openSUSE:Factory"));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -3716,9 +3769,21 @@ mod tests {
 
     #[test]
     fn buildconfig_result_is_verbatim() {
-        let (payload, text) = buildconfig_result("p", "r", "Macro: foo\n".to_string());
+        let (payload, text) = buildconfig_result("p", "r", None, "Macro: foo\n".to_string());
         assert_eq!(payload["project"], "p");
         assert_eq!(payload["repository"], "r");
+        assert_eq!(payload["alternative_project"], serde_json::Value::Null);
+        assert_eq!(payload["buildconfig"], "Macro: foo\n");
+        assert_eq!(text, "Macro: foo\n");
+        // With an alternative project the payload names it; the text
+        // stays the config verbatim (design rule 4).
+        let (payload, text) = buildconfig_result(
+            "p",
+            "r",
+            Some("openSUSE:Factory"),
+            "Macro: foo\n".to_string(),
+        );
+        assert_eq!(payload["alternative_project"], "openSUSE:Factory");
         assert_eq!(payload["buildconfig"], "Macro: foo\n");
         assert_eq!(text, "Macro: foo\n");
     }
