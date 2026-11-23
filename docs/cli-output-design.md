@@ -323,7 +323,7 @@ shape rules above. Six examples pin the shape:
 - **`download <package> <file> --output <path>`** (single object +
   confirmation): header `project: … package: … file: …`, then
   `downloaded <file> (<n> bytes) to <path>` — the bytes never ride
-  the text rendering. (tests/cli.rs:1242)
+  the text rendering. (tests/cli.rs:1355)
 - **`build results`** (list + summary, batch 5): a `project:`
   header line, then the table `REPOSITORY ARCH PACKAGE CODE`, then
   a summary line (`1 failed, 3 succeeded`, terms alphabetical) —
