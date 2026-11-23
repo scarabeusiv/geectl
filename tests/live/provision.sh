@@ -272,9 +272,24 @@ $COMPOSE "${COMPOSE_FILES[@]}" up -d backend frontend
 # tests/local_build_e2e/provision-fixture.sh. A real directory at the
 # link location is refused: silently linking over backend state would
 # hide it. The guard fires for any non-symlink, not only a directory.
+# The directories this step creates are handed to the backend runtime
+# user (obsrun): the backend daemons run as obsrun and create this
+# tree themselves on the non-cache path. A root-owned arch directory
+# makes the repserver's dirty touch (:schedulerstate.dirty, on the
+# notify path for every source write) die with Permission denied,
+# which aborts the notify eval before the scheduler event is written, so
+# the scheduler never learns of the project and the daemon never
+# rechecks. The same handoff unblocks the scheduler's :schedulerstate
+# store once it processes the repository. The mounted payload
+# directory is handed over the same way: the download-on-demand
+# daemon runs as obsrun and writes its doddata and doddata.cookie
+# into :full, and a runner- or root-owned mount makes that write
+# fail the same way. The restore re-creates the mount runner-owned
+# on every run, so the handoff runs here, after the backend is up,
+# rather than once in the workflow.
 if [ -n "${DOD_CACHE:-}" ]; then
     dod_full="/srv/obs/build/geectl:e2e/standard/${FIXTURE_ARCH}/:full"
-    $COMPOSE "${COMPOSE_FILES[@]}" exec -T backend sh -c 'mkdir -p "$(dirname "$1")"; if [ -e "$1" ] && [ ! -L "$1" ]; then echo "unexpected non-symlink at $1; refusing to link the download-on-demand cache over it" >&2; exit 1; fi; ln -sfn /srv/obs/dod-cache "$1"' _ "$dod_full"
+    $COMPOSE "${COMPOSE_FILES[@]}" exec -T backend sh -c 'd="$(dirname "$1")"; mkdir -p "$d"; p="$(dirname "$d")"; chown obsrun "$d" "$p" "$(dirname "$p")"; chown obsrun /srv/obs/dod-cache; if [ -e "$1" ] && [ ! -L "$1" ]; then echo "unexpected non-symlink at $1; refusing to link the download-on-demand cache over it" >&2; exit 1; fi; ln -sfn /srv/obs/dod-cache "$1"' _ "$dod_full"
 fi
 
 # Readiness: the public /about endpoint answers 200 only once the
