@@ -7419,32 +7419,188 @@ exit 0
             assert_eq!(vertical.engine_version().unwrap().as_deref(), Some("8.8-8"));
         }
 
-        #[test]
-        fn engine_package_version_reads_the_owning_package() {
-            // The package-manager probes read PATH: hold the lock so a
-            // PATH-mutating probe test cannot swap the managers under
-            // this one.
-            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        /// Whether a package manager on PATH owns `binary`: `Some(true)`
+        /// when one answers for it, `Some(false)` when both ran (or
+        /// are absent) and neither owns it, `None` when an ownership
+        /// probe could not run (spawn failure or timeout) — no
+        /// evidence either way, so the caller retries instead of
+        /// concluding. A manager present without owning the binary
+        /// (a Homebrew rpm, whose files are not in the rpm
+        /// database) answers neither.
+        fn manager_owns_binary(binary: &Path) -> Option<bool> {
+            let binary = binary.to_str()?;
+            let mut rpm = Command::new("rpm");
+            rpm.args(["-qf", "--queryformat", "%{VERSION}-%{RELEASE}", binary]);
+            let rpm_unknown =
+                match run_with_timeout(&mut rpm, Duration::from_secs(PACKAGE_PROBE_TIMEOUT_SECS)) {
+                    Ok(output)
+                        if output.status.success()
+                            && !String::from_utf8_lossy(&output.stdout).trim().is_empty() =>
+                    {
+                        return Some(true);
+                    }
+                    Ok(_) => false,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                };
+            let mut dpkg = Command::new("dpkg-query");
+            dpkg.args(["-S", binary]);
+            let owner_line = |stdout: &[u8]| {
+                String::from_utf8_lossy(stdout)
+                    .lines()
+                    .any(|line| line.ends_with(&format!(": {binary}")))
+            };
+            match run_with_timeout(&mut dpkg, Duration::from_secs(PACKAGE_PROBE_TIMEOUT_SECS)) {
+                Ok(output) if output.status.success() && owner_line(&output.stdout) => Some(true),
+                Ok(_) if !rpm_unknown => Some(false),
+                Ok(_) => None,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if rpm_unknown {
+                        None
+                    } else {
+                        Some(false)
+                    }
+                }
+                Err(_) => None,
+            }
+        }
+
+        /// The live-manager check, factored so the stub tests can
+        /// drive it too. Callers hold PATH_LOCK: the probes read
+        /// PATH, and a PATH-mutating probe test must not swap the
+        /// managers under this one.
+        fn check_engine_package_version() {
             // The package manager on the host answers for a binary it
             // owns: rpm on rpm systems, dpkg-query on Debian systems.
-            // The test skips when neither is on PATH (the case on a
+            // The check skips when neither is on PATH (the case on a
             // stock macOS host).
             let rpm = which(Path::new("rpm"));
             let dpkg = which(Path::new("dpkg-query"));
-            let (manager, binary) = match (rpm, dpkg) {
-                (Some(path), _) => ("rpm", path),
-                (None, Some(path)) => ("dpkg-query", path),
+            let binary = match (rpm, dpkg) {
+                (Some(path), _) => path,
+                (None, Some(path)) => path,
                 (None, None) => {
                     eprintln!("skipping: no rpm or dpkg-query on PATH");
                     return;
                 }
             };
-            let version = engine_package_version(&binary);
-            assert!(
-                version.as_deref().is_some_and(|v| !v.is_empty()),
-                "{manager} answered no version for {}",
+            // One probe attempt can fail transiently under parallel
+            // load while the managers are healthy, so retry a few
+            // times before concluding. Each attempt costs at most
+            // five probe timeouts when the managers hang (three in
+            // the version probe, two in the ownership probe); the
+            // common case is milliseconds. When no manager owns the
+            // binary (a Homebrew rpm, whose files are not in the
+            // rpm database), there is nothing to answer: skip. A
+            // manager that owns the binary while the probe still
+            // answers nothing after retries is a broken probe: fail.
+            // An ownership probe that could not run is no evidence
+            // either way: retry instead of concluding. When ownership
+            // could not be determined at all after retries, fail too:
+            // a host whose managers never answer is broken, and
+            // skipping would hide it.
+            const ATTEMPTS: u32 = 3;
+            const RETRY_DELAY: Duration = Duration::from_millis(100);
+            let mut owned = false;
+            for attempt in 0..ATTEMPTS {
+                if engine_package_version(&binary).is_some_and(|version| !version.is_empty()) {
+                    return;
+                }
+                match manager_owns_binary(&binary) {
+                    Some(true) => {
+                        owned = true;
+                    }
+                    Some(false) => {
+                        eprintln!("skipping: no package manager owns {}", binary.display());
+                        return;
+                    }
+                    None => {
+                        eprintln!(
+                            "ownership probe could not run for {}; retrying",
+                            binary.display()
+                        );
+                    }
+                }
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(RETRY_DELAY);
+                }
+            }
+            if owned {
+                panic!(
+                    "a package manager owns {} but the probe answered no version",
+                    binary.display()
+                );
+            }
+            panic!(
+                "the probe answered no version for {} and ownership could not be determined",
                 binary.display()
             );
+        }
+
+        #[test]
+        fn engine_package_version_reads_the_owning_package() {
+            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            check_engine_package_version();
+        }
+
+        #[test]
+        fn engine_package_version_skips_when_no_manager_owns_the_binary() {
+            // Hold the lock: the ownership check reads PATH, and a
+            // PATH-mutating probe test must not swap the managers.
+            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = TempDir::new();
+            // rpm refuses -qf and no dpkg-query stub answers: no
+            // manager owns the binary, so the check skips instead
+            // of failing.
+            write_script(&dir.path().join("rpm"), "#!/bin/sh\nexit 1\n");
+            let _restore = RestorePath::prepend(dir.path());
+            check_engine_package_version();
+        }
+
+        #[test]
+        fn engine_package_version_retries_a_transient_probe_failure() {
+            // Hold the lock: the ownership check reads PATH, and a
+            // PATH-mutating probe test must not swap the managers.
+            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = TempDir::new();
+            // rpm refuses -qf exactly once, then answers: the first
+            // probe attempt returns nothing while a manager owns
+            // the binary, and the retry answers it.
+            write_script(
+                &dir.path().join("rpm"),
+                &format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"-qf\" ]; then if [ -f \"{}/rpm-failed-once-{}\" ]; then echo \"9.9-9\"; exit 0; fi; touch \"{}/rpm-failed-once-{}\"; exit 1; fi\nexit 1\n",
+                    dir.path().display(),
+                    std::process::id(),
+                    dir.path().display(),
+                    std::process::id()
+                ),
+            );
+            let _restore = RestorePath::prepend(dir.path());
+            check_engine_package_version();
+        }
+
+        #[test]
+        #[should_panic(expected = "but the probe answered no version")]
+        fn engine_package_version_fails_when_a_manager_owns_the_binary_but_the_probe_answers_nothing(
+        ) {
+            // Hold the lock: the ownership check reads PATH, and a
+            // PATH-mutating probe test must not swap the managers.
+            let _path = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = TempDir::new();
+            // rpm answers -qf with an empty version and dpkg-query
+            // -S names an owner but -W refuses: the probe answers
+            // nothing while a manager owns the binary.
+            write_script(
+                &dir.path().join("rpm"),
+                "#!/bin/sh\nif [ \"$1\" = \"-qf\" ]; then exit 0; fi\nexit 1\n",
+            );
+            write_script(
+                &dir.path().join("dpkg-query"),
+                "#!/bin/sh\nif [ \"$1\" = \"-S\" ]; then echo \"obs-build: $2\"; exit 0; fi\nexit 1\n",
+            );
+            let _restore = RestorePath::prepend(dir.path());
+            check_engine_package_version();
         }
 
         #[test]
