@@ -27,6 +27,7 @@
 
 use crate::config::Config;
 use crate::error::{ErrorKind, GeectlError};
+use crate::gitea::validate_gitea_name;
 use crate::local_build::LocalBuild;
 use crate::obs::{
     valid_obs_filename, CommitFileEntry, CommitFilelistOptions, DirectoryListing, DryRun,
@@ -152,6 +153,267 @@ impl WorkingCopy {
             Backend::Git => Ok(self.base_rev.clone()),
         }
     }
+}
+
+/// The `owner/repo` the checkout's `origin` remote points at, for
+/// the Gitea arm of filing: the repo the pull request goes to when
+/// the agent names no `--repo`. The remote is an `http(s)://` URL
+/// — or an SSH remote, scp-like (`git@host:owner/repo`) or
+/// `ssh://` — with the owner and repo as its last two path segments
+/// (a trailing `.git` is stripped), and its host must be the
+/// configured Gitea instance's host: a checkout cloned from
+/// another host names a repo that does not exist on this instance,
+/// so a foreign host fails closed naming `--repo` instead of
+/// filing to the wrong instance under the same `owner/repo`.
+/// Every failure about the remote itself is `InvalidInput`: the
+/// remedy is always the `--repo` flag, whether the remote is
+/// missing, unparsable, or foreign. (A broken configured URL is
+/// `ConfigError`; a git failure surfaces its own kind.)
+pub fn origin_repo(wc: &WorkingCopy, instance_url: &str) -> Result<(String, String), GeectlError> {
+    let (success, stdout, stderr) = git_status(
+        &wc.root,
+        "config",
+        &["--local", "--get", "remote.origin.url"],
+        &[],
+    )?;
+    if !success {
+        if stderr.trim().is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "the checkout has no origin remote: pass --repo",
+            ));
+        }
+        return Err(git_error("config", stderr.as_bytes()));
+    }
+    let url = stdout.trim();
+    // Error messages name the remote without its userinfo: a remote
+    // URL can embed credentials (`https://user:token@host/...`), and
+    // those must never land in stderr or a pasted log.
+    let display = strip_url_userinfo(url);
+    let origin_host = url_host(url).ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot read a host from the origin remote {display:?}: pass --repo"),
+        )
+    })?;
+    let instance_host = url_host(instance_url).ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("cannot read a host from the configured Gitea URL {instance_url:?}"),
+        )
+    })?;
+    // An SSH remote names its host without a scheme the API client
+    // would use — the fetch runs over SSH, so only the host must
+    // match the instance, not its scheme or port. An `http(s)://`
+    // origin keeps the scheme-sensitive key: the fetch's token
+    // header is scoped to the instance URL, so an `http://` origin
+    // against an `https://` instance must not pass.
+    let same_host = if origin_host.starts_with("ssh://") {
+        bare_host(&origin_host) == bare_host(&instance_host)
+    } else {
+        origin_host == instance_host
+    };
+    if !same_host {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "the origin remote {display:?} points at {origin_host}, not the configured Gitea instance {instance_host}: pass --repo to name the repo on the configured instance"
+            ),
+        ));
+    }
+    let (owner, repo) = parse_origin_repo(url).ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot read owner/repo from the origin remote {display:?}: pass --repo"),
+        )
+    })?;
+    // The names come from the remote, not the flags: a malformed
+    // one is refused here, before the live fetch, not inside
+    // `pr_create` after a network round-trip.
+    validate_gitea_name(&owner, "owner")?;
+    validate_gitea_name(&repo, "repo")?;
+    Ok((owner, repo))
+}
+
+/// A URL with any userinfo removed, for error messages: a remote
+/// URL can embed credentials (`https://user:token@host/owner/repo`),
+/// and those must never land in stderr or a pasted log. The `@`
+/// only counts inside the authority (before the first `/`); one in
+/// a path segment is data, not userinfo.
+fn strip_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let after_scheme = &url[scheme_end + 3..];
+    let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let Some(at) = after_scheme[..authority_end].rfind('@') else {
+        return url.to_string();
+    };
+    format!("{}://{}", &url[..scheme_end], &after_scheme[at + 1..])
+}
+
+/// The scheme plus host of a URL, lowercased, with the default port
+/// for its scheme folded in: `https://host` and `https://host:443`
+/// are the same instance, and so are `http://127.0.0.1:80` and
+/// `http://127.0.0.1`. A non-default port stays part of the key
+/// (`http://127.0.0.1:3000` is not `http://127.0.0.1`). The scheme
+/// is part of the key, like `same_api_url` in `auth.rs`: an `http://`
+/// origin against an `https://` instance is a different URL for the
+/// fetch's token header, so it must not pass the host check. An SSH
+/// remote keys as `ssh://host` instead: scp-like (`git@host:owner/repo`)
+/// has no scheme or port, and `ssh://` folds its default port 22.
+/// `None` when the URL has no host to read, its scheme is unknown,
+/// or the authority is malformed (trailing garbage after a bracketed
+/// host, an empty port, a non-numeric port).
+fn url_host(url: &str) -> Option<String> {
+    // An scp-like remote has no `://`: its key is the `ssh://` host.
+    if !url.contains("://") {
+        let (host, _) = split_scp_like(url)?;
+        return Some(format!("ssh://{}", host.to_ascii_lowercase()));
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "https" => "443",
+        "http" => "80",
+        "ssh" => "22",
+        _ => return None,
+    };
+    let authority = rest.split('/').next()?;
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, port) = if let Some(bracketed) = hostport.strip_prefix('[') {
+        let end = bracketed.find(']')?;
+        let host = &bracketed[..end];
+        let after = &bracketed[end + 1..];
+        let port = match after {
+            "" => None,
+            _ => {
+                let port = after.strip_prefix(':')?;
+                if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                Some(port)
+            }
+        };
+        (host, port)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, Some(p)),
+            Some(_) => return None,
+            None => (hostport, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = port.unwrap_or(default_port);
+    if port == default_port {
+        Some(format!("{scheme}://{}", host.to_ascii_lowercase()))
+    } else {
+        Some(format!("{scheme}://{}:{port}", host.to_ascii_lowercase()))
+    }
+}
+
+/// Split an scp-like `[user@]host:path` remote into its host and
+/// path. `None` for anything else: a URL with a scheme (handled by
+/// `url_host`'s `://` branch), a local path (no `:`), or a `host:`
+/// with an empty host or a path that is empty or absolute. A
+/// bracketed host (`git@[::1]:owner/repo`) keeps its colons inside
+/// the brackets; the user part, when present, is dropped — the host
+/// is what the instance check needs.
+fn split_scp_like(url: &str) -> Option<(&str, &str)> {
+    if url.contains("://") {
+        return None;
+    }
+    let (host, path) = if let Some(bracket_at) = url.find('[') {
+        let after_bracket = &url[bracket_at..];
+        let end = after_bracket.find(']')?;
+        let host = &after_bracket[1..end];
+        let path = after_bracket[end + 1..].strip_prefix(':')?;
+        // Anything before the `[` is a `user@` prefix, not a path.
+        let prefix = &url[..bracket_at];
+        if !prefix.is_empty() && !prefix.ends_with('@') {
+            return None;
+        }
+        (host, path)
+    } else {
+        let (left, path) = url.split_once(':')?;
+        if left.is_empty() || left.contains('/') {
+            return None;
+        }
+        (left.rsplit('@').next()?, path)
+    };
+    if host.is_empty() || path.is_empty() || path.starts_with('/') {
+        return None;
+    }
+    Some((host, path))
+}
+
+/// The bare host of a `url_host` key: scheme and port stripped, so
+/// an SSH remote's host compares against the instance's host
+/// without its scheme or port (`ssh://host` and `https://host:3000`
+/// are the same host). A trailing numeric segment is a port only
+/// when what precedes it still names a host — the last segment of
+/// a bare IPv6 literal (`::1`) is not stripped.
+fn bare_host(key: &str) -> &str {
+    let after_scheme = key.split_once("://").map_or(key, |(_, rest)| rest);
+    if let Some(bracketed) = after_scheme.strip_prefix('[') {
+        let end = bracketed.find(']').unwrap_or(bracketed.len());
+        return &bracketed[..end];
+    }
+    match after_scheme.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty()
+                && port.chars().all(|c| c.is_ascii_digit())
+                && host.chars().any(|c| c.is_ascii_alphanumeric()) =>
+        {
+            host
+        }
+        _ => after_scheme,
+    }
+}
+
+/// Split a remote URL into its owner and repo: an `http(s)://` or
+/// `ssh://` URL contributes its last two path segments, an scp-like
+/// remote (`git@host:owner/repo`) its path after the `:`. `None`
+/// for anything else — a local path, or a remote with any other
+/// number of segments. A trailing `.git` is stripped.
+fn parse_origin_repo(url: &str) -> Option<(String, String)> {
+    let path = if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("ssh://"))
+    {
+        rest.split_once('/')?.1
+    } else {
+        split_scp_like(url)?.1
+    };
+    let mut segments: Vec<&str> = path.split('/').collect();
+    if segments.len() != 2 {
+        return None;
+    }
+    let repo = segments.pop()?;
+    let owner = segments.pop()?;
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
+
+/// The checkout's current branch, for the Gitea arm of filing:
+/// the head branch the pull request comes from when the agent
+/// names no `--head`. A detached HEAD has no branch to file from.
+pub fn current_branch(wc: &WorkingCopy) -> Result<String, GeectlError> {
+    let branch = git(&wc.root, "rev-parse", &["--abbrev-ref", "HEAD"], &[])?;
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "the checkout is on a detached HEAD: pass --head",
+        ));
+    }
+    Ok(branch.to_string())
 }
 
 /// One file's state against the base, in `git status --porcelain`
@@ -3147,6 +3409,77 @@ fn refuse_on_rebase(wc: &WorkingCopy) -> Result<(), GeectlError> {
         ));
     }
     Ok(())
+}
+
+/// Refuse to file from an OBS-native checkout that is not
+/// ready: a base behind the server, conflicts, or changes against
+/// the base. The order mirrors `commit_obs`: outdated first, then
+/// conflicts, then the uncommitted check. A checkout that passes
+/// files exactly the branch state the agent sees — nothing
+/// silently omitted.
+pub fn refuse_not_submittable_obs(wc: &WorkingCopy, obs: &ObsClient) -> Result<(), GeectlError> {
+    refuse_when_outdated_obs(wc, obs)?;
+    refuse_on_conflicts(wc)?;
+    refuse_uncommitted(wc)?;
+    Ok(())
+}
+
+/// Refuse to file from a git-backed checkout that is not ready:
+/// a remote ahead of the checkout, conflicts, or changes against
+/// the base. The order mirrors `commit_git`: the remote check
+/// first, then conflicts, then the uncommitted check. Live, the
+/// remote is fetched first, so the check judges the current
+/// remote; the dry-run plan does not fetch, so it refuses only
+/// when the checkout is behind what was last fetched — like the
+/// commit plan. The fetch only refreshes remote-tracking refs —
+/// never HEAD, the index, or the working tree — so a filing that
+/// then fails leaves the checkout itself untouched.
+pub fn refuse_not_submittable_git(
+    wc: &WorkingCopy,
+    gitea_auth: Option<&GiteaAuth<'_>>,
+    dry_run: &DryRun,
+) -> Result<(), GeectlError> {
+    if !dry_run.enabled() {
+        let auth = gitea_auth.ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ConfigError,
+                "a git-backed submit needs a Gitea token: the fetch authenticates with it",
+            )
+        })?;
+        let mut header = String::new();
+        let mut key = String::new();
+        let env = token_env(auth, &mut header, &mut key);
+        git_network(&wc.root, "fetch", &["origin"], &env)?;
+    }
+    refuse_when_remote_ahead(wc)?;
+    refuse_on_conflicts(wc)?;
+    refuse_uncommitted(wc)?;
+    Ok(())
+}
+
+/// Refuse when the checkout differs from its base: uncommitted
+/// changes or local commits the server never saw. The filed
+/// submission would omit them, so the agent commits first. The
+/// error names the files, so the agent sees what would be left
+/// out.
+fn refuse_uncommitted(wc: &WorkingCopy) -> Result<(), GeectlError> {
+    let entries = status(wc)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+    let more = if names.len() > 5 {
+        format!(" (and {} more)", names.len() - 5)
+    } else {
+        String::new()
+    };
+    Err(GeectlError::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "the checkout has changes against the base ({shown}{more}); commit them first, or they are not in the filed submission"
+        ),
+    ))
 }
 
 /// Refuse when files are unmerged: a commit must not send a tree
@@ -8697,5 +9030,542 @@ mod tests {
         assert!(autostash_entries(&wc).unwrap().is_empty());
         assert_eq!(wc.base_rev, REV1);
         let _ = dir;
+    }
+
+    fn obs_client_for_rev(http: &FakeHttp) -> ObsClient<'_> {
+        ObsClient::with_credentials(http, basic_credentials()).unwrap()
+    }
+
+    fn obs_checkout_current() -> (TempDirGuard, WorkingCopy) {
+        let dir = TempDirGuard::new("submit-obs");
+        init_repo(&dir.path);
+        base_commit_with(&dir.path, REV1, SRCMD5_1);
+        let wc = open(&dir.path).unwrap();
+        (dir, wc)
+    }
+
+    #[test]
+    fn refuse_not_submittable_obs_passes_when_current_and_clean() {
+        let (dir, wc) = obs_checkout_current();
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo",
+            &listing_rev1(),
+        );
+        let client = obs_client_for_rev(&http);
+        assert!(refuse_not_submittable_obs(&wc, &client).is_ok());
+        let _ = dir;
+    }
+
+    #[test]
+    fn refuse_not_submittable_obs_refuses_an_outdated_base() {
+        let (dir, wc) = obs_checkout_current();
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo",
+            &listing_rev2(),
+        );
+        let client = obs_client_for_rev(&http);
+        let err = refuse_not_submittable_obs(&wc, &client).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WorkingCopyOutdated);
+        assert!(err.to_string().contains("run update first"));
+        let _ = dir;
+    }
+
+    #[test]
+    fn refuse_not_submittable_obs_refuses_uncommitted_changes() {
+        let (dir, wc) = obs_checkout_current();
+        write_file(&wc.root, "foo.spec", "Name: edited\n");
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo",
+            &listing_rev1(),
+        );
+        let client = obs_client_for_rev(&http);
+        let err = refuse_not_submittable_obs(&wc, &client).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(message.contains("foo.spec"), "message: {message}");
+        assert!(message.contains("commit them first"), "message: {message}");
+        let _ = dir;
+    }
+
+    #[test]
+    fn refuse_not_submittable_obs_refuses_conflicts() {
+        let (dir, wc) = obs_checkout_current();
+        git_ok(&wc.root, &["checkout", "--quiet", "-b", "side"]);
+        write_file(&wc.root, "foo.spec", "Name: side\n");
+        git_ok(&wc.root, &["add", "-A"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "side"]);
+        git_ok(&wc.root, &["checkout", "--quiet", "-"]);
+        write_file(&wc.root, "foo.spec", "Name: main\n");
+        git_ok(&wc.root, &["add", "-A"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "main"]);
+        let _ = git(&wc.root, "merge", &["side"], &[]);
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo",
+            &listing_rev1(),
+        );
+        let client = obs_client_for_rev(&http);
+        let err = refuse_not_submittable_obs(&wc, &client).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FileConflict);
+        assert!(err.to_string().contains("resolve them"));
+        let _ = dir;
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_passes_when_current_and_clean() {
+        let dir = TempDirGuard::new("submit-git");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        assert!(refuse_not_submittable_git(&wc, None, &DryRun::new(true)).is_ok());
+        let _ = origin;
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_remote_ahead() {
+        let dir = TempDirGuard::new("submit-git-ahead");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        let work = dir.path.join("work");
+        write_file(&work, "foo.spec", "Name: server\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "server"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        // The dry-run plan does not fetch: judge against the
+        // last fetch, so fetch here first.
+        git(&wc.root, "fetch", &["origin"], &[]).unwrap();
+        let err = refuse_not_submittable_git(&wc, None, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WorkingCopyOutdated);
+        assert!(err.to_string().contains("run update first"));
+        let _ = origin;
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_uncommitted_changes() {
+        let dir = TempDirGuard::new("submit-git-dirty");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: edited\n");
+        let err = refuse_not_submittable_git(&wc, None, &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("commit them first"));
+        let _ = origin;
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_live_fetches_before_judging() {
+        // Live, the fetch runs first: the remote moved after the
+        // checkout, and no manual fetch happened — the live path
+        // still refuses. The token scopes to the default
+        // instance, which the loopback fetch never sees.
+        let dir = TempDirGuard::new("submit-git-live");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        let work = dir.path.join("work");
+        write_file(&work, "foo.spec", "Name: server\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "server"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let err =
+            refuse_not_submittable_git(&wc, Some(&test_auth()), &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WorkingCopyOutdated);
+        let _ = origin;
+    }
+
+    /// A bare origin at `<dir>/owner/repo`, served over smart
+    /// HTTP, with a `main` branch holding one commit: the
+    /// namespaced shape a real Gitea remote has.
+    fn git_origin_namespaced(dir: &Path) -> GitOrigin {
+        git(dir, "init", &["--bare", "-b", "main", "owner/repo"], &[]).unwrap();
+        let origin = dir.join("owner/repo");
+        git(&origin, "config", &["http.receivepack", "true"], &[]).unwrap();
+        let work = dir.join("work");
+        git(dir, "clone", &["--quiet", "owner/repo", "work"], &[]).unwrap();
+        git(&work, "config", &["--local", "user.name", "geectl"], &[]).unwrap();
+        git(
+            &work,
+            "config",
+            &["--local", "user.email", "geectl@localhost"],
+            &[],
+        )
+        .unwrap();
+        write_file(&work, "foo.spec", "Name: foo\n");
+        git_ok(&work, &["add", "-A"]);
+        git_ok(&work, &["commit", "--quiet", "-m", "initial"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let head = git(&work, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let server = HttpBackendServer::new(dir.to_path_buf());
+        let url = format!("http://127.0.0.1:{}/owner/repo", server.port);
+        GitOrigin {
+            path: origin,
+            url,
+            head,
+            _server: server,
+        }
+    }
+
+    #[test]
+    fn origin_repo_and_current_branch_read_the_checkout() {
+        let dir = TempDirGuard::new("submit-origin");
+        let origin = git_origin_namespaced(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        assert_eq!(
+            origin_repo(&wc, &origin.url).unwrap(),
+            ("owner".to_string(), "repo".to_string())
+        );
+        assert_eq!(current_branch(&wc).unwrap(), "main");
+        let _ = origin;
+    }
+
+    #[test]
+    fn origin_repo_refuses_a_remote_without_owner_and_repo() {
+        // The standard test origin serves at `/origin`: one path
+        // segment, no owner/repo to read. The host matches the
+        // instance, so the refusal is the shape, not the host.
+        let dir = TempDirGuard::new("submit-origin-flat");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        let err = origin_repo(&wc, &origin.url).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("pass --repo"));
+        let _ = origin;
+    }
+
+    #[test]
+    fn origin_repo_refuses_a_foreign_host() {
+        // The origin serves on loopback; the configured instance
+        // is src.opensuse.org. Same `owner/repo` shape, wrong
+        // instance: the PR would file elsewhere, so it fails
+        // closed naming --repo instead.
+        let dir = TempDirGuard::new("submit-origin-foreign");
+        let origin = git_origin_namespaced(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        let err = origin_repo(&wc, "https://src.opensuse.org").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(
+            message.contains("not the configured Gitea instance"),
+            "message: {message}"
+        );
+        assert!(message.contains("pass --repo"), "message: {message}");
+        let _ = origin;
+    }
+
+    #[test]
+    fn origin_repo_refuses_a_missing_origin() {
+        // A git-backed checkout whose remote was removed: no
+        // origin to read, so no default repo. The remedy is the
+        // same --repo flag as every other origin failure.
+        let dir = TempDirGuard::new("submit-origin-missing");
+        init_repo(&dir.path);
+        write_file(&dir.path, "foo.spec", "Name: foo\n");
+        git_ok(&dir.path, &["add", "-A"]);
+        git_ok(&dir.path, &["commit", "--quiet", "-m", "initial"]);
+        let head = git(&dir.path, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_record(
+            &dir.path,
+            "https://api.opensuse.org",
+            "home:alice",
+            "foo",
+            Backend::Git,
+            &head,
+            "",
+        )
+        .unwrap();
+        let wc = open(&dir.path).unwrap();
+        let err = origin_repo(&wc, "https://src.opensuse.org").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("has no origin remote"));
+    }
+
+    #[test]
+    fn origin_repo_strips_credentials_from_its_errors() {
+        // The origin embeds a token and points at a foreign host:
+        // the refusal names the host, never the token.
+        let dir = TempDirGuard::new("submit-origin-secret");
+        let origin = git_origin_namespaced(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        git_ok(
+            &wc.root,
+            &[
+                "config",
+                "--local",
+                "remote.origin.url",
+                "https://user:secret-token@codeberg.org/owner/repo",
+            ],
+        );
+        let err = origin_repo(&wc, "https://src.opensuse.org").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(message.contains("codeberg.org"), "message: {message}");
+        assert!(!message.contains("secret-token"), "message: {message}");
+        let _ = origin;
+    }
+
+    #[test]
+    fn origin_repo_refuses_a_malformed_owner_or_repo() {
+        // The origin host matches the instance, but the repo name
+        // has a space: refused here, before any live fetch, not
+        // inside `pr_create` after a network round-trip.
+        let dir = TempDirGuard::new("submit-origin-badname");
+        let origin = git_origin_namespaced(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        git_ok(
+            &wc.root,
+            &[
+                "config",
+                "--local",
+                "remote.origin.url",
+                "https://src.opensuse.org/owner/re po",
+            ],
+        );
+        let err = origin_repo(&wc, "https://src.opensuse.org").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("invalid Gitea repo name"),
+            "message: {}",
+            err
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn origin_repo_reads_an_ssh_remote() {
+        // An scp-like origin names the same repo as the https://
+        // one: SSH checkouts file without --repo.
+        let dir = TempDirGuard::new("submit-origin-ssh");
+        let origin = git_origin_namespaced(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        git_ok(
+            &wc.root,
+            &[
+                "config",
+                "--local",
+                "remote.origin.url",
+                "git@src.opensuse.org:owner/repo.git",
+            ],
+        );
+        assert_eq!(
+            origin_repo(&wc, "https://src.opensuse.org").unwrap(),
+            ("owner".to_string(), "repo".to_string())
+        );
+        let _ = origin;
+    }
+
+    #[test]
+    fn origin_repo_refuses_a_foreign_ssh_host() {
+        // An scp-like origin on another host: same shape, wrong
+        // instance — the host check applies to SSH remotes too.
+        let dir = TempDirGuard::new("submit-origin-ssh-foreign");
+        let origin = git_origin_namespaced(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        git_ok(
+            &wc.root,
+            &[
+                "config",
+                "--local",
+                "remote.origin.url",
+                "git@codeberg.org:owner/repo.git",
+            ],
+        );
+        let err = origin_repo(&wc, "https://src.opensuse.org").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(
+            message.contains("not the configured Gitea instance"),
+            "message: {message}"
+        );
+        assert!(message.contains("pass --repo"), "message: {message}");
+        let _ = origin;
+    }
+
+    #[test]
+    fn url_host_cases() {
+        assert_eq!(
+            url_host("https://src.opensuse.org/owner/repo"),
+            Some("https://src.opensuse.org".to_string())
+        );
+        assert_eq!(
+            url_host("https://src.opensuse.org:443/owner/repo"),
+            Some("https://src.opensuse.org".to_string())
+        );
+        assert_eq!(
+            url_host("https://SRC.OPENSUSE.ORG/owner/repo"),
+            Some("https://src.opensuse.org".to_string())
+        );
+        assert_eq!(
+            url_host("http://127.0.0.1:3000/owner/repo"),
+            Some("http://127.0.0.1:3000".to_string())
+        );
+        assert_eq!(
+            url_host("http://127.0.0.1:80/owner/repo"),
+            Some("http://127.0.0.1".to_string())
+        );
+        assert_eq!(
+            url_host("https://user@codeberg.org/owner/repo"),
+            Some("https://codeberg.org".to_string())
+        );
+        assert_eq!(
+            url_host("http://[::1]:3000/owner/repo"),
+            Some("http://::1:3000".to_string())
+        );
+        assert_eq!(
+            url_host("https://src.opensuse.org"),
+            Some("https://src.opensuse.org".to_string())
+        );
+        // The scheme is part of the key: an http:// origin against
+        // an https:// instance is a different URL for the fetch.
+        assert_ne!(
+            url_host("http://src.opensuse.org/owner/repo"),
+            url_host("https://src.opensuse.org/owner/repo")
+        );
+        assert_eq!(url_host("/tmp/origin"), None);
+        // SSH remotes key as `ssh://host`: scp-like has no scheme
+        // or port, `ssh://` folds its default port 22.
+        assert_eq!(
+            url_host("git@code.opensuse.org:owner/repo.git"),
+            Some("ssh://code.opensuse.org".to_string())
+        );
+        assert_eq!(
+            url_host("code.opensuse.org:owner/repo"),
+            Some("ssh://code.opensuse.org".to_string())
+        );
+        assert_eq!(
+            url_host("ssh://git@code.opensuse.org/owner/repo"),
+            Some("ssh://code.opensuse.org".to_string())
+        );
+        assert_eq!(
+            url_host("ssh://git@code.opensuse.org:2222/owner/repo"),
+            Some("ssh://code.opensuse.org:2222".to_string())
+        );
+        assert_eq!(
+            url_host("git@[::1]:owner/repo"),
+            Some("ssh://::1".to_string())
+        );
+        assert_eq!(url_host("ftp://example.org/owner/repo"), None);
+        assert_eq!(url_host("https:///owner/repo"), None);
+        // Malformed authorities refuse rather than returning junk:
+        // trailing garbage after a bracketed host, a non-numeric
+        // port, an empty port.
+        assert_eq!(url_host("http://[::1]extra/owner/repo"), None);
+        assert_eq!(url_host("https://host:notaport/owner/repo"), None);
+        assert_eq!(url_host("https://host:/owner/repo"), None);
+    }
+
+    #[test]
+    fn current_branch_refuses_a_detached_head() {
+        let dir = TempDirGuard::new("submit-detached");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let wc = do_git_checkout(&http, &dir);
+        git_ok(&wc.root, &["checkout", "--quiet", "--detach", "HEAD"]);
+        let err = current_branch(&wc).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("pass --head"));
+        let _ = origin;
+    }
+
+    #[test]
+    fn parse_origin_repo_cases() {
+        assert_eq!(
+            parse_origin_repo("https://code.opensuse.org/owner/repo"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_origin_repo("https://code.opensuse.org/owner/repo.git"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(parse_origin_repo("https://code.opensuse.org/repo"), None);
+        assert_eq!(parse_origin_repo("https://code.opensuse.org/a/b/c"), None);
+        assert_eq!(
+            parse_origin_repo("git@code.opensuse.org:owner/repo.git"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_origin_repo("git@code.opensuse.org:owner/repo"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_origin_repo("ssh://git@code.opensuse.org/owner/repo.git"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_origin_repo("ssh://git@code.opensuse.org:2222/owner/repo"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(parse_origin_repo("git@code.opensuse.org:owner"), None);
+        assert_eq!(
+            parse_origin_repo("git@code.opensuse.org:owner/repo/extra"),
+            None
+        );
+        assert_eq!(parse_origin_repo("code.opensuse.org:/abs/path"), None);
+        assert_eq!(parse_origin_repo("/tmp/origin"), None);
+    }
+
+    #[test]
+    fn split_scp_like_cases() {
+        assert_eq!(
+            split_scp_like("git@code.opensuse.org:owner/repo.git"),
+            Some(("code.opensuse.org", "owner/repo.git"))
+        );
+        assert_eq!(
+            split_scp_like("code.opensuse.org:owner/repo"),
+            Some(("code.opensuse.org", "owner/repo"))
+        );
+        assert_eq!(
+            split_scp_like("git@[::1]:owner/repo"),
+            Some(("::1", "owner/repo"))
+        );
+        assert_eq!(split_scp_like("/tmp/origin"), None);
+        assert_eq!(split_scp_like("https://code.opensuse.org/owner/repo"), None);
+        assert_eq!(split_scp_like("code.opensuse.org:/abs/path"), None);
+        assert_eq!(split_scp_like("git@code.opensuse.org:"), None);
+        assert_eq!(split_scp_like(":owner/repo"), None);
+    }
+
+    #[test]
+    fn bare_host_cases() {
+        assert_eq!(bare_host("ssh://code.opensuse.org"), "code.opensuse.org");
+        assert_eq!(
+            bare_host("ssh://code.opensuse.org:2222"),
+            "code.opensuse.org"
+        );
+        assert_eq!(bare_host("https://src.opensuse.org"), "src.opensuse.org");
+        assert_eq!(bare_host("http://127.0.0.1:3000"), "127.0.0.1");
+        assert_eq!(bare_host("http://::1:3000"), "::1");
+        assert_eq!(bare_host("http://::1"), "::1");
+    }
+
+    #[test]
+    fn strip_url_userinfo_cases() {
+        assert_eq!(
+            strip_url_userinfo("https://user:token@codeberg.org/owner/repo"),
+            "https://codeberg.org/owner/repo"
+        );
+        assert_eq!(
+            strip_url_userinfo("https://codeberg.org/owner/repo"),
+            "https://codeberg.org/owner/repo"
+        );
+        // An `@` in a path segment is data, not userinfo.
+        assert_eq!(
+            strip_url_userinfo("https://codeberg.org/owner/repo@2"),
+            "https://codeberg.org/owner/repo@2"
+        );
+        assert_eq!(strip_url_userinfo("/tmp/origin"), "/tmp/origin");
     }
 }
