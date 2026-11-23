@@ -769,7 +769,7 @@ Options:
       --live
           Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
       --write
-          Prepend the draft into the package's `.changes` file instead of printing it
+          Prepend the draft into the package's `.changes` file instead of printing it. The whole file is normalized on write: trailing whitespace stripped, legacy encodings transcoded to UTF-8
   -h, --help
           Print help
 ```
@@ -989,7 +989,10 @@ skipped target-relative rules when no target is given. `changelog
 generate` prints a draft entry — a bare version line plus explicit
 `TODO` slots — never a submission; `--write` prepends it into the
 package's `.changes` file and refuses a draft with unfilled
-`TODO` slots or a needs-detail flag.
+`TODO` slots or a needs-detail flag. Writing normalizes the whole
+file: trailing whitespace is stripped from every line and
+legacy-encoded bytes are transcoded to UTF-8, best-effort; valid
+UTF-8 is never re-decoded.
 
 The `request file` flags above are illustrative — run
 `geectl request file --help` for the exact flag set. The same holds

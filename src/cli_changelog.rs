@@ -17,6 +17,7 @@
 //! rules — the same shape the skill's `changes-lint.sh` prints.
 
 use clap::Subcommand;
+use geectl::changelog::changes::normalize_changes_content;
 use geectl::changelog::generate::{generate, prepend_entry};
 use geectl::changelog::news::{extract_news_section, find_tarball, NewsSection};
 use geectl::changelog::spec::parse_spec;
@@ -76,7 +77,9 @@ pub enum ChangelogCommand {
         #[arg(long)]
         author: Option<String>,
         /// Prepend the draft into the package's `.changes` file
-        /// instead of printing it.
+        /// instead of printing it. The whole file is normalized
+        /// on write: trailing whitespace stripped, legacy
+        /// encodings transcoded to UTF-8.
         #[arg(long)]
         write: bool,
     },
@@ -295,6 +298,24 @@ fn parse_author(author: &str) -> Result<String, GeectlError> {
     Ok(author.trim().to_string())
 }
 
+/// Write a generated entry into a `.changes` file: the preserved
+/// entries are normalized on write, then the entry is prepended.
+fn write_generated_entry(changes_path: &Path, entry: &str) -> Result<(), GeectlError> {
+    refuse_symlink_destination(changes_path)?;
+    // The preserved entries are normalized on write: trailing
+    // whitespace stripped, legacy encodings transcoded to UTF-8.
+    let old_bytes = std::fs::read(changes_path).unwrap_or_default();
+    let old_content = normalize_changes_content(&old_bytes);
+    let new_content = prepend_entry(&old_content, entry)
+        .map_err(|err| GeectlError::new(ErrorKind::InternalError, err))?;
+    std::fs::write(changes_path, &new_content).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("cannot write {}: {err}", changes_path.display()),
+        )
+    })
+}
+
 /// Refuse a `--write` destination that is a symlink: the write
 /// would follow it out of the checkout (`foo.changes` linked at
 /// `~/.bashrc` turns `--write` into an arbitrary overwrite).
@@ -387,16 +408,7 @@ fn run_generate(
         ));
     }
     let changes_path = dir.join(&changes_name);
-    refuse_symlink_destination(&changes_path)?;
-    let old_content = std::fs::read_to_string(&changes_path).unwrap_or_default();
-    let new_content = prepend_entry(&old_content, &generation.entry)
-        .map_err(|err| GeectlError::new(ErrorKind::InternalError, err))?;
-    std::fs::write(&changes_path, &new_content).map_err(|err| {
-        GeectlError::new(
-            ErrorKind::InternalError,
-            format!("cannot write {}: {err}", changes_path.display()),
-        )
-    })?;
+    write_generated_entry(&changes_path, &generation.entry)?;
     payload["written"] = json!(changes_path.display().to_string());
     Ok((payload, generation.entry))
 }
@@ -426,6 +438,29 @@ mod tests {
         // A regular file and a missing file are both fine.
         assert!(refuse_symlink_destination(&target).is_ok());
         assert!(refuse_symlink_destination(&dir.join("missing.changes")).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_generated_entry_normalizes_preserved_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-changelog-write-normalize-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("foo.changes");
+        // A long-lived file: a UTF-8 entry above a Latin-1 entry
+        // with trailing spaces.
+        let mut old = "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tomás Chvátal <tomas.chvatal@gmail.com>\n\n- Update to 2.0   \n\n-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Andr".as_bytes().to_vec();
+        old.extend_from_slice(b"\xe9 Martin <andre@example.com>\n\n- Fix the th\xe9\n");
+        std::fs::write(&path, &old).unwrap();
+        let entry = "-------------------------------------------------------------------\nMon Nov 23 00:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.1\n\n";
+        write_generated_entry(&path, entry).expect("write succeeds");
+        let written = std::fs::read(&path).unwrap();
+        let mut expected = entry.as_bytes().to_vec();
+        expected.extend_from_slice("-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tomás Chvátal <tomas.chvatal@gmail.com>\n\n- Update to 2.0\n\n-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - André Martin <andre@example.com>\n\n- Fix the thé\n".as_bytes());
+        assert_eq!(written, expected);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

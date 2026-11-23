@@ -343,6 +343,151 @@ pub fn separator_line() -> String {
     "-".repeat(SEPARATOR_LEN)
 }
 
+/// Guess the legacy encoding of `.changes` bytes, or `None` when
+/// the input is valid UTF-8. The guess is computed on the whole
+/// file; each line is then decoded on its own, so a wrong guess
+/// cannot corrupt a line that is valid UTF-8.
+fn guess_legacy_encoding(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    if std::str::from_utf8(bytes).is_ok() {
+        return None;
+    }
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+    detector.feed(bytes, true);
+    Some(detector.guess(None, chardetng::Utf8Detection::Allow))
+}
+
+/// Decode `bytes` with one legacy encoding. Bytes the encoding
+/// cannot represent arrive as U+FFFD in the decoded text itself;
+/// they are kept, not re-decoded as UTF-8.
+fn decode_with(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> String {
+    let (decoded, _, _) = encoding.decode(bytes);
+    decoded.into_owned()
+}
+
+/// Decode bytes that mix valid UTF-8 with legacy-encoded bytes.
+/// Fully valid UTF-8 is never re-decoded. Otherwise a line the
+/// guessed encoding decodes cleanly is transcoded whole: that is
+/// the only correct reading when the encoding is multi-byte
+/// (Shift_JIS, EUC-JP, GBK, Big5), since its characters span bytes
+/// that byte-at-a-time slicing would destroy — and a clean decode
+/// is evidence the line is wholly in that encoding. The exception
+/// is a line that itself mixes encodings and happens to decode
+/// cleanly: it is transcoded whole and loses its UTF-8 half.
+/// A single-byte encoding never reports an error, so a clean decode
+/// vouches for nothing there: the whole-line reading is used only
+/// when the line holds no valid multi-byte UTF-8. Any other line keeps its valid
+/// spans verbatim, and each invalid run is transcoded with the
+/// guessed encoding. A wrong-but-decodable guess keeps that
+/// encoding's interpretation of the invalid run only; the valid
+/// spans are never sacrificed to the guess.
+fn decode_mixed(bytes: &[u8], guessed: &'static encoding_rs::Encoding) -> String {
+    // Fully valid UTF-8 is never re-decoded: its bytes can decode
+    // cleanly as half-width katakana in Shift_JIS.
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    let (decoded, _, had_errors) = guessed.decode(bytes);
+    if !had_errors && (guessed_can_error(guessed) || !contains_valid_multibyte_utf8(bytes)) {
+        return decoded.into_owned();
+    }
+    let mut out = String::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                out.push_str(text);
+                break;
+            }
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                // The prefix is valid UTF-8 by construction, so
+                // this is verbatim.
+                out.push_str(&String::from_utf8_lossy(&rest[..valid_up_to]));
+                let skip = match err.error_len() {
+                    Some(len) => len,
+                    None => rest.len() - valid_up_to,
+                };
+                out.push_str(&decode_with(
+                    &rest[valid_up_to..valid_up_to + skip],
+                    guessed,
+                ));
+                rest = &rest[valid_up_to + skip..];
+            }
+        }
+    }
+    out
+}
+
+/// Whether the guessed encoding can report a decode error at
+/// all. A single-byte encoding maps every byte, so a clean decode
+/// vouches for nothing; a multi-byte one cannot represent a lone
+/// lead byte. 0x82 is such a byte in every multi-byte encoding
+/// chardetng guesses (UTF-8, Shift_JIS, EUC-JP, GBK, Big5,
+/// UTF-16) and a defined character in every single-byte one.
+/// (0x80 does not work as the probe: Shift_JIS and GBK decode it
+/// as U+0080.)
+fn guessed_can_error(encoding: &'static encoding_rs::Encoding) -> bool {
+    encoding.decode(b"\x82").2
+}
+
+/// Whether `bytes` hold a valid multi-byte UTF-8 sequence
+/// anywhere. A byte >= 0x80 inside valid UTF-8 belongs to a
+/// multi-byte character; ASCII-only and invalid bytes do not count.
+fn contains_valid_multibyte_utf8(bytes: &[u8]) -> bool {
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(_) => return rest.iter().any(|&byte| byte >= 0x80),
+            Err(err) => {
+                if rest[..err.valid_up_to()].iter().any(|&byte| byte >= 0x80) {
+                    return true;
+                }
+                match err.error_len() {
+                    Some(len) => rest = &rest[err.valid_up_to() + len..],
+                    // A truncated sequence at the end: no complete
+                    // multi-byte character here.
+                    None => return false,
+                }
+            }
+        }
+    }
+}
+
+/// Normalize `.changes` content for writing: transcode to UTF-8 and
+/// strip trailing whitespace on every line, preserved entries
+/// included. Decoding is per line, so a valid UTF-8 line is never
+/// rewritten by the legacy-encoding guess. A trailing line that
+/// trims to empty is dropped when the input has no trailing
+/// newline, and the trailing-newline state of the input is kept.
+pub fn normalize_changes_content(bytes: &[u8]) -> String {
+    let guessed = guess_legacy_encoding(bytes);
+    let trailing_newline = bytes.ends_with(b"\n");
+    let mut segments: Vec<&[u8]> = bytes.split(|&byte| byte == b'\n').collect();
+    if trailing_newline {
+        segments.pop();
+    }
+    let mut lines: Vec<String> = segments
+        .iter()
+        .map(|segment| {
+            let text = match guessed {
+                Some(encoding) => decode_mixed(segment, encoding),
+                None => String::from_utf8_lossy(segment).into_owned(),
+            };
+            text.trim_end().to_string()
+        })
+        .collect();
+    if !trailing_newline {
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+    }
+    let mut out = lines.join("\n");
+    if trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +587,154 @@ mod tests {
         let file = parse_changes("- Update to 2.0\n");
         assert!(!file.starts_with_separator);
         assert!(file.entries.is_empty());
+    }
+
+    #[test]
+    fn normalize_trims_trailing_whitespace_on_preserved_lines() {
+        let bytes = b"-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Jane <jane@example.com>\n\n- Update to 2.0   \n  continuation with a tab\t\n";
+        let out = normalize_changes_content(bytes);
+        assert_eq!(
+            out,
+            "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Jane <jane@example.com>\n\n- Update to 2.0\n  continuation with a tab\n"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_valid_utf8_verbatim() {
+        let text = "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tomáš Chvátal <tomas.chvatal@gmail.com>\n\n- Update to 2.0\n";
+        assert_eq!(normalize_changes_content(text.as_bytes()), text);
+    }
+
+    #[test]
+    fn normalize_transcodes_a_latin1_author_name() {
+        let mut bytes = b"-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tom".to_vec();
+        bytes.extend_from_slice(b"\xe1s Chv\xe1tal <tomas.chvatal@gmail.com>\n\n- Update to 2.0\n");
+        let out = normalize_changes_content(&bytes);
+        assert_eq!(
+            out,
+            "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tomás Chvátal <tomas.chvatal@gmail.com>\n\n- Update to 2.0\n"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_the_trailing_newline_state() {
+        assert_eq!(
+            normalize_changes_content(b"- Update to 2.0"),
+            "- Update to 2.0"
+        );
+        assert_eq!(
+            normalize_changes_content(b"- Update to 2.0\n"),
+            "- Update to 2.0\n"
+        );
+        assert_eq!(normalize_changes_content(b""), "");
+        // A final line that trims to empty is dropped when the
+        // input has no trailing newline; the newline state is kept.
+        assert_eq!(normalize_changes_content(b"a\n   "), "a");
+        assert_eq!(normalize_changes_content(b"a\n\n   "), "a");
+        // CRLF line endings normalize to LF.
+        assert_eq!(normalize_changes_content(b"a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(normalize_changes_content(b"a\r\nb"), "a\nb");
+    }
+
+    #[test]
+    fn decode_with_replaces_undecodable_bytes() {
+        // A lone Shift_JIS lead byte decodes with errors in Shift_JIS;
+        // the decoder marks it U+FFFD.
+        let out = decode_with(b"\x82", encoding_rs::SHIFT_JIS);
+        assert_eq!(out, "\u{FFFD}");
+    }
+
+    #[test]
+    fn normalize_transcodes_and_trims_preserved_entries() {
+        // Two preserved entries: the older one carries trailing
+        // spaces and a Latin-1 author; both come out clean.
+        let mut bytes = b"-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Jane <jane@example.com>\n\n- Update to 2.0\n\n-------------------------------------------------------------------\nTue May 26 10:00:00 UTC 2026 - Tom".to_vec();
+        bytes.extend_from_slice(
+            b"\xe1s Chv\xe1tal <tomas.chvatal@gmail.com>  \n\n- Initial package   \n",
+        );
+        let out = normalize_changes_content(&bytes);
+        assert_eq!(
+            out,
+            "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Jane <jane@example.com>\n\n- Update to 2.0\n\n-------------------------------------------------------------------\nTue May 26 10:00:00 UTC 2026 - Tomás Chvátal <tomas.chvatal@gmail.com>\n\n- Initial package\n"
+        );
+    }
+
+    #[test]
+    fn normalize_mixed_utf8_and_latin1_preserves_the_utf8_half() {
+        // A long-lived file: a newer UTF-8 entry above an older
+        // Latin-1 entry. The UTF-8 half must come out
+        // byte-identical; the Latin-1 byte is transcoded to the
+        // right character.
+        let mut input = "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tomás Chvátal <tomas.chvatal@gmail.com>\n\n- Update to 2.0\n\n-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Andr".as_bytes().to_vec();
+        input.extend_from_slice(b"\xe9 Martin <andre@example.com>\n\n- Fix the th\xe9\n");
+        let normalized = normalize_changes_content(&input);
+        assert_eq!(
+            normalized,
+            "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tomás Chvátal <tomas.chvatal@gmail.com>\n\n- Update to 2.0\n\n-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - André Martin <andre@example.com>\n\n- Fix the thé\n"
+        );
+    }
+
+    #[test]
+    fn normalize_mixed_line_keeps_the_valid_utf8_span() {
+        // Valid UTF-8 and a legacy byte on the same line: the valid
+        // span survives, the bad byte is transcoded.
+        let mut input = b"-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Th".to_vec();
+        input.extend_from_slice("é and Th".as_bytes());
+        input.extend_from_slice(b"\xe9\n");
+        let normalized = normalize_changes_content(&input);
+        assert_eq!(
+            normalized,
+            "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Thé and Thé\n"
+        );
+    }
+
+    #[test]
+    fn normalize_transcodes_a_windows1250_czech_entry() {
+        // 0xF8 is ř in windows-1250 and ø in windows-1252, 0xB9
+        // is š in windows-1250 and ¹ in windows-1252: this pins
+        // which encoding the detector guessed.
+        let input = b"-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Jan Novak <jan@example.com>\n\n- Oprava zpracov\xe1n\xed z\xe1znam\xf9 a p\xf8ehled\xf9\n- Zm\xecna nastaven\xed pro v\xb9echny u\xbeivatele\n";
+        let normalized = normalize_changes_content(input);
+        assert_eq!(
+            normalized,
+            "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Jan Novak <jan@example.com>\n\n- Oprava zpracování záznamů a přehledů\n- Změna nastavení pro všechny uživatele\n"
+        );
+    }
+
+    #[test]
+    fn normalize_transcodes_a_shift_jis_entry() {
+        // A multi-byte legacy encoding: each character is two
+        // bytes in Shift_JIS. The whole line is transcoded, not
+        // sliced apart byte by byte.
+        let mut input = b"-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - ".to_vec();
+        input.extend_from_slice(b"\x8eR\x93c\x91\xbe\x98Y <yamada@example.com>\n\n- \x83e\x83X\x83g\x82\xcc\x8fC\x90\xb3\n");
+        let normalized = normalize_changes_content(&input);
+        assert_eq!(
+            normalized,
+            "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - 山田太郎 <yamada@example.com>\n\n- テストの修正\n"
+        );
+    }
+
+    #[test]
+    fn normalize_mixed_shift_jis_and_utf8_preserves_the_utf8_line() {
+        // A file with Shift_JIS entries and one newer UTF-8 line:
+        // the UTF-8 line stays verbatim even though its bytes
+        // decode cleanly as half-width katakana in Shift_JIS.
+        let mut input = b"-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - ".to_vec();
+        input.extend_from_slice(b"\x8eR\x93c\x91\xbe\x98Y <yamada@example.com>\n\n- \x83e\x83X\x83g\x82\xcc\x8fC\x90\xb3\n- Update the th\xc3\xa9\n");
+        let normalized = normalize_changes_content(&input);
+        assert_eq!(
+            normalized,
+            "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - 山田太郎 <yamada@example.com>\n\n- テストの修正\n- Update the thé\n"
+        );
+    }
+
+    #[test]
+    fn normalize_replaces_a_lone_undecodable_byte() {
+        // A single 0x82 is not valid UTF-8 and not a decodable
+        // legacy sequence the detector can place: the detector
+        // reads it as windows-1252 ‚.
+        let normalized = normalize_changes_content(b"\x82");
+        assert_eq!(normalized, "‚");
     }
 }
