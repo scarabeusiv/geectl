@@ -546,6 +546,18 @@ pub enum RemoteCommand {
         /// The package whose `_link` is deleted.
         package: String,
     },
+    /// Delete a file from a package. A mutation: dry-run is the
+    /// default (only the plan is printed); `--live` performs the
+    /// deletion. The general form of `delete-link`: deleting `_link`
+    /// here issues the same delete as `delete-link`.
+    DeleteFile {
+        /// The project the package lives in.
+        project: String,
+        /// The package the file lives in.
+        package: String,
+        /// The file to delete.
+        file: String,
+    },
     /// Delete a project. A mutation: dry-run is the default (only
     /// the plan is printed); `--live` performs the deletion.
     /// Without `--recursive` a project holding packages is refused.
@@ -697,6 +709,7 @@ pub fn run_remote(
         RemoteCommand::UpdatePackageMetaFromSpec { .. } if !live => Credentials::None,
         RemoteCommand::DeletePackage { .. } if !live => Credentials::None,
         RemoteCommand::DeleteLink { .. } if !live => Credentials::None,
+        RemoteCommand::DeleteFile { .. } if !live => Credentials::None,
         RemoteCommand::DeleteProject { .. } if !live => Credentials::None,
         RemoteCommand::UndeletePackage { .. } if !live => Credentials::None,
         RemoteCommand::UndeleteProject { .. } if !live => Credentials::None,
@@ -1428,6 +1441,26 @@ pub fn run_remote(
                 plan,
             ))
         }
+        RemoteCommand::DeleteFile {
+            project,
+            package,
+            file,
+        } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.delete_file(&project, &package, &file, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(delete_file_result(
+                &project,
+                &package,
+                &file,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
         RemoteCommand::DeleteProject {
             project,
             recursive,
@@ -1895,6 +1928,34 @@ fn delete_link_result(
     mutation_result(
         payload,
         format!("project: {project} package: {package}"),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The `delete-file` result: the payload carries the coordinates;
+/// the text states the deletion, or the dry-run plan.
+fn delete_file_result(
+    project: &str,
+    package: &str,
+    file: &str,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let payload = json!({
+        "project": project,
+        "package": package,
+        "file": file,
+    });
+    let result_line = if dry_run {
+        format!("dry-run: would delete file {file} from package {package} in project {project}")
+    } else {
+        format!("deleted file {file} from package {package} in project {project}")
+    };
+    mutation_result(
+        payload,
+        format!("project: {project} package: {package} file: {file}"),
         result_line,
         dry_run,
         plan,
@@ -4250,6 +4311,48 @@ mod tests {
         assert_eq!(
             text,
             "project: P package: K\ndry_run: false\ndeleted link of package K from project P"
+        );
+    }
+
+    #[test]
+    fn delete_file_parses_project_package_and_file() {
+        let parsed = parse(&["geectl", "remote", "delete-file", "P", "K", "foo.spec"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::DeleteFile {
+                project,
+                package,
+                file
+            } if project == "P" && package == "K" && file == "foo.spec"
+        ));
+    }
+
+    #[test]
+    fn delete_file_result_carries_coordinates_in_both_formats() {
+        let (payload, text) = delete_file_result(
+            "P",
+            "K",
+            "foo.spec",
+            true,
+            Some(vec!["[dry-run] would: delete file P/K/foo.spec".to_string()]),
+        );
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["package"], "K");
+        assert_eq!(payload["file"], "foo.spec");
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: delete file P/K/foo.spec"
+        );
+        assert_eq!(
+            text,
+            "project: P package: K file: foo.spec\ndry_run: true\ndry-run: would delete file foo.spec from package K in project P\n[dry-run] would: delete file P/K/foo.spec"
+        );
+        let (payload, text) = delete_file_result("P", "K", "foo.spec", false, None);
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "project: P package: K file: foo.spec\ndry_run: false\ndeleted file foo.spec from package K in project P"
         );
     }
 

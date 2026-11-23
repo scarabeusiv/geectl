@@ -826,6 +826,10 @@ Batch in brackets:
 - Valid service run, `source_validator`, `precommit`, `remoterun`,
   `run NAME`, `format_spec_file`, `localrun`, `disabledrun` [8].
 - Upload revision-response body (`<revision rev="N"/>` as PUT success) [1].
+- `remote delete-file`: no osc command deletes one server file (a
+  working copy can delete the file and commit it);
+  `test_deletefiles.py` pins working-copy delete semantics only
+  (see "Explicitly NOT adopting").
 
 ## Explicitly NOT adopting (and why)
 

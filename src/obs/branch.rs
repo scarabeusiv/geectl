@@ -2161,7 +2161,7 @@ impl<'a> ObsClient<'a> {
                 // already lost with it, so drop the link. The API's
                 // file delete reports only status-ok, not a revision,
                 // so the detach reports no revision here.
-                self.delete_file(project, package, "_link")?;
+                self.delete_source_file(project, package, "_link")?;
                 Ok(None)
             }
             Err(_) => Err(copy_err),

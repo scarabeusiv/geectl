@@ -7472,6 +7472,41 @@ fn live_delete_link_removes_the_link() {
     );
 }
 
+/// Deleting a file removes it from the package directory on the
+/// live instance.
+#[test]
+fn live_delete_file_removes_the_file() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let filename = "geectl-live-delete.spec";
+    client
+        .upload_file(
+            &source_project,
+            &package,
+            filename,
+            "Name: geectl-live-pkg\nVersion: 1.0\n",
+            &DryRun::new(false),
+        )
+        .expect("upload a spec file to the live instance");
+    let before = read_directory(&base, &source_project, &package);
+    assert!(
+        before.contains(&format!("name=\"{filename}\"")),
+        "the uploaded file must be listed before the delete; directory: {before}"
+    );
+    client
+        .delete_file(&source_project, &package, filename, &DryRun::new(false))
+        .expect("delete the file on the live instance");
+    let after = read_directory(&base, &source_project, &package);
+    assert!(
+        !after.contains(&format!("name=\"{filename}\"")),
+        "the file must be gone after the delete; directory: {after}"
+    );
+}
+
 /// Filing an add-role request files one `add_role` action on the
 /// server, readable back through the request read.
 #[test]

@@ -3581,7 +3581,7 @@ impl<'a> ObsClient<'a> {
     /// the dry-run guard. Success is the `<status code="ok"/>` body:
     /// the API discards the backend's revision and reports only
     /// that the delete landed, so no revision is returned.
-    pub(crate) fn delete_file(
+    pub(crate) fn delete_source_file(
         &self,
         project: &str,
         package: &str,
@@ -3615,6 +3615,57 @@ impl<'a> ObsClient<'a> {
                 format!("unexpected OBS delete response for file {project}/{package}/{filename}"),
             ))
         }
+    }
+
+    /// Delete file `filename` from package `package` in project
+    /// `project` on OBS (`DELETE
+    /// /source/<project>/<package>/<filename>`). Requires credentials;
+    /// without them the call fails loudly before any request. In
+    /// dry-run the delete is recorded in the plan and nothing is
+    /// deleted — the guard runs before the credentials check, like
+    /// `delete_link` — and the result is `()`: the API discards the
+    /// backend's revision and reports only that the delete landed.
+    ///
+    /// An agent deletes a file to drop a stale or superseded file
+    /// from a branch package — a replaced tarball, an obsolete
+    /// `.obscpio` — without deleting the package itself.
+    /// Success is the `<status code="ok"/>` body; any other body is
+    /// a server error, never success.
+    pub fn delete_file(
+        &self,
+        project: &str,
+        package: &str,
+        filename: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !valid_obs_filename(filename) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS file name: {filename:?}"),
+            ));
+        }
+        // The dry-run guard: in dry-run the delete is recorded in the
+        // plan and nothing is deleted — not even the credentials
+        // check runs. Without this, a dry-run caller invoking delete
+        // directly would mutate the server.
+        if !dry_run.allow(&format!("delete file {project}/{package}/{filename}")) {
+            return Ok(());
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot delete a file without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        self.delete_source_file(project, package, filename)
     }
 
     /// Delete the `_link` of package `package` in project `project`
@@ -3653,7 +3704,7 @@ impl<'a> ObsClient<'a> {
                 "cannot delete the link of a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
-        self.delete_file(project, package, "_link")
+        self.delete_source_file(project, package, "_link")
     }
 
     /// Delete project `project` on OBS (`DELETE /source/<project>`).
@@ -4942,6 +4993,83 @@ mod tests {
             )
             .is_err());
         assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_file_deletes_the_file() {
+        let http = FakeHttp::new().with_delete(
+            "https://api.opensuse.org/source/test:factory/pkg/foo.spec?comment=removed%20foo.spec",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .delete_file("test:factory", "pkg", "foo.spec", &DryRun::new(false))
+            .is_ok());
+        let deletes = http.delete_calls();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(
+            deletes[0].0,
+            "https://api.opensuse.org/source/test:factory/pkg/foo.spec?comment=removed%20foo.spec"
+        );
+        assert!(deletes[0].1);
+    }
+
+    #[test]
+    fn delete_file_non_ok_body_is_error_not_success() {
+        let http = FakeHttp::new().with_delete(
+            "https://api.opensuse.org/source/test:factory/pkg/foo.spec?comment=removed%20foo.spec",
+            "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .delete_file("test:factory", "pkg", "foo.spec", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn delete_file_dry_run_records_plan_and_deletes_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .delete_file("test:factory", "pkg", "foo.spec", &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: delete file test:factory/pkg/foo.spec".to_string()]
+        );
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_file_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_delete(
+            "https://api.opensuse.org/source/test:factory/pkg/foo.spec?comment=removed%20foo.spec",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        let err = client
+            .delete_file("test:factory", "pkg", "foo.spec", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_file_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .delete_file("test:factory/pkg", "pkg", "foo.spec", &DryRun::new(false))
+            .is_err());
+        assert!(client
+            .delete_file("test:factory", "pkg", "../foo.spec", &DryRun::new(false))
+            .is_err());
+        assert!(client
+            .delete_file("test:factory", "pkg", "", &DryRun::new(false))
+            .is_err());
+        assert!(http.delete_calls().is_empty());
     }
 
     #[test]
