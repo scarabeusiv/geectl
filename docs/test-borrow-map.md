@@ -526,7 +526,7 @@ rules:
   `behave/features/build.feature` (3 scenarios — local buildroot/chroot;
   out of scope, issue #43).
 
-## Batch 5b — build-log selectors (#206)
+## Batch 5b — build-log selectors
 
 **Direct adoptions: 0. Source pins: 3.**
 
@@ -551,7 +551,7 @@ has no osc equivalent (`parse_buildlogurl` only takes the API form);
 it is geectl's own addition, written from scratch and pinned by
 geectl unit tests.
 
-## Batch 5c — single-review state change (#209)
+## Batch 5c — single-review state change
 
 **Direct adoptions: 0. Source pins: 1.**
 
@@ -900,7 +900,7 @@ semantics, not its tests).**
 - `behave/features/build.feature` (3 scenarios — local buildroot/chroot,
   out of scope for v1 by design): nothing to adopt.
 
-## Gap batch 2, wave 3 — package search by person / by devel project (#175, #176)
+## Gap batch 2, wave 3 — package search by person / by devel project
 
 **Direct adoptions: 0. No osc test covers either form.**
 
@@ -986,7 +986,7 @@ but not in this tree's map) and is not changed by it.
   grammar, the effective-config evaluation and the safe cleanup are
   written from scratch (51 unit tests, 6 CLI tests, 2 live tests).
 
-## Batch 12 — buildinfo bdep projects (#194)
+## Batch 12 — buildinfo bdep projects
 
 **Direct adoptions: 0. Spec reference: `osc/build.py` (the flag
 semantics and the project-set enumeration, not its tests).**
