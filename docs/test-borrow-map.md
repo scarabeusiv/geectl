@@ -902,6 +902,14 @@ semantics, not its tests).**
   match over complete package meta files (`/package[<match>]`).
   With a term, the substring match is combined with the devel
   predicate (parenthesised: XPath `and` binds tighter than `or`).
+## Batch 11 — prjconf
+
+**Direct adoptions: 0. osc has no prjconf tests.**
+
+- A code search for `prjconf` over osc hits only `osc/core.py` and
+  `contrib/osc.complete` (no test file, no test case). The prjconf
+  grammar, the effective-config evaluation and the safe cleanup are
+  written from scratch (51 unit tests, 6 CLI tests, 2 live tests).
 
 ## Batch 12 — buildinfo bdep projects (#194)
 
@@ -940,6 +948,7 @@ semantics and the project-set enumeration, not its tests).**
 | 9 Gitea ops | 2 | 13 | 15 |
 | 10 local-build flag parity | 0 (+spec ref) | 0 | 0 (+spec) |
 | Gap batch 2, wave 3 (#175, #176) | 0 | 0 | 0 |
+| 11 prjconf | 0 | 0 | 0 |
 | 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
 | **Total adopted** | **105** | **120** | **225** |
 

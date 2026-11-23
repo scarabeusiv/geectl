@@ -4455,7 +4455,7 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 34 blocks (top level, 10 groups, 23 leaves) — a
+    // The docs carry 38 blocks (top level, 11 groups, 26 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
     // groups and one leaf each, plus `remote download`, plus the ten
@@ -4466,8 +4466,8 @@ fn docs_help_blocks_match_the_binary() {
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-        34,
-        "docs/cli.md should carry 34 --help blocks (top level, 10 groups, 23 leaves);          update this count when a block is deliberately added or removed"
+            38,
+        "docs/cli.md should carry 38 --help blocks (top level, 11 groups, 26 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();
@@ -5418,4 +5418,88 @@ fn changelog_validate_entries_flag_lints_older_entries() {
         "context: {}",
         value["error"]["context"]
     );
+}
+
+#[test]
+fn prjconf_help_lists_the_subcommands() {
+    let out = geectl().args(["prjconf", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    for name in ["show", "validate", "clean"] {
+        assert!(text.contains(name), "prjconf --help misses {name}");
+    }
+}
+
+#[test]
+fn top_help_lists_the_prjconf_group() {
+    let out = geectl().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("prjconf"),
+        "top --help misses the prjconf group"
+    );
+}
+
+#[test]
+fn prjconf_validate_help_exits_zero() {
+    let out = geectl()
+        .args(["prjconf", "validate", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("geectl prjconf validate"), "{text}");
+    assert!(text.contains("<PROJECT>"), "{text}");
+}
+
+#[test]
+fn prjconf_clean_help_lists_the_path_dependent_opt_in() {
+    let out = geectl()
+        .args(["prjconf", "clean", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("--include-path-dependent"), "{text}");
+}
+
+/// The prjconf reads fail closed without OBS credentials: no
+/// anonymous request is attempted.
+fn prjconf_fails_closed_without_credentials(args: &[&str]) {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir).args(args).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(9),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("without OBS credentials"));
+}
+
+#[test]
+fn prjconf_show_fails_closed_without_credentials() {
+    prjconf_fails_closed_without_credentials(&["prjconf", "show", "openSUSE:Factory"]);
+}
+
+#[test]
+fn prjconf_validate_fails_closed_without_credentials() {
+    prjconf_fails_closed_without_credentials(&["prjconf", "validate", "openSUSE:Factory"]);
+}
+
+#[test]
+fn prjconf_clean_fails_closed_without_credentials() {
+    prjconf_fails_closed_without_credentials(&["prjconf", "clean", "openSUSE:Factory"]);
 }

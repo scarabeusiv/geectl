@@ -87,9 +87,9 @@ use geectl::obs::{
     CopyOptions, CopyProjectOptions, CreatePackageOptions, DeletePackageOptions, DeletePayload,
     DeleteProjectOptions, DeleteTarget, DryRun, FilePatchStatus, HistoryEntry, LinkOptions,
     LinkRevision, MaintenanceBranchOptions, MaintenanceIncidentPayload, NamedRole, ObsClient,
-    PackageDiffStatus, ReleaseOptions, Repository, Request, RequestAction, RequestSearch,
-    RequestState, ResultsQuery, ReviewState, ReviewTarget, RevisionRange, RevisionSpec, RoleGrant,
-    SourceUpdate, SrFiling, SrPayload, StagingReadOptions,
+    PackageDiffStatus, PrjconfFindingKind, ReleaseOptions, Repository, Request, RequestAction,
+    RequestSearch, RequestState, ResultsQuery, ReviewState, ReviewTarget, RevisionRange,
+    RevisionSpec, RoleGrant, SourceUpdate, SrFiling, SrPayload, StagingReadOptions,
 };
 use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus};
 use geectl::working_copy;
@@ -7915,5 +7915,111 @@ fn live_working_copy_pull_pulls_a_linked_package() {
             .expect("status after pull")
             .is_empty(),
         "the working copy is clean after the pull"
+    );
+}
+/// A prjconf with one finding of each parser-level kind the live
+/// flow can prove with no package path: a dead removal, a duplicate
+/// token, and a dead `%if` branch. `package` is the package created
+/// in the project: it resolves (a package in a project on the repo's
+/// path), so no unresolvable-target finding fires for it.
+fn live_prjconf_config(package: &str) -> String {
+    format!(
+        "Prefer: !never-added\nPrefer: {package} {package}\n%if 0 == 1\nPrefer: dead-token\n%endif\n"
+    )
+}
+
+/// Create a scratch project with one `standard` repository (x86_64,
+/// no path) and a package, then put `config` as its prjconf.
+/// Returns the project name.
+///
+/// No path: the API rejects a repository pathing to itself, and the
+/// package still resolves — the validator counts the own project as
+/// on the path, and the effective config is the project's own config.
+fn live_prjconf_project(client: &ObsClient<'_>, base: &str, package: &str, config: &str) -> String {
+    let project = create_source_branch(client, package);
+    set_project_meta(
+        base,
+        &project,
+        &project_meta_with_bare_repo(&project, "standard", "x86_64"),
+    );
+    client
+        .put_project_config(&project, config)
+        .expect("put the prjconf on the live instance");
+    project
+}
+
+/// Read-only validation against a real project config: the live
+/// instance has no Factory, so the scratch project stands in for a
+/// real project's config. The validation itself only reads.
+#[test]
+fn live_prjconf_validate_reads_a_real_config() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let config = live_prjconf_config(&package);
+    let project = live_prjconf_project(&authed, &base, &package, &config);
+    let validation = authed
+        .validate_project_config(&project)
+        .expect("validate the prjconf on the live instance");
+    let kinds: Vec<_> = validation
+        .findings
+        .iter()
+        .map(|finding| finding.kind)
+        .collect();
+    assert!(
+        kinds.contains(&PrjconfFindingKind::DeadRemoval),
+        "expected a dead-removal finding, got: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&PrjconfFindingKind::DuplicateToken),
+        "expected a duplicate-token finding, got: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&PrjconfFindingKind::DeadBranch),
+        "expected a dead-branch finding, got: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&PrjconfFindingKind::UnresolvableTarget),
+        "the created package must resolve, got: {kinds:?}"
+    );
+}
+
+/// A cleanup against a scratch project only: dry-run first (the
+/// config is unchanged), then live (the dead lines are gone, the
+/// live token stays).
+#[test]
+fn live_prjconf_clean_dry_run_then_live() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let config = live_prjconf_config(&package);
+    let project = live_prjconf_project(&authed, &base, &package, &config);
+    let dry = authed
+        .clean_project_config(&project, &DryRun::new(true), true)
+        .expect("dry-run clean on the live instance");
+    assert!(!dry.applied);
+    assert_eq!(dry.removed_lines, vec![1, 3, 4, 5]);
+    assert_eq!(
+        authed
+            .project_config(&project)
+            .expect("read back the prjconf"),
+        config,
+        "a dry-run clean must not change the config"
+    );
+    let live = authed
+        .clean_project_config(&project, &DryRun::new(false), true)
+        .expect("live clean on the live instance");
+    assert!(live.applied);
+    assert_eq!(live.removed_lines, dry.removed_lines);
+    assert_eq!(
+        authed
+            .project_config(&project)
+            .expect("read back the cleaned prjconf"),
+        format!("Prefer: {package}\n"),
+        "the cleaned config keeps only the live token"
     );
 }

@@ -93,6 +93,11 @@ pub enum ErrorKind {
     /// The git binary is not on PATH. The working copy operates
     /// through git; without the binary there is no checkout.
     NoGit,
+    /// The project has more repositories than the operation supports.
+    /// prjconf validate/clean evaluate one buildconfig per
+    /// repository and refuse past the bound instead of spinning
+    /// unboundedly. The context names the count and the bound.
+    TooManyRepositories,
 }
 
 impl ErrorKind {
@@ -129,6 +134,7 @@ impl ErrorKind {
             ErrorKind::FileConflict => "file_conflict",
             ErrorKind::NothingToCommit => "nothing_to_commit",
             ErrorKind::NoGit => "no_git",
+            ErrorKind::TooManyRepositories => "too_many_repositories",
         }
     }
 
@@ -169,6 +175,9 @@ impl ErrorKind {
             ErrorKind::FileConflict => "a merge conflict is left in the working tree",
             ErrorKind::NothingToCommit => "there is nothing to commit",
             ErrorKind::NoGit => "the git binary is not on PATH",
+            ErrorKind::TooManyRepositories => {
+                "the project has more repositories than the operation supports"
+            }
         }
     }
 
@@ -249,6 +258,9 @@ impl ErrorKind {
                 "stage a change with add first, or check status for what is staged"
             }
             ErrorKind::NoGit => "install git and retry",
+            ErrorKind::TooManyRepositories => {
+                "split the repositories across smaller projects"
+            }
         }
     }
 
@@ -288,6 +300,7 @@ impl ErrorKind {
             // is never reused.
             ErrorKind::NothingToCommit => 30,
             ErrorKind::NoGit => 31,
+            ErrorKind::TooManyRepositories => 32,
         }
     }
 
@@ -324,6 +337,7 @@ impl ErrorKind {
             ErrorKind::FileConflict,
             ErrorKind::NothingToCommit,
             ErrorKind::NoGit,
+            ErrorKind::TooManyRepositories,
         ]
     }
 }

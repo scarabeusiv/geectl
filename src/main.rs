@@ -11,6 +11,7 @@ mod cli_build;
 mod cli_changelog;
 mod cli_gitea;
 mod cli_local_build;
+mod cli_prjconf;
 mod cli_pull_request;
 mod cli_remote;
 mod cli_request;
@@ -206,6 +207,11 @@ enum Command {
     Pull,
     /// Stage the resolved files and continue a stopped rebase.
     Resolve,
+    /// Read, validate and clean a project's prjconf.
+    Prjconf {
+        #[command(subcommand)]
+        command: cli_prjconf::PrjconfCommand,
+    },
 }
 
 /// The `config` subcommands.
@@ -281,6 +287,7 @@ fn run(
         }
         Some(Command::Pull) => cli_working_copy::pull(debug, cli.live)?,
         Some(Command::Resolve) => cli_working_copy::resolve(debug, cli.live)?,
+        Some(Command::Prjconf { command }) => cli_prjconf::run_prjconf(command, debug, cli.live)?,
     };
     Ok(match format {
         Format::Json => payload.to_string(),

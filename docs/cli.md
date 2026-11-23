@@ -134,6 +134,7 @@ Commands:
   commit        Commit the staged changes
   pull          Pull a linked package to the link target's latest revision
   resolve       Stage the resolved files and continue a stopped rebase
+  prjconf       Read, validate and clean a project's prjconf
   help          Print this message or the help of the given subcommand(s)
 
 Options:
@@ -927,6 +928,106 @@ Options:
       --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
       --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
   -h, --help             Print help
+```
+
+## `prjconf` — project-config reads and cleanup
+
+```
+Read, validate and clean a project's prjconf
+
+Usage: geectl prjconf [OPTIONS] <COMMAND>
+
+Commands:
+  show      Show a project's raw prjconf
+  validate  Validate a project's prjconf across its repositories. Exits 24 when error findings exist; warnings alone do not fail the run
+  clean     Clean a project's prjconf. A mutation: dry-run is the default. Shares validate's credential gate and 32-repository bound
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Show a project's raw prjconf
+
+Usage: geectl prjconf show [OPTIONS] <PROJECT>
+
+Arguments:
+  <PROJECT>  The project to read the prjconf of
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Validate a project's prjconf across its repositories. Exits 24 when error findings exist; warnings alone do not fail the run.
+
+The config is evaluated once per repository and architecture, with one buildconfig fetch per repository; package and owner lookups are cached across evaluations. At most 32 repositories are evaluated; a project with more is refused. Requires OBS credentials; without them the command fails closed before any request. A `%if` branch is reported dead only when it is dead in every evaluation.
+
+Usage: geectl prjconf validate [OPTIONS] <PROJECT>
+
+Arguments:
+  <PROJECT>
+          The project to validate the prjconf of
+
+Options:
+      --format <FORMAT>
+          Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json`
+          
+          [possible values: json, text]
+
+      --debug
+          Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+
+      --debug-body
+          Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+
+      --live
+          Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+```
+Clean a project's prjconf. A mutation: dry-run is the default. Shares validate's credential gate and 32-repository bound.
+
+A prjconf is inherited: downstream projects concatenate this config with different repository paths, architectures and `_repository` / `_project` values. By default clean removes only lines proven dead independent of the repository path and architecture (same-line duplicate tokens and unconditionally overridden `Substitute` lines); `--include-path-dependent` also removes lines proven dead in every repository and architecture evaluation of this project.
+
+Usage: geectl prjconf clean [OPTIONS] <PROJECT>
+
+Arguments:
+  <PROJECT>
+          The project to clean the prjconf of
+
+Options:
+      --format <FORMAT>
+          Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json`
+          
+          [possible values: json, text]
+
+      --include-path-dependent
+          Also remove lines proven dead only in this project's own repository and architecture evaluations
+
+      --debug
+          Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+
+      --debug-body
+          Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+
+      --live
+          Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## Common tasks

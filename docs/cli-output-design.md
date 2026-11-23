@@ -415,7 +415,7 @@ on that work:
 
 ## Errors (shared)
 
-- The error store (`src/error.rs`, 23 kinds, exit codes 1–23) is
+- The error store (`src/error.rs`, 25 kinds, exit codes 1–25) is
   unchanged. `--debug` adds diagnostics around an error, never a
   new error kind: a failed run with `--debug` ends with the same
   JSON error payload (or the text rendering, decision 3) and the
