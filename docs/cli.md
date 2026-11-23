@@ -4,9 +4,8 @@ The command reference for the geectl binary: one subcommand per
 operation, grouped under a top-level noun (`remote`, `request`,
 `branch`, `build`, `maintenance`, `service`, `gitea`, `pull-request`), plus `version`
 and `config`.
-Every `--help` block below is the real output of the built binary
-(`geectl 0.2.1`); run `geectl --help` or `geectl <group> --help` for
-the same text live.
+Every `--help` block below is the real output of the built binary;
+run `geectl --help` or `geectl <group> --help` for the same text live.
 
 ## Invocation shape
 
