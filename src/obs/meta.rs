@@ -209,6 +209,56 @@ fn remove_role_from_lists(
     Ok((persons, groups))
 }
 
+/// Validate one repository of a project meta write: its name,
+/// architectures, and path entries must be valid OBS names, its
+/// architectures must not repeat (case-insensitively: `x86_64` and
+/// `X86_64` are the same architecture), and its settings must be
+/// valid. The name must not repeat across the list — that check
+/// lives with the caller, which sees the whole list.
+fn validate_repository_entry(repository: &Repository) -> Result<(), GeectlError> {
+    if !valid_obs_name(&repository.name) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OBS repository name: {:?}", repository.name),
+        ));
+    }
+    let mut seen_arches = Vec::new();
+    for arch in &repository.arch {
+        if !valid_obs_name(arch) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS architecture name: {arch:?}"),
+            ));
+        }
+        let lower = arch.to_lowercase();
+        if seen_arches.contains(&lower) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "duplicate architecture {arch:?} in repository {:?}",
+                    repository.name
+                ),
+            ));
+        }
+        seen_arches.push(lower);
+    }
+    for (project, repo) in &repository.paths {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        if !valid_obs_name(repo) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS repository name: {repo:?}"),
+            ));
+        }
+    }
+    validate_repository_settings(repository)
+}
+
 /// Validate the repositories of a project meta write: each name,
 /// architecture, and path entry must be a valid OBS name, each
 /// repository's settings must be valid, and no name may repeat.
@@ -219,47 +269,7 @@ fn remove_role_from_lists(
 fn validate_repositories(repositories: &[Repository]) -> Result<(), GeectlError> {
     let mut names = Vec::new();
     for repository in repositories {
-        if !valid_obs_name(&repository.name) {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!("invalid OBS repository name: {:?}", repository.name),
-            ));
-        }
-        let mut seen_arches = Vec::new();
-        for arch in &repository.arch {
-            if !valid_obs_name(arch) {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    format!("invalid OBS architecture name: {arch:?}"),
-                ));
-            }
-            let lower = arch.to_lowercase();
-            if seen_arches.contains(&lower) {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "duplicate architecture {arch:?} in repository {:?}",
-                        repository.name
-                    ),
-                ));
-            }
-            seen_arches.push(lower);
-        }
-        for (project, repo) in &repository.paths {
-            if !valid_obs_name(project) {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    format!("invalid OBS project name: {project:?}"),
-                ));
-            }
-            if !valid_obs_name(repo) {
-                return Err(GeectlError::new(
-                    ErrorKind::InvalidInput,
-                    format!("invalid OBS repository name: {repo:?}"),
-                ));
-            }
-        }
-        validate_repository_settings(repository)?;
+        validate_repository_entry(repository)?;
         if names.contains(&repository.name) {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
@@ -267,6 +277,49 @@ fn validate_repositories(repositories: &[Repository]) -> Result<(), GeectlError>
             ));
         }
         names.push(repository.name.clone());
+    }
+    Ok(())
+}
+
+/// Validate only the repositories that changed against the fetched
+/// list: a write that touches one repository must not fail on
+/// pre-existing values in another — the server accepted those once,
+/// and the rewrite renders them back unchanged. A name group (every
+/// repository sharing a name) counts as changed when its members
+/// differ from the fetched group; a changed group must carry its
+/// name once, so a write that introduces a duplicate name still
+/// fails. A group the fetched list already carries twice is
+/// pre-existing state, not this write's, and is left alone.
+fn validate_changed_repositories(
+    current: &[Repository],
+    new: &[Repository],
+) -> Result<(), GeectlError> {
+    let mut seen_names: Vec<&str> = Vec::new();
+    for repository in new {
+        if seen_names.contains(&repository.name.as_str()) {
+            continue;
+        }
+        seen_names.push(repository.name.as_str());
+        let new_group: Vec<&Repository> = new
+            .iter()
+            .filter(|entry| entry.name == repository.name)
+            .collect();
+        let current_group: Vec<&Repository> = current
+            .iter()
+            .filter(|entry| entry.name == repository.name)
+            .collect();
+        if new_group == current_group {
+            continue;
+        }
+        if new_group.len() > 1 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("duplicate repository {:?} in project meta", repository.name),
+            ));
+        }
+        for repository in &new_group {
+            validate_repository_entry(repository)?;
+        }
     }
     Ok(())
 }
@@ -675,10 +728,12 @@ impl<'a> ObsClient<'a> {
         }
         if current.repositories != meta.repositories {
             // Validation runs here, on what will actually be
-            // written: a write that leaves the repositories alone
-            // must not fail on pre-existing server values outside
-            // the modeled enumerations.
-            validate_repositories(&meta.repositories)?;
+            // written, and only on the repositories that changed:
+            // a write that leaves a repository alone must not fail
+            // on pre-existing server values outside the modeled
+            // enumerations, and a write that leaves the repositories
+            // alone validates nothing at all.
+            validate_changed_repositories(&current.repositories, &meta.repositories)?;
             refuse_unmodeled_repositories(body)?;
             doc.remove_elements("repository");
             for repository in &meta.repositories {
@@ -1271,6 +1326,8 @@ mod tests {
 
     const PROJECT_META_WITH_UNKNOWN_ATTRIBUTE: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" foo=\"bar\"><arch>x86_64</arch></repository></project>";
 
+    const PROJECT_META_WITH_TWO_REPOSITORIES: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository><repository name=\"openSUSE_Leap_15.6\" rebuild=\"bogus\"><arch>x86_64</arch><path project=\"openSUSE:Leap:15.6\" repository=\"standard\"/></repository></project>";
+
     #[test]
     fn set_project_meta_replaces_a_repository_that_carries_all_settings() {
         let http = FakeHttp::new()
@@ -1677,6 +1734,73 @@ mod tests {
             .is_ok());
         assert_eq!(http.put_calls().len(), 1);
         assert!(http.put_calls()[0].1.contains("rebuild=\"bogus\""));
+    }
+
+    #[test]
+    fn set_project_meta_changing_one_repository_ignores_an_invalid_pre_existing_repository() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PROJECT_META_WITH_TWO_REPOSITORIES,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_TWO_REPOSITORIES).unwrap();
+        meta.repositories[0].arch.push("aarch64".to_string());
+        assert!(client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert!(puts[0].1.contains("<arch>aarch64</arch>"));
+        assert!(puts[0].1.contains("rebuild=\"bogus\""));
+    }
+
+    #[test]
+    fn set_project_meta_changing_one_repository_ignores_a_pre_existing_duplicate_name() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository><repository name=\"dup\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository><repository name=\"dup\"><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(META).unwrap();
+        meta.repositories[0].arch.push("aarch64".to_string());
+        assert!(client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1.matches("<repository name=\"dup\">").count(),
+            2,
+            "the pre-existing duplicate renders back unchanged: {}",
+            puts[0].1
+        );
+    }
+
+    #[test]
+    fn set_project_meta_rejects_a_write_that_introduces_a_duplicate_repository_name() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            PROJECT_META_WITH_TWO_REPOSITORIES,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_TWO_REPOSITORIES).unwrap();
+        meta.repositories[0].name = "openSUSE_Leap_15.6".to_string();
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.put_calls().is_empty());
     }
 
     #[test]
