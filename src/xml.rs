@@ -980,6 +980,77 @@ pub(crate) fn xml_child_elements<'a>(
     Ok(out)
 }
 
+/// The bodies of the `<!-- ... -->` comments that are direct
+/// children of the scanned text, in file order: the text between
+/// `<!--` and `-->`, verbatim. A comment inside a child element
+/// belongs to that element, not to the enclosing one, so the walk
+/// skips whole child elements (open tag to matching close,
+/// self-closing tags included) and collects only the comments
+/// between them. A comment that never terminates, or an element
+/// that never closes, ends the scan: the callers that need a
+/// well-formed document fail it themselves before collecting.
+pub(crate) fn xml_direct_comments(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset < text.len() {
+        let rest = &text[offset..];
+        let Some(lt) = rest.find('<') else {
+            break;
+        };
+        let tag_start = offset + lt;
+        let after_lt = &rest[lt + 1..];
+        if after_lt.starts_with("!--") {
+            // Direct-child comment: collect it, skip to `-->`.
+            let Some(end) = after_lt.find("-->") else {
+                break;
+            };
+            out.push(&after_lt["!--".len()..end]);
+            offset = tag_start + 1 + end + 3;
+            continue;
+        }
+        if after_lt.starts_with('/') {
+            // A closing tag at this level is stray: the caller
+            // fails it before collecting, so the scan ends here.
+            break;
+        }
+        if after_lt.starts_with('?') {
+            let Some(end) = after_lt.find("?>") else {
+                break;
+            };
+            offset = tag_start + 1 + end + 2;
+            continue;
+        }
+        if after_lt.starts_with('!') {
+            let Some(end) = after_lt.find('>') else {
+                break;
+            };
+            offset = tag_start + 1 + end + 1;
+            continue;
+        }
+        let name_end = after_lt
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(after_lt.len());
+        let tag_name = &after_lt[..name_end];
+        if tag_name.is_empty() {
+            break;
+        }
+        let Some(gt) = find_tag_end(after_lt) else {
+            break;
+        };
+        let tag_end = tag_start + 1 + gt + 1;
+        if after_lt[..gt].trim_end().ends_with('/') {
+            // Self-closing: no content to skip.
+            offset = tag_end;
+            continue;
+        }
+        let Some(elem_end) = xml_element_end(text, tag_start, tag_name) else {
+            break;
+        };
+        offset = elem_end;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1489,6 +1560,36 @@ mod tests {
         let inner = "<!-- a > b --><package name=\"a\"/>";
         let found = xml_child_elements(inner, "package").unwrap();
         assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn xml_direct_comments_collects_only_direct_children() {
+        // Direct comments in file order, with `>` inside one.
+        assert_eq!(
+            xml_direct_comments("a<!-- one --><b/><!-- two -->c"),
+            vec![" one ", " two "]
+        );
+        assert!(xml_direct_comments("no comments here").is_empty());
+        // A comment inside a child element belongs to that
+        // element, not to the enclosing text.
+        assert_eq!(
+            xml_direct_comments("<param>x<!-- inner --></param><!-- outer -->"),
+            vec![" outer "]
+        );
+        assert!(xml_direct_comments("<extra><!-- deep --></extra>").is_empty());
+        // A `<!--` inside a quoted attribute value is not a
+        // comment opener: the element is skipped whole, and the
+        // real comment after it is still collected.
+        assert_eq!(
+            xml_direct_comments("<param name=\"<!--\">x</param><!-- real -->"),
+            vec![" real "]
+        );
+        // An unterminated comment ends the scan: the tail is not a
+        // body, and the complete comment before it still is.
+        assert_eq!(
+            xml_direct_comments("<!-- done --><!-- never closed"),
+            vec![" done "]
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::xml::find_tag_end;
 use crate::xml::xml_child_elements;
+use crate::xml::xml_direct_comments;
 use crate::xml::xml_unescape;
 
 /// A service definition from the stored `_service` file: one
@@ -36,6 +37,13 @@ pub struct ServiceDef {
     pub mode: String,
     /// The `<param>` children, in file order.
     pub params: Vec<ServiceParam>,
+    /// The HTML comments that are direct children of the
+    /// `<service>` element, each converted to plain text, in file
+    /// order. A comment whose
+    /// text is empty after conversion is not listed: the field
+    /// carries what a reader of the stored file would see, not
+    /// the markup.
+    pub comments: Vec<String>,
 }
 
 /// One `<param>` of a service definition: its name and value,
@@ -80,6 +88,31 @@ fn skip_document_misc(mut text: &str) -> Option<&str> {
     }
 }
 
+/// Convert an HTML fragment to plain text: a comment in a stored
+/// `_service` file is markup (a commented-out element, a prose
+/// note), and the typed view carries its text, not the tags.
+/// The render is unwrapped: the width is the stored payload, not
+/// terminal output, so a long comment stays one line and a long
+/// word is never split. Link footnotes are off
+/// (`plain_no_decorate`): a comment naming a link keeps the link
+/// text, not a footnote block. The output is otherwise
+/// `html2text`'s plain text as rendered: links keep their text in
+/// brackets, headings keep their `#`, lists keep their `*`. That
+/// rendering is the defined conversion. HTML source whitespace
+/// collapses: a comment's own line breaks do not survive, only
+/// block structure produces lines. The result is trimmed. A
+/// conversion failure yields no text and the comment is not
+/// listed: the comment is annotation, not structure, so a failed
+/// render never fails the parse. (The read itself cannot fail:
+/// the input is an in-memory slice.)
+fn html_to_plaintext(html: &str) -> String {
+    html2text::config::plain_no_decorate()
+        .string_from_read(html.as_bytes(), usize::MAX)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 /// Parse a stored `_service` file into typed service definitions.
 ///
 /// The parse follows the server's rule (`osc`'s
@@ -90,7 +123,11 @@ fn skip_document_misc(mut text: &str) -> Option<&str> {
 /// it names the project the definitions are inherited from. XML
 /// comments, a prolog, and a DOCTYPE (without an internal subset,
 /// and without `>` in a quoted literal) around the root, and comments
-/// and stray text inside it, are ignored.
+/// and stray text outside a service, are ignored. A comment that
+/// is a direct child of a service is converted to plain text
+/// and listed on the definition: the stored file's commented-out
+/// content is part of what a reader sees, so the typed view
+/// carries its text, not the markup.
 ///
 /// A malformed file is a fail-closed [`ErrorKind::ServerError`],
 /// never a partial list: a caller that acted on half a `_service`
@@ -179,6 +216,7 @@ pub(crate) fn parse_services(body: &str) -> Result<Vec<ServiceDef>, GeectlError>
             .map(|value| xml_unescape(&value))
             .unwrap_or_default();
         let mut params = Vec::new();
+        let mut comments = Vec::new();
         if !open_tag.trim_end().ends_with('/') {
             let Some(inner) = element[end + 1..].strip_suffix("</service>") else {
                 return Err(malformed());
@@ -214,8 +252,22 @@ pub(crate) fn parse_services(body: &str) -> Result<Vec<ServiceDef>, GeectlError>
                     value,
                 });
             }
+            // The direct-child comments of this service, in file
+            // order, as plain text: a commented-out parameter is
+            // still part of the stored definition a reader sees.
+            for comment in xml_direct_comments(inner) {
+                let text = html_to_plaintext(comment);
+                if !text.is_empty() {
+                    comments.push(text);
+                }
+            }
         }
-        services.push(ServiceDef { name, mode, params });
+        services.push(ServiceDef {
+            name,
+            mode,
+            params,
+            comments,
+        });
     }
     Ok(services)
 }
@@ -414,7 +466,8 @@ mod tests {
 "#;
 
     /// A comment inside a service element, carrying a commented-out
-    /// parameter: ignored, valid parse. Mirrors the spec-cleaner
+    /// parameter: its text is listed on the service, valid parse.
+    /// Mirrors the spec-cleaner
     /// `_service` file, where `obs_scm` carries
     /// `<!-- <param name="changesgenerate">enable</param> -->`.
     const SV_COMMENT_IN_SERVICE: &str = r#"<services>
@@ -560,9 +613,13 @@ mod tests {
     }
 
     #[test]
-    fn comment_inside_a_service_is_ignored() {
+    fn comment_inside_a_service_becomes_plaintext() {
         // The commented-out parameter is not a parameter: the
-        // service parses with the three live parameters only.
+        // service parses with the three live parameters only, and
+        // the comment's text is listed on the service.
+        // `html2text` renders the commented-out element as its
+        // text content: the element name and attributes are markup,
+        // not text.
         let services = parse_services(SV_COMMENT_IN_SERVICE).unwrap();
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].name, "obs_scm");
@@ -584,13 +641,15 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(services[0].comments, vec!["enable".to_string()]);
     }
 
     #[test]
     fn comment_only_content_and_comment_before_the_root_parse() {
         // A file carrying only comments besides the services, a
-        // service carrying only a comment, and a comment before the
-        // root element: all parse normally.
+        // service carrying only a comment (its text is listed on
+        // the service), and a comment before the root element
+        // (listed nowhere): all parse normally.
         let services = parse_services("<services><!-- only a comment --></services>").unwrap();
         assert!(services.is_empty());
         let services = parse_services(
@@ -600,12 +659,77 @@ mod tests {
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].name, "download_url");
         assert!(services[0].params.is_empty());
+        assert_eq!(services[0].comments, vec!["only a comment".to_string()]);
         let services = parse_services(
             "<!-- <service name=\"download_url\" mode=\"manual\"/> --><services><service name=\"download_url\" mode=\"manual\"/></services>",
         )
         .unwrap();
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].name, "download_url");
+    }
+
+    #[test]
+    fn comment_html_converts_to_plaintext() {
+        // Prose markup becomes its text; an empty comment and a
+        // comment carrying only markup with no text are not listed;
+        // several comments keep file order.
+        let services = parse_services(
+            r#"<services><service name="download_url" mode="manual"><!-- <p>Generated by foo</p> --><!----><!-- <br/> --><!-- second note --></service></services>"#,
+        )
+        .unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(
+            services[0].comments,
+            vec!["Generated by foo".to_string(), "second note".to_string()]
+        );
+    }
+
+    #[test]
+    fn long_comments_are_stored_unwrapped() {
+        // The stored payload is not terminal output: a comment
+        // longer than eighty columns keeps its line, and a long
+        // unbroken word is never split.
+        let long_word = "w".repeat(100);
+        let body = format!(
+            "<services><service name=\"download_url\" mode=\"manual\"><!-- This is a very long prose comment that keeps going well past eighty columns so that any wrapping at terminal width becomes visible in the stored text --><!-- {long_word} --></service></services>"
+        );
+        let services = parse_services(&body).unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].comments.len(), 2);
+        assert!(!services[0].comments[0].contains('\n'));
+        assert!(services[0].comments[0].starts_with("This is a very long prose comment"));
+        assert_eq!(services[0].comments[1], long_word);
+    }
+
+    #[test]
+    fn comment_links_keep_text_without_footnotes() {
+        // A link in a comment keeps its text, not a footnote
+        // block appended to the stored comment.
+        let services = parse_services(
+            r#"<services><service name="download_url" mode="manual"><!-- see <a href="https://example.com/x">docs</a> for details --></service></services>"#,
+        )
+        .unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(
+            services[0].comments,
+            vec!["see [docs] for details".to_string()]
+        );
+    }
+
+    #[test]
+    fn comments_nested_in_children_are_not_service_comments() {
+        // A comment inside a parameter, or inside another child
+        // element, belongs to that element: only direct-child
+        // comments are listed on the service.
+        let services = parse_services(
+            r#"<services><service name="download_url" mode="manual"><param name="x">v<!-- inner note --></param><extra><!-- deep note --></extra><!-- direct note --></service></services>"#,
+        )
+        .unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].params.len(), 1);
+        assert_eq!(services[0].params[0].name, "x");
+        assert_eq!(services[0].params[0].value, "v");
+        assert_eq!(services[0].comments, vec!["direct note".to_string()]);
     }
 
     #[test]

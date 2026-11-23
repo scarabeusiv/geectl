@@ -12526,31 +12526,37 @@ exit 0
                     name: "plain".to_string(),
                     mode: String::new(),
                     params: vec![],
+                    comments: vec![],
                 },
                 ServiceDef {
                     name: "manualsvc".to_string(),
                     mode: "manual".to_string(),
                     params: vec![],
+                    comments: vec![],
                 },
                 ServiceDef {
                     name: "disabledsvc".to_string(),
                     mode: "disabled".to_string(),
                     params: vec![],
+                    comments: vec![],
                 },
                 ServiceDef {
                     name: "trylocalsvc".to_string(),
                     mode: "trylocal".to_string(),
                     params: vec![],
+                    comments: vec![],
                 },
                 ServiceDef {
                     name: "buildtimesvc".to_string(),
                     mode: "buildtime".to_string(),
                     params: vec![],
+                    comments: vec![],
                 },
                 ServiceDef {
                     name: "serversvc".to_string(),
                     mode: "serveronly".to_string(),
                     params: vec![],
+                    comments: vec![],
                 },
             ]
         }
