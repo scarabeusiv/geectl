@@ -32,6 +32,9 @@ sha2 = "0.10"
 toml = "0.9"
 ureq = { version = "3", features = ["rustls", "socks-proxy"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints.rust]
 unsafe_code = "forbid"
 

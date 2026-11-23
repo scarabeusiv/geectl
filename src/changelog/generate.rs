@@ -10,7 +10,9 @@
 //! line. `generate` never files anything; `--write` prepends the
 //! draft into the `.changes` file, and refuses an incomplete draft.
 
-use crate::changelog::changes::{civil_from_days, separator_line, weekday_name, Header};
+use crate::changelog::changes::{
+    civil_from_days, normalize_changes_content_checked, separator_line, weekday_name, Header,
+};
 use crate::changelog::news::NewsSection;
 use crate::changelog::spec::parse_spec;
 use crate::changelog::validate::{is_mechanical_bullet, PackageSnapshot};
@@ -284,10 +286,36 @@ fn is_patch_file(name: &str) -> bool {
     name.ends_with(".patch") || name.ends_with(".diff") || name.ends_with(".dif")
 }
 
+/// The result of prepending an entry: the new file content, the
+/// encoding the old content was decoded from, when one was guessed
+/// or detected (`None` for valid UTF-8), and whether that guess was
+/// a single-byte encoding (unverifiable — the write path warns
+/// about it instead of refusing).
+pub struct PrependedEntry {
+    pub content: String,
+    pub source_encoding: Option<&'static str>,
+    pub guessed_single_byte: bool,
+}
+
 /// Prepend an entry to a `.changes` file's content, verifying the
-/// insertion: the old content survives as a byte-suffix and the
-/// separator count rises by exactly one.
-pub fn prepend_entry(old_content: &str, entry: &str) -> Result<String, String> {
+/// insertion: the old content survives as its normalized form and
+/// the separator count rises by exactly one. Normalization is the
+/// sanctioned rewrite (V11): trailing whitespace stripped, CRLF→LF,
+/// legacy encodings transcoded to UTF-8 — so the suffix check runs
+/// on the normalized text, not the raw bytes, and bytes no known
+/// encoding decodes refuse the write instead of being kept as
+/// U+FFFD.
+pub fn prepend_entry(old_bytes: &[u8], entry: &str) -> Result<PrependedEntry, String> {
+    let report = normalize_changes_content_checked(old_bytes);
+    if report.had_undecodable_bytes {
+        return Err(
+            "refusing to write: the existing .changes file has bytes no known encoding decodes — fix the encoding by hand first"
+                .to_string(),
+        );
+    }
+    let old_content = report.text;
+    let source_encoding = report.source_encoding;
+    let guessed_single_byte = report.guessed_single_byte;
     let new_content = format!("{entry}{old_content}");
     let old_seps = old_content
         .lines()
@@ -303,13 +331,17 @@ pub fn prepend_entry(old_content: &str, entry: &str) -> Result<String, String> {
             trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-')
         })
         .count();
-    if !new_content.ends_with(old_content) || new_seps != old_seps + 1 {
+    if !new_content.ends_with(&old_content) || new_seps != old_seps + 1 {
         return Err(
-            "prepend verification failed: the old entries did not survive as a byte-suffix"
+            "prepend verification failed: the old entries did not survive as a normalized suffix"
                 .to_string(),
         );
     }
-    Ok(new_content)
+    Ok(PrependedEntry {
+        content: new_content,
+        source_encoding,
+        guessed_single_byte,
+    })
 }
 
 #[cfg(test)]
@@ -430,9 +462,10 @@ mod tests {
             format!("{sep}\nWed May 27 16:31:48 UTC 2026 - Jane <jane@example.com>\n\n- Old\n\n");
         let entry =
             format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
-        let new = prepend_entry(&old, &entry).expect("prepend succeeds");
-        assert!(new.starts_with(&entry));
-        assert!(new.ends_with(&old));
+        let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
+        assert!(new.content.starts_with(&entry));
+        assert!(new.content.ends_with(&old));
+        assert_eq!(new.source_encoding, None);
     }
 
     #[test]

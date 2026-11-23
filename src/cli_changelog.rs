@@ -17,7 +17,6 @@
 //! rules — the same shape the skill's `changes-lint.sh` prints.
 
 use clap::Subcommand;
-use geectl::changelog::changes::normalize_changes_content;
 use geectl::changelog::generate::{generate, prepend_entry};
 use geectl::changelog::news::{extract_news_section, find_tarball, NewsSection};
 use geectl::changelog::spec::parse_spec;
@@ -27,6 +26,7 @@ use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::ObsClient;
 use serde_json::{json, Value};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The `changelog` command group: `.changes` validation and generation.
@@ -78,8 +78,10 @@ pub enum ChangelogCommand {
         author: Option<String>,
         /// Prepend the draft into the package's `.changes` file
         /// instead of printing it. The whole file is normalized
-        /// on write: trailing whitespace stripped, legacy
-        /// encodings transcoded to UTF-8.
+        /// on write: trailing ASCII whitespace stripped, CRLF→LF,
+        /// legacy encodings transcoded to UTF-8, a BOM stripped.
+        /// The write is atomic and refuses a symlink destination,
+        /// an unreadable file, or bytes no known encoding decodes.
         #[arg(long)]
         write: bool,
     },
@@ -300,21 +302,125 @@ fn parse_author(author: &str) -> Result<String, GeectlError> {
 
 /// Write a generated entry into a `.changes` file: the preserved
 /// entries are normalized on write, then the entry is prepended.
-fn write_generated_entry(changes_path: &Path, entry: &str) -> Result<(), GeectlError> {
+/// The write is atomic (a temp file in the same directory, then a
+/// rename), so a crash or a full disk never leaves a truncated
+/// `.changes` behind.
+/// Returns the single-byte-guess warning, when the old content
+/// was transcoded from a guessed single-byte encoding: the caller
+/// prints it visibly (stderr), so a wrong guess is noticed instead
+/// of silently rewriting the file.
+fn write_generated_entry(
+    changes_path: &Path,
+    entry: &str,
+    debug: &Debug,
+) -> Result<Option<String>, GeectlError> {
     refuse_symlink_destination(changes_path)?;
-    // The preserved entries are normalized on write: trailing
-    // whitespace stripped, legacy encodings transcoded to UTF-8.
-    let old_bytes = std::fs::read(changes_path).unwrap_or_default();
-    let old_content = normalize_changes_content(&old_bytes);
-    let new_content = prepend_entry(&old_content, entry)
-        .map_err(|err| GeectlError::new(ErrorKind::InternalError, err))?;
-    std::fs::write(changes_path, &new_content).map_err(|err| {
+    // Only a missing file reads as empty: any other read error
+    // (permission denied, EISDIR, I/O) propagates instead of
+    // silently dropping the preserved entries.
+    let old_bytes = match std::fs::read(changes_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            return Err(GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot read {}: {err}", changes_path.display()),
+            ));
+        }
+    };
+    let prepended = prepend_entry(&old_bytes, entry).map_err(|err| {
         GeectlError::new(
             ErrorKind::InternalError,
             format!("cannot write {}: {err}", changes_path.display()),
         )
-    })
+    })?;
+    // Name the guessed encoding on the debug channel, so a wrong
+    // guess is visible instead of silent: the normalized text is
+    // only as good as the guess.
+    if let Some(encoding) = prepended.source_encoding {
+        debug.emit(&format!(
+            "changelog: normalized {} from {encoding} to UTF-8",
+            changes_path.display()
+        ));
+    }
+    // A single-byte guess can never be wrong loudly: the write
+    // keeps the transcode, but the guess is warned about visibly
+    // (not only on the debug channel), naming the encoding.
+    let warning = if prepended.guessed_single_byte {
+        prepended.source_encoding.map(|encoding| {
+            format!(
+                "warning: {} was transcoded from {encoding} to UTF-8; a single-byte guess cannot be verified, so check the preserved entries",
+                changes_path.display()
+            )
+        })
+    } else {
+        None
+    };
+    write_file_atomically(changes_path, prepended.content.as_bytes())?;
+    Ok(warning)
 }
+
+/// Write `content` to `path` atomically: a temp file in the same
+/// directory, then a rename over the destination. The rename
+/// replaces the destination itself — even if the path became a
+/// symlink after the refusal check, the link is replaced, never
+/// followed. The temp file is hidden (dot-prefixed) so a leftover
+/// is never picked up as a package file.
+fn write_file_atomically(path: &Path, content: &[u8]) -> Result<(), GeectlError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    // Pid + counter, so two writes in one process never share a name.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp.{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let write = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp_path)?;
+        // Keep the destination's permissions: a fresh temp file is
+        // 0666 & ~umask, which would silently widen a 0600
+        // `.changes` to 0644 on rename.
+        if let Ok(metadata) = std::fs::metadata(path) {
+            std::fs::set_permissions(&temp_path, metadata.permissions())?;
+        }
+        file.write_all(content)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(GeectlError::new(
+            ErrorKind::InternalError,
+            format!("cannot write {}: {err}", path.display()),
+        ));
+    }
+    if let Err(err) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(GeectlError::new(
+            ErrorKind::InternalError,
+            format!("cannot write {}: {err}", path.display()),
+        ));
+    }
+    // Sync the directory so the rename itself is durable, not just
+    // the file's contents.
+    sync_dir_after_rename(parent);
+    Ok(())
+}
+
+/// Sync `dir` after a rename so the rename itself is durable.
+/// Unix-only: opening a directory is not portable. Best-effort:
+/// the rename already happened, so a failure here must not report
+/// the write as failed.
+#[cfg(unix)]
+fn sync_dir_after_rename(dir: &Path) {
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir_after_rename(_dir: &Path) {}
 
 /// Refuse a `--write` destination that is a symlink: the write
 /// would follow it out of the checkout (`foo.changes` linked at
@@ -408,7 +514,9 @@ fn run_generate(
         ));
     }
     let changes_path = dir.join(&changes_name);
-    write_generated_entry(&changes_path, &generation.entry)?;
+    if let Some(warning) = write_generated_entry(&changes_path, &generation.entry, debug)? {
+        eprintln!("{warning}");
+    }
     payload["written"] = json!(changes_path.display().to_string());
     Ok((payload, generation.entry))
 }
@@ -419,48 +527,128 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
+    /// One generated entry, shared by the write tests.
+    const ENTRY: &str = "-------------------------------------------------------------------\nMon Nov 23 00:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.1\n\n";
+
     #[test]
     #[cfg(unix)]
     fn write_destination_refuses_a_symlink() {
-        let dir = std::env::temp_dir().join(format!(
-            "geectl-changelog-write-symlink-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("target.changes");
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.changes");
         std::fs::write(&target, "original\n").unwrap();
-        let link = dir.join("foo.changes");
+        let link = dir.path().join("foo.changes");
         symlink(&target, &link).unwrap();
         let err = refuse_symlink_destination(&link).expect_err("symlink is refused");
         assert_eq!(err.kind, ErrorKind::ValidationFailed);
         assert!(err.context.contains("is a symlink"));
         // A regular file and a missing file are both fine.
         assert!(refuse_symlink_destination(&target).is_ok());
-        assert!(refuse_symlink_destination(&dir.join("missing.changes")).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(refuse_symlink_destination(&dir.path().join("missing.changes")).is_ok());
     }
 
     #[test]
     fn write_generated_entry_normalizes_preserved_entries() {
-        let dir = std::env::temp_dir().join(format!(
-            "geectl-changelog-write-normalize-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("foo.changes");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foo.changes");
         // A long-lived file: a UTF-8 entry above a Latin-1 entry
         // with trailing spaces.
         let mut old = "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tomás Chvátal <tomas.chvatal@gmail.com>\n\n- Update to 2.0   \n\n-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Andr".as_bytes().to_vec();
         old.extend_from_slice(b"\xe9 Martin <andre@example.com>\n\n- Fix the th\xe9\n");
         std::fs::write(&path, &old).unwrap();
         let entry = "-------------------------------------------------------------------\nMon Nov 23 00:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.1\n\n";
-        write_generated_entry(&path, entry).expect("write succeeds");
+        let warning =
+            write_generated_entry(&path, entry, &Debug::disabled()).expect("write succeeds");
+        assert!(warning.is_some_and(|warning| warning.contains("windows-1252")));
         let written = std::fs::read(&path).unwrap();
         let mut expected = entry.as_bytes().to_vec();
         expected.extend_from_slice("-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tomás Chvátal <tomas.chvatal@gmail.com>\n\n- Update to 2.0\n\n-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - André Martin <andre@example.com>\n\n- Fix the thé\n".as_bytes());
         assert_eq!(written, expected);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_generated_entry_refuses_a_symlink_and_leaves_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.changes");
+        std::fs::write(&target, "original\n").unwrap();
+        let link = dir.path().join("foo.changes");
+        symlink(&target, &link).unwrap();
+        let err = write_generated_entry(&link, ENTRY, &Debug::disabled())
+            .expect_err("symlink is refused");
+        assert_eq!(err.kind, ErrorKind::ValidationFailed);
+        assert!(err.context.contains("is a symlink"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"original\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_generated_entry_propagates_an_unreadable_file() {
+        // Runs as the invoking user; root bypasses permissions.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foo.changes");
+        std::fs::write(&path, "original\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = write_generated_entry(&path, ENTRY, &Debug::disabled())
+            .expect_err("unreadable file errors");
+        assert!(err.context.contains("cannot read"));
+        // Restore permissions so cleanup can remove the file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"original\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_generated_entry_keeps_the_destination_permissions() {
+        // A 0600 `.changes` must stay 0600: the temp file is
+        // created 0666 & ~umask and the rename must not widen it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foo.changes");
+        std::fs::write(&path, "original\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let warning =
+            write_generated_entry(&path, ENTRY, &Debug::disabled()).expect("write succeeds");
+        assert!(warning.is_none());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn write_generated_entry_warns_on_a_single_byte_guess() {
+        // PROBE1 shape end to end: a mixed file with one lone
+        // corrupt byte still writes — the guess cannot be refused —
+        // but the write warns, naming windows-1252, instead of
+        // staying silent. The corrupt byte was transcoded (as
+        // U+201A), not refused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foo.changes");
+        let mut old = "-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Tom\u{e1}s Chv\u{e1}tal <tomas.chvatal@gmail.com>\n\n- Update to 2.0\n\n-------------------------------------------------------------------\nWed May 27 16:31:48 UTC 2026 - Andr".as_bytes().to_vec();
+        old.extend_from_slice(b"\xe9 Martin <andre@example.com>\n\n- Fix the th\xe9\n");
+        old.extend_from_slice(b"\x82\n");
+        std::fs::write(&path, &old).unwrap();
+        let warning =
+            write_generated_entry(&path, ENTRY, &Debug::disabled()).expect("write succeeds");
+        let warning = warning.expect("a single-byte guess warns");
+        assert!(warning.contains("windows-1252"), "{warning}");
+        let written = std::fs::read(&path).unwrap();
+        assert!(String::from_utf8_lossy(&written).contains('\u{201A}'));
+    }
+
+    #[test]
+    fn write_generated_entry_refuses_undecodable_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foo.changes");
+        // Truncated UTF-16: the whole-input decode hits the lone byte.
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend("ab\n".encode_utf16().flat_map(|unit| unit.to_le_bytes()));
+        bytes.push(0x61);
+        std::fs::write(&path, &bytes).unwrap();
+        let err = write_generated_entry(&path, ENTRY, &Debug::disabled())
+            .expect_err("undecodable bytes are refused");
+        assert!(err.context.contains("no known encoding decodes"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }
