@@ -1,6 +1,7 @@
 //! `local-build` — the podman build vertical's command group: build
 //! a package in the container, run its `_service` services, the
-//! precommit gate, `spec-cleaner`, and wipe a build root.
+//! precommit gate, `spec-cleaner`, wipe a build root, and enter the
+//! preserved build root to run repro commands.
 //!
 //! Thin like `service` and `build`: the flags mirror the library
 //! parameters, the JSON payload carries the typed record, and the
@@ -29,8 +30,8 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::local_build::{
-    validate_build_request, BuildRecord, BuildRequest, LocalBuild, PrecommitRecord, ServiceRunMode,
-    ServiceRunRecord, ServiceRunRequest, SpecCleanerResult, WipeOutcome,
+    validate_build_request, BuildRecord, BuildRequest, ChrootRecord, LocalBuild, PrecommitRecord,
+    ServiceRunMode, ServiceRunRecord, ServiceRunRequest, SpecCleanerResult, WipeOutcome,
 };
 use geectl::obs::{ObsClient, OBS_API_BASE};
 use serde_json::{json, Value};
@@ -176,6 +177,36 @@ pub enum LocalBuildCommand {
         /// the coordinates: when set, the root is wiped as named.
         #[arg(long, conflicts_with_all = ["repo", "arch", "spec", "project", "flavor"])]
         root: Option<PathBuf>,
+    },
+    /// Enter the preserved build root of the last build for the
+    /// package and run repro commands there, read from stdin, one
+    /// per line, joined with `&&` into one shell command. A
+    /// mutation: dry-run is the default (only the plan is printed);
+    /// `--live` runs the commands in the root. There is no
+    /// interactive shell: a terminal on stdin is refused instead of
+    /// blocking on a read that never arrives. A failing repro still
+    /// exits 0: the exit code is data, in `exit:` and in
+    /// `record.result.exit_code`.
+    Chroot {
+        /// The source directory (spec + sources); the package
+        /// comes from the spec file in it, like the build.
+        directory: PathBuf,
+        /// The OBS project the package belongs to.
+        #[arg(long)]
+        project: String,
+        /// The repository the root was built for (e.g. `standard`).
+        #[arg(long)]
+        repo: String,
+        /// The architecture the root was built for; defaults to the host arch.
+        #[arg(long, default_value_t = std::env::consts::ARCH.to_string())]
+        arch: String,
+        /// The multibuild flavor; required when the source
+        /// carries a `_multibuild` file.
+        #[arg(long)]
+        flavor: Option<String>,
+        /// Timeout in seconds for the whole run.
+        #[arg(long, default_value_t = 3600)]
+        timeout_secs: u64,
     },
 }
 
@@ -428,6 +459,44 @@ pub fn run_local_build(
             });
             Ok((payload, text))
         }
+        LocalBuildCommand::Chroot {
+            directory,
+            project,
+            repo,
+            arch,
+            flavor,
+            timeout_secs,
+        } => {
+            let commands = read_stdin_commands()?;
+            let record = vertical.build_chroot(
+                &directory,
+                &project,
+                &repo,
+                &arch,
+                &flavor,
+                &commands,
+                timeout_secs,
+                !live,
+            )?;
+            let mut header = format!(
+                "directory: {} project: {project} repo: {repo} arch: {arch}",
+                directory.display()
+            );
+            if let Some(flavor) = &flavor {
+                header.push_str(&format!(" flavor: {flavor}"));
+            }
+            let text = with_header(&header, render_chroot(&record));
+            let payload = json!({
+                "directory": directory,
+                "project": project,
+                "repo": repo,
+                "arch": arch,
+                "flavor": flavor,
+                "dry_run": !live,
+                "record": record,
+            });
+            Ok((payload, text))
+        }
     }
 }
 
@@ -655,6 +724,101 @@ fn render_wipe(outcome: &WipeOutcome) -> String {
     }
 }
 
+/// The largest stdin payload `chroot` reads: 64 KiB, matching the
+/// config and secret file caps, and far below the exec `ARG_MAX` the
+/// joined `--shell-cmd` would otherwise die at. An unbounded read
+/// lets `yes | ...` grow memory without bound.
+const MAX_STDIN_COMMANDS_BYTES: usize = 64 * 1024;
+
+/// The most repro commands one `chroot` run takes: a repro is a
+/// handful of fragments, and the byte cap above bounds the total
+/// size either way — the count cap bounds the join and the argv
+/// handling for many tiny lines.
+const MAX_STDIN_COMMANDS: usize = 1024;
+
+/// Read the repro commands from stdin, one per line: blank lines
+/// are dropped, the rest are shell fragments for the root, in
+/// order. A terminal on stdin is refused instead of blocking on a
+/// read that never arrives: there is no interactive shell to fall
+/// back to. The read is capped at [`MAX_STDIN_COMMANDS_BYTES`]
+/// bytes and [`MAX_STDIN_COMMANDS`] commands: anything larger is
+/// invalid input, not a read.
+fn read_stdin_commands() -> Result<Vec<String>, GeectlError> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "chroot reads repro commands from stdin; pipe them in (no interactive shell)",
+        ));
+    }
+    read_commands_from(std::io::stdin())
+}
+
+/// Read repro commands from `reader`, capped: one byte past the byte
+/// cap, or one command past the count cap, is invalid input. The
+/// byte cap is enforced during the read, so an endless pipe stops
+/// at the cap instead of growing memory without bound.
+fn read_commands_from<R: std::io::Read>(reader: R) -> Result<Vec<String>, GeectlError> {
+    use std::io::Read;
+    let mut text = String::new();
+    reader
+        .take(MAX_STDIN_COMMANDS_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot read repro commands from stdin: {e}"),
+            )
+        })?;
+    if text.len() > MAX_STDIN_COMMANDS_BYTES {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("repro commands exceed the {MAX_STDIN_COMMANDS_BYTES}-byte stdin cap"),
+        ));
+    }
+    let commands = parse_stdin_commands(&text);
+    if commands.len() > MAX_STDIN_COMMANDS {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("repro commands exceed the {MAX_STDIN_COMMANDS}-command stdin cap"),
+        ));
+    }
+    Ok(commands)
+}
+
+/// Split piped stdin into repro commands: one non-blank line each,
+/// trimmed, in order.
+fn parse_stdin_commands(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A chroot record as text: the root, one `run:` line per command,
+/// and on a live run the exit code plus the command's stdout and
+/// stderr when non-empty. The commands stay visible on a live run:
+/// the payload carries them, so the text must too.
+fn render_chroot(record: &ChrootRecord) -> String {
+    let mut lines = vec![format!("root: {}", record.root.display())];
+    for command in &record.commands {
+        lines.push(format!("run: {command}"));
+    }
+    if !record.dry_run {
+        if let Some(result) = &record.result {
+            lines.push(format!("exit: {}", result.exit_code));
+            if !result.stdout.is_empty() {
+                lines.push(result.stdout.clone());
+            }
+            if !result.stderr.is_empty() {
+                lines.push(result.stderr.clone());
+            }
+        }
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +827,7 @@ mod tests {
     use geectl::local_build::{
         BuildRecord, CacheStats, CheckSummary, EnginePlan, EvictedItem, EvictionReport,
         PlannedService, PrecheckinOutcome, RpmlintSummary, ServiceRunOutcome, ServiceRunPlan,
+        ShellResult,
     };
 
     fn parse(args: &[&str]) -> LocalBuildCommand {
@@ -1000,6 +1165,200 @@ mod tests {
             render_wipe(&wiped),
             "wiped 3 entries (42 bytes) at /tmp/root"
         );
+    }
+
+    #[test]
+    fn chroot_parses_defaults_and_flags() {
+        match parse(&[
+            "geectl",
+            "local-build",
+            "chroot",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--repo",
+            "standard",
+        ]) {
+            LocalBuildCommand::Chroot {
+                directory,
+                project,
+                repo,
+                arch,
+                flavor,
+                timeout_secs,
+            } => {
+                assert_eq!(directory, PathBuf::from("/tmp/pkg"));
+                assert_eq!(project, "home:foo");
+                assert_eq!(repo, "standard");
+                assert_eq!(arch, std::env::consts::ARCH);
+                assert_eq!(flavor, None);
+                assert_eq!(timeout_secs, 3600);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match parse(&[
+            "geectl",
+            "local-build",
+            "chroot",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--repo",
+            "standard",
+            "--arch",
+            "x86_64",
+            "--flavor",
+            "lib",
+            "--timeout-secs",
+            "60",
+        ]) {
+            LocalBuildCommand::Chroot {
+                arch,
+                flavor,
+                timeout_secs,
+                ..
+            } => {
+                assert_eq!(arch, "x86_64");
+                assert_eq!(flavor.as_deref(), Some("lib"));
+                assert_eq!(timeout_secs, 60);
+            }
+            _ => panic!("wrong variant"),
+        }
+        assert!(Cli::try_parse_from(["geectl", "local-build", "chroot", "/tmp/pkg"]).is_err());
+        assert!(Cli::try_parse_from([
+            "geectl",
+            "local-build",
+            "chroot",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parse_stdin_commands_splits_lines_and_drops_blanks() {
+        assert_eq!(
+            parse_stdin_commands("echo hi\n\n  rpm -qa \n"),
+            vec!["echo hi".to_string(), "rpm -qa".to_string()]
+        );
+        assert!(parse_stdin_commands("").is_empty());
+        assert!(parse_stdin_commands("\n  \n").is_empty());
+        assert_eq!(
+            parse_stdin_commands("a\r\nb\r\n"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn stdin_commands_cap_bytes() {
+        // One byte past the cap is invalid input, not a read: the
+        // cap is enforced during the read, so an endless pipe
+        // stops at the cap.
+        let over = "x".repeat(MAX_STDIN_COMMANDS_BYTES + 1);
+        let err = read_commands_from(std::io::Cursor::new(over)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // Exactly at the cap reads fine.
+        let at = "x".repeat(MAX_STDIN_COMMANDS_BYTES);
+        let commands = read_commands_from(std::io::Cursor::new(at)).unwrap();
+        assert_eq!(commands.len(), 1);
+    }
+
+    #[test]
+    fn stdin_commands_cap_count() {
+        // One command past the count cap is invalid input.
+        let over = "x\n".repeat(MAX_STDIN_COMMANDS + 1);
+        let err = read_commands_from(std::io::Cursor::new(over)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // Exactly at the cap reads fine.
+        let at = "x\n".repeat(MAX_STDIN_COMMANDS);
+        let commands = read_commands_from(std::io::Cursor::new(at)).unwrap();
+        assert_eq!(commands.len(), MAX_STDIN_COMMANDS);
+    }
+
+    fn chroot_record() -> ChrootRecord {
+        ChrootRecord {
+            root: PathBuf::from("/tmp/root"),
+            commands: vec!["echo hi".to_string(), "rpm -qa".to_string()],
+            dry_run: false,
+            result: Some(ShellResult {
+                exit_code: 0,
+                stdout: "shell output: echo hi\n".to_string(),
+                stderr: String::new(),
+            }),
+        }
+    }
+
+    fn dry_run_chroot_record() -> ChrootRecord {
+        ChrootRecord {
+            root: PathBuf::from("/tmp/root"),
+            commands: vec!["echo hi".to_string(), "rpm -qa".to_string()],
+            dry_run: true,
+            result: None,
+        }
+    }
+
+    #[test]
+    fn chroot_renders_plan_and_result() {
+        let text = render_chroot(&dry_run_chroot_record());
+        assert!(text.contains("root: /tmp/root"));
+        assert!(text.contains("run: echo hi"));
+        assert!(text.contains("run: rpm -qa"));
+        assert!(!text.contains("exit:"));
+        let text = render_chroot(&chroot_record());
+        assert!(text.contains("root: /tmp/root"));
+        assert!(text.contains("run: echo hi"));
+        assert!(text.contains("run: rpm -qa"));
+        assert!(text.contains("exit: 0"));
+        assert!(text.contains("shell output: echo hi"));
+        let mut failed = chroot_record();
+        failed.result.as_mut().unwrap().exit_code = 1;
+        failed.result.as_mut().unwrap().stdout = String::new();
+        failed.result.as_mut().unwrap().stderr = "rpm: no such package\n".to_string();
+        let text = render_chroot(&failed);
+        assert!(text.contains("exit: 1"));
+        assert!(text.contains("rpm: no such package"));
+    }
+
+    /// The agreement test: every identifying field the JSON payload
+    /// carries for the chroot — the root, the commands, the exit
+    /// code, and the captured stdout and stderr — appears in the
+    /// text rendering. The expected fields come from the payload
+    /// itself, not from literals repeated from the rendering
+    /// tests, so a payload field the text drops fails here.
+    #[test]
+    fn chroot_text_carries_every_identifying_field() {
+        let record = chroot_record();
+        let payload = serde_json::to_value(&record).expect("record serializes");
+        let text = render_chroot(&record);
+        let root = payload["root"].as_str().expect("root is a string");
+        assert!(
+            text.contains(root),
+            "chroot text misses root {root}:\n{text}"
+        );
+        for command in payload["commands"]
+            .as_array()
+            .expect("commands is an array")
+        {
+            let command = command.as_str().expect("command is a string");
+            assert!(
+                text.contains(command),
+                "chroot text misses command {command}:\n{text}"
+            );
+        }
+        let result = &payload["result"];
+        assert!(text.contains(&format!("exit: {}", result["exit_code"])));
+        assert!(text.contains(result["stdout"].as_str().expect("stdout is a string")));
+        let mut failed = chroot_record();
+        failed.result.as_mut().unwrap().stdout = String::new();
+        failed.result.as_mut().unwrap().stderr = "rpm: no such package\n".to_string();
+        let payload = serde_json::to_value(&failed).expect("record serializes");
+        let text = render_chroot(&failed);
+        assert!(text.contains(
+            payload["result"]["stderr"]
+                .as_str()
+                .expect("stderr is a string")
+        ));
     }
 
     fn dry_run_record() -> ServiceRunRecord {

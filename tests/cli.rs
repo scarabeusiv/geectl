@@ -4529,6 +4529,55 @@ fn docs_help_blocks_match_the_binary() {
 }
 
 #[test]
+fn local_build_chroot_dry_run_reads_commands_from_stdin() {
+    // The dry run prints the plan — the resolved root plus the
+    // piped commands — and touches nothing: no server call, no
+    // root, no credentials. The blank line in the piped input is
+    // dropped, not run.
+    use std::io::Write;
+    let dir = TempDir::new();
+    let source = dir.0.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("foo.spec"), "Name: foo\n").unwrap();
+    let mut child = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "local-build",
+            "chroot",
+            source.to_str().unwrap(),
+            "--project",
+            "testproject",
+            "--repo",
+            "standard",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"echo hi\n\nrpm -qa\n").unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The root prints with the platform-native separator, so
+    // normalize before matching a forward-slash path fragment.
+    let slashes = text.replace('\\', "/");
+    assert!(
+        slashes.contains("build-roots/testproject/foo/standard-"),
+        "stdout: {text}"
+    );
+    assert!(text.contains("run: echo hi"), "stdout: {text}");
+    assert!(text.contains("run: rpm -qa"), "stdout: {text}");
+}
+
+#[test]
 fn copy_package_to_apiurl_with_plain_credentials_fails_clearly() {
     // Plain (default-instance) credentials must never be forwarded
     // to the target: a different-URL target with only plain creds

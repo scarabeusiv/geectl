@@ -440,6 +440,20 @@ pub struct ShellResult {
     pub stderr: String,
 }
 
+/// The result of `chroot`: the resolved build root and the repro
+/// commands, plus the shell result on a live run. A dry run
+/// carries the root and the commands and no result: the root is
+/// the preserved root of the last build for the package, resolved
+/// from the source directory's spec and the coordinates, whether
+/// or not it exists yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChrootRecord {
+    pub root: PathBuf,
+    pub commands: Vec<String>,
+    pub dry_run: bool,
+    pub result: Option<ShellResult>,
+}
+
 /// The result of `build-log`: the log lines plus the verdict the
 /// build record holds, when a record exists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4985,7 +4999,10 @@ impl<'a> LocalBuild<'a> {
     /// (they come from the root, which the build wrote). `--logfile`
     /// is dropped on purpose: passing it would overwrite the last
     /// build's log that `build-log` reads; the output rides in the
-    /// result instead. The spec itself is not passed: it lives in
+    /// result instead. The `--shell-cmd` value never reaches `--debug`:
+    /// the fragments are free-form stdin and may carry a pasted secret,
+    /// so the debug line shows `[redacted]` in its place. The spec itself
+    /// is not passed: it lives in
     /// the source dir, not the root, and the shell enters the
     /// preserved root whose rpmlist/dist carry the resolved inputs.
     // Seven arguments: the build-root coordinates plus the command
@@ -5083,8 +5100,14 @@ impl<'a> LocalBuild<'a> {
             "--shell-cmd".to_string(),
             shell_cmd,
         ];
-        self.debug
-            .emit(&format!("local-build shell: {}", argv.join(" ")));
+        // The shell fragments are free-form stdin: a pasted secret
+        // in one would land in the debug line verbatim, so the
+        // `--shell-cmd` value never reaches the channel. The real
+        // argv still carries the fragments to the engine.
+        self.debug.emit(&format!(
+            "local-build shell: {} --shell-cmd [redacted]",
+            argv[..argv.len() - 2].join(" ")
+        ));
         let (outcome, stdout, stderr) =
             run_engine(&argv, &root, Duration::from_secs(timeout_secs))?;
         if outcome.timed_out {
@@ -5106,6 +5129,121 @@ impl<'a> LocalBuild<'a> {
             exit_code: outcome.exit_code,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        })
+    }
+
+    /// Enter the preserved build root of the last build for the
+    /// package in `source_dir`: the package comes from the spec
+    /// file in it, like the build, and the root is the one the
+    /// build's own coordinates name. The commands are shell
+    /// fragments read from stdin by the caller (the leaf has no
+    /// interactive shell to offer); they run through `build_shell`,
+    /// so the same guards apply — the root must carry a marker,
+    /// rpmlist and buildconfig, and the shell is scripted,
+    /// bounded, and captured. A dry run resolves the root and the
+    /// commands and touches nothing: the root may not exist yet,
+    /// like the build's dry-run plan. A custom `--root` build is
+    /// not visible here: its root sits outside the cache dir, and
+    /// `build-shell` does not see it.
+    // Eight arguments: the source-derived root coordinates plus
+    // the command array, the timeout, and the dry-run flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_chroot(
+        &self,
+        source_dir: &Path,
+        project: &str,
+        repo: &str,
+        arch: &str,
+        flavor: &Option<String>,
+        commands: &[String],
+        timeout_secs: u64,
+        dry_run: bool,
+    ) -> Result<ChrootRecord, GeectlError> {
+        let source_dir = std::path::absolute(source_dir).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot resolve source directory {}: {e}",
+                    source_dir.display()
+                ),
+            )
+        })?;
+        let spec = find_spec(&source_dir)?;
+        let package = spec
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !valid_obs_name(&package) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "spec file name {:?} is not a valid package name",
+                    spec.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            ));
+        }
+        // The package is a cache-dir component too (see above).
+        validate_path_component("package", &package)?;
+        let flavors = multibuild_flavors(&source_dir)?;
+        if let Some(flavors) = &flavors {
+            match flavor {
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::MultibuildFlavorRequired,
+                        format!(
+                            "package {package} is multibuild; pass one flavor ({})",
+                            flavors.join(", ")
+                        ),
+                    ));
+                }
+                Some(flavor) if !flavors.iter().any(|f| f == flavor) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "unknown multibuild flavor {flavor:?} for {package}; known flavors: {}",
+                            flavors.join(", ")
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        validate_cache_components(project, repo, arch, flavor)?;
+        if commands.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "chroot takes repro commands on stdin; an empty list is not an interactive shell",
+            ));
+        }
+        if timeout_secs == 0 {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "chroot timeout must be greater than 0 seconds",
+            ));
+        }
+        let root = self.root_path(project, &package, repo, arch, flavor);
+        if dry_run {
+            return Ok(ChrootRecord {
+                root,
+                commands: commands.to_vec(),
+                dry_run: true,
+                result: None,
+            });
+        }
+        let result = self.build_shell(
+            project,
+            &package,
+            repo,
+            arch,
+            flavor,
+            commands,
+            timeout_secs,
+        )?;
+        Ok(ChrootRecord {
+            root,
+            commands: commands.to_vec(),
+            dry_run: false,
+            result: Some(result),
         })
     }
 
@@ -7226,6 +7364,204 @@ mod tests {
         assert_eq!(collect_rpms(root), vec![real]);
     }
 
+    #[test]
+    fn chroot_dry_run_resolves_the_root_and_touches_nothing() {
+        // The adopted osc case: `behave/features/build.feature`
+        // "Run `osc build --just-print-buildroot`" — the tool
+        // resolves the build root for the package's coordinates
+        // and prints it, exit 0. The chroot dry run is the same
+        // resolution for the same coordinates (the plan names the
+        // root); the commands ride along, and nothing is created.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dir = TempDir::new();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let source = write_source(dir.path(), "foo.spec");
+        let record = vertical
+            .build_chroot(
+                &source,
+                "testproject",
+                "standard",
+                host_arch(),
+                &None,
+                &["echo hi".to_string(), "rpm -qa".to_string()],
+                60,
+                true,
+            )
+            .unwrap();
+        assert!(record.dry_run);
+        assert_eq!(record.result, None);
+        assert_eq!(
+            record.commands,
+            vec!["echo hi".to_string(), "rpm -qa".to_string()]
+        );
+        assert_eq!(
+            record.root,
+            dir.path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("standard-{}", host_arch()))
+        );
+        // Nothing was created: no root, no cache.
+        assert!(!dir.path().join("cache").exists());
+    }
+
+    #[test]
+    fn chroot_dry_run_names_the_flavor_in_the_root() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dir = TempDir::new();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let source = write_source(dir.path(), "foo.spec");
+        fs::write(
+            source.join("_multibuild"),
+            "<multibuild><package>lib</package><package>devel</package></multibuild>",
+        )
+        .unwrap();
+        let record = vertical
+            .build_chroot(
+                &source,
+                "testproject",
+                "standard",
+                host_arch(),
+                &Some("lib".to_string()),
+                &["echo hi".to_string()],
+                60,
+                true,
+            )
+            .unwrap();
+        assert!(record
+            .root
+            .ends_with(format!("standard-{}-lib", host_arch())));
+    }
+
+    #[test]
+    fn chroot_refuses_an_empty_command_list_and_a_zero_timeout() {
+        // Empty commands are invalid input in both modes, never an
+        // interactive shell; a zero timeout likewise.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dir = TempDir::new();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let source = write_source(dir.path(), "foo.spec");
+        let err = vertical
+            .build_chroot(
+                &source,
+                "testproject",
+                "standard",
+                host_arch(),
+                &None,
+                &[],
+                60,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = vertical
+            .build_chroot(
+                &source,
+                "testproject",
+                "standard",
+                host_arch(),
+                &None,
+                &["echo hi".to_string()],
+                0,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn chroot_requires_a_flavor_for_multibuild() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dir = TempDir::new();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let source = write_source(dir.path(), "foo.spec");
+        fs::write(
+            source.join("_multibuild"),
+            "<multibuild><package>lib</package><package>devel</package></multibuild>",
+        )
+        .unwrap();
+        let err = vertical
+            .build_chroot(
+                &source,
+                "testproject",
+                "standard",
+                host_arch(),
+                &None,
+                &["echo hi".to_string()],
+                60,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MultibuildFlavorRequired);
+        let err = vertical
+            .build_chroot(
+                &source,
+                "testproject",
+                "standard",
+                host_arch(),
+                &Some("nope".to_string()),
+                &["echo hi".to_string()],
+                60,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn chroot_refuses_a_directory_without_a_spec() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dir = TempDir::new();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let err = vertical
+            .build_chroot(
+                &empty,
+                "testproject",
+                "standard",
+                host_arch(),
+                &None,
+                &["echo hi".to_string()],
+                60,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("no .spec file"));
+    }
+
+    #[test]
+    fn chroot_live_refuses_an_unknown_root() {
+        // No build yet: the shell's marker check refuses before
+        // any engine runs, so no stub engine is needed here.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let dir = TempDir::new();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let source = write_source(dir.path(), "foo.spec");
+        let err = vertical
+            .build_chroot(
+                &source,
+                "testproject",
+                "standard",
+                host_arch(),
+                &None,
+                &["echo hi".to_string()],
+                60,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+    }
+
     /// The stub tests below run shell scripts, so they are unix-only.
     /// They prove the flow end to end against a stub engine and a
     /// stub podman — no real build runs in CI.
@@ -7247,6 +7583,14 @@ mod tests {
         /// subdir the real engine uses. With `--shell-cmd` it
         /// echoes the command to stdout (the captured shell output).
         fn stub_engine(dir: &Path) -> (PathBuf, PathBuf) {
+            stub_engine_with_shell_exit(dir, 0)
+        }
+
+        /// A stub engine whose `--shell-cmd` run exits with
+        /// `shell_exit` (and reports the failure on stderr) while
+        /// the build path still exits 0: a failing repro is data,
+        /// not an engine failure.
+        fn stub_engine_with_shell_exit(dir: &Path, shell_exit: i32) -> (PathBuf, PathBuf) {
             let script = dir.join("build-stub");
             let argv_log = dir.join("engine-argv.log");
             write_script(
@@ -7269,7 +7613,7 @@ for arg in "$@"; do
   if [ "$prev" = "--shell-cmd" ]; then shell_cmd="$arg"; fi
   prev="$arg"
 done
-if [ -n "$shell_cmd" ]; then echo "shell output: $shell_cmd"; fi
+if [ -n "$shell_cmd" ]; then echo "shell output: $shell_cmd"; echo "shell error: $shell_cmd" >&2; exit {shell_exit}; fi
 if [ -n "$spec" ]; then
   pkg=$(basename "$spec" .spec)
   mkdir -p "$root/.build.packages/RPMS"
@@ -7279,6 +7623,7 @@ fi
 "#,
                     argv_log = argv_log.display(),
                     arch = host_arch(),
+                    shell_exit = shell_exit,
                 ),
             );
             (script, argv_log)
@@ -9777,6 +10122,144 @@ fi
             let argv = fs::read_to_string(&argv_log).unwrap();
             let shell_argv = argv.lines().last().unwrap();
             assert!(shell_argv.contains("--shell-cmd echo a && echo b"));
+        }
+
+        #[test]
+        fn build_shell_debug_line_redacts_the_shell_command() {
+            // The fragments are free-form stdin: a pasted secret in
+            // one must never reach `--debug`, so the debug line shows
+            // `[redacted]` where the `--shell-cmd` value would sit —
+            // while the real argv still carries the fragments to
+            // the engine.
+            let dir = TempDir::new();
+            let (engine, argv_log) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let (debug, lines) = Debug::captured(true, false);
+            let vertical = vertical(&client, dir.path(), engine, podman).with_debug(debug);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source, "testproject", "standard", host_arch());
+            vertical.build(&req).unwrap();
+            vertical
+                .build_shell(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["echo hunter2-fake".to_string()],
+                    60,
+                )
+                .unwrap();
+            let lines = lines.lock().expect("debug lines readable");
+            let shell_line = lines
+                .iter()
+                .find(|line| line.starts_with("local-build shell:"))
+                .expect("a shell debug line");
+            assert!(
+                !shell_line.contains("hunter2-fake"),
+                "debug leaks the fragment:\n{shell_line}"
+            );
+            assert!(shell_line.contains("--shell-cmd [redacted]"));
+            // The engine still got the real fragment.
+            let argv = fs::read_to_string(&argv_log).unwrap();
+            assert!(argv
+                .lines()
+                .last()
+                .unwrap()
+                .contains("--shell-cmd echo hunter2-fake"));
+        }
+
+        #[test]
+        fn chroot_live_round_trip_after_build() {
+            // The shell runs the stdin commands in the preserved
+            // root: two commands reach the engine as one
+            // `--shell-cmd` string, the output rides in the
+            // result, and the build log still reads the build's
+            // `finished` line (no `--logfile` on the shell run).
+            let dir = TempDir::new();
+            let (engine, argv_log) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            let chroot = vertical
+                .build_chroot(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["echo hi".to_string(), "rpm -qa".to_string()],
+                    60,
+                    false,
+                )
+                .unwrap();
+            assert!(!chroot.dry_run);
+            assert_eq!(chroot.root, record.root_path);
+            assert_eq!(
+                chroot.commands,
+                vec!["echo hi".to_string(), "rpm -qa".to_string()]
+            );
+            let result = chroot.result.unwrap();
+            assert_eq!(result.exit_code, 0);
+            assert!(result.stdout.contains("shell output: echo hi && rpm -qa"));
+            let argv = fs::read_to_string(&argv_log).unwrap();
+            let shell_argv = argv.lines().last().unwrap();
+            assert!(shell_argv.contains("--shell-cmd echo hi && rpm -qa"));
+            assert!(!shell_argv.contains("--logfile="));
+            let log = vertical
+                .build_log(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    Some(1),
+                    false,
+                )
+                .unwrap();
+            assert!(log.lines[0].contains("finished"));
+        }
+
+        #[test]
+        fn chroot_live_nonzero_exit_is_data_not_a_failure() {
+            // A failing repro is data, not a failed command: the
+            // engine exits 1, `build_chroot` still returns `Ok`,
+            // and the exit code plus both captured streams ride in
+            // the result — a caller reads `exit:` instead of `$?`.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine_with_shell_exit(dir.path(), 1);
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let req = BuildRequest::new(source.clone(), "testproject", "standard", host_arch());
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            let chroot = vertical
+                .build_chroot(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    &["false".to_string()],
+                    60,
+                    false,
+                )
+                .unwrap();
+            assert!(!chroot.dry_run);
+            let result = chroot.result.unwrap();
+            assert_eq!(result.exit_code, 1);
+            assert!(result.stdout.contains("shell output: false"));
+            assert!(result.stderr.contains("shell error: false"));
         }
 
         #[test]

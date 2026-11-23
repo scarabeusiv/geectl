@@ -118,7 +118,7 @@ Commands:
   request       Read and act on OBS submit requests, and file new ones
   branch        Branch, copy, and link packages
   build         Build-status commands: results, logs, histories, binaries, buildconfig
-  local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, and wipe a build root
+  local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, and enter the preserved build root
   maintenance   Maintenance operations: maintained-instances listing and maintenance branching
   service       Service reads and trigger: list a package's services, their run state, and trigger a server-side run
   gitea         Gitea operations: repository and branch reads and mutations on the configured instance
@@ -450,7 +450,7 @@ or a not-installed flag). Text output renders each dependency as
 ## `local-build` — podman build vertical
 
 ```
-Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, and wipe a build root
+Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, and enter the preserved build root
 
 Usage: geectl local-build [OPTIONS] <COMMAND>
 
@@ -460,6 +460,7 @@ Commands:
   spec-cleaner  Run `spec-cleaner` on a spec in the container
   build         Build the package in the container: the run-mode service run, the precommit gate, then the engine build
   wipe          Wipe a build root: delete its contents (the lock file stays). A mutation: dry-run is the default (only the plan is printed); `--live` performs the wipe. There is no force flag: the marker check and the in-use lock are safety invariants, never bypassed
+  chroot        Enter the preserved build root of the last build for the package and run repro commands there, read from stdin, one per line, joined with `&&` into one shell command. A mutation: dry-run is the default (only the plan is printed); `--live` runs the commands in the root. There is no interactive shell: a terminal on stdin is refused instead of blocking on a read that never arrives. A failing repro still exits 0: the exit code is data, in `exit:` and in `record.result.exit_code`
   help          Print this message or the help of the given subcommand(s)
 
 Options:
