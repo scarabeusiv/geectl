@@ -1731,7 +1731,7 @@ mod tests {
     }
 
     #[test]
-    fn set_project_meta_accepts_blank_rebuild_and_linkedbuild_values() {
+    fn set_project_meta_accepts_blank_rebuild_block_and_linkedbuild_values() {
         let http = FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
@@ -1744,6 +1744,7 @@ mod tests {
         let client = project_client(&http);
         let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
         meta.repositories[0].rebuild = Some(String::new());
+        meta.repositories[0].block = Some(String::new());
         meta.repositories[0].linkedbuild = Some(String::new());
         assert!(client
             .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))

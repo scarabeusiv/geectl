@@ -2009,7 +2009,7 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
     if let Some(rebuild) = &repository.rebuild {
         if !matches!(rebuild.as_str(), "" | "transitive" | "direct" | "local") {
             return Err(invalid(&format!(
-                "rebuild {rebuild:?} is not one of transitive, direct, local"
+                "rebuild {rebuild:?} is not one of blank, transitive, direct, local"
             )));
         }
     }
@@ -2019,14 +2019,14 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
             "" | "off" | "localdep" | "all" | "alldirect" | "alldirect_or_localdep"
         ) {
             return Err(invalid(&format!(
-                "linkedbuild {linkedbuild:?} is not one of off, localdep, all, alldirect, alldirect_or_localdep"
+                "linkedbuild {linkedbuild:?} is not one of blank, off, localdep, all, alldirect, alldirect_or_localdep"
             )));
         }
     }
     if let Some(block) = &repository.block {
         if !matches!(block.as_str(), "" | "all" | "local" | "never") {
             return Err(invalid(&format!(
-                "block {block:?} is not one of all, local, never"
+                "block {block:?} is not one of blank, all, local, never"
             )));
         }
     }
