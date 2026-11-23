@@ -72,7 +72,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use geectl::auth::Credentials;
-use geectl::error::ErrorKind;
+use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{sanitize_url_for_error, HttpClient, Timeout, UreqClient};
 use geectl::obs::{
     AddRolePayload, AggregateOptions, BranchOptions, BuildLogQuery, ChangeDevelPayload,
@@ -3678,6 +3678,29 @@ fn live_undelete_package() {
     );
 }
 
+/// Restore a deleted project, retrying while the server is still
+/// moving the packages to the deleted area after the delete: the
+/// restore can race it, and the server answers either NotFound or a
+/// transient 500 until the move finishes.
+fn restore_deleted_project(
+    mut attempt: impl FnMut() -> Result<(), GeectlError>,
+    deadline: std::time::Instant,
+    retry_delay: std::time::Duration,
+) -> Result<(), GeectlError> {
+    loop {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if (err.kind() == ErrorKind::NotFound || err.kind() == ErrorKind::ServerError)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(retry_delay);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 #[test]
 fn live_undelete_project() {
     let Some(base) = live_url() else {
@@ -3695,18 +3718,12 @@ fn live_undelete_project() {
     // The server moves the packages to the deleted area after
     // replying to the delete, so the restore can race it: retry
     // until the project is restorable.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
-        match client.undelete_project(&source_project, &DryRun::new(false)) {
-            Ok(()) => break,
-            Err(err)
-                if err.kind() == ErrorKind::NotFound && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
-            Err(err) => panic!("restore the deleted project on the live instance: {err}"),
-        }
-    }
+    restore_deleted_project(
+        || client.undelete_project(&source_project, &DryRun::new(false)),
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap_or_else(|err| panic!("restore the deleted project on the live instance: {err}"));
     let meta = read_meta(&base, &source_project, &package);
     assert!(
         meta.contains(&format!("name=\"{package}\"")),
@@ -4410,6 +4427,79 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), threads * per_thread);
+    }
+
+    #[test]
+    fn restore_deleted_project_retries_a_transient_server_error() {
+        let attempts = std::cell::Cell::new(0);
+        let result = restore_deleted_project(
+            || {
+                attempts.set(attempts.get() + 1);
+                match attempts.get() {
+                    1 | 2 => Err(GeectlError::new(ErrorKind::ServerError, "transient 500")),
+                    _ => Ok(()),
+                }
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(10),
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn restore_deleted_project_still_retries_not_found() {
+        let attempts = std::cell::Cell::new(0);
+        let result = restore_deleted_project(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(GeectlError::new(ErrorKind::NotFound, "not there yet"))
+                } else {
+                    Ok(())
+                }
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(10),
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn restore_deleted_project_gives_up_on_a_non_transient_error() {
+        let attempts = std::cell::Cell::new(0);
+        let result = restore_deleted_project(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(GeectlError::new(ErrorKind::InvalidInput, "bad input"))
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(10),
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn restore_deleted_project_gives_up_after_the_deadline() {
+        let attempts = std::cell::Cell::new(0);
+        let result = restore_deleted_project(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(GeectlError::new(ErrorKind::ServerError, "still 500"))
+            },
+            std::time::Instant::now() + std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(10),
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::ServerError);
+        assert!(
+            attempts.get() >= 3,
+            "must retry at least twice before giving up: {}",
+            attempts.get()
+        );
     }
 }
 
