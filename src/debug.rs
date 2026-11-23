@@ -491,6 +491,29 @@ fn is_binary_body(body: &str) -> bool {
 /// a character boundary, with a marker naming the original body's
 /// total length (the redacted form can be shorter, so the marker
 /// never names the redacted length).
+/// Strip the characters that must not reach the terminal from a
+/// string: C0/C1 control characters (except newline) and the
+/// bidirectional / format characters that reorder displayed text
+/// (U+061C, U+200E-U+200F, U+202A-U+202E, U+2066-U+2069, U+FEFF). Stored
+/// `_service` files and error bodies are untrusted input, and both
+/// are printed raw to the terminal.
+pub(crate) fn strip_terminal_controls(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            *c == '\n'
+                || (!c.is_control()
+                    && !matches!(
+                        *c,
+                        '\u{061c}'
+                            | '\u{200e}'..='\u{200f}'
+                            | '\u{202a}'..='\u{202e}'
+                            | '\u{2066}'..='\u{2069}'
+                            | '\u{feff}'
+                    ))
+        })
+        .collect()
+}
+
 pub fn format_body_preview(body: &str) -> String {
     if is_binary_body(body) {
         return format!("<binary body, {} bytes>", body.len());
@@ -823,6 +846,26 @@ Host: api.opensuse.org";
         // The cap (2048) falls inside a two-byte character, so the
         // preview backs off to 2047 bytes: `a` plus 1023 whole `é`s.
         assert_eq!(preview.matches('é').count(), 1023);
+    }
+
+    #[test]
+    fn strip_terminal_controls_removes_escapes_and_bidi_marks() {
+        // The filter is a pure function: control characters
+        // (except newline) and bidirectional / format characters
+        // are removed, everything else survives.
+        assert_eq!(strip_terminal_controls("a\u{1b}[2Jb"), "a[2Jb");
+        assert_eq!(strip_terminal_controls("a\u{7}b"), "ab");
+        assert_eq!(strip_terminal_controls("a\rb"), "ab");
+        assert_eq!(strip_terminal_controls("a\nb"), "a\nb");
+        assert_eq!(strip_terminal_controls("a\u{061c}b"), "ab");
+        assert_eq!(strip_terminal_controls("a\u{200e}b"), "ab");
+        assert_eq!(strip_terminal_controls("a\u{200f}b"), "ab");
+        assert_eq!(strip_terminal_controls("a\u{202a}b"), "ab");
+        assert_eq!(strip_terminal_controls("a\u{202e}b"), "ab");
+        assert_eq!(strip_terminal_controls("a\u{2066}b"), "ab");
+        assert_eq!(strip_terminal_controls("a\u{2069}b"), "ab");
+        assert_eq!(strip_terminal_controls("a\u{feff}b"), "ab");
+        assert_eq!(strip_terminal_controls("a\tb"), "ab");
     }
 
     #[test]
