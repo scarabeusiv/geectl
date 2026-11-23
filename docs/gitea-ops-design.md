@@ -535,7 +535,8 @@ Each step is its own PR.
    the behave close/reopen/merge steps sit in a commented-out
    timeline scenario broken by a Gitea issue.
 6. Labels: `pr_labels_add`/`pr_labels_remove` (library only).
-   Remaining. Filing is deferred until the working-copy layer lands:
+   Landed. Test borrowing: none — osc has no label operation.
+   Filing is deferred until the working-copy layer lands:
    `pr_create` and the library `submit` returning
    `PullRequestRef`, with the CLI `submit` verb. Test borrowing
    for filing: `git-pr.feature` create, `git-pr-empty.feature`.

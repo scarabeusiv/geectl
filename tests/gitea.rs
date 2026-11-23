@@ -1631,6 +1631,137 @@ fn gitea_pull_request_comment_round_trip() {
     assert_eq!(comments[0].body, "One nit.");
 }
 
+/// Create a repo label through the raw API, authenticated as the
+/// given token: there is no typed label-create operation, and the
+/// provisioned token has no `write:issue` scope, so the call goes
+/// through the labeler's token.
+fn create_label_raw(
+    http: &UreqClient,
+    base: &str,
+    owner: &str,
+    repo: &str,
+    name: &str,
+    color: &str,
+    token: &str,
+) {
+    let body = serde_json::json!({
+        "name": name,
+        "color": color,
+    })
+    .to_string();
+    http.post_json_with(
+        &format!("{base}/api/v1/repos/{owner}/{repo}/labels"),
+        &body,
+        &Credentials::Bearer {
+            token: token.to_string(),
+        },
+    )
+    .expect("POST the repo labels API on the Gitea instance");
+}
+
+#[test]
+fn gitea_pull_request_labels_round_trip() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
+    let user = gitea_user();
+    // Labelling needs `write:issue` plus repo write permission, so
+    // the labelling user is the closing client (second user, minted
+    // token, collaborator write); the token is kept for the raw
+    // label creation below.
+    let (_, token, labeler_client) = closing_client(&http, &base, &user, &repo);
+    create_label_raw(&http, &base, &user, &repo, "bug", "ee0701", &token);
+    create_label_raw(&http, &base, &user, &repo, "wontfix", "000000", &token);
+    let added = labeler_client
+        .pr_labels_add(
+            &user,
+            &repo,
+            number,
+            &["bug".to_string(), "wontfix".to_string()],
+            &DryRun::new(false),
+        )
+        .expect("typed pr_labels_add adds the labels")
+        .expect("a live add returns the labels");
+    assert_eq!(
+        added
+            .iter()
+            .map(|label| label.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bug", "wontfix"]
+    );
+    let pr = client
+        .pr_get(&user, &repo, number)
+        .expect("typed pr_get reads the pull request");
+    assert_eq!(
+        pr.labels
+            .iter()
+            .map(|label| label.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bug", "wontfix"]
+    );
+    let removed = labeler_client
+        .pr_labels_remove(
+            &user,
+            &repo,
+            number,
+            &["bug".to_string()],
+            &DryRun::new(false),
+        )
+        .expect("typed pr_labels_remove removes the label")
+        .expect("a live remove returns the names");
+    assert_eq!(removed, vec!["bug".to_string()]);
+    let pr = client
+        .pr_get(&user, &repo, number)
+        .expect("typed pr_get reads the pull request");
+    assert_eq!(
+        pr.labels
+            .iter()
+            .map(|label| label.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["wontfix"]
+    );
+    // Removing a label the pull request no longer carries is a
+    // server no-op (204) and is still reported.
+    let removed = labeler_client
+        .pr_labels_remove(
+            &user,
+            &repo,
+            number,
+            &["bug".to_string()],
+            &DryRun::new(false),
+        )
+        .expect("typed pr_labels_remove reports the no-op removal")
+        .expect("a live remove returns the names");
+    assert_eq!(removed, vec!["bug".to_string()]);
+    let pr = client
+        .pr_get(&user, &repo, number)
+        .expect("typed pr_get reads the pull request");
+    assert_eq!(
+        pr.labels
+            .iter()
+            .map(|label| label.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["wontfix"]
+    );
+    // An unknown name fails closed instead of labelling nothing.
+    let err = labeler_client
+        .pr_labels_add(
+            &user,
+            &repo,
+            number,
+            &["no-such-label".to_string()],
+            &DryRun::new(false),
+        )
+        .expect_err("an unknown label name fails closed");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+}
+
 #[test]
 fn gitea_pull_request_cancel_review_round_trip() {
     let Some(base) = gitea_url() else {
@@ -1886,7 +2017,7 @@ fn gitea_pull_request_decline_round_trip() {
     let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
     let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
     let user = gitea_user();
-    let (closer, closer_client) = closing_client(&http, &base, &user, &repo);
+    let (closer, _, closer_client) = closing_client(&http, &base, &user, &repo);
     let reference = PullRequestRef::Gitea {
         owner: user.clone(),
         repo: repo.clone(),
@@ -1924,7 +2055,7 @@ fn gitea_pull_request_withdraw_round_trip() {
     let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
     let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
     let user = gitea_user();
-    let (_, closer_client) = closing_client(&http, &base, &user, &repo);
+    let (_, _, closer_client) = closing_client(&http, &base, &user, &repo);
     let reference = PullRequestRef::Gitea {
         owner: user.clone(),
         repo: repo.clone(),
@@ -1956,7 +2087,7 @@ fn gitea_pull_request_reopen_round_trip() {
     let _guard = LiveRepo::new(&client, &gitea_user(), &repo);
     let (_, _, number) = setup_pull_request(&http, &client, &base, &repo);
     let user = gitea_user();
-    let (_, closer_client) = closing_client(&http, &base, &user, &repo);
+    let (_, _, closer_client) = closing_client(&http, &base, &user, &repo);
     let reference = PullRequestRef::Gitea {
         owner: user.clone(),
         repo: repo.clone(),
@@ -2101,25 +2232,41 @@ fn typed_client_with_token<'a>(http: &'a UreqClient, base: &str, token: &str) ->
 /// authored the PR, so an APPROVE or REQUEST_CHANGES from them
 /// is refused (422).
 fn reviewer_client<'a>(http: &'a UreqClient, base: &str) -> (String, GiteaClient<'a>) {
+    let (reviewer, _, client) = reviewer_client_with_token(http, base);
+    (reviewer, client)
+}
+
+/// A second user with a minted token, also returning the raw token
+/// for setups that mint further resources through it.
+fn reviewer_client_with_token<'a>(
+    http: &'a UreqClient,
+    base: &str,
+) -> (String, String, GiteaClient<'a>) {
     let reviewer = unique_user_name();
     let password = unique_password();
     create_user_with_password_raw(http, base, &reviewer, &password);
     let token = create_token_raw(http, base, &reviewer, &password);
-    (reviewer, typed_client_with_token(http, base, &token))
+    (
+        reviewer,
+        token.clone(),
+        typed_client_with_token(http, base, &token),
+    )
 }
 
 /// A second user with a minted token (`write:repository` +
 /// `write:issue`) added as a collaborator with write access, for
-/// the close/reopen live tests: the provisioned token has no
-/// `write:issue` scope, so it cannot PATCH an issue closed or
-/// open, and a decline comment needs that scope too.
+/// the close/reopen and labels live tests: the provisioned token has
+/// no `write:issue` scope, so it cannot PATCH an issue closed or
+/// open, a decline comment needs that scope too, and labelling
+/// needs it plus repo write permission. The raw token is returned
+/// for setups that mint further resources through it.
 fn closing_client<'a>(
     http: &'a UreqClient,
     base: &str,
     owner: &str,
     repo: &str,
-) -> (String, GiteaClient<'a>) {
-    let (reviewer, reviewer_client) = reviewer_client(http, base);
+) -> (String, String, GiteaClient<'a>) {
+    let (reviewer, token, reviewer_client) = reviewer_client_with_token(http, base);
     let owner_client = typed_client(http, base);
     owner_client
         .collaborator_add(
@@ -2132,7 +2279,7 @@ fn closing_client<'a>(
         )
         .expect("typed collaborator_add adds the closing user")
         .expect("a non-dry-run add returns the permission");
-    (reviewer, reviewer_client)
+    (reviewer, token, reviewer_client)
 }
 
 /// Request a review from users and teams through the raw API.
