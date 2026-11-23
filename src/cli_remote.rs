@@ -3641,6 +3641,12 @@ fn render_project_matches(term: &str, matches: &[ProjectMatch]) -> String {
 /// `--limit`/`--offset` can see there is more.
 fn render_scmsync_projects(term: &str, list: &ScmsyncProjectList) -> String {
     if list.projects.is_empty() {
+        if list.matches > 0 {
+            return format!(
+                "no projects on this page for '{term}' ({} matches in total; use --limit/--offset to page)",
+                list.matches
+            );
+        }
         return format!("no projects matching '{term}'");
     }
     let rows: Vec<Vec<String>> = list
@@ -5869,6 +5875,20 @@ mod tests {
         };
         let text = render_scmsync_projects("https://github.com/openSUSE/", &list);
         assert_eq!(text, "no projects matching 'https://github.com/openSUSE/'");
+    }
+
+    #[test]
+    fn list_scmsync_projects_render_flags_an_empty_page() {
+        // An offset past the last match is an empty page, not no
+        // matches: the total says so.
+        let list = ScmsyncProjectList {
+            projects: vec![],
+            matches: 3,
+            offset: 5,
+        };
+        let text = render_scmsync_projects("https://github.com/openSUSE/", &list);
+        assert!(text.contains("no projects on this page"));
+        assert!(text.contains("3 matches in total"));
     }
 
     #[test]
