@@ -49,6 +49,37 @@ fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')
 }
 
+/// True when `c` can start an XML element or attribute name here:
+/// ASCII alphabetic plus `_` and `:`. Digits, `-` and `.` can
+/// appear in a name but never start one, so a `<` followed by
+/// one of those is bare text, not a tag.
+fn is_name_start_char(c: char) -> bool {
+    c.is_ascii_alphabetic() || matches!(c, '_' | ':')
+}
+
+/// True when `text` holds a `<` outside a quoted section (either
+/// quote kind). A nested tag's own span cannot hold one: a `<`
+/// there means the `>` that ended the span belongs to a later
+/// construct, not to this tag.
+fn has_bare_lt(text: &str) -> bool {
+    let mut quote: Option<char> = None;
+    for c in text.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '<' => return true,
+                _ => {}
+            },
+        }
+    }
+    false
+}
+
 /// The element name starting at `start` (just past the `<`, or past
 /// the `</` for a close tag): the name and the index just past it.
 /// None when there is no name there.
@@ -884,11 +915,38 @@ fn xml_element_end(inner: &str, start: usize, name: &str) -> Option<usize> {
             .unwrap_or(after.len());
         if &after[..oname_end] == name {
             let ogt = find_tag_end(after)?;
-            if !after[..ogt].trim_end().ends_with('/') {
-                depth += 1;
+            if has_bare_lt(&after[..ogt]) {
+                // An unterminated nested tag of the same name is
+                // bare text, like any other `<` whose span holds
+                // a `<` outside quotes: step past it instead of
+                // swallowing the element's own close tag.
+                scan = pos + 1;
+            } else {
+                if !after[..ogt].trim_end().ends_with('/') {
+                    depth += 1;
+                }
+                scan = pos + 1 + ogt + 1;
             }
-            scan = pos + 1 + ogt + 1;
+        } else if after.chars().next().is_some_and(is_name_start_char) {
+            // A nested opening tag of another name: skip the whole
+            // tag, not just past its `<`. Its attributes may hold
+            // `<` or `<!--` (e.g. `<b title="<!--">`), which
+            // re-scanning would mistake for a comment opener. The
+            // tag's content is still scanned for the matching close.
+            // But only when the span holds no `<` outside quotes:
+            // a `<` there means the `>` that ended the span belongs
+            // to a later construct (e.g. `<b</a>`), and skipping
+            // whole would swallow the element's own close tag.
+            let ogt = find_tag_end(after)?;
+            if has_bare_lt(&after[..ogt]) {
+                scan = pos + 1;
+            } else {
+                scan = pos + 1 + ogt + 1;
+            }
         } else {
+            // Bare `<` in element text, not a tag: step past it,
+            // as before — jumping past the next `>` would swallow
+            // the element's own close tag.
             scan = pos + 1;
         }
     }
@@ -1652,6 +1710,51 @@ mod tests {
         assert!(xml_child_elements("</package>", "package").is_err());
         assert!(xml_child_elements("<></>", "package").is_err());
         assert!(xml_child_elements("<package name=\"a\"/><></>", "package").is_err());
+    }
+
+    #[test]
+    fn xml_element_end_skips_a_nested_tag_whole() {
+        // A `<!--` inside a nested tag's quoted attribute value
+        // is not a comment opener: the tag is skipped whole and
+        // its close still ends the element.
+        let inner = "<a><b title=\"<!--\">x</b></a>";
+        assert_eq!(xml_element_end(inner, 0, "a"), Some(inner.len()));
+        let inner = "<a><b title=\"<!--\">x</b></a><package name=\"p\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("name=\"p\""));
+    }
+
+    #[test]
+    fn xml_element_end_bare_lt_in_text_still_parses() {
+        // A bare `<` in element text is not a tag: the element
+        // still ends at its own close tag. That holds for `<`
+        // followed by a digit, `-`, or `.` too: those can appear
+        // in a name but never start one.
+        let inner = "<title>1 < 2</title><package name=\"p\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 1);
+        let inner = "<a>text <</a><package name=\"p\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(xml_element_end("<a>1 <2</a>", 0, "a"), Some(11));
+        let inner = "<title>needs <2GB RAM</title><package name=\"p\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 1);
+        let inner = "<a>a <- b</a><package name=\"p\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 1);
+        let inner = "<a>a <. b</a><package name=\"p\"/>";
+        let found = xml_child_elements(inner, "package").unwrap();
+        assert_eq!(found.len(), 1);
+        // An unterminated nested tag is bare text too: the `<b`
+        // in `<b</a>` has no `>` of its own, so the element still
+        // ends at its own close tag.
+        assert_eq!(xml_element_end("<a>text <b</a>", 0, "a"), Some(14));
+        assert_eq!(xml_element_end("<a>a <b c</a>", 0, "a"), Some(13));
+        // The same-name branch has the same guard.
+        assert_eq!(xml_element_end("<a>a <a b</a>", 0, "a"), Some(13));
+        assert_eq!(xml_element_end("<a>text <a</a>", 0, "a"), Some(14));
     }
 
     #[test]

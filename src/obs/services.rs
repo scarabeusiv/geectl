@@ -745,6 +745,37 @@ mod tests {
     }
 
     #[test]
+    fn service_param_with_bare_lt_in_value_parses() {
+        // A bare `<` in a parameter value is text, not a tag:
+        // the file parses (the value itself is the text before
+        // the first `<`, by the pre-existing rule).
+        let services = parse_services(
+            "<services><service name=\"download_url\" mode=\"manual\"><param name=\"x\">a < b</param></service></services>",
+        )
+        .unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].params.len(), 1);
+        assert_eq!(services[0].params[0].value, "a ");
+        // Same for `<` followed by a digit: it is text, not a tag.
+        let services = parse_services(
+            "<services><service name=\"download_url\" mode=\"manual\"><param name=\"x\">a <2 b</param></service></services>",
+        )
+        .unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].params.len(), 1);
+        assert_eq!(services[0].params[0].value, "a ");
+        // Same for `<` starting a tag-like span with no `>` of its
+        // own: it is text, not a tag.
+        let services = parse_services(
+            "<services><service name=\"download_url\" mode=\"manual\"><param name=\"x\">a <b c</param></service></services>",
+        )
+        .unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].params.len(), 1);
+        assert_eq!(services[0].params[0].value, "a ");
+    }
+
+    #[test]
     fn unknown_mode_is_stored_verbatim() {
         let services = parse_services(SV_UNKNOWN_MODE).unwrap();
         assert_eq!(services.len(), 1);
