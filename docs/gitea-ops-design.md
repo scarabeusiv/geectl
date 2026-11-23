@@ -719,9 +719,11 @@ with unique repo names per test (same rule as the OBS live suite).
 - `test_gitea_exceptions.py` (22): adopt the mapping table as
   unit tests — 301 per operation, 404 → `NotFound`, 401/403 →
   `AuthFailed`, 422 → `InvalidInput` with the server message.
-- `test_maintainership.py` (3) + converter (7): SKIP — the
-  `obs-maintainers` document is a repo-file convention, not an
-  API operation; no agent use case in the library.
+- `test_maintainership.py` (3): adopted by #207 — the git
+  maintainership read (`gitea maintainers`) parses the
+  `obs-maintainers` document (v1.0 + legacy) via the Gitea raw
+  endpoint. The converter (7) stays SKIP: the migrate/write
+  command has no agent use case.
 - Config/credentials (`test_conf.py`, `test_config_parser.py`,
   `test_credentials.py`): SKIP — geectl's config/auth already
   cover the single-instance env story; the multi-login model is
@@ -785,9 +787,11 @@ with unique repo names per test (same rule as the OBS live suite).
 - **SSH key PIN prompting** (osc #1935): geectl has no prompts —
   missing input fails fast. The PIN is git's when it uses the key,
   never geectl's.
-- **`repo init` templates, maintainership parsing, diff
-  generators**: local config / repo-file conventions / rendering —
-  not library operations (see test borrowing).
+- **`repo init` templates, diff generators**: local config /
+  repo-file conventions / rendering — not library operations
+  (see test borrowing). Maintainership parsing left this list
+  in #207: the read is a library operation (`gitea
+  maintainers`); only the migrate/write side stays out.
 
 ## Open decisions
 

@@ -685,6 +685,16 @@ unsurveyed unit tests.**
   modelled (full name only).
 - `tests/test__private_api.py::TestXmlEscape` (5 cases) →
   `xml_escape_escapes_the_five_xml_specials` (sweep 2).
+- `test_maintainership.py` (3) →
+  `parse_maintainership_v1_reads_project_and_packages`,
+  `parse_maintainership_legacy_splits_at_prefixed_groups`,
+  `parse_maintainership_empty_document_has_no_maintainers`
+  (#207, the git maintainership read). An unknown package/user
+  is `NotFound` where osc raises `ValueError`. The `null`-list
+  case comes from
+  `test_maintainership_converter.py::test_v1_format_passthrough`;
+  the converter's other 6 cases pin the migrate/write command,
+  which #207 does not build.
 - Covered in substance, no new test: `test_gitea_api_repo.py`
   (`repo_get_parses_a_repo_and_ignores_unknown_fields`,
   `repo_get_parses_a_fork_parent`); `test_gitea_api_branch.py`
@@ -746,9 +756,6 @@ unsurveyed unit tests.**
   parsing and merging (`test_gitattributes.py` 7,
   `test_gitignore.py` 7), `ScmsyncObsinfo`
   (`test_scmsync_obsinfo.py` 3).
-- Maintainership (`test_maintainership.py` 3,
-  `test_maintainership_converter.py` 7): no `obs-maintainers`
-  parsing.
 - No equivalent, surveyed and closed: `test_conf.py` (102, oscrc
   attributes geectl does not have), `test_config_parser.py` (6, INI
   format preservation — geectl config is TOML and never written),

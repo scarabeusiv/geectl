@@ -864,6 +864,71 @@ fn gitea_branch_read_round_trip() {
 }
 
 #[test]
+fn gitea_maintainership_read_round_trip_and_missing() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let repo = unique_repo_name();
+    let repo_guard = LiveRepo::new(&client, &gitea_user(), &repo);
+    create_repo_typed(&client, &repo, "factory");
+    create_commit_raw(
+        &http,
+        &RepoAddr {
+            base: &base,
+            owner: &gitea_user(),
+            repo: &repo,
+        },
+        "_maintainership.json",
+        "{\"header\": {\"document\": \"obs-maintainers\", \"version\": \"1.0\"}, \"project\": {\"users\": [\"alice\"], \"groups\": [\"team\"]}, \"packages\": {\"package1\": {\"users\": [\"bob\"], \"groups\": [\"pkg1-group\"]}}}",
+        "factory",
+        None,
+    );
+    // The typed read returns the committed document: project scope
+    // and per-package scope, users then `@`-prefixed groups.
+    let maintainership = client
+        .maintainership(&gitea_user(), &repo)
+        .expect("typed maintainership reads the committed file");
+    assert_eq!(maintainership.version, "1.0");
+    assert_eq!(maintainership.project_maintainers(), vec!["alice", "@team"]);
+    assert_eq!(
+        maintainership.package_maintainers("package1").unwrap(),
+        vec!["bob", "@pkg1-group"]
+    );
+    let deleted = repo_guard.delete();
+    assert_eq!(deleted, repo);
+    // A repo with commits but no `_maintainership.json` maps to
+    // NotFound, never an empty maintainership.
+    let repo_without = unique_repo_name();
+    let repo_without_guard = LiveRepo::new(&client, &gitea_user(), &repo_without);
+    create_repo_typed(&client, &repo_without, "factory");
+    create_commit_raw(
+        &http,
+        &RepoAddr {
+            base: &base,
+            owner: &gitea_user(),
+            repo: &repo_without,
+        },
+        "README.md",
+        "no maintainership here\n",
+        "factory",
+        None,
+    );
+    let err = client
+        .maintainership(&gitea_user(), &repo_without)
+        .expect_err("a repo without _maintainership.json must not return a value");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::NotFound,
+        "a missing _maintainership.json must map to NotFound; got {err:?}"
+    );
+    let deleted = repo_without_guard.delete();
+    assert_eq!(deleted, repo_without);
+}
+
+#[test]
 fn gitea_fork_round_trip() {
     let Some(base) = gitea_url() else {
         eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");

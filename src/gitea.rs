@@ -1,7 +1,7 @@
 //! The Gitea operations for git-backed packages: repo read, fork,
 //! repo delete, repo list, repo create, branch read and branch head,
-//! and the `branch` composite (Gitea fork + OBS `cmd=fork`) behind
-//! the uniform flow.
+//! maintainership read, and the `branch` composite (Gitea fork +
+//! OBS `cmd=fork`) behind the uniform flow.
 //!
 //! The client is internal plumbing, not the user-facing surface:
 //! the uniform flow verbs (`branch`, `submit`, …) are what an agent
@@ -51,6 +51,7 @@ use crate::obs::ObsClient;
 use crate::url::UrlBuilder;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// A Gitea user: only the login is modelled (the fork target-owner
@@ -197,6 +198,106 @@ pub struct GiteaBranch {
     /// that omits it must fail the parse rather than read the
     /// branch as unprotected.
     pub protected: bool,
+}
+
+/// The maintainers of one scope in a git project's
+/// `_maintainership.json`: the users and groups recorded for the
+/// project itself or for one package. Groups are bare logins here —
+/// the `@` prefix of the file format is presentation, not data, so
+/// the accessors add it back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaintainerInfo {
+    /// The user logins maintaining this scope.
+    pub users: Vec<String>,
+    /// The group names maintaining this scope, without `@`.
+    pub groups: Vec<String>,
+}
+
+impl MaintainerInfo {
+    /// The maintainers of this scope: users first, then groups with
+    /// the `@` prefix the file format uses.
+    pub fn names(&self) -> Vec<String> {
+        let mut names = self.users.clone();
+        names.extend(self.groups.iter().map(|group| format!("@{group}")));
+        names
+    }
+}
+
+/// The maintainers recorded in a git project's
+/// `_maintainership.json` (the `obs-maintainers` document, version
+/// `1.0`): the project maintainers and the per-package maintainers.
+/// The legacy form — a flat map of package name to a list of logins
+/// (`@`-prefixed entries are groups, the `""` entry is the project)
+/// — parses to the same shape, so callers never see the two
+/// formats. Unknown fields are ignored, like the Gitea responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Maintainership {
+    /// The document version; always `"1.0"` — the legacy form
+    /// normalizes to it.
+    pub version: String,
+    /// The project maintainers.
+    pub project: MaintainerInfo,
+    /// The per-package maintainers, by package name (sorted).
+    pub packages: BTreeMap<String, MaintainerInfo>,
+}
+
+impl Maintainership {
+    /// The project maintainers: users first, then `@`-prefixed
+    /// groups.
+    pub fn project_maintainers(&self) -> Vec<String> {
+        self.project.names()
+    }
+
+    /// The maintainers of one package: users first, then
+    /// `@`-prefixed groups. A package with no entry is `NotFound`,
+    /// never an empty list — the caller asked for that package.
+    pub fn package_maintainers(&self, package: &str) -> Result<Vec<String>, GeectlError> {
+        match self.packages.get(package) {
+            Some(info) => Ok(info.names()),
+            None => Err(GeectlError::new(
+                ErrorKind::NotFound,
+                format!("package {package:?} has no entry in _maintainership.json"),
+            )),
+        }
+    }
+
+    /// The packages a user maintains, sorted (the map is ordered).
+    /// A user maintaining nothing is `NotFound`, never an empty
+    /// list.
+    pub fn packages_for_user(&self, user: &str) -> Result<Vec<String>, GeectlError> {
+        let packages: Vec<String> = self
+            .packages
+            .iter()
+            .filter(|(_, info)| info.users.iter().any(|name| name == user))
+            .map(|(package, _)| package.clone())
+            .collect();
+        if packages.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::NotFound,
+                format!("user {user:?} maintains no package in _maintainership.json"),
+            ));
+        }
+        Ok(packages)
+    }
+
+    /// The packages a group maintains, sorted (the map is ordered).
+    /// A group maintaining nothing is `NotFound`, never an empty
+    /// list.
+    pub fn packages_for_group(&self, group: &str) -> Result<Vec<String>, GeectlError> {
+        let packages: Vec<String> = self
+            .packages
+            .iter()
+            .filter(|(_, info)| info.groups.iter().any(|name| name == group))
+            .map(|(package, _)| package.clone())
+            .collect();
+        if packages.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::NotFound,
+                format!("group {group:?} maintains no package in _maintainership.json"),
+            ));
+        }
+        Ok(packages)
+    }
 }
 
 /// A Gitea pull request: only the fields the read operations need
@@ -2060,6 +2161,34 @@ impl<'a> GiteaClient<'a> {
         Ok(self.branch_get(owner, repo, branch)?.commit.id)
     }
 
+    /// Read the maintainers recorded in a git project's
+    /// `_maintainership.json` (`GET
+    /// /api/v1/repos/{owner}/{repo}/raw/_maintainership.json`): the
+    /// project maintainers and the per-package maintainers, as typed
+    /// values — the git-side counterpart of the OBS `maintainers`
+    /// read. The file is read from the repo's default branch. A repo
+    /// without the file is `NotFound`, never an empty maintainership
+    /// — the caller asked for that repo's maintainers.
+    pub fn maintainership(&self, owner: &str, repo: &str) -> Result<Maintainership, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        let url = build_url(
+            &self.base,
+            &[
+                "api",
+                "v1",
+                "repos",
+                owner,
+                repo,
+                "raw",
+                "_maintainership.json",
+            ],
+            &[],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_maintainership(&body, owner, repo)
+    }
+
     /// Read one pull request (`GET
     /// /api/v1/repos/{owner}/{repo}/pulls/{number}`): the title and
     /// body, state and merge flags, author, labels, and the
@@ -3357,6 +3486,195 @@ fn parse_branch(
         ));
     }
     Ok(parsed)
+}
+
+/// Parse a `_maintainership.json` document (the `obs-maintainers`
+/// format osc's `gitea_api/maintainership.py` reads) into its typed
+/// form. Two shapes parse to the same value:
+/// - v1.0: `{"header": {"document": "obs-maintainers", "version":
+///   "1.0"}, "project": {"users": [...], "groups": [...]},
+///   "packages": {"<package>": {"users": [...], "groups":
+///   [...]}}}`. `users`/`groups` are optional and nullable — a
+///   missing or `null` list reads as empty (osc's converter passes
+///   a `null` list through as absent).
+/// - legacy (no `header`): a flat map of package name to a list of
+///   logins; `@`-prefixed entries are groups, the `""` entry is the
+///   project. A missing `""` entry reads as no project maintainers.
+///
+/// Anything else is a server error naming the repo and the defect:
+/// malformed JSON, a non-object document, a header naming another
+/// document or an unknown version, a scope that is not an object,
+/// or a list that is not a list of strings. osc silently skips a
+/// legacy package entry that is not a list; geectl fails the parse
+/// instead — a body that is not a maintainership document is an
+/// error, never a silently partial read.
+fn parse_maintainership(
+    body: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<Maintainership, GeectlError> {
+    let invalid = |detail: String| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected _maintainership.json content for {owner}/{repo}: {detail}"),
+        )
+    };
+    let value: Value = serde_json::from_str(body).map_err(|err| invalid(err.to_string()))?;
+    let document = value
+        .as_object()
+        .ok_or_else(|| invalid("the document is not a JSON object".to_string()))?;
+    match document.get("header") {
+        // osc's header is Optional: an explicit null reads as
+        // absent, so the document parses as legacy.
+        None | Some(Value::Null) => parse_legacy_maintainership(document, &invalid),
+        Some(header) => parse_v1_maintainership(document, header, &invalid),
+    }
+}
+
+/// The v1.0 half of `parse_maintainership`: a `header` naming the
+/// `obs-maintainers` document at version `1.0`, a `project` scope,
+/// and a `packages` map. A missing `version` reads as `"1.0"`
+/// (the model's only version, not osc's read behaviour — osc reads
+/// the header version directly and fails if it is absent); a present
+/// one must be the string `"1.0"`.
+fn parse_v1_maintainership(
+    document: &serde_json::Map<String, Value>,
+    header: &Value,
+    invalid: &dyn Fn(String) -> GeectlError,
+) -> Result<Maintainership, GeectlError> {
+    let header = header
+        .as_object()
+        .ok_or_else(|| invalid("the header is not a JSON object".to_string()))?;
+    let document_name = header
+        .get("document")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("the header names no document".to_string()))?;
+    if document_name != "obs-maintainers" {
+        return Err(invalid(format!(
+            "unknown maintainership document: {document_name:?}"
+        )));
+    }
+    let version = match header.get("version") {
+        None => "1.0".to_string(),
+        Some(value) => match value.as_str() {
+            Some(version) => version.to_string(),
+            None => {
+                return Err(invalid("the header version is not a string".to_string()));
+            }
+        },
+    };
+    if version != "1.0" {
+        return Err(invalid(format!(
+            "unknown _maintainership.json version: {version}"
+        )));
+    }
+    let project = match document.get("project") {
+        None => MaintainerInfo::default(),
+        Some(value) => parse_maintainer_info(value, "project", invalid)?,
+    };
+    let mut packages = BTreeMap::new();
+    if let Some(packages_value) = document.get("packages") {
+        let packages_object = packages_value
+            .as_object()
+            .ok_or_else(|| invalid("packages is not a JSON object".to_string()))?;
+        for (package, value) in packages_object {
+            packages.insert(
+                package.clone(),
+                parse_maintainer_info(value, &format!("package {package:?}"), invalid)?,
+            );
+        }
+    }
+    Ok(Maintainership {
+        version,
+        project,
+        packages,
+    })
+}
+
+/// One `{"users": [...], "groups": [...]}` scope of a v1.0
+/// document. Both lists are optional and nullable; a list that is
+/// present must hold strings.
+fn parse_maintainer_info(
+    value: &Value,
+    scope: &str,
+    invalid: &dyn Fn(String) -> GeectlError,
+) -> Result<MaintainerInfo, GeectlError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid(format!("{scope} is not a JSON object")))?;
+    Ok(MaintainerInfo {
+        users: string_list(object.get("users"), "users", scope, invalid)?,
+        groups: string_list(object.get("groups"), "groups", scope, invalid)?,
+    })
+}
+
+/// One optional, nullable list of strings in a v1.0 scope: missing
+/// or `null` reads as empty; a present list must hold strings.
+fn string_list(
+    value: Option<&Value>,
+    field: &str,
+    scope: &str,
+    invalid: &dyn Fn(String) -> GeectlError,
+) -> Result<Vec<String>, GeectlError> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            let mut list = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(name) => list.push(name.to_string()),
+                    None => {
+                        return Err(invalid(format!("{scope} {field} holds a non-string entry")));
+                    }
+                }
+            }
+            Ok(list)
+        }
+        Some(_) => Err(invalid(format!("{scope} {field} is not a list"))),
+    }
+}
+
+/// The legacy half of `parse_maintainership`: a flat map of package
+/// name to a list of logins, with `@`-prefixed entries as groups and
+/// the `""` entry as the project. A missing `""` entry reads as no
+/// project maintainers. The legacy form normalizes to version
+/// `"1.0"`, like osc's conversion.
+fn parse_legacy_maintainership(
+    document: &serde_json::Map<String, Value>,
+    invalid: &dyn Fn(String) -> GeectlError,
+) -> Result<Maintainership, GeectlError> {
+    let mut project = MaintainerInfo::default();
+    let mut packages = BTreeMap::new();
+    for (name, value) in document {
+        // The `header` key is what selected this branch (absent or
+        // null); it is metadata, not a package entry.
+        if name == "header" {
+            continue;
+        }
+        let items = value
+            .as_array()
+            .ok_or_else(|| invalid(format!("legacy entry {name:?} is not a list")))?;
+        let mut info = MaintainerInfo::default();
+        for item in items {
+            let login = item.as_str().ok_or_else(|| {
+                invalid(format!("legacy entry {name:?} holds a non-string entry"))
+            })?;
+            match login.strip_prefix('@') {
+                Some(group) => info.groups.push(group.to_string()),
+                None => info.users.push(login.to_string()),
+            }
+        }
+        if name.is_empty() {
+            project = info;
+        } else {
+            packages.insert(name.clone(), info);
+        }
+    }
+    Ok(Maintainership {
+        version: "1.0".to_string(),
+        project,
+        packages,
+    })
 }
 
 /// Strip what does not change which instance an authority names:
@@ -5714,6 +6032,255 @@ mod tests {
             .branch_head("pool", "systemd", "factory")
             .unwrap();
         assert_eq!(head, sha);
+    }
+
+    /// A v1.0 `_maintainership.json`, shaped like the file osc's
+    /// `test_maintainership.py::test_from_string_v1` parses.
+    const MAINTAINERSHIP_V1: &str = r#"{
+        "header": {"document": "obs-maintainers", "version": "1.0"},
+        "project": {"users": ["project_owner1", "project_owner2"], "groups": ["project-maintainer-group"]},
+        "packages": {
+            "package1": {"users": ["alice", "bob"], "groups": ["pkg1-maintainers"]},
+            "package2": {"users": ["charlie"], "groups": ["pkg2-maintainers"]}
+        }
+    }"#;
+
+    /// A legacy `_maintainership.json`, shaped like the file osc's
+    /// `test_maintainership.py::test_from_string_legacy` parses.
+    const MAINTAINERSHIP_LEGACY: &str = r#"{
+        "": ["project-maintainer"],
+        "package1": ["alice"],
+        "package2": ["bob", "@group"]
+    }"#;
+
+    #[test]
+    fn parse_maintainership_v1_reads_project_and_packages() {
+        // Borrowed from osc `test_maintainership.py::test_from_string_v1`.
+        let parsed = parse_maintainership(MAINTAINERSHIP_V1, "pool", "systemd").unwrap();
+        assert_eq!(parsed.version, "1.0");
+        assert_eq!(
+            parsed.project_maintainers(),
+            vec![
+                "project_owner1",
+                "project_owner2",
+                "@project-maintainer-group"
+            ]
+        );
+        assert_eq!(
+            parsed.package_maintainers("package1").unwrap(),
+            vec!["alice", "bob", "@pkg1-maintainers"]
+        );
+        assert_eq!(
+            parsed.package_maintainers("package2").unwrap(),
+            vec!["charlie", "@pkg2-maintainers"]
+        );
+        assert_eq!(parsed.packages_for_user("alice").unwrap(), vec!["package1"]);
+        assert_eq!(
+            parsed.packages_for_user("charlie").unwrap(),
+            vec!["package2"]
+        );
+        assert_eq!(
+            parsed.packages_for_group("pkg1-maintainers").unwrap(),
+            vec!["package1"]
+        );
+    }
+
+    #[test]
+    fn parse_maintainership_legacy_splits_at_prefixed_groups() {
+        // Borrowed from osc `test_maintainership.py::test_from_string_legacy`.
+        let parsed = parse_maintainership(MAINTAINERSHIP_LEGACY, "pool", "systemd").unwrap();
+        assert_eq!(parsed.version, "1.0");
+        assert_eq!(parsed.project_maintainers(), vec!["project-maintainer"]);
+        assert_eq!(
+            parsed.package_maintainers("package1").unwrap(),
+            vec!["alice"]
+        );
+        assert_eq!(
+            parsed.package_maintainers("package2").unwrap(),
+            vec!["bob", "@group"]
+        );
+        assert_eq!(parsed.packages_for_user("alice").unwrap(), vec!["package1"]);
+        assert_eq!(parsed.packages_for_user("bob").unwrap(), vec!["package2"]);
+        assert_eq!(
+            parsed.packages_for_group("group").unwrap(),
+            vec!["package2"]
+        );
+    }
+
+    #[test]
+    fn parse_maintainership_null_header_reads_as_legacy() {
+        // osc's header is Optional: an explicit null header reads
+        // as absent, so the document parses as the legacy form.
+        let parsed = parse_maintainership(
+            r#"{"header": null, "": ["project-maintainer"], "package1": ["alice"]}"#,
+            "pool",
+            "systemd",
+        )
+        .unwrap();
+        assert_eq!(parsed.version, "1.0");
+        assert_eq!(parsed.project_maintainers(), vec!["project-maintainer"]);
+        assert_eq!(
+            parsed.package_maintainers("package1").unwrap(),
+            vec!["alice"]
+        );
+    }
+
+    #[test]
+    fn parse_maintainership_empty_document_has_no_maintainers() {
+        // Borrowed from osc `test_maintainership.py::test_empty_and_missing`:
+        // an empty document parses; an unknown package and an unknown
+        // user are errors, never empty lists (osc raises ValueError;
+        // geectl maps it to NotFound).
+        let parsed = parse_maintainership("{}", "pool", "systemd").unwrap();
+        assert!(parsed.project_maintainers().is_empty());
+        assert!(parsed.packages.is_empty());
+        let err = parsed.package_maintainers("nonexistent").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        let err = parsed.packages_for_user("nobody").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn parse_maintainership_null_lists_read_as_empty() {
+        // From osc `test_maintainership_converter.py::test_v1_format_passthrough`:
+        // a v1.0 document with explicit `null` lists parses, the nulls
+        // reading as absent.
+        let parsed = parse_maintainership(
+            r#"{"header": {"document": "obs-maintainers", "version": "1.0"},
+                "project": {"users": ["alice"], "groups": null},
+                "packages": {"pkg1": {"users": ["bob"], "groups": ["team"]},
+                             "pkg2": {"users": null, "groups": ["team"]}}}"#,
+            "pool",
+            "systemd",
+        )
+        .unwrap();
+        assert_eq!(parsed.project_maintainers(), vec!["alice"]);
+        assert_eq!(
+            parsed.package_maintainers("pkg1").unwrap(),
+            vec!["bob", "@team"]
+        );
+        assert_eq!(parsed.package_maintainers("pkg2").unwrap(), vec!["@team"]);
+    }
+
+    #[test]
+    fn parse_maintainership_unknown_version_is_a_server_error() {
+        let err = parse_maintainership(
+            r#"{"header": {"document": "obs-maintainers", "version": "2.0"},
+                "project": {}, "packages": {}}"#,
+            "pool",
+            "systemd",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(err.to_string().contains("2.0"));
+        let err = parse_maintainership(
+            r#"{"header": {"document": "something-else", "version": "1.0"},
+                "project": {}, "packages": {}}"#,
+            "pool",
+            "systemd",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        let err = parse_maintainership("not json", "pool", "systemd").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        let err = parse_maintainership(r#"["alice"]"#, "pool", "systemd").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn parse_maintainership_missing_version_defaults_to_1_0() {
+        // The default comes from the model, not osc's read path:
+        // osc reads the header version directly and fails if it is
+        // absent; geectl stays lenient and reads it as "1.0".
+        let parsed = parse_maintainership(
+            r#"{"header": {"document": "obs-maintainers"},
+                "project": {"users": ["alice"]}, "packages": {}}"#,
+            "pool",
+            "systemd",
+        )
+        .unwrap();
+        assert_eq!(parsed.version, "1.0");
+        assert_eq!(parsed.project_maintainers(), vec!["alice"]);
+    }
+
+    #[test]
+    fn parse_maintainership_null_project_or_packages_is_a_server_error() {
+        // The model fields are not Optional, like osc's: a null
+        // `project` or `packages` scope is an error, never empty.
+        // (Null *lists* inside a scope read as empty instead — see
+        // parse_maintainership_null_lists_read_as_empty.)
+        let err = parse_maintainership(
+            r#"{"header": {"document": "obs-maintainers", "version": "1.0"},
+                "project": null, "packages": {}}"#,
+            "pool",
+            "systemd",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        let err = parse_maintainership(
+            r#"{"header": {"document": "obs-maintainers", "version": "1.0"},
+                "project": {}, "packages": null}"#,
+            "pool",
+            "systemd",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn maintainership_reads_the_raw_file() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/raw/_maintainership.json",
+            MAINTAINERSHIP_V1,
+        );
+        let parsed = client(&http).maintainership("pool", "systemd").unwrap();
+        assert_eq!(parsed.version, "1.0");
+        assert_eq!(
+            parsed.project_maintainers(),
+            vec![
+                "project_owner1",
+                "project_owner2",
+                "@project-maintainer-group"
+            ]
+        );
+        assert_eq!(
+            parsed.package_maintainers("package1").unwrap(),
+            vec!["alice", "bob", "@pkg1-maintainers"]
+        );
+    }
+
+    #[test]
+    fn maintainership_missing_file_is_not_found() {
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/raw/_maintainership.json",
+            ErrorKind::NotFound,
+        );
+        let err = client(&http).maintainership("pool", "systemd").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn maintainership_validates_names_before_any_call() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .maintainership("pool", "sys temd")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = client(&http)
+            .maintainership("po/ol", "systemd")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn maintainership_malformed_content_is_a_server_error() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/raw/_maintainership.json",
+            "not json",
+        );
+        let err = client(&http).maintainership("pool", "systemd").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]

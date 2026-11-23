@@ -39,7 +39,8 @@ use geectl::config::{self, DEFAULT_GITEA_URL};
 use geectl::debug::Debug;
 use geectl::error::GeectlError;
 use geectl::gitea::{
-    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaRepository, RepoCreateOptions,
+    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaRepository, MaintainerInfo, Maintainership,
+    RepoCreateOptions,
 };
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::DryRun;
@@ -106,6 +107,16 @@ pub enum GiteaCommand {
         repo: String,
         /// The branch name.
         branch: String,
+    },
+    /// Show the maintainers recorded in a git project's
+    /// `_maintainership.json`: the project maintainers and the
+    /// per-package maintainers. The git-side counterpart of `remote
+    /// maintainers`, read from the repo's default branch.
+    Maintainers {
+        /// The repository owner.
+        owner: String,
+        /// The repository name.
+        repo: String,
     },
 }
 
@@ -310,6 +321,10 @@ pub fn run_gitea(
             });
             // Content command: the text IS the SHA.
             Ok((payload, head))
+        }
+        GiteaCommand::Maintainers { owner, repo } => {
+            let maintainership = client.maintainership(&owner, &repo)?;
+            Ok(maintainers_result(&owner, &repo, &maintainership))
         }
     }
 }
@@ -523,6 +538,70 @@ fn render_branch(branch: &GiteaBranch) -> String {
     lines.join("\n")
 }
 
+/// The maintainership read as its JSON payload and its text
+/// rendering: the whole document in both — the typed form is the
+/// document, so the payload carries the project scope and every
+/// package scope, and the text lists them one per line.
+fn maintainers_result(owner: &str, repo: &str, maintainership: &Maintainership) -> (Value, String) {
+    (
+        maintainership_json(owner, repo, maintainership),
+        with_header(
+            &format!("owner: {owner} repo: {repo}"),
+            render_maintainership(maintainership),
+        ),
+    )
+}
+
+fn maintainership_json(owner: &str, repo: &str, maintainership: &Maintainership) -> Value {
+    let mut packages = serde_json::Map::new();
+    for (name, info) in &maintainership.packages {
+        packages.insert(name.clone(), maintainer_info_json(info));
+    }
+    json!({
+        "owner": owner,
+        "repo": repo,
+        "version": maintainership.version,
+        "project": maintainer_info_json(&maintainership.project),
+        "packages": packages,
+    })
+}
+
+fn maintainer_info_json(info: &MaintainerInfo) -> Value {
+    json!({
+        "users": info.users,
+        "groups": info.groups,
+    })
+}
+
+/// The maintainership as `key: value` lines: the project scope
+/// first, then one line per package (sorted). An empty scope reads
+/// `-`; a document with no maintainers at all reads `no
+/// maintainers`.
+fn render_maintainership(maintainership: &Maintainership) -> String {
+    if maintainership.project.names().is_empty() && maintainership.packages.is_empty() {
+        return "no maintainers".to_string();
+    }
+    let mut lines = vec![format!(
+        "project: {}",
+        maintainer_names_or_dash(&maintainership.project)
+    )];
+    for (package, info) in &maintainership.packages {
+        lines.push(format!("{package}: {}", maintainer_names_or_dash(info)));
+    }
+    lines.join("\n")
+}
+
+/// One scope's maintainers as a comma-separated list (`@`-prefixed
+/// groups), or `-` when the scope has none.
+fn maintainer_names_or_dash(info: &MaintainerInfo) -> String {
+    let names = info.names();
+    if names.is_empty() {
+        "-".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// Render rows as a space-aligned table with a header row. Widths are
 /// the widest value in the printed set, in characters.
 fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -576,6 +655,73 @@ mod tests {
             Some(Command::Gitea { command }) => command,
             _ => panic!("expected a gitea command, got {:?}", args),
         }
+    }
+
+    #[test]
+    fn gitea_maintainers_command_parses() {
+        assert!(matches!(
+            parse(&["geectl", "gitea", "maintainers", "pool", "systemd"]),
+            GiteaCommand::Maintainers { .. }
+        ));
+    }
+
+    fn maintainership_fixture() -> Maintainership {
+        Maintainership {
+            version: "1.0".to_string(),
+            project: MaintainerInfo {
+                users: vec!["alice".to_string()],
+                groups: vec!["team".to_string()],
+            },
+            packages: [
+                (
+                    "package1".to_string(),
+                    MaintainerInfo {
+                        users: vec!["bob".to_string()],
+                        groups: vec!["pkg1-group".to_string()],
+                    },
+                ),
+                (
+                    "package2".to_string(),
+                    MaintainerInfo {
+                        users: vec!["charlie".to_string()],
+                        groups: vec![],
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn maintainers_result_renders_project_and_package_lines() {
+        let (payload, text) = maintainers_result("pool", "systemd", &maintainership_fixture());
+        assert_eq!(payload["owner"], json!("pool"));
+        assert_eq!(payload["repo"], json!("systemd"));
+        assert_eq!(payload["version"], json!("1.0"));
+        assert_eq!(payload["project"]["users"], json!(["alice"]));
+        assert_eq!(payload["project"]["groups"], json!(["team"]));
+        assert_eq!(
+            payload["packages"]["package1"]["groups"],
+            json!(["pkg1-group"])
+        );
+        assert_eq!(payload["packages"]["package2"]["users"], json!(["charlie"]));
+        assert_eq!(
+            text,
+            "owner: pool repo: systemd\nproject: alice, @team\npackage1: bob, @pkg1-group\npackage2: charlie"
+        );
+    }
+
+    #[test]
+    fn maintainers_result_empty_is_no_maintainers() {
+        let empty = Maintainership {
+            version: "1.0".to_string(),
+            project: MaintainerInfo::default(),
+            packages: Default::default(),
+        };
+        let (payload, text) = maintainers_result("pool", "systemd", &empty);
+        assert_eq!(payload["packages"], json!({}));
+        assert_eq!(text, "owner: pool repo: systemd\nno maintainers");
     }
 
     #[test]

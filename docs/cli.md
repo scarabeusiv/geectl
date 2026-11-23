@@ -565,6 +565,7 @@ Commands:
   branch-list  List the branches of a repository
   branch-get   Show one branch: name, head commit, protection
   branch-head  Print the head commit SHA of a branch. Content command: the text IS the SHA, with no header
+  maintainers  Show the maintainers recorded in a git project's `_maintainership.json`: the project maintainers and the per-package maintainers. The git-side counterpart of `remote maintainers`, read from the repo's default branch
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -762,6 +763,7 @@ geectl service state openSUSE:Factory vim
 # Gitea (needs GEECTL_GITEA_TOKEN, even in dry-run)
 geectl gitea repo-get pool systemd
 geectl gitea branch-head pool systemd factory
+geectl gitea maintainers pool systemd
 geectl gitea repo-create vim --private
 
 # Pull requests (OBS + Gitea as one surface)

@@ -3559,7 +3559,7 @@ fn top_help_lists_the_service_group() {
 }
 
 #[test]
-fn gitea_help_lists_all_eight_subcommands() {
+fn gitea_help_lists_all_nine_subcommands() {
     let out = geectl().args(["gitea", "--help"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
@@ -3572,6 +3572,7 @@ fn gitea_help_lists_all_eight_subcommands() {
         "branch-list",
         "branch-get",
         "branch-head",
+        "maintainers",
     ] {
         assert!(text.contains(name), "gitea --help misses {name}");
     }
@@ -3782,6 +3783,26 @@ fn pull_request_show_gitea_without_credentials_fails_with_config_error() {
         .output()
         .unwrap();
     // ConfigError exits 9; a `gitea:` read needs the Bearer token
+    // and fails loudly without it.
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_GITEA_TOKEN"));
+}
+
+#[test]
+fn gitea_maintainers_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["gitea", "maintainers", "pool", "systemd"])
+        .output()
+        .unwrap();
+    // ConfigError exits 9; a `gitea:` read needs the Bearer <redacted>
     // and fails loudly without it.
     assert_eq!(out.status.code(), Some(9));
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
