@@ -855,12 +855,15 @@ fn xml_element_end(inner: &str, start: usize, name: &str) -> Option<usize> {
             scan = pos + 1;
             continue;
         }
-        if after.starts_with("!--") {
+        if let Some(content) = after.strip_prefix("!--") {
             // Comment (`after` is past the `<`, so the marker is
             // `!--`): skip to `-->`, not to the first `>`: a `>`
-            // inside a comment does not end it.
-            let end = after.find("-->")?;
-            scan = pos + 1 + end + 3;
+            // inside a comment does not end it. The search starts
+            // past the opener: a `-->` overlapping it (`<!-->`,
+            // `<!--->`) is not a terminator, it is an unterminated
+            // comment.
+            let rel = content.find("-->")?;
+            scan = pos + 1 + 3 + rel + 3;
             continue;
         }
         if after.starts_with('?') {
@@ -931,12 +934,16 @@ pub(crate) fn xml_child_elements<'a>(
             // was stripped by the caller, so nothing may close here.
             return Err(stray_close());
         }
-        if after_lt.starts_with("!--") {
+        if let Some(content) = after_lt.strip_prefix("!--") {
             // Comment (`after_lt` is past the `<`, so the marker
-            // is `!--`): skip to `-->`, not to the first `>`.
-            let Some(end) = after_lt.find("-->") else {
+            // is `!--`): skip to `-->`, not to the first `>`. The
+            // search starts past the opener: a `-->` overlapping
+            // it (`<!-->`, `<!--->`) is not a terminator, it is an
+            // unterminated comment.
+            let Some(rel) = content.find("-->") else {
                 return Err(unterminated());
             };
+            let end = 3 + rel;
             offset = tag_start + 1 + end + 3;
             continue;
         }
@@ -1012,9 +1019,12 @@ pub(crate) fn xml_top_level_text(inner: &str) -> Option<String> {
         out.push_str(&rest[..lt]);
         let tag_start = offset + lt;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with("!--") {
-            // Comment: skip to `-->`, not to the first `>`.
-            let end = after_lt.find("-->")?;
+        if let Some(content) = after_lt.strip_prefix("!--") {
+            // Comment: skip to `-->`, not to the first `>`. The
+            // search starts past the opener: a `-->` overlapping
+            // it (`<!-->`, `<!--->`) is not a terminator.
+            let rel = content.find("-->")?;
+            let end = 3 + rel;
             offset = tag_start + 1 + end + 3;
             continue;
         }
@@ -1083,11 +1093,15 @@ pub(crate) fn xml_direct_comments(text: &str) -> Vec<&str> {
         };
         let tag_start = offset + lt;
         let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with("!--") {
+        if let Some(content) = after_lt.strip_prefix("!--") {
             // Direct-child comment: collect it, skip to `-->`.
-            let Some(end) = after_lt.find("-->") else {
+            // The search starts past the opener: a `-->` overlapping
+            // it (`<!-->`, `<!--->`) is not a terminator, it is an
+            // unterminated comment, and the scan ends here.
+            let Some(rel) = content.find("-->") else {
                 break;
             };
+            let end = 3 + rel;
             out.push(&after_lt["!--".len()..end]);
             offset = tag_start + 1 + end + 3;
             continue;
@@ -1659,6 +1673,15 @@ mod tests {
     }
 
     #[test]
+    fn xml_top_level_text_degenerate_openers_are_unterminated() {
+        // A `-->` overlapping the comment opener is not a
+        // terminator: the text is unterminated, like in the other
+        // scanners.
+        assert!(xml_top_level_text("<!-->").is_none());
+        assert!(xml_top_level_text("<!---><arch>x</arch>").is_none());
+    }
+
+    #[test]
     fn xml_top_level_text_reads_text_between_elements_and_cdata() {
         assert_eq!(
             xml_top_level_text("junk<arch>x86_64</arch>more"),
@@ -1723,6 +1746,28 @@ mod tests {
             xml_direct_comments("<!-- done --><!-- never closed"),
             vec![" done "]
         );
+    }
+
+    #[test]
+    fn xml_direct_comments_degenerate_openers_end_the_scan() {
+        // `<!-->` and `<!--->` are not terminated comments: the
+        // `-->` in them overlaps the opener, so the scan ends and
+        // nothing after them is collected. An empty comment
+        // (`<!---->`) still collects as an empty body.
+        assert!(xml_direct_comments("<!-->").is_empty());
+        assert!(xml_direct_comments("<!--->").is_empty());
+        assert_eq!(xml_direct_comments("<!-- done --><!-->"), vec![" done "]);
+        assert_eq!(xml_direct_comments("<!-- done --><!--->"), vec![" done "]);
+        assert_eq!(xml_direct_comments("<!---->"), vec![""]);
+    }
+
+    #[test]
+    fn xml_child_elements_degenerate_comments_are_unterminated() {
+        // A degenerate comment opener fails the file, like any
+        // unterminated comment: it must not swallow the child
+        // that follows it.
+        assert!(xml_child_elements("<!--><package name=\"a\"/>", "package").is_err());
+        assert!(xml_child_elements("<!---><package name=\"a\"/>", "package").is_err());
     }
 
     #[test]
