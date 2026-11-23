@@ -704,7 +704,10 @@ fn parse_commitfilelist_response(body: &str) -> Result<CommitFilelistResponse, G
             return Err(malformed());
         };
         if !(first.is_whitespace() || first == '/' || first == '>') {
-            rest = &after_tag[1..];
+            // Skip the whole first character, not one byte: a
+            // multi-byte character (`<entryé`) would panic on a
+            // byte-boundary slice.
+            rest = &after_tag[first.len_utf8()..];
             continue;
         }
         let Some(end) = after_tag.find('>') else {
@@ -6791,6 +6794,17 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
+    }
+
+    #[test]
+    fn commitfilelist_response_with_a_multibyte_char_after_entry_does_not_panic() {
+        // `<entryé` used to slice one byte into the two-byte `é`
+        // and panic; the parser skips the whole character and
+        // reads the well-formed entry that follows.
+        let body = "<directory error=\"missing\" name=\"foo\"><entryé <entry name=\"bar.txt\" md5=\"d41d8cd98f00b204e9800998ecf8427e\" /></directory>";
+        let answer = parse_commitfilelist_response(body).unwrap();
+        assert_eq!(answer.missing, vec!["bar.txt".to_string()]);
+        assert!(answer.rev.is_none());
     }
 
     #[test]
