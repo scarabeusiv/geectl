@@ -521,7 +521,7 @@ fn rm_result(
     mutation_result(payload, header, result_line, dry_run, plan)
 }
 
-/// Stage every change in the worktree.
+/// Stage new files and worktree deletions.
 pub fn addremove(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
@@ -539,11 +539,14 @@ fn addremove_result(wc: &WorkingCopy, dry_run: bool, plan: Option<Vec<String>>) 
     });
     let result_line = if dry_run {
         format!(
-            "dry-run: would stage every change in {}/{}",
+            "dry-run: would stage new files and worktree deletions in {}/{}",
             wc.project, wc.package
         )
     } else {
-        format!("staged every change in {}/{}", wc.project, wc.package)
+        format!(
+            "staged new files and worktree deletions in {}/{}",
+            wc.project, wc.package
+        )
     };
     mutation_result(payload, header, result_line, dry_run, plan)
 }

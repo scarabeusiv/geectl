@@ -1989,7 +1989,10 @@ pub fn rm(wc: &WorkingCopy, files: &[String], dry_run: &DryRun) -> Result<Option
 /// rules either way. Modifications to tracked files are staged
 /// with `add`, not here. Returns `None` in dry-run.
 pub fn addremove(wc: &WorkingCopy, dry_run: &DryRun) -> Result<Option<()>, GeectlError> {
-    if !dry_run.allow(&format!("stage every change in {}", wc.root.display())) {
+    if !dry_run.allow(&format!(
+        "stage new files and worktree deletions in {}",
+        wc.root.display()
+    )) {
         return Ok(None);
     }
     let entries = status(wc)?;
@@ -1999,16 +2002,18 @@ pub fn addremove(wc: &WorkingCopy, dry_run: &DryRun) -> Result<Option<()>, Geect
         .map(|entry| entry.path.as_str())
         .collect();
     // A staged-new file deleted from the worktree is `Added`,
-    // not `Missing` (the cached diff wins), but it stages as a
-    // deletion all the same, as `git add -A` did: otherwise the
-    // next commit would send a file that no longer exists.
+    // and a staged rename whose new path is deleted is
+    // `Renamed`, not `Missing` (the cached diff wins), but both
+    // stage as a deletion all the same, as `git add -A` did:
+    // otherwise the next commit would send a file that no
+    // longer exists.
     // `symlink_metadata`, not `exists`: a broken symlink is
     // still in the worktree.
     let missing: Vec<&str> = entries
         .iter()
         .filter(|entry| {
             entry.code == StatusCode::Missing
-                || (entry.code == StatusCode::Added
+                || ((entry.code == StatusCode::Added || entry.code == StatusCode::Renamed)
                     && wc.root.join(&entry.path).symlink_metadata().is_err())
         })
         .map(|entry| entry.path.as_str())
@@ -4442,6 +4447,30 @@ mod tests {
                 ("other.txt".to_string(), StatusCode::Added),
             ]
         );
+    }
+
+    #[test]
+    fn addremove_stages_a_renamed_then_deleted_file_as_a_deletion() {
+        let dir = TempDirGuard::new("addrm-rename");
+        init_repo(&dir.path);
+        base_commit_with(&dir.path, REV1, SRCMD5_1);
+        let wc = open(&dir.path).unwrap();
+        // A staged rename whose new path is deleted from the
+        // worktree: `status` reports the new path as `Renamed`
+        // (the cached diff wins over the worktree deletion), but
+        // `addremove` stages it as a deletion — otherwise the
+        // next commit would send a file that no longer exists
+        // while deleting the old path.
+        git_ok(&dir.path, &["mv", "foo.spec", "bar.spec"]);
+        std::fs::remove_file(dir.path.join("bar.spec")).unwrap();
+        addremove(&wc, &DryRun::new(false)).unwrap().unwrap();
+        let mut found: Vec<(String, StatusCode)> = status(&wc)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.path, entry.code))
+            .collect();
+        found.sort();
+        assert_eq!(found, vec![("foo.spec".to_string(), StatusCode::Deleted)]);
     }
 
     #[test]

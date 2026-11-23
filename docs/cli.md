@@ -130,7 +130,7 @@ Commands:
   diff          Show the diff of the worktree and the index against the base
   add           Stage files for commit
   rm            Remove files from the working copy
-  addremove     Stage every change in the worktree
+  addremove     Stage new files and worktree deletions
   commit        Commit the staged changes
   pull          Pull a linked package to the link target's latest revision
   resolve       Stage the resolved files and continue a stopped rebase
@@ -876,7 +876,7 @@ Options:
 ```
 
 ```
-Stage every change in the worktree
+Stage new files and worktree deletions
 
 Usage: geectl addremove [OPTIONS]
 

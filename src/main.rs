@@ -190,7 +190,7 @@ enum Command {
         #[arg(required = true)]
         files: Vec<String>,
     },
-    /// Stage every change in the worktree.
+    /// Stage new files and worktree deletions.
     Addremove,
     /// Commit the staged changes.
     Commit {
