@@ -11,9 +11,9 @@
 //! The parser is hand-rolled, like the `parse_*` functions in `obs`:
 //! no XML crate is a dependency. It handles what these documents
 //! carry — elements (nested, self-closing), attributes (single or
-//! double quoted), comments, processing instructions, and text — and
-//! refuses anything else: a malformed document is an error, never a
-//! guess.
+//! double quoted), comments, processing instructions, CDATA sections,
+//! and text — and refuses anything else: a malformed document is an
+//! error, never a guess.
 
 use crate::error::{ErrorKind, GeectlError};
 
@@ -346,6 +346,17 @@ impl XmlDoc {
                 };
                 children.push(text[pos..pos + 2 + end + 2].to_string());
                 pos += 2 + end + 2;
+                continue;
+            }
+            if text[pos..].starts_with("<![CDATA[") {
+                // A CDATA section is character data, kept verbatim as
+                // an opaque entry like text: it carries no element
+                // name, so the name-based edits never touch it.
+                let Some(end) = text[pos + 9..].find("]]>") else {
+                    return Err(malformed("unterminated CDATA section"));
+                };
+                children.push(text[pos..pos + 9 + end + 3].to_string());
+                pos += 9 + end + 3;
                 continue;
             }
             if text[pos..].starts_with('<') {
@@ -980,6 +991,79 @@ pub(crate) fn xml_child_elements<'a>(
     Ok(out)
 }
 
+/// The character data directly inside `inner` (the content between
+/// an element's open and close tags): the text between child
+/// elements, plus the content of CDATA sections there. Comments and
+/// processing instructions are skipped, not text. Text inside a
+/// child element belongs to that element, not to this level. None
+/// when a child element, comment, processing instruction, or CDATA
+/// section never closes, or a closing tag appears at this level:
+/// the callers that need a well-formed document fail it themselves
+/// before collecting.
+pub(crate) fn xml_top_level_text(inner: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut offset = 0;
+    while offset < inner.len() {
+        let rest = &inner[offset..];
+        let Some(lt) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..lt]);
+        let tag_start = offset + lt;
+        let after_lt = &rest[lt + 1..];
+        if after_lt.starts_with("!--") {
+            // Comment: skip to `-->`, not to the first `>`.
+            let end = after_lt.find("-->")?;
+            offset = tag_start + 1 + end + 3;
+            continue;
+        }
+        if after_lt.starts_with('?') {
+            // Processing instruction: skip to `?>`.
+            let end = after_lt.find("?>")?;
+            offset = tag_start + 1 + end + 2;
+            continue;
+        }
+        if after_lt.starts_with("![CDATA[") {
+            // A CDATA section is character data at this level: its
+            // content counts as text, unlike a comment.
+            let end = after_lt.find("]]>")?;
+            out.push_str(&after_lt["![CDATA[".len()..end]);
+            offset = tag_start + 1 + end + 3;
+            continue;
+        }
+        if after_lt.starts_with('/') {
+            // A closing tag at this level is stray: the parent's
+            // close was stripped by the caller, so nothing may close
+            // here.
+            return None;
+        }
+        if after_lt.starts_with('!') {
+            // Other markup (e.g. a doctype): skip to `>`.
+            let end = after_lt.find('>')?;
+            offset = tag_start + 1 + end + 1;
+            continue;
+        }
+        let name_end = after_lt
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(after_lt.len());
+        let tag_name = &after_lt[..name_end];
+        if tag_name.is_empty() {
+            return None;
+        }
+        let gt = find_tag_end(after_lt)?;
+        let tag_end = tag_start + 1 + gt + 1;
+        if after_lt[..gt].trim_end().ends_with('/') {
+            // Self-closing: no content to skip.
+            offset = tag_end;
+            continue;
+        }
+        let elem_end = xml_element_end(inner, tag_start, tag_name)?;
+        offset = elem_end;
+    }
+    Some(out)
+}
+
 /// The bodies of the `<!-- ... -->` comments that are direct
 /// children of the scanned text, in file order: the text between
 /// `<!--` and `-->`, verbatim. A comment inside a child element
@@ -1087,6 +1171,18 @@ mod tests {
             doc.render(),
             "<package><packageX/><title>Žluťoučký kůň</title></package>"
         );
+    }
+
+    #[test]
+    fn parse_keeps_a_cdata_section_as_an_opaque_child() {
+        let doc = XmlDoc::parse("<project><![CDATA[junk]]><title>T</title></project>").unwrap();
+        assert_eq!(
+            doc.render(),
+            "<project><![CDATA[junk]]><title>T</title></project>"
+        );
+        assert_eq!(doc.child_names(), vec!["title"]);
+        assert!(doc.has_content());
+        assert!(XmlDoc::parse("<project><![CDATA[never closed</project>").is_err());
     }
 
     #[test]
@@ -1560,6 +1656,43 @@ mod tests {
         let inner = "<!-- a > b --><package name=\"a\"/>";
         let found = xml_child_elements(inner, "package").unwrap();
         assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn xml_top_level_text_reads_text_between_elements_and_cdata() {
+        assert_eq!(
+            xml_top_level_text("junk<arch>x86_64</arch>more"),
+            Some("junkmore".to_string())
+        );
+        assert_eq!(
+            xml_top_level_text("<arch>x86_64</arch>"),
+            Some(String::new())
+        );
+        assert_eq!(
+            xml_top_level_text("<![CDATA[junk]]><arch>x86_64</arch>"),
+            Some("junk".to_string())
+        );
+        assert_eq!(
+            xml_top_level_text("  \n  <arch>x86_64</arch>\n  "),
+            Some("  \n  \n  ".to_string())
+        );
+        // Comments and processing instructions are skipped, not
+        // text; text inside a child belongs to the child.
+        assert_eq!(
+            xml_top_level_text("<!-- a note --><arch>x86_64</arch><?pi data?>"),
+            Some(String::new())
+        );
+        // A nested element of the same name is skipped whole.
+        assert_eq!(
+            xml_top_level_text("<a><a>inner</a>tail</a>after"),
+            Some("after".to_string())
+        );
+        // Malformed content is None, never a partial read.
+        assert_eq!(xml_top_level_text("</arch>"), None);
+        assert_eq!(xml_top_level_text("<!-- never closed"), None);
+        assert_eq!(xml_top_level_text("<![CDATA[never closed"), None);
+        assert_eq!(xml_top_level_text("<arch>x86_64"), None);
+        assert_eq!(xml_top_level_text("<>"), None);
     }
 
     #[test]

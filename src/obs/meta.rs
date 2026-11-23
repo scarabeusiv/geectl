@@ -20,6 +20,7 @@ use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::xml::skip_xml_prolog;
 use crate::xml::xml_escape;
+use crate::xml::xml_top_level_text;
 use crate::xml::XmlDoc;
 
 /// Set the text element `name` in `doc` to `value`, or remove it
@@ -329,15 +330,16 @@ fn validate_changed_repositories(
 /// and `linkedbuild` on the repository itself; any child outside
 /// `arch`, `path`, `download`, `releasetarget`, and `hostsystem` —
 /// the expanded-repo `<base>` element, for one, is never part of a
-/// project meta; any attribute outside the modeled set on a child
-/// (`download`, `master`, `releasetarget`, `hostsystem`, `path`,
-/// `arch`, `archfilter`, `pubkey`); any child of `<download>`
-/// outside `archfilter`, `master`, and `pubkey`; a second
-/// `<master>`, `<archfilter>`, or `<pubkey>` in one `<download>`;
-/// and any content inside `<master>`, `<releasetarget>`,
-/// `<hostsystem>`, or `<path>`, which carry attributes only. A child
-/// missing a required value is malformed, not unmodeled: the parser
-/// errors on it before this check runs.
+/// project meta; any text directly inside `<repository>` or
+/// `<download>`, including a CDATA section; any attribute outside
+/// the modeled set on a child (`download`, `master`,
+/// `releasetarget`, `hostsystem`, `path`, `arch`, `archfilter`,
+/// `pubkey`); any child of `<download>` outside `archfilter`,
+/// `master`, and `pubkey`; a second `<master>`, `<archfilter>`, or
+/// `<pubkey>` in one `<download>`; and any content inside `<master>`,
+/// `<releasetarget>`, `<hostsystem>`, or `<path>`, which carry
+/// attributes only. A child missing a required value is malformed,
+/// not unmodeled: the parser errors on it before this check runs.
 fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<String>, GeectlError> {
     let mut found = Vec::new();
     for attr in tag_attr_names(open_tag) {
@@ -361,6 +363,16 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
             "processing instructions in <repository>".to_string(),
         );
     }
+    // Stray text directly inside the repository — character data or
+    // a CDATA section between the child elements — is content the
+    // render drops: the typed model carries no text here, so a
+    // rewrite would delete it silently. Whitespace between elements
+    // is formatting, not content.
+    if let Some(text) = xml_top_level_text(inner) {
+        if !text.trim().is_empty() {
+            push_finding(&mut found, "text in <repository>".to_string());
+        }
+    }
     let doc = XmlDoc::parse(&format!("<repository{open_tag}>{inner}</repository>"))?;
     for child in doc.child_names() {
         if !matches!(
@@ -378,6 +390,13 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
         }
         if download_tag.trim_end().ends_with('/') {
             continue;
+        }
+        // Stray text directly inside the download, as above: the
+        // render keeps only the modeled children.
+        if let Some(text) = xml_top_level_text(&download_inner) {
+            if !text.trim().is_empty() {
+                push_finding(&mut found, "text in <download>".to_string());
+            }
         }
         let download_doc = XmlDoc::parse(&format!(
             "<download{download_tag}>{download_inner}</download>"
@@ -1637,6 +1656,51 @@ mod tests {
     fn set_project_meta_refuses_a_repository_rewrite_with_a_comment_inside_a_download() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><!-- a note --></download></repository></project>";
         set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_stray_text_inside_a_repository() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\">junk<arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_cdata_inside_a_repository() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><![CDATA[junk]]><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_stray_text_inside_a_download() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\">junk<master url=\"https://master.example.com\"/></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_cdata_inside_a_download() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><![CDATA[junk]]><master url=\"https://master.example.com\"/></download></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_keeps_a_pretty_printed_repository() {
+        const META: &str = "<project name=\"home:scarabeus_iv\">\n  <title>Old title</title>\n  <repository name=\"openSUSE_Tumbleweed\">\n    <arch>x86_64</arch>\n    <path project=\"openSUSE:Factory\" repository=\"snapshot\"/>\n  </repository>\n</project>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(META).unwrap();
+        meta.repositories = vec![replacement_repository()];
+        assert!(client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.put_calls().len(), 1);
     }
 
     #[test]
