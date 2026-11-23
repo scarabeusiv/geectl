@@ -2074,18 +2074,28 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
 const DOWNLOAD_REPOTYPES: [&str; 7] =
     ["rpmmd", "susetags", "deb", "arch", "mdk", "registry", "apk"];
 
-/// A url carries a scheme when it starts with letters followed by a
-/// colon, and holds printable characters only, like the server's
-/// url check.
+/// A url carries a scheme when it starts with a URI scheme
+/// (RFC 3986: a letter followed by letters, digits, `+`, `-`, or
+/// `.`), then a colon, then at least one character, and holds no
+/// control characters. Deliberately not the server's check: the
+/// server accepts a bare `x:` and rejects a legal `svn+ssh:` scheme,
+/// while this check follows the scheme syntax in both directions.
 fn has_url_scheme(url: &str) -> bool {
-    match url.find(':') {
-        Some(colon) => {
-            colon > 0
-                && url[..colon].chars().all(|c| c.is_ascii_alphabetic())
-                && url.chars().all(|c| !c.is_control())
-        }
-        None => false,
-    }
+    let Some(colon) = url.find(':') else {
+        return false;
+    };
+    let scheme = &url[..colon];
+    let rest = &url[colon + 1..];
+    !scheme.is_empty()
+        && scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        && !rest.is_empty()
+        && url.chars().all(|c| !c.is_control())
 }
 
 /// Add `repository` to the project meta document `doc`: a
@@ -6506,6 +6516,19 @@ mod tests {
         repo.hostsystem = vec![("openSUSE:Factory".to_string(), "snapshot".to_string())];
         assert!(validate_repository_settings(&repo).is_ok());
         assert!(validate_repository(&repo).is_ok());
+    }
+
+    #[test]
+    fn has_url_scheme_follows_uri_scheme_syntax() {
+        assert!(has_url_scheme("https://example.com"));
+        assert!(has_url_scheme("svn+ssh://example.com/repo"));
+        assert!(has_url_scheme("git+https://example.com/repo.git"));
+        assert!(!has_url_scheme("x:"));
+        assert!(!has_url_scheme("http:"));
+        assert!(!has_url_scheme("1http://example.com"));
+        assert!(!has_url_scheme("example.com/no-scheme"));
+        assert!(!has_url_scheme("https://example.com/\u{1}"));
+        assert!(!has_url_scheme(""));
     }
 
     #[test]
