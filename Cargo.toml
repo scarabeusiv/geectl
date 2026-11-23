@@ -21,6 +21,10 @@ chardetng = "1"
 clap = { version = "4", features = ["derive"] }
 encoding_rs = "0.8"
 fs2 = "0.4"
+# Renders `_service` comments as plain text: the stored file's
+# commented-out content is part of what a reader sees. The render
+# is bounded (finite width, capped comment count and length), and
+# `cargo deny check` is clean for this tree.
 html2text = "0.17"
 libc = "0.2"
 log = "0.4"
