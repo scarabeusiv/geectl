@@ -251,6 +251,7 @@ Commands:
   change-state                 Change a submit request's state to one of new/review/accepted/declined/revoked
   try-change-state             Best-effort state change: try it, and report whether it happened instead of failing when the request cannot move
   add-review                   Ask a user, group, project, or package to review a submit request
+  change-review-state          Change the state of one review on a submit request: accept it, decline it, or reopen it to new
   add-comment                  Comment on a submit request, optionally as a reply to another comment
   file                         File a submit request: source package to a devel project, superseding every open submit request for the package from the same user
   refile                       File a submit request and supersede an old one with it, plus every other open submit request for the package from the same user: the new request is filed first, and only then is each open one superseded pointing at it

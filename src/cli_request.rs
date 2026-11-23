@@ -66,8 +66,8 @@ use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
     AcceptInfo, ChangeDevelPayload, CveId, DeletePayload, DeleteTarget, DryRun, FiledRequest,
     MaintenanceIncidentPayload, ObsClient, Request, RequestAction, RequestComment, RequestHistory,
-    RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewTarget, SrFiling,
-    SrPayload, OBS_API_BASE,
+    RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewState, ReviewTarget,
+    SrFiling, SrPayload, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 
@@ -262,6 +262,29 @@ pub enum RequestCommand {
         package: Option<String>,
         /// The reason the review is asked for. Values starting with `-` are taken literally: a comment may open with a `- ` bullet.
         #[arg(long, allow_hyphen_values = true)]
+        comment: String,
+    },
+    /// Change the state of one review on a submit request: accept it, decline it, or reopen it to new.
+    ChangeReviewState {
+        /// The request id.
+        id: String,
+        /// The state to change the review to.
+        #[arg(value_parser = ["new", "accepted", "declined"])]
+        state: String,
+        /// The user the review was asked of.
+        #[arg(long)]
+        user: Option<String>,
+        /// The group the review was asked of.
+        #[arg(long)]
+        group: Option<String>,
+        /// The project the review was asked of.
+        #[arg(long)]
+        project: Option<String>,
+        /// The package the review was asked of (needs its project).
+        #[arg(long)]
+        package: Option<String>,
+        /// The message left with the change. Values starting with `-` are taken literally: a comment may open with a `- ` bullet.
+        #[arg(long, default_value = "", allow_hyphen_values = true)]
         comment: String,
     },
     /// Comment on a submit request, optionally as a reply to another comment.
@@ -719,6 +742,57 @@ pub fn run(
                 Ok((payload, text))
             })
         }
+        RequestCommand::ChangeReviewState {
+            id,
+            state,
+            user,
+            group,
+            project,
+            package,
+            comment,
+        } => {
+            let state = parse_review_state(&state)?;
+            let target = ReviewTarget::new(
+                user.as_deref(),
+                group.as_deref(),
+                project.as_deref(),
+                package.as_deref(),
+            )?;
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            with_client(debug, live, |client| {
+                client.change_review_state(&id, state, &target, &comment, &dry_run)?;
+                let mut payload = json!({
+                    "id": request_id_json(&id),
+                    "target_state": state.as_str(),
+                    "review": {
+                        "by_user": target.by_user,
+                        "by_group": target.by_group,
+                        "by_project": target.by_project,
+                        "by_package": target.by_package,
+                    },
+                    "comment": comment,
+                    "dry_run": dry_run.enabled(),
+                });
+                add_plan(&mut payload, &dry_run);
+                let mut text = if dry_run.enabled() {
+                    format!(
+                        "dry-run: would change the review by {} on request {id} to {}",
+                        target.describe(),
+                        state.as_str()
+                    )
+                } else {
+                    format!(
+                        "changed the review by {} on request {id} to {}",
+                        target.describe(),
+                        state.as_str()
+                    )
+                };
+                if !comment.is_empty() {
+                    text.push_str(&format!(" — {comment}"));
+                }
+                Ok((payload, text))
+            })
+        }
         RequestCommand::AddComment { id, body, parent } => {
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
             with_client(debug, live, |client| {
@@ -909,6 +983,18 @@ fn parse_state(value: &str) -> Result<RequestState, GeectlError> {
         GeectlError::new(
             ErrorKind::InvalidInput,
             format!("invalid request state: {value:?}"),
+        )
+    })
+}
+
+/// Parse a review state name. The domain is restricted by clap's
+/// `value_parser` at the call site — new, accepted, declined — so
+/// a failure here is a caller bug, not user input.
+fn parse_review_state(value: &str) -> Result<ReviewState, GeectlError> {
+    ReviewState::parse(value).ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid review state: {value:?}"),
         )
     })
 }
@@ -2428,6 +2514,22 @@ mod tests {
     }
 
     #[test]
+    fn clap_refuses_final_states_for_change_review_state() {
+        for state in ["superseded", "obsoleted"] {
+            let err = TestCli::try_parse_from([
+                "geectl",
+                "change-review-state",
+                "42",
+                state,
+                "--user",
+                "Admin",
+            ])
+            .expect_err("a final state is not a review state change");
+            assert!(err.to_string().contains("invalid value"));
+        }
+    }
+
+    #[test]
     fn state_parsing_accepts_valid_states_and_rejects_garbage() {
         for value in [
             "new",
@@ -2442,6 +2544,15 @@ mod tests {
         }
         assert!(parse_state("bogus").is_err());
         assert!(parse_state("").is_err());
+    }
+
+    #[test]
+    fn review_state_parsing_accepts_valid_states_and_rejects_garbage() {
+        for value in ["new", "accepted", "declined"] {
+            assert!(parse_review_state(value).is_ok(), "{value} parses");
+        }
+        assert!(parse_review_state("bogus").is_err());
+        assert!(parse_review_state("").is_err());
     }
 
     #[test]

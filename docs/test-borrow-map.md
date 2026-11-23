@@ -551,6 +551,24 @@ has no osc equivalent (`parse_buildlogurl` only takes the API form);
 it is geectl's own addition, written from scratch and pinned by
 geectl unit tests.
 
+## Batch 5c — single-review state change (#209)
+
+**Direct adoptions: 0. Source pins: 1.**
+
+No osc test pins the `changereviewstate` behaviour: `tests/` has no
+review state-change test — only `tests/test_obs_api_request.py`
+(search `match=` construction, already adopted under batch 2) and
+`tests/test_request.py` (request read/act, batch 2). Adopted as a
+source pin instead (behaviour spec, not a test case):
+
+- `osc/core.py:2289` `change_review_state` — the query construction
+  (`cmd=changereviewstate`, `newstate`, `by_user`/`by_group`/
+  `by_project`/`by_package`, comment as the POST body), already
+  adopted verbatim in the library (`ObsClient::change_review_state`);
+  the CLI leaf mirrors it with the state as a positional and the
+  target as flags. osc's per-state subcommands (`review accept` /
+  `decline` / `reopen`) collapse into the one leaf.
+
 ## Batch 6 — working-copy layer
 
 **Direct adoptions: 0. Spec reference: 36 tests.**
@@ -835,6 +853,7 @@ semantics, not its tests).**
 | 4 branch/copy/link | 9 | 42 | 51 |
 | 5 build status | 4 | 42 | 46 |
 | 5b build-log selectors (#206) | 0 (+3 source pins) | 0 | 0 (+pins) |
+| 5c single-review state change (#209) | 0 (+1 source pin) | 0 | 0 (+pin) |
 | 6 working-copy layer | 0 (+36 spec ref) | 0 | 0 (+spec) |
 | 7 maintenance requests | 0 (counted in 2/4) | 0 (counted in 2/4) | 0 (+gaps) |
 | 8 services | 0 | 1 | 1 |

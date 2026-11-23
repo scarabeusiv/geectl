@@ -198,6 +198,7 @@ fn request_help_lists_the_subcommands() {
         "change-state",
         "try-change-state",
         "add-review",
+        "change-review-state",
         "add-comment",
         "file",
         "refile",
@@ -695,6 +696,98 @@ fn request_add_review_dry_run_names_the_reviewer() {
     assert_eq!(value["review"]["by_group"], "factory-staging");
     assert_eq!(value["dry_run"], true);
     assert_plan_non_empty(&value);
+}
+
+#[test]
+fn request_change_review_state_dry_run_names_the_reviewer_and_state() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "request",
+            "change-review-state",
+            "42",
+            "declined",
+            "--group",
+            "factory-staging",
+            "--comment",
+            "not this way",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["target_state"], "declined");
+    assert_eq!(value["review"]["by_group"], "factory-staging");
+    assert_eq!(value["comment"], "not this way");
+    assert_eq!(value["dry_run"], true);
+    assert_plan_non_empty(&value);
+}
+
+#[test]
+fn request_change_review_state_dry_run_text_renders_the_plan() {
+    // The agreement test: every identifying field the JSON payload
+    // carries appears in the text rendering.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "request",
+            "change-review-state",
+            "42",
+            "declined",
+            "--group",
+            "factory-staging",
+            "--comment",
+            "not this way",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would change the review by group factory-staging on request 42 to declined — not this way"
+    );
+}
+
+#[test]
+fn request_change_review_state_rejects_final_states() {
+    for state in ["superseded", "obsoleted"] {
+        let dir = TempDir::new();
+        let out = geectl_isolated(&dir)
+            .args([
+                "request",
+                "change-review-state",
+                "42",
+                state,
+                "--user",
+                "Admin",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+    }
+}
+
+#[test]
+fn request_change_review_state_without_a_target_fails() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "change-review-state", "42", "accepted"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
 }
 
 #[test]
