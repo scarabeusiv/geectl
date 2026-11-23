@@ -158,7 +158,7 @@ Commands:
   owners                         Show the owners of a package (project/package scope)
   owners-for-binary              Show the owners of a binary package
   maintainers                    Show the maintainers of a package
-  whois                          Show a user's full name, email, and account state
+  whois                          Show a user's full name, email, and account state. Without a login, the authenticated user
   link-target                    Show the link target of a package, when it is a link
   project-diff                   Diff two projects, package by package. Computed client-side: the library lists both projects and reads every file of every differing package, so a large diff issues many requests and a differing binary file fails the call
   diff-packages                  Diff two packages, file by file. Computed client-side: the library diffs the two file lists and cats each changed file, so a differing binary file fails the call

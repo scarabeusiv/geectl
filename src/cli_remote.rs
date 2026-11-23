@@ -321,9 +321,11 @@ pub enum RemoteCommand {
         package: String,
     },
     /// Show a user's full name, email, and account state.
+    /// Without a login, the authenticated user.
     Whois {
-        /// The login name to look up.
-        login: String,
+        /// The login name to look up; without one, the
+        /// authenticated user.
+        login: Option<String>,
     },
     /// Show the link target of a package, when it is a link.
     LinkTarget {
@@ -978,6 +980,7 @@ pub fn run_remote(
             Ok(maintainers_result(&project, &package, maintainers))
         }
         RemoteCommand::Whois { login } => {
+            let login = resolve_whois_login(&login, client.credentials())?;
             let person = client.whois(&login)?;
             let payload = person_json(&person);
             Ok((payload, render_person(&person)))
@@ -2630,6 +2633,24 @@ fn package_meta_json(meta: &PackageMeta) -> Value {
     })
 }
 
+/// The login a `whois` read looks up: the given login, or the
+/// authenticated user's login when none is given. Fails closed
+/// when the configured credentials carry no username.
+fn resolve_whois_login(
+    login: &Option<String>,
+    credentials: &Credentials,
+) -> Result<String, GeectlError> {
+    match login {
+        Some(login) => Ok(login.clone()),
+        None => credentials.username().map(str::to_string).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ConfigError,
+                "remote whois with no login needs OBS Basic credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            )
+        }),
+    }
+}
+
 fn person_json(person: &Person) -> Value {
     json!({
         "login": person.login,
@@ -3173,10 +3194,16 @@ mod tests {
             parse(&["geectl", "remote", "maintainers", "P", "K"]),
             RemoteCommand::Maintainers { .. }
         ));
-        assert!(matches!(
-            parse(&["geectl", "remote", "whois", "alice"]),
-            RemoteCommand::Whois { .. }
-        ));
+        match parse(&["geectl", "remote", "whois", "alice"]) {
+            RemoteCommand::Whois { login } => {
+                assert_eq!(login.as_deref(), Some("alice"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        match parse(&["geectl", "remote", "whois"]) {
+            RemoteCommand::Whois { login } => assert_eq!(login, None),
+            _ => panic!("wrong variant"),
+        }
         assert!(matches!(
             parse(&["geectl", "remote", "link-target", "P", "K"]),
             RemoteCommand::LinkTarget { .. }
@@ -3185,6 +3212,48 @@ mod tests {
             parse(&["geectl", "remote", "devel-project", "vim"]),
             RemoteCommand::DevelProject { .. }
         ));
+    }
+
+    #[test]
+    fn resolve_whois_login_prefers_the_given_login() {
+        let resolved = resolve_whois_login(
+            &Some("alice".to_string()),
+            &Credentials::Basic {
+                username: "bob".to_string(),
+                password: "secret".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved, "alice");
+    }
+
+    #[test]
+    fn resolve_whois_login_defaults_to_the_authenticated_user() {
+        let resolved = resolve_whois_login(
+            &None,
+            &Credentials::Basic {
+                username: "bob".to_string(),
+                password: "secret".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved, "bob");
+    }
+
+    #[test]
+    fn resolve_whois_login_fails_closed_without_a_username() {
+        for credentials in [
+            Credentials::None,
+            Credentials::Bearer {
+                token: "token".to_string(),
+            },
+            Credentials::SshKey {
+                path: std::path::PathBuf::from("/x"),
+            },
+        ] {
+            let err = resolve_whois_login(&None, &credentials).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError);
+        }
     }
 
     #[test]
