@@ -95,6 +95,13 @@ the configured instance's credentials are never forwarded.
 `branch copy-package --to-apiurl` resolves the target's
 credentials this way.
 
+The same rule applies to Gitea: `GEECTL_GITEA_TOKEN_<ALIAS>` (or
+`GEECTL_GITEA_TOKEN_FILE_<ALIAS>`) for the instance named in
+`[instances]`, e.g. `GEECTL_GITEA_TOKEN_LIVE` for an instance named
+`live`; the plain `GEECTL_GITEA_TOKEN` (or
+`GEECTL_GITEA_TOKEN_FILE`) applies to the configured Gitea URL and
+is never forwarded to another instance.
+
 A half-configured credential pair (a username with no password source,
 or the reverse) is handled per group. `branch`, `maintenance`, and
 `service` fail fast on it before any work — `branch` and `maintenance`
@@ -1172,7 +1179,7 @@ geectl service list openSUSE:Factory vim
 geectl service state openSUSE:Factory vim
 geectl --live service trigger openSUSE:Factory vim
 
-# Gitea (needs GEECTL_GITEA_TOKEN, even in dry-run)
+# Gitea (needs GEECTL_GITEA_TOKEN, or GEECTL_GITEA_TOKEN_<ALIAS> for an aliased instance, even in dry-run)
 geectl gitea repo-get pool systemd
 geectl gitea branch-head pool systemd factory
 geectl gitea maintainers pool systemd

@@ -46,14 +46,14 @@
 //! `show` call away.
 
 use clap::{Args, Subcommand};
-use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth};
+use geectl::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
 use geectl::config::{self, DEFAULT_GITEA_URL};
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::gitea::{
     parse_gitea_repo, validate_gitea_base, GiteaClient, GiteaMergeMethod, PrCreateOptions,
 };
-use geectl::http::{HttpClient, Timeout, UreqClient};
+use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{CveId, DryRun, ObsClient, ReviewTarget, SrPayload, OBS_API_BASE};
 use geectl::pull_request::{
     PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint, PullRequestRef,
@@ -607,31 +607,6 @@ fn with_obs<T>(
     f(&client)
 }
 
-/// A `GiteaClient` for the configured Gitea instance (config file /
-/// env / default) with the environment Bearer token, reporting on
-/// the debug channel. Construction fails closed without a token —
-/// even for reads (see the `gitea` group's module docs). The same
-/// construction as the `gitea` group; each group owns its client
-/// construction.
-fn gitea_client<'a>(
-    http: &'a dyn HttpClient,
-    debug: &Debug,
-) -> Result<GiteaClient<'a>, GeectlError> {
-    let path = config::config_path()?;
-    let file_config = config::load_config_at(&path)?;
-    let effective = config::effective_config(&file_config)?;
-    // Unreachable by construction — effective_config always yields
-    // Some(gitea_url) — but kept as a defensive default rather than
-    // an unwrap: a config change must not turn into a panic here.
-    let base = effective
-        .config
-        .gitea_url
-        .as_deref()
-        .unwrap_or(DEFAULT_GITEA_URL);
-    let credentials = EnvGiteaAuth.credentials()?;
-    GiteaClient::with_base(http, base, credentials).map(|client| client.with_debug(debug.clone()))
-}
-
 /// Run `f` with a `GiteaClient` for the configured instance. The
 /// client borrows the transport, so both live in this scope and
 /// the caller runs inside it.
@@ -640,7 +615,7 @@ fn with_gitea<T>(
     f: impl FnOnce(&GiteaClient) -> Result<T, GeectlError>,
 ) -> Result<T, GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
-    let client = gitea_client(&http, debug)?;
+    let client = crate::cli_gitea::gitea_client(&http, debug)?;
     f(&client)
 }
 

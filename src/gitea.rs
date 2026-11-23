@@ -987,6 +987,63 @@ pub struct GiteaClient<'a> {
     debug: Debug,
 }
 
+/// Pass `credentials` through, rejecting [`Credentials::None`] for
+/// `base` with the error naming what to set — the alias variables
+/// when an alias matches (plus the plain variables when the URL is
+/// also the configured default), the `[instances]` entry to add
+/// when none does — instead of [`GiteaClient::with_base`]'s
+/// plain-vars message, which is the wrong guidance for an alias or
+/// an unknown instance. `None` passes through unchanged for the
+/// default URL with no alias match, where
+/// [`GiteaClient::with_base`]'s plain-vars message is the right
+/// one. Every production construction site maps through here
+/// (directly, or via [`GiteaClient::with_base_resolved`]), so the
+/// unauthenticated error is the same everywhere.
+pub fn require_credentials_for_url(
+    credentials: Credentials,
+    base: &str,
+    default_url: &str,
+    instances: &[(String, String)],
+) -> Result<Credentials, GeectlError> {
+    if !matches!(credentials, Credentials::None) {
+        return Ok(credentials);
+    }
+    // `with_base` rejects an unauthenticated client, and its
+    // error names the plain variables — the wrong guidance when
+    // the URL is an alias or an unknown instance, so name what
+    // to set here instead. The default URL passes `None`
+    // through to `with_base`, whose plain-vars message is the
+    // right one there.
+    if let Some(alias) = alias_for_url(base, instances)? {
+        let (token_var, token_file_var) = gitea_alias_vars(alias);
+        // The URL can also be the configured default:
+        // then the plain variables would fix it too, so
+        // name both sets.
+        let default_suffix = if same_api_url(base, default_url)? {
+            format!(
+                " — or the plain {GITEA_TOKEN_VAR} (or {GITEA_TOKEN_FILE_VAR}), since this URL is also the configured default"
+            )
+        } else {
+            String::new()
+        };
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "no credentials configured for {base}; instance alias '{alias}' matches this URL — set {token_var} (or {token_file_var}){default_suffix}"
+            ),
+        ));
+    }
+    if !same_api_url(base, default_url)? {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "no credentials configured for {base}; no instance alias matches it — add an [instances] entry for it in the config file and set GEECTL_GITEA_TOKEN_<ALIAS> (or GEECTL_GITEA_TOKEN_FILE_<ALIAS>) for that alias"
+            ),
+        ));
+    }
+    Ok(credentials)
+}
+
 impl<'a> GiteaClient<'a> {
     /// Build a client for the configured Gitea instance
     /// (`DEFAULT_GITEA_URL`) with the given Bearer credentials.
@@ -1060,43 +1117,12 @@ impl<'a> GiteaClient<'a> {
         // misdirects the user to `[instances]` — and no secret
         // file is read for a base the client would reject.
         validate_gitea_base(base)?;
-        let credentials =
-            resolve_gitea_bearer_for_url(base, default_url, instances, vars, read_file)?;
-        if matches!(credentials, Credentials::None) {
-            // `with_base` rejects an unauthenticated client, and
-            // its error names the plain variables — the wrong
-            // guidance when the URL is an alias or an unknown
-            // instance, so name what to set here instead. The
-            // default URL falls through to `with_base`, whose
-            // plain-vars message is the right one there.
-            if let Some(alias) = alias_for_url(base, instances)? {
-                let (token_var, token_file_var) = gitea_alias_vars(alias);
-                // The URL can also be the configured default:
-                // then the plain variables would fix it too, so
-                // name both sets.
-                let default_suffix = if same_api_url(base, default_url)? {
-                    format!(
-                        " — or the plain {GITEA_TOKEN_VAR} (or {GITEA_TOKEN_FILE_VAR}), since this URL is also the configured default"
-                    )
-                } else {
-                    String::new()
-                };
-                return Err(GeectlError::new(
-                    ErrorKind::ConfigError,
-                    format!(
-                        "no credentials configured for {base}; instance alias '{alias}' matches this URL — set {token_var} (or {token_file_var}){default_suffix}"
-                    ),
-                ));
-            }
-            if !same_api_url(base, default_url)? {
-                return Err(GeectlError::new(
-                    ErrorKind::ConfigError,
-                    format!(
-                        "no credentials configured for {base}; no instance alias matches it — add an [instances] entry for it in the config file and set GEECTL_GITEA_TOKEN_<ALIAS> (or GEECTL_GITEA_TOKEN_FILE_<ALIAS>) for that alias"
-                    ),
-                ));
-            }
-        }
+        let credentials = require_credentials_for_url(
+            resolve_gitea_bearer_for_url(base, default_url, instances, vars, read_file)?,
+            base,
+            default_url,
+            instances,
+        )?;
         Self::with_base(http, base, credentials)
     }
 
@@ -4675,6 +4701,51 @@ mod tests {
                     .contains("the plain GEECTL_GITEA_TOKEN (or GEECTL_GITEA_TOKEN_FILE)"));
             }
         }
+    }
+
+    #[test]
+    fn require_credentials_for_url_names_what_to_set_for_none() {
+        // The production construction sites map `None` through
+        // here, so an alias-only setup with its token unset gets
+        // the alias variables — never `with_base`'s plain-vars
+        // message — and an unmatched URL gets the `[instances]`
+        // guidance. The default URL with no alias match passes
+        // `None` through to `with_base` unchanged.
+        let instances = vec![(
+            "example".to_string(),
+            "https://gitea.example.org".to_string(),
+        )];
+        match require_credentials_for_url(
+            Credentials::None,
+            "https://gitea.example.org",
+            BASE,
+            &instances,
+        ) {
+            Ok(_) => panic!("None for an aliased URL must fail"),
+            Err(err) => {
+                assert_eq!(err.kind(), ErrorKind::ConfigError);
+                assert!(err.context.contains("GEECTL_GITEA_TOKEN_EXAMPLE"));
+                assert!(!err.context.contains(
+                    "no Gitea token configured (GEECTL_GITEA_TOKEN or GEECTL_GITEA_TOKEN_FILE)"
+                ));
+            }
+        }
+        match require_credentials_for_url(Credentials::None, "https://gitea.example.org", BASE, &[])
+        {
+            Ok(_) => panic!("None for an unmatched URL must fail"),
+            Err(err) => {
+                assert_eq!(err.kind(), ErrorKind::ConfigError);
+                assert!(err.context.contains("[instances]"));
+            }
+        }
+        assert!(matches!(
+            require_credentials_for_url(Credentials::None, BASE, BASE, &[]),
+            Ok(Credentials::None)
+        ));
+        assert!(matches!(
+            require_credentials_for_url(bearer(), BASE, BASE, &[]),
+            Ok(Credentials::Bearer { .. })
+        ));
     }
 
     #[test]

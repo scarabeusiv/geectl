@@ -34,13 +34,13 @@
 //! text). The JSON payload remains the complete record in every case.
 
 use clap::{Args, Subcommand};
-use geectl::auth::{AuthProvider, EnvGiteaAuth};
+use geectl::auth::EnvGiteaAuth;
 use geectl::config::{self, DEFAULT_GITEA_URL};
 use geectl::debug::Debug;
 use geectl::error::GeectlError;
 use geectl::gitea::{
-    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaRepository, MaintainerInfo, Maintainership,
-    RepoCreateOptions,
+    require_credentials_for_url, ForkRepoOptions, GiteaBranch, GiteaClient, GiteaRepository,
+    MaintainerInfo, Maintainership, RepoCreateOptions,
 };
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::DryRun;
@@ -330,10 +330,15 @@ pub fn run_gitea(
 }
 
 /// A `GiteaClient` for the configured Gitea instance (config file /
-/// env / default) with the environment Bearer <redacted> reporting on
-/// the debug channel. Construction fails closed without a token —
-/// even in dry-run (see the module docs).
-fn gitea_client<'a>(
+/// env / default) with the Bearer token resolved for that URL — the
+/// matching alias's variables when the URL is named in `[instances]`,
+/// the plain variables otherwise — reporting on the debug channel.
+/// Construction fails closed without a token — even in dry-run, even
+/// for reads (see the `gitea` group's module docs). The one
+/// construction for both the `gitea` group and the `pull-request`
+/// group's Gitea backend, so the credential resolution cannot drift
+/// between them.
+pub(crate) fn gitea_client<'a>(
     http: &'a dyn HttpClient,
     debug: &Debug,
 ) -> Result<GiteaClient<'a>, GeectlError> {
@@ -348,7 +353,18 @@ fn gitea_client<'a>(
         .gitea_url
         .as_deref()
         .unwrap_or(DEFAULT_GITEA_URL);
-    let credentials = EnvGiteaAuth.credentials()?;
+    // Both arguments are `base`: it is the effective URL
+    // (environment, then config file, then default), so the plain
+    // variables belong to it. A second URL must never be resolved
+    // here as its own default — resolve it with this `base` as
+    // `default_url` instead, or the default's token would be
+    // forwarded to that host.
+    let credentials = require_credentials_for_url(
+        EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?,
+        base,
+        base,
+        &file_config.instances,
+    )?;
     GiteaClient::with_base(http, base, credentials).map(|client| client.with_debug(debug.clone()))
 }
 

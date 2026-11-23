@@ -46,6 +46,13 @@ use geectl::gitea::{
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::DryRun;
 use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus};
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 /// Whether `url` points at a loopback host over plain HTTP.
 ///
@@ -307,6 +314,313 @@ fn live_gitea_client_resolves_credentials_by_alias() {
         .repo_get("pool", "systemd")
         .expect("alias-resolved client reads the fixture repo");
     assert_eq!(repo.full_name, "pool/systemd");
+}
+
+/// A temp dir under the system temp dir, removed on drop. The
+/// binary test below needs its own HOME and XDG_CONFIG_HOME, and
+/// the counter keeps two tests from sharing one when they run in
+/// the same nanosecond.
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "geectl-gitea-test-{}-{nanos}-{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        TempDir(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The geectl binary with the alias-only setup: HOME and
+/// XDG_CONFIG_HOME point at the temp dir (so no real config is read),
+/// the live URL is the config file's `gitea_url` named once in
+/// `[instances]` under the alias `live`, and the provisioned token is
+/// injected only as `GEECTL_GITEA_TOKEN_LIVE` — the plain variables
+/// and the environment URL are removed, so the run proves the
+/// config-file path.
+fn geectl_alias_only(dir: &TempDir, token: &str) -> Command {
+    let mut cmd = geectl_hermetic(dir);
+    cmd.env("GEECTL_GITEA_TOKEN_LIVE", token);
+    cmd
+}
+
+/// A `geectl` invocation with an isolated HOME and no Gitea
+/// variables set: the caller sets exactly the variables the case
+/// needs, so ambient credentials can never leak into a hermetic
+/// test.
+fn geectl_hermetic(dir: &TempDir) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_geectl"));
+    cmd.env("HOME", &dir.0)
+        .env("XDG_CONFIG_HOME", &dir.0)
+        .env_remove("GEECTL_GITEA_URL")
+        .env_remove("GEECTL_GITEA_TOKEN")
+        .env_remove("GEECTL_GITEA_TOKEN_FILE")
+        .env_remove("GEECTL_GITEA_TOKEN_LIVE")
+        .env_remove("GEECTL_GITEA_TOKEN_FILE_LIVE")
+        .env_remove("GEECTL_GITEA_SSH_KEY")
+        .env_remove("GEECTL_DEBUG")
+        .env_remove("GEECTL_FORMAT")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy");
+    cmd
+}
+
+/// Real commands authenticate an alias-only setup: the live URL
+/// in the config file, named in `[instances]` under the alias
+/// `live`, with the provisioned token only in
+/// `GEECTL_GITEA_TOKEN_LIVE`. Runs the real binary, so this pins
+/// the shared production `gitea_client()` construction — exercised
+/// through both the `gitea` group (`repo-get`) and the
+/// `pull-request` group (`search`) — where the resolver test above
+/// pins only the library client.
+/// `config show` and the commands must agree: all three see the
+/// alias token.
+#[test]
+fn alias_only_setup_authenticates_a_real_gitea_command() {
+    let Some(base) = gitea_url() else {
+        eprintln!("skipping Gitea live test: GEECTL_GITEA_URL is not set");
+        return;
+    };
+    let token = match EnvGiteaAuth
+        .credentials()
+        .expect("reading the Gitea token from the environment")
+    {
+        Credentials::Bearer { token } => token,
+        _ => panic!("the provisioned Gitea token must resolve to a Bearer"),
+    };
+    let dir = TempDir::new();
+    write_live_config(&dir, &base);
+    // `config show` reports the alias token; the command must
+    // authenticate with the same token.
+    let out = geectl_alias_only(&dir, &token)
+        .args(["config", "show"])
+        .output()
+        .expect("run geectl config show");
+    assert!(
+        out.status.success(),
+        "config show failed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("config show prints valid JSON");
+    assert_eq!(value["gitea_auth"]["status"], "configured");
+    assert_eq!(value["instances"]["live"].as_str(), Some(base.as_str()));
+    assert!(!stdout.contains(&token));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(&token));
+    let out = geectl_alias_only(&dir, &token)
+        .args(["gitea", "repo-get", "pool", "systemd"])
+        .output()
+        .expect("run geectl gitea repo-get");
+    assert!(
+        out.status.success(),
+        "gitea repo-get failed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("repo-get prints valid JSON");
+    assert_eq!(value["full_name"], "pool/systemd");
+    assert!(!stdout.contains(&token));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(&token));
+    // The second production caller: `pull-request search` on the
+    // Gitea backend builds its client through the shared
+    // `gitea_client()`. The search lists the pulls of
+    // one repo, and Gitea 404s that list on an empty repo — the
+    // fixture repo has no commits — so the test sets up a real pull
+    // request first and asserts the binary lists it.
+    let http = gitea_client();
+    let client = typed_client(&http, &base);
+    let org = create_org_raw(&http, &base);
+    let repo = unique_repo_name();
+    let _guard = LiveRepo::new(&client, &org, &repo);
+    let number = setup_org_pull_request(&http, &base, &org, &repo);
+    let out = geectl_alias_only(&dir, &token)
+        .args([
+            "pull-request",
+            "search",
+            "--backend",
+            "gitea",
+            "--repo",
+            &format!("{org}/{repo}"),
+        ])
+        .output()
+        .expect("run geectl pull-request search");
+    assert!(
+        out.status.success(),
+        "pull-request search failed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("search prints valid JSON");
+    assert_eq!(value["count"], 1);
+    assert_eq!(value["pull_requests"][0]["title"], "Add feature");
+    assert_eq!(
+        value["pull_requests"][0]["reference"].as_str(),
+        Some(format!("gitea:{org}/{repo}#{number}").as_str())
+    );
+    assert!(!stdout.contains(&token));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(&token));
+}
+
+/// A config file pointing `gitea_url` at `url` and naming it once
+/// in `[instances]` under the alias `live`.
+fn write_live_config(dir: &TempDir, url: &str) {
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::write(
+        config_dir.join("config.toml"),
+        format!("gitea_url = \"{url}\"\n\n[instances]\nlive = \"{url}\"\n"),
+    )
+    .expect("write config file");
+}
+
+/// A loopback port with nothing listening on it: bind an ephemeral
+/// port, then drop the listener. A run against it fails at the
+/// transport, never at auth.
+fn closed_loopback_port() -> u16 {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
+    listener
+        .local_addr()
+        .expect("read the ephemeral port")
+        .port()
+}
+
+/// A loopback listener that records the first request's
+/// `Authorization` header and answers 500: the command under test
+/// fails on the reply, but the recorded request proves which token
+/// it sent. The listener runs on a spawned thread and reports over
+/// a channel, so a binary that never connects fails the test on a
+/// timeout instead of hanging the suite.
+fn capturing_listener() -> (u16, mpsc::Receiver<Option<String>>) {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
+    let port = listener.local_addr().expect("ephemeral port").port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut authorization = None;
+        if let Ok((mut stream, _)) = listener.accept() {
+            {
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim_end();
+                            if trimmed.is_empty() {
+                                break;
+                            }
+                            // Header names arrive lowercase (ureq
+                            // normalises them), so match the name
+                            // case-insensitively.
+                            if let Some((name, value)) = trimmed.split_once(':') {
+                                if name.eq_ignore_ascii_case("authorization") {
+                                    authorization = Some(value.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+        }
+        let _ = tx.send(authorization);
+    });
+    (port, rx)
+}
+
+/// An alias-only setup reaches the network instead of failing at
+/// auth: the binary against a closed loopback port fails on the
+/// connection, never with "no Gitea token configured". Hermetic —
+/// no live instance — so it runs in a default `cargo test`, and it
+/// fails on the pre-fix wiring, which resolved the plain variables
+/// only and reported no token configured.
+#[test]
+fn alias_only_setup_reaches_the_network_not_the_auth_error() {
+    let port = closed_loopback_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let dir = TempDir::new();
+    write_live_config(&dir, &base);
+    let out = geectl_alias_only(&dir, "aliasTokenForClosedPortTest")
+        .args(["gitea", "repo-get", "pool", "systemd"])
+        .output()
+        .expect("run geectl gitea repo-get");
+    assert!(
+        !out.status.success(),
+        "repo-get against a closed port must fail; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("no Gitea token configured"),
+        "alias-only setup must not report no token configured; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Connection refused") || stderr.contains("actively refused"),
+        "alias-only setup must fail at the transport; stderr: {stderr}"
+    );
+}
+
+/// The alias token wins over the plain token in the real binary:
+/// both set to different values, the request the binary sends to a
+/// loopback listener carries the alias token. Hermetic — no live
+/// instance — so it runs in a default `cargo test`. A closed port
+/// cannot show which token wins (both fail at the connection the
+/// same way); the listener is the same hermetic shape with the
+/// request observed.
+#[test]
+fn alias_token_wins_over_the_plain_token_in_the_real_binary() {
+    let (port, rx) = capturing_listener();
+    let base = format!("http://127.0.0.1:{port}");
+    let dir = TempDir::new();
+    write_live_config(&dir, &base);
+    let alias_token = "aliasTokenForListenerTest";
+    let out = geectl_hermetic(&dir)
+        .env("GEECTL_GITEA_TOKEN_LIVE", alias_token)
+        .env("GEECTL_GITEA_TOKEN", "plainTokenForListenerTest")
+        .args(["gitea", "repo-get", "pool", "systemd"])
+        .output()
+        .expect("run geectl gitea repo-get");
+    assert!(
+        !out.status.success(),
+        "repo-get against a 500 listener must fail; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let authorization = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the binary connects to the listener")
+        .expect("the binary sends a request with an Authorization header");
+    assert_eq!(
+        authorization,
+        format!("Bearer {alias_token}"),
+        "the request must carry the alias token, not the plain one"
+    );
 }
 
 /// Fork through the typed operation in live mode (dry-run off)

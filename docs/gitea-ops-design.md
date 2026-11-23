@@ -76,7 +76,10 @@ pull-request-level act operations; labels are not implemented yet. The OBS side 
 - Config (`src/config.rs`): `gitea_url` (default
   `https://src.opensuse.org`), `GEECTL_GITEA_URL` env override.
 - Auth (`src/auth.rs`): `EnvGiteaAuth` (Bearer from
-  `GEECTL_GITEA_TOKEN` or `GEECTL_GITEA_TOKEN_FILE`, exactly one),
+  `GEECTL_GITEA_TOKEN` or `GEECTL_GITEA_TOKEN_FILE`, exactly one —
+  or the matching alias's `GEECTL_GITEA_TOKEN_<ALIAS>` /
+  `GEECTL_GITEA_TOKEN_FILE_<ALIAS>` when the URL is named in
+  `[instances]`, resolved per URL by `resolve_gitea_bearer_for_url`),
   `GiteaSshKey` (private-key path from `GEECTL_GITEA_SSH_KEY`),
   `resolve_gitea_bearer`, `resolve_gitea_ssh_key`. The `AuthProvider`
   trait is the seam.
