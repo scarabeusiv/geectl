@@ -5,6 +5,7 @@
 //! `--help` and `--version` exit 0, the version payload is valid JSON on
 //! stdout, and errors go to stderr with a structured shape.
 
+use geectl::changelog::changes::parse_header;
 use std::process::Command;
 
 fn geectl() -> Command {
@@ -4882,6 +4883,26 @@ fn changelog_validate_missing_dir_fails_with_invalid_input() {
     assert_eq!(value["error"]["code"], "invalid_input");
 }
 
+/// Replace the header line's date-time with a fixed placeholder, so two
+/// runs stamped from separate `SystemTime::now()` reads compare equal
+/// across a UTC second/minute/hour/day boundary. The author is kept.
+fn normalize_header_time(entry: &str) -> String {
+    let mut out = String::with_capacity(entry.len());
+    for line in entry.split_inclusive('\n') {
+        let stripped = line.strip_suffix('\n').unwrap_or(line);
+        match parse_header(stripped) {
+            Some(header) => {
+                out.push_str(&format!("HEADER - {}", header.author));
+                if line.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
 #[test]
 fn changelog_generate_prints_draft_with_news_slots() {
     let dir = TempDir::new();
@@ -4909,7 +4930,22 @@ fn changelog_generate_prints_draft_with_news_slots() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert_eq!(String::from_utf8_lossy(&out.stdout), entry);
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The two runs stamp the header from separate `SystemTime::now()`
+    // reads, so the seconds can differ by one across a UTC second
+    // boundary; the timestamps must still be within a second.
+    let json_header = entry
+        .lines()
+        .find_map(parse_header)
+        .expect("generated entry carries a header");
+    let text_header = text
+        .lines()
+        .find_map(parse_header)
+        .expect("generated entry carries a header");
+    assert!((json_header.timestamp - text_header.timestamp).abs() <= 1);
+    // The text rendering is the entry itself, verbatim, apart from the
+    // wall-clock time in the header line.
+    assert_eq!(normalize_header_time(&text), normalize_header_time(entry));
 }
 
 #[test]
