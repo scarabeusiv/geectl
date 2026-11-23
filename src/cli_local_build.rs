@@ -24,6 +24,12 @@
 //! exactly `prune --apply` and the leaf's confirmation is the flag
 //! itself.
 //!
+//! Two mutations no flag names still go through the dry-run guard
+//! (`DryRun::allow`): the first live `build` records the
+//! would-install of the periodic schedule, and `prune --apply`
+//! records the would-delete — a dry run prints the plan entry
+//! instead of mutating.
+//!
 //! Coordinate header (design rule 1): every text rendering opens
 //! with one header line echoing the query coordinates (`directory:
 //! …`, plus `mode: …` and `service: …` when the query carries
@@ -43,7 +49,7 @@ use geectl::local_build::{
     LocalBuild, PrecommitRecord, ServiceRunMode, ServiceRunRecord, ServiceRunRequest,
     SpecCleanerResult, WipeOutcome,
 };
-use geectl::obs::{ObsClient, OBS_API_BASE};
+use geectl::obs::{DryRun, ObsClient, OBS_API_BASE};
 use geectl::periodic::{self, PeriodicOs, PeriodicOutcome, PeriodicStatus};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -429,6 +435,26 @@ pub fn run_local_build(
             build_req.timeout_secs = timeout_secs;
             build_req.dry_run = !live;
             validate_build_request(&build_req)?;
+            // First live build installs the daily cleanup schedule,
+            // so nobody has to remember `periodic-install`. Best
+            // effort only: a missing scheduler never fails the
+            // build, and a dry run installs nothing. The notice is
+            // printed when the install happens, so it is not lost
+            // when the build itself fails. The install is a
+            // mutation the build does not ask for by name, so it
+            // goes through the dry-run guard like every other
+            // mutation: a dry run records the would-install in
+            // the plan instead of installing.
+            let dry_run = DryRun::new(!live);
+            let auto_install_notice =
+                if dry_run.allow("install the daily periodic cache cleanup on first live build") {
+                    auto_install_periodic_notice()
+                } else {
+                    None
+                };
+            if let Some(notice) = &auto_install_notice {
+                eprintln!("{notice}");
+            }
             let mut service_req = ServiceRunRequest::new(directory.clone(), ServiceRunMode::Run);
             service_req.timeout_secs = timeout_secs;
             service_req.dry_run = !live;
@@ -472,6 +498,7 @@ pub fn run_local_build(
                 "keep_rpms": keep_rpms,
                 "prefer_packages": prefer_packages,
                 "dry_run": !live,
+                "periodic_auto_install": auto_install_notice,
                 "services": services,
                 "precommit": precommit,
                 "record": record,
@@ -535,7 +562,12 @@ pub fn run_local_build(
             // `prune --apply`, and the plan is the default. A
             // `--live` without `--apply` says so in text, so it
             // never looks like a deletion that did not happen.
-            let report = if apply {
+            // `--apply` is the confirmation, not the global
+            // `--live` — but the deletion still goes through the
+            // dry-run guard, so a plan run records the
+            // would-delete instead of deleting.
+            let dry_run = DryRun::new(!apply);
+            let report = if dry_run.allow("delete the local build cache") {
                 vertical.prune_apply()?
             } else {
                 vertical.prune_plan()?
@@ -654,6 +686,17 @@ pub fn run_local_build(
             ))
         }
     }
+}
+
+/// The first-run auto-install, resolved and swallowed: any missing
+/// piece (unsupported platform, no home, no binary path) or any
+/// install failure is a quiet skip, never a build failure.
+fn auto_install_periodic_notice() -> Option<String> {
+    let os = periodic_os().ok()?;
+    let exe = std::env::current_exe().ok()?;
+    let home = periodic::resolve_home().ok()?;
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    periodic::maybe_auto_install(os, &exe, &home, xdg.as_deref())
 }
 
 /// The current platform's schedule, or `UnsupportedOs` where no

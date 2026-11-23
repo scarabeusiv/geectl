@@ -34,11 +34,14 @@
 
 use crate::config;
 use crate::error::{ErrorKind, GeectlError};
+use fs2::FileExt;
 use serde::Serialize;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The systemd unit base name and the Task Scheduler task name.
 pub const TASK_NAME: &str = "geectl-prune";
@@ -48,6 +51,11 @@ pub const LAUNCHD_LABEL: &str = "io.github.scarabeusiv.geectl.prune";
 /// `schtasks`): admin commands return promptly, a wedged service
 /// manager must not hang geectl.
 const SCHEDULER_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a failed auto-install suppresses the next attempt: a
+/// day. Long enough to stop every build re-running the scheduler
+/// probes for a failure that has not changed, short enough that a
+/// fixed scheduler is picked up without any manual step.
+const AUTO_INSTALL_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 const SYSTEMD_SERVICE_TEMPLATE: &str = include_str!("../packaging/systemd/geectl-prune.service");
 const SYSTEMD_TIMER_TEMPLATE: &str = include_str!("../packaging/systemd/geectl-prune.timer");
@@ -442,11 +450,16 @@ pub fn install_plan(
         PeriodicOs::Windows => {
             // The task XML lives only long enough for schtasks to
             // read it: schtasks owns the task afterwards. The temp
-            // path carries this process's id, so two concurrent
-            // installs never share one file; it is bound once so
-            // the file and the command agree.
+            // path carries a suffix unique to this install (pid,
+            // wall-clock nanos, per-process counter), so two
+            // concurrent installs never share one file — a pid
+            // alone could collide across a pid reuse — and the
+            // write itself is an O_EXCL temp file plus rename, so
+            // a planted name fails the write instead of being
+            // followed. The path is bound once so the file and
+            // the command agree.
             let xml_path =
-                std::env::temp_dir().join(format!("{TASK_NAME}-{}.xml", std::process::id()));
+                std::env::temp_dir().join(format!("{TASK_NAME}-{}.xml", unique_suffix()));
             Ok(PeriodicPlan {
                 os,
                 label: TASK_NAME.to_string(),
@@ -709,8 +722,139 @@ impl Drop for TempCleanup {
     }
 }
 
+/// A suffix unique to this write: pid, wall-clock nanos, and a
+/// per-process counter. No randomness source is needed: the temp
+/// file is created with O_EXCL, so a guessed name only fails the
+/// write instead of hijacking it, and the counter keeps two writes
+/// in one process apart even in the same nanosecond.
+fn unique_suffix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        nanos,
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Write `content` to `path` atomically: a temp file in the same
+/// directory, created with O_EXCL, fsynced, then renamed over the
+/// destination, with the directory fsynced so the rename itself
+/// is durable. A crash or a full disk never leaves a truncated
+/// destination, and a planted temp name fails the write instead
+/// of being followed. The temp file is removed on every failure
+/// path, so a retry never trips over this run's leftover.
+fn write_file_atomically(path: &Path, content: &str) -> Result<(), GeectlError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp_path = parent.join(format!(".{file_name}.tmp-{}", unique_suffix()));
+    let write = (|| -> std::io::Result<()> {
+        let mut file = fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write {
+        let _ = fs::remove_file(&temp_path);
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("cannot write {}: {err}", path.display()),
+        ));
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("cannot write {}: {err}", path.display()),
+        ));
+    }
+    sync_dir_after_rename(parent);
+    Ok(())
+}
+
+/// Sync `dir` after a rename so the rename itself is durable.
+/// Unix-only: opening a directory is not portable. Best-effort:
+/// the rename already happened, so a failure here must not report
+/// the write as failed.
+#[cfg(unix)]
+fn sync_dir_after_rename(dir: &Path) {
+    if let Ok(dir) = fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir_after_rename(_dir: &Path) {}
+
+/// An exclusive lock on the file `path` would write, held while
+/// the write runs: two concurrent installs serialize instead of
+/// racing their renames. The lock file (`<path>.lock`) is an
+/// anchor that is never removed — removing it would let a second
+/// process lock a deleted inode while the first still holds the
+/// live one. A lock held over 5 s fails the write instead of
+/// waiting forever; a crashed holder's lock is released by the
+/// OS when its process dies, so no stale-lock cleanup is needed.
+struct WriteLock {
+    _file: fs::File,
+}
+
+impl WriteLock {
+    fn acquire(path: &Path) -> Result<Self, GeectlError> {
+        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+        let file = fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!("cannot lock {}: {e}", path.display()),
+                )
+            })?;
+        let deadline = Instant::now() + Duration::from_millis(5_000);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(WriteLock { _file: file }),
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        return Err(GeectlError::new(
+                            ErrorKind::ConfigError,
+                            format!("cannot lock {}: timed out after 5s", path.display()),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
+/// Write `content` to `path` under the exclusive lock, atomically:
+/// the lock serializes concurrent writers, the temp file plus
+/// rename keeps every reader on a complete file.
+fn write_file_locked(path: &Path, content: &str) -> Result<(), GeectlError> {
+    let _lock = WriteLock::acquire(path)?;
+    write_file_atomically(path, content)
+}
+
 /// Install the schedule for `os`: write the files, then run the
-/// enable commands. A dry run writes nothing and runs nothing, but
+/// enable commands. Every file is written atomically under an
+/// exclusive lock, so concurrent installs never leave a torn file.
+/// A dry run writes nothing and runs nothing, but
 /// lists the full plan: on macOS a live run skips the unload step
 /// when `launchctl list` reports nothing loaded. An enable failure
 /// leaves the files written and reports it, so a retry only
@@ -761,12 +905,7 @@ pub fn install(
                 )
             })?;
         }
-        fs::write(&file.path, &file.content).map_err(|e| {
-            GeectlError::new(
-                ErrorKind::ConfigError,
-                format!("cannot write {}: {e}", file.path.display()),
-            )
-        })?;
+        write_file_locked(&file.path, &file.content)?;
     }
     let mut enable = plan.enable;
     if os == PeriodicOs::MacOs && launchctl_loaded(&plan.label) == Some(false) {
@@ -846,6 +985,10 @@ pub fn uninstall(
             }
         }
     }
+    // A deliberate uninstall opts out of the first-run auto-install:
+    // record the decision so the next build does not silently put
+    // the schedule back.
+    record_auto_install_decided(home, xdg_config_home);
     Ok(PeriodicOutcome {
         platform: os,
         label: plan.label,
@@ -1054,6 +1197,188 @@ pub fn status(
         active: state.active,
         files,
     })
+}
+
+/// The auto-install marker: `$XDG_CONFIG_HOME/geectl/periodic-auto-install`,
+/// else `~/.config/geectl/periodic-auto-install`. Its presence means the
+/// first-run decision is made: the schedule was installed (by
+/// auto-install or by hand), or the user opted out with
+/// `periodic-uninstall`. It is never removed, so an uninstall stays
+/// uninstalled until a manual `periodic-install`.
+pub fn auto_install_marker_path(
+    home: &Path,
+    xdg_config_home: Option<&str>,
+) -> Result<PathBuf, GeectlError> {
+    let dir = match xdg_config_home {
+        Some(xdg) if !xdg.trim().is_empty() => PathBuf::from(xdg.trim()).join("geectl"),
+        _ => home.join(".config").join("geectl"),
+    };
+    if !dir.is_absolute() {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "periodic auto-install marker directory is not absolute: {}",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(dir.join("periodic-auto-install"))
+}
+
+/// The negative-cache marker: `$XDG_CONFIG_HOME/geectl/periodic-auto-install-failed`,
+/// else `~/.config/geectl/periodic-auto-install-failed`. It carries
+/// the unix time of the last failed auto-install attempt; while it
+/// is younger than the retry window, later builds skip the
+/// scheduler probes instead of retrying a failure that has not
+/// changed. Recording the decision removes it.
+pub fn auto_install_failed_marker_path(
+    home: &Path,
+    xdg_config_home: Option<&str>,
+) -> Result<PathBuf, GeectlError> {
+    let dir = match xdg_config_home {
+        Some(xdg) if !xdg.trim().is_empty() => PathBuf::from(xdg.trim()).join("geectl"),
+        _ => home.join(".config").join("geectl"),
+    };
+    if !dir.is_absolute() {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "periodic auto-install marker directory is not absolute: {}",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(dir.join("periodic-auto-install-failed"))
+}
+
+/// Record that the auto-install decision is made: create the marker
+/// file (and its directory) when missing. Best effort by design: a
+/// marker that cannot be written only means the next build asks
+/// again, never a failure.
+fn record_auto_install_decided(home: &Path, xdg_config_home: Option<&str>) {
+    let Ok(marker) = auto_install_marker_path(home, xdg_config_home) else {
+        return;
+    };
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // Atomic under the lock, like every other periodic write: two
+    // concurrent first builds record the same decision without
+    // racing. A decision supersedes a failed attempt, so a stale
+    // negative-cache marker goes with it.
+    let _ = write_file_locked(&marker, "auto-install decided\n");
+    if let Ok(failed) = auto_install_failed_marker_path(home, xdg_config_home) {
+        let _ = fs::remove_file(failed);
+    }
+}
+
+/// Record that the last auto-install attempt failed: write the
+/// current unix time to the negative-cache marker (and its
+/// directory) when missing. Best effort by design, like the
+/// decision marker: a marker that cannot be written only means
+/// the next build asks again, never a failure.
+fn record_auto_install_failed(home: &Path, xdg_config_home: Option<&str>) {
+    let Ok(marker) = auto_install_failed_marker_path(home, xdg_config_home) else {
+        return;
+    };
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = write_file_locked(&marker, &format!("{now}\n"));
+}
+
+/// Whether the last failed auto-install attempt is still inside
+/// the retry window: a missing, unreadable or unparsable marker
+/// counts as no failure, so a corrupt marker never suppresses
+/// the install forever.
+fn auto_install_failed_recently(home: &Path, xdg_config_home: Option<&str>) -> bool {
+    let Ok(marker) = auto_install_failed_marker_path(home, xdg_config_home) else {
+        return false;
+    };
+    let Ok(content) = fs::read_to_string(&marker) else {
+        return false;
+    };
+    let Ok(failed_at) = content.trim().parse::<u64>() else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(failed_at) < AUTO_INSTALL_RETRY_AFTER.as_secs()
+}
+
+/// The one-line notice printed when the first-run install happens.
+fn auto_install_notice(os: PeriodicOs, label: &str) -> String {
+    format!(
+        "periodic: installed the daily cache cleanup ({}, {label}); run geectl local-build periodic-uninstall to remove it",
+        os.name()
+    )
+}
+
+/// Whether the schedule counts as installed: the files exist (or the
+/// query answers so on Windows), and the scheduler confirms it
+/// enabled. A unit the scheduler reports disabled — or cannot be
+/// asked about — is not installed: the enable step failed, never
+/// ran, or cannot be verified, so the next build retries the
+/// install instead of recording the decision.
+fn already_installed(status: &PeriodicStatus) -> bool {
+    status.installed == Some(true) && status.enabled == Some(true)
+}
+
+/// Install the schedule on the first live `local-build` run, unless
+/// the decision is already made. Returns the one-line notice when an
+/// install happened, `None` otherwise. Never errors: every failure
+/// is a quiet skip, so a missing scheduler can never fail the build
+/// that triggered it. An install that fails writes no marker, so a
+/// later build retries — whether the files were never written or
+/// the enable failed and left them behind: the decision is
+/// recorded only once the scheduler confirms the unit enabled. An
+/// install that fails writes the failed-attempt marker, so later
+/// builds skip the probes until the retry window (a day) passes.
+/// A deliberate uninstall records the opt-out, so it is never
+/// re-installed.
+pub fn maybe_auto_install(
+    os: PeriodicOs,
+    exe: &Path,
+    home: &Path,
+    xdg_config_home: Option<&str>,
+) -> Option<String> {
+    let marker = auto_install_marker_path(home, xdg_config_home).ok()?;
+    if marker.is_file() {
+        return None;
+    }
+    // Already installed by hand: record the decision and stop. The
+    // files answer it on Linux/macOS; on Windows the query does. A
+    // scheduler that cannot be asked leaves the decision unrecorded,
+    // so a later build retries once the scheduler answers; a unit
+    // the scheduler reports disabled is not installed either, so it
+    // falls through to the install attempt below.
+    if let Ok(status) = status(os, home, xdg_config_home) {
+        if already_installed(&status) {
+            record_auto_install_decided(home, xdg_config_home);
+            return None;
+        }
+    }
+    // A failed attempt is negatively cached: without this every
+    // build re-runs the scheduler probes and the install attempt
+    // for a failure that has not changed.
+    if auto_install_failed_recently(home, xdg_config_home) {
+        return None;
+    }
+    let outcome = match install(os, exe, home, xdg_config_home, false) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            record_auto_install_failed(home, xdg_config_home);
+            return None;
+        }
+    };
+    record_auto_install_decided(home, xdg_config_home);
+    Some(auto_install_notice(os, &outcome.label))
 }
 
 #[cfg(test)]
@@ -1451,5 +1776,272 @@ mod tests {
         let output = run_bounded(&argv).unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!(
+                "geectl-periodic-test-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn auto_install_marker_path_honours_xdg_config_home() {
+        assert_eq!(
+            auto_install_marker_path(&home(), Some("/xdg/config")).unwrap(),
+            PathBuf::from("/xdg/config/geectl/periodic-auto-install")
+        );
+        assert_eq!(
+            auto_install_marker_path(&home(), None).unwrap(),
+            PathBuf::from("/home/tester/.config/geectl/periodic-auto-install")
+        );
+        assert!(auto_install_marker_path(&home(), Some("relative/xdg")).is_err());
+    }
+
+    #[test]
+    fn auto_install_notice_names_the_platform_and_the_removal() {
+        assert_eq!(
+            auto_install_notice(PeriodicOs::Linux, "geectl-prune.timer"),
+            "periodic: installed the daily cache cleanup (linux, geectl-prune.timer); run geectl local-build periodic-uninstall to remove it"
+        );
+    }
+
+    #[test]
+    fn already_installed_needs_the_scheduler_not_to_report_disabled() {
+        let status_with_enabled = |enabled: Option<bool>| PeriodicStatus {
+            platform: PeriodicOs::Linux,
+            label: "geectl-prune.timer".to_string(),
+            installed: Some(true),
+            enabled,
+            active: None,
+            files: vec![],
+        };
+        assert!(already_installed(&status_with_enabled(Some(true))));
+        assert!(!already_installed(&status_with_enabled(None)));
+        assert!(!already_installed(&status_with_enabled(Some(false))));
+        assert!(!already_installed(&PeriodicStatus {
+            installed: Some(false),
+            ..status_with_enabled(Some(true))
+        }));
+        assert!(!already_installed(&PeriodicStatus {
+            installed: None,
+            ..status_with_enabled(Some(true))
+        }));
+    }
+
+    #[test]
+    fn maybe_auto_install_skips_when_marker_present() {
+        let tmp = TempDir::new("marker-present");
+        let home = tmp.0.join("home");
+        let xdg = tmp.0.join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let xdg = xdg.to_str().unwrap();
+        record_auto_install_decided(&home, Some(xdg));
+        assert_eq!(
+            maybe_auto_install(PeriodicOs::Linux, &exe(), &home, Some(xdg)),
+            None
+        );
+        // No install was attempted: no unit files exist.
+        assert!(!systemd_user_dir(Some(xdg), &home)
+            .unwrap()
+            .join("geectl-prune.timer")
+            .exists());
+    }
+
+    #[test]
+    fn maybe_auto_install_does_not_decide_when_the_scheduler_cannot_be_asked() {
+        // Unit files exist but the scheduler cannot confirm the
+        // unit enabled: no marker is recorded, so a later build
+        // retries once the scheduler answers. The enabled answer
+        // comes from the real scheduler — on Linux a unit absent
+        // from the real home reads disabled (or unknown with no
+        // user manager), elsewhere the query fails — but every path
+        // ends in an install attempt that fails without writing the
+        // marker.
+        let tmp = TempDir::new("unconfirmed-installed");
+        let home = tmp.0.join("home");
+        let xdg = tmp.0.join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let xdg = xdg.to_str().unwrap();
+        let plan = install_plan(PeriodicOs::Linux, &exe(), &home, Some(xdg)).unwrap();
+        for file in &plan.files {
+            std::fs::create_dir_all(file.path.parent().unwrap()).unwrap();
+            std::fs::write(&file.path, &file.content).unwrap();
+        }
+        assert_eq!(
+            maybe_auto_install(PeriodicOs::Linux, &exe(), &home, Some(xdg)),
+            None
+        );
+        assert!(!auto_install_marker_path(&home, Some(xdg))
+            .unwrap()
+            .is_file());
+    }
+
+    #[test]
+    fn maybe_auto_install_skips_quietly_when_the_install_fails() {
+        // XDG_CONFIG_HOME points at a regular file: no unit
+        // directory can be created under it, so the install fails
+        // before any scheduler is involved — on every platform.
+        let tmp = TempDir::new("install-fails");
+        let home = tmp.0.join("home");
+        let blocker = tmp.0.join("blocker");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let xdg = blocker.to_str().unwrap();
+        assert_eq!(
+            maybe_auto_install(PeriodicOs::Linux, &exe(), &home, Some(xdg)),
+            None
+        );
+        // A failed install writes no decision marker — and the
+        // failed-attempt marker cannot be written either, because
+        // its directory is the same unwritable path: a later build
+        // retries.
+        assert!(!auto_install_marker_path(&home, Some(xdg))
+            .unwrap()
+            .is_file());
+        assert!(!auto_install_failed_marker_path(&home, Some(xdg))
+            .unwrap()
+            .is_file());
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_and_leaves_no_temp_files() {
+        let tmp = TempDir::new("atomic-write");
+        let path = tmp.0.join("geectl-prune.timer");
+        write_file_locked(&path, "one\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\n");
+        write_file_locked(&path, "two\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
+        // No temp file survives either write: only the destination
+        // and its lock anchor remain.
+        let mut names: Vec<String> = std::fs::read_dir(&tmp.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["geectl-prune.timer", "geectl-prune.timer.lock"]);
+    }
+
+    #[test]
+    fn windows_plan_xml_names_differ_between_installs() {
+        // The temp name carries a unique suffix, not just the pid:
+        // two installs in one process never share one file.
+        let first = install_plan(PeriodicOs::Windows, &exe(), &home(), None).unwrap();
+        let second = install_plan(PeriodicOs::Windows, &exe(), &home(), None).unwrap();
+        assert_ne!(first.files[0].path, second.files[0].path);
+    }
+
+    #[test]
+    fn failed_auto_install_is_negatively_cached() {
+        // A recent failed marker short-circuits the probes: no
+        // unit files are written, and the decision marker stays
+        // unwritten, so the retry window — not the failure — is
+        // what suppresses the attempt.
+        let tmp = TempDir::new("failed-recent");
+        let home = tmp.0.join("home");
+        let xdg = tmp.0.join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let xdg = xdg.to_str().unwrap();
+        record_auto_install_failed(&home, Some(xdg));
+        assert!(auto_install_failed_recently(&home, Some(xdg)));
+        assert_eq!(
+            maybe_auto_install(PeriodicOs::Linux, &exe(), &home, Some(xdg)),
+            None
+        );
+        assert!(!systemd_user_dir(Some(xdg), &home)
+            .unwrap()
+            .join("geectl-prune.timer")
+            .exists());
+        assert!(!auto_install_marker_path(&home, Some(xdg))
+            .unwrap()
+            .is_file());
+    }
+
+    #[test]
+    fn stale_failed_marker_does_not_suppress_the_retry() {
+        let tmp = TempDir::new("failed-stale");
+        let home = tmp.0.join("home");
+        let xdg = tmp.0.join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let xdg = xdg.to_str().unwrap();
+        let failed = auto_install_failed_marker_path(&home, Some(xdg)).unwrap();
+        std::fs::create_dir_all(failed.parent().unwrap()).unwrap();
+        std::fs::write(&failed, "1\n").unwrap();
+        assert!(!auto_install_failed_recently(&home, Some(xdg)));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn failed_auto_install_writes_the_failed_marker() {
+        // Linux install on macOS: the unit files write, then the
+        // systemctl enable fails (no systemctl on macOS), so the
+        // attempt fails and the failed marker records it.
+        let tmp = TempDir::new("failed-marker-written");
+        let home = tmp.0.join("home");
+        let xdg = tmp.0.join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let xdg = xdg.to_str().unwrap();
+        assert_eq!(
+            maybe_auto_install(PeriodicOs::Linux, &exe(), &home, Some(xdg)),
+            None
+        );
+        assert!(!auto_install_marker_path(&home, Some(xdg))
+            .unwrap()
+            .is_file());
+        let failed = auto_install_failed_marker_path(&home, Some(xdg)).unwrap();
+        assert!(failed.is_file());
+        let stored: u64 = std::fs::read_to_string(&failed)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(stored > 1_700_000_000);
+        // Inside the retry window the next build skips the probes.
+        assert_eq!(
+            maybe_auto_install(PeriodicOs::Linux, &exe(), &home, Some(xdg)),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn uninstall_records_the_opt_out() {
+        let tmp = TempDir::new("uninstall-opt-out");
+        let home = tmp.0.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let outcome = uninstall(PeriodicOs::MacOs, &home, None, false).unwrap();
+        assert!(!outcome.dry_run);
+        assert!(auto_install_marker_path(&home, None).unwrap().is_file());
+        // The next build does not put the schedule back.
+        assert_eq!(
+            maybe_auto_install(PeriodicOs::MacOs, &exe(), &home, None),
+            None
+        );
+        // No install was attempted: the marker short-circuited the
+        // call, so no plist file exists — a failed install would
+        // have left one behind.
+        assert!(!home
+            .join("Library")
+            .join("LaunchAgents")
+            .join("io.github.scarabeusiv.geectl.prune.plist")
+            .exists());
     }
 }

@@ -424,11 +424,11 @@ policy and safeguards as automatic eviction.
   `OnCalendar=*-*-* 03:00:00`, the launchd agent a
   `StartCalendarInterval` of hour 3, minute 0, and the scheduled task
   a daily trigger at 03:00. Pinned by
-  `systemd_units_carry_the_binary_and_0300` (`src/periodic.rs:1073`),
+  `systemd_units_carry_the_binary_and_0300` (`src/periodic.rs:1420`),
   `launchd_plist_carries_the_binary_log_and_0300`
-  (`src/periodic.rs:1101`) and
+  (`src/periodic.rs:1448`) and
   `scheduled_task_xml_carries_the_binary_and_daily_0300`
-  (`src/periodic.rs:1113`).
+  (`src/periodic.rs:1466`).
 - **Linux: a systemd user timer.** `geectl-prune.service` +
   `geectl-prune.timer` in `~/.config/systemd/user/` (or
   `$XDG_CONFIG_HOME/systemd/user/`), enabled with `systemctl --user
@@ -438,7 +438,7 @@ policy and safeguards as automatic eviction.
   same files (separate packaging track; the spec substitutes
   `@GEECTL_BIN@` with the packaged binary path). Pinned by
   `linux_plan_writes_both_units_and_enables_the_timer`
-  (`src/periodic.rs:1154`).
+  (`src/periodic.rs:1509`).
 - **macOS: a launchd agent.** `io.github.scarabeusiv.geectl.prune.plist`
   in `~/Library/LaunchAgents/`, loaded with `launchctl load`, logging
   to `~/Library/Logs/geectl-prune.log`. A re-install unloads the
@@ -449,12 +449,12 @@ policy and safeguards as automatic eviction.
   where load/unload cannot run — where the query itself fails, the
   unload is still attempted. The dry run lists the full plan either
   way. Pinned by
-  `macos_plan_writes_the_plist_and_loads_it` (`src/periodic.rs:1206`).
+  `macos_plan_writes_the_plist_and_loads_it` (`src/periodic.rs:1569`).
 - **Windows: a Task Scheduler task.** `geectl-prune`, created with
   `schtasks /create /xml`, running as the creating user
   (`InteractiveToken`, least privilege). Pinned by
   `windows_plan_writes_the_xml_to_temp_and_creates_the_task`
-  (`src/periodic.rs:1251`).
+  (`src/periodic.rs:1602`).
 - **Install, uninstall and status are leaves, not packaging.**
   `geectl local-build periodic-install --live` writes the entry and
   enables it; without `--live` it prints the plan only. `geectl
@@ -467,13 +467,47 @@ policy and safeguards as automatic eviction.
   cannot be asked or its answer names no known state — `installed`
   only on Windows, where the query is the answer; elsewhere the
   files answer it. The leaves parse as
-  `periodic_leaves_parse` (`src/cli_local_build.rs:1230`).
+  `periodic_leaves_parse` (`src/cli_local_build.rs:1273`).
+- **The first live build installs the schedule.** A live
+  `local-build build` installs the schedule when no decision is
+  recorded yet, so nobody has to remember `periodic-install`, and
+  prints a one-line notice when it does; a dry run installs
+  nothing, and a missing scheduler never fails the build. The decision is recorded in
+  `$XDG_CONFIG_HOME/geectl/periodic-auto-install` (else
+  `~/.config/geectl/periodic-auto-install`): once written, the
+  build never installs again — including after
+  `periodic-uninstall`, which records the opt-out, so the next
+  build does not put the schedule back. A manual disable before
+  the decision is recorded is undone by the next build — the
+  files and the disabled state read the same as a failed enable;
+  `periodic-uninstall` is the opt-out. A manual
+  `periodic-install` is the way back in. A dry run records the
+  would-install through `DryRun::allow` instead of installing,
+  and a failed install writes the failed-attempt marker
+  (`periodic-auto-install-failed`, unix time), so later builds
+  skip the probes until the day-long retry window passes. Pinned by
+  `already_installed_needs_the_scheduler_not_to_report_disabled`
+  (`src/periodic.rs:1855`),
+  `maybe_auto_install_skips_when_marker_present`
+  (`src/periodic.rs:1878`),
+  `maybe_auto_install_does_not_decide_when_the_scheduler_cannot_be_asked`
+  (`src/periodic.rs:1898`),
+  `maybe_auto_install_skips_quietly_when_the_install_fails`
+  (`src/periodic.rs:1928`),
+  `failed_auto_install_is_negatively_cached`,
+  `stale_failed_marker_does_not_suppress_the_retry`,
+  `failed_auto_install_writes_the_failed_marker` (macOS-only) and
+  `uninstall_records_the_opt_out`
+  (`src/periodic.rs:2058`).
 - **The timer's command is exactly `prune --apply`.** `prune`
   deletes only with its own `--apply` flag: the global `--live`
   does not gate it, because the scheduled task runs
   `geectl local-build prune --apply` and the leaf's confirmation is
-  the flag itself. Pinned by `prune_parses_defaults_and_apply`
-  (`src/cli_local_build.rs:1218`).
+  the flag itself. The deletion itself goes through
+  `DryRun::allow`, so a plan run records the would-delete;
+  `--live` without `--apply` still only notes that `--live` never
+  deletes here. Pinned by `prune_parses_defaults_and_apply`
+  (`src/cli_local_build.rs:1261`).
 - **No schedule ships off the three platforms.** Install, uninstall
   and status fail with `UnsupportedOs` anywhere else.
 
