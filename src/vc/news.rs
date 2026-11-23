@@ -554,4 +554,80 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn tar_archive_arg_prefixes_dash_leading_paths() {
+        assert_eq!(
+            tar_archive_arg(std::path::Path::new("-foo-2.0.tar.gz")),
+            "./-foo-2.0.tar.gz"
+        );
+        assert_eq!(
+            tar_archive_arg(std::path::Path::new("foo-2.0.tar.gz")),
+            "foo-2.0.tar.gz"
+        );
+        assert_eq!(
+            tar_archive_arg(std::path::Path::new("/tmp/foo-2.0.tar.gz")),
+            "/tmp/foo-2.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn tar_extracts_a_dash_leading_member_name() {
+        // A member whose name starts with `-` is an operand, never
+        // an option: without the `--` separator `tar` parses it as a
+        // flag.
+        if Command::new("tar").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-changelog-news-dash-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("--weird"), "## 2.0\n\n- Fix a crash\n").unwrap();
+        let tarball = dir.join("foo-2.0.tar.gz");
+        let status = Command::new("tar")
+            .args(["-czf"])
+            .arg(&tarball)
+            .args(["-C"])
+            .arg(&dir)
+            .args(["--", "--weird"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let members = tar_list(&tarball).expect("listing runs");
+        assert!(members.iter().any(|m| m == "--weird"));
+        let text = tar_extract(&tarball, "--weird").expect("extraction runs");
+        assert!(text.contains("Fix a crash"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tar_extract_refuses_an_oversized_member() {
+        if Command::new("tar").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-changelog-news-cap-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("foo-2.0")).unwrap();
+        let big = "- filler\n".repeat(200_000);
+        std::fs::write(dir.join("foo-2.0/NEWS"), format!("## 2.0\n\n{big}")).unwrap();
+        let tarball = dir.join("foo-2.0.tar.gz");
+        let status = Command::new("tar")
+            .args(["-czf"])
+            .arg(&tarball)
+            .args(["-C"])
+            .arg(&dir)
+            .arg("foo-2.0")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let err = extract_news_section(&tarball, "2.0").expect_err("oversized member is refused");
+        assert_eq!(err, NewsError::OutputTooLarge);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

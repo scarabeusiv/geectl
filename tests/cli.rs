@@ -3763,7 +3763,7 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 20 blocks (top level, 9 groups, 10 leaves) — a
+    // The docs carry 23 blocks (top level, 10 groups, 12 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
     // groups and one leaf each, plus `remote download` — and the count
@@ -3773,8 +3773,8 @@ fn docs_help_blocks_match_the_binary() {
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-        20,
-        "docs/cli.md should carry 20 --help blocks (top level, 9 groups, 10 leaves);          update this count when a block is deliberately added or removed"
+        23,
+        "docs/cli.md should carry 23 --help blocks (top level, 10 groups, 12 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();
@@ -4412,4 +4412,268 @@ fn config_show_reports_error_source_when_default_cache_dir_unresolvable() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("build_cache_dir: - (error)"), "{stdout}");
+}
+
+// --- vc validate / vc generate integration tests ---
+
+/// A package directory fixture: spec + `.changes` (+ optional NEWS
+/// tarball for the 2.0 version). `changes_entry` is the body of the
+/// newest entry.
+fn vc_fixture(dir: &TempDir, changes_entry: &str, with_news: bool) -> PathBuf {
+    let pkg = dir.0.join("foo");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        pkg.join("foo.spec"),
+        "Name:           foo\nVersion:        2.0\nLicense:        GPL-3.0-only\nSource0:        foo-2.0.tar.gz\nPatch0:         new.patch\nBuildRequires:  pkgconfig\n\n%changelog\n",
+    )
+    .unwrap();
+    let sep = "-".repeat(67);
+    fs::write(
+        pkg.join("foo.changes"),
+        format!(
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n{changes_entry}\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package\n\n"
+        ),
+    )
+    .unwrap();
+    fs::write(pkg.join("new.patch"), "new patch content\n").unwrap();
+    if with_news {
+        let news_dir = pkg.join("foo-2.0");
+        fs::create_dir_all(&news_dir).unwrap();
+        fs::write(
+            news_dir.join("NEWS"),
+            "## 1.0\n\n- Old news\n\n## 2.0\n\n- Fix a crash in the parser\n- Add a new subcommand\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new("tar")
+            .args(["-czf", "foo-2.0.tar.gz", "foo-2.0"])
+            .current_dir(&pkg)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    pkg
+}
+
+#[test]
+fn vc_validate_clean_fixture_exits_zero() {
+    let dir = TempDir::new();
+    let pkg = vc_fixture(
+        &dir,
+        "- Update to 2.0\n- Fix a crash in the parser (boo#1234567)",
+        false,
+    );
+    let out = geectl_isolated(&dir)
+        .args(["vc", "validate"])
+        .arg(&pkg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["verdict"], "pass");
+    assert!(value["findings"].as_array().unwrap().is_empty());
+    // The text rendering opens with the coordinate header and ends
+    // with the verdict line.
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "vc", "validate"])
+        .arg(&pkg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("dir: "));
+    assert!(text.contains("OK: clean"));
+}
+
+#[test]
+fn vc_validate_bare_update_with_news_exits_24() {
+    let dir = TempDir::new();
+    let pkg = vc_fixture(&dir, "- Update to 2.0", true);
+    let out = geectl_isolated(&dir)
+        .args(["vc", "validate"])
+        .arg(&pkg)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(24));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "validation_failed");
+    let context = value["error"]["context"].as_str().unwrap();
+    assert!(context.contains("V9"), "context: {context}");
+    assert!(context.contains("foo.changes:4:"), "context: {context}");
+}
+
+#[test]
+fn vc_validate_missing_dir_fails_with_invalid_input() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["vc", "validate"])
+        .arg(dir.0.join("no-such-package"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn vc_generate_prints_draft_with_news_slots() {
+    let dir = TempDir::new();
+    let pkg = vc_fixture(&dir, "- Update to 2.0", true);
+    let out = geectl_isolated(&dir)
+        .args(["vc", "generate"])
+        .arg(&pkg)
+        .args(["--author", "Jane Packager <jane@example.com>"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["needs_detail"], true);
+    assert_eq!(value["news_found"], true);
+    let entry = value["entry"].as_str().unwrap();
+    assert!(entry.contains("- Update to 2.0"));
+    assert!(entry.contains("TODO"));
+    assert!(entry.contains("Fix a crash in the parser"));
+    // The text rendering is the entry itself, verbatim.
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "vc", "generate"])
+        .arg(&pkg)
+        .args(["--author", "Jane Packager <jane@example.com>"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), entry);
+}
+
+#[test]
+fn vc_generate_write_refuses_incomplete_draft() {
+    let dir = TempDir::new();
+    let pkg = vc_fixture(&dir, "- Update to 2.0", true);
+    let before = fs::read_to_string(pkg.join("foo.changes")).unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["vc", "generate"])
+        .arg(&pkg)
+        .args(["--author", "Jane Packager <jane@example.com>", "--write"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(24));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "validation_failed");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("refusing to write an incomplete entry"));
+    // The file is untouched.
+    assert_eq!(fs::read_to_string(pkg.join("foo.changes")).unwrap(), before);
+}
+
+#[test]
+fn vc_generate_write_refuses_slot_only_draft() {
+    // No NEWS tarball: no detail is demanded, but the draft still
+    // carries the no-news TODO slot — `--write` refuses it. (The
+    // `--write` success path, a slot-free draft, needs a target diff
+    // and is covered at the lib level by
+    // `generate_license_only_change_has_no_slots`.)
+    let dir = TempDir::new();
+    let pkg = vc_fixture(&dir, "- Update to 2.0", false);
+    let before = fs::read_to_string(pkg.join("foo.changes")).unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["vc", "generate"])
+        .arg(&pkg)
+        .args(["--author", "Jane Packager <jane@example.com>", "--write"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(24));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "validation_failed");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("unfilled TODO slot"),
+        "context: {}",
+        value["error"]["context"]
+    );
+    // The file is untouched.
+    assert_eq!(fs::read_to_string(pkg.join("foo.changes")).unwrap(), before);
+}
+
+#[test]
+fn vc_target_flags_go_together() {
+    let dir = TempDir::new();
+    let pkg = vc_fixture(&dir, "- Update to 2.0", false);
+    let out = geectl_isolated(&dir)
+        .args(["vc", "validate"])
+        .arg(&pkg)
+        .args(["--target-project", "openSUSE:Factory"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn vc_generate_without_author_fails() {
+    let dir = TempDir::new();
+    let pkg = vc_fixture(&dir, "- Update to 2.0", false);
+    let out = geectl_isolated(&dir)
+        .args(["vc", "generate"])
+        .arg(&pkg)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn vc_validate_entries_flag_lints_older_entries() {
+    // The older entry opens with a `* ` bullet at the top level: the
+    // default `--entries 1` lints only the newest entry (pass), while
+    // `--entries 2` lints it too (exit 24).
+    let dir = TempDir::new();
+    let pkg = dir.0.join("foo");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(
+        pkg.join("foo.spec"),
+        "Name:           foo\nVersion:        2.0\nLicense:        GPL-3.0-only\n\n%changelog\n",
+    )
+    .unwrap();
+    let sep = "-".repeat(67);
+    fs::write(
+        pkg.join("foo.changes"),
+        format!(
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n* Bad top star\n\n"
+        ),
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["vc", "validate"])
+        .arg(&pkg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out = geectl_isolated(&dir)
+        .args(["vc", "validate"])
+        .arg(&pkg)
+        .args(["--entries", "2"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(24));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "validation_failed");
+    assert!(
+        value["error"]["context"].as_str().unwrap().contains("V11"),
+        "context: {}",
+        value["error"]["context"]
+    );
 }

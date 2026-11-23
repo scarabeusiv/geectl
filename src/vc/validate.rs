@@ -1941,6 +1941,8 @@ mod tests {
         let options = ValidateOptions {
             entries: 1,
             news_section: Some("## 2.0\n\n- Fix a crash\n"),
+            tarball_present: true,
+            news_lookup_failed: false,
         };
         let report = validate(&local, None, &options);
         assert!(report
@@ -1978,6 +1980,8 @@ mod tests {
         let options = ValidateOptions {
             entries: 1,
             news_section: Some("## 2.0\n\n- Fix a crash\n"),
+            tarball_present: true,
+            news_lookup_failed: false,
         };
         let report = validate(&local, None, &options);
         assert!(!report.findings.iter().any(|f| f.rule == Rule::V9));
@@ -2218,6 +2222,8 @@ mod tests {
         let options = ValidateOptions {
             entries: 1,
             news_section: Some("## 2.0\n\n- Fix a crash\n"),
+            tarball_present: true,
+            news_lookup_failed: false,
         };
         let report = validate(&local, None, &options);
         assert!(report
@@ -2238,6 +2244,8 @@ mod tests {
         let options = ValidateOptions {
             entries: 1,
             news_section: Some("## 2.0\n\n- Fix a crash\n"),
+            tarball_present: true,
+            news_lookup_failed: false,
         };
         let report = validate(&local, None, &options);
         assert!(report
@@ -2510,5 +2518,189 @@ mod tests {
         ]);
         let report = validate(&local, None, &ValidateOptions::default());
         assert!(!report.findings.iter().any(|f| f.rule == Rule::V6));
+    }
+
+    #[test]
+    fn glob_match_handles_many_stars_without_backtracking_blowup() {
+        // `*a*a*a*a*b` against a long run of `a`s: the recursive
+        // matcher tried every split per `*` (exponential). The
+        // iterative one restarts from the last star instead.
+        assert!(glob_match("*a*a*a*a*b", "aaaab"));
+        assert!(!glob_match("*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaa"));
+        assert!(glob_match("*a*a*a*a*", "aaaaaaaaaaaaaaaaaaaa"));
+        assert!(glob_match("foo-*.tar.gz", "foo-2.0.tar.gz"));
+        assert!(!glob_match("foo-*.tar.gz", "foo-2.0.tar"));
+        assert!(glob_match("foo-?.tar.gz", "foo-2.tar.gz"));
+        assert!(!glob_match("foo-?.tar.gz", "foo-20.tar.gz"));
+        // Eight stars against 25 `a`s: the recursive matcher tried
+        // every split per `*` (seconds); the iterative one restarts
+        // from the last star instead.
+        let many_a = "a".repeat(25);
+        assert!(!glob_match("*a*a*a*a*a*a*a*a*b", &many_a));
+        assert!(glob_match("*a*a*a*a*a*a*a*a*", &many_a));
+    }
+
+    #[test]
+    fn diff_added_removed_falls_back_to_membership_past_the_lcs_cap() {
+        // 2000 x 2000 lines is 4M cells, past the cap: no table is
+        // built, and the added/removed lines still come out.
+        let old: Vec<String> = (0..2000).map(|i| format!("line {i}")).collect();
+        let mut new = old.clone();
+        new.push("line 2000".to_string());
+        new.remove(0);
+        let (added, removed) = diff_added_removed(&old, &new);
+        assert_eq!(added, vec!["line 2000".to_string()]);
+        assert_eq!(removed, vec!["line 0".to_string()]);
+        // Under the cap the LCS path reports the same lines.
+        let (added, removed) = diff_added_removed(&old[..10], &new[..10]);
+        assert_eq!(added, vec!["line 10".to_string()]);
+        assert_eq!(removed, vec!["line 0".to_string()]);
+        // Duplicates stay multiplicity-sensitive past the cap: two
+        // copies in `old`, one in `new` is one removal, not none —
+        // and the reverse is one addition.
+        let mut old: Vec<String> = vec!["a".to_string(), "a".to_string()];
+        old.extend((0..1998).map(|i| format!("line {i}")));
+        let mut new: Vec<String> = vec!["a".to_string()];
+        new.extend((0..1998).map(|i| format!("line {i}")));
+        new.push("line 2000".to_string());
+        let (added, removed) = diff_added_removed(&old, &new);
+        assert_eq!(added, vec!["line 2000".to_string()]);
+        assert_eq!(removed, vec!["a".to_string()]);
+        let mut old: Vec<String> = vec!["a".to_string()];
+        old.extend((0..1999).map(|i| format!("line {i}")));
+        let mut new: Vec<String> = vec!["a".to_string(), "a".to_string()];
+        new.extend((0..1998).map(|i| format!("line {i}")));
+        let (added, removed) = diff_added_removed(&old, &new);
+        assert_eq!(added, vec!["a".to_string()]);
+        assert_eq!(removed, vec!["line 1998".to_string()]);
+    }
+
+    #[test]
+    fn v4_source_exemption_covers_macro_and_url_sources() {
+        // A patch carried as a Source: via a macro or a URL is
+        // exempt: the V7 glob, not exact equality.
+        let target_spec = SPEC.replace("Version:        2.0", "Version:        1.0");
+        let target = snapshot(&[
+            ("foo.spec", &target_spec),
+            (
+                "foo.changes",
+                &changes_file("- Update to 1.0", "- Initial package"),
+            ),
+            ("foo-1.0.tar.gz", "binary"),
+        ]);
+        let local_spec = SPEC
+            .replace(
+                "Patch0:         fix-crash.patch",
+                "Patch0:         new.patch",
+            )
+            .replace(
+                "Source0:        foo-2.0.tar.gz",
+                "Source0:        foo-2.0.tar.gz\nSource1:        https://example.com/files/data.patch\nSource2:        %{name}-extra.patch",
+            );
+        let local = snapshot(&[
+            ("foo.spec", &local_spec),
+            (
+                "foo.changes",
+                &changes_file(
+                    "- Update to 2.0\n  * Drop old.patch, add new.patch",
+                    "- Initial package",
+                ),
+            ),
+            ("foo-2.0.tar.gz", "binary"),
+            ("new.patch", "diff"),
+            ("data.patch", "diff"),
+            ("foo-extra.patch", "diff"),
+        ]);
+        let report = validate(&local, Some(&target), &ValidateOptions::default());
+        assert!(!report.findings.iter().any(|f| f.rule == Rule::V4));
+    }
+
+    #[test]
+    fn v9_skip_says_when_no_tarball_was_on_disk() {
+        // A bare update with no tarball at all: the rule is skipped,
+        // and the skip says the line was never checked.
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file("- Update to 2.0", "- Initial package"),
+            ),
+        ]);
+        let options = ValidateOptions {
+            entries: 1,
+            news_section: None,
+            tarball_present: false,
+            news_lookup_failed: false,
+        };
+        let report = validate(&local, None, &options);
+        assert!(report
+            .skipped
+            .iter()
+            .any(|s| s.rule == Rule::V9 && s.reason.contains("no source tarball on disk")));
+        assert!(!report.findings.iter().any(|f| f.rule == Rule::V9));
+        // A tarball on disk with no NEWS section keeps the old skip.
+        let options = ValidateOptions {
+            entries: 1,
+            news_section: None,
+            tarball_present: true,
+            news_lookup_failed: false,
+        };
+        let report = validate(&local, None, &options);
+        assert!(report
+            .skipped
+            .iter()
+            .any(|s| s.rule == Rule::V9 && s.reason.contains("no upstream NEWS section found")));
+    }
+
+    #[test]
+    fn v9_stays_silent_when_the_news_lookup_failed() {
+        // A failed NEWS lookup is reported once by the caller; V9
+        // adds no second, contradictory skip for it.
+        let local = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file("- Update to 2.0", "- Initial package"),
+            ),
+        ]);
+        let options = ValidateOptions {
+            entries: 1,
+            news_section: None,
+            tarball_present: true,
+            news_lookup_failed: true,
+        };
+        let report = validate(&local, None, &options);
+        assert!(!report.skipped.iter().any(|s| s.rule == Rule::V9));
+        assert!(!report.findings.iter().any(|f| f.rule == Rule::V9));
+    }
+
+    #[test]
+    fn v9_skip_does_not_claim_a_missing_tarball_without_a_version() {
+        // A spec with no Version: never had a tarball to look for;
+        // the skip says the version was unknown, not that no
+        // tarball was on disk.
+        let spec = SPEC.replace("Version:        2.0\n", "");
+        let local = snapshot(&[
+            ("foo.spec", &spec),
+            (
+                "foo.changes",
+                &changes_file("- Update to 2.0", "- Initial package"),
+            ),
+        ]);
+        let options = ValidateOptions {
+            entries: 1,
+            news_section: None,
+            tarball_present: false,
+            news_lookup_failed: false,
+        };
+        let report = validate(&local, None, &options);
+        assert!(report
+            .skipped
+            .iter()
+            .any(|s| s.rule == Rule::V9 && s.reason.contains("carries no version")));
+        assert!(!report
+            .skipped
+            .iter()
+            .any(|s| s.rule == Rule::V9 && s.reason.contains("no source tarball")));
     }
 }

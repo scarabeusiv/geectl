@@ -358,9 +358,21 @@ mod tests {
         assert_eq!(header.author, "Jane Packager <jane@example.com>");
         assert!(header.author_is_full_form());
         assert_eq!(
-            header.render(),
-            "Wed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>"
+            header.render().as_deref(),
+            Some("Wed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>")
         );
+    }
+
+    #[test]
+    fn render_returns_none_for_an_out_of_range_month() {
+        let header =
+            parse_header("Wed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>")
+                .expect("canonical header parses");
+        let mut bad = header.clone();
+        bad.month = 0;
+        assert_eq!(bad.render(), None);
+        bad.month = 13;
+        assert_eq!(bad.render(), None);
     }
 
     #[test]

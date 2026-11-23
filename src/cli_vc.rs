@@ -400,3 +400,32 @@ fn run_generate(
     payload["written"] = json!(changes_path.display().to_string());
     Ok((payload, generation.entry))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    #[cfg(unix)]
+    fn write_destination_refuses_a_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-changelog-write-symlink-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.changes");
+        std::fs::write(&target, "original\n").unwrap();
+        let link = dir.join("foo.changes");
+        symlink(&target, &link).unwrap();
+        let err = refuse_symlink_destination(&link).expect_err("symlink is refused");
+        assert_eq!(err.kind, ErrorKind::ValidationFailed);
+        assert!(err.context.contains("is a symlink"));
+        // A regular file and a missing file are both fine.
+        assert!(refuse_symlink_destination(&target).is_ok());
+        assert!(refuse_symlink_destination(&dir.join("missing.changes")).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

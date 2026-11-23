@@ -350,7 +350,8 @@ mod tests {
             Some(&target),
             "Jane Packager <jane@example.com>",
             Some(&news),
-        );
+        )
+        .expect("generation runs");
         assert!(gen.entry.contains("- Update to 2.0"));
         assert!(gen.entry.contains("- Add new.patch"));
         assert!(gen.entry.contains("- Drop old.patch"));
@@ -372,7 +373,8 @@ mod tests {
     #[test]
     fn generate_without_a_target_emits_the_version_line_and_a_slot() {
         let local = snapshot(&[("foo.spec", SPEC_V2)]);
-        let gen = generate(&local, None, "Jane Packager <jane@example.com>", None);
+        let gen = generate(&local, None, "Jane Packager <jane@example.com>", None)
+            .expect("generation runs");
         assert!(gen.entry.contains("- Update to 2.0"));
         assert!(gen.entry.contains("TODO: summarize the upstream changes"));
         assert!(!gen.news_found);
@@ -396,7 +398,8 @@ mod tests {
             Some(&target),
             "Jane Packager <jane@example.com>",
             Some(&news),
-        );
+        )
+        .expect("generation runs");
         assert!(gen.needs_detail);
     }
 
@@ -413,7 +416,8 @@ mod tests {
             Some(&target),
             "Jane Packager <jane@example.com>",
             None,
-        );
+        )
+        .expect("generation runs");
         assert!(gen.entry.contains("- Change License: MIT -> GPL-3.0-only"));
         assert_eq!(gen.slots, 0);
         assert!(!gen.needs_detail);

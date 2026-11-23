@@ -118,6 +118,7 @@ Commands:
   service       Service reads: list a package's services and their run state
   gitea         Gitea operations: repository and branch reads and mutations on the configured instance
   pull-request  Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface
+  vc            Validate and generate `.changes` entries in a package directory, pre-file
   help          Print this message or the help of the given subcommand(s)
 
 Options:
@@ -643,6 +644,82 @@ Options:
   -h, --help             Print help
 ```
 
+## `vc` — `.changes` validation and generation
+
+```
+Validate and generate `.changes` entries in a package directory, pre-file
+
+Usage: geectl vc [OPTIONS] <COMMAND>
+
+Commands:
+  validate  Validate the `.changes` entries in a package directory against the V1–V12 rules. Local-only by default; with `--target-project`/`--target-package` the target-relative rules (V2, V4, V5 newest-vs-target, V11 older entries) run against the target's current files. Exits non-zero naming the failing rule
+  generate  Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball. The output is a draft: what the diff cannot supply arrives as explicit `TODO` slots for a human to fill. `--write` prepends the draft into the package's `.changes` file, and refuses an incomplete draft (V9 needs-detail)
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Validate the `.changes` entries in a package directory against the V1–V12 rules. Local-only by default; with `--target-project`/`--target-package` the target-relative rules (V2, V4, V5 newest-vs-target, V11 older entries) run against the target's current files. Exits non-zero naming the failing rule
+
+Usage: geectl vc validate [OPTIONS] [DIR]
+
+Arguments:
+  [DIR]  The package directory (default: the current directory) [default: .]
+
+Options:
+      --format <FORMAT>
+          Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --target-project <TARGET_PROJECT>
+          The target project to compare against
+      --debug
+          Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --target-package <TARGET_PACKAGE>
+          The target package to compare against
+      --debug-body
+          Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --entries <ENTRIES>
+          Newest N entries to lint for format, and the number of new entries the submission may carry vs the target (default 1: one entry per SR) [default: 1]
+      --live
+          Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help
+          Print help
+```
+
+```
+Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball. The output is a draft: what the diff cannot supply arrives as explicit `TODO` slots for a human to fill. `--write` prepends the draft into the package's `.changes` file, and refuses an incomplete draft (V9 needs-detail)
+
+Usage: geectl vc generate [OPTIONS] [DIR]
+
+Arguments:
+  [DIR]  The package directory (default: the current directory) [default: .]
+
+Options:
+      --format <FORMAT>
+          Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --target-project <TARGET_PROJECT>
+          The target project to diff against
+      --debug
+          Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --target-package <TARGET_PACKAGE>
+          The target package to diff against
+      --author <AUTHOR>
+          The author line for the entry header, in `Name <email>` form — exactly what a bare `vc` invocation writes
+      --debug-body
+          Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live
+          Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+      --write
+          Prepend the draft into the package's `.changes` file instead of printing it
+  -h, --help
+          Print help
+```
+
 ## Common tasks
 
 ```sh
@@ -686,7 +763,20 @@ geectl gitea repo-create vim --private
 geectl pull-request show obs:1398977
 geectl pull-request show gitea:openSUSE/geectl#122
 geectl pull-request search --backend gitea --state open
+
+# .changes validation and generation (local, pre-file)
+geectl vc validate ~/work/foo
+geectl vc validate ~/work/foo --target-project openSUSE:Factory --target-package foo
+geectl vc generate ~/work/foo --author 'Jane Packager <jane@example.com>'
 ```
+
+Validate a package directory before filing: `vc validate` exits
+24 (`validation_failed`) naming the failing rule, and lists the
+skipped target-relative rules when no target is given. `vc
+generate` prints a draft entry — a bare version line plus explicit
+`TODO` slots — never a submission; `--write` prepends it into the
+package's `.changes` file and refuses a draft with unfilled
+`TODO` slots or a needs-detail flag.
 
 The `request file` flags above are illustrative — run
 `geectl request file --help` for the exact flag set. The same holds
