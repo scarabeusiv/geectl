@@ -6605,6 +6605,147 @@ fn live_service_state_on_project_probe() {
     eprintln!("P4 probe: service_state on _project returned {outcome:?}");
 }
 
+/// The trigger batch live tests: the server-side trigger against the
+/// live instance. The trigger only queues the run — the service
+/// binaries the instance ships do not matter here — so the positive
+/// cases assert the trigger is accepted, never the run's eventual
+/// state. A package with no `_service` file is a server 404.
+#[test]
+fn live_trigger_service_runs_on_live_instance() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "_service",
+            LIVE_SERVICE_MIXED,
+            &DryRun::new(false),
+        )
+        .expect("upload _service on the live instance");
+    let triggered = authed
+        .trigger_service(&source_project, &package, None, &DryRun::new(false))
+        .expect("trigger services on the live instance")
+        .expect("a live trigger returns a result");
+    assert_eq!(triggered.code, "ok");
+    assert_eq!(triggered.service, None);
+}
+
+/// The named form triggers when the service is defined in the
+/// stored `_service`.
+#[test]
+fn live_trigger_service_with_named_service_runs_on_live_instance() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "_service",
+            LIVE_SERVICE_MIXED,
+            &DryRun::new(false),
+        )
+        .expect("upload _service on the live instance");
+    let triggered = authed
+        .trigger_service(
+            &source_project,
+            &package,
+            Some("download_url"),
+            &DryRun::new(false),
+        )
+        .expect("trigger a named service on the live instance")
+        .expect("a live trigger returns a result");
+    assert_eq!(triggered.code, "ok");
+    assert_eq!(triggered.service.as_deref(), Some("download_url"));
+}
+
+/// A service the stored `_service` does not define fails closed
+/// before any trigger goes out.
+#[test]
+fn live_trigger_service_with_unknown_service_is_not_found() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "_service",
+            LIVE_SERVICE_MIXED,
+            &DryRun::new(false),
+        )
+        .expect("upload _service on the live instance");
+    assert_eq!(
+        authed
+            .trigger_service(
+                &source_project,
+                &package,
+                Some("no_such_service"),
+                &DryRun::new(false),
+            )
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// A package with no `_service` file has nothing to run: the
+/// server refuses with 404.
+#[test]
+fn live_trigger_service_without_service_file_is_not_found() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    assert_eq!(
+        authed
+            .trigger_service(&source_project, &package, None, &DryRun::new(false))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// A dry-run trigger sends nothing to the server: no run is
+/// queued and the plan names the trigger.
+#[test]
+fn live_trigger_service_dry_run_sends_nothing() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    // No `_service` upload: dry-run short-circuits before any read,
+    // so the trigger never looks at the stored file.
+    let dry_run = DryRun::new(true);
+    assert_eq!(
+        authed
+            .trigger_service(&source_project, &package, None, &dry_run)
+            .expect("a dry-run trigger returns without error"),
+        None
+    );
+    assert_eq!(
+        dry_run.plan(),
+        vec![format!(
+            "[dry-run] would: trigger services for {source_project}/{package}"
+        )]
+    );
+}
+
 /// The newer read and write operations against the live instance:
 /// staging read, person-match search, scmsync count, meta write
 /// (project and package), update from spec, `_link` delete,

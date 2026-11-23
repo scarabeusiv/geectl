@@ -656,11 +656,22 @@ Gap: mr / maintained / mbranch filing flows.**
 - Adjacent (file handling, not service-run):
   `tests/test_update.py:213` / `:229` — `_service:*` files downloaded only
   with `service_files=True`, ignored by default.
+- `service trigger` (issue #182): no osc test pins `remoterun` — the
+  only service test is the manualrun case above — so the trigger is
+  written from scratch. The endpoint is mined from osc's code, not
+  its tests (`osc/commandline.py` `do_service` and `osc/core.py`
+  `runservice`: `POST /source/<project>/<package>?cmd=runservice`,
+  `<status code="ok"/>` on success), and the server behaviour from
+  the OBS backend (`triggerservicerun` re-runs the package's whole
+  `_service`; no per-service parameter exists anywhere in the
+  trigger path, so `--service` validates the name against the
+  stored file and fails closed instead of narrowing the run).
+  No count change: 0 new adoptions.
 
 ### Gap — NO osc coverage, written from scratch
 
 Valid service run, `source_validator` gate (gate 2), `precommit`,
-`remoterun`, `run NAME` (manual-mode single service), `format_spec_file`,
+`run NAME` (manual-mode single service), `format_spec_file`,
 `localrun`, `disabledrun`. No dedicated service-run unit tests exist
 (grep for `service` over `tests/test_*.py` hits only `test_commit.py`,
 `test_conf.py`, `test_deletefiles.py`, `test_update.py` — `_service` file
@@ -823,7 +834,7 @@ Batch in brackets:
   `view=fileinfo_ext` [5].
 - `osc mr`, `osc maintained`, `osc mbranch`, `creq`/`deletereq` filing
   flows (action XML exists; flows don't) [7].
-- Valid service run, `source_validator`, `precommit`, `remoterun`,
+- Valid service run, `source_validator`, `precommit`,
   `run NAME`, `format_spec_file`, `localrun`, `disabledrun` [8].
 - Upload revision-response body (`<revision rev="N"/>` as PUT success) [1].
 - `remote delete-file`: no osc command deletes one server file (a

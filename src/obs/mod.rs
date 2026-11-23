@@ -211,6 +211,7 @@ pub use self::request::ReviewTarget;
 pub use self::request::XpathQuery;
 pub use self::services::ServiceDef;
 pub use self::services::ServiceParam;
+pub use self::services::ServiceTrigger;
 pub use self::staging::StagedRequest;
 pub use self::staging::StagingProject;
 pub use self::staging::StagingReadOptions;

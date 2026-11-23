@@ -1,19 +1,20 @@
-//! `service` — the service-read command group: a package's source
-//! services (`_service`) and their last run state.
+//! `service` — the service command group: a package's source
+//! services (`_service`), their last run state, and the server-side
+//! trigger.
 //!
-//! Two reads over `ObsClient`, thin like `remote`: the flags mirror
-//! the library parameters, the JSON payload carries the typed values,
-//! and the text renderer prints the same values in a human-readable
-//! form. No XML reaches the user anywhere.
+//! Two reads and one mutation over `ObsClient`, thin like `remote`:
+//! the flags mirror the library parameters, the JSON payload carries
+//! the typed values, and the text renderer prints the same values in
+//! a human-readable form. No XML reaches the user anywhere.
 //!
-//! These are reads, not runs: server-side trigger/wait/merge and
-//! local service runs are out of geectl by the Factory filter (see
-//! `docs/cli-swaps.md`) — local runs belong to the podman build
+//! The trigger is the one mutation: it runs the package's services
+//! on the server. Wait and merge stay out by the Factory filter (see
+//! `docs/cli-swaps.md`); local runs belong to the podman build
 //! vertical (issue #43). There is no osc command for either read;
 //! osc reaches the same data only via `osc api`.
 //!
 //! Coordinate header (design rule 1):
-//! both text renderings open with one header line echoing the query
+//! each text rendering opens with one header line echoing the query
 //! coordinates (`project: … package: …`); tables follow as designed.
 //!
 //! Documented omissions (not gaps): `list` text carries
@@ -23,8 +24,11 @@
 //! itself names. The JSON payload remains the complete record in
 //! every case.
 //!
-//! Credentials in dry-run: there is no dry-run here — both commands
-//! are reads — but credentials resolve up front (see `docs/cli.md`).
+//! Credentials in dry-run: the reads need none, but credentials
+//! resolve up front (see `docs/cli.md`) — a half-configured pair
+//! fails fast here, even for the reads — and the trigger is a
+//! mutation like any other: dry-run is the default, `--live`
+//! performs it.
 
 use clap::Subcommand;
 use geectl::auth::EnvObsAuth;
@@ -32,7 +36,7 @@ use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::GeectlError;
 use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{ObsClient, ServiceDef, ServiceState, OBS_API_BASE};
+use geectl::obs::{DryRun, ObsClient, ServiceDef, ServiceState, ServiceTrigger, OBS_API_BASE};
 use serde_json::{json, Value};
 
 /// The `service` subcommands. Names are the library operation names
@@ -53,13 +57,33 @@ pub enum ServiceCommand {
         /// The package to show the service state of.
         package: String,
     },
+    /// Trigger a server-side run of a package's services. A mutation:
+    /// dry-run is the default (only the plan is printed); `--live`
+    /// performs the trigger.
+    Trigger {
+        /// The project the package lives in.
+        project: String,
+        /// The package to trigger the services of.
+        package: String,
+        /// The service the trigger is for: it must be defined in the
+        /// package's `_service`, and the trigger fails closed when it
+        /// is not. The server runs the whole service set either way;
+        /// without this flag, every service runs.
+        #[arg(long)]
+        service: Option<String>,
+    },
 }
 
 /// Run a `service` command, returning the JSON payload and its text
 /// rendering.
-pub fn run_service(command: ServiceCommand, debug: &Debug) -> Result<(Value, String), GeectlError> {
+pub fn run_service(
+    command: ServiceCommand,
+    debug: &Debug,
+    live: bool,
+) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let client = obs_client(&http, debug)?;
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
     match command {
         ServiceCommand::List { project, package } => {
             let services = client.list_services(&project, &package)?;
@@ -93,6 +117,37 @@ pub fn run_service(command: ServiceCommand, debug: &Debug) -> Result<(Value, Str
                 ),
             ))
         }
+        ServiceCommand::Trigger {
+            project,
+            package,
+            service,
+        } => {
+            let triggered =
+                client.trigger_service(&project, &package, service.as_deref(), &dry_run)?;
+            let mut payload = json!({
+                "project": project,
+                "package": package,
+                "service": service,
+                "triggered": triggered.is_some(),
+                "code": triggered.as_ref().map(|trigger| trigger.code.as_str()),
+                "dry_run": dry_run.enabled(),
+            });
+            if dry_run.enabled() {
+                if let Value::Object(map) = &mut payload {
+                    map.insert(
+                        "plan".to_string(),
+                        Value::Array(dry_run.plan().into_iter().map(Value::String).collect()),
+                    );
+                }
+            }
+            Ok((
+                payload,
+                with_header(
+                    &format!("project: {project} package: {package}"),
+                    render_trigger(&triggered, &service, &dry_run),
+                ),
+            ))
+        }
     }
 }
 
@@ -100,8 +155,8 @@ pub fn run_service(command: ServiceCommand, debug: &Debug) -> Result<(Value, Str
 /// default) with the environment OBS credentials for that URL,
 /// reporting on the debug channel. Credentials resolve to `None`
 /// when unconfigured; the operations fail closed themselves when
-/// they need them. A half-configured pair fails fast here, even
-/// though both commands are reads (see the module docs).
+/// they need them. A half-configured pair fails fast here, even for
+/// the reads (see the module docs).
 fn obs_client<'a>(http: &'a dyn HttpClient, debug: &Debug) -> Result<ObsClient<'a>, GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
@@ -238,6 +293,30 @@ fn render_service_state(state: &Option<ServiceState>) -> String {
     }
 }
 
+/// The trigger outcome as `key: value` lines: whether the services
+/// were triggered, which service the trigger was for (`all` when no
+/// service was named), and the server's status code when the trigger
+/// went out. In dry-run the plan lines follow the `dry_run` line.
+fn render_trigger(
+    triggered: &Option<ServiceTrigger>,
+    service: &Option<String>,
+    dry_run: &DryRun,
+) -> String {
+    let mut lines = vec![format!(
+        "triggered: {}",
+        if triggered.is_some() { "yes" } else { "no" }
+    )];
+    lines.push(format!("service: {}", service.as_deref().unwrap_or("all")));
+    if let Some(trigger) = triggered {
+        lines.push(format!("code: {}", trigger.code));
+    }
+    lines.push(format!("dry_run: {}", dry_run.enabled()));
+    if dry_run.enabled() {
+        lines.extend(dry_run.plan());
+    }
+    lines.join("\n")
+}
+
 /// Render rows as a space-aligned table with a header row. Widths are
 /// the widest value in the printed set, in characters.
 fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -306,9 +385,35 @@ mod tests {
     }
 
     #[test]
+    fn trigger_parses_positionals_and_service_flag() {
+        assert!(matches!(
+            parse(&["geectl", "service", "trigger", "P", "K"]),
+            ServiceCommand::Trigger { service: None, .. }
+        ));
+        match parse(&[
+            "geectl",
+            "service",
+            "trigger",
+            "P",
+            "K",
+            "--service",
+            "download_url",
+        ]) {
+            ServiceCommand::Trigger { service, .. } => {
+                assert_eq!(service.as_deref(), Some("download_url"));
+            }
+            other => panic!("expected a trigger command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_service_command_fails_to_parse() {
         assert!(Cli::try_parse_from(["geectl", "service", "frobnicate"]).is_err());
         assert!(Cli::try_parse_from(["geectl", "service", "list", "only-one"]).is_err());
+        assert!(Cli::try_parse_from(["geectl", "service", "trigger", "only-one"]).is_err());
+        assert!(
+            Cli::try_parse_from(["geectl", "service", "trigger", "P", "K", "--service"]).is_err()
+        );
     }
 
     fn sample_services() -> Vec<ServiceDef> {
@@ -401,6 +506,44 @@ mod tests {
         assert_eq!(render_service_state(&None), "no service state");
     }
 
+    #[test]
+    fn trigger_renders_outcome_service_and_code() {
+        let dry_run = DryRun::new(false);
+        let triggered = Some(ServiceTrigger {
+            service: Some("download_url".to_string()),
+            code: "ok".to_string(),
+        });
+        let text = render_trigger(&triggered, &Some("download_url".to_string()), &dry_run);
+        assert!(text.contains("triggered: yes"));
+        assert!(text.contains("service: download_url"));
+        assert!(text.contains("code: ok"));
+        assert!(text.contains("dry_run: false"));
+        // No service named: the whole set runs, rendered as `all`.
+        let text = render_trigger(
+            &Some(ServiceTrigger {
+                service: None,
+                code: "ok".to_string(),
+            }),
+            &None,
+            &dry_run,
+        );
+        assert!(text.contains("triggered: yes"));
+        assert!(text.contains("service: all"));
+        assert!(text.contains("code: ok"));
+    }
+
+    #[test]
+    fn trigger_dry_run_renders_no_trigger_and_the_plan() {
+        let dry_run = DryRun::new(true);
+        dry_run.allow("trigger services for P/K (service download_url)");
+        let text = render_trigger(&None, &Some("download_url".to_string()), &dry_run);
+        assert!(text.contains("triggered: no"));
+        assert!(text.contains("service: download_url"));
+        assert!(!text.contains("code:"));
+        assert!(text.contains("dry_run: true"));
+        assert!(text.contains("[dry-run] would: trigger services for P/K (service download_url)"));
+    }
+
     /// The agreement test: every identifying field the JSON payload
     /// carries — service name, mode, `name=value` parameters, and
     /// comments; state code, md5s, and error — appears in the text
@@ -482,5 +625,41 @@ mod tests {
                 "state text misses {field}: {value}:\n{text}"
             );
         }
+    }
+
+    /// The trigger agreement test: the service name, the triggered
+    /// flag, and the server's status code the payload carries all
+    /// appear in the text rendering.
+    #[test]
+    fn trigger_text_carries_every_identifying_field() {
+        let dry_run = DryRun::new(false);
+        let triggered = Some(ServiceTrigger {
+            service: Some("download_url".to_string()),
+            code: "ok".to_string(),
+        });
+        let payload = json!({
+            "service": "download_url",
+            "triggered": true,
+            "code": "ok",
+        });
+        let text = render_trigger(&triggered, &Some("download_url".to_string()), &dry_run);
+        assert!(
+            text.contains(&format!(
+                "service: {}",
+                payload["service"].as_str().expect("service is a string")
+            )),
+            "trigger text misses service:\n{text}"
+        );
+        assert!(
+            text.contains("triggered: yes"),
+            "trigger text misses triggered:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "code: {}",
+                payload["code"].as_str().expect("code is a string")
+            )),
+            "trigger text misses code:\n{text}"
+        );
     }
 }

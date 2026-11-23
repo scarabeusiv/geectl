@@ -93,7 +93,8 @@ A half-configured credential pair (a username with no password source,
 or the reverse) is handled per group. `branch`, `maintenance`, and
 `service` fail fast on it before any work — `branch` and `maintenance`
 in dry-run too, since a dry run that cannot be performed live is not a
-useful preview (`service` has no dry-run; both commands are reads).
+useful preview (`service`'s trigger is the mutation there; its reads
+need no credentials but resolve them up front).
 `request` swallows it in dry-run (a preview never needs credentials;
 the dropped error goes to the debug channel). `remote` and `build`
 resolve credentials per command instead: the public reads (see
@@ -119,7 +120,7 @@ Commands:
   build         Build-status commands: results, logs, histories, binaries, buildconfig
   local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, and wipe a build root
   maintenance   Maintenance operations: maintained-instances listing and maintenance branching
-  service       Service reads: list a package's services and their run state
+  service       Service reads and trigger: list a package's services, their run state, and trigger a server-side run
   gitea         Gitea operations: repository and branch reads and mutations on the configured instance
   pull-request  Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface
   changelog     Validate and generate `.changes` entries in a package directory, pre-file
@@ -542,17 +543,18 @@ Options:
           Print help
 ```
 
-## `service` — service reads
+## `service` — service reads and trigger
 
 ```
-Service reads: list a package's services and their run state
+Service reads and trigger: list a package's services, their run state, and trigger a server-side run
 
 Usage: geectl service [OPTIONS] <COMMAND>
 
 Commands:
-  list   List the services defined in a package's `_service` file
-  state  Show the last service run state of a package
-  help   Print this message or the help of the given subcommand(s)
+  list     List the services defined in a package's `_service` file
+  state    Show the last service run state of a package
+  trigger  Trigger a server-side run of a package's services. A mutation: dry-run is the default (only the plan is printed); `--live` performs the trigger
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
       --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
@@ -577,6 +579,24 @@ Options:
       --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
       --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
   -h, --help             Print help
+```
+
+```
+Trigger a server-side run of a package's services. A mutation: dry-run is the default (only the plan is printed); `--live` performs the trigger
+
+Usage: geectl service trigger [OPTIONS] <PROJECT> <PACKAGE>
+
+Arguments:
+  <PROJECT>  The project the package lives in
+  <PACKAGE>  The package to trigger the services of
+
+Options:
+      --format <FORMAT>    Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --service <SERVICE>  The service the trigger is for: it must be defined in the package's `_service`, and the trigger fails closed when it is not. The server runs the whole service set either way; without this flag, every service runs
+      --debug              Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body         Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live               Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help               Print help
 ```
 
 ## `gitea` — Gitea operations
@@ -944,6 +964,7 @@ geectl maintenance maintenance-branch --package vim
 # Services
 geectl service list openSUSE:Factory vim
 geectl service state openSUSE:Factory vim
+geectl --live service trigger openSUSE:Factory vim
 
 # Gitea (needs GEECTL_GITEA_TOKEN, even in dry-run)
 geectl gitea repo-get pool systemd

@@ -42,8 +42,9 @@ spec-cleaner inside an openSUSE container).
 
 What the vertical does NOT own:
 
-- Server-side service runs (trigger/wait/merge) — those are #19's server
-  operations, not local execution.
+- Server-side service runs: the trigger landed as `service trigger`
+  (issue #182); wait and merge are still out — those are #19's
+  server operations, not local execution.
 - `buildtime` services — they run on the OBS worker during the build,
   never in a checkout, never locally.
 - `runall` — never; mode-blind, it would fire `buildtime` services

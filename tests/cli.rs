@@ -3663,13 +3663,99 @@ fn build_help_lists_all_sixteen_subcommands() {
 }
 
 #[test]
-fn service_help_lists_both_subcommands() {
+fn service_help_lists_all_subcommands() {
     let out = geectl().args(["service", "--help"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    for name in ["list", "state"] {
+    for name in ["list", "state", "trigger"] {
         assert!(text.contains(name), "service --help misses {name}");
     }
+}
+
+#[test]
+fn service_trigger_dry_run_reports_plan_without_credentials() {
+    // The trigger is a mutation with dry-run as the default: the
+    // plan is printed and nothing goes out, with no credentials at
+    // all — the library's dry-run guard runs before its
+    // credentials check — and the JSON payload carries the plan.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["service", "trigger", "P", "K"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["triggered"], false);
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["service"], serde_json::Value::Null);
+    assert_eq!(value["code"], serde_json::Value::Null);
+    assert_eq!(
+        value["plan"],
+        serde_json::json!(["[dry-run] would: trigger services for P/K"])
+    );
+    // The named form plans the service it is for.
+    let out = geectl_isolated(&dir)
+        .args(["service", "trigger", "P", "K", "--service", "download_url"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["triggered"], false);
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["service"], "download_url");
+    assert_eq!(value["code"], serde_json::Value::Null);
+    assert_eq!(
+        value["plan"],
+        serde_json::json!(["[dry-run] would: trigger services for P/K (service download_url)"])
+    );
+}
+
+#[test]
+fn service_trigger_live_against_closed_port_fails_with_network_error() {
+    // `--live` flows through main.rs into the trigger: with
+    // credentials set and the base URL on a closed loopback port,
+    // the POST fails with a network error instead of silently
+    // dry-running.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "service", "trigger", "P", "K"])
+        .env("GEECTL_OBS_URL", "http://127.0.0.1:1")
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "network_error");
+}
+
+#[test]
+fn service_trigger_dry_run_fails_fast_on_half_set_credentials() {
+    // The service group resolves credentials up front: a
+    // half-configured pair fails fast before any work, even for a
+    // dry-run trigger that needs no credentials itself.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["service", "trigger", "P", "K"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
 }
 
 #[test]
@@ -4369,7 +4455,7 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 33 blocks (top level, 10 groups, 22 leaves) — a
+    // The docs carry 34 blocks (top level, 10 groups, 23 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
     // groups and one leaf each, plus `remote download`, plus the ten
@@ -4380,8 +4466,8 @@ fn docs_help_blocks_match_the_binary() {
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-        33,
-        "docs/cli.md should carry 33 --help blocks (top level, 10 groups, 22 leaves);          update this count when a block is deliberately added or removed"
+        34,
+        "docs/cli.md should carry 34 --help blocks (top level, 10 groups, 23 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();

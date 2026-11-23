@@ -193,11 +193,12 @@ layout. `osc mr` (`maintenancerequest`) is NOT here: incident filing
 lives with the other filings under `request` (`request
 file-maintenance-incident`, issue #73).
 
-## `service` — service reads
+## `service` — service reads and trigger
 
 | osc | geectl | Why |
 |---|---|---|
 | (no osc command) | `service list` / `service state` | New surface: read a package's `_service` file and its last run state; osc has no service reads |
+| `osc service remoterun [PROJECT PACKAGE]` | `service trigger PROJECT PACKAGE [--service NAME]` | Same server-side trigger (`POST /source/<project>/<package>?cmd=runservice`): the server runs the package's whole service set, so `--service` names the service the trigger is for and fails closed when it is not defined in the stored `_service` — it does not narrow the run. A mutation: dry-run is the default (only the plan is printed); `--live` performs the trigger |
 
 ## `gitea` — Gitea operations
 

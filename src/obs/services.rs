@@ -1,15 +1,21 @@
-//! OBS service state and service definitions: the two read-only
-//! operations the Factory scope filter keeps. A service run is
-//! triggered by a commit, never by this library: [`ObsClient::service_state`]
-//! reads the run state the server recorded in the directory listing,
-//! and [`ObsClient::list_services`] reads the stored `_service` text
-//! as typed definitions. Trigger, wait, and merge are out under the
-//! Factory scope filter (design §4): each exists only to drive
-//! server-side runs, which Factory declines. The commit path is intended to reuse
-//! `service_state` as its settlement read.
+//! OBS service state, service definitions, and the server-side
+//! service trigger: [`ObsClient::service_state`] reads the run state
+//! the server recorded in the directory listing,
+//! [`ObsClient::list_services`] reads the stored `_service` text
+//! as typed definitions, and [`ObsClient::trigger_service`] triggers
+//! a server-side run of the package's services. A service run is
+//! otherwise triggered by a commit, never by this library. Wait and
+//! merge are out under the Factory scope filter (design §4): each
+//! exists only to drive server-side runs, which Factory declines.
+//! The commit path is intended to reuse `service_state` as its
+//! settlement read.
 
+use super::build_url;
+use super::parse_status_ok;
 use super::tag_attr;
+use super::valid_obs_name;
 use super::DirectoryListing;
+use super::DryRun;
 use super::ObsClient;
 use super::ServiceState;
 use crate::debug::format_body_preview;
@@ -272,6 +278,16 @@ pub(crate) fn parse_services(body: &str) -> Result<Vec<ServiceDef>, GeectlError>
     Ok(services)
 }
 
+/// The accepted server-side service trigger: the server answered
+/// `<status code="ok"/>` to the `runservice` POST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceTrigger {
+    /// The service the trigger was for, when one was named.
+    pub service: Option<String>,
+    /// The status code from the server's answer (`"ok"`).
+    pub code: String,
+}
+
 impl ObsClient<'_> {
     /// The directory listing behind a service read: the public
     /// listing, except for `_project`, which the public routes
@@ -367,6 +383,107 @@ impl ObsClient<'_> {
             services.len()
         ));
         Ok(Some(services))
+    }
+
+    /// Trigger a server-side run of the services of package `package`
+    /// in project `project` (`POST
+    /// /source/<project>/<package>?cmd=runservice`) and return the
+    /// server's `<status code>`. Requires credentials; without them the
+    /// call fails loudly before any request. In dry-run the trigger is
+    /// recorded in the plan and nothing is triggered — the guard runs
+    /// before the credentials check, like `branch_package` — and the
+    /// result is `None`.
+    ///
+    /// The server runs the package's whole service set: there is no
+    /// per-service server-side run. `service`, when given, names the
+    /// service the trigger is for: the name must be defined in the
+    /// package's stored `_service` — a name that is not is a
+    /// fail-closed [`ErrorKind::NotFound`], before any POST — but it
+    /// does not narrow the run. Without it, every service runs. A
+    /// package with no `_service` file is likewise
+    /// [`ErrorKind::NotFound`]: the server has nothing to run. A
+    /// missing package is [`ErrorKind::NotFound`]; any other server
+    /// refusal is the transport's error, never success.
+    ///
+    /// An agent triggers the services of the package it just changed
+    /// so the server re-runs them without waiting for a commit.
+    pub fn trigger_service(
+        &self,
+        project: &str,
+        package: &str,
+        service: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<Option<ServiceTrigger>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if let Some(service) = service {
+            if service.chars().count() < 3 || service.contains('/') {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid service name: {service:?}"),
+                ));
+            }
+        }
+        let action = match service {
+            Some(service) => {
+                format!("trigger services for {project}/{package} (service {service})")
+            }
+            None => format!("trigger services for {project}/{package}"),
+        };
+        if !dry_run.allow(&action) {
+            return Ok(None);
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot trigger services without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        if let Some(service) = service {
+            match self.list_services(project, package)? {
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::NotFound,
+                        format!("package {project}/{package} has no _service file"),
+                    ));
+                }
+                Some(services) if !services.iter().any(|defined| defined.name == service) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::NotFound,
+                        format!("service {service} is not defined in {project}/{package}"),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        let url = build_url(
+            &self.base,
+            &["source", project, package],
+            &[("cmd", "runservice")],
+        );
+        let body = self.http.post(&url, "", &self.credentials)?;
+        if !parse_status_ok(&body) {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS runservice response for package {project}/{package}"),
+            ));
+        }
+        self.debug.emit(&format!(
+            "trigger_service {project}/{package}: ok{}",
+            service
+                .map(|name| format!(" (service {name})"))
+                .unwrap_or_default()
+        ));
+        Ok(Some(ServiceTrigger {
+            service: service.map(str::to_string),
+            code: "ok".to_string(),
+        }))
     }
 }
 
@@ -1090,6 +1207,257 @@ mod tests {
             vec![
                 (PROJECT_DIRECTORY_URL.to_string(), true),
                 (PROJECT_SERVICE_URL.to_string(), true),
+            ]
+        );
+    }
+
+    const TRIGGER_URL: &str = "https://api.opensuse.org/source/openSUSE:Factory/foo?cmd=runservice";
+
+    fn authed_client(http: &FakeHttp) -> ObsClient<'_> {
+        ObsClient::with_credentials(http, basic_credentials()).unwrap()
+    }
+
+    #[test]
+    fn trigger_posts_runservice_and_returns_ok() {
+        let http = FakeHttp::new().with_post(TRIGGER_URL, "<status code=\"ok\"/>");
+        let client = authed_client(&http);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "foo", None, &DryRun::new(false))
+                .unwrap(),
+            Some(ServiceTrigger {
+                service: None,
+                code: "ok".to_string(),
+            })
+        );
+        // One authed POST, no reads: the trigger needs no `_service`
+        // lookup when no service is named.
+        assert_eq!(
+            http.post_calls(),
+            vec![(TRIGGER_URL.to_string(), String::new(), true)]
+        );
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn trigger_with_named_service_validates_against_the_stored_file() {
+        let http = fake_with(DIR_WITH_SERVICE, Some(SV_MIXED_ALL))
+            .with_post(TRIGGER_URL, "<status code=\"ok\"/>");
+        let client = authed_client(&http);
+        assert_eq!(
+            client
+                .trigger_service(
+                    "openSUSE:Factory",
+                    "foo",
+                    Some("download_url"),
+                    &DryRun::new(false),
+                )
+                .unwrap(),
+            Some(ServiceTrigger {
+                service: Some("download_url".to_string()),
+                code: "ok".to_string(),
+            })
+        );
+        // The stored file is read first (public reads, no
+        // credentials), then the trigger posts.
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                (DIRECTORY_URL.to_string(), false),
+                (SERVICE_URL.to_string(), false),
+            ]
+        );
+        assert_eq!(
+            http.post_calls(),
+            vec![(TRIGGER_URL.to_string(), String::new(), true)]
+        );
+    }
+
+    #[test]
+    fn trigger_with_unknown_service_is_not_found_without_a_post() {
+        let http = fake_with(DIR_WITH_SERVICE, Some(SV_MIXED_ALL));
+        let client = authed_client(&http);
+        assert_eq!(
+            client
+                .trigger_service(
+                    "openSUSE:Factory",
+                    "foo",
+                    Some("no_such_service"),
+                    &DryRun::new(false),
+                )
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn trigger_with_named_service_and_no_service_file_is_not_found() {
+        let http = fake_with(DIR_NO_SERVICE, None);
+        let client = authed_client(&http);
+        assert_eq!(
+            client
+                .trigger_service(
+                    "openSUSE:Factory",
+                    "foo",
+                    Some("download_url"),
+                    &DryRun::new(false),
+                )
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn trigger_without_service_file_fails_on_the_server_refusal() {
+        // No `--service` to validate, so the POST goes out and the
+        // server refuses: no service defined is its 404.
+        let http = FakeHttp::new().with_post_error(TRIGGER_URL, ErrorKind::NotFound);
+        let client = authed_client(&http);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "foo", None, &DryRun::new(false))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            http.post_calls(),
+            vec![(TRIGGER_URL.to_string(), String::new(), true)]
+        );
+    }
+
+    #[test]
+    fn trigger_missing_package_is_not_found() {
+        let http = FakeHttp::new().with_post_error(TRIGGER_URL, ErrorKind::NotFound);
+        let client = authed_client(&http);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "foo", None, &DryRun::new(false))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        // The POST went out: the 404 is the server's answer, not a
+        // client-side refusal before any request.
+        assert_eq!(
+            http.post_calls(),
+            vec![(TRIGGER_URL.to_string(), String::new(), true)]
+        );
+    }
+
+    #[test]
+    fn trigger_non_ok_answer_is_a_server_error() {
+        for body in ["<status code=\"error\"/>", ""] {
+            let http = FakeHttp::new().with_post(TRIGGER_URL, body);
+            let client = authed_client(&http);
+            assert_eq!(
+                client
+                    .trigger_service("openSUSE:Factory", "foo", None, &DryRun::new(false))
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::ServerError
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_invalid_names_fail_closed() {
+        let http = FakeHttp::new().with_post(TRIGGER_URL, "<status code=\"ok\"/>");
+        let client = authed_client(&http);
+        for (project, package, service) in [
+            ("bad/project", "foo", None),
+            ("openSUSE:Factory", "bad/package", None),
+            ("openSUSE:Factory", "foo", Some("ab")),
+            ("openSUSE:Factory", "foo", Some("bad/name")),
+            ("openSUSE:Factory", "foo", Some("")),
+        ] {
+            assert_eq!(
+                client
+                    .trigger_service(project, package, service, &DryRun::new(false))
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidInput,
+                "project={project} package={package} service={service:?}"
+            );
+        }
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn trigger_without_credentials_fails_before_any_request() {
+        let http = FakeHttp::new().with_post(TRIGGER_URL, "<status code=\"ok\"/>");
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "foo", None, &DryRun::new(false))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ConfigError
+        );
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn trigger_dry_run_records_the_plan_and_sends_nothing() {
+        let http = fake_with(DIR_WITH_SERVICE, Some(SV_MIXED_ALL))
+            .with_post(TRIGGER_URL, "<status code=\"ok\"/>");
+        let client = authed_client(&http);
+        let dry_run = DryRun::new(true);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "foo", None, &dry_run)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: trigger services for openSUSE:Factory/foo".to_string()]
+        );
+        // The named form plans the name too — and still sends
+        // nothing, not even the `_service` validation read.
+        let dry_run = DryRun::new(true);
+        assert_eq!(
+            client
+                .trigger_service("openSUSE:Factory", "foo", Some("download_url"), &dry_run,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: trigger services for openSUSE:Factory/foo (service download_url)"
+                    .to_string()
+            ]
+        );
+        assert!(http.post_calls().is_empty());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn trigger_debug_channel_carries_decision_lines_only() {
+        let (debug, lines) = Debug::captured(true, false);
+        let http = fake_with(DIR_WITH_SERVICE, Some(SV_MIXED_ALL))
+            .with_post(TRIGGER_URL, "<status code=\"ok\"/>");
+        let client = authed_client(&http).with_debug(debug);
+        let _ = client.trigger_service("openSUSE:Factory", "foo", None, &DryRun::new(false));
+        let _ = client.trigger_service(
+            "openSUSE:Factory",
+            "foo",
+            Some("download_url"),
+            &DryRun::new(false),
+        );
+        assert_eq!(
+            captured_lines(&lines),
+            vec![
+                "trigger_service openSUSE:Factory/foo: ok".to_string(),
+                "list_services openSUSE:Factory/foo: 6 service(s)".to_string(),
+                "trigger_service openSUSE:Factory/foo: ok (service download_url)".to_string(),
             ]
         );
     }
