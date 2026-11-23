@@ -2373,13 +2373,15 @@ impl<'a> ObsClient<'a> {
     /// revision `rev` (`GET /public/source/<project>/<package>?rev=…`):
     /// the revision-carrying form of
     /// [`ObsClient::directory_listing`], for reading a pinned base.
-    /// `None` reads the latest revision.
+    /// `None` reads the latest revision. Returns the listing plus
+    /// the revision triple (`rev`, `vrev`, `srcmd5`) from the same
+    /// body, so the caller pins the base without a second read.
     pub(crate) fn directory_listing_rev(
         &self,
         project: &str,
         package: &str,
         rev: Option<&RevisionSpec>,
-    ) -> Result<DirectoryListing, GeectlError> {
+    ) -> Result<(DirectoryListing, DirectoryRev), GeectlError> {
         for (label, value) in [("project", project), ("package", package)] {
             if !valid_obs_name(value) {
                 return Err(GeectlError::new(
@@ -2402,7 +2404,41 @@ impl<'a> ObsClient<'a> {
         }
         let url = build_url(&self.base, &["public", "source", project, package], &query);
         let body = self.http.get_with(&url, &Credentials::None)?;
-        parse_directory(&body)
+        let listing = parse_directory(&body)?;
+        let rev = parse_directory_rev(&body)?;
+        Ok((listing, rev))
+    }
+
+    /// List the files of package `package` in project `project` with
+    /// the link expanded (`GET /source/<project>/<package>?expand=1`):
+    /// the expanded form of [`ObsClient::directory_listing`], for
+    /// the `pull` read. Returns the listing plus the revision triple
+    /// (`rev`, `vrev`, `srcmd5`) from the same body, so the caller
+    /// pins the expanded revision without a second read. The authed
+    /// source route: the expand read is a working-copy operation, and
+    /// the caller holds credentials.
+    pub(crate) fn directory_listing_expanded(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<(DirectoryListing, DirectoryRev), GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let url = build_url(
+            &self.base,
+            &["source", project, package],
+            &[("expand", "1")],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        let listing = parse_directory(&body)?;
+        let rev = parse_directory_rev(&body)?;
+        Ok((listing, rev))
     }
 
     /// GET a public directory listing (`/public/source/...`) and
@@ -6605,7 +6641,7 @@ mod tests {
             "<directory name=\"foo\" rev=\"41\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /></directory>",
         );
         let client = ObsClient::new(&http);
-        let listing = client
+        let (listing, rev) = client
             .directory_listing_rev("home:alice", "foo", Some(&RevisionSpec::Rev(41)))
             .unwrap();
         assert_eq!(listing.entries.len(), 1);
@@ -6613,6 +6649,48 @@ mod tests {
         assert_eq!(
             listing.srcmd5,
             Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string())
+        );
+        assert_eq!(
+            rev,
+            (
+                Some("41".to_string()),
+                Some("1".to_string()),
+                Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn directory_listing_expanded_reads_the_expanded_listing_and_rev() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:alice/foo?expand=1",
+            "<directory name=\"foo\" rev=\"7\" srcmd5=\"dddddddddddddddddddddddddddddddd\" vrev=\"1\"><entry md5=\"0d62ceea6020d75154078a20d8c9f9ba\" mtime=\"1282047302\" name=\"foo\" size=\"23\" /><linkinfo project=\"home:alice\" package=\"foo\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" xsrcmd5=\"dddddddddddddddddddddddddddddddd\" /></directory>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (listing, rev) = client
+            .directory_listing_expanded("home:alice", "foo")
+            .unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "foo");
+        assert_eq!(
+            listing.srcmd5,
+            Some("dddddddddddddddddddddddddddddddd".to_string())
+        );
+        assert_eq!(
+            rev,
+            (
+                Some("7".to_string()),
+                Some("1".to_string()),
+                Some("dddddddddddddddddddddddddddddddd".to_string()),
+            )
+        );
+        // The expand read carried the credentials.
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/home:alice/foo?expand=1".to_string(),
+                true
+            )]
         );
     }
 
