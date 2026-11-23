@@ -47,6 +47,10 @@
 //!   quick debug, with the shared pkg cache, per-root sccache,
 //!   and the size-capped eviction policy. The server stays the source
 //!   of truth; local is for iterating fast.
+//! - [`working_copy`]: the git working copy — checkout, update,
+//!   status, diff, add, rm, addremove, commit, pull, and resolve
+//!   over one OBS package or one git-backed package, through the
+//!   `git` binary.
 
 pub mod auth;
 pub mod changelog;
@@ -59,5 +63,6 @@ pub mod local_build;
 pub mod obs;
 pub mod pull_request;
 pub mod url;
+pub mod working_copy;
 
 pub(crate) mod xml;

@@ -19,6 +19,7 @@ pub(crate) struct FakeHttp {
     get_errors: RefCell<HashMap<String, ErrorKind>>,
     get_error_sequences: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     posts: RefCell<HashMap<String, String>>,
+    post_sequences: RefCell<HashMap<String, VecDeque<String>>>,
     post_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
     patches: RefCell<HashMap<String, String>>,
     patch_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
@@ -54,6 +55,7 @@ impl FakeHttp {
             get_errors: RefCell::new(HashMap::new()),
             get_error_sequences: RefCell::new(HashMap::new()),
             posts: RefCell::new(HashMap::new()),
+            post_sequences: RefCell::new(HashMap::new()),
             post_errors: RefCell::new(HashMap::new()),
             patches: RefCell::new(HashMap::new()),
             patch_errors: RefCell::new(HashMap::new()),
@@ -216,6 +218,19 @@ impl FakeHttp {
         self.posts
             .borrow_mut()
             .insert(url.to_string(), body.to_string());
+        self
+    }
+
+    /// Answer successive POSTs of `url` with `bodies` in order;
+    /// once the queue is empty, the plain canned response (if any)
+    /// answers. Lets a test model a multi-pass exchange on one URL
+    /// (a validate pass that reports missing files, then a clean
+    /// re-validate after the stage).
+    pub(crate) fn with_post_sequence(self, url: &str, bodies: &[&str]) -> Self {
+        self.post_sequences.borrow_mut().insert(
+            url.to_string(),
+            bodies.iter().map(|body| body.to_string()).collect(),
+        );
         self
     }
 
@@ -566,6 +581,14 @@ impl HttpClient for FakeHttp {
                 kind,
                 format!("canned POST error for {url}"),
             ));
+        }
+        if let Some(body) = self
+            .post_sequences
+            .borrow_mut()
+            .get_mut(url)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Ok(body);
         }
         self.posts.borrow().get(url).cloned().ok_or_else(|| {
             GeectlError::new(

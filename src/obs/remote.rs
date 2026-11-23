@@ -2611,6 +2611,54 @@ impl<'a> ObsClient<'a> {
         self.http.get_to_file(&url, &Credentials::None, dest)
     }
 
+    /// Download file `file` of package `package` in project `project`
+    /// through the link expansion
+    /// (`GET /source/<project>/<package>/<file>?expand=1`), streaming
+    /// the body to `dest` instead of buffering it: the expanded
+    /// counterpart of [`ObsClient::download_source_to_file`]. The
+    /// public file route serves only the package's own files, so a
+    /// pull of a linked package downloads through the authenticated
+    /// source endpoint, which resolves the link for the file read.
+    /// Same validation and `?rev=` forms as
+    /// `download_source_to_file`. Returns the bytes written.
+    pub(crate) fn download_source_expanded_to_file(
+        &self,
+        project: &str,
+        package: &str,
+        file: &str,
+        rev: Option<&RevisionSpec>,
+        dest: &Path,
+    ) -> Result<u64, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !valid_obs_filename(file) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS filename: {file:?}"),
+            ));
+        }
+        if let Some(RevisionSpec::Rev(0)) = rev {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "invalid revision: 0",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("expand", "1")];
+        let rev_text;
+        if let Some(rev) = rev {
+            rev_text = rev.to_string();
+            query.push(("rev", &rev_text));
+        }
+        let url = build_url(&self.base, &["source", project, package, file], &query);
+        self.http.get_to_file(&url, &self.credentials, dest)
+    }
+
     /// GET a public directory listing (`/public/source/...`),
     /// optionally at revision `rev` (`?rev=N` for a number,
     /// `?rev=<srcmd5>` for the revision carrying that hash), and
@@ -7573,6 +7621,74 @@ mod tests {
             .unwrap();
         assert_eq!(written, bytes.len() as u64);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn download_source_expanded_to_file_uses_the_authed_route_with_expand() {
+        // A linked package's files resolve only with `expand=1`,
+        // through the authenticated source endpoint — the public
+        // route serves the link's own files.
+        let bytes: &[u8] = b"Name: bar\n";
+        let http = FakeHttp::new().with_get_to_file(
+            "https://api.opensuse.org/source/home:alice/foo-link/bar.spec?expand=1",
+            bytes,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let path = download_dest("expanded");
+        let written = client
+            .download_source_expanded_to_file("home:alice", "foo-link", "bar.spec", None, &path)
+            .unwrap();
+        assert_eq!(written, bytes.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.to_vec());
+        assert_eq!(
+            http.get_to_file_calls(),
+            vec![(
+                "https://api.opensuse.org/source/home:alice/foo-link/bar.spec?expand=1".to_string(),
+                true
+            )]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn download_source_expanded_to_file_with_rev_passes_expand_and_rev() {
+        // The expanded download composes `?expand=1&rev=...`: the
+        // expansion and the revision pin travel together.
+        let url_rev = "https://api.opensuse.org/source/home:alice/foo-link/bar.spec?expand=1&rev=2";
+        let url_md5 = "https://api.opensuse.org/source/home:alice/foo-link/bar.spec?expand=1&rev=aabbccddaabbccddaabbccddaabbccdd";
+        let http = FakeHttp::new()
+            .with_get_to_file(url_rev, b"Name: bar\n")
+            .with_get_to_file(url_md5, b"Name: bar\n");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let path = download_dest("expanded-rev");
+        let written = client
+            .download_source_expanded_to_file(
+                "home:alice",
+                "foo-link",
+                "bar.spec",
+                Some(&RevisionSpec::Rev(2)),
+                &path,
+            )
+            .unwrap();
+        assert_eq!(written, 10);
+        let _ = std::fs::remove_file(&path);
+        let path = download_dest("expanded-md5");
+        let md5 = RevisionSpec::parse("AABBCCDDAABBCCDDAABBCCDDAABBCCDD").unwrap();
+        let written = client
+            .download_source_expanded_to_file(
+                "home:alice",
+                "foo-link",
+                "bar.spec",
+                Some(&md5),
+                &path,
+            )
+            .unwrap();
+        assert_eq!(written, 10);
+        assert_eq!(
+            http.get_to_file_calls(),
+            vec![(url_rev.to_string(), true), (url_md5.to_string(), true)]
+        );
         let _ = std::fs::remove_file(&path);
     }
 
