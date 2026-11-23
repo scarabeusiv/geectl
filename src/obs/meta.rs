@@ -1768,14 +1768,19 @@ mod tests {
     }
 
     #[test]
-    fn set_project_meta_rejects_a_duplicate_download_arch_case_insensitively() {
+    fn set_project_meta_rejects_a_download_arch_that_differs_only_by_case() {
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
             PROJECT_META_WITH_FULL_REPOSITORY,
         );
         let client = project_client(&http);
         let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
-        meta.repositories[0].arch.push("X86_64".to_string());
+        // "X86_64" is not one of the repository's architectures: the
+        // membership check is case-sensitive, so a download arch that
+        // differs only by case is rejected here, not by the dedup.
+        // (A repository listing both casings is rejected by the
+        // repository-arch check; the download dedup's own
+        // case-insensitivity is pinned by the settings unit test.)
         meta.repositories[0].downloads.push(RepositoryDownload {
             arch: Some("X86_64".to_string()),
             url: "https://other.example.com".to_string(),
@@ -1788,6 +1793,12 @@ mod tests {
             .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context
+                .contains("is not one of the repository's architectures"),
+            "{}",
+            err.context
+        );
         assert!(http.put_calls().is_empty());
     }
 

@@ -2046,6 +2046,10 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
                 "download arch {arch:?} is not one of the repository's architectures"
             )));
         }
+        // Case-insensitive, like the server's download-arch
+        // uniqueness: the repository-arch check normally fires first
+        // when both casings are listed, but this is the validator's
+        // own guarantee for a download pair that differs only by case.
         let lower = arch.to_lowercase();
         if download_arches.contains(&lower) {
             return Err(invalid(&format!(
