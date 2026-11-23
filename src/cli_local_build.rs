@@ -513,7 +513,8 @@ fn render_spec_cleaner(result: &SpecCleanerResult) -> String {
 /// arch, flavor, the new-flag fields when set, and the engine argv),
 /// or the verdict with the exit code, log path, RPMs, rpmlint and
 /// check summaries, image digest, engine version, root, cache
-/// numbers, and eviction.
+/// numbers, and eviction, plus the trusted foreign projects when
+/// any were accepted.
 fn render_build(record: &BuildRecord) -> String {
     if record.dry_run {
         match &record.plan {
@@ -593,6 +594,12 @@ fn render_build(record: &BuildRecord) -> String {
         lines.push(cache);
         if let Some(image) = &record.preinstall_image {
             lines.push(format!("preinstall-image: {image}"));
+        }
+        if !record.trusted_foreign_projects.is_empty() {
+            lines.push(format!(
+                "trusted-foreign-projects: {}",
+                record.trusted_foreign_projects.join(", ")
+            ));
         }
         if record.eviction.ran {
             lines.push(format!(
@@ -1158,6 +1165,7 @@ mod tests {
             },
             eviction: EvictionReport::default(),
             preinstall_image: Some("preinstallimage.x86_64.rpm".to_string()),
+            trusted_foreign_projects: Vec::new(),
             dry_run: false,
             plan: None,
         }
@@ -1179,6 +1187,7 @@ mod tests {
             cache: CacheStats::default(),
             eviction: EvictionReport::default(),
             preinstall_image: None,
+            trusted_foreign_projects: Vec::new(),
             dry_run: true,
             plan: Some(EnginePlan {
                 image: "registry.opensuse.org/opensuse/tumbleweed".to_string(),

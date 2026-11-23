@@ -413,6 +413,13 @@ pub struct BuildRecord {
     /// The preinstall image filename the server offered, if any.
     /// Dropped for a rootless podman build, never installed.
     pub preinstall_image: Option<String>,
+    /// The foreign `home:` projects `--trust-all-projects` accepted
+    /// for this build (empty otherwise): the override is recorded
+    /// here so a run that trusted foreign projects does not look
+    /// like a clean one. Empty on a dry run — the plan carries the
+    /// flag instead, and trust is not evaluated.
+    #[serde(default)]
+    pub trusted_foreign_projects: Vec<String>,
     /// True for a dry run: nothing was touched, `plan` holds the
     /// invocation.
     pub dry_run: bool,
@@ -1135,6 +1142,7 @@ impl<'a> LocalBuild<'a> {
                     ..EvictionReport::default()
                 },
                 preinstall_image: None,
+                trusted_foreign_projects: Vec::new(),
                 dry_run: true,
                 plan: Some(EnginePlan {
                     image: DEFAULT_IMAGE.to_string(),
@@ -1191,7 +1199,8 @@ impl<'a> LocalBuild<'a> {
         for dep in &info.bdeps {
             validate_dep(dep)?;
         }
-        self.check_trust(req.fetch_project(), &info, req.trust_all_projects)?;
+        let trusted_foreign_projects =
+            self.check_trust(req.fetch_project(), &info, req.trust_all_projects)?;
         let buildconfig = self.obs.buildconfig(req.fetch_project(), &req.repo)?;
 
         // The image is resolved before eviction: the current digest
@@ -1321,6 +1330,7 @@ impl<'a> LocalBuild<'a> {
             info.preinstall_image
                 .as_ref()
                 .and_then(|i| i.filename.clone()),
+            trusted_foreign_projects,
             outcome,
         )?;
         Ok(record)
@@ -1532,8 +1542,11 @@ impl<'a> LocalBuild<'a> {
     /// project refuses with `UntrustedProject`
     /// naming it, unless `--trust-all-projects` is set: the flag
     /// overrides the refusal for the dep set the buildinfo
-    /// enumerates, and the accepted foreign projects are reported
-    /// on the debug channel. A dep without
+    /// enumerates, and the accepted foreign projects are recorded
+    /// in the build record and reported on the debug channel.
+    /// Returns the foreign `home:` projects: empty when the dep set
+    /// holds none, the accepted set when the flag overrode the
+    /// refusal. A dep without
     /// a `project` carries no origin to enumerate: it is a virtual
     /// provide or a not-installed flag, not a package the build
     /// would install, so it joins no trust set — the existing tool's
@@ -1544,7 +1557,7 @@ impl<'a> LocalBuild<'a> {
         build_project: &str,
         info: &crate::obs::BuildInfo,
         trust_all_projects: bool,
-    ) -> Result<(), GeectlError> {
+    ) -> Result<Vec<String>, GeectlError> {
         let username = match self.obs.credentials() {
             Credentials::Basic { username, .. } => Some(username.as_str()),
             _ => None,
@@ -1574,14 +1587,14 @@ impl<'a> LocalBuild<'a> {
             }
         }
         if foreign.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if trust_all_projects {
             self.debug.emit(&format!(
                 "local-build trust: accepting foreign home: project(s) via --trust-all-projects: {}",
                 foreign.join(", ")
             ));
-            return Ok(());
+            return Ok(foreign);
         }
         Err(GeectlError::new(
             ErrorKind::UntrustedProject,
@@ -2829,7 +2842,7 @@ impl<'a> LocalBuild<'a> {
     /// record. A non-zero engine exit is `BuildFailed` (exit code +
     /// log path + tail); a zero exit with no `finished` line or no
     /// RPMs is a record with verdict `failed`.
-    // Eleven arguments: the build record's fields, assembled here
+    // Twelve arguments: the build record's fields, assembled here
     // from the build's inputs — there is no earlier record to pass.
     #[allow(clippy::too_many_arguments)]
     fn finish_build(
@@ -2844,6 +2857,7 @@ impl<'a> LocalBuild<'a> {
         cache: CacheStats,
         eviction: EvictionReport,
         preinstall_image: Option<String>,
+        trusted_foreign_projects: Vec<String>,
         outcome: EngineOutcome,
     ) -> Result<BuildRecord, GeectlError> {
         // Lossy on purpose: a non-UTF-8 log must still parse (a
@@ -2887,6 +2901,7 @@ impl<'a> LocalBuild<'a> {
             cache,
             eviction,
             preinstall_image,
+            trusted_foreign_projects,
             dry_run: false,
             plan: None,
         };
@@ -8235,8 +8250,8 @@ fi
         fn build_trusts_a_foreign_home_project_with_trust_all_projects() {
             // `--trust-all-projects` overrides the foreign `home:`
             // refusal for the dep set the buildinfo enumerates: the
-            // build proceeds, and the accepted project is reported
-            // on the debug channel.
+            // build proceeds, and the accepted project is recorded
+            // in the build record and reported on the debug channel.
             let dir = TempDir::new();
             let (engine, _) = stub_engine(dir.path());
             let (podman, _) = stub_podman(dir.path(), true);
@@ -8267,6 +8282,7 @@ fi
             req.trust_all_projects = true;
             let record = vertical.build(&req).unwrap();
             assert_eq!(record.verdict, "green");
+            assert_eq!(record.trusted_foreign_projects, ["home:someoneelse"]);
             let lines = lines.lock().expect("debug lines readable");
             assert!(
                 lines.iter().any(|line| line.contains(
