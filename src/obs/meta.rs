@@ -579,7 +579,12 @@ impl<'a> ObsClient<'a> {
     /// without them the call fails loudly before any request. In
     /// dry-run the write is recorded in the plan and nothing is
     /// written — the guard runs before the credentials check, like
-    /// `create_package`.
+    /// `create_package`. Repository validation runs on what will
+    /// actually be written, so a dry run cannot validate a repository
+    /// change: telling a changed repository from a pre-existing one
+    /// needs the fetched list, and dry-run performs no fetch. The
+    /// repository-changing command validates its repository before
+    /// its own dry-run gate instead.
     ///
     /// An agent writes project meta to correct a project's title or
     /// description, point it at its git source, or change who
