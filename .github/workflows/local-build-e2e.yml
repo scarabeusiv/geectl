@@ -112,7 +112,7 @@ jobs:
           dpkg-query -W -f='${Version}\n' obs-build
           podman --version
       # The fixture repository's arch, derived once so the cache key,
-      # the bind mount in tests/live/docker-compose.dod-cache.yml and
+      # the link into the backend in tests/live/provision.sh and
       # the fixture script all agree on it.
       - name: Set fixture arch
         run: echo "FIXTURE_ARCH=$(uname -m)" >> "$GITHUB_ENV"
@@ -140,8 +140,9 @@ jobs:
             echo "repomd-ok=false" >> "$GITHUB_OUTPUT"
           fi
       # Restore the download-on-demand payload cache: the fixture
-      # repository's fetched RPMs and parsed metadata, bind-mounted
-      # into the backend by tests/live/docker-compose.dod-cache.yml.
+      # repository's fetched RPMs and parsed metadata, served to the
+      # backend by tests/live/docker-compose.dod-cache.yml (bind-mounted
+      # at /srv/obs/dod-cache and linked into place by provision.sh).
       # An exact-key miss falls back to the newest same-arch entry
       # below, rechecked in-run by the daemon (the fixture's
       # recheck wait; a failed recheck leaves the last-known-good
@@ -170,9 +171,10 @@ jobs:
           LIVE_ENABLE_DOD: "1"
           # Enables the download-on-demand payload cache (see
           # tests/live/docker-compose.dod-cache.yml): the backend's
-          # fixture :full directory is bind-mounted from this
-          # directory, restored by the step above. Local runs leave
-          # it unset and fetch fresh, as before.
+          # fixture :full directory is served from this directory
+          # (bind-mounted at /srv/obs/dod-cache and linked into place
+          # by provision.sh), restored by the step above. Local runs
+          # leave it unset and fetch fresh, as before.
           DOD_CACHE: "1"
           DOD_CACHE_DIR: ${{ github.workspace }}/tests/live/dod-cache
         run: bash tests/live/provision.sh

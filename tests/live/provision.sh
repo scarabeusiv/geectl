@@ -91,18 +91,19 @@ if [ -n "${LIVE_CACHE:-}" ]; then
 fi
 # CI-only download-on-demand payload cache (see
 # docker-compose.dod-cache.yml): when DOD_CACHE is set, the backend's
-# fixture :full directory is bind-mounted from DOD_CACHE_DIR
-# (default ./dod-cache, next to this file), so the fetched RPMs and
-# the parsed metadata survive the container. Local runs leave
-# DOD_CACHE unset and never load the file, so podman and plain
-# docker runs are unchanged.
+# fixture :full directory is served from DOD_CACHE_DIR (default
+# ./dod-cache, next to this file) — bind-mounted at the colon-free
+# /srv/obs/dod-cache and linked into place once the backend is up —
+# so the fetched RPMs and the parsed metadata survive the container.
+# Local runs leave DOD_CACHE unset and never load the file, so podman
+# and plain docker runs are unchanged.
 if [ -n "${DOD_CACHE:-}" ]; then
     COMPOSE_FILES+=(-f "$SCRIPT_DIR/docker-compose.dod-cache.yml")
-    # The bind mount and the fixture script agree on the arch through
-    # FIXTURE_ARCH: default it to the host arch here so a manual run
-    # on any arch mounts the repository the fixture creates, instead
-    # of silently mounting the x86_64 default. The cache directory
-    # defaults to ./dod-cache next to this file.
+    # The link into the backend and the fixture script agree on the
+    # arch through FIXTURE_ARCH: default it to the host arch here so
+    # a manual run on any arch links the repository the fixture
+    # creates, instead of silently linking the x86_64 default. The
+    # cache directory defaults to ./dod-cache next to this file.
     export FIXTURE_ARCH="${FIXTURE_ARCH:-$(uname -m)}"
 # FIXTURE_ARCH flows into chown paths and the :full link target in
 # the backend container below, so it must be a bare arch name:
@@ -261,6 +262,20 @@ $COMPOSE "${COMPOSE_FILES[@]}" run --rm --no-deps \
 # boots instead of exiting on a missing database.
 echo "Starting backend and frontend ..."
 $COMPOSE "${COMPOSE_FILES[@]}" up -d backend frontend
+
+# Download-on-demand cache: link the mounted payload into the place
+# the backend expects it. The payload is bind-mounted at the
+# colon-free /srv/obs/dod-cache (see docker-compose.dod-cache.yml);
+# the backend reads it at .../:full, which compose cannot mount
+# directly because the path contains colons. The project, repository
+# and arch here must agree with
+# tests/local_build_e2e/provision-fixture.sh. A real directory at the
+# link location is refused: silently linking over backend state would
+# hide it. The guard fires for any non-symlink, not only a directory.
+if [ -n "${DOD_CACHE:-}" ]; then
+    dod_full="/srv/obs/build/geectl:e2e/standard/${FIXTURE_ARCH}/:full"
+    $COMPOSE "${COMPOSE_FILES[@]}" exec -T backend sh -c 'mkdir -p "$(dirname "$1")"; if [ -e "$1" ] && [ ! -L "$1" ]; then echo "unexpected non-symlink at $1; refusing to link the download-on-demand cache over it" >&2; exit 1; fi; ln -sfn /srv/obs/dod-cache "$1"' _ "$dod_full"
+fi
 
 # Readiness: the public /about endpoint answers 200 only once the
 # frontend can serve, which needs the database. It says nothing about

@@ -10,20 +10,32 @@
 # RPMs — lives in the backend container at
 # `/srv/obs/build/geectl:e2e/standard/<arch>/:full`. That directory is
 # inside the container's writable layer, so `down -v` destroys it on
-# every run. This file bind-mounts it from DOD_CACHE_DIR on the host
-# (default `./dod-cache`; relative paths resolve against the first
-# compose file's directory, `tests/live/`, where all the compose
-# files live), and the workflow restores and saves that directory in
-# the GitHub Actions cache, so a warm run reuses the payload instead
-# of re-fetching it from download.opensuse.org.
+# every run. The payload is therefore served from DOD_CACHE_DIR
+# on the host (default `./dod-cache`; relative paths resolve against
+# the first compose file's directory, `tests/live/`, where all the
+# compose files live), and the workflow restores and saves that
+# directory in the GitHub Actions cache, so a warm run reuses the
+# payload instead of re-fetching it from download.opensuse.org.
 #
-# The mount uses the long syntax because the project name contains a
-# colon (`geectl:e2e`), which the short `source:target` syntax cannot
-# express. Only the `:full` directory is mounted, not the whole build
-# tree: the scheduler's own state (buildinfo, repoinfo, job state)
-# lives beside it and is rebuilt from the fresh database every run,
-# while everything under `:full` is owned by the download-on-demand
-# daemon and the scheduler's DoD handling.
+# The mount target is the colon-free `/srv/obs/dod-cache`, NOT the
+# `:full` directory itself: no compose volume form can target a path
+# containing a colon. Compose renders every volume form (long/short
+# syntax, bind or named volume) as a `HostConfig.Binds` string, and
+# the daemon parses that string by splitting on `:`, so a target
+# containing `geectl:e2e` and `:full` is rejected as an invalid volume
+# specification. provision.sh links the mounted directory into place
+# (`:full` -> `/srv/obs/dod-cache`) once the backend is up.
+#
+# The link is safe: the backend only ever removes files inside
+# `:full`, never the directory itself, and creates it with `mkdir -p`,
+# which follows an existing symlink to a directory (verified against
+# the OBS backend source, `bs_dodup` and `BSSched::DoD`).
+#
+# Only the `:full` directory is cached, not the whole build tree: the
+# scheduler's own state (buildinfo, repoinfo, job state) lives beside
+# it and is rebuilt from the fresh database every run, while
+# everything under `:full` is owned by the download-on-demand daemon
+# and the scheduler's DoD handling.
 #
 # What a stale cache can and cannot serve: the scheduler removes RPMs
 # the on-disk metadata no longer lists, which reconciles the payload
@@ -45,4 +57,4 @@ services:
     volumes:
       - type: bind
         source: ${DOD_CACHE_DIR:-./dod-cache}
-        target: /srv/obs/build/geectl:e2e/standard/${FIXTURE_ARCH:-x86_64}/:full
+        target: /srv/obs/dod-cache
