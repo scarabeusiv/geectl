@@ -135,6 +135,7 @@ with no osc counterpart.
 | `buildlog -o/--offset` | `build build-log --start` | Flag named after the library query field |
 | `buildlog -s/--strip-time` | Dropped | Logs are rendered verbatim; no post-processing of server text |
 | `buildinfo [REPOSITORY ARCH [BUILD_DESCR]]` | `build buildinfo PROJECT PACKAGE REPOSITORY ARCH` | Explicit coordinates; no local-spec (`BUILD_DESCR`) form — the library reads the server-side spec only |
+| `buildconfig REPOSITORY (in pkg or prj dir) \| buildconfig PROJECT REPOSITORY` | `build buildconfig PROJECT REPOSITORY` | Explicit coordinates; no in-directory form — project is always required; the config text renders verbatim, coordinates in the payload |
 | `buildhistory` | `build build-history` | Kebab-case library name, same mechanical mapping as `build-log` |
 | `jobhistory [PROJECT [PACKAGE] REPOSITORY ARCH]` | `build job-history PROJECT REPOSITORY ARCH` + `--package` flag | Positionals are required coordinates only |
 | `repos [PROJECT] [PACKAGE]` | `build list-repositories PROJECT` | Verb-noun `list-*` scheme for listings; package argument dropped — the library reads project meta only, no per-package disabled-repo filtering |

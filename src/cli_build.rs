@@ -13,18 +13,19 @@
 //! the payload names the written file. `check-constraints` takes the
 //! constraints document inline (`--constraints`): the one place raw
 //! XML crosses the public API, because there is no typed constraints
-//! model.
+//! model. `buildconfig` returns raw text: the payload carries it as
+//! one string and the text renders it verbatim, like `build-log`.
 //!
 //! Coordinate header (design rule 1):
 //! every command's text starts with one header line echoing the query
 //! coordinates — the required positionals, in the order project,
 //! package, repository, arch (`project: p package: k repository: r
 //! arch: a`), plus `package:` when the query is package-scoped. Tables stay as the design's
-//! worked examples pin them; the header is the only addition. The one
-//! exception is `build-log`: its text *is* the log content, verbatim
-//! (design rule 4), so no header is prepended to the log itself —
-//! the coordinates live in the JSON payload, and the synthetic
-//! `no log` line does carry the header.
+//! worked examples pin them; the header is the only addition. The
+//! exceptions are `build-log` and `buildconfig`: their text *is* the
+//! content, verbatim (design rule 4), so no header is prepended to
+//! the content itself — the coordinates live in the JSON payload, and
+//! the synthetic `no log` line (build-log only) does carry the header.
 //!
 //! Documented omissions (not gaps — see the renderers):
 //! job-history text carries 11 of 16 fields (worker and verification
@@ -177,6 +178,14 @@ pub enum BuildCommand {
         repository: String,
         /// The architecture the package builds for.
         arch: String,
+    },
+    /// Read the build configuration for a project/repository: the
+    /// expanded `_buildconfig` text the engine takes as `--dist`.
+    Buildconfig {
+        /// The project to read the build configuration for.
+        project: String,
+        /// The repository to read the build configuration for.
+        repository: String,
     },
     /// List the completed builds for a package, newest first.
     BuildHistory {
@@ -385,9 +394,9 @@ pub fn run_build(
         ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
     // The coordinate header (design rule 1) is
     // computed from the command before the match moves it. Every arm
-    // prepends it — except the `BuildLog` content itself, whose text
-    // is the log verbatim (rule 4); its synthetic `no log` line
-    // still carries the header.
+    // prepends it — except the `BuildLog` and `Buildconfig` content
+    // itself, whose text is the content verbatim (rule 4); the
+    // `BuildLog` synthetic `no log` line still carries the header.
     let header = coordinates_header(&command);
     match command {
         BuildCommand::Results {
@@ -560,6 +569,16 @@ pub fn run_build(
                 buildinfo_payload(&project, &package, &repository, &arch, &info),
                 with_header(&header, render_buildinfo_text(&info)),
             ))
+        }
+        BuildCommand::Buildconfig {
+            project,
+            repository,
+        } => {
+            let config = client.buildconfig(&project, &repository)?;
+            // No coordinate header on the config itself: the text *is*
+            // the build configuration, verbatim (design rule 4) — the
+            // coordinates live in the JSON payload.
+            Ok(buildconfig_result(&project, &repository, config))
         }
         BuildCommand::BuildHistory {
             project,
@@ -834,6 +853,13 @@ fn coordinates_header(command: &BuildCommand) -> String {
             coords.push(format!("package: {package}"));
             coords.push(format!("repository: {repository}"));
             coords.push(format!("arch: {arch}"));
+        }
+        BuildCommand::Buildconfig {
+            project,
+            repository,
+        } => {
+            coords.push(format!("project: {project}"));
+            coords.push(format!("repository: {repository}"));
         }
         BuildCommand::ListRepositories { project } => {
             coords.push(format!("project: {project}"));
@@ -1165,6 +1191,17 @@ fn render_job_status_text(job: &Option<JobStatus>) -> String {
     lines.extend(opt_line("jobid", &job.jobid));
     lines.extend(opt_num_line("attempt", &job.attempt));
     lines.join("\n")
+}
+
+/// The `buildconfig` result: the payload carries the coordinates and
+/// the config text; the text is the config verbatim.
+fn buildconfig_result(project: &str, repository: &str, config: String) -> (Value, String) {
+    let payload = json!({
+        "project": project,
+        "repository": repository,
+        "buildconfig": config,
+    });
+    (payload, config)
 }
 
 /// Buildinfo as JSON: the blocking error plus the dependency names.
@@ -2590,6 +2627,29 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_buildconfig_parses_positionals() {
+        match parse_build(&["buildconfig", "p", "r"]) {
+            BuildCommand::Buildconfig {
+                project,
+                repository,
+            } => {
+                assert_eq!(project, "p");
+                assert_eq!(repository, "r");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buildconfig_result_is_verbatim() {
+        let (payload, text) = buildconfig_result("p", "r", "Macro: foo\n".to_string());
+        assert_eq!(payload["project"], "p");
+        assert_eq!(payload["repository"], "r");
+        assert_eq!(payload["buildconfig"], "Macro: foo\n");
+        assert_eq!(text, "Macro: foo\n");
     }
 
     #[test]

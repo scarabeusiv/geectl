@@ -112,7 +112,7 @@ Commands:
   remote        Remote reads and mutations: inspect what the distribution holds, and change it
   request       Read and act on OBS submit requests, and file new ones
   branch        Branch, copy, and link packages
-  build         Build-status commands: results, logs, histories, binaries
+  build         Build-status commands: results, logs, histories, binaries, buildconfig
   local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, and `spec-cleaner`
   maintenance   Maintenance operations: maintained-instances listing and maintenance branching
   service       Service reads: list a package's services and their run state
@@ -362,7 +362,7 @@ Options:
 ## `build` — build status
 
 ```
-Build-status commands: results, logs, histories, binaries
+Build-status commands: results, logs, histories, binaries, buildconfig
 
 Usage: geectl build [OPTIONS] <COMMAND>
 
@@ -376,6 +376,7 @@ Commands:
   restart-build      Restart the running build of a package, without touching the sources. A mutation: dry-run is the default (only the plan is printed); `--live` performs the restart
   abort-build        Abort the running build of a package. A mutation: dry-run is the default (only the plan is printed); `--live` performs the abort
   buildinfo          Read the buildinfo for a package: the blocking error, if any, and the dependencies the build pulls in
+  buildconfig        Read the build configuration for a project/repository: the expanded `_buildconfig` text the engine takes as `--dist`
   build-history      List the completed builds for a package, newest first
   job-history        List the build jobs that ran in a repository, newest first
   list-binaries      List the built files for a package (or the whole repository)

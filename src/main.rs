@@ -107,7 +107,7 @@ enum Command {
         // larger than the other variants (clippy::large_enum_variant).
         command: Box<cli_branch::BranchCommand>,
     },
-    /// Build-status commands: results, logs, histories, binaries.
+    /// Build-status commands: results, logs, histories, binaries, buildconfig.
     Build {
         #[command(subcommand)]
         command: cli_build::BuildCommand,

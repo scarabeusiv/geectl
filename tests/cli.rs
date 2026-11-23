@@ -2981,7 +2981,7 @@ fn copy_package_to_apiurl_dry_run_text_echoes_the_target_instance() {
 // --- build commands integration tests (isolated env) ---
 
 #[test]
-fn build_help_lists_all_fifteen_subcommands() {
+fn build_help_lists_all_sixteen_subcommands() {
     let out = geectl().args(["build", "--help"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
@@ -2992,6 +2992,7 @@ fn build_help_lists_all_fifteen_subcommands() {
         "build-status",
         "job-status",
         "buildinfo",
+        "buildconfig",
         "build-history",
         "job-history",
         "list-binaries",
