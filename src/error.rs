@@ -240,7 +240,7 @@ impl ErrorKind {
                 "run update to rebase onto the latest base, then retry the commit"
             }
             ErrorKind::WorkingCopyInconsistent => {
-                "check the checkout out again into a fresh directory; a fresh checkout replaces repair"
+                "check the checkout out again into a fresh directory; a fresh checkout replaces repair, and any local edits and unpushed commits in this checkout are lost"
             }
             ErrorKind::FileConflict => {
                 "resolve the conflicted files, then run resolve to mark them resolved"

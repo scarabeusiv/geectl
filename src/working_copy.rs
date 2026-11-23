@@ -34,15 +34,36 @@ use crate::obs::{
 };
 use crate::xml::XmlDoc;
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// The git binary's fixed timeout: generous, since a clone or a
 /// fetch of a large repository takes a while and a local operation
 /// never should.
 const GIT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The timeout for network git operations (clone, fetch, push),
+/// in seconds, from `GEectl_GIT_NETWORK_TIMEOUT_SECS`. A clone or
+/// a fetch of a large repository takes a while; a single fixed
+/// value cannot fit every network, so the network budget is
+/// configurable while local operations keep the fixed timeout.
+/// Invalid, zero, or unset values fall back to the default.
+const DEFAULT_GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn git_network_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var("GEectl_GIT_NETWORK_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_GIT_NETWORK_TIMEOUT)
+    })
+}
 
 /// The precommit gate's budget: source services plus
 /// `pre_checkin.sh` before a commit.
@@ -196,6 +217,12 @@ pub struct UpdateReport {
     /// rebase finished. Non-empty means the rebase is still in
     /// progress: resolve the files, then run `resolve`.
     pub conflicts: Vec<String>,
+    /// A stash entry from the update is still there: the worktree
+    /// changes the rebase stashed could not be re-applied (they
+    /// conflict with the new base). `resolve` restores them after
+    /// the rebase continues; while set, the entry stays in the
+    /// stash under the message `geectl autostash`.
+    pub stash_remaining: bool,
 }
 
 /// The result of a `pull`: whether the link moved, the old and new
@@ -218,6 +245,10 @@ pub struct PullReport {
     /// The files a stopped rebase left conflicted, empty when the
     /// rebase finished.
     pub conflicts: Vec<String>,
+    /// A stash entry from the pull is still there: the worktree
+    /// changes the rebase stashed could not be re-applied. See
+    /// [`UpdateReport::stash_remaining`].
+    pub stash_remaining: bool,
 }
 
 /// The outcome of one `git` run: whether it succeeded, and the
@@ -228,25 +259,66 @@ struct GitOutput {
     stderr: Vec<u8>,
 }
 
-/// Run the `git` binary in `dir` with `subcommand` and `args`,
-/// argv-only, with a fixed environment and a fixed timeout. The
-/// error carries the subcommand and the bounded stderr, never the
-/// full argv: argv can carry a token (the clone header passes
-/// through the environment, not argv, for the same reason). No
-/// signing and no line-ending conversion: the working copy holds
-/// the server bytes exactly on every platform.
-fn run_git(
+/// Environment variables scrubbed from every `git` call: a
+/// caller's `GIT_DIR`, `GIT_WORK_TREE`, or `GIT_INDEX_FILE` would
+/// redirect the call at another repository (or at the update
+/// tree's temporary index), a `GIT_CONFIG_*` would inject config,
+/// and `GIT_SSH_COMMAND`/`GIT_ASKPASS` would hand the transport to
+/// the caller's helpers. The identity and date variables are NOT
+/// scrubbed: the author/committer dates pin deterministic
+/// synthesized commits, and the identity comes from the checkout's
+/// own repo-local config. `extra_env` is applied after the scrub,
+/// so the call's own values (the token header, the temporary
+/// index) win.
+const GIT_ENV_SCRUB: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_ASKPASS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_ALLOW_PROTOCOL",
+    "GIT_PROTOCOL_FROM_USER",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_QUARANTINE_PATH",
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "GIT_DEFAULT_HASH",
+    "GIT_DEFAULT_BRANCH",
+];
+
+/// Build the `git` command: the fixed `-c` flags, the scrubbed
+/// environment, and the fixed environment, before the subcommand.
+/// No signing and no line-ending conversion: the working copy
+/// holds the server bytes exactly on every platform. No hooks:
+/// user hooks must not run on synthesized commits, rebases, or
+/// pushes. `globals` are `git`-level options placed before the
+/// subcommand (`--literal-pathspecs`); `extra_env` is applied
+/// after the scrub.
+fn git_command(
     dir: &Path,
+    globals: &[&str],
     subcommand: &str,
     args: &[&str],
     extra_env: &[(&str, &str)],
-) -> Result<GitOutput, GeectlError> {
-    if !dir.is_dir() {
-        return Err(GeectlError::new(
-            ErrorKind::InvalidInput,
-            format!("git working directory does not exist: {}", dir.display()),
-        ));
-    }
+) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-c")
         .arg("commit.gpgsign=false")
@@ -254,9 +326,19 @@ fn run_git(
         .arg("core.autocrlf=false")
         .arg("-c")
         .arg("protocol.ext.allow=never")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .args(globals)
         .arg(subcommand)
         .args(args);
     cmd.current_dir(dir);
+    for key in GIT_ENV_SCRUB {
+        cmd.env_remove(key);
+    }
+    for n in 0..16 {
+        cmd.env_remove(format!("GIT_CONFIG_KEY_{n}"));
+        cmd.env_remove(format!("GIT_CONFIG_VALUE_{n}"));
+    }
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("GIT_EDITOR", "true");
     cmd.env("GIT_SEQUENCE_EDITOR", "true");
@@ -264,6 +346,40 @@ fn run_git(
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
+    cmd
+}
+
+/// Run the `git` binary in `dir` with `subcommand` and `args`,
+/// argv-only, with a fixed environment and a fixed timeout. The
+/// error carries the subcommand and the bounded stderr, never the
+/// full argv: argv can carry a token (the clone header passes
+/// through the environment, not argv, for the same reason).
+fn run_git(
+    dir: &Path,
+    subcommand: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<GitOutput, GeectlError> {
+    run_git_inner(dir, &[], subcommand, args, extra_env, GIT_TIMEOUT)
+}
+
+/// Run `git` with the network timeout (clone, fetch, push) and
+/// `globals` before the subcommand.
+fn run_git_inner(
+    dir: &Path,
+    globals: &[&str],
+    subcommand: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<GitOutput, GeectlError> {
+    if !dir.is_dir() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("git working directory does not exist: {}", dir.display()),
+        ));
+    }
+    let mut cmd = git_command(dir, globals, subcommand, args, extra_env);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -297,7 +413,7 @@ fn run_git(
             buf
         })
     });
-    let deadline = Instant::now() + GIT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -321,11 +437,11 @@ fn run_git(
                         ErrorKind::Timeout,
                         format!(
                             "git {subcommand} timed out after {} seconds",
-                            GIT_TIMEOUT.as_secs()
+                            timeout.as_secs()
                         ),
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(5));
             }
             Err(e) => {
                 return Err(GeectlError::new(
@@ -344,6 +460,45 @@ fn bounded(text: &str) -> String {
     text.chars().take(2048).collect()
 }
 
+/// The error kind for a failed `git` run, from its stderr: an
+/// auth failure, a network failure, a non-fast-forward, an
+/// overwrite a rebase would do, or a missing repository are
+/// distinct, actionable states — not an internal error. Anything
+/// else stays `InternalError`: the failure is the tool's, not the
+/// caller's or the network's.
+fn classify_git_failure(stderr: &str) -> ErrorKind {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("not a git repository") {
+        ErrorKind::WorkingCopyNotFound
+    } else if lower.contains("authentication failed")
+        || lower.contains("permission denied (publickey)")
+        || lower.contains("permission denied, please try again")
+        || lower.contains("could not read username")
+        || lower.contains("401")
+        || lower.contains("403")
+    {
+        ErrorKind::AuthFailed
+    } else if lower.contains("could not resolve host")
+        || lower.contains("connection refused")
+        || lower.contains("failed to connect")
+        || lower.contains("network is unreachable")
+        || lower.contains("connection reset")
+        || lower.contains("connection timed out")
+        || lower.contains("unable to connect")
+    {
+        ErrorKind::NetworkError
+    } else if lower.contains("non-fast-forward")
+        || lower.contains("fetch first")
+        || lower.contains("updates were rejected because the remote contains work")
+    {
+        ErrorKind::WorkingCopyOutdated
+    } else if lower.contains("untracked working tree files would be overwritten") {
+        ErrorKind::FileConflict
+    } else {
+        ErrorKind::InternalError
+    }
+}
+
 fn git_error(subcommand: &str, stderr: &[u8]) -> GeectlError {
     let text = String::from_utf8_lossy(stderr);
     let bounded: String = text.chars().take(2048).collect();
@@ -352,7 +507,7 @@ fn git_error(subcommand: &str, stderr: &[u8]) -> GeectlError {
     } else {
         format!("git {subcommand} failed: {}", bounded.trim())
     };
-    GeectlError::new(ErrorKind::InternalError, message)
+    GeectlError::new(classify_git_failure(&text), message)
 }
 
 /// Run `git` and return its stdout as text. A non-zero exit is an
@@ -384,6 +539,253 @@ fn git_bytes(
         Ok(output.stdout)
     } else {
         Err(git_error(subcommand, &output.stderr))
+    }
+}
+
+/// Run `git` for a network operation (clone, fetch, push) with the
+/// configurable network timeout. A non-zero exit is an error
+/// carrying the subcommand and the bounded stderr.
+fn git_network(
+    dir: &Path,
+    subcommand: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<String, GeectlError> {
+    let output = run_git_inner(dir, &[], subcommand, args, extra_env, git_network_timeout())?;
+    if output.success {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(git_error(subcommand, &output.stderr))
+    }
+}
+
+/// Run `git` with `--literal-pathspecs` before the subcommand:
+/// user-supplied paths are literal paths, never globs
+/// (`rm 'file[1].txt'` must not also remove `file1.txt`). The
+/// option is a `git`-level option, so it goes before the
+/// subcommand — after it, git rejects it as unknown.
+fn git_literal(
+    dir: &Path,
+    subcommand: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<String, GeectlError> {
+    let output = run_git_inner(
+        dir,
+        &["--literal-pathspecs"],
+        subcommand,
+        args,
+        extra_env,
+        GIT_TIMEOUT,
+    )?;
+    if output.success {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(git_error(subcommand, &output.stderr))
+    }
+}
+
+/// The md5 of a file, streamed in 64 KiB chunks: a large file
+/// never sits in memory whole.
+fn md5_of_file(path: &Path) -> Result<String, GeectlError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("failed to read {}: {e}", path.display()),
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut context = md5::Context::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("failed to read {}: {e}", path.display()),
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        context.consume(&buf[..n]);
+    }
+    Ok(format!("{:x}", context.compute()))
+}
+
+/// The sha256 of a worktree file, streamed: `None` when the file
+/// is missing, a symlink, or not a regular file. A tracked
+/// symlink to `/dev/zero` or a FIFO must not hang the gate or
+/// exhaust memory: symlinks are never followed here, and a FIFO
+/// is never opened.
+fn hash_worktree_file(root: &Path, path: &str) -> Option<String> {
+    let full = root.join(path);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(&full).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// One `git cat-file --batch` process serving blob md5s for a
+/// whole operation: the base and index blobs are hashed through a
+/// single spawn, streamed, instead of one `git show` spawn per
+/// file (each of which re-resolved the base commit and buffered
+/// the whole blob).
+struct BlobBatch {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl BlobBatch {
+    fn new(dir: &Path) -> Result<Self, GeectlError> {
+        let mut cmd = git_command(dir, &[], "cat-file", &["--batch"], &[]);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("failed to run git cat-file: {e}"),
+            )
+        })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            GeectlError::new(ErrorKind::InternalError, "git cat-file has no stdin")
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            GeectlError::new(ErrorKind::InternalError, "git cat-file has no stdout")
+        })?;
+        Ok(BlobBatch {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    /// The md5 of the blob `sha`, streamed through the batch
+    /// process: the blob content is hashed in chunks and never
+    /// buffered.
+    fn md5(&mut self, sha: &str) -> Result<String, GeectlError> {
+        writeln!(self.stdin, "{sha}").map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("failed to read blob {sha} from git cat-file: {e}"),
+            )
+        })?;
+        self.stdin.flush().map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("failed to read blob {sha} from git cat-file: {e}"),
+            )
+        })?;
+        let mut header = String::new();
+        self.stdout.read_line(&mut header).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("failed to read blob {sha} from git cat-file: {e}"),
+            )
+        })?;
+        let mut parts = header.split_whitespace();
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(found), Some(kind), Some(size)) if found == sha && kind == "blob" => {
+                let size: u64 = size.parse().map_err(|_| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("git cat-file returned a malformed header for blob {sha}"),
+                    )
+                })?;
+                let mut context = md5::Context::new();
+                let mut remaining = size;
+                let mut buf = [0u8; 65536];
+                while remaining > 0 {
+                    let want = remaining.min(buf.len() as u64) as usize;
+                    self.stdout.read_exact(&mut buf[..want]).map_err(|e| {
+                        GeectlError::new(
+                            ErrorKind::InternalError,
+                            format!("failed to read blob {sha} from git cat-file: {e}"),
+                        )
+                    })?;
+                    context.consume(&buf[..want]);
+                    remaining -= want as u64;
+                }
+                // The batch protocol ends each blob with one LF:
+                // anything else means the stream desynced, and the
+                // next read would take a corrupt header for an
+                // answer.
+                let mut lf = [0u8; 1];
+                self.stdout.read_exact(&mut lf).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("failed to read blob {sha} from git cat-file: {e}"),
+                    )
+                })?;
+                if lf != [b'\n'] {
+                    return Err(GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("git cat-file returned a malformed blob trailer for {sha}"),
+                    ));
+                }
+                Ok(format!("{:x}", context.compute()))
+            }
+            _ => Err(GeectlError::new(
+                ErrorKind::InternalError,
+                format!("git cat-file has no blob {sha}"),
+            )),
+        }
+    }
+}
+
+impl Drop for BlobBatch {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Stream the blob `sha` into `dest` without buffering it:
+/// `git cat-file` piped straight to the file. The reuse path for
+/// an update file whose listing md5 matches the base blob.
+fn git_blob_to_file(dir: &Path, sha: &str, dest: &Path) -> Result<(), GeectlError> {
+    let mut cmd = git_command(dir, &[], "cat-file", &["blob", sha], &[]);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("failed to run git cat-file: {e}"),
+        )
+    })?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GeectlError::new(ErrorKind::InternalError, "git cat-file has no stdout"))?;
+    let mut file = std::fs::File::create(dest).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("failed to create {}: {e}", dest.display()),
+        )
+    })?;
+    let copied = std::io::copy(&mut stdout, &mut file);
+    let status = child.wait().map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("failed to wait for git cat-file: {e}"),
+        )
+    })?;
+    match (copied, status.success()) {
+        (Ok(_), true) => Ok(()),
+        _ => Err(GeectlError::new(
+            ErrorKind::InternalError,
+            format!("failed to read blob {sha} from git cat-file"),
+        )),
     }
 }
 
@@ -543,6 +945,20 @@ fn root_message(dir: &Path, root: &str) -> Result<String, GeectlError> {
 /// record being updated), the record is rewritten from the root:
 /// the history is the source of truth, the record follows it.
 pub fn open(dir: &Path) -> Result<WorkingCopy, GeectlError> {
+    open_inner(dir, true)
+}
+
+/// Open the working copy at `dir` without touching local state:
+/// the record is read, never rewritten. Read paths (`status`,
+/// `diff`) and dry-run plans use this: a read must not rewrite
+/// `geectl.base-*` config. When the root commit disagrees with
+/// the record, the root's coordinates are returned (the history
+/// is the source of truth) and the record is left stale on disk.
+pub fn open_read(dir: &Path) -> Result<WorkingCopy, GeectlError> {
+    open_inner(dir, false)
+}
+
+fn open_inner(dir: &Path, heal: bool) -> Result<WorkingCopy, GeectlError> {
     if !dir.is_dir() {
         return Err(GeectlError::new(
             ErrorKind::WorkingCopyNotFound,
@@ -554,6 +970,35 @@ pub fn open(dir: &Path) -> Result<WorkingCopy, GeectlError> {
         return Err(GeectlError::new(
             ErrorKind::WorkingCopyNotFound,
             "the directory is not a geectl working copy",
+        ));
+    }
+    // The checkout root is the repository top level: a
+    // subdirectory is not a checkout. `diff --name-only` is
+    // root-relative while `ls-files` and `:(literal)` pathspecs
+    // are cwd-relative, so opening a subdirectory would read the
+    // index wrong and treat changed files as deleted.
+    let toplevel = git(dir, "rev-parse", &["--show-toplevel"], &[])?;
+    let toplevel = toplevel.trim();
+    let canonical_dir = std::fs::canonicalize(dir).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("failed to resolve {}: {e}", dir.display()),
+        )
+    })?;
+    let canonical_top = std::fs::canonicalize(toplevel).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InternalError,
+            format!("failed to resolve the checkout root {toplevel}: {e}"),
+        )
+    })?;
+    if canonical_dir != canonical_top {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{} is a subdirectory of the checkout at {}: run working-copy commands from the checkout root",
+                dir.display(),
+                toplevel
+            ),
         ));
     }
     let mut values: Vec<Option<String>> = Vec::new();
@@ -606,8 +1051,10 @@ pub fn open(dir: &Path) -> Result<WorkingCopy, GeectlError> {
             )
         })?;
         if rev != working_copy.base_rev || srcmd5 != working_copy.base_srcmd5 {
-            git_config_set(dir, "base-rev", &rev)?;
-            git_config_set(dir, "base-srcmd5", &srcmd5)?;
+            if heal {
+                git_config_set(dir, "base-rev", &rev)?;
+                git_config_set(dir, "base-srcmd5", &srcmd5)?;
+            }
             working_copy.base_rev = rev;
             working_copy.base_srcmd5 = srcmd5;
         }
@@ -631,30 +1078,70 @@ fn is_service_generated(name: &str) -> bool {
     name.starts_with("_service:") || name.starts_with("_service_")
 }
 
-/// The content of `path` as stored in the index.
+/// The content of `path` as stored in the index. `--no-textconv`:
+/// a textconv filter would return converted bytes, not the bytes
+/// the commit sends.
 fn index_content(wc: &WorkingCopy, path: &str) -> Result<Vec<u8>, GeectlError> {
-    git_bytes(&wc.root, "show", &[&format!(":{path}")], &[])
-}
-
-/// The files in the base tree: the listing is compared against
-/// this, not the index, so a dry-run plan describes what the
-/// server did, not what local work added or changed.
-fn base_file_list(wc: &WorkingCopy) -> Result<Vec<String>, GeectlError> {
-    let base = wc.base_commit()?;
-    let out = git(
+    git_bytes(
         &wc.root,
-        "ls-tree",
-        &["-r", "--name-only", "-z", &base],
+        "show",
+        &["--no-textconv", &format!(":{path}")],
         &[],
-    )?;
-    Ok(split_nul(&out))
+    )
 }
 
-/// The content of a file in the base tree. Fails when the file is
-/// not in the base.
-fn base_content(wc: &WorkingCopy, path: &str) -> Result<Vec<u8>, GeectlError> {
-    let base = wc.base_commit()?;
-    git_bytes(&wc.root, "show", &[&format!("{base}:{path}")], &[])
+/// The base tree's `(name, blob SHA)` entries, for the base
+/// `base` (resolved once by the caller): one `ls-tree` for the
+/// whole tree, so a per-file md5 never re-resolves the base.
+fn ls_tree_entries(wc: &WorkingCopy, base: &str) -> Result<Vec<(String, String)>, GeectlError> {
+    let out = git(&wc.root, "ls-tree", &["-r", "-z", base], &[])?;
+    let mut entries = Vec::new();
+    for field in split_nul(&out) {
+        let Some((meta, name)) = field.split_once('\t') else {
+            return Err(GeectlError::new(
+                ErrorKind::WorkingCopyInconsistent,
+                "git ls-tree output is malformed: an entry has no name",
+            ));
+        };
+        let mut parts = meta.split_whitespace();
+        let _mode = parts.next();
+        let _kind = parts.next();
+        let Some(sha) = parts.next() else {
+            return Err(GeectlError::new(
+                ErrorKind::WorkingCopyInconsistent,
+                "git ls-tree output is malformed: an entry has no blob SHA",
+            ));
+        };
+        entries.push((name.to_string(), sha.to_string()));
+    }
+    Ok(entries)
+}
+
+/// The index's `name -> blob SHA` map: one `ls-files` for the
+/// whole index, so a per-file md5 never re-resolves the base.
+fn ls_files_entries(
+    wc: &WorkingCopy,
+) -> Result<std::collections::HashMap<String, String>, GeectlError> {
+    let out = git(&wc.root, "ls-files", &["-s", "-z"], &[])?;
+    let mut entries = std::collections::HashMap::new();
+    for field in split_nul(&out) {
+        let Some((meta, name)) = field.split_once('\t') else {
+            return Err(GeectlError::new(
+                ErrorKind::WorkingCopyInconsistent,
+                "git ls-files output is malformed: an entry has no name",
+            ));
+        };
+        let mut parts = meta.split_whitespace();
+        let _mode = parts.next();
+        let Some(sha) = parts.next() else {
+            return Err(GeectlError::new(
+                ErrorKind::WorkingCopyInconsistent,
+                "git ls-files output is malformed: an entry has no blob SHA",
+            ));
+        };
+        entries.insert(name.to_string(), sha.to_string());
+    }
+    Ok(entries)
 }
 
 /// Whether `path` is in the index.
@@ -671,13 +1158,25 @@ fn index_has(wc: &WorkingCopy, path: &str) -> Result<bool, GeectlError> {
 /// The files whose index state differs from the base commit: the
 /// staged plus locally committed changes. Unstaged worktree changes
 /// are not in this list: a commit sends the index state, never the
-/// worktree.
+/// worktree. `--no-renames`: a rename lists both paths (the old
+/// path deleted, the new path added) — without it, only the new
+/// path is listed and the old path is re-added from the base, so
+/// the commit sends both files.
 fn index_file_list(wc: &WorkingCopy) -> Result<Vec<String>, GeectlError> {
     let base = wc.base_commit()?;
     let out = git(
         &wc.root,
         "diff",
-        &["--cached", "--name-only", "-z", &base],
+        &[
+            "--cached",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            "--name-only",
+            "-z",
+            &base,
+        ],
         &[],
     )?;
     Ok(split_nul(&out))
@@ -688,7 +1187,14 @@ fn unmerged_files(wc: &WorkingCopy) -> Result<Vec<String>, GeectlError> {
     let out = git(
         &wc.root,
         "diff",
-        &["--name-only", "--diff-filter=U", "-z"],
+        &[
+            "--name-only",
+            "--diff-filter=U",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            "-z",
+        ],
         &[],
     )?;
     Ok(split_nul(&out))
@@ -730,13 +1236,31 @@ fn path_segment(name: &str) -> String {
     name.replace(':', "_")
 }
 
+/// Refuse a project or package name that is not a single path
+/// segment: `.` and `..` would escape the checkout directory
+/// (and a failed checkout's cleanup would delete outside it),
+/// and a separator or NUL is never a name. OBS names allow `.`
+/// (so `..` passes the server's own name check) — this is the
+/// check that stops it.
+fn check_name_segment(kind: &str, name: &str) -> Result<(), GeectlError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OBS {kind} name: {name:?}"),
+        ));
+    }
+    Ok(())
+}
+
 /// The checkout directory for a project and package:
 /// `<dir>/<project>/<package>/` with `:` sanitized (see
 /// `path_segment`). The CLI renders the same target for a dry-run
 /// checkout, so the plan names the directory the live checkout
 /// creates.
-pub fn checkout_target(dir: &Path, project: &str, package: &str) -> PathBuf {
-    dir.join(path_segment(project)).join(path_segment(package))
+pub fn checkout_target(dir: &Path, project: &str, package: &str) -> Result<PathBuf, GeectlError> {
+    check_name_segment("project", project)?;
+    check_name_segment("package", package)?;
+    Ok(dir.join(path_segment(project)).join(path_segment(package)))
 }
 
 /// Refuse a directory listing whose entries are not plain file
@@ -776,11 +1300,17 @@ pub fn checkout(
     gitea_auth: Option<&GiteaAuth<'_>>,
     dry_run: &DryRun,
 ) -> Result<Option<WorkingCopy>, GeectlError> {
-    let target = checkout_target(dir, project, package);
+    // The segment check runs before anything else: a `..`
+    // project would otherwise put the target (and the failure
+    // cleanup below) outside `dir`.
+    let target = checkout_target(dir, project, package)?;
     if target.exists() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            format!("checkout target already exists: {}", target.display()),
+            format!(
+                "checkout target already exists: {}; on a case-insensitive filesystem a checkout with the same name in different case counts as existing",
+                target.display()
+            ),
         ));
     }
     let meta = client.package_meta(project, package)?;
@@ -832,6 +1362,42 @@ pub fn checkout(
     }
 }
 
+/// Download `name` at the pinned `rev` and verify it against the
+/// listing's md5: the bytes are hashed as they are read back from
+/// disk, so a revision that landed between the listing and the
+/// download (or a corrupt transfer) is refused before the file is
+/// used. `expected_md5` is `None` when the listing carries no md5:
+/// the download is still pinned, just not verified.
+#[allow(clippy::too_many_arguments)]
+fn download_verified(
+    client: &ObsClient,
+    project: &str,
+    package: &str,
+    name: &str,
+    rev: Option<&RevisionSpec>,
+    dest: &Path,
+    expected_md5: Option<&str>,
+    expanded: bool,
+) -> Result<(), GeectlError> {
+    if expanded {
+        client.download_source_expanded_to_file(project, package, name, rev, dest)?;
+    } else {
+        client.download_source_to_file(project, package, name, rev, dest)?;
+    }
+    if let Some(expected) = expected_md5 {
+        let actual = md5_of_file(dest)?;
+        if actual != expected {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "downloaded {name} does not match the directory listing (md5 {actual} != {expected}): the server moved under the download; retry the operation",
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The OBS-native checkout: download every file at the base
 /// revision, then commit the tree as the root commit.
 fn checkout_obs(
@@ -841,7 +1407,7 @@ fn checkout_obs(
     rev: Option<&RevisionSpec>,
     dir: &Path,
 ) -> Result<WorkingCopy, GeectlError> {
-    let target = checkout_target(dir, project, package);
+    let target = checkout_target(dir, project, package)?;
     let (listing, (rev_number, _, srcmd5)) = client.directory_listing_rev(project, package, rev)?;
     let rev_number = rev_number.ok_or_else(|| {
         GeectlError::new(
@@ -855,6 +1421,16 @@ fn checkout_obs(
             format!("the server did not return a source md5 for {project}/{package}"),
         )
     })?;
+    // The downloads are pinned to the listing's revision: a
+    // revision landing between the listing and the download is
+    // recorded under the older rev otherwise.
+    let pinned_rev = rev_number.parse::<u64>().map_err(|_| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("the server returned a non-numeric revision for {project}/{package}"),
+        )
+    })?;
+    let pinned = RevisionSpec::Rev(pinned_rev);
     check_listing_names(&listing)?;
     std::fs::create_dir_all(&target).map_err(|e| {
         GeectlError::new(
@@ -863,12 +1439,15 @@ fn checkout_obs(
         )
     })?;
     for entry in &listing.entries {
-        client.download_source_to_file(
+        download_verified(
+            client,
             project,
             package,
             &entry.name,
-            rev,
+            Some(&pinned),
             &target.join(&entry.name),
+            entry.md5.as_deref(),
+            false,
         )?;
     }
     git(&target, "init", &["--quiet"], &[])?;
@@ -881,7 +1460,11 @@ fn checkout_obs(
         &rev_number,
         &srcmd5,
     )?;
-    git(&target, "add", &["-A"], &[])?;
+    // Forced: `git add -A` honours the user's global excludes, so
+    // a `*.patch` in `core.excludesFile` would leave server files
+    // out of the base and the next commit would delete them on the
+    // server.
+    git(&target, "add", &["-f", "-A"], &[])?;
     // An empty package has nothing to add: the root commit is
     // created over the empty tree, so the checkout still opens.
     git(
@@ -889,6 +1472,7 @@ fn checkout_obs(
         "commit",
         &[
             "--quiet",
+            "--no-verify",
             "--allow-empty",
             "-m",
             &format!("geectl base {rev_number} {srcmd5}"),
@@ -925,19 +1509,22 @@ fn checkout_git(
     dir: &Path,
     gitea_auth: Option<&GiteaAuth<'_>>,
 ) -> Result<WorkingCopy, GeectlError> {
-    let target = checkout_target(dir, project, package);
+    let target = checkout_target(dir, project, package)?;
     // The `#branch` fragment names the branch to check out, but
     // git does not understand it: passing it to `git clone` makes
     // the fragment part of the path, and the clone fails. Strip it
     // and check the branch out with `--branch` instead.
     let (clone_url, branch) = split_scmsync_url(url);
-    // A scmsync URL is an http(s) URL from the server; one starting
-    // with `-` would be parsed as a git option, not a repository.
-    // The refusal runs before anything is created on disk.
-    if clone_url.starts_with('-') {
+    // A scmsync URL comes from the server (`_meta`), so it is
+    // maintainer-controlled: only http(s) is accepted. A `file://`
+    // URL, a local path, `ssh://` (the user's keys and agent), or
+    // `git://` would hand the clone to a transport the checkout
+    // never asked for. The refusal runs before anything is created
+    // on disk.
+    if !(clone_url.starts_with("http://") || clone_url.starts_with("https://")) {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            format!("refusing to clone a scmsync URL starting with '-': {clone_url:?}"),
+            format!("refusing to clone a scmsync URL that is not http(s): {clone_url:?}"),
         ));
     }
     std::fs::create_dir_all(target.parent().unwrap_or(dir)).map_err(|e| {
@@ -951,10 +1538,14 @@ fn checkout_git(
     })?;
     let mut header = String::new();
     let mut key = String::new();
-    let env: Vec<(&str, &str)> = match gitea_auth {
+    let mut env: Vec<(&str, &str)> = match gitea_auth {
         Some(auth) => token_env(auth, &mut header, &mut key).to_vec(),
         None => Vec::new(),
     };
+    // Belt and braces with the scheme check above: only http(s)
+    // transports are allowed for the clone, whatever the URL
+    // names.
+    env.push(("GIT_ALLOW_PROTOCOL", "http:https"));
     let target_str = target.to_string_lossy().into_owned();
     let mut args: Vec<&str> = Vec::new();
     if let Some(branch) = branch {
@@ -963,9 +1554,14 @@ fn checkout_git(
             args.push(branch);
         }
     }
+    // The `--` keeps the URL a repository, never an option: the
+    // scheme check above already refuses a `-`-prefixed URL, and
+    // this stops any other option-shaped value from being parsed
+    // as one.
+    args.push("--");
     args.push(clone_url);
     args.push(&target_str);
-    git(dir, "clone", &args, &env)?;
+    git_network(dir, "clone", &args, &env)?;
     let head = git(&target, "rev-parse", &["HEAD"], &[])?
         .trim()
         .to_string();
@@ -1032,17 +1628,21 @@ pub fn status(wc: &WorkingCopy) -> Result<Vec<StatusEntry>, GeectlError> {
         &[],
     )?;
     let unmerged = unmerged_files(wc)?;
-    let mut codes: Vec<(String, char, char)> = Vec::new();
-    let put = |path: String, x: char, y: char, codes: &mut Vec<(String, char, char)>| {
-        if let Some(slot) = codes.iter_mut().find(|(p, _, _)| *p == path) {
-            if x != ' ' {
-                slot.1 = x;
-            }
-            if y != ' ' {
-                slot.2 = y;
-            }
-        } else {
-            codes.push((path, x, y));
+    // One map for the merged `XY` pair per path (a linear
+    // find per entry is O(n^2) on a large checkout), one set
+    // for the entries already reported.
+    let mut codes: std::collections::HashMap<String, (char, char)> =
+        std::collections::HashMap::new();
+    let put = |path: String,
+               x: char,
+               y: char,
+               codes: &mut std::collections::HashMap<String, (char, char)>| {
+        let slot = codes.entry(path).or_insert((' ', ' '));
+        if x != ' ' {
+            slot.0 = x;
+        }
+        if y != ' ' {
+            slot.1 = y;
         }
     };
     for (code, path) in cached {
@@ -1053,13 +1653,15 @@ pub fn status(wc: &WorkingCopy) -> Result<Vec<StatusEntry>, GeectlError> {
     }
     let mut entries: Vec<StatusEntry> = codes
         .into_iter()
-        .filter_map(|(path, x, y)| status_code(x, y).map(|code| StatusEntry { path, code }))
+        .filter_map(|(path, (x, y))| status_code(x, y).map(|code| StatusEntry { path, code }))
         .collect();
+    let mut seen: std::collections::HashSet<String> =
+        entries.iter().map(|entry| entry.path.clone()).collect();
     for path in split_nul(&untracked) {
         // A file staged for deletion that is still on disk is
         // both in the cached diff (Deleted) and untracked: report
         // it once, as the staged state.
-        if !entries.iter().any(|entry| entry.path == path) {
+        if seen.insert(path.clone()) {
             entries.push(StatusEntry {
                 path,
                 code: StatusCode::Unknown,
@@ -1108,7 +1710,18 @@ fn status_code(x: char, y: char) -> Option<StatusCode> {
 /// skipped (the record itself carries the new path, as in
 /// porcelain `-z`).
 fn name_status(dir: &Path, args: &[&str]) -> Result<Vec<(char, String)>, GeectlError> {
-    let mut full = vec!["diff", "--name-status", "-z"];
+    // No `--no-renames` here: `status` reports renames as `R`,
+    // and this parser reads the rename record (old path skipped,
+    // new path kept). The `--no-renames` fix is for the diffs
+    // that derive file lists for a commit.
+    let mut full = vec![
+        "diff",
+        "--name-status",
+        "--no-ext-diff",
+        "--no-color",
+        "--no-textconv",
+        "-z",
+    ];
     full.extend_from_slice(args);
     let out = git(dir, full[0], &full[1..], &[])?;
     let mut entries = Vec::new();
@@ -1157,8 +1770,24 @@ fn is_unmerged(x: char, y: char) -> bool {
 /// staged-only change would be invisible.
 pub fn diff(wc: &WorkingCopy) -> Result<String, GeectlError> {
     let base = wc.base_commit()?;
-    let mut out = git(&wc.root, "diff", &["--cached", &base], &[])?;
-    out.push_str(&git(&wc.root, "diff", &[], &[])?);
+    let mut out = git(
+        &wc.root,
+        "diff",
+        &[
+            "--cached",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            &base,
+        ],
+        &[],
+    )?;
+    out.push_str(&git(
+        &wc.root,
+        "diff",
+        &["--no-ext-diff", "--no-color", "--no-textconv"],
+        &[],
+    )?);
     let untracked = git(
         &wc.root,
         "ls-files",
@@ -1221,7 +1850,8 @@ pub fn add(
     }
     let mut args = vec!["--"];
     args.extend(files.iter().map(String::as_str));
-    git(&wc.root, "add", &args, &[])?;
+    // Literal pathspecs: a user path is a path, never a glob.
+    git_literal(&wc.root, "add", &args, &[])?;
     Ok(Some(()))
 }
 
@@ -1286,6 +1916,18 @@ pub fn rm(wc: &WorkingCopy, files: &[String], dry_run: &DryRun) -> Result<Option
             ));
         }
     }
+    // The tracked removal runs first: an untracked file deleted
+    // before a failing `git rm` would leave a partial state (the
+    // untracked file gone, the tracked file still there).
+    if !tracked.is_empty() {
+        // Forced: the agent asked for the removal, and the file's
+        // modifications go with it — the same as the existing
+        // tool's remove.
+        let mut args = vec!["-f", "--"];
+        args.extend(tracked.iter().map(String::as_str));
+        // Literal pathspecs: a user path is a path, never a glob.
+        git_literal(&wc.root, "rm", &args, &[])?;
+    }
     for file in &untracked {
         std::fs::remove_file(wc.root.join(file)).map_err(|e| {
             GeectlError::new(
@@ -1293,14 +1935,6 @@ pub fn rm(wc: &WorkingCopy, files: &[String], dry_run: &DryRun) -> Result<Option
                 format!("failed to remove {file}: {e}"),
             )
         })?;
-    }
-    if !tracked.is_empty() {
-        // Forced: the agent asked for the removal, and the file's
-        // modifications go with it — the same as the existing
-        // tool's remove.
-        let mut args = vec!["rm", "-f", "--"];
-        args.extend(tracked.iter().map(String::as_str));
-        git(&wc.root, "rm", &args[1..], &[])?;
     }
     Ok(Some(()))
 }
@@ -1311,7 +1945,10 @@ pub fn addremove(wc: &WorkingCopy, dry_run: &DryRun) -> Result<Option<()>, Geect
     if !dry_run.allow(&format!("stage every change in {}", wc.root.display())) {
         return Ok(None);
     }
-    git(&wc.root, "add", &["-A"], &[])?;
+    // Forced: `git add -A` honours the user's global excludes,
+    // so an excluded file would be left out of the stage (see
+    // `checkout_obs`).
+    git(&wc.root, "add", &["-f", "-A"], &[])?;
     Ok(Some(()))
 }
 
@@ -1326,11 +1963,11 @@ fn snapshot_gate_inputs(wc: &WorkingCopy) -> Result<GateSnapshot, GeectlError> {
     let tracked = git(&wc.root, "ls-files", &["-z"], &[])?;
     let mut hashes = Vec::new();
     for path in split_nul(&tracked) {
-        let hash = match std::fs::read(wc.root.join(&path)) {
-            Ok(content) => Some(format!("{:x}", Sha256::digest(&content))),
-            Err(_) => None,
-        };
-        hashes.push((path, hash));
+        // Streamed, and never through a symlink: a tracked
+        // symlink to `/dev/zero` or a FIFO would hang or exhaust
+        // memory on `fs::read`, and a symlink's target bytes are
+        // not the file's content.
+        hashes.push((path.clone(), hash_worktree_file(&wc.root, &path)));
     }
     Ok(GateSnapshot { hashes })
 }
@@ -1345,18 +1982,17 @@ fn snapshot_gate_inputs(wc: &WorkingCopy) -> Result<GateSnapshot, GeectlError> {
 fn stage_gate_changes(wc: &WorkingCopy, before: &GateSnapshot) -> Result<Vec<String>, GeectlError> {
     let mut changed = Vec::new();
     for (path, hash) in &before.hashes {
-        let now = match std::fs::read(wc.root.join(path)) {
-            Ok(content) => Some(format!("{:x}", Sha256::digest(&content))),
-            Err(_) => None,
-        };
+        let now = hash_worktree_file(&wc.root, path);
         if now.as_deref() != hash.as_deref() {
             changed.push(path.clone());
         }
     }
     if !changed.is_empty() {
-        let mut args = vec!["add", "--"];
+        let mut args = vec!["--"];
         args.extend(changed.iter().map(String::as_str));
-        git(&wc.root, "add", &args[1..], &[])?;
+        // Literal pathspecs: a gate-changed path is a path, never
+        // a glob.
+        git_literal(&wc.root, "add", &args, &[])?;
     }
     Ok(changed)
 }
@@ -1381,30 +2017,35 @@ fn run_service_gate(client: &ObsClient, config: &Config, dir: &Path) -> Result<(
 fn build_commit_entries(
     wc: &WorkingCopy,
 ) -> Result<(Vec<CommitFileEntry>, Vec<String>), GeectlError> {
+    let base = wc.base_commit()?;
     let changed = index_file_list(wc)?;
     let changed_names: std::collections::HashSet<&str> =
         changed.iter().map(String::as_str).collect();
+    // One `ls-tree`, one `ls-files`, one `cat-file --batch` for
+    // the whole file list: the md5s stream through the batch
+    // process instead of one `git show` spawn (and one
+    // base-commit re-resolution) per file, buffering each blob.
+    let base_entries = ls_tree_entries(wc, &base)?;
+    let index_entries = ls_files_entries(wc)?;
+    let mut batch = BlobBatch::new(&wc.root)?;
     let mut entries = Vec::new();
     let mut files = Vec::new();
-    for name in base_file_list(wc)? {
-        if is_service_generated(&name) || changed_names.contains(name.as_str()) {
+    for (name, sha) in &base_entries {
+        if is_service_generated(name) || changed_names.contains(name.as_str()) {
             continue;
         }
-        let content = base_content(wc, &name)?;
-        let md5 = format!("{:x}", md5::compute(&content));
-        entries.push(CommitFileEntry::new(&name, &md5));
+        let md5 = batch.md5(sha)?;
+        entries.push(CommitFileEntry::new(name, &md5));
     }
     for name in changed {
         if is_service_generated(&name) {
             continue;
         }
         files.push(name.clone());
-        if !index_has(wc, &name)? {
-            continue;
+        if let Some(sha) = index_entries.get(&name) {
+            let md5 = batch.md5(sha)?;
+            entries.push(CommitFileEntry::new(&name, &md5));
         }
-        let content = index_content(wc, &name)?;
-        let md5 = format!("{:x}", md5::compute(&content));
-        entries.push(CommitFileEntry::new(&name, &md5));
     }
     Ok((entries, files))
 }
@@ -1443,6 +2084,15 @@ pub fn commit(
     gitea_auth: Option<&GiteaAuth<'_>>,
     dry_run: &DryRun,
 ) -> Result<Option<CommitReport>, GeectlError> {
+    // An empty message aborts `git commit` on the git path and
+    // sends an empty comment on the OBS path: refuse it up front,
+    // on both.
+    if message.trim().is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "commit needs a non-empty --message",
+        ));
+    }
     if !dry_run.allow(&format!(
         "commit working copy {}/{}: {message}",
         wc.project, wc.package
@@ -1454,6 +2104,28 @@ pub fn commit(
         Backend::Obs => commit_obs(wc, client, config, message, noservice, dry_run).map(Some),
         Backend::Git => commit_git(wc, client, config, message, noservice, gitea_auth).map(Some),
     }
+}
+
+/// Refuse to commit a package whose `_link` points at a
+/// different project: geectl does not auto-branch a link to a
+/// different project (the existing tool branches); the agent
+/// decides, and the error names the `branch_package` it needs —
+/// the link target branched into this project and package.
+fn refuse_link_to_other_project(wc: &WorkingCopy) -> Result<(), GeectlError> {
+    if !index_has(wc, "_link")? {
+        return Ok(());
+    }
+    let (link_project, link_package) = read_link_target(wc)?;
+    if link_project != wc.project {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to commit a link to a different project: _link points at {link_project}/{link_package}; branch it first (branch_package {link_project}/{link_package} into {}/{})",
+                wc.project, wc.package
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The dry-run plan for a commit: the files it would send, and the
@@ -1469,6 +2141,7 @@ fn record_commit_plan(
         Backend::Obs => {
             // The outdated check live commit_obs runs first: the
             // plan refuses a commit the live path would refuse.
+            refuse_link_to_other_project(wc)?;
             refuse_when_outdated_obs(wc, client)?;
             refuse_on_conflicts(wc)?;
             let (entries, files) = build_commit_entries(wc)?;
@@ -1493,7 +2166,16 @@ fn record_commit_plan(
             let staged = git(
                 &wc.root,
                 "diff",
-                &["--cached", "--name-only", "-z", "HEAD"],
+                &[
+                    "--cached",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-color",
+                    "--no-textconv",
+                    "--name-only",
+                    "-z",
+                    "HEAD",
+                ],
                 &[],
             )?;
             for name in split_nul(&staged) {
@@ -1543,6 +2225,7 @@ fn commit_obs(
     // The upstream check: the checkout's base must equal the
     // server's latest revision, else the commit would land on top
     // of a revision the checkout never saw.
+    refuse_link_to_other_project(wc)?;
     refuse_when_outdated_obs(wc, client)?;
     refuse_on_conflicts(wc)?;
     let (_, committed_files) = build_commit_entries(wc)?;
@@ -1748,7 +2431,18 @@ fn commit_obs(
             )
         })?;
     }
-    refresh_base(wc, &new_rev.to_string(), &new_srcmd5)?;
+    // The base refresh runs after the commit landed: a failure
+    // here must name the landed revision, like the settle-poll
+    // errors do — otherwise the agent cannot tell the commit
+    // landed and retries it, creating a second revision.
+    refresh_base(wc, &new_rev.to_string(), &new_srcmd5).map_err(|e| {
+        GeectlError::new(
+            e.kind(),
+            format!(
+                "the commit landed as revision {new_rev}, but the base could not be refreshed: {e}; run update, then check status"
+            ),
+        )
+    })?;
     // The open-requests report is informational: the commit landed,
     // so a failing search does not fail the commit.
     let open_requests = client
@@ -1788,13 +2482,22 @@ fn commit_git(
     let env = token_env(auth, &mut header, &mut key);
     // The outdated check: fetch first, then refuse when the
     // upstream has commits the checkout does not have.
-    git(&wc.root, "fetch", &["origin"], &env)?;
+    git_network(&wc.root, "fetch", &["origin"], &env)?;
     refuse_when_remote_ahead(wc)?;
     refuse_on_conflicts(wc)?;
     let staged = git(
         &wc.root,
         "diff",
-        &["--cached", "--name-only", "-z", "HEAD"],
+        &[
+            "--cached",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            "--name-only",
+            "-z",
+            "HEAD",
+        ],
         &[],
     )?;
     let head = git(&wc.root, "rev-parse", &["HEAD"], &[])?
@@ -1817,11 +2520,25 @@ fn commit_git(
     let staged = git(
         &wc.root,
         "diff",
-        &["--cached", "--name-only", "-z", "HEAD"],
+        &[
+            "--cached",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            "--name-only",
+            "-z",
+            "HEAD",
+        ],
         &[],
     )?;
     if !split_nul(&staged).is_empty() {
-        git(&wc.root, "commit", &["--quiet", "-m", message], &[])?;
+        git(
+            &wc.root,
+            "commit",
+            &["--quiet", "--no-verify", "-m", message],
+            &[],
+        )?;
     }
     let head = git(&wc.root, "rev-parse", &["HEAD"], &[])?
         .trim()
@@ -1832,7 +2549,7 @@ fn commit_git(
             "there is nothing to commit: no local commits ahead of the base",
         ));
     }
-    git(&wc.root, "push", &["origin", "HEAD"], &env)?;
+    git_network(&wc.root, "push", &["--no-verify", "origin", "HEAD"], &env)?;
     // The push landed; the OBS side picks it up through scmsync.
     // Poll `_scmsync.obsinfo` until its `commit:` matches the
     // pushed head, bounded: a sync that never arrives is a timeout,
@@ -1870,12 +2587,31 @@ fn commit_git(
         std::thread::sleep(POLL_INTERVAL);
     }
     let old_base = wc.base_rev.clone();
-    git_config_set(&wc.root, "base-rev", &head)?;
+    // The push landed: a failure here must name the pushed head,
+    // like the OBS path names the landed revision — otherwise the
+    // agent cannot tell the push landed and pushes again.
+    git_config_set(&wc.root, "base-rev", &head).map_err(|e| {
+        GeectlError::new(
+            e.kind(),
+            format!(
+                "the push landed (head {head}), but the base record could not be updated: {e}; run update, then check status"
+            ),
+        )
+    })?;
     wc.base_rev = head.clone();
     let changed = git(
         &wc.root,
         "diff",
-        &["--name-only", "-z", &old_base, "HEAD"],
+        &[
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            "-z",
+            &old_base,
+            "HEAD",
+        ],
         &[],
     )?;
     Ok(CommitReport {
@@ -1944,31 +2680,52 @@ fn build_base_tree(
     let _cleanup = TempCleanup {
         paths: vec![tmp_dir.clone(), tmp_index.clone()],
     };
+    // A stale temporary directory from a killed run blocks the
+    // next one: remove it (and the stale index) before creating
+    // them, instead of only removing the index.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_file(&tmp_index);
     std::fs::create_dir_all(&tmp_dir).map_err(|e| {
         GeectlError::new(
             ErrorKind::InternalError,
             format!("failed to create {}: {e}", tmp_dir.display()),
         )
     })?;
-    let _ = std::fs::remove_file(&tmp_index);
     let tmp_index_str = tmp_index.to_string_lossy().into_owned();
     let index_env = [("GIT_INDEX_FILE", tmp_index_str.as_str())];
     git(&wc.root, "read-tree", &["--empty"], &index_env)?;
+    // The base tree's blob SHAs, resolved once: a file whose
+    // listing md5 matches the base blob is copied out of the
+    // object store instead of re-downloaded.
+    let base = wc.base_commit()?;
+    let base_blobs: std::collections::HashMap<String, String> =
+        ls_tree_entries(wc, &base)?.into_iter().collect();
+    let mut batch = BlobBatch::new(&wc.root)?;
     for entry in &listing.entries {
         let dest = tmp_dir.join(&entry.name);
-        // An expanded listing names the link target's files: they
-        // resolve only through the link expansion, so they download
-        // through the authenticated source endpoint.
-        if expand {
-            client.download_source_expanded_to_file(
+        let reused = match (&entry.md5, base_blobs.get(&entry.name)) {
+            (Some(listing_md5), Some(sha)) => batch.md5(sha)? == *listing_md5,
+            _ => false,
+        };
+        if reused {
+            let sha = base_blobs.get(&entry.name).unwrap();
+            git_blob_to_file(&wc.root, sha, &dest)?;
+        } else {
+            // An expanded listing names the link target's files:
+            // they resolve only through the link expansion, so
+            // they download through the authenticated source
+            // endpoint. Either way the download is pinned to
+            // `rev` and verified against the listing's md5.
+            download_verified(
+                client,
                 &wc.project,
                 &wc.package,
                 &entry.name,
                 rev,
                 &dest,
+                entry.md5.as_deref(),
+                expand,
             )?;
-        } else {
-            client.download_source_to_file(&wc.project, &wc.package, &entry.name, rev, &dest)?;
         }
         add_to_tmp_index(&wc.root, &index_env, &dest, &entry.name)?;
     }
@@ -1979,7 +2736,19 @@ fn build_base_tree(
         // unexpanded route — it is the link package's own file —
         // and rewrite its baserev to the pulled target revision.
         let dest = tmp_dir.join("_link");
-        client.download_source_to_file(&wc.project, &wc.package, "_link", rev, &dest)?;
+        // Pinned to `rev` like every other download; no md5 to
+        // verify against — the expanded listing never carries
+        // `_link`.
+        download_verified(
+            client,
+            &wc.project,
+            &wc.package,
+            "_link",
+            rev,
+            &dest,
+            None,
+            false,
+        )?;
         let text = std::fs::read_to_string(&dest).map_err(|e| {
             GeectlError::new(
                 ErrorKind::InternalError,
@@ -2000,28 +2769,129 @@ fn build_base_tree(
     Ok(tree.trim().to_string())
 }
 
+/// The outcome of a rebase: the conflicts it stopped on (if
+/// any), and whether the stash entry holding the pre-rebase
+/// worktree changes is still there.
+struct RebaseOutcome {
+    conflicts: Option<Vec<String>>,
+    stash_remaining: bool,
+}
+
+/// The `stash@{n}` refs of the `geectl autostash` entries, newest
+/// first: `git stash list` orders newest first, so the first
+/// match is the latest update's entry.
+fn autostash_entries(wc: &WorkingCopy) -> Result<Vec<String>, GeectlError> {
+    let list = git(&wc.root, "stash", &["list"], &[])?;
+    let mut entries = Vec::new();
+    for line in list.lines() {
+        // `stash@{0}: On main: geectl autostash`: the message is
+        // the last `: `-separated field.
+        if line.rsplit(": ").next() == Some("geectl autostash") {
+            if let Some(entry) = line.split(':').next() {
+                entries.push(entry.to_string());
+            }
+        }
+    }
+    Ok(entries)
+}
+
 /// Rebase the local commits onto `new_root`, with the worktree
-/// stashed and restored. A clean rebase returns `Ok(None)`; a
-/// rebase stopped on conflicts returns the conflicted files.
-fn rebase_onto(wc: &WorkingCopy, new_root: &str) -> Result<Option<Vec<String>>, GeectlError> {
+/// stashed and restored. A clean rebase returns no conflicts; a
+/// rebase stopped on conflicts returns the conflicted files, and
+/// a stash entry that could not be re-applied is reported
+/// (`stash_remaining`): a rebase that exits 0 can still leave
+/// unmerged files behind when the stash re-apply conflicts, so
+/// exit 0 is never taken as clean on its own. The stash is done
+/// by hand, not with `--autostash`: autostash restores without
+/// `--index`, so staged changes come back unstaged and the staged
+/// intent is lost; the pop below uses `--index`, which restores
+/// staged changes as staged.
+fn rebase_onto(wc: &WorkingCopy, new_root: &str) -> Result<RebaseOutcome, GeectlError> {
     let old_root = wc.base_commit()?;
+    let stashes_before = autostash_entries(wc)?.len();
+    let unstaged = git(
+        &wc.root,
+        "diff",
+        &[
+            "--name-only",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            "-z",
+        ],
+        &[],
+    )?;
+    let staged = git(
+        &wc.root,
+        "diff",
+        &[
+            "--cached",
+            "--name-only",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            "-z",
+            "HEAD",
+        ],
+        &[],
+    )?;
+    let stashed = !split_nul(&unstaged).is_empty() || !split_nul(&staged).is_empty();
+    if stashed {
+        git(&wc.root, "stash", &["push", "-m", "geectl autostash"], &[])?;
+    }
     let (success, _, stderr) = git_status(
         &wc.root,
         "rebase",
-        &["--autostash", "--onto", new_root, &old_root],
+        &["--no-verify", "--onto", new_root, &old_root],
         &[],
     )?;
-    if success {
-        return Ok(None);
+    if !success {
+        let conflicts = unmerged_files(wc)?;
+        if conflicts.is_empty() {
+            // The rebase failed without leaving conflicts — an
+            // untracked file in the way of the new base, for
+            // example. The stash still holds the pre-rebase
+            // worktree changes: restore them (best effort) so the
+            // failure does not strand them silently, and name the
+            // stash in the error when the restore does not take.
+            if stashed {
+                if let Some(entry) = autostash_entries(wc)?.into_iter().next() {
+                    let _ = git_status(&wc.root, "stash", &["pop", "--index", &entry], &[]);
+                }
+            }
+            let mut err = git_error("rebase", stderr.as_bytes());
+            if autostash_entries(wc)?.len() > stashes_before {
+                err.context.push_str(
+                    "; the stashed worktree changes could not be restored (they stay in the stash)",
+                );
+            }
+            return Err(err);
+        }
+        return Ok(RebaseOutcome {
+            conflicts: Some(conflicts),
+            stash_remaining: autostash_entries(wc)?.len() > stashes_before,
+        });
+    }
+    // The rebase finished: restore the stashed worktree changes
+    // with `--index`, so staged changes stay staged.
+    if stashed {
+        if let Some(entry) = autostash_entries(wc)?.into_iter().next() {
+            // A failed pop leaves the entry in the stash and the
+            // conflicting files unmerged: both are reported below,
+            // not swallowed.
+            let _ = git_status(&wc.root, "stash", &["pop", "--index", &entry], &[]);
+        }
     }
     let conflicts = unmerged_files(wc)?;
-    if conflicts.is_empty() {
-        return Err(GeectlError::new(
-            ErrorKind::InternalError,
-            format!("git rebase failed: {}", bounded(&stderr).trim()),
-        ));
-    }
-    Ok(Some(conflicts))
+    let stash_remaining = autostash_entries(wc)?.len() > stashes_before;
+    Ok(RebaseOutcome {
+        conflicts: if conflicts.is_empty() {
+            None
+        } else {
+            Some(conflicts)
+        },
+        stash_remaining,
+    })
 }
 
 /// Update the working copy to the latest base (or to `rev`): the
@@ -2063,28 +2933,36 @@ fn note_listing_changes(
     dry_run: &DryRun,
     retain: &[&str],
 ) -> Result<(), GeectlError> {
-    let base_files = base_file_list(wc)?;
+    let base = wc.base_commit()?;
+    // The base tree's entries, resolved once: the SHAs feed the
+    // md5 comparison, the names feed the delete check below.
+    let base_blobs: std::collections::HashMap<String, String> =
+        ls_tree_entries(wc, &base)?.into_iter().collect();
     let base_names: std::collections::HashSet<&str> =
-        base_files.iter().map(String::as_str).collect();
+        base_blobs.keys().map(String::as_str).collect();
     let listing_names: std::collections::HashSet<&str> = listing
         .entries
         .iter()
         .map(|entry| entry.name.as_str())
         .collect();
+    // The base blob md5s stream through one `cat-file --batch`:
+    // one spawn for the whole listing, not one `git show` (and
+    // one base-commit re-resolution) per file.
+    let mut batch = BlobBatch::new(&wc.root)?;
     for entry in &listing.entries {
-        match base_content(wc, &entry.name) {
-            Ok(content) => {
+        match base_blobs.get(&entry.name) {
+            Some(sha) => {
                 // The listing carries no md5 for this file: its
                 // content cannot be compared without a download,
                 // so no line is recorded.
                 if let Some(server_md5) = &entry.md5 {
-                    let md5 = format!("{:x}", md5::compute(&content));
+                    let md5 = batch.md5(sha)?;
                     if *server_md5 != md5 {
                         dry_run.note(&format!("would change {}", entry.name));
                     }
                 }
             }
-            Err(_) => {
+            None => {
                 dry_run.note(&format!("would add {}", entry.name));
             }
         }
@@ -2298,9 +3176,24 @@ fn update_obs(
             old_base_srcmd5: wc.base_srcmd5.clone(),
             new_base_srcmd5: srcmd5,
             conflicts: Vec::new(),
+            stash_remaining: false,
         });
     }
-    let tree = build_base_tree(client, wc, &listing, spec.as_ref(), None, false)?;
+    // The new base tree is built at the listing's revision, not
+    // at the requested (or latest) spec: a revision landing
+    // between the listing and the download would otherwise be
+    // recorded under the older rev.
+    let pinned_rev = rev_number.parse::<u64>().map_err(|_| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "the server returned a non-numeric revision for {}/{}",
+                wc.project, wc.package
+            ),
+        )
+    })?;
+    let pinned = RevisionSpec::Rev(pinned_rev);
+    let tree = build_base_tree(client, wc, &listing, Some(&pinned), None, false)?;
     let new_root = git(
         &wc.root,
         "commit-tree",
@@ -2309,8 +3202,8 @@ fn update_obs(
     )?
     .trim()
     .to_string();
-    let conflicts = rebase_onto(wc, &new_root)?;
-    match conflicts {
+    let outcome = rebase_onto(wc, &new_root)?;
+    match outcome.conflicts {
         None => {
             git_config_set(&wc.root, "base-rev", &rev_number)?;
             git_config_set(&wc.root, "base-srcmd5", &srcmd5)?;
@@ -2321,6 +3214,7 @@ fn update_obs(
                 old_base_srcmd5: wc.base_srcmd5.clone(),
                 new_base_srcmd5: srcmd5.clone(),
                 conflicts: Vec::new(),
+                stash_remaining: outcome.stash_remaining,
             };
             wc.base_rev = rev_number;
             wc.base_srcmd5 = srcmd5;
@@ -2333,6 +3227,7 @@ fn update_obs(
             old_base_srcmd5: wc.base_srcmd5.clone(),
             new_base_srcmd5: srcmd5,
             conflicts,
+            stash_remaining: outcome.stash_remaining,
         }),
     }
 }
@@ -2358,7 +3253,7 @@ fn update_git(
         Some(auth) => token_env(auth, &mut header, &mut key).to_vec(),
         None => Vec::new(),
     };
-    git(&wc.root, "fetch", &["origin"], &env)?;
+    git_network(&wc.root, "fetch", &["origin"], &env)?;
     let target = match git(&wc.root, "rev-parse", &["@{u}"], &[]) {
         Ok(sha) => sha.trim().to_string(),
         Err(_) => {
@@ -2376,37 +3271,35 @@ fn update_git(
             old_base_srcmd5: wc.base_srcmd5.clone(),
             new_base_srcmd5: wc.base_srcmd5.clone(),
             conflicts: Vec::new(),
+            stash_remaining: false,
         });
     }
-    let (success, _, stderr) = git_status(&wc.root, "rebase", &["--autostash", &target], &[])?;
-    if success {
-        git_config_set(&wc.root, "base-rev", &target)?;
-        let report = UpdateReport {
-            updated: true,
+    let outcome = rebase_onto(wc, &target)?;
+    match outcome.conflicts {
+        None => {
+            git_config_set(&wc.root, "base-rev", &target)?;
+            let report = UpdateReport {
+                updated: true,
+                old_base_rev: wc.base_rev.clone(),
+                new_base_rev: target.clone(),
+                old_base_srcmd5: wc.base_srcmd5.clone(),
+                new_base_srcmd5: wc.base_srcmd5.clone(),
+                conflicts: Vec::new(),
+                stash_remaining: outcome.stash_remaining,
+            };
+            wc.base_rev = target;
+            Ok(report)
+        }
+        Some(conflicts) => Ok(UpdateReport {
+            updated: false,
             old_base_rev: wc.base_rev.clone(),
-            new_base_rev: target.clone(),
+            new_base_rev: target,
             old_base_srcmd5: wc.base_srcmd5.clone(),
             new_base_srcmd5: wc.base_srcmd5.clone(),
-            conflicts: Vec::new(),
-        };
-        wc.base_rev = target;
-        return Ok(report);
+            conflicts,
+            stash_remaining: outcome.stash_remaining,
+        }),
     }
-    let conflicts = unmerged_files(wc)?;
-    if conflicts.is_empty() {
-        return Err(GeectlError::new(
-            ErrorKind::InternalError,
-            format!("git rebase failed: {}", bounded(&stderr).trim()),
-        ));
-    }
-    Ok(UpdateReport {
-        updated: false,
-        old_base_rev: wc.base_rev.clone(),
-        new_base_rev: target,
-        old_base_srcmd5: wc.base_srcmd5.clone(),
-        new_base_srcmd5: wc.base_srcmd5.clone(),
-        conflicts,
-    })
 }
 
 /// The link a linked package points at: the target project and
@@ -2415,6 +3308,29 @@ fn read_link(wc: &WorkingCopy) -> Result<(String, String, String), GeectlError> 
     let link_content = index_content(wc, "_link")?;
     let link_text = String::from_utf8_lossy(&link_content);
     let doc = XmlDoc::parse(&link_text)?;
+    let (link_project, link_package) = link_target(&doc)?;
+    let old_baserev = doc.root_attr("baserev").ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "the link has no baserev: pull needs a pinned link revision",
+        )
+    })?;
+    Ok((link_project, link_package, old_baserev))
+}
+
+/// The link target: the project and package a `_link` points at.
+/// No baserev is required: a plain link (committed with
+/// `keeplink`) has none, and the commit-time check only needs
+/// the target.
+fn read_link_target(wc: &WorkingCopy) -> Result<(String, String), GeectlError> {
+    let link_content = index_content(wc, "_link")?;
+    let link_text = String::from_utf8_lossy(&link_content);
+    let doc = XmlDoc::parse(&link_text)?;
+    link_target(&doc)
+}
+
+/// The project and package a parsed `_link` document points at.
+fn link_target(doc: &XmlDoc) -> Result<(String, String), GeectlError> {
     let link_project = doc.root_attr("project").ok_or_else(|| {
         GeectlError::new(
             ErrorKind::InvalidInput,
@@ -2427,13 +3343,7 @@ fn read_link(wc: &WorkingCopy) -> Result<(String, String, String), GeectlError> 
             "the _link file has no package attribute",
         )
     })?;
-    let old_baserev = doc.root_attr("baserev").ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::InvalidInput,
-            "the link has no baserev: pull needs a pinned link revision",
-        )
-    })?;
-    Ok((link_project, link_package, old_baserev))
+    Ok((link_project, link_package))
 }
 
 /// The dry-run plan for a pull: the link baserev it would move to,
@@ -2510,8 +3420,15 @@ pub fn pull(
     }
     let (link_project, link_package, old_baserev) = read_link(wc)?;
     refuse_on_rebase(wc)?;
+    // The clean-tree check must not honour user excludes:
+    // `status --porcelain` hides untracked files the user's
+    // excludes match, so the untracked half is read with plain
+    // `ls-files --others` (no `--exclude-standard`). An ignored
+    // file blocks the pull like any other untracked file: the
+    // contract is a clean tree.
     let status_out = git(&wc.root, "status", &["--porcelain=v1", "-z"], &[])?;
-    if !split_nul(&status_out).is_empty() {
+    let untracked_out = git(&wc.root, "ls-files", &["--others", "-z"], &[])?;
+    if !split_nul(&status_out).is_empty() || !split_nul(&untracked_out).is_empty() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             "the working copy has uncommitted changes: commit or stash them before pull",
@@ -2563,10 +3480,25 @@ pub fn pull(
             old_base_rev: wc.base_rev.clone(),
             new_base_rev: own_rev,
             conflicts: Vec::new(),
+            stash_remaining: false,
         }));
     }
-    let (listing, _) = client.directory_listing_expanded(&wc.project, &wc.package)?;
-    let tree = build_base_tree(client, wc, &listing, None, Some(&new_baserev), true)?;
+    let (listing, (expanded_rev, _, _)) =
+        client.directory_listing_expanded(&wc.project, &wc.package)?;
+    // The expanded downloads are pinned to the expanded
+    // listing's revision, like the update path pins to its
+    // listing's revision.
+    let pinned = expanded_rev
+        .and_then(|rev| rev.parse::<u64>().ok())
+        .map(RevisionSpec::Rev);
+    let tree = build_base_tree(
+        client,
+        wc,
+        &listing,
+        pinned.as_ref(),
+        Some(&new_baserev),
+        true,
+    )?;
     let new_root = git(
         &wc.root,
         "commit-tree",
@@ -2575,8 +3507,8 @@ pub fn pull(
     )?
     .trim()
     .to_string();
-    let conflicts = rebase_onto(wc, &new_root)?;
-    match conflicts {
+    let outcome = rebase_onto(wc, &new_root)?;
+    match outcome.conflicts {
         None => {
             git_config_set(&wc.root, "base-rev", &own_rev)?;
             git_config_set(&wc.root, "base-srcmd5", &own_srcmd5)?;
@@ -2587,6 +3519,7 @@ pub fn pull(
                 old_base_rev: wc.base_rev.clone(),
                 new_base_rev: own_rev.clone(),
                 conflicts: Vec::new(),
+                stash_remaining: outcome.stash_remaining,
             };
             wc.base_rev = own_rev;
             wc.base_srcmd5 = own_srcmd5;
@@ -2599,6 +3532,7 @@ pub fn pull(
             old_base_rev: wc.base_rev.clone(),
             new_base_rev: own_rev,
             conflicts,
+            stash_remaining: outcome.stash_remaining,
         })),
     }
 }
@@ -2633,6 +3567,99 @@ fn rebase_target(wc: &WorkingCopy) -> Result<Option<String>, GeectlError> {
     Ok(None)
 }
 
+/// Whether the worktree file `path` still contains conflict
+/// markers: a line starting with `<<<<<<<` or `>>>>>>>`, or a
+/// line that is exactly `=======`. Read as bytes, streamed: the
+/// file may be large, and may not be UTF-8. A missing file holds
+/// no markers (a deletion in a conflict is a resolution).
+fn file_has_conflict_markers(root: &Path, path: &str) -> Result<bool, GeectlError> {
+    let full = root.join(path);
+    let Ok(file) = std::fs::File::open(&full) else {
+        return Ok(false);
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("failed to read {}: {e}", full.display()),
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        let mut line = line.as_slice();
+        if line.ends_with(b"\n") {
+            line = &line[..line.len() - 1];
+        }
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        if line.starts_with(b"<<<<<<<") || line.starts_with(b">>>>>>>") || line == b"=======" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Refuse to stage files that still contain conflict markers:
+/// the markers would end up in base history and be sent on the
+/// next commit. The agent edits the file to remove them, then
+/// runs `resolve` again.
+fn refuse_on_conflict_markers(wc: &WorkingCopy, files: &[String]) -> Result<(), GeectlError> {
+    let mut marked = Vec::new();
+    for file in files {
+        if file_has_conflict_markers(&wc.root, file)? {
+            marked.push(file.clone());
+        }
+    }
+    if marked.is_empty() {
+        return Ok(());
+    }
+    Err(GeectlError::new(
+        ErrorKind::FileConflict,
+        format!(
+            "these files still contain conflict markers (<<<<<<< / ======= / >>>>>>>): {}; edit them to remove the markers, then run resolve again",
+            marked.join(", ")
+        ),
+    ))
+}
+
+/// Restore a `geectl autostash` entry left by an update whose
+/// rebase stopped: the entry holds the pre-update worktree
+/// changes. Popped with `--index`, so staged changes stay
+/// staged. A pop that conflicts leaves the entry in the stash:
+/// that is an error naming the stash, not a silent loss.
+fn restore_autostash(wc: &WorkingCopy) -> Result<(), GeectlError> {
+    let Some(entry) = autostash_entries(wc)?.into_iter().next() else {
+        return Ok(());
+    };
+    let (pop_ok, _, pop_stderr) = git_status(&wc.root, "stash", &["pop", "--index", &entry], &[])?;
+    if pop_ok {
+        return Ok(());
+    }
+    let still = unmerged_files(wc)?;
+    if still.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InternalError,
+            format!(
+                "the stashed worktree changes could not be restored (they stay in the stash as {entry}): {}",
+                bounded(&pop_stderr).trim()
+            ),
+        ));
+    }
+    Err(GeectlError::new(
+        ErrorKind::FileConflict,
+        format!(
+            "the stashed worktree changes could not be restored (they stay in the stash as {entry}): {}; unresolved conflicts remain in: {}",
+            bounded(&pop_stderr).trim(),
+            still.join(", ")
+        ),
+    ))
+}
+
 /// The dry-run plan for a resolve: the files it would stage, and
 /// whether it would continue the rebase.
 fn record_resolve_plan(wc: &WorkingCopy, dry_run: &DryRun) -> Result<(), GeectlError> {
@@ -2642,6 +3669,9 @@ fn record_resolve_plan(wc: &WorkingCopy, dry_run: &DryRun) -> Result<(), GeectlE
         dry_run.note("nothing to resolve: no conflicts and no rebase in progress");
         return Ok(());
     }
+    // The plan refuses what live would refuse: markers still in
+    // the tree are not stageable.
+    refuse_on_conflict_markers(wc, &before)?;
     for file in &before {
         dry_run.note(&format!("would stage {file}"));
     }
@@ -2668,15 +3698,24 @@ pub fn resolve(wc: &mut WorkingCopy, dry_run: &DryRun) -> Result<Option<Vec<Stri
     let before = unmerged_files(wc)?;
     let in_progress = rebase_in_progress(wc)?;
     if before.is_empty() && !in_progress {
+        // No conflicts and no rebase — but an autostash entry
+        // from an earlier stopped update may still be waiting:
+        // restore it now, instead of leaving it stranded.
+        restore_autostash(wc)?;
         return Ok(Some(Vec::new()));
     }
     if !before.is_empty() {
+        // A file that still holds conflict markers is not a
+        // resolution: staging it would send the markers.
+        refuse_on_conflict_markers(wc, &before)?;
         // Stage only the files that were conflicted: unrelated
         // unstaged edits stay unstaged, and the next commit sends the
         // index state only.
-        let mut args = vec!["add", "--"];
+        let mut args = vec!["--"];
         args.extend(before.iter().map(String::as_str));
-        git(&wc.root, "add", &args[1..], &[])?;
+        // Literal pathspecs: a resolved path is a path, never a
+        // glob.
+        git_literal(&wc.root, "add", &args, &[])?;
         let remaining = unmerged_files(wc)?;
         if !remaining.is_empty() {
             return Err(GeectlError::new(
@@ -2701,7 +3740,18 @@ pub fn resolve(wc: &mut WorkingCopy, dry_run: &DryRun) -> Result<Option<Vec<Stri
         // unrelated to the conflict. Stash the unstaged changes
         // — keeping the staged resolutions in the index —
         // continue, then restore them.
-        let unstaged = git(&wc.root, "diff", &["--name-only", "-z"], &[])?;
+        let unstaged = git(
+            &wc.root,
+            "diff",
+            &[
+                "--name-only",
+                "--no-ext-diff",
+                "--no-color",
+                "--no-textconv",
+                "-z",
+            ],
+            &[],
+        )?;
         let stashed = !split_nul(&unstaged).is_empty();
         if stashed {
             git(
@@ -2711,7 +3761,11 @@ pub fn resolve(wc: &mut WorkingCopy, dry_run: &DryRun) -> Result<Option<Vec<Stri
                 &[],
             )?;
         }
-        let (success, _, stderr) = git_status(&wc.root, "rebase", &["--continue"], &[])?;
+        let (success, _, stderr) =
+            // `git rebase --continue` rejects `--no-verify`
+            // alongside the action flag; the fixed `-c
+            // core.hooksPath=/dev/null` already keeps hooks out.
+            git_status(&wc.root, "rebase", &["--continue"], &[])?;
         if !success {
             // Restore the agent's worktree state before reporting
             // the failure. A pop that fails strands the edits in
@@ -2744,10 +3798,12 @@ pub fn resolve(wc: &mut WorkingCopy, dry_run: &DryRun) -> Result<Option<Vec<Stri
                 ));
             }
             if still.is_empty() {
-                return Err(GeectlError::new(
-                    ErrorKind::InternalError,
-                    format!("git rebase --continue failed: {}", bounded(&stderr).trim()),
-                ));
+                // The continue failed but no file is unmerged:
+                // the failure is git's, classified like every
+                // other git failure — the same state as the
+                // conflicts-remain case below is never reported
+                // under two kinds.
+                return Err(git_error("rebase --continue", stderr.as_bytes()));
             }
             return Err(GeectlError::new(
                 ErrorKind::FileConflict,
@@ -2793,6 +3849,10 @@ pub fn resolve(wc: &mut WorkingCopy, dry_run: &DryRun) -> Result<Option<Vec<Stri
             }
         }
     }
+    // An update whose rebase stopped left the pre-update worktree
+    // changes in the `geectl autostash` entry: restore them now
+    // that the rebase is done (or was never in progress).
+    restore_autostash(wc)?;
     Ok(Some(before))
 }
 
@@ -2886,7 +3946,7 @@ mod tests {
     fn listing_rev1() -> String {
         format!(
             "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
-            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+            <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
             <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
             </directory>"
         )
@@ -2895,7 +3955,7 @@ mod tests {
     fn listing_rev2() -> String {
         format!(
             "<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\">\
-            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047303\" name=\"foo.spec\" size=\"12\" />\
+            <entry md5=\"d3fed47ff119d916236560718c57971c\" mtime=\"1282047303\" name=\"foo.spec\" size=\"13\" />\
             <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
             </directory>"
         )
@@ -2912,11 +3972,11 @@ mod tests {
                 &listing_rev1(),
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
                 b"Name: foo\n",
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=1",
                 b"",
             )
     }
@@ -2945,12 +4005,15 @@ mod tests {
     /// the remote change touch lines far enough apart (1 and 5)
     /// that the rebase merges them instead of conflicting.
     fn gtxt6_http() -> FakeHttp {
-        let listing = |rev: &str, srcmd5: &str| {
+        // The listing carries the real md5s: the rev-1 `g.txt`
+        // is "one\ntwo\nthree\nfour\nfive\nsix\n", the rev-2
+        // one is "uno\ntwo\nthree\nfour\nfive\nsix\n".
+        let listing = |rev: &str, srcmd5: &str, gtxt_md5: &str| {
             format!(
                 "<directory name=\"foo\" rev=\"{rev}\" srcmd5=\"{srcmd5}\" vrev=\"{rev}\">\
-                <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+                <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
                 <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
-                <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"g.txt\" size=\"28\" />\
+                <entry md5=\"{gtxt_md5}\" mtime=\"1282047302\" name=\"g.txt\" size=\"28\" />\
                 </directory>"
             )
         };
@@ -2961,23 +4024,23 @@ mod tests {
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
-                &listing("1", SRCMD5_1),
+                &listing("1", SRCMD5_1, "b256e7fa23f105539085c7c895557c41"),
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
                 b"Name: foo\n",
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=1",
                 b"",
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/g.txt",
+                "https://api.opensuse.org/public/source/home:alice/foo/g.txt?rev=1",
                 b"one\ntwo\nthree\nfour\nfive\nsix\n",
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo?rev=2",
-                &listing("2", SRCMD5_2),
+                &listing("2", SRCMD5_2, "779daf71cbd68fa63f678839b4f16b5e"),
             )
             .with_get_to_file(
                 "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=2",
@@ -2994,12 +4057,15 @@ mod tests {
     }
 
     fn gtxt_http() -> FakeHttp {
-        let listing = |rev: &str, srcmd5: &str| {
+        // The listing carries the real md5s: the rev-1 `g.txt`
+        // is "one\ntwo\nthree\n", the rev-2 one is
+        // "uno\ntwo\nthree\n".
+        let listing = |rev: &str, srcmd5: &str, gtxt_md5: &str| {
             format!(
                 "<directory name=\"foo\" rev=\"{rev}\" srcmd5=\"{srcmd5}\" vrev=\"{rev}\">\
-                <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+                <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
                 <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
-                <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"g.txt\" size=\"14\" />\
+                <entry md5=\"{gtxt_md5}\" mtime=\"1282047302\" name=\"g.txt\" size=\"14\" />\
                 </directory>"
             )
         };
@@ -3010,23 +4076,23 @@ mod tests {
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo",
-                &listing("1", SRCMD5_1),
+                &listing("1", SRCMD5_1, "deed54b823522e0525693b090363f9df"),
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
                 b"Name: foo\n",
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=1",
                 b"",
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/g.txt",
+                "https://api.opensuse.org/public/source/home:alice/foo/g.txt?rev=1",
                 b"one\ntwo\nthree\n",
             )
             .with_get(
                 "https://api.opensuse.org/public/source/home:alice/foo?rev=2",
-                &listing("2", SRCMD5_2),
+                &listing("2", SRCMD5_2, "61ff98d33c7c7c175d294d25cb949b7b"),
             )
             .with_get_to_file(
                 "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=2",
@@ -3725,7 +4791,7 @@ mod tests {
         let final_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv";
         let listing_failed = format!(
             "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
-            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+            <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
             <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
             <serviceinfo code=\"failed\" xsrcmd5=\"aaa\" lsrcmd5=\"bbb\"><error>service run failed: download_url: 404 Not Found</error></serviceinfo></directory>"
         );
@@ -3739,11 +4805,11 @@ mod tests {
                 &listing_failed,
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
                 b"Name: foo\n",
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=1",
                 b"",
             )
             .with_post(validate_url, "<directory name=\"foo\" />")
@@ -3814,11 +4880,11 @@ mod tests {
                 &[&listing, &listing, &listing],
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
                 b"Name: foo\n",
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=1",
                 b"",
             )
             .with_post(validate_url, "<directory name=\"foo\" />")
@@ -3876,11 +4942,11 @@ mod tests {
                 &[&listing_rev1(), &listing_rev2()],
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
                 b"Name: foo\n",
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=1",
                 b"",
             );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
@@ -4725,7 +5791,7 @@ mod tests {
                 &listing_rev1(),
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec",
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
                 b"Name: foo\n",
             );
         // foo.tar.gz has no download mapping: the checkout fails
@@ -4746,12 +5812,223 @@ mod tests {
         assert!(!dir.path.join("home:alice").join("foo").exists());
     }
 
+    /// A `git http-backend` server rooted at `root`, serving smart
+    /// HTTP on 127.0.0.1. The git-backed checkout tests clone,
+    /// fetch, and push through it: `checkout_git` only accepts
+    /// http(s) scmsync URLs, so the test origins must be served
+    /// over HTTP — a local path would be refused, and a dumb
+    /// static server cannot serve pushes. Each request spawns
+    /// `git http-backend` with the CGI environment (all request
+    /// headers as `HTTP_*`, so `Git-Protocol: version=2` reaches
+    /// it), and the response is written back with
+    /// `Connection: close`.
+    struct HttpBackendServer {
+        port: u16,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl HttpBackendServer {
+        fn new(root: PathBuf) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = shutdown.clone();
+            // `git --exec-path` locates `git-http-backend` for
+            // this git installation.
+            let exec_path = std::process::Command::new("git")
+                .arg("--exec-path")
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .unwrap_or_default();
+            let backend = PathBuf::from(exec_path).join("git-http-backend");
+            std::thread::spawn(move || {
+                // A blocking accept: the wake-up connect in
+                // `Drop` unblocks it for shutdown. An accept
+                // error is never fatal — under a full test load
+                // the process can briefly hit its file-descriptor
+                // limit (`EMFILE`), and dropping the listener
+                // over it would reset every later git connection;
+                // the error is retried until fds free up or the
+                // server is shut down.
+                while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let root = root.clone();
+                            let backend = backend.clone();
+                            std::thread::spawn(move || {
+                                serve_http_backend(stream, &root, &backend);
+                            });
+                        }
+                        Err(_) => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                }
+            });
+            HttpBackendServer { port, shutdown }
+        }
+    }
+
+    impl Drop for HttpBackendServer {
+        fn drop(&mut self) {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Wake the accept loop so the thread exits.
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        }
+    }
+
+    fn serve_http_backend(stream: std::net::TcpStream, root: &Path, backend: &Path) {
+        use std::io::{Read, Write};
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+        // One handle for the whole connection: the reader is
+        // turned back into the stream for the response, so no
+        // second file descriptor (and no failing clone) per
+        // request.
+        let mut reader = std::io::BufReader::new(stream);
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while head.len() < 65536 {
+            match reader.read(&mut byte) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let head_text = String::from_utf8_lossy(&head).into_owned();
+        let mut lines = head_text.lines();
+        let Some(request_line) = lines.next() else {
+            return;
+        };
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("GET").to_string();
+        let target = parts.next().unwrap_or("/").to_string();
+        let (path, query) = match target.split_once('?') {
+            Some((path, query)) => (path.to_string(), query.to_string()),
+            None => (target.clone(), String::new()),
+        };
+        let mut content_length = 0usize;
+        let mut content_type = String::new();
+        let mut header_env: Vec<(String, String)> = Vec::new();
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            let value = value.trim().to_string();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("content-type") {
+                content_type = value.clone();
+            }
+            let env_name = format!("HTTP_{}", name.to_ascii_uppercase().replace('-', "_"));
+            header_env.push((env_name, value));
+        }
+        let mut body = vec![0u8; content_length];
+        // Reading zero bytes is a no-op, so no length guard is
+        // needed here.
+        if reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        // The request is fully read: the reader turns back
+        // into the stream for the response.
+        let mut stream = reader.into_inner();
+        let mut cmd = std::process::Command::new(backend);
+        cmd.env("GIT_PROJECT_ROOT", root);
+        cmd.env("GIT_HTTP_EXPORT_ALL", "1");
+        cmd.env("PATH_INFO", &path);
+        cmd.env("QUERY_STRING", &query);
+        cmd.env("REQUEST_METHOD", &method);
+        cmd.env("REMOTE_ADDR", "127.0.0.1");
+        if !content_type.is_empty() {
+            cmd.env("CONTENT_TYPE", &content_type);
+        }
+        cmd.env("CONTENT_LENGTH", content_length.to_string());
+        for (name, value) in header_env {
+            cmd.env(name, value);
+        }
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::null());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                return;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&body);
+        }
+        let output = child.wait_with_output();
+        let Ok(output) = output else {
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            return;
+        };
+        let stdout = output.stdout;
+        let (headers, body) = match find_subsequence(&stdout, b"\r\n\r\n") {
+            Some(pos) => (&stdout[..pos], &stdout[pos + 4..]),
+            None => match find_subsequence(&stdout, b"\n\n") {
+                Some(pos) => (&stdout[..pos], &stdout[pos + 2..]),
+                None => (&stdout[..], &stdout[stdout.len()..]),
+            },
+        };
+        let headers_text = String::from_utf8_lossy(headers).into_owned();
+        let mut status = "200 OK".to_string();
+        let mut header_lines = Vec::new();
+        for line in headers_text.lines() {
+            if let Some(value) = line.strip_prefix("Status:") {
+                status = value.trim().to_string();
+            } else if !line.trim().is_empty() {
+                header_lines.push(line.to_string());
+            }
+        }
+        let mut response = format!("HTTP/1.1 {status}\r\n");
+        for line in header_lines {
+            response.push_str(&line);
+            response.push_str("\r\n");
+        }
+        response.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        response.push_str("Connection: close\r\n\r\n");
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(body);
+    }
+
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
     /// A bare origin repository with a `main` branch holding one
-    /// commit, plus the work clone that made it. Returns the origin
-    /// path and the main head SHA.
-    fn git_origin(dir: &Path) -> (PathBuf, String) {
+    /// commit, plus the work clone that made it — served over
+    /// smart HTTP, the way a real scmsync URL serves it. Returns
+    /// the origin path, the HTTP clone URL, and the main head SHA;
+    /// the server lives as long as the returned value does.
+    struct GitOrigin {
+        path: PathBuf,
+        url: String,
+        head: String,
+        _server: HttpBackendServer,
+    }
+
+    /// The bare origin repository with a `main` branch holding one
+    /// commit, plus the work clone that made it, served over
+    /// smart HTTP.
+    fn git_origin(dir: &Path) -> GitOrigin {
         let origin = dir.join("origin");
         git(dir, "init", &["--bare", "-b", "main", "origin"], &[]).unwrap();
+        // `git http-backend` refuses pushes unless the repo
+        // enables receive-pack; a real scmsync host does the same.
+        git(&origin, "config", &["http.receivepack", "true"], &[]).unwrap();
         let work = dir.join("work");
         git(dir, "clone", &["--quiet", "origin", "work"], &[]).unwrap();
         git(&work, "config", &["--local", "user.name", "geectl"], &[]).unwrap();
@@ -4770,17 +6047,23 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-        (origin, head)
+        let server = HttpBackendServer::new(dir.to_path_buf());
+        let url = format!("http://127.0.0.1:{}/origin", server.port);
+        GitOrigin {
+            path: origin,
+            url,
+            head,
+            _server: server,
+        }
     }
 
     /// The `_meta` for a git-backed package whose scmsync URL is
-    /// the local origin path, on branch `main`.
-    fn git_checkout_http(origin: &Path) -> FakeHttp {
+    /// the origin's HTTP URL, on branch `main`.
+    fn git_checkout_http(origin_url: &str) -> FakeHttp {
         FakeHttp::new().with_get(
             "https://api.opensuse.org/public/source/home:alice/foo/_meta",
             &format!(
-                "<package name=\"foo\" project=\"home:alice\"><scmsync>{}#main</scmsync></package>",
-                origin.display()
+                "<package name=\"foo\" project=\"home:alice\"><scmsync>{origin_url}#main</scmsync></package>",
             ),
         )
     }
@@ -4971,7 +6254,8 @@ mod tests {
     #[test]
     fn checkout_git_clones_the_scmsync_branch() {
         let dir = TempDirGuard::new("git-checkout");
-        let (origin, main_head) = git_origin(&dir.path);
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
         // A second branch, `other`, becomes the origin's default:
         // the clone must still check out `main`, the fragment's
         // branch, not the default.
@@ -4981,8 +6265,14 @@ mod tests {
         git_ok(&work, &["add", "-A"]);
         git_ok(&work, &["commit", "--quiet", "-m", "other branch"]);
         git_ok(&work, &["push", "--quiet", "origin", "other"]);
-        git(&origin, "symbolic-ref", &["HEAD", "refs/heads/other"], &[]).unwrap();
-        let http = git_checkout_http(&origin);
+        git(
+            &origin.path,
+            "symbolic-ref",
+            &["HEAD", "refs/heads/other"],
+            &[],
+        )
+        .unwrap();
+        let http = git_checkout_http(&origin.url);
         let wc = do_git_checkout(&http, &dir);
         assert_eq!(wc.backend, Backend::Git);
         assert_eq!(wc.base_rev, main_head);
@@ -4994,14 +6284,15 @@ mod tests {
     #[test]
     fn checkout_git_clones_with_an_empty_fragment() {
         let dir = TempDirGuard::new("git-checkout-empty-frag");
-        let (origin, main_head) = git_origin(&dir.path);
+        let origin = git_origin(&dir.path);
+        let main_head = origin.head.clone();
         // An empty fragment names no branch: the clone takes the
         // origin's default, like a URL with no fragment at all.
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/public/source/home:alice/foo/_meta",
             &format!(
                 "<package name=\"foo\" project=\"home:alice\"><scmsync>{}#</scmsync></package>",
-                origin.display()
+                origin.url
             ),
         );
         let wc = do_git_checkout(&http, &dir);
@@ -5014,8 +6305,8 @@ mod tests {
     #[test]
     fn checkout_refuses_rev_for_a_git_backed_package() {
         let dir = TempDirGuard::new("git-checkout-rev");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let err = checkout(
             &client,
@@ -5034,8 +6325,8 @@ mod tests {
     #[test]
     fn commit_git_pushes_and_polls_the_sync() {
         let dir = TempDirGuard::new("git-commit");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         write_file(&wc.root, "foo.spec", "Name: local\n");
         add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
@@ -5069,7 +6360,7 @@ mod tests {
         assert_eq!(report.rev, None);
         assert_eq!(open(&wc.root).unwrap().base_rev, head);
         // The push landed in the origin.
-        let origin_head = git(&origin, "rev-parse", &["main"], &[])
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
             .unwrap()
             .trim()
             .to_string();
@@ -5107,8 +6398,8 @@ mod tests {
         let _author_date = RestoreVar::set("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z");
         let _committer_date = RestoreVar::set("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z");
         let dir = TempDirGuard::new("git-commit-synth");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         write_file(&wc.root, "foo.spec", "Name: staged\n");
         add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
@@ -5153,7 +6444,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.pushed_head, Some(expected.clone()));
         assert_eq!(open(&wc.root).unwrap().base_rev, expected);
-        let origin_head = git(&origin, "rev-parse", &["main"], &[])
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
             .unwrap()
             .trim()
             .to_string();
@@ -5163,8 +6454,8 @@ mod tests {
     #[test]
     fn commit_git_skips_the_outdated_check_without_an_upstream() {
         let dir = TempDirGuard::new("git-no-upstream");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         // The branch has no upstream: the fetch still works, but
         // `@{u}` does not resolve, so the outdated check is
@@ -5203,8 +6494,8 @@ mod tests {
     #[test]
     fn commit_git_refuses_when_the_remote_moved() {
         let dir = TempDirGuard::new("git-outdated");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         // The remote moves: a second clone pushes a new commit.
         let work = dir.path.join("work");
@@ -5236,8 +6527,8 @@ mod tests {
     #[test]
     fn update_git_rebases_onto_the_upstream_head() {
         let dir = TempDirGuard::new("git-update");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         // The remote moves: a second clone pushes a new commit.
         let work = dir.path.join("work");
@@ -5264,8 +6555,9 @@ mod tests {
     #[test]
     fn update_git_stops_on_a_conflict() {
         let dir = TempDirGuard::new("git-update-conflict");
-        let (origin, initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let initial = origin.head.clone();
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         // The remote moves on the same line the local commit
         // changed: the rebase stops with the conflict in the tree.
@@ -5293,8 +6585,8 @@ mod tests {
     #[test]
     fn resolve_adopts_the_new_base_on_a_git_backed_checkout() {
         let dir = TempDirGuard::new("git-resolve-base");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         // The remote moves on the same line the local commit
         // changed, and adds bar.txt on its own: the rebase stops
@@ -5339,8 +6631,8 @@ mod tests {
     #[test]
     fn update_git_keeps_the_reused_checkout_current() {
         let dir = TempDirGuard::new("git-update-struct");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         write_file(&wc.root, "foo.spec", "Name: local\n");
         add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
@@ -5380,8 +6672,8 @@ mod tests {
     #[test]
     fn update_git_refuses_rev() {
         let dir = TempDirGuard::new("git-update-rev");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let err = update(&mut wc, &client, Some("2"), None, &DryRun::new(false)).unwrap_err();
@@ -5514,7 +6806,7 @@ mod tests {
                 &foo_rev1,
             )
             .with_get_to_file(
-                "https://api.opensuse.org/public/source/home:alice/foo/_link",
+                "https://api.opensuse.org/public/source/home:alice/foo/_link?rev=1",
                 link_xml(LINK_OLD_BASEREV).as_bytes(),
             )
             .with_get(
@@ -5528,7 +6820,7 @@ mod tests {
                 &foo_expanded,
             )
             .with_get_to_file(
-                "https://api.opensuse.org/source/home:alice/foo/bar.spec?expand=1",
+                "https://api.opensuse.org/source/home:alice/foo/bar.spec?expand=1&rev=1",
                 b"Name: bar\n",
             )
             .with_post(
@@ -5636,8 +6928,8 @@ mod tests {
     #[test]
     fn pull_dry_run_refuses_a_git_backed_checkout() {
         let dir = TempDirGuard::new("pull-dry-git");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let err = pull(&mut wc, &client, &DryRun::new(true)).unwrap_err();
@@ -5848,8 +7140,8 @@ mod tests {
     #[test]
     fn commit_git_dry_run_refuses_when_behind_the_last_fetched_upstream() {
         let dir = TempDirGuard::new("git-commit-dry-outdated");
-        let (origin, _initial) = git_origin(&dir.path);
-        let http = git_checkout_http(&origin);
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
         let mut wc = do_git_checkout(&http, &dir);
         write_file(&wc.root, "foo.spec", "Name: local\n");
         add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
@@ -6014,6 +7306,702 @@ mod tests {
             "plan: {plan:?}"
         );
         assert_eq!(open(&wc.root).unwrap().base_rev, REV1);
+        let _ = dir;
+    }
+    #[test]
+    fn commit_rename_deletes_the_old_path_on_the_server() {
+        // A rename staged with `git mv` is two changes under
+        // `--no-renames` — the old path deleted, the new path
+        // added — so the posted file list carries the new path
+        // and drops the old one: the server deletes it instead
+        // of keeping a stale file.
+        let validate_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv&withvalidate=1";
+        let final_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv";
+        let http = checkout_http()
+            .with_post(
+                validate_url,
+                "<directory error=\"missing\" name=\"foo\"><entry md5=\"9444ad22a238286bca9bf649b2aef01d\" name=\"bar.spec\" /></directory>",
+            )
+            .with_post(
+                final_url,
+                &format!("<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\" />"),
+            )
+            .with_put_bytes(
+                "https://api.opensuse.org/source/home:alice/foo/bar.spec?rev=repository",
+                "<revision rev=\"repository\"><srcmd5>empty</srcmd5></revision>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = client
+            .package_requests_search_url("home:alice", "foo")
+            .unwrap();
+        let http = http.with_get(
+            &search_url,
+            "<collection matches=\"1\"><request id=\"42\" /></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        git_ok(&wc.root, &["mv", "foo.spec", "bar.spec"]);
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.rev, Some(2));
+        assert_eq!(
+            report.files,
+            vec!["bar.spec".to_string(), "foo.spec".to_string()]
+        );
+        // Both passes send the new path and the unchanged
+        // tarball, never the renamed-away path.
+        let full_list = "<directory><entry name=\"bar.spec\" md5=\"9444ad22a238286bca9bf649b2aef01d\" /><entry name=\"foo.tar.gz\" md5=\"d41d8cd98f00b204e9800998ecf8427e\" /></directory>";
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0].1.as_str(), full_list);
+        assert_eq!(posts[1].1.as_str(), full_list);
+        let _ = dir;
+    }
+
+    #[test]
+    fn update_reports_a_conflicting_autostash_and_resolve_restores_it() {
+        // A dirty file the server also changed: the update
+        // stashes it, rebases, and the stash pop conflicts — the
+        // report carries the conflict and the remaining stash,
+        // and the update is not reported as done.
+        let http = checkout_http()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo?rev=2",
+                &listing_rev2(),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=2",
+                b"Name: server\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=2",
+                b"",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        let report = update(&mut wc, &client, Some("2"), None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(!report.updated);
+        assert_eq!(report.conflicts, vec!["foo.spec".to_string()]);
+        assert!(report.stash_remaining);
+        // Resolve by keeping the dirty change: the autostash
+        // entry pops cleanly (its change is the resolution) and
+        // the stash is empty afterwards.
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        let resolved = resolve(&mut wc, &DryRun::new(false)).unwrap().unwrap();
+        assert_eq!(resolved, vec!["foo.spec".to_string()]);
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: local\n");
+        assert!(autostash_entries(&wc).unwrap().is_empty());
+        let _ = dir;
+    }
+
+    #[test]
+    fn addremove_stages_a_globally_excluded_file() {
+        // `git add -A` honours the excludes, so `addremove`
+        // forces the add: a new file matching the excludes is
+        // still picked up, not silently dropped.
+        let (dir, wc) = do_checkout(&checkout_http());
+        std::fs::write(
+            wc.root.join(".git").join("info").join("exclude"),
+            "*.patch\n",
+        )
+        .unwrap();
+        write_file(&wc.root, "fix.patch", "patch\n");
+        addremove(&wc, &DryRun::new(false)).unwrap().unwrap();
+        let tracked = git(&wc.root, "ls-files", &["-z"], &[]).unwrap();
+        assert!(split_nul(&tracked).contains(&"fix.patch".to_string()));
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_includes_a_globally_excluded_file_in_the_root_commit() {
+        // The root commit is built with `git add -f -A`: a
+        // downloaded file matching the user's global excludes
+        // (here `*.patch`) is committed, not dropped by the
+        // excludes.
+        let home = TempDirGuard::new("fake-home");
+        std::fs::write(home.path.join("excludes"), "*.patch\n").unwrap();
+        std::fs::write(
+            home.path.join(".gitconfig"),
+            format!(
+                "[user]\n\tname = geectl\n\temail = geectl@localhost\n[core]\n\texcludesFile = {}\n",
+                home.path.join("excludes").display()
+            ),
+        )
+        .unwrap();
+        let _home_var = RestoreVar::set("HOME", home.path.to_str().unwrap());
+        let listing = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
+            <entry md5=\"60291f7f68053968761025e399094dbe\" mtime=\"1282047302\" name=\"fix.patch\" size=\"6\" />\
+            </directory>"
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &listing,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=1",
+                b"Name: foo\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=1",
+                b"",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/fix.patch?rev=1",
+                b"patch\n",
+            );
+        let (dir, wc) = do_checkout(&http);
+        let tracked = git(&wc.root, "ls-files", &["-z"], &[]).unwrap();
+        assert!(
+            split_nul(&tracked).contains(&"fix.patch".to_string()),
+            "tracked: {tracked:?}"
+        );
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn resolve_refuses_files_still_holding_conflict_markers() {
+        // The conflicted file still holds its markers: resolve
+        // refuses to stage it instead of sending the markers on
+        // the next commit.
+        let http = checkout_http()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo?rev=2",
+                &listing_rev2(),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=2",
+                b"Name: server\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=2",
+                b"",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local spec"]);
+        let report = update(&mut wc, &client, Some("2"), None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.conflicts, vec!["foo.spec".to_string()]);
+        assert!(read_file(&wc.root, "foo.spec").contains("<<<<<<<"));
+        let err = resolve(&mut wc, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FileConflict);
+        let message = err.to_string();
+        assert!(message.contains("foo.spec"), "message: {message}");
+        assert!(message.contains("conflict markers"), "message: {message}");
+        assert!(rebase_in_progress(&wc).unwrap());
+        let _ = dir;
+    }
+
+    #[test]
+    fn open_rejects_a_subdirectory_of_a_checkout() {
+        let (dir, wc) = do_checkout(&checkout_http());
+        let sub = wc.root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let err = open(&sub).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(
+            message.contains("subdirectory of the checkout"),
+            "message: {message}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn rm_with_a_glob_like_name_removes_only_that_file() {
+        // A staged file whose name looks like a glob
+        // (`file[1].txt`) is a literal pathspec: removing it
+        // must not touch `file1.txt`.
+        let (dir, wc) = do_checkout(&checkout_http());
+        write_file(&wc.root, "file1.txt", "one\n");
+        write_file(&wc.root, "file[1].txt", "bracket\n");
+        add(
+            &wc,
+            &["file1.txt".to_string(), "file[1].txt".to_string()],
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        rm(&wc, &["file[1].txt".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(!wc.root.join("file[1].txt").exists());
+        assert!(wc.root.join("file1.txt").exists());
+        let _ = dir;
+    }
+
+    #[test]
+    fn update_reuses_unchanged_files_from_the_base() {
+        // The rev-2 listing keeps `foo.spec` and `foo.tar.gz`
+        // byte-identical and adds `new.txt`: only the new file
+        // is downloaded — the unchanged files come out of the
+        // base object store.
+        let listing_rev2 = format!(
+            "<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\">\
+            <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047303\" name=\"foo.spec\" size=\"10\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
+            <entry md5=\"9cd599a3523898e6a12e13ec787da50a\" mtime=\"1282047303\" name=\"new.txt\" size=\"4\" />\
+            </directory>"
+        );
+        let http = checkout_http()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo?rev=2",
+                &listing_rev2,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/new.txt?rev=2",
+                b"new\n",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        let report = update(&mut wc, &client, Some("2"), None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.updated);
+        let downloads = http.get_to_file_calls();
+        assert!(
+            !downloads
+                .iter()
+                .any(|(url, _)| url.contains("foo.spec?rev=2")),
+            "downloads: {downloads:?}"
+        );
+        assert!(
+            !downloads
+                .iter()
+                .any(|(url, _)| url.contains("foo.tar.gz?rev=2")),
+            "downloads: {downloads:?}"
+        );
+        assert!(
+            downloads.iter().any(|(url, _)| url
+                == "https://api.opensuse.org/public/source/home:alice/foo/new.txt?rev=2"),
+            "downloads: {downloads:?}"
+        );
+        assert_eq!(read_file(&wc.root, "new.txt"), "new\n");
+        let _ = dir;
+    }
+
+    #[test]
+    fn pull_refuses_an_ignored_untracked_file() {
+        // The untracked file is ignored by the repo's excludes,
+        // so `git status` hides it — the pull still refuses: the
+        // contract is a clean tree, not a clean status.
+        let http = pull_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dir = TempDirGuard::new("pull-dirty");
+        let mut wc = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            None,
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::write(
+            wc.root.join(".git").join("info").join("exclude"),
+            "ignored.txt\n",
+        )
+        .unwrap();
+        write_file(&wc.root, "ignored.txt", "junk\n");
+        let err = pull(&mut wc, &client, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(
+            message.contains("uncommitted changes"),
+            "message: {message}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_target_rejects_dot_segments() {
+        let dir = TempDirGuard::new("dot-target");
+        for segment in [".", ".."] {
+            let err = checkout_target(&dir.path, segment, "foo").unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+        let err = checkout_target(&dir.path, "home:alice", "..").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The live checkout validates before computing the
+        // target (and before any download): a `..` project
+        // never resolves to a directory outside `dir`.
+        let fake = FakeHttp::new();
+        let client = ObsClient::with_credentials(&fake, basic_credentials()).unwrap();
+        let err = checkout(
+            &client,
+            "..",
+            "foo",
+            None,
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(!dir.path.join("foo").exists());
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_refuses_an_empty_message() {
+        let (dir, mut wc) = do_checkout(&checkout_http());
+        let http = checkout_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        write_file(&wc.root, "foo.spec", "Name: bar\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        for message in ["", "   "] {
+            let err = commit(
+                &mut wc,
+                &client,
+                &Config::default(),
+                message,
+                false,
+                None,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("non-empty --message"));
+        }
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_refuses_a_link_to_a_different_project() {
+        // The `_link` points at home:bob/bar while the checkout
+        // is home:alice/foo: the commit refuses and names the
+        // `branch_package` the agent needs, live and in the
+        // dry-run plan alike.
+        let link = "<link project=\"home:bob\" package=\"bar\"/>";
+        let listing = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"b3b44f408df58466c24a78bccde615ec\" mtime=\"1282047302\" name=\"_link\" size=\"{}\" />\
+            </directory>",
+            link.len()
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &listing,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/_link?rev=1",
+                link.as_bytes(),
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        for dry in [false, true] {
+            let err = commit(
+                &mut wc,
+                &client,
+                &Config::default(),
+                "test",
+                false,
+                None,
+                &DryRun::new(dry),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "dry: {dry}");
+            let message = err.to_string();
+            assert!(
+                message.contains("branch_package home:bob/bar into home:alice/foo"),
+                "dry: {dry}, message: {message}"
+            );
+        }
+        let _ = dir;
+    }
+
+    #[test]
+    fn git_error_classifies_common_failures() {
+        assert_eq!(
+            classify_git_failure(
+                "fatal: not a git repository (or any of the parent directories): .git"
+            ),
+            ErrorKind::WorkingCopyNotFound
+        );
+        assert_eq!(
+            classify_git_failure("fatal: Authentication failed for 'https://example.com/'"),
+            ErrorKind::AuthFailed
+        );
+        assert_eq!(
+            classify_git_failure(
+                "ssh: Could not resolve hostname example.com: Name or service not known"
+            ),
+            ErrorKind::NetworkError
+        );
+        assert_eq!(
+            classify_git_failure("fatal: unable to connect to example.com: Connection refused"),
+            ErrorKind::NetworkError
+        );
+        assert_eq!(
+            classify_git_failure("! [rejected] main -> main (non-fast-forward)"),
+            ErrorKind::WorkingCopyOutdated
+        );
+        assert_eq!(
+            classify_git_failure(
+                "error: untracked working tree files would be overwritten by merge"
+            ),
+            ErrorKind::FileConflict
+        );
+        assert_eq!(
+            classify_git_failure("fatal: some unknown failure"),
+            ErrorKind::InternalError
+        );
+    }
+
+    #[test]
+    fn git_calls_ignore_a_bogus_git_dir_in_the_environment() {
+        // A bogus `GIT_DIR` in the environment is scrubbed
+        // before any git spawn: the calls still find this
+        // repository instead of failing on the bogus path.
+        let (dir, wc) = do_checkout(&checkout_http());
+        {
+            let _guard = RestoreVar::set("GIT_DIR", "/nonexistent/geectl-test");
+            let head = git(&wc.root, "rev-parse", &["HEAD"], &[]).unwrap();
+            assert!(!head.trim().is_empty());
+            assert!(status(&wc).unwrap().is_empty());
+        }
+        let _ = dir;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn commit_git_ignores_a_failing_pre_commit_hook() {
+        // A failing pre-commit hook in the checkout's own hooks
+        // directory: the synthesized commit skips it
+        // (`--no-verify` plus the forced
+        // `core.hooksPath=/dev/null`), so the commit still lands
+        // and pushes.
+        let _author_date = RestoreVar::set("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z");
+        let _committer_date = RestoreVar::set("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z");
+        let dir = TempDirGuard::new("git-hook");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: staged\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let hooks = wc.root.join(".git").join("hooks");
+        std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\nexit 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                hooks.join("pre-commit"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let tree = git(&wc.root, "write-tree", &[], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let expected = git(
+            &wc.root,
+            "commit-tree",
+            &[&tree, "-p", &head, "-m", "test"],
+            &[],
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {expected}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.pushed_head, Some(expected));
+        let _ = origin;
+        let _ = dir;
+    }
+
+    #[test]
+    fn update_clears_a_stale_temp_directory() {
+        // A leftover temp directory (and index) from a killed
+        // run blocks `create_dir_all`: the next update removes
+        // both before building the new base tree.
+        let http = checkout_http()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo?rev=2",
+                &listing_rev2(),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=2",
+                b"Name: server\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=2",
+                b"",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        let git_dir = wc.root.join(".git");
+        let stale = git_dir.join("geectl-tmp");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("foo.spec"), "stale\n").unwrap();
+        std::fs::write(git_dir.join("geectl-tmp-index"), "stale\n").unwrap();
+        let report = update(&mut wc, &client, Some("2"), None, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.updated);
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: server\n");
+        let _ = dir;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tracked_symlink_is_not_followed_by_the_service_gate() {
+        // A tracked symlink to `/dev/zero`: the gate snapshot
+        // records no hash for it (it hashes file content, never
+        // a link target) instead of reading through the link.
+        let (dir, wc) = do_checkout(&checkout_http());
+        std::os::unix::fs::symlink("/dev/zero", wc.root.join("zero-link")).unwrap();
+        add(&wc, &["zero-link".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let snapshot = snapshot_gate_inputs(&wc).unwrap();
+        let entry = snapshot
+            .hashes
+            .iter()
+            .find(|(name, _)| name == "zero-link")
+            .unwrap();
+        assert_eq!(entry.1, None);
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_git_refuses_non_http_scmsync_urls() {
+        for url in [
+            "file:///tmp/origin#main",
+            "ssh://git@example.com/foo.git#main",
+            "git://example.com/foo.git#main",
+            "/tmp/origin#main",
+        ] {
+            let dir = TempDirGuard::new("git-bad-scheme");
+            let http = FakeHttp::new().with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                &format!(
+                    "<package name=\"foo\" project=\"home:alice\"><scmsync>{url}</scmsync></package>",
+                ),
+            );
+            let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+            let err = checkout(
+                &client,
+                "home:alice",
+                "foo",
+                None,
+                &dir.path,
+                None,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "url: {url}");
+            let message = err.to_string();
+            assert!(
+                message.contains("not http(s)"),
+                "url: {url}, message: {message}"
+            );
+            let _ = dir;
+        }
+    }
+    #[test]
+    fn update_restores_the_autostash_when_the_rebase_fails_without_conflicts() {
+        // The new base adds `new.txt`, which already exists
+        // untracked in the checkout, and the worktree holds a dirty
+        // change: the rebase fails on the untracked file with no
+        // conflicts left behind. The failed update restores the
+        // dirty change instead of stranding it in the stash.
+        let listing_rev2 = format!(
+            "<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\">\
+            <entry md5=\"d3fed47ff119d916236560718c57971c\" mtime=\"1282047303\" name=\"foo.spec\" size=\"13\" />\
+            <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
+            <entry md5=\"9cd599a3523898e6a12e13ec787da50a\" mtime=\"1282047303\" name=\"new.txt\" size=\"4\" />\
+            </directory>"
+        );
+        let http = checkout_http()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo?rev=2",
+                &listing_rev2,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.spec?rev=2",
+                b"Name: server\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/foo.tar.gz?rev=2",
+                b"",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/new.txt?rev=2",
+                b"new\n",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        write_file(&wc.root, "new.txt", "mine\n");
+        let err = update(&mut wc, &client, Some("2"), None, &DryRun::new(false)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FileConflict);
+        let message = err.to_string();
+        assert!(
+            message.contains("untracked working tree files would be overwritten"),
+            "message: {message}"
+        );
+        assert!(!message.contains("stay in the stash"), "message: {message}");
+        // The dirty change is back in the worktree and the stash
+        // is empty: the failed update did not strand it.
+        assert_eq!(read_file(&wc.root, "foo.spec"), "Name: local\n");
+        assert!(autostash_entries(&wc).unwrap().is_empty());
+        assert_eq!(wc.base_rev, REV1);
         let _ = dir;
     }
 }

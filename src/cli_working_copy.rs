@@ -54,6 +54,17 @@ fn endpoints() -> Result<Endpoints, GeectlError> {
     })
 }
 
+/// Whether the leaf needs OBS credentials: `pull` reads the
+/// authed expanded routes (`directory_listing_expanded`,
+/// `download_source_expanded_to_file`) and `commit` mutates; the
+/// rest read public routes. A leaf that needs credentials and
+/// does not ask for them 401s — `pull` did, until this table
+/// said so. The single source of truth for the credential
+/// wiring, pinned by the `leaf_credential_wiring` test.
+fn needs_obs_credentials(leaf: &str) -> bool {
+    matches!(leaf, "pull" | "commit")
+}
+
 /// An OBS client on `http`: no credentials for reads, the
 /// per-instance OBS credentials for mutations when live (the
 /// CLI-wide rule: a dry-run mutation resolves no credentials).
@@ -115,9 +126,17 @@ fn current_dir() -> Result<PathBuf, GeectlError> {
     })
 }
 
-/// The working copy in the current directory.
-fn open_working_copy() -> Result<WorkingCopy, GeectlError> {
-    working_copy::open(&current_dir()?)
+/// The working copy in the current directory. `live` decides
+/// whether the record may be healed from the root commit: a
+/// dry-run plan must not rewrite `geectl.base-*` config, so it
+/// opens read-only.
+fn open_working_copy(live: bool) -> Result<WorkingCopy, GeectlError> {
+    let dir = current_dir()?;
+    if live {
+        working_copy::open(&dir)
+    } else {
+        working_copy::open_read(&dir)
+    }
 }
 
 /// The dry-run plan, when dry-run is on.
@@ -199,12 +218,21 @@ pub fn checkout(
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let endpoints = endpoints()?;
-    let client = obs_client(&http, &endpoints, false, live, debug)?;
+    let client = obs_client(
+        &http,
+        &endpoints,
+        needs_obs_credentials("checkout"),
+        live,
+        debug,
+    )?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let auth = gitea_auth(&endpoints)?;
+    // A dry-run checkout clones nothing: resolving the Gitea
+    // token here would resolve credentials for a plan.
+    let auth = if live { gitea_auth(&endpoints)? } else { None };
     let auth = gitea_auth_ref(&auth);
     let rev = rev.map(RevisionSpec::parse).transpose()?;
     let dir = current_dir()?;
+    let target = working_copy::checkout_target(&dir, project, package)?;
     let wc = working_copy::checkout(
         &client,
         project,
@@ -217,7 +245,7 @@ pub fn checkout(
     Ok(checkout_result(
         project,
         package,
-        &dir,
+        &target,
         wc.as_ref(),
         dry_run.enabled(),
         plan_of(&dry_run),
@@ -229,7 +257,7 @@ pub fn checkout(
 fn checkout_result(
     project: &str,
     package: &str,
-    dir: &Path,
+    target: &Path,
     wc: Option<&WorkingCopy>,
     dry_run: bool,
     plan: Option<Vec<String>>,
@@ -254,7 +282,6 @@ fn checkout_result(
             mutation_result(payload, header, result_line, dry_run, plan)
         }
         None => {
-            let target = working_copy::checkout_target(dir, project, package);
             let payload = json!({
                 "project": project,
                 "package": package,
@@ -278,11 +305,19 @@ pub fn update(
 ) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let endpoints = endpoints()?;
-    let client = obs_client(&http, &endpoints, false, live, debug)?;
+    let client = obs_client(
+        &http,
+        &endpoints,
+        needs_obs_credentials("update"),
+        live,
+        debug,
+    )?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let auth = gitea_auth(&endpoints)?;
+    // A dry-run update fetches nothing: resolving the Gitea
+    // token here would resolve credentials for a plan.
+    let auth = if live { gitea_auth(&endpoints)? } else { None };
     let auth = gitea_auth_ref(&auth);
-    let mut wc = open_working_copy()?;
+    let mut wc = open_working_copy(live)?;
     let report = working_copy::update(&mut wc, &client, rev, auth.as_ref(), &dry_run)?;
     Ok(update_result(
         &wc,
@@ -312,8 +347,9 @@ fn update_result(
                 "old_base_srcmd5": report.old_base_srcmd5,
                 "new_base_srcmd5": report.new_base_srcmd5,
                 "conflicts": report.conflicts,
+                "stash_remaining": report.stash_remaining,
             });
-            let result_line = if !report.conflicts.is_empty() {
+            let mut result_line = if !report.conflicts.is_empty() {
                 format!(
                     "update stopped with conflicts in: {}",
                     report.conflicts.join(", ")
@@ -329,6 +365,11 @@ fn update_result(
                     wc.project, wc.package, report.new_base_rev
                 )
             };
+            if report.stash_remaining {
+                result_line.push_str(
+                    "; stashed changes remain in the stash (resolve the conflicts, then run resolve to restore them)",
+                );
+            }
             mutation_result(payload, header, result_line, dry_run, plan)
         }
         None => {
@@ -345,7 +386,7 @@ fn update_result(
 /// Show the working copy's state against the base.
 pub fn status(debug: &Debug) -> Result<(Value, String), GeectlError> {
     let _ = debug;
-    let wc = open_working_copy()?;
+    let wc = open_working_copy(false)?;
     let entries = working_copy::status(&wc)?;
     Ok(status_result(&wc, &entries))
 }
@@ -383,7 +424,7 @@ fn status_result(wc: &WorkingCopy, entries: &[working_copy::StatusEntry]) -> (Va
 /// A content command: the text IS the diff.
 pub fn diff(debug: &Debug) -> Result<(Value, String), GeectlError> {
     let _ = debug;
-    let wc = open_working_copy()?;
+    let wc = open_working_copy(false)?;
     let diff = working_copy::diff(&wc)?;
     Ok(diff_result(&wc, &diff))
 }
@@ -408,7 +449,7 @@ fn diff_result(wc: &WorkingCopy, diff: &str) -> (Value, String) {
 pub fn add(files: &[String], debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let wc = open_working_copy()?;
+    let wc = open_working_copy(live)?;
     working_copy::add(&wc, files, &dry_run)?;
     Ok(add_result(&wc, files, dry_run.enabled(), plan_of(&dry_run)))
 }
@@ -448,7 +489,7 @@ fn add_result(
 pub fn rm(files: &[String], debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let wc = open_working_copy()?;
+    let wc = open_working_copy(live)?;
     working_copy::rm(&wc, files, &dry_run)?;
     Ok(rm_result(&wc, files, dry_run.enabled(), plan_of(&dry_run)))
 }
@@ -488,7 +529,7 @@ fn rm_result(
 pub fn addremove(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let wc = open_working_copy()?;
+    let wc = open_working_copy(live)?;
     working_copy::addremove(&wc, &dry_run)?;
     Ok(addremove_result(&wc, dry_run.enabled(), plan_of(&dry_run)))
 }
@@ -518,13 +559,30 @@ pub fn commit(
     debug: &Debug,
     live: bool,
 ) -> Result<(Value, String), GeectlError> {
+    // Refused before anything is resolved: an empty message
+    // aborts the git commit and sends an empty comment on the
+    // OBS path, and neither needs a client or credentials first.
+    if message.trim().is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "commit needs a non-empty --message",
+        ));
+    }
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let endpoints = endpoints()?;
-    let client = obs_client(&http, &endpoints, true, live, debug)?;
+    let client = obs_client(
+        &http,
+        &endpoints,
+        needs_obs_credentials("commit"),
+        live,
+        debug,
+    )?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let auth = gitea_auth(&endpoints)?;
+    // A dry-run commit pushes nothing: resolving the Gitea
+    // token here would resolve credentials for a plan.
+    let auth = if live { gitea_auth(&endpoints)? } else { None };
     let auth = gitea_auth_ref(&auth);
-    let mut wc = open_working_copy()?;
+    let mut wc = open_working_copy(live)?;
     let report = working_copy::commit(
         &mut wc,
         &client,
@@ -595,9 +653,18 @@ fn commit_result(
 pub fn pull(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let endpoints = endpoints()?;
-    let client = obs_client(&http, &endpoints, false, live, debug)?;
+    // `pull` needs credentials: its reads hit the authed
+    // expanded routes, and without them the pull (and its
+    // dry-run plan) 401s.
+    let client = obs_client(
+        &http,
+        &endpoints,
+        needs_obs_credentials("pull"),
+        live,
+        debug,
+    )?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let mut wc = open_working_copy()?;
+    let mut wc = open_working_copy(live)?;
     let report = working_copy::pull(&mut wc, &client, &dry_run)?;
     Ok(pull_result(
         &wc,
@@ -627,8 +694,9 @@ fn pull_result(
                 "old_base_rev": report.old_base_rev,
                 "new_base_rev": report.new_base_rev,
                 "conflicts": report.conflicts,
+                "stash_remaining": report.stash_remaining,
             });
-            let result_line = if !report.conflicts.is_empty() {
+            let mut result_line = if !report.conflicts.is_empty() {
                 format!(
                     "pull stopped with conflicts in: {}",
                     report.conflicts.join(", ")
@@ -644,6 +712,11 @@ fn pull_result(
                     wc.project, wc.package, report.new_baserev
                 )
             };
+            if report.stash_remaining {
+                result_line.push_str(
+                    "; stashed changes remain in the stash (resolve the conflicts, then run resolve to restore them)",
+                );
+            }
             mutation_result(payload, header, result_line, dry_run, plan)
         }
         None => {
@@ -661,7 +734,7 @@ fn pull_result(
 pub fn resolve(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let mut wc = open_working_copy()?;
+    let mut wc = open_working_copy(live)?;
     let resolved = working_copy::resolve(&mut wc, &dry_run)?;
     Ok(resolve_result(
         &wc,
@@ -730,7 +803,8 @@ mod tests {
     fn checkout_result_live_carries_the_record() {
         let dir = PathBuf::from("/tmp");
         let wc = wc();
-        let (_, text) = checkout_result("home:alice", "foo", &dir, Some(&wc), false, None);
+        let target = dir.join("home_alice").join("foo");
+        let (_, text) = checkout_result("home:alice", "foo", &target, Some(&wc), false, None);
         assert!(text.contains("project: home:alice package: foo"));
         assert!(text.contains("dry_run: false"));
         assert!(text.contains(&format!(
@@ -744,23 +818,24 @@ mod tests {
         let dir = PathBuf::from("/tmp");
         // The target names the sanitized directory (`:` becomes
         // `_`); the separators are the platform's.
-        let target = dir.join("home_alice").join("foo").display().to_string();
+        let target = dir.join("home_alice").join("foo");
+        let target_text = target.display().to_string();
         let (payload, text) = checkout_result(
             "home:alice",
             "foo",
-            &dir,
+            &target,
             None,
             true,
-            Some(vec![format!("checkout home:alice/foo into {target}")]),
+            Some(vec![format!("checkout home:alice/foo into {target_text}")]),
         );
         assert_eq!(payload["dry_run"], json!(true));
-        assert_eq!(payload["dir"], json!(target));
+        assert_eq!(payload["dir"], json!(target_text));
         assert_eq!(
             payload["plan"],
-            json!([format!("checkout home:alice/foo into {target}")])
+            json!([format!("checkout home:alice/foo into {target_text}")])
         );
         assert!(text.contains(&format!(
-            "dry-run: would check out home:alice/foo into {target}"
+            "dry-run: would check out home:alice/foo into {target_text}"
         )));
     }
 
@@ -773,6 +848,7 @@ mod tests {
             old_base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             new_base_srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             conflicts: Vec::new(),
+            stash_remaining: false,
         };
         let (_, text) = update_result(&wc(), Some(&report), false, None);
         assert!(text.contains("updated home:alice/foo to base 2"));
@@ -783,6 +859,7 @@ mod tests {
             old_base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             new_base_srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             conflicts: vec!["foo.spec".to_string()],
+            stash_remaining: false,
         };
         let (_, text) = update_result(&wc(), Some(&conflicted), false, None);
         assert!(text.contains("update stopped with conflicts in: foo.spec"));
@@ -793,6 +870,7 @@ mod tests {
             old_base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             new_base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             conflicts: Vec::new(),
+            stash_remaining: false,
         };
         let (_, text) = update_result(&wc(), Some(&current), false, None);
         assert!(text.contains("home:alice/foo is already at base 1"));
@@ -868,6 +946,7 @@ mod tests {
             old_base_rev: "1".to_string(),
             new_base_rev: "2".to_string(),
             conflicts: Vec::new(),
+            stash_remaining: false,
         };
         let (_, text) = pull_result(&wc(), Some(&report), false, None);
         assert!(text.contains("pulled home:alice/foo to baserev bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
@@ -879,6 +958,42 @@ mod tests {
         assert!(text.contains("resolved foo.spec in home:alice/foo"));
         let (_, text) = resolve_result(&wc(), Some(&[]), false, None);
         assert!(text.contains("nothing to resolve in home:alice/foo"));
+    }
+
+    #[test]
+    fn leaf_credential_wiring_pins_which_leaves_need_credentials() {
+        // `pull` reads the authed expanded routes and `commit`
+        // mutates: without credentials both 401. `checkout` and
+        // `update` read public routes only.
+        assert!(needs_obs_credentials("pull"));
+        assert!(needs_obs_credentials("commit"));
+        assert!(!needs_obs_credentials("checkout"));
+        assert!(!needs_obs_credentials("update"));
+        assert!(!needs_obs_credentials("status"));
+    }
+
+    #[test]
+    fn update_result_names_a_remaining_stash() {
+        let report = UpdateReport {
+            updated: false,
+            old_base_rev: "1".to_string(),
+            new_base_rev: "2".to_string(),
+            old_base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            new_base_srcmd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            conflicts: vec!["foo.spec".to_string()],
+            stash_remaining: true,
+        };
+        let (payload, text) = update_result(&wc(), Some(&report), false, None);
+        assert_eq!(payload["stash_remaining"], json!(true));
+        assert!(text.contains("stashed changes remain in the stash"));
+    }
+
+    #[test]
+    fn commit_rejects_an_empty_message_before_any_resolution() {
+        let err = commit("", false, &Debug::disabled(), false).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = commit("   ", false, &Debug::disabled(), false).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]
