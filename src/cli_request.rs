@@ -778,7 +778,19 @@ pub fn run(
             package,
             comment,
         } => {
-            let state = parse_review_state(&state)?;
+            // Clap's value_parser admits only new, accepted, declined,
+            // and all three parse, so this cannot fail from the CLI.
+            let parsed = ReviewState::parse(&state);
+            debug_assert!(
+                parsed.is_some(),
+                "clap value_parser admits only new, accepted, declined"
+            );
+            let state = parsed.ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid review state: {state:?}"),
+                )
+            })?;
             let target = ReviewTarget::new(
                 user.as_deref(),
                 group.as_deref(),
@@ -1074,18 +1086,6 @@ fn parse_state(value: &str) -> Result<RequestState, GeectlError> {
         GeectlError::new(
             ErrorKind::InvalidInput,
             format!("invalid request state: {value:?}"),
-        )
-    })
-}
-
-/// Parse a review state name. The domain is restricted by clap's
-/// `value_parser` at the call site — new, accepted, declined — so
-/// a failure here is a caller bug, not user input.
-fn parse_review_state(value: &str) -> Result<ReviewState, GeectlError> {
-    ReviewState::parse(value).ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::InvalidInput,
-            format!("invalid review state: {value:?}"),
         )
     })
 }
@@ -3062,15 +3062,6 @@ mod tests {
         }
         assert!(parse_state("bogus").is_err());
         assert!(parse_state("").is_err());
-    }
-
-    #[test]
-    fn review_state_parsing_accepts_valid_states_and_rejects_garbage() {
-        for value in ["new", "accepted", "declined"] {
-            assert!(parse_review_state(value).is_ok(), "{value} parses");
-        }
-        assert!(parse_review_state("bogus").is_err());
-        assert!(parse_review_state("").is_err());
     }
 
     #[test]
