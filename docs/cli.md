@@ -138,6 +138,7 @@ Usage: geectl remote [OPTIONS] <COMMAND>
 
 Commands:
   cat                            Print a source file to standard output. Text only: the library reads the file as a UTF-8 string, so a binary file fails the call with a server error ("response body is not valid UTF-8") instead of printing bytes
+  download                       Download a source file to a local path. The binary counterpart of `cat`: the library streams the file to disk instead of reading it as a UTF-8 string, so a binary file (a source tarball) downloads instead of failing the UTF-8 check, and a file larger than the transport's 10 MiB body cap downloads instead of failing. A read: `--live` is ignored, like `cat`
   list-files                     List the files of a package
   list-packages                  List the packages of a project
   list-projects                  List the top-level projects on the instance
@@ -185,7 +186,7 @@ Options:
   -h, --help             Print help
 ```
 
-One leaf, to show the flag style (required coordinates as
+Two leaves, to show the flag style (required coordinates as
 positionals, everything else a long flag):
 
 ```
@@ -202,6 +203,26 @@ Options:
       --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
       --rev <REV>        Print the file as of this revision (default: latest)
       --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Download a source file to a local path. The binary counterpart of `cat`: the library streams the file to disk instead of reading it as a UTF-8 string, so a binary file (a source tarball) downloads instead of failing the UTF-8 check, and a file larger than the transport's 10 MiB body cap downloads instead of failing. A read: `--live` is ignored, like `cat`
+
+Usage: geectl remote download [OPTIONS] --output <OUTPUT> <PROJECT> <PACKAGE> <FILE>
+
+Arguments:
+  <PROJECT>  The project the package lives in
+  <PACKAGE>  The package the file lives in
+  <FILE>     The file to download
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --rev <REV>        Download the file as of this revision: a revision number or a srcmd5 (default: latest)
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --output <OUTPUT>  Where to write the downloaded bytes
       --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
       --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
   -h, --help             Print help
@@ -627,6 +648,7 @@ Options:
 geectl remote list-packages openSUSE:Factory
 geectl remote list-files openSUSE:Factory vim
 geectl remote cat openSUSE:Factory vim vim.spec
+geectl remote download openSUSE:Factory vim vim.spec --output vim.spec
 geectl --format text remote list-packages openSUSE:Factory
 
 # Build status

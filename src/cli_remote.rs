@@ -1,8 +1,8 @@
 //! Remote CLI commands (`geectl remote ...`).
 //!
 //! The inspection surface for what the distribution holds: file
-//! contents, listings, history, meta, search, ownership, and diffs —
-//! plus the group's mutations, which edit a project's repository
+//! contents and downloads, listings, history, meta, search, ownership,
+//! and diffs — plus the group's mutations, which edit a project's repository
 //! list in its meta (`repo-add`, `repo-remove`) or create, upload
 //! to, delete, restore, aggregate, and release projects and
 //! packages. Each command is a thin wrapper over one `ObsClient`
@@ -77,11 +77,11 @@ use geectl::obs::{
     AggregateOptions, CreatePackageOptions, DeleteProjectOptions, DryRun, FilePatch,
     FilePatchStatus, HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus,
     PackageMatch, PackageMeta, Person, ProjectMatch, ProjectMeta, ReleaseOptions, Repository,
-    RevisionPatch, RevisionRange, SourceFile, StagedRequest, StagingProject, StagingReadOptions,
-    FACTORY_PROJECT, OBS_API_BASE,
+    RevisionPatch, RevisionRange, RevisionSpec, SourceFile, StagedRequest, StagingProject,
+    StagingReadOptions, FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The `remote` command group: inspection of the OBS source tree,
 /// and the mutations that change it.
@@ -101,6 +101,27 @@ pub enum RemoteCommand {
         /// Print the file as of this revision (default: latest).
         #[arg(long)]
         rev: Option<u64>,
+    },
+    /// Download a source file to a local path. The binary counterpart
+    /// of `cat`: the library streams the file to disk instead of
+    /// reading it as a UTF-8 string, so a binary file (a source
+    /// tarball) downloads instead of failing the UTF-8 check, and a
+    /// file larger than the transport's 10 MiB body cap downloads
+    /// instead of failing. A read: `--live` is ignored, like `cat`.
+    Download {
+        /// The project the package lives in.
+        project: String,
+        /// The package the file lives in.
+        package: String,
+        /// The file to download.
+        file: String,
+        /// Download the file as of this revision: a revision number
+        /// or a srcmd5 (default: latest).
+        #[arg(long)]
+        rev: Option<String>,
+        /// Where to write the downloaded bytes.
+        #[arg(long)]
+        output: PathBuf,
     },
     /// List the files of a package.
     ListFiles {
@@ -584,6 +605,7 @@ pub fn run_remote(
     // Credentials resolve per command (see `docs/cli.md`).
     let credentials = match &command {
         RemoteCommand::Cat { .. }
+        | RemoteCommand::Download { .. }
         | RemoteCommand::ListFiles { .. }
         | RemoteCommand::ListPackages { .. }
         | RemoteCommand::ProjectMeta { .. }
@@ -630,6 +652,25 @@ pub fn run_remote(
             // `terminated` in main.rs), so a file ending in a newline
             // gains no extra blank line.
             Ok(cat_result(&project, &package, &file, rev, content))
+        }
+        RemoteCommand::Download {
+            project,
+            package,
+            file,
+            rev,
+            output,
+        } => {
+            let rev = rev.as_deref().map(RevisionSpec::parse).transpose()?;
+            let bytes =
+                client.download_source_to_file(&project, &package, &file, rev.as_ref(), &output)?;
+            Ok(download_result(
+                &project,
+                &package,
+                &file,
+                rev.as_ref(),
+                &output,
+                bytes,
+            ))
         }
         RemoteCommand::ListFiles { project, package } => {
             let files = client.list_files(&project, &package)?;
@@ -1453,6 +1494,36 @@ fn cat_result(
     });
     // Content commands render verbatim: the text IS the file.
     (payload, content)
+}
+
+/// The `download` result: the payload carries the coordinates, the
+/// revision (the normalized spec string — a number or an md5 — or
+/// null for latest), the written path, and the byte count; the text
+/// carries the coordinate header and the confirmation line. The
+/// bytes themselves ride neither rendering: the file is the output.
+fn download_result(
+    project: &str,
+    package: &str,
+    file: &str,
+    rev: Option<&RevisionSpec>,
+    output: &Path,
+    bytes: u64,
+) -> (Value, String) {
+    let payload = json!({
+        "project": project,
+        "package": package,
+        "file": file,
+        "rev": rev.map(|spec| spec.to_string()),
+        "path": output.to_string_lossy(),
+        "size_bytes": bytes,
+    });
+    (
+        payload,
+        with_header(
+            &format!("project: {project} package: {package} file: {file}"),
+            format!("downloaded {file} ({bytes} bytes) to {}", output.display()),
+        ),
+    )
 }
 
 /// Read a local file as text for upload. A missing file, or a file
@@ -4739,6 +4810,48 @@ mod tests {
         );
         assert_eq!(payload["rev"], 12);
         assert_eq!(text, "Name: vim\n");
+    }
+
+    #[test]
+    fn download_result_carries_path_size_and_rev() {
+        let (payload, text) = download_result(
+            "openSUSE:Factory",
+            "vim",
+            "vim-9.1.tar.gz",
+            None,
+            Path::new("/tmp/vim-9.1.tar.gz"),
+            6,
+        );
+        assert_eq!(payload["project"], "openSUSE:Factory");
+        assert_eq!(payload["package"], "vim");
+        assert_eq!(payload["file"], "vim-9.1.tar.gz");
+        assert_eq!(payload["rev"], Value::Null);
+        assert_eq!(payload["path"], "/tmp/vim-9.1.tar.gz");
+        assert_eq!(payload["size_bytes"], 6);
+        assert_eq!(
+            text,
+            "project: openSUSE:Factory package: vim file: vim-9.1.tar.gz\ndownloaded vim-9.1.tar.gz (6 bytes) to /tmp/vim-9.1.tar.gz"
+        );
+        let (payload, text) = download_result(
+            "openSUSE:Factory",
+            "vim",
+            "vim-9.1.tar.gz",
+            Some(&RevisionSpec::Rev(2)),
+            Path::new("/tmp/vim-9.1.tar.gz"),
+            6,
+        );
+        assert_eq!(payload["rev"], "2");
+        assert!(text.contains("downloaded vim-9.1.tar.gz (6 bytes)"));
+        let md5 = RevisionSpec::parse("AABBCCDDAABBCCDDAABBCCDDAABBCCDD").unwrap();
+        let (payload, _) = download_result(
+            "openSUSE:Factory",
+            "vim",
+            "vim-9.1.tar.gz",
+            Some(&md5),
+            Path::new("/tmp/vim-9.1.tar.gz"),
+            6,
+        );
+        assert_eq!(payload["rev"], "aabbccddaabbccddaabbccddaabbccdd");
     }
 
     #[test]

@@ -292,6 +292,38 @@ classification + rdiff API params; exact CLI stdout text is osc-specific):
   variants (working-copy inference; explicit forms above cover the server
   behaviour), `develproject-project.feature:9` (CLI arity error only).
 
+### Remote download — `get_source_file` protocol (GAP 3)
+
+**Direct adoptions: 0 tests. Protocol spec: 1.**
+
+osc has no dedicated test for a single-file source download; the
+protocol comes from the implementation, mined at openSUSE/osc @
+`a83810c` (`osc/core.py:2820` `get_source_file`,
+`osc/core.py:2791` `download`, `osc/commandline.py:10379`
+`do_cat`, `osc/commandline.py:5689` checkout single-file path):
+
+- URL shape: `GET /source/<prj>/<pkg>/<filename>?rev=<revision>`
+  (`get_source_file`).
+- `rev` passes verbatim — a revision number or a srcmd5 (`do_cat`
+  passes `opts.revision` verbatim as `rev`; `get_source_file`
+  passes `revision` verbatim).
+- Streamed to disk in chunks, not buffered (`download` streams via
+  `streamfile` in `BUFSIZE` chunks).
+
+Deliberate divergences, not misses:
+
+- osc writes to a temp file and renames (atomic); geectl streams to
+  the destination with exclusive create — a failure mid-stream
+  leaves a partial file for the caller to delete (the #111
+  transport rule, shared with `download_binary_to_file`).
+- osc resolves the rev through the expanded upstream srcmd5 by
+  default (`show_upstream_srcmd5` + `expand=1`); geectl passes the
+  rev verbatim, like `cat` (no link expansion).
+- osc sets the downloaded file's mtime; geectl does not (the
+  transport leaves the file as created).
+- Not adopted: the `getbinaries-*.feature` scenarios (built-binary
+  downloads, a different endpoint) — already counted under batch 5.
+
 ## Batch 4 — branch/copy/link
 
 **Direct adoptions: 51 (42 behave + 9 unit).**
@@ -671,7 +703,7 @@ Batch in brackets:
 |---|---|---|---|
 | 1 file upload | 0 (+1 protocol spec) | 0 | 0 (+spec) |
 | 2 request read/act | 54 | 5 | 59 |
-| 3 remote read | 36 | 17 | 53 |
+| 3 remote read | 36 | 17 | 53 (+1 protocol spec) |
 | 4 branch/copy/link | 9 | 42 | 51 |
 | 5 build status | 4 | 42 | 46 |
 | 6 working-copy layer | 0 (+36 spec ref) | 0 | 0 (+spec) |

@@ -37,6 +37,7 @@
 //! asserting the bytes and the revision number.
 //!
 //! The remote-read tests (`live_cat_reads_back_uploaded_file`,
+//! `live_download_reads_back_uploaded_file`,
 //! `live_list_files_and_packages_read_back`,
 //! `live_package_log_newest_first_and_range`,
 //! `live_revision_patch_diffs_revisions`,
@@ -78,8 +79,8 @@ use geectl::obs::{
     DeleteTarget, DryRun, FilePatchStatus, HistoryEntry, LinkOptions, LinkRevision,
     MaintenanceBranchOptions, MaintenanceIncidentPayload, NamedRole, ObsClient, PackageDiffStatus,
     ReleaseOptions, Repository, Request, RequestAction, RequestSearch, RequestState, ResultsQuery,
-    ReviewState, ReviewTarget, RevisionRange, RoleGrant, SourceUpdate, SrFiling, SrPayload,
-    StagingReadOptions,
+    ReviewState, ReviewTarget, RevisionRange, RevisionSpec, RoleGrant, SourceUpdate, SrFiling,
+    SrPayload, StagingReadOptions,
 };
 use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus};
 
@@ -1216,6 +1217,61 @@ fn live_cat_reads_back_uploaded_file() {
             .expect("cat revision 2 on the live instance"),
         v2
     );
+}
+
+/// A binary file uploaded through geectl downloads back through
+/// `download_source_to_file`, at the current revision and at an
+/// earlier one, with the byte count. The download is public: no
+/// credentials. The bytes include NULs, which `cat` cannot carry.
+#[test]
+fn live_download_reads_back_uploaded_file() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let v1: &[u8] = b"binary\x00v1\xff";
+    let v2: &[u8] = b"binary\x00v2\xff\xfe";
+    authed
+        .upload_file_bytes(
+            &source_project,
+            &package,
+            "geectl-live.bin",
+            v1,
+            &DryRun::new(false),
+        )
+        .expect("upload the first binary on the live instance");
+    authed
+        .upload_file_bytes(
+            &source_project,
+            &package,
+            "geectl-live.bin",
+            v2,
+            &DryRun::new(false),
+        )
+        .expect("upload the second binary on the live instance");
+    let public = live_client(&base);
+    let path = std::env::temp_dir().join(format!("geectl-live-download-{}.bin", unique_suffix()));
+    let _ = std::fs::remove_file(&path);
+    let written = public
+        .download_source_to_file(&source_project, &package, "geectl-live.bin", None, &path)
+        .expect("download the current revision on the live instance");
+    assert_eq!(written, v2.len() as u64);
+    assert_eq!(std::fs::read(&path).unwrap(), v2);
+    let _ = std::fs::remove_file(&path);
+    let written = public
+        .download_source_to_file(
+            &source_project,
+            &package,
+            "geectl-live.bin",
+            Some(&RevisionSpec::Rev(1)),
+            &path,
+        )
+        .expect("download revision 1 on the live instance");
+    assert_eq!(written, v1.len() as u64);
+    assert_eq!(std::fs::read(&path).unwrap(), v1);
+    let _ = std::fs::remove_file(&path);
 }
 
 /// The directory listing and the project listing read back what was

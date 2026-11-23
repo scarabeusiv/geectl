@@ -197,6 +197,18 @@ impl RevisionSpec {
     }
 }
 
+impl std::fmt::Display for RevisionSpec {
+    /// Render the specifier the way it goes into a `rev` query
+    /// parameter: a number renders as itself, an md5 renders
+    /// lowercase (already normalized by [`RevisionSpec::parse`]).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RevisionSpec::Rev(n) => write!(f, "{n}"),
+            RevisionSpec::Md5(md5) => write!(f, "{md5}"),
+        }
+    }
+}
+
 /// A revision range: an optional lower and upper bound, each a
 /// [`RevisionSpec`]. Parsed by [`RevisionRange::parse`] from the
 /// `rev` option form: `""` or `":"` → no bounds; `"1"` → only rev 1;
@@ -1070,6 +1082,17 @@ mod tests {
                 from: Some(RevisionSpec::Md5(hash1.to_string())),
                 to: Some(RevisionSpec::Md5(hash2.to_string()))
             }
+        );
+    }
+
+    #[test]
+    fn revision_spec_renders_as_the_rev_query_value() {
+        assert_eq!(RevisionSpec::Rev(2).to_string(), "2");
+        assert_eq!(
+            RevisionSpec::parse("AABBCCDDAABBCCDDAABBCCDDAABBCCDD")
+                .unwrap()
+                .to_string(),
+            "aabbccddaabbccddaabbccddaabbccdd"
         );
     }
 

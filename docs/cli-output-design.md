@@ -80,15 +80,14 @@ what "one coherent channel" means.
 - **Read-after-write retries** (the library's bounded retries, not the
   HTTP policy): each probe plus the remaining budget, e.g.
   `retry: create_package registration probe 1/30s: still not found`.
-  (test `src/obs/remote.rs:7409`).
+  (test `src/obs/remote.rs:7623`).
   These are retries with no output elsewhere — a retried
   `change_state` consuming its 60 s budget would otherwise leave no
   visible trace.
 - **Library decision points** (the ones that change what happens
-  next): the supersede-all filing decision (`decision: filing for foo; superseding open submit request(s) 1398492 with the new request`; test `src/obs/payload.rs:3789`), dedup checks (`decision: open maintenance_incident request(s) 1399001 already target openSUSE:Maintenance for foo; refusing to file`; test `src/obs/payload.rs:3876`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1084`),
+  next): the supersede-all filing decision (`decision: filing for foo; superseding open submit request(s) 1398492 with the new request`; test `src/obs/payload.rs:3789`), dedup checks (`decision: open maintenance_incident request(s) 1399001 already target openSUSE:Maintenance for foo; refusing to file`; test `src/obs/payload.rs:3876`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1107`),
   endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:4058` vs
-  `decision: read via /source (authenticated)`; test `src/http.rs:4170`), and the accept-state check
-  before a retried `change_state` (`decision: request 1398977 still new, re-issuing
+  `decision: read via /source (authenticated)`; test `src/http.rs:4170`), and the accept-state check before a retried `change_state` (`decision: request 1398977 still new, re-issuing
   accepted`; test `src/obs/request.rs:5985`).
 - **Service status lines**: `service_state <project>/<package>: <code>` and
   `list_services <project>/<package>: <n> service(s)` — emitted by the services
@@ -303,7 +302,7 @@ Consequences:
 ### Worked examples (shape, not an exhaustive field list)
 
 Per-command fields are the command author's decision, following the
-shape rules above. Five examples pin the shape:
+shape rules above. Six examples pin the shape:
 
 - **`request show <id>`** (single object, `key: value`):
   `id: 1398977`, `state: new`, `creator: ...`, `created: ...`,
@@ -319,6 +318,10 @@ shape rules above. Five examples pin the shape:
   row. (If a human need for the md5 in text is proven, it is a new
   decision.)
 - **`cat <package> <file>`** (content): the file verbatim.
+- **`download <package> <file> --output <path>`** (single object +
+  confirmation): header `project: … package: … file: …`, then
+  `downloaded <file> (<n> bytes) to <path>` — the bytes never ride
+  the text rendering. (tests/cli.rs:1063)
 - **`build results`** (list + summary, batch 5): a `project:`
   header line, then the table `REPOSITORY ARCH PACKAGE CODE`, then
   a summary line (`1 failed, 3 succeeded`, terms alphabetical) —

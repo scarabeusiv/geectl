@@ -647,6 +647,7 @@ fn remote_help_lists_every_command() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     for command in [
         "cat",
+        "download",
         "list-files",
         "list-packages",
         "package-log",
@@ -693,6 +694,37 @@ fn remote_cat_help_names_the_rev_flag() {
     assert!(stdout.contains("project"));
     assert!(stdout.contains("package"));
     assert!(stdout.contains("file"));
+}
+
+#[test]
+fn remote_download_help_names_the_rev_and_output_flags() {
+    let out = geectl()
+        .args(["remote", "download", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--rev"));
+    assert!(stdout.contains("--output"));
+    assert!(stdout.contains("project"));
+    assert!(stdout.contains("package"));
+    assert!(stdout.contains("file"));
+}
+
+#[test]
+fn remote_download_without_output_fails_with_parse_error() {
+    let out = geectl()
+        .args([
+            "remote",
+            "download",
+            "openSUSE:Factory",
+            "foo",
+            "foo-1.0.tar.gz",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]
@@ -828,6 +860,29 @@ fn serve_once(body: &str) -> std::net::SocketAddr {
     serve_once_status(200, "OK", body)
 }
 
+/// A one-shot HTTP fixture serving raw bytes: the same
+/// single-connection shape as `serve_once`, for downloads whose body
+/// is not valid UTF-8.
+fn serve_once_bytes(body: &[u8]) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = body.to_vec();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(&body);
+        let _ = stream.flush();
+    });
+    addr
+}
+
 /// A many-shot HTTP fixture: serves the same canned response to
 /// every connection, until the test process ends. For commands that
 /// fan out (a diff lists both sides, then reads files), where one
@@ -936,6 +991,167 @@ fn remote_list_packages_json_mode_renders_the_payload() {
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["project"], "openSUSE:Factory");
     assert_eq!(value["packages"], serde_json::json!(["curl", "vim"]));
+}
+
+#[test]
+fn remote_download_writes_binary_bytes_to_disk() {
+    // A binary body (NULs, non-UTF-8) downloads to --output and the
+    // payload names the file instead of carrying the bytes.
+    let bytes: &[u8] = &[0xED, 0xAB, 0x00, 0xEE, 0xDB, 0xFF];
+    let addr = serve_once_bytes(bytes);
+    let dir = TempDir::new();
+    let output = dir.0.join("foo-1.0.tar.gz");
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "download",
+            "openSUSE:Factory",
+            "foo",
+            "foo-1.0.tar.gz",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["project"], "openSUSE:Factory");
+    assert_eq!(value["package"], "foo");
+    assert_eq!(value["file"], "foo-1.0.tar.gz");
+    assert_eq!(value["rev"], serde_json::Value::Null);
+    assert_eq!(value["path"], output.to_str().unwrap());
+    assert_eq!(value["size_bytes"], 6);
+    assert_eq!(std::fs::read(&output).unwrap(), bytes);
+}
+
+#[test]
+fn remote_download_text_mode_renders_the_confirmation_line() {
+    let bytes: &[u8] = &[1, 2, 3];
+    let addr = serve_once_bytes(bytes);
+    let dir = TempDir::new();
+    let output = dir.0.join("foo-1.0.tar.gz");
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "download",
+            "openSUSE:Factory",
+            "foo",
+            "foo-1.0.tar.gz",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        format!(
+            "project: openSUSE:Factory package: foo file: foo-1.0.tar.gz\ndownloaded foo-1.0.tar.gz (3 bytes) to {}",
+            output.display()
+        )
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), bytes);
+}
+
+#[test]
+fn remote_download_rev_forms_are_accepted() {
+    // Both rev forms reach the server: the exact `?rev=` value is
+    // pinned at the library level; here the CLI accepts the forms
+    // and the payload echoes the normalized spec.
+    for rev in ["2", "aabbccddaabbccddaabbccddaabbccdd"] {
+        let addr = serve_once_bytes(&[1]);
+        let dir = TempDir::new();
+        let output = dir.0.join("foo-1.0.tar.gz");
+        let out = geectl_isolated(&dir)
+            .args([
+                "remote",
+                "download",
+                "openSUSE:Factory",
+                "foo",
+                "foo-1.0.tar.gz",
+                "--rev",
+                rev,
+                "--output",
+                output.to_str().unwrap(),
+            ])
+            .env("GEECTL_OBS_URL", format!("http://{addr}"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "rev {rev}: stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        assert_eq!(value["rev"], rev);
+        assert_eq!(std::fs::read(&output).unwrap(), vec![1]);
+    }
+}
+
+#[test]
+fn remote_download_invalid_rev_fails_fast_without_network() {
+    let dir = TempDir::new();
+    let output = dir.0.join("foo-1.0.tar.gz");
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "download",
+            "openSUSE:Factory",
+            "foo",
+            "foo-1.0.tar.gz",
+            "--rev",
+            "not-a-rev",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(!output.exists());
+}
+
+#[test]
+fn remote_download_missing_file_is_an_error() {
+    let addr = serve_once_status(404, "Not Found", "");
+    let dir = TempDir::new();
+    let output = dir.0.join("nope.tar.gz");
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "download",
+            "openSUSE:Factory",
+            "foo",
+            "nope.tar.gz",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "not_found");
+    assert!(!output.exists());
 }
 
 #[test]
@@ -3308,18 +3524,18 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 19 blocks (top level, 9 groups, 9 leaves) — a
+    // The docs carry 20 blocks (top level, 9 groups, 10 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
-    // groups and one leaf each — and the count assertion guards the
-    // docs side only.
+    // groups and one leaf each, plus `remote download` — and the count
+    // assertion guards the docs side only.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let docs = fs::read_to_string(manifest.join("docs/cli.md")).expect("docs/cli.md");
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-        19,
-        "docs/cli.md should carry 19 --help blocks (top level, 9 groups, 9 leaves);          update this count when a block is deliberately added or removed"
+        20,
+        "docs/cli.md should carry 20 --help blocks (top level, 9 groups, 10 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();

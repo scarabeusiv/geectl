@@ -292,7 +292,10 @@ on, not part of it.
 
 Remote reads: the read surface for inspecting what the distribution
 holds, all typed — no method takes or returns raw XML. The public
-reads (see Credentials below) need no credentials. `cat` reads one file at a revision (`rev`); the
+reads (see Credentials below) need no credentials. `cat` reads one file at a revision (`rev`);
+`download_source_to_file` streams one file to disk at a revision (a number or a srcmd5),
+without the transport's 10 MiB body cap and without the UTF-8 check, so a source tarball
+downloads instead of failing; the
 directory listings (`list_files`, `list_packages`) are the server's
 own `<directory>` documents. `package_log` reads the package history
 (newest first — the server lists oldest first, so the log is
@@ -629,7 +632,8 @@ back (`live_create_project_shows_up_on_server`), upload a file
 and read it back (`live_upload_file_reads_back_on_server`, in
 `tests/live_obs.rs`: the bytes and the revision number), read the
 remote state back through the new read operations
-(`tests/live_obs.rs`: cat at a revision, directory and project
+(`tests/live_obs.rs`: cat at a revision, download at a revision,
+directory and project
 listings, log newest-first with a range, revision patch, meta, search,
 owners, whois, link target, project diff), and file
 real submit requests and assert on the server state they leave behind

@@ -33,6 +33,7 @@ use super::ReleaseOptions;
 use super::Repository;
 use super::RevisionPatch;
 use super::RevisionRange;
+use super::RevisionSpec;
 use super::ServiceCode;
 use super::ServiceState;
 use super::SourceFile;
@@ -47,6 +48,7 @@ use crate::xml::skip_xml_prolog;
 use crate::xml::xml_escape;
 use crate::xml::xml_unescape;
 use crate::xml::XmlDoc;
+use std::path::Path;
 
 /// Releasing to an explicit target needs one source repository and
 /// one target repository to be unambiguous, and a target repository
@@ -1912,6 +1914,59 @@ impl<'a> ObsClient<'a> {
         }
         let url = build_url(&self.base, &["source", project, package, file], &[]);
         self.http.get_with(&url, &self.credentials)
+    }
+
+    /// Download file `file` of package `package` in project `project`
+    /// (`GET /public/source/<project>/<package>/<file>`), streaming
+    /// the body to `dest` instead of buffering it: the binary
+    /// counterpart of [`ObsClient::cat`], without the transport's
+    /// 10 MiB body cap and without the UTF-8 check, so a source
+    /// tarball downloads instead of failing. Same validation and
+    /// `?rev=` forms as `cat`: a revision number or a srcmd5
+    /// ([`RevisionSpec`]), passed verbatim. A public read: no
+    /// credentials. The file is created exclusively, and a failure
+    /// mid-stream leaves a partial file for the caller to delete.
+    /// Returns the bytes written.
+    pub fn download_source_to_file(
+        &self,
+        project: &str,
+        package: &str,
+        file: &str,
+        rev: Option<&RevisionSpec>,
+        dest: &Path,
+    ) -> Result<u64, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !valid_obs_filename(file) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS filename: {file:?}"),
+            ));
+        }
+        if let Some(RevisionSpec::Rev(0)) = rev {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "invalid revision: 0",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        let rev_text;
+        if let Some(rev) = rev {
+            rev_text = rev.to_string();
+            query.push(("rev", &rev_text));
+        }
+        let url = build_url(
+            &self.base,
+            &["public", "source", project, package, file],
+            &query,
+        );
+        self.http.get_to_file(&url, &Credentials::None, dest)
     }
 
     /// GET a public directory listing (`/public/source/...`) and
@@ -5968,6 +6023,165 @@ mod tests {
             .cat("openSUSE:Factory", "foo", "nope.spec", None)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    /// A scratch destination for a download test: unique per test
+    /// name, removed before use so the exclusive create succeeds.
+    fn download_dest(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "geectl-download-source-{name}-{}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn download_source_to_file_streams_binary_bytes_to_disk() {
+        // Bytes `cat` cannot carry (NULs, non-UTF-8) stream to disk
+        // through the public source route, with no credentials.
+        let bytes: &[u8] = &[0xED, 0xAB, 0x00, 0xEE, 0xDB, 0xFF, 0xFE];
+        let http = FakeHttp::new().with_get_to_file(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo-1.0.tar.gz",
+            bytes,
+        );
+        let client = ObsClient::new(&http);
+        let path = download_dest("binary");
+        let written = client
+            .download_source_to_file("openSUSE:Factory", "foo", "foo-1.0.tar.gz", None, &path)
+            .unwrap();
+        assert_eq!(written, bytes.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.to_vec());
+        assert_eq!(
+            http.get_to_file_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo-1.0.tar.gz"
+                    .to_string(),
+                false
+            )]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn download_source_to_file_streams_a_body_over_the_cap_to_disk() {
+        // A body over the transport's 10 MiB cap streams to disk
+        // instead of failing: the point of the streamed download.
+        let bytes = vec![b'a'; crate::http::MAX_BODY_BYTES + 1];
+        let http = FakeHttp::new().with_get_to_file(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo-1.0.tar.gz",
+            &bytes,
+        );
+        let client = ObsClient::new(&http);
+        let path = download_dest("over-cap");
+        let written = client
+            .download_source_to_file("openSUSE:Factory", "foo", "foo-1.0.tar.gz", None, &path)
+            .unwrap();
+        assert_eq!(written, bytes.len() as u64);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn download_source_to_file_at_revision_passes_rev_number_and_md5() {
+        // Both rev forms go into `?rev=` verbatim: a number as
+        // itself, an md5 lowercase (an uppercase md5 normalizes).
+        let url_rev =
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo-1.0.tar.gz?rev=2";
+        let url_md5 = "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo-1.0.tar.gz?rev=aabbccddaabbccddaabbccddaabbccdd";
+        let http = FakeHttp::new()
+            .with_get_to_file(url_rev, &[1])
+            .with_get_to_file(url_md5, &[2]);
+        let client = ObsClient::new(&http);
+        let path = download_dest("rev-number");
+        let written = client
+            .download_source_to_file(
+                "openSUSE:Factory",
+                "foo",
+                "foo-1.0.tar.gz",
+                Some(&RevisionSpec::Rev(2)),
+                &path,
+            )
+            .unwrap();
+        assert_eq!(written, 1);
+        let _ = std::fs::remove_file(&path);
+        let path = download_dest("rev-md5");
+        let md5 = RevisionSpec::parse("AABBCCDDAABBCCDDAABBCCDDAABBCCDD").unwrap();
+        let written = client
+            .download_source_to_file(
+                "openSUSE:Factory",
+                "foo",
+                "foo-1.0.tar.gz",
+                Some(&md5),
+                &path,
+            )
+            .unwrap();
+        assert_eq!(written, 1);
+        assert_eq!(
+            http.get_to_file_calls(),
+            vec![(url_rev.to_string(), false), (url_md5.to_string(), false)]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn download_source_to_file_rejects_bad_inputs() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let path = download_dest("bad-inputs");
+        assert!(client
+            .download_source_to_file("openSUSE:Factory", "foo/bar", "foo-1.0.tar.gz", None, &path)
+            .is_err());
+        assert!(client
+            .download_source_to_file("openSUSE:Factory", "foo", ".hidden", None, &path)
+            .is_err());
+        assert!(client
+            .download_source_to_file("openSUSE:Factory", "foo", "a/b", None, &path)
+            .is_err());
+        assert!(client
+            .download_source_to_file(
+                "openSUSE:Factory",
+                "foo",
+                "foo-1.0.tar.gz",
+                Some(&RevisionSpec::Rev(0)),
+                &path
+            )
+            .is_err());
+        assert!(http.get_to_file_calls().is_empty());
+    }
+
+    #[test]
+    fn download_source_to_file_missing_file_is_an_error() {
+        let http = FakeHttp::new().with_get_to_file_error_sequence(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/nope.tar.gz",
+            &[ErrorKind::NotFound],
+        );
+        let client = ObsClient::new(&http);
+        let path = download_dest("missing");
+        let err = client
+            .download_source_to_file("openSUSE:Factory", "foo", "nope.tar.gz", None, &path)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn download_source_to_file_refuses_a_pre_existing_destination() {
+        // The transport creates exclusively: a destination that
+        // already exists is an error, never a truncation.
+        let http = FakeHttp::new().with_get_to_file(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo-1.0.tar.gz",
+            &[1, 2, 3],
+        );
+        let client = ObsClient::new(&http);
+        let path = download_dest("pre-existing");
+        std::fs::write(&path, [9, 9]).unwrap();
+        let err = client
+            .download_source_to_file("openSUSE:Factory", "foo", "foo-1.0.tar.gz", None, &path)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![9, 9]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
