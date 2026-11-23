@@ -26,16 +26,16 @@ the two commit-protocol calls (see "Commit protocol").
 
 | Operation | API calls | Local state |
 |---|---|---|
-| `checkout` | OBS-native: `list_packages` (project form) or `list_files` + `cat` per file + `package_meta`. Git-backed: `package_meta` (to read the scmsync URL) + clone (the `#branch` fragment names the branch to check out and is stripped before the clone, since git does not understand it). | Writes files to `<dir>/<project>/<package>/`. A `:` in a project or package name becomes `_` in the directory name (a Windows path cannot hold `:`); the recorded project and package keep the real names. A `:` in a file name is not sanitized — the file keeps its server name — so on Windows such a file cannot be created and the checkout fails there. Git-backed package: real clone of the Gitea repository. OBS-native package: synthesized repository whose root commit holds the base revision content; a brand-new package synthesizes a root commit over the empty tree. Records `apiurl`, `project`, `package`, `backend` (`obs` \| `git`), `base-rev`, `base-srcmd5` in the checkout's git config (`geectl.*`). No OBS credentials; a git-backed checkout clones with the configured Gitea token when one is set. The token is scoped to the configured Gitea instance (`http.<gitea-url>.extraHeader`): git sends it only to that instance, never to whatever host a scmsync URL names. |
-| `update` | OBS-native: `list_files` at latest rev (or `rev=`), `cat` for every file in the listing (the full tree is needed for the new base commit). Git-backed: fetch from the Gitea remote. | Rebase. OBS-native: the new base becomes the new root commit and local commits rebase onto it. Git-backed: local commits rebase onto the synced HEAD. Git merges text changes; real conflicts stay in the tree as merge conflicts. No local commit is lost. Downloads stream to disk; no size refusal. |
+| `checkout` | OBS-native: `list_packages` (project form) or `list_files` + `cat` per file + `package_meta`. Downloads are pinned to the listing's revision and md5-verified (see `update`). Git-backed: `package_meta` (to read the scmsync URL) + clone (the `#branch` fragment names the branch to check out and is stripped before the clone, since git does not understand it). The scmsync URL must be `http(s)`: any other scheme is refused, the clone runs with `--` before the URL and `GIT_ALLOW_PROTOCOL=http:https`. | Writes files to `<dir>/<project>/<package>/`. A `:` in a project or package name becomes `_` in the directory name (a Windows path cannot hold `:`); the recorded project and package keep the real names. A `:` in a file name is not sanitized — the file keeps its server name — so on Windows such a file cannot be created and the checkout fails there. Git-backed package: real clone of the Gitea repository. OBS-native package: synthesized repository whose root commit holds the base revision content; a brand-new package synthesizes a root commit over the empty tree. Records `apiurl`, `project`, `package`, `backend` (`obs` \| `git`), `base-rev`, `base-srcmd5` in the checkout's git config (`geectl.*`). No OBS credentials; a git-backed checkout clones with the configured Gitea token when one is set. The token is scoped to the configured Gitea instance (`http.<gitea-url>.extraHeader`): git sends it only to that instance, never to whatever host a scmsync URL names. The root commit is built with `git add -f -A`, so a downloaded file matching the user's global excludes is still committed. |
+| `update` | OBS-native: `list_files` at latest rev (or `rev=`), `cat` for the files the listing adds or changes — a download is pinned to the listing's revision (`rev=<n>`) and its md5 is verified against the downloaded bytes (hashed in chunks from disk); a file whose listing md5 matches the base blob is reused from the object store instead of re-downloaded. Git-backed: fetch from the Gitea remote. | Rebase. OBS-native: the new base becomes the new root commit and local commits rebase onto it. Git-backed: local commits rebase onto the synced HEAD. Git merges text changes; real conflicts stay in the tree as merge conflicts. No local commit is lost. Dirty worktree changes are stashed before the rebase (a manual stash, popped with `--index` so staged intent survives) instead of `--autostash`; a pop that conflicts leaves the entry in the stash and the conflict in the tree, and the report names both (`conflicts`, `stash_remaining`). Downloads stream to disk; no size refusal. |
 | `status` | None | Compares the working tree and the index against the base commit. Same single-letter vocabulary as the existing tool (`A`/`M`/`D`/`?`/`!`/`C`/`R`, blank for clean). The mapping from git states to letters is the layer's own, pinned by the layer's tests. There is no `S` status: files are never skipped for size. |
 | `diff` | None for local diff; `project_diff` for remote-vs-remote | Local git diff of the staged index against the base commit plus the unstaged worktree against the index — the two halves together, so a staged-only change shows. Binary files appear as git's `Binary files … differ` line in the diff text, not a failure. Remote-vs-remote diff reuses `project_diff`. |
 | `add` / `rm` / `addremove` | None (local intent only) | Stage into the index: `add` stages, `rm` removes from index and working tree. `addremove` is `status` + add of `?` + rm of `!`. `commit` sends the full file list derived from the base plus the staged diff. |
 | `commit` | `commit_filelist` (validate, then final) + staged file PUTs (`rev=repository`) + `open_requests_for_package` (report after) | Requires base rev == upstream rev, else `WorkingCopyOutdated`. One revision per commit, exactly (see protocol). Services run before commit, hard gate: a failing service run blocks the commit. Dispatches on the recorded backend kind (see "Git-backed commit"). Refreshes the base at the new rev: OBS-native, the new server revision becomes the new root commit and the committed local commits' content is in it, their separate identities gone; git-backed, the pushed HEAD is the new base. |
 | `changelog` | None pre-commit; validate after filing reads `request diff` | `changelog validate` + `changelog generate` (see "`changelog`"). Runs pre-commit in the hard gate, pre-file, and after filing. |
 | `mkpac` | `create_package` (exists) + `checkout` | No new operation. |
-| `pull` | Expanded directory read (`list_files` with expand) + expanded file downloads + `update` | Only for linked packages with a baserev and a clean WC: no uncommitted changes and no untracked files (local commits are rebased, not refused), refuse without baserev. Rebases link-target changes into the WC, like `update`. The expanded listing never carries `_link` (the server's expanded tree excludes it): pull fetches `_link` through the unexpanded route and rewrites its baserev to the target's latest srcmd5. |
-| `resolve` | None (local git only) | Stage the resolved files and continue a stopped rebase. A successful continue adopts the new base — OBS-native from the new root commit's message, git-backed from the rebase target — on disk and in the checkout. Unstaged edits are stashed around the continue and restored after; a failed restore strands them in the stash (named in the error) with the base already adopted. |
+| `pull` | Expanded directory read (`list_files` with expand) + expanded file downloads + `update` | Only for linked packages with a baserev and a clean WC: no uncommitted changes and no untracked files (local commits are rebased, not refused), refuse without baserev. The clean-tree check does not honour user excludes: `status` hides ignored untracked files, so the untracked half is read with plain `ls-files --others` (no `--exclude-standard`) — an ignored file blocks the pull like any other untracked file. Rebases link-target changes into the WC, like `update`. The expanded listing never carries `_link` (the server's expanded tree excludes it): pull fetches `_link` through the unexpanded route and rewrites its baserev to the target's latest srcmd5. Expanded downloads are pinned to the expanded listing's revision and md5-verified. |
+| `resolve` | None (local git only) | Stage the resolved files and continue a stopped rebase. A file that still holds conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`) is refused, not staged. A successful continue adopts the new base — OBS-native from the new root commit's message, git-backed from the rebase target — on disk and in the checkout. Unstaged edits are stashed around the continue and restored after; a failed restore strands them in the stash (named in the error) with the base already adopted. An autostash entry left by an earlier stopped update is restored at the end of `resolve` (or immediately when there is nothing to resolve), so it is not left stranded. |
 
 ## The base record
 
@@ -46,8 +46,10 @@ for server reads. The OBS revision and the git SHA are two different base
 identities: the git SHA is the checkout's base, the OBS srcmd5 names the
 same base on the server side. If the recorded coordinates disagree with
 the base commit, the record is healed from the base commit: the commit is
-the source of truth, and the record is re-read from it on every open, so
-an update stopped mid-rebase still resolves against the new base. That
+the source of truth, and a live open re-reads the record from it, so
+an update stopped mid-rebase still resolves against the new base. A
+read-only open (`open_read`, used by read paths and dry-run plans) returns
+the root commit's coordinates without rewriting the record. That
 healing is OBS-native only: a git-backed checkout records the base in
 config, not in a root commit. `resolve` adopts the new base after a
 successful continue on both backends — OBS-native from the new root
@@ -106,7 +108,11 @@ after commit.
 
 What geectl does not do at commit time: no link-to-different-project
 auto-branch (the existing tool branches; geectl refuses with a structured
-error naming `branch_package` — the agent decides).
+error naming `branch_package` — the agent decides). The refusal runs in
+`commit` and in the dry-run plan alike, and names the `branch_package`
+that branches the link target into this project and package. The staged
+diff is derived with `--no-renames`, so a rename is a delete-plus-add:
+the old path is omitted from the file list and the server deletes it.
 
 ## Git-backed commit
 
@@ -190,9 +196,19 @@ changes the call the agent makes:
 - No git-mode refusals copied from the existing tool. The layer operates
   on the checkout through git, via a small `Git` wrapper around the git
   binary (argv-only, no shell). The wrapper passes
-  `-c commit.gpgsign=false -c core.autocrlf=false -c protocol.ext.allow=never`:
+  `-c commit.gpgsign=false -c core.autocrlf=false -c core.hooksPath=/dev/null -c protocol.ext.allow=never`:
   no signing, no line-ending conversion — the working copy holds the
-  server bytes exactly on every platform — and no `ext::` transport.
+  server bytes exactly on every platform — no user hooks, and no `ext::`
+  transport. It scrubs `GIT_*` environment variables (directory, config,
+  identity, and transport variables) before every spawn, so the user's
+  environment cannot redirect a call; the only `GIT_*` a call carries are
+  the ones the layer sets itself (the token header, a temporary index).
+  Mutating git calls add `--no-verify`; diff output adds
+  `--no-ext-diff --no-color --no-textconv`; pathspecs are literal
+  (`--literal-pathspecs`), so a file named like a glob is a path, never
+  a pattern. Clone, fetch, and push use a configurable network timeout
+  (`GEectl_GIT_NETWORK_TIMEOUT_SECS`, seconds, default 300); local git
+  operations use the fixed 300 s timeout.
 
 ## Conflicts, DryRun, errors
 
@@ -201,7 +217,8 @@ changes the call the agent makes:
   conflict, `status` shows `C`, and the error names the files. The agent
   edits the file, then runs `resolve`, which stages the resolved files
   (the git equivalent of marking resolved); the agent owns the content —
-  the layer does not verify the merge. When the resolutions are already
+  the layer does not verify the merge. A file that still holds conflict
+  markers is refused at `resolve`, not staged. When the resolutions are already
   staged, `resolve` continues the rebase directly. Unrelated unstaged edits are
   stashed around the rebase continue (git refuses to continue with a
   dirty worktree) and restored afterwards, so they stay unstaged; when
@@ -209,7 +226,10 @@ changes the call the agent makes:
   names the stash they stay in.
   `commit` refuses while any file is conflicted.
 - **DryRun:** same convention as the rest of the library — the DryRun guard
-  runs before the credentials check. `checkout` in DryRun lists what would
+  runs before the credentials check. A dry-run resolves no Gitea
+  credentials and opens the checkout read-only (`open_read`): the base
+  record is read, never rewritten, so a read path cannot heal or move
+  it. `checkout` in DryRun lists what would
   be downloaded, writes nothing. `update`/`commit` print the plan (files
   to PUT, files to delete, the would-be revision is not created) and touch
   neither server nor local state. `add`/`rm` in DryRun are no-ops that
