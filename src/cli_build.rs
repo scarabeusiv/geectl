@@ -634,6 +634,19 @@ pub fn run_build(
             filename,
             output,
         } => {
+            // Refuse an existing destination before downloading: the
+            // bytes would be refused by write_downloaded anyway, and
+            // the download is wasted work. The exclusive create in
+            // write_downloaded is still the enforcement.
+            if output.exists() {
+                return Err(GeectlError::new(
+                    ErrorKind::AlreadyExists,
+                    format!(
+                        "cannot create download file {}: already exists",
+                        output.display()
+                    ),
+                ));
+            }
             let bytes =
                 client.download_binary(&project, &package, &repository, &arch, &filename)?;
             write_downloaded(&output, &bytes)?;
@@ -966,11 +979,32 @@ fn download_text(filename: &str, size: usize, output: &Path) -> String {
     )
 }
 
-/// Write downloaded bytes to the `--output` path. A write failure is
-/// an internal error naming the path (the download itself already
-/// succeeded, so the failure is on our side, not the server's).
+/// Write downloaded bytes to the `--output` path. The file is created
+/// exclusively: an existing destination is refused instead of silently
+/// overwritten, like `remote download`. A write failure is an internal
+/// error naming the path (the download itself already succeeded, so
+/// the failure is on our side, not the server's). A failed write
+/// removes the partial file, so a retry never hits AlreadyExists on
+/// the tool's own corrupt output.
 fn write_downloaded(output: &PathBuf, bytes: &[u8]) -> Result<(), GeectlError> {
-    std::fs::write(output, bytes).map_err(|e| {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .map_err(|e| {
+            let kind = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                ErrorKind::AlreadyExists
+            } else {
+                ErrorKind::InternalError
+            };
+            GeectlError::new(
+                kind,
+                format!("cannot create download file {}: {e}", output.display()),
+            )
+        })?;
+    file.write_all(bytes).map_err(|e| {
+        let _ = std::fs::remove_file(output);
         GeectlError::new(
             ErrorKind::InternalError,
             format!("cannot write {}: {e}", output.display()),
@@ -2414,7 +2448,26 @@ mod tests {
         let missing_parent = dir.join("no-such-dir").join("foo.rpm");
         let err = write_downloaded(&missing_parent, b"bytes").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InternalError);
-        assert!(err.context.contains("cannot write"));
+        assert!(err.context.contains("cannot create download file"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_downloaded_refuses_an_existing_destination() {
+        // The destination is created exclusively: a second write to
+        // the same path is refused and the existing file is left
+        // intact, never silently overwritten.
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-cli-build-test-refuse-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("foo.rpm");
+        write_downloaded(&path, b"bytes").unwrap();
+        let err = write_downloaded(&path, b"bytes").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert!(err.context.contains("cannot create download file"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"bytes");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

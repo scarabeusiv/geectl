@@ -3484,6 +3484,38 @@ fn build_download_binary_without_output_fails_with_parse_error() {
 }
 
 #[test]
+fn build_download_binary_refuses_an_existing_destination_before_downloading() {
+    // The refusal precedes the download: the output already exists
+    // and the server is unreachable, so a download-first order would
+    // fail with a transport error instead of AlreadyExists.
+    let dir = TempDir::new();
+    let output = dir.0.join("foo-1.0-1.x86_64.rpm");
+    fs::write(&output, b"existing").unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "build",
+            "download-binary",
+            "openSUSE:Factory",
+            "foo",
+            "standard",
+            "x86_64",
+            "foo-1.0-1.x86_64.rpm",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .env("GEECTL_OBS_URL", "http://127.0.0.1:1")
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(10));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "already_exists");
+    assert_eq!(fs::read(&output).unwrap(), b"existing");
+}
+
+#[test]
 fn build_list_repositories_needs_no_credentials() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
