@@ -18,6 +18,7 @@ use crate::xml::xml_elements;
 use crate::xml::xml_escape;
 use crate::xml::xml_unescape;
 use crate::xml::XmlDoc;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// The build-results matrix for a project: one entry per
@@ -737,6 +738,12 @@ pub struct BuildInfo {
     pub bdeps: Vec<BuildDep>,
     /// The preinstall image the server offers, if any.
     pub preinstall_image: Option<PreinstallImage>,
+    /// The published-repo mirror URL per (project, repository),
+    /// from the buildinfo `<path>` elements: the verbatim `url`
+    /// attribute, e.g. `https://download.opensuse.org/tumbleweed/repo/oss/`.
+    /// A repo without a `url` has no entry — the dep fetch falls
+    /// back to the API for it.
+    pub urls: HashMap<(String, String), String>,
 }
 
 /// One entry of a package's build history: a completed build.
@@ -848,6 +855,7 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
             error: None,
             bdeps: Vec::new(),
             preinstall_image: None,
+            urls: HashMap::new(),
         });
     }
     let inner = &after_open[end + 1..];
@@ -909,10 +917,41 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
         }),
         Err(_) => None,
     };
+    // The published-repo mirror URLs, from the `<path>` elements:
+    // one per (project, repository), keyed by that pair, carrying
+    // the verbatim `url` attribute. A `<path>` without a project or
+    // repository is malformed — the server always names both — so
+    // it fails the parse, the same fail-closed treatment as the
+    // `<path>` handling in project-meta parsing. A `<path>` without
+    // a `url` names a repo that is not published: it carries no
+    // entry, and the dep fetch falls back to the API for it (the
+    // existing tool reads the URL the same way, skipping a path
+    // with no `url`). A later element for the same pair wins, as
+    // in the existing tool's mapping.
+    let mut urls = HashMap::new();
+    for element in xml_elements(inner, "path")? {
+        let (tag, _) = xml_split_element(element, "path");
+        let project = xml_attr_non_empty(tag, "project").ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS buildinfo response: <path> without project",
+            )
+        })?;
+        let repository = xml_attr_non_empty(tag, "repository").ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS buildinfo response: <path> without repository",
+            )
+        })?;
+        if let Some(url) = xml_attr(tag, "url").filter(|url| !url.is_empty()) {
+            urls.insert((project, repository), url);
+        }
+    }
     Ok(BuildInfo {
         error,
         bdeps,
         preinstall_image,
+        urls,
     })
 }
 
@@ -3293,6 +3332,31 @@ impl<'a> ObsClient<'a> {
         self.http.get_to_file(&url, &self.credentials, dest)
     }
 
+    /// Download one file from a published-repo mirror URL, as bytes:
+    /// the verbatim `<path url>` from the buildinfo, with the
+    /// `<arch>/<filename>` suffix appended by the caller. No
+    /// credentials are sent — mirrors are public — and the download
+    /// is capped at 10 MiB by the transport's body limit, like
+    /// [`ObsClient::download_binary`]. A failure is the caller's to
+    /// fall back from, never a reason to fail the build.
+    pub(crate) fn download_mirror_bytes(&self, url: &str) -> Result<Vec<u8>, GeectlError> {
+        self.http.get_bytes(url, &Credentials::None)
+    }
+
+    /// Download one file from a published-repo mirror URL, streaming
+    /// the body to `dest` instead of buffering it: the byte-download
+    /// counterpart of [`ObsClient::download_mirror_bytes`], without
+    /// the transport's 10 MiB body cap. Same no-credentials rule; the
+    /// file is created exclusively, and a failure mid-stream leaves a
+    /// partial file for the caller to delete.
+    pub(crate) fn download_mirror_to_file(
+        &self,
+        url: &str,
+        dest: &Path,
+    ) -> Result<u64, GeectlError> {
+        self.http.get_to_file(url, &Credentials::None, dest)
+    }
+
     /// The versions of one binary in `repository`/`arch`: the
     /// server-reported name (`<binary>.<suffix>`, e.g. `foo.rpm`),
     /// the RPM header md5, and the size in KiB the server reports
@@ -5022,6 +5086,62 @@ mod tests {
         let parsed =
             parse_buildinfo("<buildinfo project=\"p\"><bdep name=\"gcc\"/></buildinfo>").unwrap();
         assert_eq!(parsed.preinstall_image, None);
+    }
+
+    #[test]
+    fn parse_buildinfo_reads_path_mirror_urls() {
+        // The live shape: a published repo carries one `<path>` per
+        // (project, repository) with the verbatim mirror URL; a repo
+        // that is not published carries no `url` and reads as no
+        // entry; a buildinfo with no paths at all reads as empty; a
+        // later `<path>` for the same pair wins.
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"openSUSE:Factory\" repository=\"standard\" package=\"hello\" arch=\"x86_64\">\
+             <path project=\"openSUSE:Factory\" repository=\"standard\" url=\"https://download.opensuse.org/tumbleweed/repo/oss/\"/>\
+             <path project=\"openSUSE:Factory\" repository=\"ports\" url=\"https://download.opensuse.org/repositories/openSUSE:/Factory/ports/\"/>\
+             <path project=\"openSUSE:Factory\" repository=\"standard\" url=\"https://mirror.example.com/later/\"/>\
+             <path project=\"home:alice\" repository=\"standard\"/>\
+             <bdep name=\"bash\"/></buildinfo>",
+        )
+        .unwrap();
+        assert_eq!(parsed.urls.len(), 2);
+        assert_eq!(
+            parsed
+                .urls
+                .get(&("openSUSE:Factory".to_string(), "standard".to_string())),
+            Some(&"https://mirror.example.com/later/".to_string())
+        );
+        assert_eq!(
+            parsed
+                .urls
+                .get(&("openSUSE:Factory".to_string(), "ports".to_string())),
+            Some(
+                &"https://download.opensuse.org/repositories/openSUSE:/Factory/ports/".to_string()
+            )
+        );
+        assert_eq!(
+            parsed
+                .urls
+                .get(&("home:alice".to_string(), "standard".to_string())),
+            None
+        );
+        let parsed =
+            parse_buildinfo("<buildinfo project=\"p\"><bdep name=\"gcc\"/></buildinfo>").unwrap();
+        assert!(parsed.urls.is_empty());
+    }
+
+    #[test]
+    fn parse_buildinfo_rejects_path_without_project_or_repository() {
+        let err = parse_buildinfo(
+            "<buildinfo project=\"p\"><path repository=\"standard\" url=\"https://example.com/\"/></buildinfo>",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        let err = parse_buildinfo(
+            "<buildinfo project=\"p\"><path project=\"openSUSE:Factory\" url=\"https://example.com/\"/></buildinfo>",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]

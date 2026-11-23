@@ -94,6 +94,13 @@ The existing tool's invocation, from `osc` `build.py`:
   engine. Geectl does the same preparation with its own typed calls. The
   library transport caps response bodies at 10 MiB; a dep RPM over the cap
   streams to disk instead of failing.
+- Dep downloads are mirror-first: the buildinfo's `<path url>` values
+  are the mirror base URLs for their (project, repository); a dep
+  whose repo has one is fetched from `<url>/<arch>/<filename>` with no
+  credentials before the API is tried. Any mirror failure — network
+  error, 404, hdrmd5 mismatch — falls back to the API download, which
+  keeps its own retry and name-warming behaviour. A repo with no
+  `<path url>` (unpublished, or a local instance) is API-only.
 - Dep file names resolve from the buildinfo's `<bdep>` attributes:
   the scheduler sends no `binary` attribute, so the file name is computed
   locally as `name-version-release.arch.rpm` from `version`/`release`/`arch`

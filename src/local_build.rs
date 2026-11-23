@@ -2504,7 +2504,7 @@ impl<'a> LocalBuild<'a> {
                 Some(binary) => binary.clone(),
                 None => self.resolve_dep_filename(req, dep)?,
             };
-            let cached = self.ensure_cached(req, dep, &filename, &mut stats)?;
+            let cached = self.ensure_cached(req, info, dep, &filename, &mut stats)?;
             if dep.sysroot {
                 lines.push(format!("sysroot: {} {}", dep.name, cached.display()));
             } else {
@@ -2597,6 +2597,7 @@ impl<'a> LocalBuild<'a> {
     fn ensure_cached(
         &self,
         req: &BuildRequest,
+        info: &crate::obs::BuildInfo,
         dep: &BuildDep,
         filename: &str,
         stats: &mut CacheStats,
@@ -2712,7 +2713,7 @@ impl<'a> LocalBuild<'a> {
             }
         }
         stats.pkg_misses += 1;
-        match self.download_dep(req, dep, project, filename, &dir)? {
+        match self.download_dep(req, info, dep, project, filename, &dir)? {
             DownloadedDep::InMemory(bytes, warmed_hdrmd5) => {
                 write_atomic(&path, &bytes).map_err(|e| {
                     GeectlError::new(
@@ -2825,6 +2826,7 @@ impl<'a> LocalBuild<'a> {
     fn download_dep(
         &self,
         req: &BuildRequest,
+        info: &crate::obs::BuildInfo,
         dep: &BuildDep,
         project: &str,
         filename: &str,
@@ -2833,6 +2835,23 @@ impl<'a> LocalBuild<'a> {
         let package = dep.package.as_deref().unwrap_or("_repository");
         let repo = Self::dep_repo(dep, req);
         let arch = Self::dep_arch(dep, req);
+        // Mirror-first: a dep whose (project, repo) the buildinfo
+        // names a published-repo mirror URL for is tried from the
+        // mirror before the API. Any mirror failure logs on the
+        // debug channel and falls through to the API path below as
+        // if the mirror had never been tried — a stale mirror file
+        // fails the hdrmd5 check inside the attempt, never the
+        // build.
+        if let Some(url) = self.mirror_url(info, project, dep, req, filename) {
+            match self.download_mirror(dep, filename, &url, dir) {
+                Ok(downloaded) => return Ok(downloaded),
+                Err(e) => {
+                    self.debug.emit(&format!(
+                        "local-build: mirror download of {filename} from {url} failed ({e}); falling back to the API",
+                    ));
+                }
+            }
+        }
         match self
             .obs
             .download_binary(project, package, repo, arch, filename)
@@ -2956,15 +2975,140 @@ impl<'a> LocalBuild<'a> {
         }
     }
 
+    /// The mirror URL for one dep RPM: the buildinfo `<path url>`
+    /// for the dep's (project, repo), with the `<arch>/<filename>`
+    /// suffix. None when the buildinfo names no mirror for the
+    /// pair, when the URL is not http(s), or when the arch or file
+    /// name cannot name a path segment: the API path is the
+    /// fallback in every case, and it fails closed on a bad name
+    /// itself. A mirror URL with a trailing slash reads the same
+    /// as one without.
+    fn mirror_url(
+        &self,
+        info: &crate::obs::BuildInfo,
+        project: &str,
+        dep: &BuildDep,
+        req: &BuildRequest,
+        filename: &str,
+    ) -> Option<String> {
+        let repo = Self::dep_repo(dep, req);
+        let arch = Self::dep_arch(dep, req);
+        let base = info.urls.get(&(project.to_string(), repo.to_string()))?;
+        let base = base.trim();
+        let scheme = base.to_ascii_lowercase();
+        if !(scheme.starts_with("http://") || scheme.starts_with("https://")) {
+            self.debug.emit(&format!(
+                "local-build: ignoring non-http(s) mirror URL for {project}/{repo}"
+            ));
+            return None;
+        }
+        if !valid_obs_name(arch) {
+            self.debug.emit(&format!(
+                "local-build: ignoring mirror URL for {project}/{repo}: invalid arch {arch:?}"
+            ));
+            return None;
+        }
+        if validate_path_component("dependency binary", filename).is_err() {
+            return None;
+        }
+        Some(format!("{}/{arch}/{filename}", base.trim_end_matches('/')))
+    }
+
+    /// Download one dep RPM from its mirror URL. The bytes are
+    /// hdrmd5-verified against the buildinfo digest before they are
+    /// returned — a stale mirror file reads as a mirror failure and
+    /// the caller falls back to the API. A dep over the transport's
+    /// 10 MiB body cap streams to a temp file, verified the same
+    /// way, like the API path's `stream_dep`.
+    fn download_mirror(
+        &self,
+        dep: &BuildDep,
+        filename: &str,
+        url: &str,
+        dir: &Path,
+    ) -> Result<DownloadedDep, GeectlError> {
+        let expected = Self::effective_hdrmd5(dep, None);
+        match self.obs.download_mirror_bytes(url) {
+            Ok(bytes) => {
+                self.verify_mirror_bytes(&bytes, filename, expected)?;
+                Ok(DownloadedDep::InMemory(bytes, None))
+            }
+            Err(e) if is_transport_cap_error(&e) => {
+                let tmp =
+                    self.stream_to_temp(dir, |tmp| self.obs.download_mirror_to_file(url, tmp))?;
+                if let Err(e) = self.verify_mirror_file(&tmp, filename, expected) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e);
+                }
+                Ok(DownloadedDep::Streamed(tmp, None))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Verify mirror-downloaded bytes against the expected hdrmd5.
+    /// No expected value skips the comparison, but the body must
+    /// still parse as an RPM: an unparsable mirror body is a mirror
+    /// failure that falls back to the API.
+    fn verify_mirror_bytes(
+        &self,
+        bytes: &[u8],
+        filename: &str,
+        expected: Option<&str>,
+    ) -> Result<(), GeectlError> {
+        let actual = rpm_hdrmd5_bytes(bytes).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("cannot read hdrmd5 of mirror download {filename}: {e}"),
+            )
+        })?;
+        Self::check_mirror_hdrmd5(&actual, expected, filename)
+    }
+
+    /// Verify a mirror-downloaded temp file against the expected
+    /// hdrmd5: the streamed counterpart of `verify_mirror_bytes`.
+    fn verify_mirror_file(
+        &self,
+        path: &Path,
+        filename: &str,
+        expected: Option<&str>,
+    ) -> Result<(), GeectlError> {
+        let actual = rpm_hdrmd5(path).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("cannot read hdrmd5 of mirror download {filename}: {e}"),
+            )
+        })?;
+        Self::check_mirror_hdrmd5(&actual, expected, filename)
+    }
+
+    /// Compare a computed hdrmd5 against the expected value for a
+    /// mirror download. A mismatch is a mirror failure (the caller
+    /// falls back to the API), never cache corruption: the bytes
+    /// never landed in the cache.
+    fn check_mirror_hdrmd5(
+        actual: &str,
+        expected: Option<&str>,
+        filename: &str,
+    ) -> Result<(), GeectlError> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        if actual.eq_ignore_ascii_case(expected) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "hdrmd5 mismatch for mirror download {filename}: expected {expected}, got {actual}"
+                ),
+            ))
+        }
+    }
+
     /// Stream one dep RPM to a temp file in the cache directory: the
-    /// over-cap fallback for `download_dep`. The temp name is
-    /// allocated by `fresh_temp_path` and created exclusively by the
-    /// download, so a name that already exists is retried with the
-    /// next name instead of deleting a file this call did not create.
-    /// A 409 from the server reports the same kind without creating
-    /// the file, so it is returned, not retried. Any other failure
-    /// deletes the temp file; on success the caller verifies it and
-    /// renames it into the cache.
+    /// over-cap fallback for `download_dep`. On success the caller
+    /// verifies it and renames it into the cache.
     fn stream_dep(
         &self,
         req: &BuildRequest,
@@ -2977,6 +3121,27 @@ impl<'a> LocalBuild<'a> {
         let package = dep.package.as_deref().unwrap_or("_repository");
         let repo = Self::dep_repo(dep, req);
         let arch = Self::dep_arch(dep, req);
+        let tmp = self.stream_to_temp(dir, |tmp| {
+            self.obs
+                .download_binary_to_file(project, package, repo, arch, filename, tmp)
+        })?;
+        Ok(DownloadedDep::Streamed(tmp, warmed_hdrmd5))
+    }
+
+    /// Stream one download to a temp file in the cache directory:
+    /// the over-cap fallback shared by the API and mirror paths.
+    /// The temp name is allocated by `fresh_temp_path` and created
+    /// exclusively by the download, so a name that already exists is
+    /// retried with the next name instead of deleting a file this
+    /// call did not create. A 409 from the server reports the same
+    /// kind without creating the file, so it is returned, not
+    /// retried. Any other failure deletes the temp file; on success
+    /// the caller verifies it and renames it into the cache.
+    fn stream_to_temp(
+        &self,
+        dir: &Path,
+        download: impl Fn(&Path) -> Result<u64, GeectlError>,
+    ) -> Result<PathBuf, GeectlError> {
         for _ in 0..1000 {
             let tmp = fresh_temp_path(dir).map_err(|e| {
                 let kind = if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -2989,11 +3154,8 @@ impl<'a> LocalBuild<'a> {
                     format!("cannot allocate a temp file in {}: {e}", dir.display()),
                 )
             })?;
-            match self
-                .obs
-                .download_binary_to_file(project, package, repo, arch, filename, &tmp)
-            {
-                Ok(_) => return Ok(DownloadedDep::Streamed(tmp, warmed_hdrmd5)),
+            match download(&tmp) {
+                Ok(_) => return Ok(tmp),
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                     // `AlreadyExists` has two sources: a temp name
                     // that already exists (retry with the next name),
@@ -4206,35 +4368,54 @@ fn last_lines(log: &str, n: usize) -> Vec<&str> {
 /// length instead: a file truncated inside its header still fails
 /// correctly, its digest never matching the expected hdrmd5.
 fn rpm_hdrmd5(path: &Path) -> Result<String, String> {
-    use std::io::{Seek, SeekFrom};
     let mut file = File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let file_len = file
         .metadata()
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?
         .len();
+    rpm_hdrmd5_reader(&mut file, file_len, &path.display().to_string())
+}
+
+/// The hdrmd5 of in-memory RPM bytes: the file form, for a mirror
+/// download that has not landed on disk yet.
+fn rpm_hdrmd5_bytes(bytes: &[u8]) -> Result<String, String> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    rpm_hdrmd5_reader(&mut cursor, bytes.len() as u64, "in-memory RPM bytes")
+}
+
+/// The hdrmd5 of an RPM from any seekable reader: the digest covers
+/// the main header and the payload, from the header's offset to the
+/// end. `what` names the input in read errors only.
+fn rpm_hdrmd5_reader<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    file_len: u64,
+    what: &str,
+) -> Result<String, String> {
+    use std::io::SeekFrom;
     // The lead (96) plus the signature header's 16-byte prologue:
     // the prologue declares the signature header's length, which
     // is all the offset needs. A file shorter than that is not an
     // RPM at all.
     let mut prologue = [0u8; 112];
-    file.read_exact(&mut prologue).map_err(|e| {
+    reader.read_exact(&mut prologue).map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             "file too short to be an RPM".to_string()
         } else {
-            format!("cannot read {}: {e}", path.display())
+            format!("cannot read {what}: {e}")
         }
     })?;
     let header_start = rpm_header_start(&prologue, file_len)?;
     // The main header's own prologue: its length must fit in the
     // file, or the file is truncated inside its header.
     let mut main_prologue = [0u8; 16];
-    file.seek(SeekFrom::Start(header_start as u64))
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    file.read_exact(&mut main_prologue).map_err(|e| {
+    reader
+        .seek(SeekFrom::Start(header_start as u64))
+        .map_err(|e| format!("cannot read {what}: {e}"))?;
+    reader.read_exact(&mut main_prologue).map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             "truncated RPM header".to_string()
         } else {
-            format!("cannot read {}: {e}", path.display())
+            format!("cannot read {what}: {e}")
         }
     })?;
     let (header_len, _) =
@@ -4245,15 +4426,16 @@ fn rpm_hdrmd5(path: &Path) -> Result<String, String> {
     {
         return Err("truncated RPM header".to_string());
     }
-    file.seek(SeekFrom::Start(header_start as u64))
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    reader
+        .seek(SeekFrom::Start(header_start as u64))
+        .map_err(|e| format!("cannot read {what}: {e}"))?;
     let mut ctx = md5::Context::new();
     let mut chunk = [0u8; 8192];
     loop {
-        match file.read(&mut chunk) {
+        match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => ctx.consume(&chunk[..n]),
-            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+            Err(e) => return Err(format!("cannot read {what}: {e}")),
         }
     }
     Ok(format!("{:x}", ctx.compute()))
@@ -7901,6 +8083,51 @@ exit 0
             )
         }
 
+        /// A buildinfo with no deps and no mirror URLs: the dep
+        /// fetch reads it as API-only.
+        fn empty_info() -> crate::obs::BuildInfo {
+            crate::obs::BuildInfo {
+                error: None,
+                bdeps: Vec::new(),
+                preinstall_image: None,
+                urls: HashMap::new(),
+            }
+        }
+
+        /// A buildinfo naming one mirror URL for the testproject
+        /// standard repo: the dep fetch reads it as mirror-first.
+        /// The base carries the trailing slash the live `<path url>`
+        /// values carry, so the URL join is pinned with it.
+        fn mirror_info() -> crate::obs::BuildInfo {
+            let mut urls = HashMap::new();
+            urls.insert(
+                ("testproject".to_string(), "standard".to_string()),
+                "https://mirror.example.com/repos/testproject/standard/".to_string(),
+            );
+            crate::obs::BuildInfo {
+                error: None,
+                bdeps: Vec::new(),
+                preinstall_image: None,
+                urls,
+            }
+        }
+
+        /// The same single mirror URL without the trailing slash:
+        /// the URL join reads the same either way.
+        fn mirror_info_no_slash() -> crate::obs::BuildInfo {
+            let mut urls = HashMap::new();
+            urls.insert(
+                ("testproject".to_string(), "standard".to_string()),
+                "https://mirror.example.com/repos/testproject/standard".to_string(),
+            );
+            crate::obs::BuildInfo {
+                error: None,
+                bdeps: Vec::new(),
+                preinstall_image: None,
+                urls,
+            }
+        }
+
         /// Build the full stubbed setup: buildinfo + buildconfig +
         /// dep downloads + binary list for the binary-less dep.
         /// Returns the client and the http recorder (the client
@@ -11500,7 +11727,7 @@ exit 0
             let mut stats = CacheStats::default();
             let filename = format!("helper-1.0-1.{arch}/../../evil.rpm");
             let err = vertical
-                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .ensure_cached(&req, &empty_info(), &dep, &filename, &mut stats)
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
         }
@@ -11563,7 +11790,7 @@ exit 0
             let mut stats = CacheStats::default();
             let filename = format!("bash-5.3.20-11.1.{arch}.rpm");
             let path = vertical
-                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .ensure_cached(&req, &empty_info(), &dep, &filename, &mut stats)
                 .unwrap();
             assert_eq!(fs::read(&path).unwrap(), rpm);
             assert_eq!(stats.pkg_misses, 1);
@@ -11638,7 +11865,7 @@ exit 0
             };
             let mut stats = CacheStats::default();
             let path = vertical
-                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .ensure_cached(&req, &empty_info(), &dep, &filename, &mut stats)
                 .unwrap();
             assert_eq!(fs::read(&path).unwrap(), rpm);
             assert_eq!(stats.pkg_hits, 1);
@@ -11701,7 +11928,7 @@ exit 0
             let mut stats = CacheStats::default();
             let filename = format!("bash-5.3.20-11.1.{arch}.rpm");
             let err = vertical
-                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .ensure_cached(&req, &empty_info(), &dep, &filename, &mut stats)
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
             let cached = dir
@@ -11772,7 +11999,7 @@ exit 0
             let mut stats = CacheStats::default();
             let filename = format!("bash-5.3.20-11.1.{arch}.rpm");
             let err = vertical
-                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .ensure_cached(&req, &empty_info(), &dep, &filename, &mut stats)
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
         }
@@ -11863,7 +12090,7 @@ exit 0
             let mut stats = CacheStats::default();
             let filename = format!("kernel-obs-build-7.3.5-1.1.{arch}.rpm");
             let path = vertical
-                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .ensure_cached(&req, &empty_info(), &dep, &filename, &mut stats)
                 .unwrap();
             assert_eq!(fs::read(&path).unwrap(), rpm);
             assert_eq!(stats.pkg_misses, 1);
@@ -11937,7 +12164,7 @@ exit 0
             let mut stats = CacheStats::default();
             let filename = format!("big-1.0-1.{arch}.rpm");
             let err = vertical
-                .ensure_cached(&req, &dep, &filename, &mut stats)
+                .ensure_cached(&req, &empty_info(), &dep, &filename, &mut stats)
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
             let cache_dir = dir
@@ -12016,6 +12243,7 @@ exit 0
             let DownloadedDep::InMemory(bytes, warmed) = vertical
                 .download_dep(
                     &req,
+                    &empty_info(),
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
@@ -12397,6 +12625,7 @@ exit 0
             let DownloadedDep::InMemory(bytes, warmed) = vertical
                 .download_dep(
                     &req,
+                    &empty_info(),
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
@@ -12480,6 +12709,7 @@ exit 0
             let err = vertical
                 .download_dep(
                     &req,
+                    &empty_info(),
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
@@ -12545,6 +12775,7 @@ exit 0
             let err = vertical
                 .download_dep(
                     &req,
+                    &empty_info(),
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
@@ -12673,6 +12904,7 @@ exit 0
             let err = vertical
                 .download_dep(
                     &req,
+                    &empty_info(),
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
@@ -12809,6 +13041,7 @@ exit 0
             let downloaded = vertical
                 .download_dep(
                     &req,
+                    &empty_info(),
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
@@ -12866,6 +13099,7 @@ exit 0
             let err = vertical
                 .download_dep(
                     &req,
+                    &empty_info(),
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
@@ -12929,6 +13163,7 @@ exit 0
             let err = vertical
                 .download_dep(
                     &req,
+                    &empty_info(),
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
@@ -12944,6 +13179,556 @@ exit 0
                     "temp file left in the directory: {name:?}"
                 );
             }
+        }
+
+        #[test]
+        fn download_dep_uses_the_mirror_first() {
+            // The buildinfo names a mirror URL for the dep's repo:
+            // the dep comes from the mirror, the API URL is never
+            // hit, and the mirror request carries no credentials.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"glibc payload");
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let mirror_url = format!(
+                "https://mirror.example.com/repos/testproject/standard/{arch}/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new().with_get_bytes(&mirror_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(hdrmd5),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let DownloadedDep::InMemory(bytes, warmed) = vertical
+                .download_dep(
+                    &req,
+                    &mirror_info(),
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap()
+            else {
+                panic!("expected an in-memory download");
+            };
+            assert_eq!(bytes, rpm);
+            assert_eq!(warmed, None);
+            assert_eq!(http.get_bytes_calls(), vec![(mirror_url, false)]);
+        }
+
+        #[test]
+        fn download_dep_falls_back_to_the_api_when_the_mirror_404s() {
+            // The mirror has no such file: the API path runs next,
+            // mirror first in call order, and only the API request
+            // carries credentials.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"glibc payload");
+            let mirror_url = format!(
+                "https://mirror.example.com/repos/testproject/standard/{arch}/glibc-2.38-1.{arch}.rpm"
+            );
+            let api_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_error(&mirror_url, ErrorKind::NotFound)
+                .with_get_bytes(&api_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let DownloadedDep::InMemory(bytes, warmed) = vertical
+                .download_dep(
+                    &req,
+                    &mirror_info_no_slash(),
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap()
+            else {
+                panic!("expected an in-memory download");
+            };
+            assert_eq!(bytes, rpm);
+            assert_eq!(warmed, None);
+            assert_eq!(
+                http.get_bytes_calls(),
+                vec![(mirror_url, false), (api_url, true)]
+            );
+        }
+
+        #[test]
+        fn download_dep_falls_back_to_the_api_when_the_mirror_errors() {
+            // A mirror transport failure is not a 404: the API path
+            // runs next all the same, mirror first in call order.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"glibc payload");
+            let mirror_url = format!(
+                "https://mirror.example.com/repos/testproject/standard/{arch}/glibc-2.38-1.{arch}.rpm"
+            );
+            let api_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_error(&mirror_url, ErrorKind::NetworkError)
+                .with_get_bytes(&api_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let DownloadedDep::InMemory(bytes, warmed) = vertical
+                .download_dep(
+                    &req,
+                    &mirror_info(),
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap()
+            else {
+                panic!("expected an in-memory download");
+            };
+            assert_eq!(bytes, rpm);
+            assert_eq!(warmed, None);
+            assert_eq!(
+                http.get_bytes_calls(),
+                vec![(mirror_url, false), (api_url, true)]
+            );
+        }
+
+        #[test]
+        fn download_dep_falls_back_to_the_api_on_mirror_hdrmd5_mismatch() {
+            // The mirror serves a stale file: its digest does not
+            // match the buildinfo value, so the API path runs next
+            // and its bytes are the ones returned.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"glibc payload");
+            let stale = make_rpm(b"stale payload");
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let mirror_url = format!(
+                "https://mirror.example.com/repos/testproject/standard/{arch}/glibc-2.38-1.{arch}.rpm"
+            );
+            let api_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes(&mirror_url, &stale)
+                .with_get_bytes(&api_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(hdrmd5),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let DownloadedDep::InMemory(bytes, warmed) = vertical
+                .download_dep(
+                    &req,
+                    &mirror_info(),
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap()
+            else {
+                panic!("expected an in-memory download");
+            };
+            assert_eq!(bytes, rpm);
+            assert_eq!(warmed, None);
+            assert_eq!(
+                http.get_bytes_calls(),
+                vec![(mirror_url, false), (api_url, true)]
+            );
+        }
+
+        #[test]
+        fn download_dep_falls_back_to_the_api_on_streamed_mirror_hdrmd5_mismatch() {
+            // The mirror streams a stale file over the cap: its
+            // digest fails, the temp file is deleted, and the API
+            // bytes are the ones returned — nothing is left behind
+            // in the download directory.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"glibc payload");
+            let stale = make_rpm(b"stale payload");
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let mirror_url = format!(
+                "https://mirror.example.com/repos/testproject/standard/{arch}/glibc-2.38-1.{arch}.rpm"
+            );
+            let api_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_cap_error(&mirror_url)
+                .with_get_to_file(&mirror_url, &stale)
+                .with_get_bytes(&api_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(hdrmd5),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let dl = dir.path().join("dl");
+            fs::create_dir(&dl).unwrap();
+            let DownloadedDep::InMemory(bytes, warmed) = vertical
+                .download_dep(
+                    &req,
+                    &mirror_info(),
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    &dl,
+                )
+                .unwrap()
+            else {
+                panic!("expected an in-memory download");
+            };
+            assert_eq!(bytes, rpm);
+            assert_eq!(warmed, None);
+            assert!(fs::read_dir(&dl).unwrap().next().is_none());
+            assert_eq!(http.get_to_file_calls(), vec![(mirror_url.clone(), false)]);
+            assert_eq!(
+                http.get_bytes_calls(),
+                vec![(mirror_url, false), (api_url, true)]
+            );
+        }
+
+        #[test]
+        fn download_dep_streams_an_over_cap_mirror_download() {
+            // A mirror file over the transport cap streams to a temp
+            // file like the API path's, verified before it is
+            // returned, and the API URL is never hit.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"streamed payload");
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let mirror_url = format!(
+                "https://mirror.example.com/repos/testproject/standard/{arch}/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_cap_error(&mirror_url)
+                .with_get_to_file(&mirror_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(hdrmd5),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let downloaded = vertical
+                .download_dep(
+                    &req,
+                    &mirror_info(),
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap();
+            let DownloadedDep::Streamed(tmp, warmed) = downloaded else {
+                panic!("expected a streamed download");
+            };
+            assert_eq!(warmed, None);
+            assert!(tmp.starts_with(dir.path()));
+            assert_eq!(fs::read(&tmp).unwrap(), rpm);
+            assert_eq!(http.get_bytes_calls(), vec![(mirror_url.clone(), false)]);
+            assert_eq!(http.get_to_file_calls(), vec![(mirror_url, false)]);
+        }
+
+        #[test]
+        fn download_dep_ignores_a_non_http_mirror_url() {
+            // A mirror URL with an unsupported scheme is never
+            // fetched: the API path runs as if no mirror existed.
+            // The existing tool pins the same shape for its mirror
+            // group (an invalid scheme must not fail the fetch).
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"glibc payload");
+            let api_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new().with_get_bytes(&api_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let mut urls = HashMap::new();
+            urls.insert(
+                ("testproject".to_string(), "standard".to_string()),
+                "container://example.com".to_string(),
+            );
+            let info = crate::obs::BuildInfo {
+                error: None,
+                bdeps: Vec::new(),
+                preinstall_image: None,
+                urls,
+            };
+            let DownloadedDep::InMemory(bytes, warmed) = vertical
+                .download_dep(
+                    &req,
+                    &info,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap()
+            else {
+                panic!("expected an in-memory download");
+            };
+            assert_eq!(bytes, rpm);
+            assert_eq!(warmed, None);
+            assert_eq!(http.get_bytes_calls(), vec![(api_url, true)]);
+        }
+
+        #[test]
+        fn download_dep_accepts_an_uppercase_mirror_scheme() {
+            // The scheme guard is case-insensitive: an uppercase
+            // scheme is still a mirror URL, fetched with no
+            // credentials.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"glibc payload");
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let mirror_url = format!(
+                "HTTPS://mirror.example.com/repos/testproject/standard/{arch}/glibc-2.38-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new().with_get_bytes(&mirror_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(hdrmd5),
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let mut urls = HashMap::new();
+            urls.insert(
+                ("testproject".to_string(), "standard".to_string()),
+                "HTTPS://mirror.example.com/repos/testproject/standard/".to_string(),
+            );
+            let info = crate::obs::BuildInfo {
+                error: None,
+                bdeps: Vec::new(),
+                preinstall_image: None,
+                urls,
+            };
+            let DownloadedDep::InMemory(bytes, warmed) = vertical
+                .download_dep(
+                    &req,
+                    &info,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap()
+            else {
+                panic!("expected an in-memory download");
+            };
+            assert_eq!(bytes, rpm);
+            assert_eq!(warmed, None);
+            assert_eq!(http.get_bytes_calls(), vec![(mirror_url, false)]);
+        }
+
+        #[test]
+        fn ensure_cached_downloads_from_the_mirror_first() {
+            // End to end: a cache miss with a mirror URL fetches
+            // from the mirror, lands the verified file in the cache,
+            // and never touches the API.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let rpm = make_rpm(b"helper payload");
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let mirror_url = format!(
+                "https://mirror.example.com/repos/testproject/standard/{arch}/helper-1.0-1.{arch}.rpm"
+            );
+            let http = FakeHttp::new().with_get_bytes(&mirror_url, &rpm);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "helper".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: Some(hdrmd5),
+                preinstall: false,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let mut stats = CacheStats::default();
+            let filename = format!("helper-1.0-1.{arch}.rpm");
+            let cached = vertical
+                .ensure_cached(&req, &mirror_info(), &dep, &filename, &mut stats)
+                .unwrap();
+            assert_eq!(fs::read(&cached).unwrap(), rpm);
+            assert_eq!(stats.pkg_misses, 1);
+            assert_eq!(http.get_bytes_calls(), vec![(mirror_url, false)]);
         }
 
         #[test]
@@ -12989,6 +13774,7 @@ exit 0
             let downloaded = vertical
                 .download_dep(
                     &req,
+                    &empty_info(),
                     &dep,
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),

@@ -974,6 +974,21 @@ semantics and the project-set enumeration, not its tests).**
   (`osc/commandline.py:7788`, "trust packages from all projects") is
   the wording geectl's flag help follows.
 
+## Batch 13 — mirror-first dep fetch
+
+**Direct adoptions: 1 unit test.**
+
+- `tests/test_grabber.py::test_invalid_scheme` — a `container://`
+  mirror URL must not fail the fetch →
+  `download_dep_ignores_a_non_http_mirror_url` (mirror URL skipped,
+  API only). The grabber's other behaviour (mirrors tried in order,
+  any failure falling through) is the mirror-first order itself,
+  pinned by geectl's own fallback tests, not adopted case by case.
+- `osc/build.py:375-382` (path-url to download-URL construction) and
+  `osc/grabber.py:36-51` (mirror-group fallback) are the spec reference
+  for the URL shape and the any-failure-falls-back rule, not adopted
+  tests.
+
 ## Counts (direct adoptions, de-duplicated)
 
 | Batch | Unit | Behave | Total |
@@ -994,15 +1009,17 @@ semantics and the project-set enumeration, not its tests).**
 | Gap batch 3 — buildconfig --alternative-project (#252) | 0 (+spec ref) | 0 | 0 (+spec) |
 | 11 prjconf | 0 | 0 | 0 |
 | 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
-| **Total adopted** | **105** | **120** | **225** |
+| 13 mirror-first dep fetch | 1 | 0 | 1 |
+| **Total adopted** | **106** | **120** | **226** |
 
 Surveyed base: 272 behave scenarios + 707 unit tests = 979 items;
-adoptable as written: 225 of them (120 behave scenarios, 105 unit tests),
+adoptable as written: 226 of them (120 behave scenarios, 106 unit tests),
 plus the batch 1/6 protocol specs. The rest is SKIP (osc-internal),
 stdout-only, covered by geectl's existing tests, or a gap for a batch
-that has not landed. The table sums to 225; issue #40 counts 231
-(125 behave + 106 unit) — the 6-count gap (5 behave + 1 unit)
-predates this sweep and is unresolved.
+that has not landed. The table sums to 226; issue #40 counts 241
+(125 behave + 116 unit) — the 15-count gap (5 behave + 10 unit)
+predates this batch and is unresolved: 6 of the unit gap is #217's
+working-copy adoptions, recorded in the issue but not in this table.
 
 ## Quirks in osc's own tests
 
