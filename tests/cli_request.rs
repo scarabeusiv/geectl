@@ -810,6 +810,46 @@ fn request_supersede_without_credentials_fails_with_config_error() {
     assert_eq!(error_of(&out)["error"]["code"], "config_error");
 }
 
+/// Read one request (headers + body) from a loopback connection:
+/// the body length comes from Content-Length (a request without one
+/// has no body). A single read can return only the headers when the
+/// body arrives in a later segment, and answering before the body is
+/// read resets the client's write on Windows, which the client reads
+/// as a transport failure.
+fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header_end = end + 4;
+                    let header_text = String::from_utf8_lossy(&buf[..end]);
+                    let content_length: usize = header_text
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                v.trim().parse().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
 /// A many-shot HTTP fixture answering every request with a status-ok
 /// body: the supersede POST needs one canned answer, and the test
 /// runs the command twice (JSON and text) against the same server.
@@ -820,7 +860,7 @@ fn serve_supersede_ok() -> (
     std::net::SocketAddr,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let body = "<status code=\"ok\" />";
@@ -831,12 +871,11 @@ fn serve_supersede_ok() -> (
             let Ok(mut stream) = stream else {
                 continue;
             };
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = read_request(&mut stream);
             seen_in_thread
                 .lock()
                 .unwrap()
-                .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                .push(String::from_utf8_lossy(&request).into_owned());
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -844,6 +883,7 @@ fn serve_supersede_ok() -> (
             );
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
         }
     });
     (addr, seen)

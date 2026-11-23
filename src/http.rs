@@ -3360,7 +3360,7 @@ mod tests {
         listener.set_nonblocking(true).expect("nonblocking");
         let port = listener.local_addr().expect("local addr").port();
         let handle = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 match listener.accept() {
@@ -3372,8 +3372,7 @@ mod tests {
                         // server answers a request it never read.
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf);
+                        let _ = read_request(&mut stream);
                         let mut response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
                             body.len()
@@ -3381,6 +3380,8 @@ mod tests {
                         .into_bytes();
                         response.extend_from_slice(&body);
                         let _ = stream.write_all(&response);
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
                         return;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

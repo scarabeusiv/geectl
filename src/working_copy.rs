@@ -7753,11 +7753,20 @@ mod tests {
         // excludes.
         let home = TempDirGuard::new("fake-home");
         std::fs::write(home.path.join("excludes"), "*.patch\n").unwrap();
+        // Gitconfig values treat `\` as an escape, so a Windows
+        // path (`C:\...`) fails to parse; git on Windows accepts
+        // forward slashes. HOME is process-wide, so this config is
+        // visible to every test in this process: it must parse
+        // wherever a parallel test's `git init` reads it.
+        let excludes = home
+            .path
+            .join("excludes")
+            .to_string_lossy()
+            .replace('\\', "/");
         std::fs::write(
             home.path.join(".gitconfig"),
             format!(
-                "[user]\n\tname = geectl\n\temail = geectl@localhost\n[core]\n\texcludesFile = {}\n",
-                home.path.join("excludes").display()
+                "[user]\n\tname = geectl\n\temail = geectl@localhost\n[core]\n\texcludesFile = {excludes}\n"
             ),
         )
         .unwrap();

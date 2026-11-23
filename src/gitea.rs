@@ -7568,18 +7568,58 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                use std::io::Read;
                 use std::io::Write;
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+                let _ = read_request(&mut stream);
                 let response = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
         (port, handle)
+    }
+
+    /// Read one request (headers + body) from a loopback connection:
+    /// the body length comes from Content-Length (a request without one
+    /// has no body). A single read can return only the headers when the
+    /// body arrives in a later segment, and answering before the body is
+    /// read resets the client's write on Windows, which the client reads
+    /// as a transport failure.
+    fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header_end = end + 4;
+                        let header_text = String::from_utf8_lossy(&buf[..end]);
+                        let content_length: usize = header_text
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= header_end + content_length {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        buf
     }
 
     #[test]

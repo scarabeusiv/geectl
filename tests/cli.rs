@@ -953,15 +953,14 @@ fn remote_unreachable_server_fails_with_network_error() {
 /// same single-connection shape as `serve_once`, for the failure
 /// paths (a credentialed read answered 401).
 fn serve_once_status(status: u16, reason: &str, body: &str) -> std::net::SocketAddr {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let body = body.to_string();
     let reason = reason.to_string();
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf);
+        let _ = read_request(&mut stream);
         let response = format!(
             "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
@@ -969,6 +968,7 @@ fn serve_once_status(status: u16, reason: &str, body: &str) -> std::net::SocketA
         );
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
     });
     addr
 }
@@ -977,18 +977,57 @@ fn serve_once(body: &str) -> std::net::SocketAddr {
     serve_once_status(200, "OK", body)
 }
 
+/// Read one request (headers + body) from a loopback connection:
+/// the body length comes from Content-Length (a request without one
+/// has no body). A single read can return only the headers when the
+/// body arrives in a later segment, and answering before the body is
+/// read resets the client's write on Windows, which the client reads
+/// as a transport failure.
+fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header_end = end + 4;
+                    let header_text = String::from_utf8_lossy(&buf[..end]);
+                    let content_length: usize = header_text
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                v.trim().parse().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
 /// A one-shot HTTP fixture serving raw bytes: the same
 /// single-connection shape as `serve_once`, for downloads whose body
 /// is not valid UTF-8.
 fn serve_once_bytes(body: &[u8]) -> std::net::SocketAddr {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let body = body.to_vec();
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf);
+        let _ = read_request(&mut stream);
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -996,6 +1035,7 @@ fn serve_once_bytes(body: &[u8]) -> std::net::SocketAddr {
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.write_all(&body);
         let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
     });
     addr
 }
@@ -1008,7 +1048,7 @@ fn serve_once_bytes(body: &[u8]) -> std::net::SocketAddr {
 /// test fails on its own assertion and the thread dies with the
 /// test process.
 fn serve_many(body: &str) -> std::net::SocketAddr {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let body = body.to_string();
@@ -1017,8 +1057,7 @@ fn serve_many(body: &str) -> std::net::SocketAddr {
             let Ok(mut stream) = stream else {
                 continue;
             };
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
+            let _ = read_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -1026,6 +1065,7 @@ fn serve_many(body: &str) -> std::net::SocketAddr {
             );
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
         }
     });
     addr
