@@ -405,12 +405,25 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
 
 /// True when `text` carries `marker` outside a quoted attribute
 /// value: inside quotes the marker is literal text, outside it the
-/// marker starts a comment or a processing instruction.
+/// marker starts a comment or a processing instruction. Quotes only
+/// count inside a tag — a quote in element text is literal — and a
+/// CDATA section is opaque, like the XML layer treats it.
 fn text_has_unquoted(text: &str, marker: &str) -> bool {
     let bytes = text.as_bytes();
+    let marker = marker.as_bytes();
+    let mut in_tag = false;
     let mut in_quote: Option<u8> = None;
     let mut i = 0;
     while i < bytes.len() {
+        if bytes[i..].starts_with(b"<![CDATA[") {
+            match find_subslice(&bytes[i + 9..], b"]]>") {
+                Some(end) => {
+                    i += 9 + end + 3;
+                    continue;
+                }
+                None => return false,
+            }
+        }
         let b = bytes[i];
         if let Some(q) = in_quote {
             if b == q {
@@ -419,17 +432,32 @@ fn text_has_unquoted(text: &str, marker: &str) -> bool {
             i += 1;
             continue;
         }
-        if b == b'"' || b == b'\'' {
+        if (b == b'"' || b == b'\'') && in_tag {
             in_quote = Some(b);
             i += 1;
             continue;
         }
-        if text[i..].starts_with(marker) {
-            return true;
+        if b == b'<' {
+            if bytes[i..].starts_with(marker) {
+                return true;
+            }
+            in_tag = true;
+            i += 1;
+            continue;
+        }
+        if b == b'>' && in_tag {
+            in_tag = false;
         }
         i += 1;
     }
     false
+}
+
+/// The byte offset of the first `needle` in `haystack`, if any.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Record a refusal reason once: the same dropped piece named twice
@@ -1502,8 +1530,35 @@ mod tests {
     }
 
     #[test]
+    fn text_has_unquoted_ignores_quotes_in_element_text() {
+        // An apostrophe in element text is literal: the comment
+        // after it is still found.
+        assert!(text_has_unquoted(
+            "<pubkey>Comment: Tom's key</pubkey><!-- a note -->",
+            "<!--"
+        ));
+        // A marker inside a quoted attribute value is literal.
+        assert!(!text_has_unquoted(
+            "<download url=\"https://example.com/<!--\" />",
+            "<!--"
+        ));
+        // A marker inside a CDATA section is opaque text.
+        assert!(!text_has_unquoted(
+            "<pubkey><![CDATA[<!-- not a comment -->]]></pubkey>",
+            "<!--"
+        ));
+        assert!(!text_has_unquoted("<arch>x86_64</arch>", "<!--"));
+    }
+
+    #[test]
     fn set_project_meta_refuses_a_repository_rewrite_with_a_comment_inside_a_repository() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><!-- a note --><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        set_project_meta_replacing_repositories_is_refused(META);
+    }
+
+    #[test]
+    fn set_project_meta_refuses_a_repository_rewrite_with_a_comment_after_a_quoted_pubkey() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><pubkey>Comment: Tom's key</pubkey></download><!-- a note --><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
         set_project_meta_replacing_repositories_is_refused(META);
     }
 
