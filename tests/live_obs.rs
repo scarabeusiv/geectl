@@ -5760,6 +5760,41 @@ fn live_build_log_and_status_none_for_a_never_built_package() {
         None,
         "a package that was never built has no log"
     );
+    // The new selectors round-trip against the live server on the
+    // same never-built package: strip-time changes nothing when
+    // there is no log, and the flavored path (`pkg:flavor1`) is
+    // accepted by the server the same way (404 reads as no log).
+    // No live build runs here, so no log content exists to strip;
+    // the strip itself is pinned by the unit tests.
+    assert_eq!(
+        client
+            .build_log(
+                &source_project,
+                &package,
+                "standard",
+                "x86_64",
+                &BuildLogQuery {
+                    strip_time: true,
+                    ..BuildLogQuery::default()
+                }
+            )
+            .expect("stripped build log on the live instance"),
+        None,
+        "strip-time on a package that was never built has no log either"
+    );
+    assert_eq!(
+        client
+            .build_log(
+                &source_project,
+                &format!("{package}:flavor1"),
+                "standard",
+                "x86_64",
+                &BuildLogQuery::default()
+            )
+            .expect("flavored build log on the live instance"),
+        None,
+        "a flavored package that was never built has no log either"
+    );
     assert_eq!(
         client
             .build_status(&source_project, &package, "standard", "x86_64")

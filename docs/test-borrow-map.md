@@ -526,6 +526,31 @@ rules:
   `behave/features/build.feature` (3 scenarios — local buildroot/chroot;
   out of scope, issue #43).
 
+## Batch 5b — build-log selectors (#206)
+
+**Direct adoptions: 0. Source pins: 3.**
+
+No osc test pins the `rbl`/`buildlog` behaviour being built: `behave/features/`
+has no `buildlog`/`rbl` scenario, and `tests/` has no `parse_buildlogurl`
+or strip-time test — only `tests/test_conf.py:211`
+(`test_buildlog_strip_time`, the `buildlog_strip_time = 0` config
+default), which is SKIP: geectl has no such config; `--strip-time`
+is a per-invocation flag. Adopted as source pins instead (behaviour
+specs, not test cases):
+
+- `osc/core.py:105` `BUILDLOGURL_RE` — the API-form URL shape
+  (`https?://<host>/build/<project>/<repository>/<arch>/<package>/_log`),
+  adopted verbatim for geectl's URL form.
+- `osc/core.py:4722` `buildlog_strip_time` — the `^\[[^\]]*\] ` strip
+  rule, adopted as a manual line-prefix strip (no regex dependency).
+- `osc/commandline.py:6807-6808` (`do_buildlog`) — `-M FLAVOR`
+  appends `:FLAVOR` to the package, adopted for `--multibuild`.
+
+The web-UI URL form (`build.opensuse.org/package/live_build_log/…`)
+has no osc equivalent (`parse_buildlogurl` only takes the API form);
+it is geectl's own addition, written from scratch and pinned by
+geectl unit tests.
+
 ## Batch 6 — working-copy layer
 
 **Direct adoptions: 0. Spec reference: 36 tests.**
@@ -798,6 +823,7 @@ Batch in brackets:
 | 3 remote read | 36 | 17 | 53 (+1 protocol spec) |
 | 4 branch/copy/link | 9 | 42 | 51 |
 | 5 build status | 4 | 42 | 46 |
+| 5b build-log selectors (#206) | 0 (+3 source pins) | 0 | 0 (+pins) |
 | 6 working-copy layer | 0 (+36 spec ref) | 0 | 0 (+spec) |
 | 7 maintenance requests | 0 (counted in 2/4) | 0 (counted in 2/4) | 0 (+gaps) |
 | 8 services | 0 | 1 | 1 |

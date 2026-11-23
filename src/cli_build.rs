@@ -50,9 +50,9 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    valid_obs_filename, BinaryFile, BuildHistoryEntry, BuildInfo, BuildLogQuery, BuildResults,
-    DryRun, ExtDependency, FileInfo, JobHistoryEntry, JobStatus, ObsClient, PackageDeps,
-    ProvidedBy, Repository, ResultsQuery, OBS_API_BASE,
+    parse_build_log_url, valid_obs_filename, valid_obs_name, BinaryFile, BuildHistoryEntry,
+    BuildInfo, BuildLogQuery, BuildResults, DryRun, ExtDependency, FileInfo, JobHistoryEntry,
+    JobStatus, ObsClient, PackageDeps, ProvidedBy, Repository, ResultsQuery, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -90,14 +90,19 @@ pub enum BuildCommand {
     },
     /// Read the build log for a package.
     BuildLog {
-        /// The project the package is in.
+        /// The project the package is in — or a build-log URL, in
+        /// which case the other coordinates are omitted. The URL
+        /// form takes an API log URL
+        /// (`http(s)://<api-host>/build/<project>/<repository>/<arch>/<package>/_log`)
+        /// or a web-UI log URL
+        /// (`http(s)://build.opensuse.org/package/live_build_log/<project>/<package>/<repository>/<arch>`).
         project: String,
-        /// The package to read the log for.
-        package: String,
-        /// The repository the package builds in.
-        repository: String,
-        /// The architecture the package builds for.
-        arch: String,
+        /// The package to read the log for. Omit with a URL.
+        package: Option<String>,
+        /// The repository the package builds in. Omit with a URL.
+        repository: Option<String>,
+        /// The architecture the package builds for. Omit with a URL.
+        arch: Option<String>,
         /// Start reading at this byte offset; a negative offset reads
         /// from the end of the log.
         #[arg(long, allow_hyphen_values = true)]
@@ -109,6 +114,14 @@ pub enum BuildCommand {
         /// The last succeeded build's log. Cannot combine with `--last`.
         #[arg(long)]
         lastsucceeded: bool,
+        /// Only this multibuild flavor's log: appends `:FLAVOR` to
+        /// the package. Refused when the package already carries a
+        /// flavor.
+        #[arg(long, value_name = "FLAVOR")]
+        multibuild: Option<String>,
+        /// Strip the leading `[timestamp] ` from each log line.
+        #[arg(long)]
+        strip_time: bool,
     },
     /// Read the build status code for a package.
     BuildStatus {
@@ -372,6 +385,83 @@ impl ResultsQueryArgs {
     }
 }
 
+/// Resolve the `build-log` coordinates: either all four
+/// positionals, or a single build-log URL in the first positional.
+/// A URL takes no other coordinates, and `--multibuild` appends
+/// `:FLAVOR` to the resolved package (refused when the package
+/// already carries a flavor, or when the flavor is not a valid
+/// OBS name fragment).
+fn resolve_build_log_coordinates(
+    project: &str,
+    package: Option<&str>,
+    repository: Option<&str>,
+    arch: Option<&str>,
+    multibuild: Option<&str>,
+    api_base: &str,
+) -> Result<(String, String, String, String), GeectlError> {
+    let (project, mut package, repository, arch) = match (package, repository, arch) {
+        (Some(package), Some(repository), Some(arch)) => {
+            if is_build_log_url(project) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    "a build-log URL takes no other coordinates: pass the URL alone",
+                ));
+            }
+            (
+                project.to_string(),
+                package.to_string(),
+                repository.to_string(),
+                arch.to_string(),
+            )
+        }
+        (None, None, None) => {
+            let coords = parse_build_log_url(project, api_base)?;
+            (
+                coords.project,
+                coords.package,
+                coords.repository,
+                coords.arch,
+            )
+        }
+        _ => {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "pass all four coordinates (PROJECT PACKAGE REPOSITORY ARCH) or a single build-log URL",
+            ));
+        }
+    };
+    if let Some(flavor) = multibuild {
+        if flavor.contains(':') || !valid_obs_name(flavor) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("--multibuild needs a flavor name, not {flavor:?}"),
+            ));
+        }
+        if package.contains(':') {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("package {package:?} already carries a flavor; --multibuild adds another"),
+            ));
+        }
+        package = format!("{package}:{flavor}");
+    }
+    Ok((project, package, repository, arch))
+}
+
+/// True when the first positional is a pasted build-log URL rather
+/// than a project name: project names never carry `://`.
+fn is_build_log_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+/// The coordinate header for a resolved `build-log`: the four
+/// coordinates, in order. It echoes resolved coordinates, never a
+/// pasted URL (the helper's arm below can only echo what was given,
+/// so `run_build` does not use it for `build-log`).
+fn build_log_header(project: &str, package: &str, repository: &str, arch: &str) -> String {
+    format!("project: {project} package: {package} repository: {repository} arch: {arch}")
+}
+
 /// Run one `build` subcommand: build the OBS client from the
 /// effective config and credentials, call the library operation, and
 /// return the `(payload, text)` pair. Every build command except
@@ -394,6 +484,28 @@ pub fn run_build(
     // public and never touches them, so a half-set credential env
     // (username without password) must not break it.
     let (base, instances) = obs_endpoint()?;
+    // The build-log coordinates resolve before credentials: a pasted
+    // URL or a half-given coordinate set fails with its own typed
+    // error instead of a credentials error, and the header below
+    // echoes resolved coordinates, never a pasted URL.
+    let resolved_log = match &command {
+        BuildCommand::BuildLog {
+            project,
+            package,
+            repository,
+            arch,
+            multibuild,
+            ..
+        } => Some(resolve_build_log_coordinates(
+            project,
+            package.as_deref(),
+            repository.as_deref(),
+            arch.as_deref(),
+            multibuild.as_deref(),
+            &base,
+        )?),
+        _ => None,
+    };
     let credentials = match &command {
         BuildCommand::ListRepositories { .. } => Credentials::None,
         BuildCommand::RebuildPackage { .. }
@@ -407,12 +519,19 @@ pub fn run_build(
     };
     let client =
         ObsClient::with_base_and_credentials(&http, &base, credentials)?.with_debug(debug.clone());
-    // The coordinate header (design rule 1) is
-    // computed from the command before the match moves it. Every arm
-    // prepends it — except the `BuildLog` and `Buildconfig` content
-    // itself, whose text is the content verbatim (rule 4); the
-    // `BuildLog` synthetic `no log` line still carries the header.
-    let header = coordinates_header(&command);
+    // The coordinate header (design rule 1) is computed from the
+    // command before the match moves it — except `build-log`, whose
+    // header comes from the resolved coordinates above, so a pasted
+    // URL never echoes as a project. Every arm prepends it — except
+    // the `BuildLog` and `Buildconfig` content itself, whose text is
+    // the content verbatim (rule 4); the `BuildLog` synthetic
+    // `no log` line still carries the header.
+    let header = match &resolved_log {
+        Some((project, package, repository, arch)) => {
+            build_log_header(project, package, repository, arch)
+        }
+        None => coordinates_header(&command),
+    };
     match command {
         BuildCommand::Results {
             project,
@@ -440,18 +559,19 @@ pub fn run_build(
             ))
         }
         BuildCommand::BuildLog {
-            project,
-            package,
-            repository,
-            arch,
             start,
             last,
             lastsucceeded,
+            strip_time,
+            ..
         } => {
+            let (project, package, repository, arch) =
+                resolved_log.expect("build-log coordinates resolve before dispatch");
             let query = BuildLogQuery {
                 start,
                 last,
                 lastsucceeded,
+                strip_time,
             };
             let log = client.build_log(&project, &package, &repository, &arch, &query)?;
             // No coordinate header on the log itself: the text *is*
@@ -862,8 +982,23 @@ fn coordinates_header(command: &BuildCommand) -> String {
             repository,
             arch,
             ..
+        } => {
+            // Only the unresolved form reaches here: run_build
+            // resolves build-log coordinates before dispatch and
+            // headers the resolved form, so this echoes what was
+            // given (a URL form echoes the URL as the project).
+            coords.push(format!("project: {project}"));
+            if let Some(package) = package {
+                coords.push(format!("package: {package}"));
+            }
+            if let Some(repository) = repository {
+                coords.push(format!("repository: {repository}"));
+            }
+            if let Some(arch) = arch {
+                coords.push(format!("arch: {arch}"));
+            }
         }
-        | BuildCommand::BuildStatus {
+        BuildCommand::BuildStatus {
             project,
             package,
             repository,
@@ -2129,13 +2264,20 @@ mod tests {
             coordinates_header(&parse_build(&["list-binaries", "p", "r", "a"])),
             "project: p repository: r arch: a"
         );
+        // `build-log` has an arm in the helper for the unresolved
+        // form, but `run_build` headers the resolved coordinates
+        // (`build_log_header`), so a pasted URL never echoes as a
+        // project. The run_build arm deliberately does not prepend
+        // it to the log content (rule 4: the log is verbatim
+        // content).
         assert_eq!(
             coordinates_header(&parse_build(&["build-log", "p", "k", "r", "a"])),
             "project: p package: k repository: r arch: a"
         );
-        // The helper still builds the header for `build-log`; the
-        // run_build arm deliberately does not prepend it to the log
-        // content (rule 4: the log is verbatim content).
+        assert_eq!(
+            build_log_header("p", "k", "r", "a"),
+            "project: p package: k repository: r arch: a"
+        );
         assert_eq!(
             coordinates_header(&parse_build(&[
                 "wait-for-results",
@@ -3266,6 +3408,217 @@ mod tests {
                 assert!(lastsucceeded);
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_build_log_multibuild_and_strip_time() {
+        match parse_build(&[
+            "build-log",
+            "p",
+            "k",
+            "r",
+            "a",
+            "--multibuild",
+            "flavor1",
+            "--strip-time",
+        ]) {
+            BuildCommand::BuildLog {
+                project,
+                package,
+                repository,
+                arch,
+                multibuild,
+                strip_time,
+                ..
+            } => {
+                assert_eq!(project, "p");
+                assert_eq!(package.as_deref(), Some("k"));
+                assert_eq!(repository.as_deref(), Some("r"));
+                assert_eq!(arch.as_deref(), Some("a"));
+                assert_eq!(multibuild.as_deref(), Some("flavor1"));
+                assert!(strip_time);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_build_log_url_form_parses_as_one_positional() {
+        match parse_build(&["build-log", "https://api.opensuse.org/build/p/r/a/k/_log"]) {
+            BuildCommand::BuildLog {
+                project,
+                package,
+                repository,
+                arch,
+                ..
+            } => {
+                assert_eq!(project, "https://api.opensuse.org/build/p/r/a/k/_log");
+                assert_eq!(package, None);
+                assert_eq!(repository, None);
+                assert_eq!(arch, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_build_log_coordinates_four_positionals() {
+        assert_eq!(
+            resolve_build_log_coordinates(
+                "p",
+                Some("k"),
+                Some("r"),
+                Some("a"),
+                None,
+                "https://api.opensuse.org"
+            )
+            .unwrap(),
+            (
+                "p".to_string(),
+                "k".to_string(),
+                "r".to_string(),
+                "a".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_build_log_coordinates_url_forms() {
+        assert_eq!(
+            resolve_build_log_coordinates(
+                "https://api.opensuse.org/build/p/r/a/k/_log",
+                None,
+                None,
+                None,
+                None,
+                "https://api.opensuse.org"
+            )
+            .unwrap(),
+            (
+                "p".to_string(),
+                "k".to_string(),
+                "r".to_string(),
+                "a".to_string()
+            )
+        );
+        assert_eq!(
+            resolve_build_log_coordinates(
+                "https://build.opensuse.org/package/live_build_log/p/k/r/a",
+                None,
+                None,
+                None,
+                None,
+                "https://api.opensuse.org"
+            )
+            .unwrap(),
+            (
+                "p".to_string(),
+                "k".to_string(),
+                "r".to_string(),
+                "a".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_build_log_coordinates_multibuild_appends_the_flavor() {
+        assert_eq!(
+            resolve_build_log_coordinates(
+                "p",
+                Some("k"),
+                Some("r"),
+                Some("a"),
+                Some("flavor1"),
+                "https://api.opensuse.org"
+            )
+            .unwrap()
+            .1,
+            "k:flavor1"
+        );
+        // A URL form with a flavored package plus --multibuild is
+        // the same append, on the resolved package.
+        assert_eq!(
+            resolve_build_log_coordinates(
+                "https://api.opensuse.org/build/p/r/a/k/_log",
+                None,
+                None,
+                None,
+                Some("flavor1"),
+                "https://api.opensuse.org"
+            )
+            .unwrap()
+            .1,
+            "k:flavor1"
+        );
+    }
+
+    #[test]
+    fn resolve_build_log_coordinates_fails_closed() {
+        let api = "https://api.opensuse.org";
+        // A half-given coordinate set names neither form.
+        for (project, package, repository, arch) in [
+            ("p", Some("k"), None, None),
+            ("p", Some("k"), Some("r"), None),
+            ("p", None, Some("r"), Some("a")),
+        ] {
+            let err = resolve_build_log_coordinates(project, package, repository, arch, None, api)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.context.contains("all four coordinates"),
+                "{}",
+                err.context
+            );
+        }
+        // A URL with other coordinates is not a coordinate set.
+        let err = resolve_build_log_coordinates(
+            "https://api.opensuse.org/build/p/r/a/k/_log",
+            Some("k"),
+            Some("r"),
+            Some("a"),
+            None,
+            api,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains("no other coordinates"),
+            "{}",
+            err.context
+        );
+        // A single positional that is not a URL.
+        let err = resolve_build_log_coordinates("p", None, None, None, None, api).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // --multibuild on a package that already carries a flavor.
+        let err = resolve_build_log_coordinates(
+            "p",
+            Some("k:flavor1"),
+            Some("r"),
+            Some("a"),
+            Some("flavor2"),
+            api,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains("already carries a flavor"),
+            "{}",
+            err.context
+        );
+        // --multibuild with no flavor, or a flavor that is not a
+        // name fragment.
+        for flavor in ["", "a/b", "a:b"] {
+            let err = resolve_build_log_coordinates(
+                "p",
+                Some("k"),
+                Some("r"),
+                Some("a"),
+                Some(flavor),
+                api,
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{flavor:?}");
         }
     }
 

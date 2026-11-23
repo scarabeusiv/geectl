@@ -123,12 +123,14 @@ pub(crate) mod test_support;
 pub(crate) mod types;
 
 pub(crate) use self::branch::build_link_meta;
+pub use self::build::parse_build_log_url;
 pub(crate) use self::build::repository_element;
 pub(crate) use self::build::validate_repository_settings;
 pub use self::build::BinaryFile;
 pub use self::build::BuildDep;
 pub use self::build::BuildHistoryEntry;
 pub use self::build::BuildInfo;
+pub use self::build::BuildLogCoordinates;
 pub use self::build::BuildLogQuery;
 pub use self::build::BuildResult;
 pub use self::build::BuildResults;

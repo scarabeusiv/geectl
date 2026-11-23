@@ -736,6 +736,8 @@ geectl --format text remote list-packages openSUSE:Factory
 # Build status
 geectl build results openSUSE:Factory --code failed
 geectl build build-log openSUSE:Factory vim standard x86_64
+geectl build build-log openSUSE:Factory multibuild-pkg standard x86_64 --multibuild flavor1 --strip-time
+geectl build build-log https://build.opensuse.org/package/live_build_log/openSUSE:Factory/vim/standard/x86_64
 geectl build list-binaries openSUSE:Factory standard x86_64 --package vim
 
 # Submit requests

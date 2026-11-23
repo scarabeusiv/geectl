@@ -131,11 +131,12 @@ with no osc counterpart.
 | `results [PROJECT [PACKAGE]]` | `build results PROJECT` + `--package` flag | Positionals are required coordinates only; the optional package is a flag |
 | `prjresults [PROJECT]` | Dropped (`build results PROJECT`) | The same matrix without a package filter; one matrix command |
 | `buildlog` | `build build-log` | Kebab-case library name under the `build` group; the mapping stays mechanical (group + kebab(library op)) |
-| `buildlog [REPOSITORY ARCH \| BUILDLOGURL]` | `build build-log PROJECT PACKAGE REPOSITORY ARCH` | Explicit coordinates; no URL form, no hostarch default |
+| `buildlog [REPOSITORY ARCH \| BUILDLOGURL]` | `build build-log PROJECT PACKAGE REPOSITORY ARCH`, or `build build-log BUILDLOGURL` | Explicit coordinates, or a single build-log URL (API or web-UI form); no hostarch default |
 | `buildlog` tail via `blt` alias | Dropped | No follow/tail mode; the library reads whole logs only |
 | `buildlog --lastsucceeded` / `--last-succeeded` (two spellings) | `--lastsucceeded` | One spelling, the library field name |
+| `buildlog -M/--multibuild-package FLAVOR` | `build build-log --multibuild FLAVOR` | The flavor appends `:FLAVOR` to the package |
 | `buildlog -o/--offset` | `build build-log --start` | Flag named after the library query field |
-| `buildlog -s/--strip-time` | Dropped | Logs are rendered verbatim; no post-processing of server text |
+| `buildlog -s/--strip-time` | `build build-log --strip-time` | Client-side strip of the leading `[timestamp] ` from each log line |
 | `buildinfo [REPOSITORY ARCH [BUILD_DESCR]]` | `build buildinfo PROJECT PACKAGE REPOSITORY ARCH` | Explicit coordinates; no local-spec (`BUILD_DESCR`) form — the library reads the server-side spec only |
 | `buildconfig REPOSITORY (in pkg or prj dir) \| buildconfig PROJECT REPOSITORY` | `build buildconfig PROJECT REPOSITORY` | Explicit coordinates; no in-directory form — project is always required; the config text renders verbatim, coordinates in the payload |
 | `buildhistory` | `build build-history` | Kebab-case library name, same mechanical mapping as `build-log` |

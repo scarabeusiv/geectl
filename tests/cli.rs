@@ -3837,6 +3837,94 @@ fn build_log_last_and_lastsucceeded_conflict() {
 }
 
 #[test]
+fn build_log_single_positional_that_is_not_a_url_fails_with_invalid_input() {
+    // A single positional must be a build-log URL: a bare project
+    // name fails in resolution (exit 2, invalid_input) before any
+    // credential or network work.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["build", "build-log", "openSUSE:Factory"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("not a build-log URL"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn build_log_url_with_coordinates_fails_with_invalid_input() {
+    // A pasted URL takes no other coordinates.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "build",
+            "build-log",
+            "https://api.opensuse.org/build/p/r/a/k/_log",
+            "k",
+            "r",
+            "a",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("no other coordinates"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn build_log_multibuild_on_flavored_package_fails_with_invalid_input() {
+    // --multibuild appends a flavor; a package that already carries
+    // one refuses instead of gaining a second.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "build",
+            "build-log",
+            "p",
+            "k:flavor1",
+            "r",
+            "a",
+            "--multibuild",
+            "flavor2",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("already carries a flavor"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn build_download_binary_without_output_fails_with_parse_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)

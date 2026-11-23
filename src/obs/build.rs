@@ -280,6 +280,150 @@ pub struct BuildLogQuery {
     pub last: bool,
     /// The last succeeded build's log. Cannot combine with `last`.
     pub lastsucceeded: bool,
+    /// Strip the leading `[timestamp] ` from each log line before
+    /// returning the text. Client-side only: the server sends the
+    /// same log either way.
+    pub strip_time: bool,
+}
+
+/// Build-log coordinates from a pasted URL: project, package,
+/// repository, arch. The package may carry a multibuild flavor
+/// (`pkg:flavor`), as in the four-coordinate form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildLogCoordinates {
+    /// The project the package is in.
+    pub project: String,
+    /// The package to read the log for, with an optional `:flavor`.
+    pub package: String,
+    /// The repository the package builds in.
+    pub repository: String,
+    /// The architecture the package builds for.
+    pub arch: String,
+}
+
+/// The host (with port, if any) of an `http(s)://` URL, or None
+/// when the URL has no `http(s)://` scheme.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    Some(rest.split('/').next().unwrap_or(""))
+}
+
+/// Parse a pasted build-log URL into its coordinates. Two forms,
+/// both fail closed: anything else is an [`ErrorKind::InvalidInput`]
+/// naming the expected forms, never a guess.
+///
+/// * API form: `http(s)://<api-host>/build/<project>/<repository>/<arch>/<package>/_log`
+///   — the host must be the configured API host (`api_base`).
+/// * Web-UI form: `http(s)://build.opensuse.org/package/live_build_log/<project>/<package>/<repository>/<arch>`
+///   — only for the public instance: the configured API host must
+///   be `api.opensuse.org`, since no other web host maps to a known
+///   API host.
+///
+/// The URL takes no query string or fragment: a pasted `?start=…`
+/// or `#…` is refused rather than silently ignored.
+pub fn parse_build_log_url(url: &str, api_base: &str) -> Result<BuildLogCoordinates, GeectlError> {
+    let expected = "expected http(s)://<api-host>/build/<project>/<repository>/<arch>/<package>/_log \
+        or http(s)://build.opensuse.org/package/live_build_log/<project>/<package>/<repository>/<arch>";
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("not a build-log URL: {url:?}; {expected}"),
+        )
+    };
+    if url.contains('?') || url.contains('#') {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("build-log URL takes no query string or fragment: {url:?}; {expected}"),
+        ));
+    }
+    let Some(host) = url_host(url) else {
+        return Err(malformed());
+    };
+    let api_host = url_host(api_base.trim_end_matches('/')).unwrap_or("");
+    let Some((_, rest)) = url.split_once("://") else {
+        return Err(malformed());
+    };
+    let segments: Vec<&str> = rest.split('/').collect();
+    // segments[0] is the host; the rest is the path.
+    let path = &segments[1..];
+    let coords = match path {
+        ["build", project, repository, arch, package, "_log"] => {
+            if host != api_host {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "build-log URL points at {host}, but the configured API host is {api_host}"
+                    ),
+                ));
+            }
+            BuildLogCoordinates {
+                project: (*project).to_string(),
+                package: (*package).to_string(),
+                repository: (*repository).to_string(),
+                arch: (*arch).to_string(),
+            }
+        }
+        ["package", "live_build_log", project, package, repository, arch] => {
+            if host != "build.opensuse.org" || api_host != "api.opensuse.org" {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "the web-UI build-log form is only mapped for build.opensuse.org against api.opensuse.org; the URL host is {host} and the configured API host is {api_host}"
+                    ),
+                ));
+            }
+            BuildLogCoordinates {
+                project: (*project).to_string(),
+                package: (*package).to_string(),
+                repository: (*repository).to_string(),
+                arch: (*arch).to_string(),
+            }
+        }
+        _ => return Err(malformed()),
+    };
+    ObsClient::validate_build_coordinates(
+        &coords.project,
+        Some(&coords.package),
+        &coords.repository,
+        &coords.arch,
+    )?;
+    Ok(coords)
+}
+
+/// Strip the leading `[timestamp] ` from each log line: the
+/// client-side strip-time behaviour. A line is stripped only when
+/// it starts with `[` and the first `]` is followed by a space —
+/// the same rule as the `^\[[^\]]*\] ` pattern, without a regex
+/// dependency. Lines without the prefix pass through unchanged, as
+/// do the line endings.
+pub(crate) fn strip_log_timestamps(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    for line in log.split_inclusive('\n') {
+        let (text, newline) = match line.strip_suffix('\n') {
+            Some(text) => (text, "\n"),
+            None => (line, ""),
+        };
+        out.push_str(strip_timestamp_prefix(text));
+        out.push_str(newline);
+    }
+    out
+}
+
+/// The text of one line after its `[…] ` prefix, or the line
+/// unchanged when it carries no such prefix.
+fn strip_timestamp_prefix(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix('[') else {
+        return line;
+    };
+    let Some(end) = rest.find(']') else {
+        return line;
+    };
+    if rest.as_bytes().get(end + 1) != Some(&b' ') {
+        return line;
+    }
+    &rest[end + 2..]
 }
 
 /// A running build job, from `GET .../_jobstatus`. `code` is the
@@ -2657,6 +2801,8 @@ impl<'a> ObsClient<'a> {
     /// log (404): the package was never built, or the package/project
     /// does not exist — the server answers 404 for both, so the caller
     /// checks the package exists when the distinction matters.
+    /// With `query.strip_time` the leading `[timestamp] ` is stripped
+    /// from each line client-side before the text is returned.
     /// Requires OBS credentials. The log is capped by the
     /// transport's body limit, like every read.
     pub fn build_log(
@@ -2692,7 +2838,11 @@ impl<'a> ObsClient<'a> {
             &pairs,
         );
         match self.http.get_with(&url, &self.credentials) {
-            Ok(body) => Ok(Some(body)),
+            Ok(body) => Ok(Some(if query.strip_time {
+                strip_log_timestamps(&body)
+            } else {
+                body
+            })),
             // A 404 means no log: never built, or the package/project
             // does not exist. Any other failure stays an error.
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
@@ -4335,6 +4485,175 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
         assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn build_log_strip_time_strips_the_timestamp_prefix() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1",
+            "[12:00:01] first line\nplain line\n[12:00:02] second line\n",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let query = BuildLogQuery {
+            strip_time: true,
+            ..BuildLogQuery::default()
+        };
+        assert_eq!(
+            client
+                .build_log("testproject", "foo", "standard", "x86_64", &query)
+                .unwrap(),
+            Some("first line\nplain line\nsecond line\n".to_string())
+        );
+    }
+
+    #[test]
+    fn build_log_without_strip_time_keeps_the_timestamps() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_log?nostream=1",
+            "[12:00:01] first line\n",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .build_log(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    "x86_64",
+                    &BuildLogQuery::default()
+                )
+                .unwrap(),
+            Some("[12:00:01] first line\n".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_log_timestamps_keeps_lines_without_the_prefix() {
+        // The bracketed prefix strips only at the line start, only
+        // when the first `]` is followed by a space: `[a]b] c` keeps
+        // its brackets (the first `]` is followed by `b`, not a
+        // space), an unterminated `[` keeps the line, and a bare `[]`
+        // with no trailing space is not a prefix either.
+        assert_eq!(
+            strip_log_timestamps(
+                "[12:00:01] stripped\nplain\n[a]b] c\n[unterminated\n[]\n[] empty\n"
+            ),
+            "stripped\nplain\n[a]b] c\n[unterminated\n[]\nempty\n"
+        );
+        assert_eq!(strip_log_timestamps(""), "");
+        assert_eq!(strip_log_timestamps("[12:00:01] no newline"), "no newline");
+    }
+
+    #[test]
+    fn parse_build_log_url_accepts_the_api_form() {
+        assert_eq!(
+            parse_build_log_url(
+                "https://api.opensuse.org/build/openSUSE:Factory/standard/x86_64/vim/_log",
+                "https://api.opensuse.org"
+            )
+            .unwrap(),
+            BuildLogCoordinates {
+                project: "openSUSE:Factory".to_string(),
+                package: "vim".to_string(),
+                repository: "standard".to_string(),
+                arch: "x86_64".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_build_log_url_keeps_the_flavor_in_the_api_form() {
+        assert_eq!(
+            parse_build_log_url(
+                "https://api.opensuse.org/build/openSUSE:Factory/standard/x86_64/multibuild-pkg:flavor1/_log",
+                "https://api.opensuse.org"
+            )
+            .unwrap()
+            .package,
+            "multibuild-pkg:flavor1"
+        );
+    }
+
+    #[test]
+    fn parse_build_log_url_accepts_the_web_ui_form() {
+        assert_eq!(
+            parse_build_log_url(
+                "https://build.opensuse.org/package/live_build_log/openSUSE:Factory/vim/standard/x86_64",
+                "https://api.opensuse.org"
+            )
+            .unwrap(),
+            BuildLogCoordinates {
+                project: "openSUSE:Factory".to_string(),
+                package: "vim".to_string(),
+                repository: "standard".to_string(),
+                arch: "x86_64".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_build_log_url_keeps_the_flavor_in_the_web_ui_form() {
+        assert_eq!(
+            parse_build_log_url(
+                "https://build.opensuse.org/package/live_build_log/openSUSE:Factory/multibuild-pkg:flavor2/standard/x86_64",
+                "https://api.opensuse.org"
+            )
+            .unwrap()
+            .package,
+            "multibuild-pkg:flavor2"
+        );
+    }
+
+    #[test]
+    fn parse_build_log_url_accepts_a_loopback_api_host() {
+        // The live instance is loopback http, not api.opensuse.org:
+        // the host check compares against the configured base, so a
+        // pasted URL from the configured instance parses.
+        assert_eq!(
+            parse_build_log_url(
+                "http://127.0.0.1:3000/build/testproject/standard/x86_64/foo/_log",
+                "http://127.0.0.1:3000"
+            )
+            .unwrap()
+            .project,
+            "testproject"
+        );
+    }
+
+    #[test]
+    fn parse_build_log_url_fails_closed() {
+        let api = "https://api.opensuse.org";
+        for url in [
+            // Not a build-log URL at all.
+            "openSUSE:Factory",
+            "https://api.opensuse.org/build/openSUSE:Factory/standard/x86_64/vim",
+            // Wrong path shape: a segment missing, one extra.
+            "https://api.opensuse.org/build/openSUSE:Factory/standard/x86_64/_log",
+            "https://api.opensuse.org/build/openSUSE:Factory/standard/x86_64/vim/extra/_log",
+            // Trailing slash, query string, fragment: refused rather
+            // than silently ignored.
+            "https://api.opensuse.org/build/openSUSE:Factory/standard/x86_64/vim/_log/",
+            "https://api.opensuse.org/build/openSUSE:Factory/standard/x86_64/vim/_log?start=100",
+            "https://api.opensuse.org/build/openSUSE:Factory/standard/x86_64/vim/_log#top",
+            // A different API instance than the configured one.
+            "https://api.example.org/build/openSUSE:Factory/standard/x86_64/vim/_log",
+            // A web-UI URL from another host, and a web-UI URL
+            // against a non-public configured API.
+            "https://build.example.org/package/live_build_log/openSUSE:Factory/vim/standard/x86_64",
+            "https://api.opensuse.org/package/live_build_log/openSUSE:Factory/vim/standard/x86_64",
+            // An empty coordinate is not a coordinate.
+            "https://api.opensuse.org/build//standard/x86_64/vim/_log",
+        ] {
+            let err = parse_build_log_url(url, api).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{url}");
+        }
+        // The web-UI form against a non-public API base.
+        let err = parse_build_log_url(
+            "https://build.opensuse.org/package/live_build_log/openSUSE:Factory/vim/standard/x86_64",
+            "http://127.0.0.1:3000",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]
