@@ -88,7 +88,7 @@ what "one coherent channel" means.
   next): the supersede-all filing decision (`decision: filing for foo; superseding open submit request(s) 1398492 with the new request`; test `src/obs/payload.rs:3789`), dedup checks (`decision: open maintenance_incident request(s) 1399001 already target openSUSE:Maintenance for foo; refusing to file`; test `src/obs/payload.rs:3876`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1111`),
   endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:4253` vs
   `decision: read via /source (authenticated)`; test `src/http.rs:4365`), and the accept-state check before a retried `change_state` (`decision: request 1398977 still new, re-issuing
-  accepted`; test `src/obs/request.rs:5985`).
+  accepted`; test `src/obs/request.rs:6314`).
 - **Service status lines**: `service_state <project>/<package>: <code>` and
   `list_services <project>/<package>: <n> service(s)` — emitted by the services
   reads, unprefixed (the verb names the operation, as with the startup line;

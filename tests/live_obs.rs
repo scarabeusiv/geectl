@@ -2430,8 +2430,10 @@ fn live_search_requests_finds_the_filed_request() {
 }
 
 /// The `since` bound is evaluated server-side on the request
-/// history: a date after the filing hides the filed request, a date
-/// before it keeps it (the creation entry is a history entry).
+/// history or its last update: a date after the filing hides the
+/// filed request, a date before it keeps it. The last-update
+/// branch covers a freshly filed request, which has no
+/// request-history rows.
 #[test]
 fn live_search_requests_since_bounds_by_history_date() {
     let Some(base) = live_url() else {

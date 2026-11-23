@@ -134,7 +134,8 @@ pub enum RequestCommand {
         #[arg(long)]
         with_full_history: bool,
         /// Only requests with a history entry at or after this
-        /// date, as `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`.
+        /// date, or a last update at or after it, as `YYYY-MM-DD`
+        /// or `YYYY-MM-DDTHH:MM:SS`.
         #[arg(long)]
         since: Option<String>,
         /// Ask the server for at most this many matches.
@@ -156,7 +157,8 @@ pub enum RequestCommand {
         #[arg(long)]
         state: Vec<String>,
         /// Only requests with a history entry at or after this
-        /// date, as `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`.
+        /// date, or a last update at or after it, as `YYYY-MM-DD`
+        /// or `YYYY-MM-DDTHH:MM:SS`.
         #[arg(long)]
         since: Option<String>,
         /// Ask the server for at most this many matches.
@@ -2796,7 +2798,9 @@ mod tests {
             search
                 .match_expr()
                 .expect("the built search builds")
-                .contains("history[@when>='2026-10-01T00:00:00']"),
+                .contains(
+                "(history[@when>='2026-10-01T00:00:00'] or state[@when>='2026-10-01T00:00:00'])"
+            ),
             "since clause present"
         );
     }

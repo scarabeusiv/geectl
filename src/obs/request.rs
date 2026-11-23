@@ -1964,12 +1964,19 @@ const KNOWN_ACTION_TYPES: &[&str] = &[
 /// elements. When both are set the server prefers the full history.
 ///
 /// `since` matches requests with a history entry at or after the
-/// date: the `history[@when >= ...]` predicate. A history entry is
-/// any request history element — a state change, a review addition,
-/// a priority change, a supersede — not only the creation entry.
-/// It is not `state[@when >= ...]`: that attribute maps
-/// to the request row's last-update timestamp, which moves on any
-/// touch to the row, not on state changes.
+/// date, or a last update at or after it: the
+/// `history[@when >= ...] or state[@when >= ...]` predicate. The
+/// history branch alone never matches a request that has no
+/// request-history rows — filing one creates none (there is no
+/// creation history element; the creation entry in rendered output
+/// is synthesised from the filing time) — so any `--since` would
+/// hide a freshly filed request. The state branch covers that
+/// case: `state/@when` is the request row's last-update timestamp,
+/// which is the filing time for an untouched request, and every
+/// history-creating event also saves the row. The converse does not
+/// hold: the timestamp also moves on touches that create no
+/// request-history row (approver, review changes), so `--since` is
+/// a superset of history activity.
 #[derive(Debug, Clone, Default)]
 pub struct RequestSearch {
     /// Match requests with one of these numbers.
@@ -2004,8 +2011,8 @@ pub struct RequestSearch {
     /// Include all history elements in each result.
     with_full_history: bool,
     /// Match requests with a history entry at or after this date,
-    /// as `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`. A date alone reads
-    /// as midnight.
+    /// or a last update at or after it, as `YYYY-MM-DD` or
+    /// `YYYY-MM-DDTHH:MM:SS`. A date alone reads as midnight.
     since: Option<String>,
     /// Ask the server for at most this many matches. The server
     /// reports the full match count in `matches` and returns only
@@ -2106,7 +2113,8 @@ impl RequestSearch {
         self
     }
 
-    /// Match requests with a history entry at or after this date.
+    /// Match requests with a history entry at or after this date,
+    /// or a last update at or after it.
     /// The value is validated by [`RequestSearch::match_expr`]; an
     /// invalid date fails the search as `InvalidInput` before any
     /// request is made.
@@ -2272,9 +2280,15 @@ impl RequestSearch {
         }
         if let Some(since) = &self.since {
             let normalized = parse_since_date(since)?;
-            clauses.push(XpathQuery::Pred(
-                "history".to_string(),
-                Box::new(XpathQuery::Ge("@when".to_string(), normalized)),
+            clauses.push(XpathQuery::Or(
+                Box::new(XpathQuery::Pred(
+                    "history".to_string(),
+                    Box::new(XpathQuery::Ge("@when".to_string(), normalized.clone())),
+                )),
+                Box::new(XpathQuery::Pred(
+                    "state".to_string(),
+                    Box::new(XpathQuery::Ge("@when".to_string(), normalized)),
+                )),
             ));
         }
         if !self.types.is_empty() {
@@ -6128,13 +6142,15 @@ description</description>
     }
 
     #[test]
-    fn match_expr_since_adds_a_history_clause() {
+    fn match_expr_since_adds_a_history_or_state_clause() {
         let expr = RequestSearch::new()
             .since("2026-10-01".to_string())
             .match_expr()
             .expect("a valid since builds");
         assert!(
-            expr.contains("history[@when>='2026-10-01T00:00:00']"),
+            expr.contains(
+                "(history[@when>='2026-10-01T00:00:00'] or state[@when>='2026-10-01T00:00:00'])"
+            ),
             "since clause present: {expr}"
         );
         let expr = RequestSearch::new()
@@ -6144,7 +6160,7 @@ description</description>
             .expect("since with a state builds");
         assert_eq!(
             expr,
-            "state[@name='declined'] and history[@when>='2026-10-01T10:00:00']"
+            "state[@name='declined'] and (history[@when>='2026-10-01T10:00:00'] or state[@when>='2026-10-01T10:00:00'])"
         );
     }
 
