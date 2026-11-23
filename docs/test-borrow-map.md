@@ -853,6 +853,27 @@ semantics, not its tests).**
   With a term, the substring match is combined with the devel
   predicate (parenthesised: XPath `and` binds tighter than `or`).
 
+## Batch 12 — buildinfo bdep projects (#194)
+
+**Direct adoptions: 0. Spec reference: `osc/build.py` (the flag
+semantics and the project-set enumeration, not its tests).**
+
+- `behave/features/buildinfo.feature:4` — `osc buildinfo` exits 0 and
+  prints the raw `<error>unresolvable: nothing provides
+  DOES-NOT-EXIST</error>` XML: stdout-only raw XML, and the error case
+  is already pinned by geectl's `buildinfo_error_and_clean` in its
+  typed form — nothing to adopt.
+- `tests/test_build.py` (2 tests — `test_name`, `test_glob`) — they
+  pin the `trusted_prj` config globs; geectl has no trusted-project
+  config, and batch 10 already surveyed them as nothing to adopt.
+- `osc/build.py:1287-1289` (`if not opts.trust_all_projects:` around
+  the `check_trusted_projects` call) is the spec reference for the
+  flag skipping the trust check; `osc/build.py:351-370` (the buildinfo
+  parse collecting `self.projects[p.project]`) is the spec reference
+  for enumerating the dep set's source projects. The flag help
+  (`osc/commandline.py:7788`, "trust packages from all projects") is
+  the wording geectl's flag help follows.
+
 ## Counts (direct adoptions, de-duplicated)
 
 | Batch | Unit | Behave | Total |
@@ -869,6 +890,7 @@ semantics, not its tests).**
 | 9 Gitea ops | 2 | 13 | 15 |
 | 10 local-build flag parity | 0 (+spec ref) | 0 | 0 (+spec) |
 | Gap batch 2, wave 3 (#175, #176) | 0 | 0 | 0 |
+| 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
 | **Total adopted** | **105** | **120** | **225** |
 
 Surveyed base: 272 behave scenarios + 707 unit tests = 979 items;

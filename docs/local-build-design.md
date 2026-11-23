@@ -390,9 +390,10 @@ adds an `eviction` object to every build record:
   `home:`. The build project itself is excluded from the set (osc parity,
   `check_trusted_projects(... if not i == prj)`, exact match only): a dep
   resolving from the project being built is the build's own output.
-  `--trust-all-projects` is accepted only after that check
-  passes — the flag cannot override a foreign-`home:` refusal; that
-  decision stays with the user.
+  `--trust-all-projects` overrides that refusal for the dep set the
+  buildinfo enumerates: the build proceeds with those deps, and the
+  accepted foreign `home:` projects are reported on the debug
+  channel.
 - **`--release N`** is supported (passes through to the engine; sets
   `BUILD_RELEASE` → `SOURCE_DATE_EPOCH`, which removes the local-only
   `python-bytecode-inconsistent-mtime` artifact for new packages).

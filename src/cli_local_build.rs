@@ -109,7 +109,7 @@ pub enum LocalBuildCommand {
         /// The release number, passed through to the engine.
         #[arg(long)]
         release: Option<String>,
-        /// Accept the resolved dep set.
+        /// Trust packages from all projects.
         #[arg(long)]
         trust_all_projects: bool,
         /// Force an image pull even when the local image is fresh.

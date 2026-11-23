@@ -176,11 +176,11 @@ pub struct BuildRequest {
     /// `BUILD_RELEASE`, which removes the local-only
     /// `python-bytecode-inconsistent-mtime` artifact).
     pub release: Option<String>,
-    /// Accept the resolved dep set. Accepted for CLI parity with
-    /// the existing tool, and only after the trust check passes:
-    /// the flag cannot override a foreign-`home:` refusal — that
-    /// decision stays with the user — and it is read nowhere in
-    /// the refusal decision.
+    /// Trust packages from all projects: skip the foreign-`home:`
+    /// refusal for the dep set the buildinfo enumerates — the build
+    /// proceeds with those deps, and the accepted foreign projects
+    /// are reported on the debug channel. Without it, a foreign
+    /// `home:` dep refuses with `UntrustedProject`.
     pub trust_all_projects: bool,
     /// Force an image pull even when the local image is fresh.
     pub refresh_image: bool,
@@ -1182,7 +1182,7 @@ impl<'a> LocalBuild<'a> {
                 format!("build cannot start: {error}"),
             ));
         }
-        self.check_trust(req.fetch_project(), &info)?;
+        self.check_trust(req.fetch_project(), &info, req.trust_all_projects)?;
         let buildconfig = self.obs.buildconfig(req.fetch_project(), &req.repo)?;
 
         // The image is resolved before eviction: the current digest
@@ -1521,9 +1521,10 @@ impl<'a> LocalBuild<'a> {
     /// `check_trusted_projects` excludes it (`if not i == prj`),
     /// exact match only, never a subproject. A foreign `home:`
     /// project refuses with `UntrustedProject`
-    /// naming it; `--trust-all-projects` cannot override that
-    /// refusal — the flag is accepted only after this check passes,
-    /// and it is read nowhere in the refusal decision. A dep without
+    /// naming it, unless `--trust-all-projects` is set: the flag
+    /// overrides the refusal for the dep set the buildinfo
+    /// enumerates, and the accepted foreign projects are reported
+    /// on the debug channel. A dep without
     /// a `project` carries no origin to enumerate: it is a virtual
     /// provide or a not-installed flag, not a package the build
     /// would install, so it joins no trust set — the existing tool's
@@ -1533,6 +1534,7 @@ impl<'a> LocalBuild<'a> {
         &self,
         build_project: &str,
         info: &crate::obs::BuildInfo,
+        trust_all_projects: bool,
     ) -> Result<(), GeectlError> {
         let username = match self.obs.credentials() {
             Credentials::Basic { username, .. } => Some(username.as_str()),
@@ -1562,16 +1564,23 @@ impl<'a> LocalBuild<'a> {
                 foreign.push(project.clone());
             }
         }
-        if !foreign.is_empty() {
-            return Err(GeectlError::new(
-                ErrorKind::UntrustedProject,
-                format!(
-                    "build pulls dependencies from foreign home: project(s): {}; only non-home: projects and the caller's own home: are trusted",
-                    foreign.join(", ")
-                ),
-            ));
+        if foreign.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        if trust_all_projects {
+            self.debug.emit(&format!(
+                "local-build trust: accepting foreign home: project(s) via --trust-all-projects: {}",
+                foreign.join(", ")
+            ));
+            return Ok(());
+        }
+        Err(GeectlError::new(
+            ErrorKind::UntrustedProject,
+            format!(
+                "build pulls dependencies from foreign home: project(s): {}; only non-home: projects and the caller's own home: are trusted; pass --trust-all-projects to trust them",
+                foreign.join(", ")
+            ),
+        ))
     }
 
     /// The engine version, when the engine reports one: the engine's
@@ -8139,6 +8148,7 @@ fi
             let err = vertical.build(&req).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::UntrustedProject);
             assert!(err.to_string().contains("home:someoneelse"));
+            assert!(err.to_string().contains("--trust-all-projects"));
         }
 
         #[test]
@@ -8178,10 +8188,11 @@ fi
         }
 
         #[test]
-        fn build_refuses_a_foreign_home_project_even_with_trust_all_projects() {
-            // `--trust-all-projects` is accepted only after the
-            // trust check passes: it cannot override a foreign
-            // `home:` refusal.
+        fn build_trusts_a_foreign_home_project_with_trust_all_projects() {
+            // `--trust-all-projects` overrides the foreign `home:`
+            // refusal for the dep set the buildinfo enumerates: the
+            // build proceeds, and the accepted project is reported
+            // on the debug channel.
             let dir = TempDir::new();
             let (engine, _) = stub_engine(dir.path());
             let (podman, _) = stub_podman(dir.path(), true);
@@ -8195,15 +8206,31 @@ fi
                         arch = host_arch()
                     ),
                 )
-                .with_get(&buildconfig_url(), "Macro: test 1\n");
+                .with_get(&buildconfig_url(), "Macro: test 1\n")
+                .with_get_bytes(
+                    &format!(
+                        "https://api.opensuse.org/build/home:someoneelse/standard/{}/_repository/glibc-2.38-1.{}.rpm",
+                        host_arch(),
+                        host_arch()
+                    ),
+                    b"fake glibc rpm",
+                );
             let client = client_with(&http);
-            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (debug, lines) = Debug::captured(true, false);
+            let vertical = vertical(&client, dir.path(), engine, podman).with_debug(debug);
             let source = write_source(dir.path(), "foo.spec");
             let mut req = BuildRequest::new(source, "testproject", "standard", host_arch());
             req.trust_all_projects = true;
-            let err = vertical.build(&req).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::UntrustedProject);
-            assert!(err.to_string().contains("home:someoneelse"));
+            let record = vertical.build(&req).unwrap();
+            assert_eq!(record.verdict, "green");
+            let lines = lines.lock().expect("debug lines readable");
+            assert!(
+                lines.iter().any(|line| line.contains(
+                    "local-build trust: accepting foreign home: project(s) via --trust-all-projects: home:someoneelse"
+                )),
+                "debug misses the trust override:\n{}",
+                lines.join("\n")
+            );
         }
 
         #[test]

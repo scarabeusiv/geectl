@@ -1670,7 +1670,9 @@ fn buildconfig_result(project: &str, repository: &str, config: String) -> (Value
     (payload, config)
 }
 
-/// Buildinfo as JSON: the blocking error plus the dependency names.
+/// Buildinfo as JSON: the blocking error plus the dependencies, each
+/// with the project it resolves from (`null` when the server did not
+/// say — a virtual provide or a not-installed flag).
 fn buildinfo_payload(
     project: &str,
     package: &str,
@@ -1686,11 +1688,21 @@ fn buildinfo_payload(
         "arch": arch,
         "alternative_project": alternative_project,
         "error": info.error,
-        "bdeps": info.bdeps.iter().map(|dep| dep.name.as_str()).collect::<Vec<_>>(),
+        "bdeps": info
+            .bdeps
+            .iter()
+            .map(|dep| {
+                json!({
+                    "name": dep.name,
+                    "project": dep.project,
+                })
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
-/// Buildinfo as text: the blocking error, then the dependencies.
+/// Buildinfo as text: the blocking error, then the dependencies, each
+/// with the project it resolves from when the server said one.
 fn render_buildinfo_text(info: &BuildInfo) -> String {
     let mut lines = Vec::new();
     match &info.error {
@@ -1701,7 +1713,10 @@ fn render_buildinfo_text(info: &BuildInfo) -> String {
         lines.push("no dependencies".to_string());
     } else {
         lines.push("dependencies:".to_string());
-        lines.extend(info.bdeps.iter().map(|dep| dep.name.clone()));
+        lines.extend(info.bdeps.iter().map(|dep| match &dep.project {
+            Some(project) => format!("{} ({project})", dep.name),
+            None => dep.name.clone(),
+        }));
     }
     lines.join("\n")
 }
@@ -2788,7 +2803,7 @@ mod tests {
             bdeps: vec![
                 BuildDep {
                     name: "gcc".to_string(),
-                    project: None,
+                    project: Some("openSUSE:Factory".to_string()),
                     repository: None,
                     package: None,
                     binary: None,
@@ -2837,11 +2852,17 @@ mod tests {
             "buildinfo text misses the error:\n{text}"
         );
         for dep in info_payload["bdeps"].as_array().expect("bdeps is an array") {
-            let dep = dep.as_str().expect("dep is a string");
+            let name = dep["name"].as_str().expect("dep name is a string");
             assert!(
-                text.contains(dep),
-                "buildinfo text misses dep {dep}:\n{text}"
+                text.contains(name),
+                "buildinfo text misses dep {name}:\n{text}"
             );
+            if let Some(project) = dep["project"].as_str() {
+                assert!(
+                    text.contains(project),
+                    "buildinfo text misses dep project {project}:\n{text}"
+                );
+            }
         }
 
         let entries = vec![BuildHistoryEntry {
@@ -2966,7 +2987,7 @@ mod tests {
             bdeps: vec![
                 BuildDep {
                     name: "gcc".to_string(),
-                    project: None,
+                    project: Some("openSUSE:Factory".to_string()),
                     repository: None,
                     package: None,
                     binary: None,
@@ -3007,8 +3028,13 @@ mod tests {
         };
         let text = render_buildinfo_text(&clean);
         assert!(text.contains("no blocking error"));
-        assert!(text.contains("gcc"));
+        assert!(text.contains("gcc (openSUSE:Factory)"));
         assert!(text.contains("make"));
+        // A dep without a project renders bare, and its payload
+        // project is null: the server did not resolve it to a binary.
+        let payload = buildinfo_payload("p", "k", "r", "a", None, &clean);
+        assert_eq!(payload["bdeps"][0]["project"], "openSUSE:Factory");
+        assert!(payload["bdeps"][1]["project"].is_null());
     }
 
     #[test]
