@@ -1925,6 +1925,199 @@ fn render_history_text(id: &str, history: &[RequestHistory]) -> String {
     lines.join("\n")
 }
 
+/// Render stored Markdown as plaintext for text output.
+///
+/// The typed model keeps the raw Markdown and JSON output carries it
+/// verbatim; only the human-readable text rendering converts. Inline
+/// formatting is stripped, link text is kept and the URL dropped,
+/// headings and list items keep their text. A literal `<foo>` in the
+/// body passes through unchanged: it is user-typed text, not markup.
+///
+/// Block spacing: a paragraph ends with one newline, so
+/// multi-paragraph bodies render as separated lines with no blank
+/// line between them; a loose list renders its items
+/// blank-separated. Lists are flattened: nested items lose their
+/// indentation and a nested ordered list restarts its numbering;
+/// the blank line between a tight nested list and a following
+/// paragraph in the same item is not preserved.
+fn markdown_to_plaintext(markdown: &str) -> String {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let mut out = String::new();
+    let mut lists: Vec<Option<u64>> = Vec::new();
+    // Looseness per list level: true when the list's parent item
+    // ended a paragraph before the list started. The enclosing
+    // item's end keeps its newline in that case, preserving the
+    // outer list's blank line.
+    let mut list_loose: Vec<bool> = Vec::new();
+    // True when the previous event closed a (nested) list. Both
+    // flags are cleared by any event other than an item or list end,
+    // so they cannot leak into a later list.
+    let mut just_closed_list = false;
+    let mut closed_loose = false;
+    // True while an item's first block is still to come: a block tag
+    // there shares the marker line ("- head") instead of starting a
+    // line of its own.
+    let mut at_item_start = false;
+    for event in Parser::new(markdown) {
+        match &event {
+            Event::End(TagEnd::Item) | Event::End(TagEnd::List(_)) => {}
+            _ => {
+                just_closed_list = false;
+                closed_loose = false;
+            }
+        }
+        match &event {
+            Event::Start(Tag::Item) => at_item_start = true,
+            Event::Start(Tag::Heading { .. })
+            | Event::Start(Tag::CodeBlock(_))
+            | Event::Start(Tag::BlockQuote(_))
+            | Event::Start(Tag::HtmlBlock)
+            | Event::Rule => {}
+            _ => at_item_start = false,
+        }
+        match event {
+            Event::Text(text) | Event::Code(text) => out.push_str(&text),
+            Event::Html(html) | Event::InlineHtml(html) => out.push_str(&html),
+            Event::Start(Tag::Paragraph)
+            | Event::Start(Tag::Link { .. })
+            | Event::Start(Tag::Image { .. })
+            | Event::Start(Tag::Emphasis)
+            | Event::Start(Tag::Strong) => {}
+            Event::Start(Tag::Heading { .. })
+            | Event::Start(Tag::CodeBlock(_))
+            | Event::Start(Tag::BlockQuote(_))
+            | Event::Start(Tag::HtmlBlock) => {
+                // Block tags start on their own line; at an item's
+                // start the block shares the marker line ("- head").
+                if !at_item_start && !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Event::Start(
+                Tag::FootnoteDefinition(_)
+                | Tag::DefinitionList
+                | Tag::DefinitionListTitle
+                | Tag::DefinitionListDefinition
+                | Tag::Table(_)
+                | Tag::TableHead
+                | Tag::TableRow
+                | Tag::TableCell
+                | Tag::Strikethrough
+                | Tag::Superscript
+                | Tag::Subscript
+                | Tag::MetadataBlock(_),
+            ) => {}
+            Event::End(TagEnd::Paragraph) => {
+                out.push('\n');
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                // A heading with no text emits no Text event; the
+                // line is already ended, so pushing another newline
+                // here would double-count it into a blank line.
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                // Code block text already ends with a newline;
+                // pushing another would double-count it into a
+                // blank line.
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Event::End(TagEnd::Link)
+            | Event::End(TagEnd::Image)
+            | Event::End(TagEnd::Emphasis)
+            | Event::End(TagEnd::Strong) => {}
+            Event::End(
+                TagEnd::BlockQuote(_)
+                | TagEnd::HtmlBlock
+                | TagEnd::FootnoteDefinition
+                | TagEnd::DefinitionList
+                | TagEnd::DefinitionListTitle
+                | TagEnd::DefinitionListDefinition
+                | TagEnd::Table
+                | TagEnd::TableHead
+                | TagEnd::TableRow
+                | TagEnd::TableCell
+                | TagEnd::Strikethrough
+                | TagEnd::Superscript
+                | TagEnd::Subscript
+                | TagEnd::MetadataBlock(_),
+            ) => {}
+            Event::Start(Tag::List(start)) => {
+                // A list nested inside an item starts on its own
+                // line: the parent item's text ends with no newline
+                // of its own in a tight list, and with one in a
+                // loose list — a blank line needs one more either way.
+                let loose = !lists.is_empty() && out.ends_with('\n');
+                if !lists.is_empty() {
+                    out.push('\n');
+                }
+                lists.push(start);
+                list_loose.push(loose);
+            }
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+                closed_loose = list_loose.pop().unwrap_or(false);
+                just_closed_list = true;
+            }
+            Event::Start(Tag::Item) => {
+                let marker = match lists.last_mut() {
+                    Some(Some(number)) => {
+                        let marker = format!("{number}. ");
+                        *number += 1;
+                        marker
+                    }
+                    _ => "- ".to_string(),
+                };
+                out.push_str(&marker);
+            }
+            Event::End(TagEnd::Item) => {
+                // After a nested list, the enclosing item adds a
+                // newline only when the parent was loose and no
+                // blank line is already there: in a tight list the
+                // nested item's end already separated the lines.
+                if !just_closed_list || (closed_loose && !out.ends_with("\n\n")) {
+                    out.push('\n');
+                }
+                just_closed_list = false;
+                closed_loose = false;
+            }
+            Event::SoftBreak => out.push(' '),
+            Event::HardBreak => out.push('\n'),
+            Event::Rule => {
+                if !at_item_start && !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("---\n");
+            }
+            // The parser runs with default options, so these
+            // extension events never fire; they are matched
+            // explicitly so a future option change is a deliberate
+            // decision here, not a silent catch-all fallthrough —
+            // revisit these arms if any option is enabled.
+            Event::TaskListMarker(checked) => {
+                out.push_str(if checked { "[x] " } else { "[ ] " });
+            }
+            Event::FootnoteReference(label) => {
+                out.push_str(&format!("[^{label}]"));
+            }
+            Event::InlineMath(text) | Event::DisplayMath(text) => out.push_str(&text),
+        }
+    }
+    // One line per line, no trailing whitespace, no leading or
+    // trailing blank lines: a single-paragraph body renders as one
+    // line, multi-paragraph bodies as separated lines.
+    out.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 fn render_comments_text(id: &str, comments: &[RequestComment]) -> String {
     if comments.is_empty() {
         return format!("no comments on request {id}");
@@ -1933,7 +2126,10 @@ fn render_comments_text(id: &str, comments: &[RequestComment]) -> String {
     lines.extend(comments.iter().map(|comment| {
         let mut line = format!(
             "comment {} by {} at {}: {}",
-            comment.id, comment.who, comment.when, comment.body
+            comment.id,
+            comment.who,
+            comment.when,
+            markdown_to_plaintext(&comment.body)
         );
         if let Some(parent) = comment.parent_id {
             line.push_str(&format!(" (reply to {parent})"));
@@ -2252,6 +2448,162 @@ mod tests {
         assert!(text.contains("a reply"));
         assert!(text.contains("(reply to 1)"));
         assert_eq!(render_comments_text("42", &[]), "no comments on request 42");
+    }
+
+    const COMMENTS_MARKDOWN_XML: &str = r#"<comments request="42">
+  <comment who="user1" when="2010-12-29T10:00:00" id="1">**bold** and [link](https://example.com)</comment>
+  <comment who="user2" when="2010-12-29T11:00:00" id="2">see req#123 and @user</comment>
+  <comment who="user3" when="2010-12-29T12:00:00" id="3">Please fix &lt;foo&gt; and see **note**</comment>
+</comments>"#;
+
+    #[test]
+    fn comments_text_renders_markdown_as_plaintext() {
+        let comments = parse_comments(COMMENTS_MARKDOWN_XML).expect("comments parse");
+        let text = render_comments_text("42", &comments);
+        assert!(text.contains("comment 1 by user1 at 2010-12-29T10:00:00: bold and link"));
+        assert!(text.contains("comment 2 by user2 at 2010-12-29T11:00:00: see req#123 and @user"));
+        assert!(text
+            .contains("comment 3 by user3 at 2010-12-29T12:00:00: Please fix <foo> and see note"));
+        assert!(!text.contains("**"));
+        assert!(!text.contains("https://example.com"));
+    }
+
+    #[test]
+    fn comment_json_keeps_the_raw_markdown() {
+        let comments = parse_comments(COMMENTS_MARKDOWN_XML).expect("comments parse");
+        let payload = comment_json(&comments[0]);
+        assert_eq!(payload["body"], "**bold** and [link](https://example.com)");
+    }
+
+    #[test]
+    fn markdown_to_plaintext_keeps_plain_text_and_lists() {
+        assert_eq!(markdown_to_plaintext("plain text"), "plain text");
+        assert_eq!(
+            markdown_to_plaintext("# Title\n\n- one\n- two"),
+            "Title\n- one\n- two"
+        );
+        assert_eq!(
+            markdown_to_plaintext("1. first\n2. second"),
+            "1. first\n2. second"
+        );
+        assert_eq!(
+            markdown_to_plaintext("- a\n  - b\n  - c\n- d"),
+            "- a\n- b\n- c\n- d"
+        );
+        assert_eq!(
+            markdown_to_plaintext("1. a\n   1. b\n   2. c\n2. d"),
+            "1. a\n1. b\n2. c\n2. d"
+        );
+        assert_eq!(
+            markdown_to_plaintext("- a\n\n  - b\n\n- d"),
+            "- a\n\n- b\n\n- d"
+        );
+        assert_eq!(
+            markdown_to_plaintext("1. a\n\n   1. b\n   2. c\n\n2. d"),
+            "1. a\n\n1. b\n2. c\n\n2. d"
+        );
+        assert_eq!(
+            markdown_to_plaintext("- a\n\n  - b\n\n    - c\n\n  - d\n\n- e"),
+            "- a\n\n- b\n\n- c\n\n- d\n\n- e"
+        );
+        assert_eq!(
+            markdown_to_plaintext("- a\n  - b\n    - c\n  - d\n- e"),
+            "- a\n- b\n- c\n- d\n- e"
+        );
+        assert_eq!(
+            markdown_to_plaintext("`code` and *italic*"),
+            "code and italic"
+        );
+        assert_eq!(markdown_to_plaintext(""), "");
+    }
+
+    #[test]
+    fn markdown_to_plaintext_keeps_block_tags_on_their_own_line() {
+        assert_eq!(
+            markdown_to_plaintext("- a\n  ```\n  code\n  ```\n- b"),
+            "- a\ncode\n\n- b"
+        );
+        assert_eq!(markdown_to_plaintext("```\ncode\n```\npara"), "code\npara");
+        assert_eq!(
+            markdown_to_plaintext("- a\n  # head\n- b"),
+            "- a\nhead\n\n- b"
+        );
+        assert_eq!(markdown_to_plaintext("- a\n  ***\n- b"), "- a\n---\n\n- b");
+        assert_eq!(
+            markdown_to_plaintext("- a\n  > quote\n- b"),
+            "- a\nquote\n\n- b"
+        );
+        assert_eq!(
+            markdown_to_plaintext("- a\n  <div>\n  foo\n  </div>\n- b"),
+            "- a\n<div>\nfoo\n</div>\n\n- b"
+        );
+        // A block as an item's first content shares the marker line.
+        assert_eq!(
+            markdown_to_plaintext("- # head\n  - b\n- d"),
+            "- head\n\n- b\n\n- d"
+        );
+        // An empty heading adds no line of its own: the guarded
+        // Start already ended the line.
+        assert_eq!(markdown_to_plaintext("- a\n  #\n- b"), "- a\n\n- b");
+        assert_eq!(
+            markdown_to_plaintext("- a\n  #\n  - b\n- d"),
+            "- a\n\n- b\n\n- d"
+        );
+        assert_eq!(
+            markdown_to_plaintext("- a\n  # ![](x.png)\n- b"),
+            "- a\n\n- b"
+        );
+        assert_eq!(markdown_to_plaintext("- a\n\n  #\n\n- b"), "- a\n\n- b");
+    }
+
+    #[test]
+    fn markdown_to_plaintext_pins_spacing_and_literal_passthrough() {
+        // Multi-paragraph bodies render as separated lines with no
+        // blank line between them; a loose list keeps its blank line.
+        assert_eq!(markdown_to_plaintext("para1\n\npara2"), "para1\npara2");
+        assert_eq!(markdown_to_plaintext("- one\n\n- two"), "- one\n\n- two");
+        // A fenced block renders its code; the info string is dropped.
+        assert_eq!(
+            markdown_to_plaintext("```rust\nfn main() {}\n```"),
+            "fn main() {}"
+        );
+        // Default parser options: strikethrough, tables and math are
+        // not extensions here, so they pass through literally.
+        assert_eq!(markdown_to_plaintext("~~struck~~"), "~~struck~~");
+        assert_eq!(
+            markdown_to_plaintext("| a | b |\n|---|---|\n| c | d |"),
+            "| a | b | |---|---| | c | d |"
+        );
+        assert_eq!(markdown_to_plaintext("$x^2$"), "$x^2$");
+        // An autolink keeps its address as the link text; an image
+        // keeps its alt text (an empty alt leaves the two spaces
+        // around it, which is the current behaviour).
+        assert_eq!(
+            markdown_to_plaintext("see <https://example.com>"),
+            "see https://example.com"
+        );
+        assert_eq!(
+            markdown_to_plaintext("see ![alt](https://example.com/x.png) now"),
+            "see alt now"
+        );
+        assert_eq!(
+            markdown_to_plaintext("see ![](https://example.com/x.png) now"),
+            "see  now"
+        );
+        // A blockquote renders as its text; raw HTML passes through
+        // unchanged, like `<foo>`.
+        assert_eq!(markdown_to_plaintext("> quote\n> more"), "quote more");
+        assert_eq!(markdown_to_plaintext("<!-- secret -->"), "<!-- secret -->");
+        // A footnote definition is consumed by the parser without
+        // the footnotes extension; the reference keeps its number.
+        assert_eq!(markdown_to_plaintext("text[^1]\n\n[^1]: note"), "text^1");
+        // Known flattening loss, pre-existing: the blank line
+        // between a tight nested list and a following paragraph in
+        // the same item is not preserved.
+        assert_eq!(
+            markdown_to_plaintext("- a\n  - b\n\n  after\n- d"),
+            "- a\n\n- b\nafter\n\n- d"
+        );
     }
 
     #[test]
