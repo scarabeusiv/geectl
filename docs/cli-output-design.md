@@ -69,14 +69,14 @@ what "one coherent channel" means.
   `http: GET /source/openSUSE:Factory/geectl -> 200 in 123ms (attempt 1/4)`
   On a retryable failure the line carries the reason and the backoff:
   `http: GET /source/... -> 500 in 210ms (attempt 2/4, retry in 2s: transient status 500)`
-  (test `src/http.rs:4307`).
+  (test `src/http.rs:4390`).
   On exhaustion: `http: GET /source/... failed after 4 attempts (last: 500)`.
-  (test `src/http.rs:4312`).
+  (test `src/http.rs:4395`).
   A body that fails mid-read retries the same way, and emits a second
   line for the same attempt: the status line when the headers arrive,
   then the failure — two events, not two attempts:
   `http: GET /source/... -> network error in 210ms (attempt 1/4, retry in 1s: body read failed)`
-  (test `src/http.rs:4340`).
+  (test `src/http.rs:4423`).
 - **Read-after-write retries** (the library's bounded retries, not the
   HTTP policy): each probe plus the remaining budget, e.g.
   `retry: create_package registration probe 1/30s: still not found`.
@@ -86,8 +86,8 @@ what "one coherent channel" means.
   visible trace.
 - **Library decision points** (the ones that change what happens
   next): the supersede-all filing decision (`decision: filing for foo; superseding open submit request(s) 1398492 with the new request`; test `src/obs/payload.rs:3789`), dedup checks (`decision: open maintenance_incident request(s) 1399001 already target openSUSE:Maintenance for foo; refusing to file`; test `src/obs/payload.rs:3876`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `src/obs/types.rs:1160`),
-  endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:4253` vs
-  `decision: read via /source (authenticated)`; test `src/http.rs:4365`), and the accept-state check before a retried `change_state` (`decision: request 1398977 still new, re-issuing
+  endpoint selection (`decision: read via /public/source (no credentials)`; test `src/http.rs:4336` vs
+  `decision: read via /source (authenticated)`; test `src/http.rs:4448`), and the accept-state check before a retried `change_state` (`decision: request 1398977 still new, re-issuing
   accepted`; test `src/obs/request.rs:6661`).
 - **Service status lines**: `service_state <project>/<package>: <code>` and
   `list_services <project>/<package>: <n> service(s)` — emitted by the services

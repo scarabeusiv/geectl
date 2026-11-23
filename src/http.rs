@@ -183,6 +183,56 @@ fn body_read_error(e: std::io::Error) -> GeectlError {
     GeectlError::new(kind, e.to_string())
 }
 
+/// The phase of a streaming download that failed: the error kind
+/// depends on it — a read failure is the network, a write failure is
+/// the disk, and the two must not share one error kind.
+enum DownloadIoPhase {
+    Create,
+    Read,
+    Write,
+    Sync,
+}
+
+/// Map a streaming-download I/O error by phase, naming the file: a
+/// read failure is the network (or a timeout), a write or sync
+/// failure is the disk, and creating over an existing destination
+/// is `AlreadyExists`.
+fn download_io_error(phase: DownloadIoPhase, path: &Path, e: &std::io::Error) -> GeectlError {
+    let (kind, message) = match phase {
+        DownloadIoPhase::Create => {
+            let kind = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                ErrorKind::AlreadyExists
+            } else {
+                ErrorKind::InternalError
+            };
+            (
+                kind,
+                format!("cannot create download file {}: {e}", path.display()),
+            )
+        }
+        DownloadIoPhase::Read => {
+            let kind = if is_read_timeout(e) {
+                ErrorKind::Timeout
+            } else {
+                ErrorKind::NetworkError
+            };
+            (
+                kind,
+                format!("cannot read download body for {}: {e}", path.display()),
+            )
+        }
+        DownloadIoPhase::Write => (
+            ErrorKind::InternalError,
+            format!("cannot write download file {}: {e}", path.display()),
+        ),
+        DownloadIoPhase::Sync => (
+            ErrorKind::InternalError,
+            format!("cannot sync download file {}: {e}", path.display()),
+        ),
+    };
+    GeectlError::new(kind, message)
+}
+
 /// The HTTP client interface. Implementations are synchronous and return
 /// the response body as a string on a 2xx status, or a [`GeectlError`].
 /// `get` uses the client's configured credentials (from its
@@ -1779,17 +1829,7 @@ impl HttpClient for UreqClient {
                 .write(true)
                 .create_new(true)
                 .open(path)
-                .map_err(|e| {
-                    let kind = if e.kind() == std::io::ErrorKind::AlreadyExists {
-                        ErrorKind::AlreadyExists
-                    } else {
-                        ErrorKind::InternalError
-                    };
-                    GeectlError::new(
-                        kind,
-                        format!("cannot create download file {}: {e}", path.display()),
-                    )
-                })?;
+                .map_err(|e| download_io_error(DownloadIoPhase::Create, path, &e))?;
             // Copy in a loop, not `io::copy`: a read failure is the
             // network, a write failure is the disk, and the two must
             // not share one error kind.
@@ -1809,14 +1849,8 @@ impl HttpClient for UreqClient {
                         // distinguishable from a severed one. The
                         // error retries either way (see
                         // `get_with_body`), but the kind decides what
-                        // the caller sees when the budget runs out.
-                        let kind = if is_read_timeout(&e) {
-                            ErrorKind::Timeout
-                        } else {
-                            ErrorKind::NetworkError
-                        };
-                        let message =
-                            format!("cannot read download body for {}: {e}", path.display());
+                        // the caller sees when the budget runs out
+                        // (see `download_io_error`).
                         // A retry follows, so the partial file goes
                         // first: the next attempt creates it
                         // exclusively, and a stale partial would
@@ -1829,28 +1863,20 @@ impl HttpClient for UreqClient {
                         // collision the next attempt would hit.
                         if attempt < RETRY_POLICY.max_retries && std::fs::remove_file(path).is_err()
                         {
-                            return Err(GeectlError::new(kind, message));
+                            return Err(download_io_error(DownloadIoPhase::Read, path, &e));
                         }
-                        return Err(GeectlError::new(kind, message));
+                        return Err(download_io_error(DownloadIoPhase::Read, path, &e));
                     }
                 };
                 if n == 0 {
                     break;
                 }
-                file.write_all(&buf[..n]).map_err(|e| {
-                    GeectlError::new(
-                        ErrorKind::InternalError,
-                        format!("cannot write download file {}: {e}", path.display()),
-                    )
-                })?;
+                file.write_all(&buf[..n])
+                    .map_err(|e| download_io_error(DownloadIoPhase::Write, path, &e))?;
                 bytes += n as u64;
             }
-            file.sync_all().map_err(|e| {
-                GeectlError::new(
-                    ErrorKind::InternalError,
-                    format!("cannot sync download file {}: {e}", path.display()),
-                )
-            })?;
+            file.sync_all()
+                .map_err(|e| download_io_error(DownloadIoPhase::Sync, path, &e))?;
             Ok(bytes)
         })
     }
@@ -2158,6 +2184,63 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"existing");
         let _ = std::fs::remove_file(&path);
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn download_io_error_maps_each_phase() {
+        // The mapping the streaming download relies on, pinned
+        // without a failing disk: create names the file and
+        // distinguishes an existing destination, read separates
+        // timeouts from the network, write and sync blame the disk.
+        let path = std::path::Path::new("/tmp/foo.rpm");
+        let err = download_io_error(
+            DownloadIoPhase::Create,
+            path,
+            &std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+        );
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert!(err
+            .context
+            .contains("cannot create download file /tmp/foo.rpm"));
+        let err = download_io_error(
+            DownloadIoPhase::Create,
+            path,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(err.kind(), ErrorKind::InternalError);
+        let err = download_io_error(
+            DownloadIoPhase::Read,
+            path,
+            &std::io::Error::from(std::io::ErrorKind::TimedOut),
+        );
+        assert_eq!(err.kind(), ErrorKind::Timeout);
+        let err = download_io_error(
+            DownloadIoPhase::Read,
+            path,
+            &std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"),
+        );
+        assert_eq!(err.kind(), ErrorKind::NetworkError);
+        assert!(err
+            .context
+            .contains("cannot read download body for /tmp/foo.rpm"));
+        let err = download_io_error(
+            DownloadIoPhase::Write,
+            path,
+            &std::io::Error::from(std::io::ErrorKind::StorageFull),
+        );
+        assert_eq!(err.kind(), ErrorKind::InternalError);
+        assert!(err
+            .context
+            .contains("cannot write download file /tmp/foo.rpm"));
+        let err = download_io_error(
+            DownloadIoPhase::Sync,
+            path,
+            &std::io::Error::from(std::io::ErrorKind::Other),
+        );
+        assert_eq!(err.kind(), ErrorKind::InternalError);
+        assert!(err
+            .context
+            .contains("cannot sync download file /tmp/foo.rpm"));
     }
 
     #[test]

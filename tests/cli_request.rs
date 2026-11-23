@@ -534,6 +534,36 @@ fn request_file_delete_dry_run_names_the_target() {
 }
 
 #[test]
+fn request_file_delete_dry_run_text_names_the_target() {
+    // The dry-run text names the target, like the JSON payload's
+    // `target` field; the description stays JSON-only.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "request",
+            "file-delete",
+            "--target-project",
+            "test:delete-me",
+            "--whole-project",
+            "--description",
+            "removing",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would file delete request for test:delete-me"
+    );
+}
+
+#[test]
 fn request_file_delete_accept_in_hours_names_the_timer() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
@@ -778,6 +808,95 @@ fn request_supersede_without_credentials_fails_with_config_error() {
         .unwrap();
     assert_eq!(out.status.code(), Some(9));
     assert_eq!(error_of(&out)["error"]["code"], "config_error");
+}
+
+/// A many-shot HTTP fixture answering every request with a status-ok
+/// body: the supersede POST needs one canned answer, and the test
+/// runs the command twice (JSON and text) against the same server.
+/// The thread is not joined: if the binary never connects, the test
+/// fails on its own assertion and the thread dies with the test
+/// process.
+fn serve_supersede_ok() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = "<status code=\"ok\" />";
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (addr, seen)
+}
+
+#[test]
+fn request_supersede_live_shape_carries_ids_and_dry_run_false() {
+    // With --live the command performs the supersede and reports the
+    // pair with dry_run false, in both formats.
+    let (addr, seen) = serve_supersede_ok();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "supersede", "42", "43"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["old_id"], 42);
+    assert_eq!(value["new_id"], 43);
+    assert_eq!(value["dry_run"], false);
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "--live",
+            "request",
+            "supersede",
+            "42",
+            "43",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "superseded request 42 with 43"
+    );
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|r| r.contains("request/42") && r.contains("superseded_by=43")),
+        "recorded requests: {seen:?}"
+    );
 }
 
 #[test]
