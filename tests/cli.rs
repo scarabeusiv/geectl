@@ -1880,6 +1880,332 @@ fn remote_set_package_meta_live_with_half_set_credentials_fails_with_config_erro
 }
 
 #[test]
+fn remote_set_project_meta_add_person_dry_run_ignores_half_set_credentials() {
+    // A person-only change writes no meta itself — the meta write
+    // runs only when a field flag is set — so the plan carries only
+    // the role entry, and the payload carries the granted person.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--add-person",
+            "alice:maintainer",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["name"], "home:alice");
+    assert_eq!(value["persons"][0]["name"], "alice");
+    assert_eq!(value["persons"][0]["role"], "maintainer");
+    assert_eq!(
+        value["plan"],
+        serde_json::json!([
+            "[dry-run] would: add maintainer role for person alice on project home:alice"
+        ])
+    );
+}
+
+#[test]
+fn remote_set_project_meta_field_and_person_flags_dry_run() {
+    // A field flag and a person flag combine: the meta write plans
+    // first, then the role grant.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--title",
+            "Alice",
+            "--add-person",
+            "alice:maintainer",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["title"], "Alice");
+    assert_eq!(value["persons"][0]["name"], "alice");
+    assert_eq!(
+        value["plan"],
+        serde_json::json!([
+            "[dry-run] would: set project meta of home:alice",
+            "[dry-run] would: add maintainer role for person alice on project home:alice"
+        ])
+    );
+}
+
+#[test]
+fn remote_set_package_meta_person_flags_dry_run_records_removal_before_addition() {
+    // Removal applies before addition: the plan lists the removal
+    // first, so the pair moves a person to a new role.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--add-person",
+            "alice:maintainer",
+            "--remove-person",
+            "bob",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "home:alice");
+    assert_eq!(value["name"], "vim");
+    assert_eq!(
+        value["plan"],
+        serde_json::json!([
+            "[dry-run] would: remove person bob from package home:alice/vim (unverified: dry-run does not read the live meta)",
+            "[dry-run] would: add maintainer role for person alice on package home:alice/vim"
+        ])
+    );
+    assert_eq!(value["persons"][0]["name"], "alice");
+    assert_eq!(value["persons"][0]["role"], "maintainer");
+}
+
+#[test]
+fn remote_set_project_meta_add_person_without_colon_fails() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--add-person",
+            "alice",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "invalid person role \"alice\": expected LOGIN:ROLE"
+    );
+}
+
+#[test]
+fn remote_set_project_meta_add_person_with_invalid_role_fails_in_dry_run() {
+    // The role is validated by the library call before the dry-run
+    // guard, so an invalid role fails without a server.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--add-person",
+            "alice:admin",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "invalid OBS role \"admin\" for project home:alice; roles are maintainer, bugowner, reviewer, downloader, reader"
+    );
+}
+
+#[test]
+fn remote_set_project_meta_add_person_with_invalid_login_fails_in_dry_run() {
+    // The login is validated up front, so a bad login fails without
+    // a server, as a login error rather than a role error.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--add-person",
+            "a/b:maintainer",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "invalid OBS person name: \"a/b\""
+    );
+}
+
+#[test]
+fn remote_set_project_meta_handover_dry_run_grants_the_maintainer_first() {
+    // A maintainer grant to someone who is not being removed applies
+    // before the removal, so a handover in one call keeps a
+    // maintainer; the removal itself is unverified in dry-run.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--add-person",
+            "bob:maintainer",
+            "--remove-person",
+            "alice",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(
+        value["plan"],
+        serde_json::json!([
+            "[dry-run] would: add maintainer role for person bob on project home:alice",
+            "[dry-run] would: remove person alice from project home:alice (unverified: dry-run does not read the live meta)"
+        ])
+    );
+    assert_eq!(value["persons"][0]["name"], "bob");
+    assert_eq!(value["persons"][0]["role"], "maintainer");
+}
+
+#[test]
+fn remote_set_project_meta_same_person_move_dry_run_removes_before_adding() {
+    // The same-login move removes first, then adds: the plan lists
+    // the removal before the grant, so the person ends on the new
+    // role only.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--remove-person",
+            "alice",
+            "--add-person",
+            "alice:reviewer",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(
+        value["plan"],
+        serde_json::json!([
+            "[dry-run] would: remove person alice from project home:alice (unverified: dry-run does not read the live meta)",
+            "[dry-run] would: add reviewer role for person alice on project home:alice"
+        ])
+    );
+    assert_eq!(value["persons"][0]["name"], "alice");
+    assert_eq!(value["persons"][0]["role"], "reviewer");
+}
+
+#[test]
+fn remote_set_project_meta_remove_person_with_invalid_login_fails() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--remove-person",
+            "bad login",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "invalid OBS person name: \"bad login\""
+    );
+}
+
+#[test]
+fn remote_set_project_meta_without_any_flag_fails() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "set-project-meta", "home:alice"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "set-project-meta needs at least one of --title, --description, --url, --scmsync, --devel-project, --add-person, --remove-person"
+    );
+}
+
+#[test]
+fn remote_set_project_meta_add_person_live_with_half_set_credentials_fails_with_config_error() {
+    // A live person change needs credentials: the library's
+    // credentials check runs after the dry-run guard.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--add-person",
+            "alice:maintainer",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
 fn remote_update_package_meta_from_spec_dry_run_ignores_half_set_credentials() {
     // A dry-run mutation preview needs no credentials — the
     // library's dry-run guard runs before its credentials check —

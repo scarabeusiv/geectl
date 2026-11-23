@@ -90,7 +90,7 @@ const LOCAL_ROLES: [&str; 5] = ["maintainer", "bugowner", "reviewer", "downloade
 
 /// Validate a role for a direct grant on `what`: it must be one of
 /// the local roles the server grants on projects and packages.
-fn validate_role(role: &str, what: &str) -> Result<(), GeectlError> {
+pub fn validate_role(role: &str, what: &str) -> Result<(), GeectlError> {
     if LOCAL_ROLES.contains(&role) {
         Ok(())
     } else {

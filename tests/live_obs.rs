@@ -68,6 +68,7 @@
 //! requests unless explicitly authorised) is documented on
 //! `ObsClient::change_state` in `src/obs.rs`, and the server stays
 //! the authority on who may move a request.
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use geectl::auth::Credentials;
@@ -316,6 +317,23 @@ fn create_source_branch(client: &ObsClient<'_>, package: &str) -> String {
         )
         .expect("create source package on the live instance");
     source_project
+}
+
+/// Strip every maintainer from a scratch project's meta, through
+/// the library: the server may carry the creating user as the
+/// sole maintainer, and the CLI refuses to remove the last
+/// maintainer, so a test that removes a person from the project
+/// strips first to make the remove step deterministic. The
+/// bootstrap admin can still write the meta afterwards.
+fn strip_project_maintainers(client: &ObsClient<'_>, project: &str) {
+    let mut meta = client
+        .project_meta(project)
+        .expect("read the project meta on the live instance");
+    meta.persons.retain(|entry| entry.role != "maintainer");
+    meta.groups.retain(|entry| entry.role != "maintainer");
+    client
+        .set_project_meta(project, &meta, &DryRun::new(false))
+        .expect("write project meta without maintainers on the live instance");
 }
 
 /// Create a source branch and a target project, all uniquely named
@@ -5254,6 +5272,50 @@ fn live_username() -> String {
     }
 }
 
+/// The built geectl binary against the live instance, with an
+/// isolated HOME/XDG_CONFIG_HOME and the live URL + credentials in
+/// the environment: the same binary `cargo test` builds for the
+/// CLI tests (`CARGO_BIN_EXE_geectl`). The tests that drive the
+/// flags (rather than the library) use this.
+fn live_geectl(dir: &std::path::Path, base: &str) -> Command {
+    let (username, password) = match live_credentials() {
+        Credentials::Basic { username, password } => (username, password),
+        _ => unreachable!("live credentials are Basic"),
+    };
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_geectl"));
+    cmd.env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir)
+        .env("GEECTL_OBS_URL", base)
+        .env("GEECTL_OBS_USERNAME", username)
+        .env("GEECTL_OBS_PASSWORD", password)
+        .env_remove("GEECTL_OBS_PASSWORD_FILE")
+        .env_remove("GEECTL_GITEA_URL")
+        .env_remove("GEECTL_GITEA_TOKEN")
+        .env_remove("GEECTL_GITEA_TOKEN_FILE")
+        .env_remove("GEECTL_GITEA_SSH_KEY")
+        .env_remove("GEECTL_DEBUG")
+        .env_remove("GEECTL_FORMAT");
+    cmd
+}
+
+/// A temp dir under the system temp dir, removed on drop: the
+/// isolated HOME/XDG_CONFIG_HOME for a live CLI run.
+struct LiveTempDir(std::path::PathBuf);
+
+impl LiveTempDir {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("geectl-live-cli-{}", unique_suffix()));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        LiveTempDir(path)
+    }
+}
+
+impl Drop for LiveTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Redact the live username where it appears as a `home:<user>`
 /// project in a diagnostic string: `home:<user>:` becomes
 /// `home:[redacted]:`, and the bare form `home:<user>` at a segment
@@ -6467,6 +6529,282 @@ fn live_role_add_and_remove_package_round_trip() {
             .iter()
             .any(|entry| entry.name == user && entry.role == "maintainer"),
         "the maintainer removal reads back"
+    );
+}
+
+/// The `--add-person` / `--remove-person` flags round-trip through
+/// the live server on a scratch project, driven through the CLI:
+/// the grant reads back after the add, and is gone after the
+/// remove.
+#[test]
+fn live_set_project_meta_person_flags_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let user = live_username();
+    strip_project_maintainers(&client, &project);
+    let dir = LiveTempDir::new();
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "remote",
+            "set-project-meta",
+            &project,
+            "--add-person",
+            &format!("{user}:bugowner"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = client
+        .project_meta(&project)
+        .expect("read the project meta on the live instance");
+    assert!(
+        meta.persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "bugowner"),
+        "the bugowner grant reads back"
+    );
+    assert!(
+        !meta
+            .persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "maintainer"),
+        "the test user holds no maintainer role, so the removal cannot hit the last-maintainer refusal"
+    );
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "remote",
+            "set-project-meta",
+            &project,
+            "--remove-person",
+            &user,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = client
+        .project_meta(&project)
+        .expect("read the project meta back from the server");
+    assert!(
+        !meta
+            .persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "bugowner"),
+        "the bugowner removal reads back"
+    );
+}
+
+/// The `--add-person` / `--remove-person` flags round-trip through
+/// the live server on a scratch package, driven through the CLI.
+#[test]
+fn live_set_package_meta_person_flags_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let user = live_username();
+    let dir = LiveTempDir::new();
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "remote",
+            "set-package-meta",
+            &project,
+            &package,
+            "--add-person",
+            &format!("{user}:reviewer"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta on the live instance");
+    assert!(
+        meta.persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "reviewer"),
+        "the reviewer grant reads back"
+    );
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "remote",
+            "set-package-meta",
+            &project,
+            &package,
+            "--remove-person",
+            &user,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta back from the server");
+    assert!(
+        !meta
+            .persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "reviewer"),
+        "the reviewer removal reads back"
+    );
+}
+
+/// The same-login move round-trips through the live server on a
+/// scratch project, driven through the CLI: removing a person and
+/// granting them a new role in one call leaves them on the new
+/// role only. The project is stripped of maintainers first, like
+/// the flags round-trip above.
+#[test]
+fn live_set_project_meta_same_person_move_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let user = live_username();
+    strip_project_maintainers(&client, &project);
+    let dir = LiveTempDir::new();
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "remote",
+            "set-project-meta",
+            &project,
+            "--add-person",
+            &format!("{user}:bugowner"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "remote",
+            "set-project-meta",
+            &project,
+            "--remove-person",
+            &user,
+            "--add-person",
+            &format!("{user}:reviewer"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = client
+        .project_meta(&project)
+        .expect("read the project meta back from the server");
+    assert!(
+        meta.persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "reviewer"),
+        "the reviewer grant reads back"
+    );
+    assert!(
+        !meta
+            .persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "bugowner"),
+        "the bugowner grant is gone after the move"
+    );
+}
+
+/// The same-login move round-trips through the live server on a
+/// scratch package, driven through the CLI.
+#[test]
+fn live_set_package_meta_same_person_move_round_trip() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let user = live_username();
+    let dir = LiveTempDir::new();
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "remote",
+            "set-package-meta",
+            &project,
+            &package,
+            "--add-person",
+            &format!("{user}:reviewer"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "remote",
+            "set-package-meta",
+            &project,
+            &package,
+            "--remove-person",
+            &user,
+            "--add-person",
+            &format!("{user}:bugowner"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta back from the server");
+    assert!(
+        meta.persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "bugowner"),
+        "the bugowner grant reads back"
+    );
+    assert!(
+        !meta
+            .persons
+            .iter()
+            .any(|entry| entry.name == user && entry.role == "reviewer"),
+        "the reviewer grant is gone after the move"
     );
 }
 

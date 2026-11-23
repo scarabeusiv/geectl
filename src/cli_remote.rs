@@ -74,11 +74,11 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    AggregateOptions, CreatePackageOptions, DeleteProjectOptions, DryRun, FilePatch,
-    FilePatchStatus, HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus,
-    PackageMatch, PackageMeta, Person, ProjectMatch, ProjectMeta, ReleaseOptions, Repository,
-    RevisionPatch, RevisionRange, RevisionSpec, SourceFile, StagedRequest, StagingProject,
-    StagingReadOptions, FACTORY_PROJECT, OBS_API_BASE,
+    valid_obs_name, validate_role, AggregateOptions, CreatePackageOptions, DeleteProjectOptions,
+    DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff,
+    PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch, ProjectMeta,
+    ReleaseOptions, Repository, RevisionPatch, RevisionRange, RevisionSpec, RoleGrant, SourceFile,
+    StagedRequest, StagingProject, StagingReadOptions, FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -196,6 +196,21 @@ pub enum RemoteCommand {
     /// default (only the plan is printed); `--live` performs the
     /// write. Only the given fields change; the rest of the meta is
     /// kept as it is. There is no flag to clear a field.
+    ///
+    /// `--add-person LOGIN:ROLE` grants a role to a person;
+    /// `--remove-person LOGIN` removes every role that login holds.
+    /// Removal applies before addition, so the pair moves a person
+    /// to a new role — except a maintainer grant to someone who is
+    /// not being removed, which applies first so a handover in one
+    /// call keeps a maintainer. Roles: maintainer, bugowner,
+    /// reviewer, reader, downloader.
+    ///
+    /// The write is not atomic: the field write runs first, then
+    /// each person change is a separate read-modify-write, so a
+    /// failure part-way leaves the earlier changes applied, with no
+    /// rollback. Dry-run does not read the live meta, so a removal
+    /// is not validated there: a login holding no role, and the
+    /// last-maintainer refusal, only fail with `--live`.
     SetProjectMeta {
         /// The project whose meta is written.
         project: String,
@@ -214,6 +229,12 @@ pub enum RemoteCommand {
         /// The new devel project.
         #[arg(long)]
         devel_project: Option<String>,
+        /// Grant a role to a person: `LOGIN:ROLE`, repeatable.
+        #[arg(long)]
+        add_person: Vec<String>,
+        /// Remove a person: every role the login holds, repeatable.
+        #[arg(long)]
+        remove_person: Vec<String>,
     },
     /// Show a package's meta (title, description, persons, devel project).
     PackageMeta {
@@ -226,6 +247,20 @@ pub enum RemoteCommand {
     /// default (only the plan is printed); `--live` performs the
     /// write. Only the given fields change; the rest of the meta is
     /// kept as it is. There is no flag to clear a field.
+    ///
+    /// `--add-person LOGIN:ROLE` grants a role to a person;
+    /// `--remove-person LOGIN` removes every role that login holds.
+    /// Removal applies before addition, so the pair moves a person
+    /// to a new role. There is no last-maintainer refusal on a
+    /// package: the project maintainers still cover it. Roles:
+    /// maintainer, bugowner, reviewer, reader, downloader.
+    ///
+    /// The write is not atomic: the field write runs first, then
+    /// each person change is a separate read-modify-write, so a
+    /// failure part-way leaves the earlier changes applied, with no
+    /// rollback. Dry-run does not read the live meta, so a removal
+    /// is not validated there: a login holding no role only fails
+    /// with `--live`.
     SetPackageMeta {
         /// The project the package lives in.
         project: String,
@@ -253,6 +288,12 @@ pub enum RemoteCommand {
         /// package already has a devel project.
         #[arg(long)]
         devel_package: Option<String>,
+        /// Grant a role to a person: `LOGIN:ROLE`, repeatable.
+        #[arg(long)]
+        add_person: Vec<String>,
+        /// Remove a person: every role the login holds, repeatable.
+        #[arg(long)]
+        remove_person: Vec<String>,
     },
     /// Update a package's meta from its spec file. A mutation:
     /// dry-run is the default (only the plan is printed); `--live`
@@ -799,6 +840,8 @@ pub fn run_remote(
             url,
             scmsync,
             devel_project,
+            add_person,
+            remove_person,
         } => {
             let flags = ProjectMetaFlags {
                 title,
@@ -806,23 +849,47 @@ pub fn run_remote(
                 url,
                 scmsync,
                 devel_project,
+                add_person: parse_person_roles(&add_person)?,
+                remove_person: {
+                    validate_person_logins(&remove_person)?;
+                    dedupe_logins(remove_person)
+                },
             };
             let fields = project_meta_fields(&flags)?;
+            validate_person_roles(&flags.add_person, &format!("project {project}"))?;
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
             let current = if live {
                 client.project_meta(&project)?
             } else {
                 empty_project_meta(&project)
             };
-            let merged = merge_project_meta(&current, &flags);
-            client.set_project_meta(&project, &merged, &dry_run)?;
+            let removals = if live {
+                plan_project_removals(&project, &current, &flags.remove_person, &flags.add_person)?
+            } else {
+                Vec::new()
+            };
+            let mut merged = merge_project_meta(&current, &flags);
+            if flags.has_fields() {
+                client.set_project_meta(&project, &merged, &dry_run)?;
+            }
+            apply_project_person_changes(&client, &project, &removals, &flags, &dry_run)?;
+            let result_meta = if flags.has_person_changes() {
+                if live {
+                    client.project_meta(&project)?
+                } else {
+                    apply_person_adds(&mut merged.persons, &flags.add_person);
+                    merged
+                }
+            } else {
+                merged
+            };
             let plan = if dry_run.enabled() {
                 Some(dry_run.plan())
             } else {
                 None
             };
             Ok(set_project_meta_result(
-                &merged,
+                &result_meta,
                 &fields,
                 dry_run.enabled(),
                 plan,
@@ -838,6 +905,8 @@ pub fn run_remote(
             releasename,
             devel_project,
             devel_package,
+            add_person,
+            remove_person,
         } => {
             let flags = PackageMetaFlags {
                 title,
@@ -847,23 +916,47 @@ pub fn run_remote(
                 releasename,
                 devel_project,
                 devel_package,
+                add_person: parse_person_roles(&add_person)?,
+                remove_person: {
+                    validate_person_logins(&remove_person)?;
+                    dedupe_logins(remove_person)
+                },
             };
             let fields = package_meta_fields(&flags)?;
+            validate_person_roles(&flags.add_person, &format!("package {project}/{package}"))?;
             let dry_run = DryRun::new(!live).with_debug(debug.clone());
             let current = if live {
                 client.package_meta(&project, &package)?
             } else {
                 empty_package_meta(&project, &package)
             };
-            let merged = merge_package_meta(&current, &flags)?;
-            client.set_package_meta(&project, &package, &merged, &dry_run)?;
+            let removals = if live {
+                plan_package_removals(&project, &package, &current, &flags.remove_person)?
+            } else {
+                Vec::new()
+            };
+            let mut merged = merge_package_meta(&current, &flags)?;
+            if flags.has_fields() {
+                client.set_package_meta(&project, &package, &merged, &dry_run)?;
+            }
+            apply_package_person_changes(&client, &project, &package, &removals, &flags, &dry_run)?;
+            let result_meta = if flags.has_person_changes() {
+                if live {
+                    client.package_meta(&project, &package)?
+                } else {
+                    apply_person_adds(&mut merged.persons, &flags.add_person);
+                    merged
+                }
+            } else {
+                merged
+            };
             let plan = if dry_run.enabled() {
                 Some(dry_run.plan())
             } else {
                 None
             };
             Ok(set_package_meta_result(
-                &merged,
+                &result_meta,
                 &fields,
                 dry_run.enabled(),
                 plan,
@@ -1748,17 +1841,40 @@ fn empty_package_meta(project: &str, package: &str) -> PackageMeta {
 }
 
 /// The flags of a `set-project-meta` call: one optional value per
-/// writable field. Absent means keep the current value.
+/// writable field, plus the parsed person changes. An absent field
+/// flag keeps the current value.
 struct ProjectMetaFlags {
     title: Option<String>,
     description: Option<String>,
     url: Option<String>,
     scmsync: Option<String>,
     devel_project: Option<String>,
+    /// Grants from `--add-person`, parsed.
+    add_person: Vec<RoleGrant>,
+    /// Logins from `--remove-person`.
+    remove_person: Vec<String>,
+}
+
+impl ProjectMetaFlags {
+    /// True when any field flag is set: only then is the meta
+    /// itself written (person flags write through the role calls).
+    fn has_fields(&self) -> bool {
+        self.title.is_some()
+            || self.description.is_some()
+            || self.url.is_some()
+            || self.scmsync.is_some()
+            || self.devel_project.is_some()
+    }
+
+    /// True when any person flag is set.
+    fn has_person_changes(&self) -> bool {
+        !self.add_person.is_empty() || !self.remove_person.is_empty()
+    }
 }
 
 /// The flags of a `set-package-meta` call: one optional value per
-/// writable field. Absent means keep the current value.
+/// writable field, plus the parsed person changes. An absent field
+/// flag keeps the current value.
 struct PackageMetaFlags {
     title: Option<String>,
     description: Option<String>,
@@ -1767,6 +1883,29 @@ struct PackageMetaFlags {
     releasename: Option<String>,
     devel_project: Option<String>,
     devel_package: Option<String>,
+    /// Grants from `--add-person`, parsed.
+    add_person: Vec<RoleGrant>,
+    /// Logins from `--remove-person`.
+    remove_person: Vec<String>,
+}
+
+impl PackageMetaFlags {
+    /// True when any field flag is set: only then is the meta
+    /// itself written (person flags write through the role calls).
+    fn has_fields(&self) -> bool {
+        self.title.is_some()
+            || self.description.is_some()
+            || self.url.is_some()
+            || self.scmsync.is_some()
+            || self.releasename.is_some()
+            || self.devel_project.is_some()
+            || self.devel_package.is_some()
+    }
+
+    /// True when any person flag is set.
+    fn has_person_changes(&self) -> bool {
+        !self.add_person.is_empty() || !self.remove_person.is_empty()
+    }
 }
 
 /// Merge the given project-meta flags onto the current meta: a flag
@@ -1864,10 +2003,20 @@ fn project_meta_fields(flags: &ProjectMetaFlags) -> Result<Vec<String>, GeectlEr
     if let Some(devel) = &flags.devel_project {
         fields.push(format!("devel-project: {devel}"));
     }
+    for grant in &flags.add_person {
+        fields.push(format!(
+            "add-person: {}:{}",
+            grant.person.as_deref().unwrap_or_default(),
+            grant.role
+        ));
+    }
+    for login in &flags.remove_person {
+        fields.push(format!("remove-person: {login}"));
+    }
     if fields.is_empty() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "set-project-meta needs at least one of --title, --description, --url, --scmsync, --devel-project",
+            "set-project-meta needs at least one of --title, --description, --url, --scmsync, --devel-project, --add-person, --remove-person",
         ));
     }
     Ok(fields)
@@ -1899,10 +2048,20 @@ fn package_meta_fields(flags: &PackageMetaFlags) -> Result<Vec<String>, GeectlEr
     if let Some(devel) = &flags.devel_package {
         fields.push(format!("devel-package: {devel}"));
     }
+    for grant in &flags.add_person {
+        fields.push(format!(
+            "add-person: {}:{}",
+            grant.person.as_deref().unwrap_or_default(),
+            grant.role
+        ));
+    }
+    for login in &flags.remove_person {
+        fields.push(format!("remove-person: {login}"));
+    }
     if fields.is_empty() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "set-package-meta needs at least one of --title, --description, --url, --scmsync, --releasename, --devel-project, --devel-package",
+            "set-package-meta needs at least one of --title, --description, --url, --scmsync, --releasename, --devel-project, --devel-package, --add-person, --remove-person",
         ));
     }
     Ok(fields)
@@ -2383,6 +2542,301 @@ fn parse_repo_paths(paths: &[String]) -> Result<Vec<(String, String)>, GeectlErr
             )),
         })
         .collect()
+}
+
+/// Parse `--add-person LOGIN:ROLE` values into role grants: the
+/// two sides split on the first `:`. A value with no `:`, or an
+/// empty side, is an input error naming the expected form. The
+/// login is validated here, up front: a login is an OBS name, so
+/// a value whose login side is not one fails as a login error,
+/// not as a confusing role error for the text after the colon.
+/// The role itself is validated by the library call, which runs
+/// before the dry-run guard, so an invalid role fails in dry-run
+/// too. Identical grants dedupe: a repeated `--add-person`
+/// applies once.
+fn parse_person_roles(values: &[String]) -> Result<Vec<RoleGrant>, GeectlError> {
+    let mut grants = Vec::new();
+    for value in values {
+        let grant = match value.split_once(':') {
+            Some((login, role)) if !login.is_empty() && !role.is_empty() => {
+                if !valid_obs_name(login) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid OBS person name: {login:?}"),
+                    ));
+                }
+                RoleGrant::person(login, role)
+            }
+            _ => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid person role {value:?}: expected LOGIN:ROLE"),
+                ));
+            }
+        };
+        if !grants.iter().any(|held: &RoleGrant| {
+            held.person.as_deref() == grant.person.as_deref() && held.role == grant.role
+        }) {
+            grants.push(grant);
+        }
+    }
+    Ok(grants)
+}
+
+/// Validate `--remove-person LOGIN` values: every login must be a
+/// valid OBS name. A login is a single name: `:` separates project
+/// segments, so it can never appear in one — `valid_obs_name`
+/// allows it for project names, so it is rejected here. The
+/// library validates the login too, but only on the live path —
+/// dry-run never reaches it — so the CLI validates up front and
+/// both modes reject a bad login.
+fn validate_person_logins(values: &[String]) -> Result<(), GeectlError> {
+    for login in values {
+        if !valid_obs_name(login) || login.contains(':') {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS person name: {login:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Dedupe `--remove-person` logins, keeping the first occurrence:
+/// a repeated login would otherwise plan twice and fail on the
+/// second removal, after the first already applied.
+fn dedupe_logins(values: Vec<String>) -> Vec<String> {
+    let mut kept = Vec::new();
+    for value in values {
+        if !kept.contains(&value) {
+            kept.push(value);
+        }
+    }
+    kept
+}
+
+/// Validate the `--add-person` roles up front: the library
+/// validates them too, but only when the grant runs — after the
+/// field write — so an invalid role would apply the fields first.
+fn validate_person_roles(grants: &[RoleGrant], what: &str) -> Result<(), GeectlError> {
+    for grant in grants {
+        validate_role(&grant.role, what)?;
+    }
+    Ok(())
+}
+
+/// The roles `login` holds in `persons`, in meta order,
+/// deduplicated.
+fn roles_of_person<'a>(persons: &'a [NamedRole], login: &str) -> Vec<&'a str> {
+    let mut roles = Vec::new();
+    for entry in persons {
+        if entry.name == login && !roles.contains(&entry.role.as_str()) {
+            roles.push(entry.role.as_str());
+        }
+    }
+    roles
+}
+
+/// Apply the `--add-person` grants to a meta's persons in memory,
+/// so a dry-run result payload carries the persons the flags set.
+/// A grant already present adds nothing, like the library call.
+fn apply_person_adds(persons: &mut Vec<NamedRole>, grants: &[RoleGrant]) {
+    for grant in grants {
+        let name = grant.person.as_deref().unwrap_or_default();
+        if !persons
+            .iter()
+            .any(|entry| entry.name == name && entry.role == grant.role)
+        {
+            persons.push(NamedRole {
+                name: name.to_string(),
+                role: grant.role.clone(),
+            });
+        }
+    }
+}
+
+/// The removal plan for `--remove-person` on a project: each
+/// login with the roles it holds, from the meta as read. Computed
+/// before any write, so a removal that cannot happen fails before
+/// the fields apply: a login holding no role is an error, never a
+/// silent no-op, and removing the last maintainer is refused. A
+/// repeated login plans once. The last-maintainer refusal is
+/// end-state aware: co-requested maintainer grants to someone who
+/// is not being removed count — a handover in one call keeps a
+/// maintainer — but a grant to a person being removed does not,
+/// because the removal runs before that grant could apply. The
+/// library refuses it per call too; without the pre-check a
+/// multi-role removal would apply partially.
+fn plan_project_removals(
+    project: &str,
+    current: &ProjectMeta,
+    logins: &[String],
+    adds: &[RoleGrant],
+) -> Result<Vec<(String, Vec<String>)>, GeectlError> {
+    let mut plan: Vec<(String, Vec<String>)> = Vec::new();
+    for login in logins {
+        if plan.iter().any(|(held, _)| held == login) {
+            continue;
+        }
+        let roles = roles_of_person(&current.persons, login);
+        if roles.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("person {login} holds no role on project {project}"),
+            ));
+        }
+        plan.push((
+            login.clone(),
+            roles.into_iter().map(str::to_string).collect(),
+        ));
+    }
+    let removes_a_maintainer = plan
+        .iter()
+        .any(|(_, roles)| roles.iter().any(|role| role.as_str() == "maintainer"));
+    if removes_a_maintainer {
+        let kept_maintainer = current.persons.iter().any(|entry| {
+            entry.role == "maintainer" && !plan.iter().any(|(login, _)| login == &entry.name)
+        }) || current
+            .groups
+            .iter()
+            .any(|entry| entry.role == "maintainer")
+            || adds.iter().any(|grant| {
+                grant.role == "maintainer"
+                    && grant
+                        .person
+                        .as_deref()
+                        .is_some_and(|name| !plan.iter().any(|(login, _)| login.as_str() == name))
+            });
+        if !kept_maintainer {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("refusing to remove the last maintainer of project {project}: the project would have no maintainer left; grant a maintainer role to someone who is not being removed first"),
+            ));
+        }
+    }
+    Ok(plan)
+}
+
+/// The removal plan for `--remove-person` on a package: same
+/// terms as `plan_project_removals`, except removing the last
+/// package maintainer is allowed — the project maintainers still
+/// cover the package. A repeated login plans once.
+fn plan_package_removals(
+    project: &str,
+    package: &str,
+    current: &PackageMeta,
+    logins: &[String],
+) -> Result<Vec<(String, Vec<String>)>, GeectlError> {
+    let mut plan = Vec::new();
+    for login in logins {
+        if plan.iter().any(|(held, _)| held == login) {
+            continue;
+        }
+        let roles = roles_of_person(&current.persons, login);
+        if roles.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("person {login} holds no role on package {project}/{package}"),
+            ));
+        }
+        plan.push((
+            login.clone(),
+            roles.into_iter().map(str::to_string).collect(),
+        ));
+    }
+    Ok(plan)
+}
+
+/// Apply the person flags of a `set-project-meta` call: removals
+/// first, then additions, so the pair moves a person to a new role.
+/// A maintainer grant to someone who is not being removed applies
+/// before the removals, so a handover in one call keeps a
+/// maintainer (the plan already counted it). Removals run from
+/// the pre-validated plan, one library removal per role
+/// (force-confirmed: the flag names the person to remove). In
+/// dry-run a removal records a whole-person plan entry — the roles
+/// are unread there, and the entry says so — while an addition
+/// records its own per-role entry through the library call.
+fn apply_project_person_changes(
+    client: &ObsClient<'_>,
+    project: &str,
+    removals: &[(String, Vec<String>)],
+    flags: &ProjectMetaFlags,
+    dry_run: &DryRun,
+) -> Result<(), GeectlError> {
+    // A maintainer grant to someone who is not being removed runs
+    // before the removals: without it the removal of the last
+    // maintainer would fail before the grant could restore one.
+    let (pre_grants, post_grants): (Vec<&RoleGrant>, Vec<&RoleGrant>) =
+        flags.add_person.iter().partition(|grant| {
+            grant.role == "maintainer"
+                && grant.person.as_deref().is_some_and(|name| {
+                    !flags
+                        .remove_person
+                        .iter()
+                        .any(|login| login.as_str() == name)
+                })
+        });
+    for grant in pre_grants {
+        client.role_add_project(project, grant, dry_run)?;
+    }
+    if dry_run.enabled() {
+        for login in &flags.remove_person {
+            dry_run.note(&format!(
+                "would: remove person {login} from project {project} (unverified: dry-run does not read the live meta)"
+            ));
+        }
+    } else {
+        for (login, roles) in removals {
+            for role in roles {
+                client.role_remove_project(
+                    project,
+                    &RoleGrant::person(login, role),
+                    true,
+                    dry_run,
+                )?;
+            }
+        }
+    }
+    for grant in post_grants {
+        client.role_add_project(project, grant, dry_run)?;
+    }
+    Ok(())
+}
+
+/// Apply the person flags of a `set-package-meta` call: same terms
+/// as `apply_project_person_changes`.
+fn apply_package_person_changes(
+    client: &ObsClient<'_>,
+    project: &str,
+    package: &str,
+    removals: &[(String, Vec<String>)],
+    flags: &PackageMetaFlags,
+    dry_run: &DryRun,
+) -> Result<(), GeectlError> {
+    if dry_run.enabled() {
+        for login in &flags.remove_person {
+            dry_run.note(&format!(
+                "would: remove person {login} from package {project}/{package} (unverified: dry-run does not read the live meta)"
+            ));
+        }
+    } else {
+        for (login, roles) in removals {
+            for role in roles {
+                client.role_remove_package(
+                    project,
+                    package,
+                    &RoleGrant::person(login, role),
+                    true,
+                    dry_run,
+                )?;
+            }
+        }
+    }
+    for grant in &flags.add_person {
+        client.role_add_package(project, package, grant, dry_run)?;
+    }
+    Ok(())
 }
 
 fn maintainers_result(
@@ -3565,7 +4019,13 @@ mod tests {
                 url: Some(url),
                 scmsync: None,
                 devel_project: None,
-            } if project == "home:alice" && title == "Alice" && url == "https://example.org"
+                add_person,
+                remove_person,
+            } if project == "home:alice"
+                && title == "Alice"
+                && url == "https://example.org"
+                && add_person.is_empty()
+                && remove_person.is_empty()
         ));
     }
 
@@ -3635,6 +4095,8 @@ mod tests {
             url: None,
             scmsync: Some("https://github.com/openSUSE/factory.git".to_string()),
             devel_project: None,
+            add_person: vec![],
+            remove_person: vec![],
         };
         let merged = merge_project_meta(&current, &flags);
         assert_eq!(merged.title, Some("New title".to_string()));
@@ -3674,6 +4136,8 @@ mod tests {
             releasename: None,
             devel_project: Some("devel:languages:vim".to_string()),
             devel_package: None,
+            add_person: vec![],
+            remove_person: vec![],
         };
         let merged = merge_package_meta(&current, &flags).unwrap();
         assert_eq!(
@@ -3704,6 +4168,8 @@ mod tests {
             releasename: None,
             devel_project: None,
             devel_package: Some("other".to_string()),
+            add_person: vec![],
+            remove_person: vec![],
         };
         // Both modes reject the pair: live reads the current meta and
         // finds no devel project; dry-run never reads the current meta,
@@ -3731,6 +4197,8 @@ mod tests {
             url: None,
             scmsync: None,
             devel_project: None,
+            add_person: vec![],
+            remove_person: vec![],
         };
         assert!(project_meta_fields(&project_flags).is_err());
         let package_flags = PackageMetaFlags {
@@ -3741,8 +4209,337 @@ mod tests {
             releasename: None,
             devel_project: None,
             devel_package: None,
+            add_person: vec![],
+            remove_person: vec![],
         };
         assert!(package_meta_fields(&package_flags).is_err());
+    }
+
+    #[test]
+    fn parse_person_roles_splits_login_and_role() {
+        let grants =
+            parse_person_roles(&["alice:maintainer".to_string(), "bob:reviewer".to_string()])
+                .unwrap();
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[0].person.as_deref(), Some("alice"));
+        assert_eq!(grants[0].role, "maintainer");
+        assert_eq!(grants[1].person.as_deref(), Some("bob"));
+        assert_eq!(grants[1].role, "reviewer");
+        assert!(parse_person_roles(&["alice".to_string()]).is_err());
+        assert!(parse_person_roles(&[":maintainer".to_string()]).is_err());
+        assert!(parse_person_roles(&["alice:".to_string()]).is_err());
+        assert!(parse_person_roles(&["".to_string()]).is_err());
+    }
+
+    #[test]
+    fn validate_person_logins_rejects_an_invalid_login() {
+        assert!(validate_person_logins(&["alice".to_string()]).is_ok());
+        assert!(validate_person_logins(&["".to_string()]).is_err());
+        assert!(validate_person_logins(&["bad login".to_string()]).is_err());
+        assert!(validate_person_logins(&["a/b".to_string()]).is_err());
+        assert!(validate_person_logins(&["a:b".to_string()]).is_err());
+    }
+
+    #[test]
+    fn meta_fields_lists_person_changes() {
+        let flags = ProjectMetaFlags {
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            devel_project: None,
+            add_person: vec![RoleGrant::person("alice", "maintainer")],
+            remove_person: vec!["bob".to_string()],
+        };
+        assert_eq!(
+            project_meta_fields(&flags).unwrap(),
+            vec![
+                "add-person: alice:maintainer".to_string(),
+                "remove-person: bob".to_string(),
+            ]
+        );
+        let flags = PackageMetaFlags {
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel_project: None,
+            devel_package: None,
+            add_person: vec![RoleGrant::person("alice", "bugowner")],
+            remove_person: vec![],
+        };
+        assert_eq!(
+            package_meta_fields(&flags).unwrap(),
+            vec!["add-person: alice:bugowner".to_string()]
+        );
+    }
+
+    #[test]
+    fn roles_of_person_deduplicates_in_meta_order() {
+        let persons = vec![
+            NamedRole {
+                name: "alice".to_string(),
+                role: "maintainer".to_string(),
+            },
+            NamedRole {
+                name: "bob".to_string(),
+                role: "reviewer".to_string(),
+            },
+            NamedRole {
+                name: "alice".to_string(),
+                role: "reviewer".to_string(),
+            },
+            NamedRole {
+                name: "alice".to_string(),
+                role: "maintainer".to_string(),
+            },
+        ];
+        assert_eq!(
+            roles_of_person(&persons, "alice"),
+            vec!["maintainer", "reviewer"]
+        );
+        assert!(roles_of_person(&persons, "carol").is_empty());
+    }
+
+    #[test]
+    fn validate_person_roles_rejects_an_unknown_role() {
+        assert!(
+            validate_person_roles(&[RoleGrant::person("alice", "maintainer")], "project P").is_ok()
+        );
+        let err =
+            validate_person_roles(&[RoleGrant::person("alice", "admin")], "project P").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.context,
+            "invalid OBS role \"admin\" for project P; roles are maintainer, bugowner, reviewer, downloader, reader"
+        );
+    }
+
+    #[test]
+    fn plan_project_removals_refuses_the_last_maintainer_and_an_unknown_login() {
+        let mut meta = sample_project_meta();
+        // alice is the only maintainer: removing her is refused.
+        assert!(
+            plan_project_removals("openSUSE:Factory", &meta, &["alice".to_string()], &[]).is_err()
+        );
+        // bob holds no role: an error, never a silent no-op.
+        assert!(
+            plan_project_removals("openSUSE:Factory", &meta, &["bob".to_string()], &[]).is_err()
+        );
+        // With a second maintainer, removing alice plans her roles.
+        meta.persons.push(NamedRole {
+            name: "bob".to_string(),
+            role: "maintainer".to_string(),
+        });
+        assert_eq!(
+            plan_project_removals("openSUSE:Factory", &meta, &["alice".to_string()], &[]).unwrap(),
+            vec![("alice".to_string(), vec!["maintainer".to_string()])]
+        );
+    }
+
+    #[test]
+    fn plan_package_removals_allows_the_last_maintainer() {
+        let meta = PackageMeta {
+            name: "vim".to_string(),
+            project: "P".to_string(),
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel: None,
+            persons: vec![NamedRole {
+                name: "alice".to_string(),
+                role: "maintainer".to_string(),
+            }],
+            groups: vec![],
+        };
+        assert_eq!(
+            plan_package_removals("P", "vim", &meta, &["alice".to_string()]).unwrap(),
+            vec![("alice".to_string(), vec!["maintainer".to_string()])]
+        );
+        assert!(plan_package_removals("P", "vim", &meta, &["bob".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_person_roles_rejects_an_invalid_login_and_dedupes_repeats() {
+        assert!(parse_person_roles(&["a/b:maintainer".to_string()]).is_err());
+        let grants = parse_person_roles(&[
+            "alice:maintainer".to_string(),
+            "alice:maintainer".to_string(),
+            "alice:reviewer".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[0].role, "maintainer");
+        assert_eq!(grants[1].role, "reviewer");
+    }
+
+    #[test]
+    fn dedupe_logins_keeps_the_first_occurrence() {
+        assert_eq!(
+            dedupe_logins(vec![
+                "bob".to_string(),
+                "alice".to_string(),
+                "bob".to_string()
+            ]),
+            vec!["bob".to_string(), "alice".to_string()]
+        );
+    }
+
+    #[test]
+    fn plan_project_removals_dedupes_a_repeated_login() {
+        let mut meta = sample_project_meta();
+        meta.persons.push(NamedRole {
+            name: "bob".to_string(),
+            role: "maintainer".to_string(),
+        });
+        assert_eq!(
+            plan_project_removals(
+                "openSUSE:Factory",
+                &meta,
+                &["alice".to_string(), "alice".to_string()],
+                &[]
+            )
+            .unwrap(),
+            vec![("alice".to_string(), vec!["maintainer".to_string()])]
+        );
+    }
+
+    #[test]
+    fn plan_project_removals_allows_a_handover_in_one_call() {
+        let meta = sample_project_meta();
+        // alice is the only maintainer, but bob is granted the
+        // maintainer role in the same call: the end state keeps one.
+        let adds = vec![RoleGrant::person("bob", "maintainer")];
+        assert_eq!(
+            plan_project_removals("openSUSE:Factory", &meta, &["alice".to_string()], &adds)
+                .unwrap(),
+            vec![("alice".to_string(), vec!["maintainer".to_string()])]
+        );
+    }
+
+    #[test]
+    fn plan_project_removals_refuses_when_every_maintainer_leaves() {
+        let mut meta = sample_project_meta();
+        meta.persons.push(NamedRole {
+            name: "bob".to_string(),
+            role: "maintainer".to_string(),
+        });
+        // Removing both maintainers leaves none, even though each
+        // removal alone looks fine against the current meta.
+        assert!(plan_project_removals(
+            "openSUSE:Factory",
+            &meta,
+            &["alice".to_string(), "bob".to_string()],
+            &[]
+        )
+        .is_err());
+        // A maintainer grant to a person being removed does not cure
+        // it: the removal runs before that grant could apply.
+        let adds = vec![RoleGrant::person("alice", "maintainer")];
+        assert!(plan_project_removals(
+            "openSUSE:Factory",
+            &meta,
+            &["alice".to_string(), "bob".to_string()],
+            &adds
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn plan_project_removals_refuses_a_sole_maintainer_moving_to_another_role() {
+        let meta = sample_project_meta();
+        // alice is the only maintainer: removing her to grant her a
+        // reviewer role instead would leave no maintainer.
+        let adds = vec![RoleGrant::person("alice", "reviewer")];
+        assert!(
+            plan_project_removals("openSUSE:Factory", &meta, &["alice".to_string()], &adds)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn plan_project_removals_refuses_a_sole_maintainer_regranting_themselves() {
+        let meta = sample_project_meta();
+        // alice is the only maintainer: granting the maintainer role
+        // back to herself in the same call does not keep one — the
+        // removal runs before that grant could apply — so the
+        // refusal stands, and names the cure.
+        let adds = vec![RoleGrant::person("alice", "maintainer")];
+        let err = plan_project_removals("openSUSE:Factory", &meta, &["alice".to_string()], &adds)
+            .unwrap_err();
+        assert!(err.context.contains("someone who is not being removed"));
+    }
+
+    #[test]
+    fn plan_package_removals_dedupes_a_repeated_login() {
+        let meta = PackageMeta {
+            name: "vim".to_string(),
+            project: "P".to_string(),
+            title: None,
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel: None,
+            persons: vec![NamedRole {
+                name: "alice".to_string(),
+                role: "maintainer".to_string(),
+            }],
+            groups: vec![],
+        };
+        assert_eq!(
+            plan_package_removals(
+                "P",
+                "vim",
+                &meta,
+                &["alice".to_string(), "alice".to_string()]
+            )
+            .unwrap(),
+            vec![("alice".to_string(), vec!["maintainer".to_string()])]
+        );
+    }
+
+    #[test]
+    fn parse_set_project_meta_person_flags() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "set-project-meta",
+            "P",
+            "--add-person",
+            "alice:maintainer",
+            "--remove-person",
+            "bob",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::SetProjectMeta {
+                add_person,
+                remove_person,
+                ..
+            } if add_person == vec!["alice:maintainer".to_string()]
+                && remove_person == vec!["bob".to_string()]
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "set-package-meta",
+            "P",
+            "K",
+            "--add-person",
+            "alice:bugowner",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::SetPackageMeta {
+                add_person,
+                remove_person,
+                ..
+            } if add_person == vec!["alice:bugowner".to_string()] && remove_person.is_empty()
+        ));
     }
 
     #[test]
