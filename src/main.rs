@@ -130,7 +130,8 @@ enum Command {
         #[command(subcommand)]
         command: maintenance::MaintenanceCommand,
     },
-    /// Service reads: list a package's services and their run state.
+    /// Service reads and trigger: list a package's services, their
+    /// run state, and trigger a server-side run.
     Service {
         #[command(subcommand)]
         command: cli_service::ServiceCommand,
@@ -256,7 +257,7 @@ fn run(
             let (payload, text) = maintenance::run(command, debug, cli.live)?;
             (payload, text)
         }
-        Some(Command::Service { command }) => cli_service::run_service(command, debug)?,
+        Some(Command::Service { command }) => cli_service::run_service(command, debug, cli.live)?,
         Some(Command::Gitea { command }) => cli_gitea::run_gitea(command, debug, cli.live)?,
         Some(Command::PullRequest { command }) => {
             cli_pull_request::run_pull_request(command, debug, cli.live)?
