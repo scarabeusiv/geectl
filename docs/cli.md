@@ -107,7 +107,9 @@ resolve credentials per command instead: the public reads (see
 Credentials in `docs/architecture.md`) never touch them, so a half-set
 env must not break them, and neither does a dry-run `remote` mutation
 preview; every other command in those groups fails fast on a half-set
-pair up front. Setting both a token and a Basic pair for one instance
+pair up front. `remote list-files --include-deleted` resolves
+credentials too: the deleted listing reads the authenticated route.
+Setting both a token and a Basic pair for one instance
 is a configuration error at the same resolution points.
 
 ### `.env` file

@@ -1145,7 +1145,7 @@ impl<'a> ObsClient<'a> {
     /// by listing the package files when exactly one exists.
     fn discover_spec_file(&self, project: &str, package: &str) -> Result<String, GeectlError> {
         let specs: Vec<String> = self
-            .authed_directory_listing(project, package)?
+            .authed_directory_listing(project, package, &[])?
             .entries
             .into_iter()
             .map(|file| file.name)

@@ -449,10 +449,10 @@ fn live_cross_instance_copy() {
     // What B holds must be exactly what A holds: same files, same
     // md5s — and nothing else (no `_link`, no `_service:` output).
     let src_files = source
-        .list_files(&src_project, "foo", None)
+        .list_files(&src_project, "foo", None, false)
         .expect("list the source package on instance A");
     let tgt_files = target
-        .list_files(&tgt_project, "foo", None)
+        .list_files(&tgt_project, "foo", None, false)
         .expect("list the copied package on instance B");
     let tgt_pairs = files_by_name(tgt_files);
     assert_eq!(
@@ -526,7 +526,7 @@ fn live_cross_instance_copy() {
     );
     assert_eq!(link_result.skipped_files, 0);
     let link_files = target
-        .list_files(&tgt_project, "linkcopy", None)
+        .list_files(&tgt_project, "linkcopy", None, false)
         .expect("list the copied link package on instance B");
     let link_pairs = files_by_name(link_files);
     assert_eq!(
@@ -538,7 +538,7 @@ fn live_cross_instance_copy() {
         "the expanded link copy holds exactly the two resolved files, no _link"
     );
     let src_pairs = source
-        .list_files(&src_project, "foo", None)
+        .list_files(&src_project, "foo", None, false)
         .expect("list the source package on instance A");
     assert_eq!(
         files_by_name(src_pairs),

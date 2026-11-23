@@ -165,7 +165,7 @@ fn fetch_target(
     let client =
         ObsClient::with_base_and_credentials(&http, &base, geectl::auth::Credentials::None)?
             .with_debug(debug.clone());
-    let files = match client.list_files(project, package, None) {
+    let files = match client.list_files(project, package, None, false) {
         Ok(files) => files,
         Err(err) if err.kind == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),

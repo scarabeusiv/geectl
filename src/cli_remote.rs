@@ -137,6 +137,12 @@ pub enum RemoteCommand {
         /// a revision number or a srcmd5.
         #[arg(long)]
         rev: Option<String>,
+        /// Include files from deleted revisions in the listing: the
+        /// files of a deleted package, for asking whether a project
+        /// ever held it. Requires OBS credentials: the deleted
+        /// listing reads the authenticated source route.
+        #[arg(long)]
+        include_deleted: bool,
     },
     /// List the packages of a project.
     ListPackages {
@@ -698,7 +704,6 @@ pub fn run_remote(
     let credentials = match &command {
         RemoteCommand::Cat { .. }
         | RemoteCommand::Download { .. }
-        | RemoteCommand::ListFiles { .. }
         | RemoteCommand::ListPackages { .. }
         | RemoteCommand::ProjectMeta { .. }
         | RemoteCommand::PackageMeta { .. }
@@ -706,6 +711,9 @@ pub fn run_remote(
         | RemoteCommand::DevelProject { .. }
         | RemoteCommand::RevisionPatch { .. }
         | RemoteCommand::DiffPackages { .. } => Credentials::None,
+        RemoteCommand::ListFiles {
+            include_deleted, ..
+        } if !*include_deleted => Credentials::None,
         RemoteCommand::ProjectDiff {
             annotate_requests, ..
         } if !*annotate_requests => Credentials::None,
@@ -770,9 +778,10 @@ pub fn run_remote(
             project,
             package,
             rev,
+            include_deleted,
         } => {
             let rev = rev.as_deref().map(RevisionSpec::parse).transpose()?;
-            let files = client.list_files(&project, &package, rev.as_ref())?;
+            let files = client.list_files(&project, &package, rev.as_ref(), include_deleted)?;
             let payload = json!({
                 "project": project,
                 "package": package,
@@ -781,6 +790,7 @@ pub fn run_remote(
                     Some(RevisionSpec::Rev(n)) => json!(n),
                     Some(RevisionSpec::Md5(md5)) => json!(md5),
                 },
+                "include_deleted": include_deleted,
                 "files": files.iter().map(source_file_json).collect::<Vec<_>>(),
             });
             Ok((
@@ -3762,6 +3772,7 @@ mod tests {
                 project,
                 package,
                 rev: None,
+                include_deleted: false,
             } if project == "P" && package == "K"
         ));
         let parsed = parse(&["geectl", "remote", "list-files", "P", "K", "--rev", "12"]);
@@ -3804,6 +3815,33 @@ mod tests {
                 target_project: Some(ref target),
                 ..
             } if target == "test:factory"
+        ));
+    }
+
+    #[test]
+    fn list_files_parses_include_deleted() {
+        let parsed = parse(&["geectl", "remote", "list-files", "P", "K"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::ListFiles {
+                include_deleted: false,
+                ..
+            }
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "list-files",
+            "P",
+            "K",
+            "--include-deleted",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::ListFiles {
+                include_deleted: true,
+                ..
+            }
         ));
     }
 

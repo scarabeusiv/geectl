@@ -502,7 +502,7 @@ fileinfo. A malformed document is a server error, never an empty
 result.
 
 Credentials: the public reads (devel project, devel version, file
-and directory reads, meta, link target, project diff (without
+and directory reads (except the deleted-package listing), meta, link target, project diff (without
 annotation), package diff, revision patch, repository list)
 need none; the package log, the top-level project listing, the
 maintained-instances listing, the open-SR search, the package and project
@@ -511,8 +511,9 @@ superseding, deleting, creating, and uploading, repository add and
 remove, and every `/build` read,
 and every request read and act (show, log, search, state change,
 review, comment, diff) need OBS credentials and fail loudly without them —
-except the package log, the top-level project listing, and the
-`_project` service reads, which read with whatever credentials the
+except the package log, the top-level project listing, the
+deleted-package listing (`list_files` with `include_deleted`), and
+the `_project` service reads, which read with whatever credentials the
 client carries and fail on the server's 401/403 instead of refusing
 up front. OBS accepts Basic credentials or a Bearer token —
 an SSH key is refused at client construction. No

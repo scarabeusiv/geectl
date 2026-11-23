@@ -589,7 +589,7 @@ fn wait_until_gone(base: &str, path: &str) {
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
     panic!(
-        "{} still exists on the server 60s after the accept",
+        "{} still exists on the server 60s after the operation",
         redact_live_username(path)
     );
 }
@@ -1404,7 +1404,7 @@ fn live_list_files_and_packages_read_back() {
         .expect("upload b.spec on the live instance");
     let public = live_client(&base);
     let files = public
-        .list_files(&source_project, &package, None)
+        .list_files(&source_project, &package, None, false)
         .expect("list the package files on the live instance");
     let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
     assert!(
@@ -1455,7 +1455,7 @@ fn live_list_files_at_revision() {
     let rev2_spec = RevisionSpec::Rev(2);
     let names_at = |rev: Option<&RevisionSpec>| {
         public
-            .list_files(&source_project, &package, rev)
+            .list_files(&source_project, &package, rev, false)
             .expect("list the package files on the live instance")
             .iter()
             .map(|file| file.name.clone())
@@ -1493,6 +1493,64 @@ fn live_list_files_at_revision() {
     assert!(
         latest.contains(&"a.spec".to_string()) && latest.contains(&"b.spec".to_string()),
         "the unpinned listing holds the latest files; got {latest:?}"
+    );
+}
+
+/// Listing with `--include-deleted` reads back a deleted package:
+/// the package is created, a file uploaded, then the package is
+/// deleted; the plain listing is gone with the package while the
+/// deleted listing still holds the uploaded file — the forward check
+/// for whether a project ever held a package. The deleted listing
+/// reads the authenticated route, so it runs on the authed client.
+#[test]
+fn live_list_files_include_deleted_reads_a_deleted_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "a.spec",
+            "Name: a\nVersion: 1.0\n",
+            &DryRun::new(false),
+        )
+        .expect("upload a.spec on the live instance");
+    let public = live_client(&base);
+    let live = public
+        .list_files(&source_project, &package, None, false)
+        .expect("list the live package files on the live instance");
+    assert!(
+        live.iter().any(|file| file.name == "a.spec"),
+        "the live listing must hold the uploaded file; got {live:?}"
+    );
+    authed
+        .delete_package(
+            &source_project,
+            &package,
+            &DeletePackageOptions {
+                force: true,
+                ..Default::default()
+            },
+            &DryRun::new(false),
+        )
+        .expect("delete the package on the live instance");
+    // The deletion runs through the backend, so the plain listing
+    // must be awaited gone before the deleted listing is read.
+    wait_until_gone(&base, &format!("{source_project}/{package}"));
+    let err = public
+        .list_files(&source_project, &package, None, false)
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    let deleted = authed
+        .list_files(&source_project, &package, None, true)
+        .expect("list the deleted package files on the live instance");
+    assert!(
+        deleted.iter().any(|file| file.name == "a.spec"),
+        "the deleted listing must hold the uploaded file; got {deleted:?}"
     );
 }
 

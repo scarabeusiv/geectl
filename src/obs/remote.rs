@@ -2490,14 +2490,18 @@ impl<'a> ObsClient<'a> {
     }
 
     /// GET an authenticated directory listing (`/source/...`) and
-    /// parse it. The authed source endpoints resolve the `_project`
-    /// (and `_pattern`) pseudo-packages via the project, where the
-    /// public routes cannot address them at all: the public access
-    /// check looks up a Package row, and `_project` is not one.
+    /// parse it, with `query` passed verbatim (`?rev=`,
+    /// `?deleted=1`). The authed source endpoints resolve the
+    /// `_project` (and `_pattern`) pseudo-packages via the project,
+    /// where the public routes cannot address them at all: the
+    /// public access check looks up a Package row, and `_project`
+    /// is not one. A deleted package is the same class: it is no
+    /// longer a Package row, so the public route 404s it.
     pub(crate) fn authed_directory_listing(
         &self,
         project: &str,
         package: &str,
+        query: &[(&str, &str)],
     ) -> Result<DirectoryListing, GeectlError> {
         for (label, value) in [("project", project), ("package", package)] {
             if !valid_obs_name(value) {
@@ -2507,7 +2511,7 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        let url = build_url(&self.base, &["source", project, package], &[]);
+        let url = build_url(&self.base, &["source", project, package], query);
         let body = self.http.get_with(&url, &self.credentials)?;
         parse_directory(&body)
     }
@@ -2739,18 +2743,25 @@ impl<'a> ObsClient<'a> {
         self.http.get_to_file(&url, &self.credentials, dest)
     }
 
-    /// GET a public directory listing (`/public/source/...`),
-    /// optionally at revision `rev` (`?rev=N` for a number,
-    /// `?rev=<srcmd5>` for the revision carrying that hash), and
-    /// parse it, returning the full listing: files, link target, and
-    /// service state. A public read: no credentials. Shared by the
-    /// listing readers that need more than the file entries
-    /// ([`ObsClient::service_state`]).
+    /// GET a directory listing, optionally at revision `rev`
+    /// (`?rev=N` for a number, `?rev=<srcmd5>` for the revision
+    /// carrying that hash), and optionally including deleted files
+    /// (`?deleted=1` — the listing of a deleted package, for
+    /// asking whether a project ever held it), and parse it,
+    /// returning the full listing: files, link target, and service
+    /// state. A public read (`/public/source/...`): no credentials
+    /// — except with `include_deleted`, which reads the
+    /// authenticated `/source/...` route with the client's
+    /// credentials, and fails fast without them instead of sending
+    /// an unauthenticated request. Shared by the listing readers
+    /// that need more
+    /// than the file entries ([`ObsClient::service_state`]).
     pub(crate) fn directory_listing(
         &self,
         project: &str,
         package: &str,
         rev: Option<&RevisionSpec>,
+        include_deleted: bool,
     ) -> Result<DirectoryListing, GeectlError> {
         for (label, value) in [("project", project), ("package", package)] {
             if !valid_obs_name(value) {
@@ -2766,21 +2777,40 @@ impl<'a> ObsClient<'a> {
             rev_text = rev.to_string();
             query.push(("rev", &rev_text));
         }
+        if include_deleted {
+            if !self.has_auth() {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!("cannot list deleted files of package {project}/{package} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"),
+                ));
+            }
+            query.push(("deleted", "1"));
+            return self.authed_directory_listing(project, package, &query);
+        }
         self.public_directory(&[project, package], &query)
     }
 
     /// List the files of package `package` in project `project`
-    /// (`GET /public/source/<project>/<package>`), optionally at
-    /// revision `rev` (`?rev=N` for a number, `?rev=<srcmd5>` for
+    /// (`GET /public/source/<project>/<package>`, or
+    /// `/source/<project>/<package>` with `include_deleted`),
+    /// optionally at revision `rev` (`?rev=N` for a number,
+    /// `?rev=<srcmd5>` for
     /// the revision carrying that hash — the backend resolves the
-    /// hash). A public read: no credentials. The listing carries
-    /// each file's name, size, modification time, and md5, in
-    /// server order.
+    /// hash), and optionally including deleted files
+    /// (`include_deleted` sends `?deleted=1`: the listing of a
+    /// deleted package, for asking whether a project ever held it).
+    /// A public read: no credentials — except with
+    /// `include_deleted`, which reads the authenticated
+    /// `/source/<project>/<package>?deleted=1` with the client's
+    /// credentials. The listing carries each
+    /// file's name, size, modification time, and md5, in server
+    /// order.
     pub fn list_files(
         &self,
         project: &str,
         package: &str,
         rev: Option<&RevisionSpec>,
+        include_deleted: bool,
     ) -> Result<Vec<SourceFile>, GeectlError> {
         if let Some(RevisionSpec::Rev(0)) = rev {
             return Err(GeectlError::new(
@@ -2788,7 +2818,9 @@ impl<'a> ObsClient<'a> {
                 "invalid revision: 0",
             ));
         }
-        Ok(self.directory_listing(project, package, rev)?.entries)
+        Ok(self
+            .directory_listing(project, package, rev, include_deleted)?
+            .entries)
     }
 
     /// List the packages of project `project` (`GET
@@ -2943,14 +2975,15 @@ impl<'a> ObsClient<'a> {
             // empty — but only once the package is known to exist: a
             // bare short-circuit would also report an empty patch
             // for a package that is not there at all.
-            self.list_files(project, package, Some(&RevisionSpec::Rev(1)))?;
+            self.list_files(project, package, Some(&RevisionSpec::Rev(1)), false)?;
             return Ok(RevisionPatch {
                 rev,
                 files: Vec::new(),
             });
         }
-        let new_files = self.list_files(project, package, Some(&RevisionSpec::Rev(rev)))?;
-        let old_files = self.list_files(project, package, Some(&RevisionSpec::Rev(rev - 1)))?;
+        let new_files = self.list_files(project, package, Some(&RevisionSpec::Rev(rev)), false)?;
+        let old_files =
+            self.list_files(project, package, Some(&RevisionSpec::Rev(rev - 1)), false)?;
         let mut patches = Vec::new();
         for new in &new_files {
             match old_files.iter().find(|old| old.name == new.name) {
@@ -3527,8 +3560,8 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        let old_files = self.list_files(old_project, old_package, None)?;
-        let new_files = self.list_files(new_project, new_package, None)?;
+        let old_files = self.list_files(old_project, old_package, None, false)?;
+        let new_files = self.list_files(new_project, new_package, None, false)?;
         self.diff_files(
             old_project,
             old_package,
@@ -3614,8 +3647,8 @@ impl<'a> ObsClient<'a> {
                 (true, false) => (PackageDiffStatus::OnlyInOld, Vec::new()),
                 (false, true) => (PackageDiffStatus::OnlyInNew, Vec::new()),
                 (true, true) => {
-                    let old_files = self.list_files(old, &name, None)?;
-                    let new_files = self.list_files(new, &name, None)?;
+                    let old_files = self.list_files(old, &name, None, false)?;
+                    let new_files = self.list_files(new, &name, None, false)?;
                     let files = self.diff_files(old, &name, &old_files, new, &name, &new_files)?;
                     let status = if files.is_empty() {
                         PackageDiffStatus::Identical
@@ -8304,7 +8337,9 @@ mod tests {
             DIRECTORY_FIXTURE,
         );
         let client = ObsClient::new(&http);
-        let files = client.list_files("openSUSE:Factory", "foo", None).unwrap();
+        let files = client
+            .list_files("openSUSE:Factory", "foo", None, false)
+            .unwrap();
         assert_eq!(files.len(), 3);
         assert_eq!(files[0].name, "foo.spec");
         assert_eq!(files[2].name, "_link");
@@ -8325,7 +8360,12 @@ mod tests {
         );
         let client = ObsClient::new(&http);
         let files = client
-            .list_files("openSUSE:Factory", "foo", Some(&RevisionSpec::Rev(2)))
+            .list_files(
+                "openSUSE:Factory",
+                "foo",
+                Some(&RevisionSpec::Rev(2)),
+                false,
+            )
             .unwrap();
         assert_eq!(files.len(), 3);
         assert_eq!(files[0].name, "foo.spec");
@@ -8351,6 +8391,7 @@ mod tests {
                 "openSUSE:Factory",
                 "foo",
                 Some(&RevisionSpec::Md5(hash.to_string())),
+                false,
             )
             .unwrap();
         assert_eq!(files.len(), 3);
@@ -8368,10 +8409,75 @@ mod tests {
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
         let err = client
-            .list_files("openSUSE:Factory", "foo", Some(&RevisionSpec::Rev(0)))
+            .list_files(
+                "openSUSE:Factory",
+                "foo",
+                Some(&RevisionSpec::Rev(0)),
+                false,
+            )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn list_files_include_deleted_passes_deleted_1() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo?deleted=1",
+            DIRECTORY_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let files = client
+            .list_files("openSUSE:Factory", "foo", None, true)
+            .unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].name, "foo.spec");
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo?deleted=1".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn list_files_at_revision_with_include_deleted_passes_both() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo?rev=2&deleted=1",
+            DIRECTORY_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let files = client
+            .list_files("openSUSE:Factory", "foo", Some(&RevisionSpec::Rev(2)), true)
+            .unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo?rev=2&deleted=1".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn list_files_include_deleted_without_credentials_fails_closed() {
+        // No credentials: fail fast with a config error — no
+        // unauthenticated request reaches the server (which would
+        // 401 it).
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .list_files("openSUSE:Factory", "foo", None, true)
+            .expect_err("deleted listing without credentials must fail");
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("without OBS credentials"));
+        assert!(
+            http.get_calls().is_empty(),
+            "no anonymous request is attempted: {:?}",
+            http.get_calls()
+        );
     }
 
     #[test]
@@ -8441,7 +8547,7 @@ mod tests {
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
         assert!(client
-            .list_files("openSUSE:Factory", "foo/bar", None)
+            .list_files("openSUSE:Factory", "foo/bar", None, false)
             .is_err());
         assert!(client.list_packages("openSUSE:Factory/x").is_err());
         assert!(http.get_calls().is_empty());

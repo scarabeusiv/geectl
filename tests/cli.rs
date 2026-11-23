@@ -1611,6 +1611,68 @@ fn remote_devel_project_target_project_carries_the_target_in_payload_and_text() 
 }
 
 #[test]
+fn remote_list_files_include_deleted_carries_flag_in_payload_and_keeps_the_text_table() {
+    // The fixture answers the one request whatever its query is; the
+    // library unit tests pin `?deleted=1` on the wire. This pins the
+    // CLI half: the payload carries the flag, and the text stays the
+    // design table under the coordinate header. The deleted listing
+    // is a credentialed read, so the fixture calls carry credentials.
+    let body = "<directory><entry name=\"vim.spec\" size=\"1234\" mtime=\"1700000000\" md5=\"deadbeef\"/></directory>";
+    let dir = TempDir::new();
+    let addr = serve_once(body);
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-files",
+            "openSUSE:Factory",
+            "vim",
+            "--include-deleted",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["include_deleted"], true);
+    assert_eq!(value["files"][0]["name"], "vim.spec");
+    let addr = serve_once(body);
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "list-files",
+            "openSUSE:Factory",
+            "vim",
+            "--include-deleted",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.lines().next(),
+        Some("project: openSUSE:Factory package: vim"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("vim.spec"), "{stdout}");
+}
+
+#[test]
 fn remote_list_packages_json_mode_renders_the_payload() {
     let addr = serve_once("<directory><entry name=\"curl\"/><entry name=\"vim\"/></directory>");
     let dir = TempDir::new();
@@ -1973,6 +2035,55 @@ fn remote_search_packages_with_half_set_credentials_fails_with_config_error() {
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
     assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_list_files_include_deleted_with_half_set_credentials_fails_with_config_error() {
+    // The deleted listing is a credentialed read, so it fails fast
+    // on a half-set env like the other credentialed reads — the
+    // plain listing stays public.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-files",
+            "openSUSE:Factory",
+            "vim",
+            "--include-deleted",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_list_files_include_deleted_without_credentials_fails_closed() {
+    // No credentials at all: the deleted listing fails fast with a
+    // config error instead of sending an unauthenticated request
+    // for the server to 401 — the plain listing stays public.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-files",
+            "openSUSE:Factory",
+            "vim",
+            "--include-deleted",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("without OBS credentials"));
 }
 
 #[test]

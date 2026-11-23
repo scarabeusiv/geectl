@@ -302,9 +302,9 @@ impl ObsClient<'_> {
         package: &str,
     ) -> Result<DirectoryListing, GeectlError> {
         if package == "_project" {
-            self.authed_directory_listing(project, package)
+            self.authed_directory_listing(project, package, &[])
         } else {
-            self.directory_listing(project, package, None)
+            self.directory_listing(project, package, None, false)
         }
     }
 
