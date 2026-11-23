@@ -68,10 +68,18 @@
 //! requests unless explicitly authorised) is documented on
 //! `ObsClient::change_state` in `src/obs.rs`, and the server stays
 //! the authority on who may move a request.
+//
+//! The working-copy tests (`live_working_copy_checkout_edit_commit_update`,
+//! `live_working_copy_pull_pulls_a_linked_package`) exercise the git
+//! working-copy layer the same way: checkout through the library, edit
+//! and commit, then read the committed content back from the server; the
+//! git-backed path has no live test — the ephemeral instance serves no
+//! scmsync package.
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use geectl::auth::Credentials;
+use geectl::config::Config;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{sanitize_url_for_error, HttpClient, Timeout, UreqClient};
 use geectl::obs::{
@@ -84,6 +92,30 @@ use geectl::obs::{
     SourceUpdate, SrFiling, SrPayload, StagingReadOptions,
 };
 use geectl::pull_request::{OpinionState, PullRequestClient, PullRequestRef, PullRequestStatus};
+use geectl::working_copy;
+
+/// A temp dir under the system temp dir, removed on drop. The name
+/// carries the same unique suffix as the live projects, so parallel
+/// tests never share one.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("geectl-live-wc-{}", unique_suffix()));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        TempDir(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 /// Whether `url` points at a loopback host.
 ///
@@ -960,6 +992,23 @@ fn file_content(base: &str, project: &str, package: &str, filename: &str) -> Str
     )
     .map_err(|err| redact_live_username(&format!("{err}")))
     .expect("GET the uploaded file back from the server")
+}
+
+/// Read a package's current srcmd5 from its directory document:
+/// the library's revision reads are crate-private, so the harness
+/// reads the same document the server serves.
+fn directory_srcmd5(base: &str, project: &str, package: &str) -> String {
+    let http = Box::leak(Box::new(
+        UreqClient::new(Timeout::default()).expect("default timeout is valid"),
+    ));
+    let body = http
+        .get_with(
+            &format!("{base}/source/{project}/{package}"),
+            &live_credentials(),
+        )
+        .map_err(|err| redact_live_username(&format!("{err}")))
+        .expect("GET the directory back from the server");
+    xml_attr(&body, "srcmd5").expect("the directory carries a srcmd5")
 }
 
 /// Upload a file through geectl and read it back from the server,
@@ -7503,4 +7552,192 @@ fn live_build_control_accepts_commands_on_a_never_built_package() {
     client
         .abort_build(&source_project, "standard", "x86_64", &package, &dry)
         .expect("abort on the live instance");
+}
+
+/// The working copy round trip against the live instance: checkout
+/// a package, edit and stage a file, commit it through the real
+/// service gate (no services, no `pre_checkin.sh`: the gate passes
+/// without touching podman), read the committed content back from
+/// the server, then update onto a second agent's upload. The
+/// git-backed path has no live test: the ephemeral instance serves
+/// no scmsync package.
+#[test]
+fn live_working_copy_checkout_edit_commit_update() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let spec = format!("{package}.spec");
+    let v1 = "Name: geectl-live-pkg\nVersion: 1.0\n";
+    let v2 = "Name: geectl-live-pkg\nVersion: 2.0\n";
+    let v3 = "Name: geectl-live-pkg\nVersion: 3.0\n";
+    client
+        .upload_file(&source_project, &package, &spec, v1, &DryRun::new(false))
+        .expect("upload the v1 spec to the live instance");
+    let notes = "notes.txt";
+    let notes_v1 = "geectl live notes\n";
+    client
+        .upload_file(
+            &source_project,
+            &package,
+            notes,
+            notes_v1,
+            &DryRun::new(false),
+        )
+        .expect("upload the notes file to the live instance");
+    let dir = TempDir::new();
+    let mut wc = working_copy::checkout(
+        &client,
+        &source_project,
+        &package,
+        None,
+        dir.path(),
+        None,
+        &DryRun::new(false),
+    )
+    .expect("checkout the package")
+    .expect("checkout is live, not a dry run");
+    assert_eq!(wc.backend, working_copy::Backend::Obs);
+    assert_eq!(wc.base_rev, "2");
+    let spec_path = wc.root.join(&spec);
+    assert_eq!(
+        std::fs::read_to_string(&spec_path).expect("read the checked-out spec"),
+        v1
+    );
+    std::fs::write(&spec_path, v2).expect("edit the spec");
+    working_copy::add(&wc, std::slice::from_ref(&spec), &DryRun::new(false))
+        .expect("stage the edit");
+    let entries = working_copy::status(&wc).expect("status the working copy");
+    assert_eq!(entries.len(), 1, "one file changed: {entries:?}");
+    assert_eq!(entries[0].path, spec);
+    assert_eq!(entries[0].code, working_copy::StatusCode::Modified);
+    let report = working_copy::commit(
+        &mut wc,
+        &client,
+        &Config::default(),
+        "Update to version 2",
+        false,
+        None,
+        &DryRun::new(false),
+    )
+    .expect("commit the edit")
+    .expect("commit is live, not a dry run");
+    assert_eq!(report.rev, Some(3), "the commit is revision 3");
+    assert_eq!(
+        file_content(&base, &source_project, &package, &spec),
+        v2,
+        "the server must hold the committed content"
+    );
+    // The commit sends the full file list: the file it did not
+    // touch stays on the server.
+    assert_eq!(
+        file_content(&base, &source_project, &package, notes),
+        notes_v1,
+        "the commit must keep the file it did not touch"
+    );
+    // A second agent's upload lands as revision 4; update rebases onto it.
+    client
+        .upload_file(&source_project, &package, &spec, v3, &DryRun::new(false))
+        .expect("upload the v3 spec to the live instance");
+    let update = working_copy::update(&mut wc, &client, None, None, &DryRun::new(false))
+        .expect("update the working copy")
+        .expect("update is live, not a dry run");
+    assert!(update.updated, "the base moved to revision 4");
+    assert_eq!(update.new_base_rev, "4");
+    assert_eq!(
+        std::fs::read_to_string(&spec_path).expect("read the updated spec"),
+        v3
+    );
+    assert!(
+        working_copy::status(&wc)
+            .expect("status after update")
+            .is_empty(),
+        "the working copy is clean after the update"
+    );
+}
+
+/// Pull a linked package against the live instance: checkout the
+/// link package (the checkout holds the link only), upload a new
+/// version to the link target, and pull the target's latest revision
+/// into the checkout.
+#[test]
+fn live_working_copy_pull_pulls_a_linked_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let spec = format!("{package}.spec");
+    let v1 = "Name: geectl-live-pkg\nVersion: 1.0\n";
+    let v2 = "Name: geectl-live-pkg\nVersion: 2.0\n";
+    client
+        .upload_file(&source_project, &package, &spec, v1, &DryRun::new(false))
+        .expect("upload the v1 spec to the live instance");
+    let source_srcmd5 = directory_srcmd5(&base, &source_project, &package);
+    let link_package = format!("{package}-link");
+    client
+        .create_package(
+            &source_project,
+            &link_package,
+            "geectl live test link package",
+            "Created by the geectl live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create the link package on the live instance");
+    client
+        .upload_file(
+            &source_project,
+            &link_package,
+            "_link",
+            &format!(
+                "<link project=\"{source_project}\" package=\"{package}\" baserev=\"{source_srcmd5}\"/>"
+            ),
+            &DryRun::new(false),
+        )
+        .expect("upload the _link file on the live instance");
+    let dir = TempDir::new();
+    let mut wc = working_copy::checkout(
+        &client,
+        &source_project,
+        &link_package,
+        None,
+        dir.path(),
+        None,
+        &DryRun::new(false),
+    )
+    .expect("checkout the link package")
+    .expect("checkout is live, not a dry run");
+    assert!(
+        !wc.root.join(&spec).exists(),
+        "the link checkout holds no target files before pull"
+    );
+    client
+        .upload_file(&source_project, &package, &spec, v2, &DryRun::new(false))
+        .expect("upload the v2 spec to the live instance");
+    let report = working_copy::pull(&mut wc, &client, &DryRun::new(false))
+        .expect("pull the link package")
+        .expect("pull is live, not a dry run");
+    assert!(
+        report.updated,
+        "the link moved to the target's new revision"
+    );
+    assert_eq!(report.old_baserev, source_srcmd5);
+    assert_eq!(
+        std::fs::read_to_string(wc.root.join(&spec)).expect("read the pulled spec"),
+        v2
+    );
+    let link = std::fs::read_to_string(wc.root.join("_link")).expect("read the pulled _link");
+    assert!(
+        link.contains(&format!("baserev=\"{}\"", report.new_baserev)),
+        "the _link must carry the new baserev; link: {link}"
+    );
+    assert!(
+        working_copy::status(&wc)
+            .expect("status after pull")
+            .is_empty(),
+        "the working copy is clean after the pull"
+    );
 }
