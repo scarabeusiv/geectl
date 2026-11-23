@@ -221,7 +221,7 @@ Scope note: the sibling `git-obs` entry point has `repo list` and `repo fork` (`
 | `osc diff` | `diff` | The diff of the worktree and the index against the base, rendered verbatim; a linked package's link diff is out of scope |
 | `osc add FILE...` | `add FILE...` | Same stage |
 | `osc delete` / `rm FILE...` | `rm FILE...` | Same remove |
-| `osc addremove` | `addremove` | Same stage-everything |
+| `osc addremove` | `addremove` | Same stage-new-and-deleted: stages new files and worktree deletions; modifications to tracked files still need `add` |
 | `osc commit` / `ci` / `checkin` | `commit --message MSG [--noservice]` | Same commit, plus a hard gate: the source services and `pre_checkin.sh` run before the send, unless `--noservice` is passed. The send is the staged-plus-committed state against the base; unstaged worktree changes are not sent, except an unstaged edit to a file the service gate changed, which is staged whole with the gate's output |
 | `osc pull` | `pull` | Linked packages only: pulls the link target's latest revision into the checkout; a clean working copy (no uncommitted changes and no untracked files) and a recorded baserev are required |
 | `osc resolved` | `resolve` | Stages the resolved files; when a rebase is in progress and every conflict is resolved, continues it |
