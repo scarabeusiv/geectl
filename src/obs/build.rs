@@ -1949,8 +1949,9 @@ pub(crate) fn validate_repository(repository: &Repository) -> Result<(), GeectlE
 }
 
 /// Validate the settings of one repository beyond name,
-/// architectures, and paths: the rebuild and linkedbuild flags carry
-/// the server's enumerations (blank accepted, like the API model),
+/// architectures, and paths: the rebuild, block, and linkedbuild
+/// flags carry the server's enumerations (blank accepted, like the
+/// API model),
 /// and the download, release-target, and hostsystem settings carry
 /// the server's rules — a download's arch is required, one of the
 /// repository's architectures, and unique in the repository; a
@@ -1979,6 +1980,13 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
         ) {
             return Err(invalid(&format!(
                 "linkedbuild {linkedbuild:?} is not one of off, localdep, all, alldirect, alldirect_or_localdep"
+            )));
+        }
+    }
+    if let Some(block) = &repository.block {
+        if !matches!(block.as_str(), "" | "all" | "local" | "never") {
+            return Err(invalid(&format!(
+                "block {block:?} is not one of all, local, never"
             )));
         }
     }
@@ -6370,6 +6378,15 @@ mod tests {
         repo.linkedbuild = Some(String::new());
         assert!(validate_repository_settings(&repo).is_ok());
         repo.linkedbuild = Some("all".to_string());
+        repo.block = Some("bogus".to_string());
+        assert!(validate_repository_settings(&repo).is_err());
+        repo.block = Some(String::new());
+        assert!(validate_repository_settings(&repo).is_ok());
+        for block in ["all", "local", "never"] {
+            repo.block = Some(block.to_string());
+            assert!(validate_repository_settings(&repo).is_ok());
+        }
+        repo.block = None;
         // A download needs its arch, in the repository's architectures.
         repo.downloads = vec![RepositoryDownload {
             arch: None,
