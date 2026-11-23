@@ -656,7 +656,7 @@ Usage: geectl service [OPTIONS] <COMMAND>
 Commands:
   list     List the services defined in a package's `_service` file
   state    Show the last service run state of a package
-  trigger  Trigger a server-side run of a package's services. A mutation: dry-run is the default (only the plan is printed); `--live` performs the trigger
+  trigger  Trigger a server-side run of a package's services. A mutation: dry-run is the default (only the plan is printed); `--live` performs the trigger. The trigger only queues the run: the server runs the services asynchronously, so a successful trigger says the run was queued, not that it finished. Check the outcome with `service state`
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -685,7 +685,7 @@ Options:
 ```
 
 ```
-Trigger a server-side run of a package's services. A mutation: dry-run is the default (only the plan is printed); `--live` performs the trigger
+Trigger a server-side run of a package's services. A mutation: dry-run is the default (only the plan is printed); `--live` performs the trigger. The trigger only queues the run: the server runs the services asynchronously, so a successful trigger says the run was queued, not that it finished. Check the outcome with `service state`
 
 Usage: geectl service trigger [OPTIONS] <PROJECT> <PACKAGE>
 

@@ -4399,6 +4399,7 @@ fn service_trigger_dry_run_reports_plan_without_credentials() {
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["triggered"], false);
+    assert_eq!(value["queued"], false);
     assert_eq!(value["dry_run"], true);
     assert_eq!(value["service"], serde_json::Value::Null);
     assert_eq!(value["code"], serde_json::Value::Null);
@@ -4419,6 +4420,7 @@ fn service_trigger_dry_run_reports_plan_without_credentials() {
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["triggered"], false);
+    assert_eq!(value["queued"], false);
     assert_eq!(value["dry_run"], true);
     assert_eq!(value["service"], "download_url");
     assert_eq!(value["code"], serde_json::Value::Null);

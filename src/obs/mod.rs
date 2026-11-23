@@ -160,6 +160,7 @@ pub(crate) use self::common::parse_request_id;
 pub(crate) use self::common::parse_request_ids;
 pub(crate) use self::common::parse_request_ids_for_action;
 pub(crate) use self::common::parse_search_matches;
+pub(crate) use self::common::parse_status_code;
 pub(crate) use self::common::parse_status_invoked;
 pub(crate) use self::common::parse_status_ok;
 pub(crate) use self::common::parse_submit_request_ids;

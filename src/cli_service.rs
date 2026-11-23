@@ -59,7 +59,10 @@ pub enum ServiceCommand {
     },
     /// Trigger a server-side run of a package's services. A mutation:
     /// dry-run is the default (only the plan is printed); `--live`
-    /// performs the trigger.
+    /// performs the trigger. The trigger only queues the run: the
+    /// server runs the services asynchronously, so a successful
+    /// trigger says the run was queued, not that it finished. Check
+    /// the outcome with `service state`.
     Trigger {
         /// The project the package lives in.
         project: String,
@@ -129,6 +132,7 @@ pub fn run_service(
                 "package": package,
                 "service": service,
                 "triggered": triggered.is_some(),
+                "queued": triggered.is_some(),
                 "code": triggered.as_ref().map(|trigger| trigger.code.as_str()),
                 "dry_run": dry_run.enabled(),
             });
@@ -144,7 +148,7 @@ pub fn run_service(
                 payload,
                 with_header(
                     &format!("project: {project} package: {package}"),
-                    render_trigger(&triggered, &service, &dry_run),
+                    render_trigger(&triggered, &service, &dry_run, &project, &package),
                 ),
             ))
         }
@@ -296,21 +300,42 @@ fn render_service_state(state: &Option<ServiceState>) -> String {
 /// The trigger outcome as `key: value` lines: whether the services
 /// were triggered, which service the trigger was for (`all` when no
 /// service was named), and the server's status code when the trigger
-/// went out. In dry-run the plan lines follow the `dry_run` line.
+/// went out. A live trigger only queues the run, so `triggered`
+/// reads `yes (queued)` and points at `service state` for the
+/// outcome; `--service` only validates the name — the whole service
+/// set runs — so a named trigger carries a warning line. In dry-run
+/// the plan lines follow the `dry_run` line.
 fn render_trigger(
     triggered: &Option<ServiceTrigger>,
     service: &Option<String>,
     dry_run: &DryRun,
+    project: &str,
+    package: &str,
 ) -> String {
     let mut lines = vec![format!(
         "triggered: {}",
-        if triggered.is_some() { "yes" } else { "no" }
+        if triggered.is_some() {
+            "yes (queued)"
+        } else {
+            "no"
+        }
     )];
     lines.push(format!("service: {}", service.as_deref().unwrap_or("all")));
+    if service.is_some() {
+        lines.push(
+            "warning: --service only validates the name; the server runs the whole service set"
+                .to_string(),
+        );
+    }
     if let Some(trigger) = triggered {
         lines.push(format!("code: {}", trigger.code));
     }
     lines.push(format!("dry_run: {}", dry_run.enabled()));
+    if triggered.is_some() {
+        lines.push(format!(
+            "state: check the run with `geectl service state {project} {package}`"
+        ));
+    }
     if dry_run.enabled() {
         lines.extend(dry_run.plan());
     }
@@ -513,12 +538,23 @@ mod tests {
             service: Some("download_url".to_string()),
             code: "ok".to_string(),
         });
-        let text = render_trigger(&triggered, &Some("download_url".to_string()), &dry_run);
-        assert!(text.contains("triggered: yes"));
+        let text = render_trigger(
+            &triggered,
+            &Some("download_url".to_string()),
+            &dry_run,
+            "P",
+            "K",
+        );
+        assert!(text.contains("triggered: yes (queued)"));
         assert!(text.contains("service: download_url"));
+        assert!(text.contains(
+            "warning: --service only validates the name; the server runs the whole service set"
+        ));
         assert!(text.contains("code: ok"));
         assert!(text.contains("dry_run: false"));
-        // No service named: the whole set runs, rendered as `all`.
+        assert!(text.contains("state: check the run with `geectl service state P K`"));
+        // No service named: the whole set runs, rendered as `all`,
+        // with no warning line.
         let text = render_trigger(
             &Some(ServiceTrigger {
                 service: None,
@@ -526,21 +562,29 @@ mod tests {
             }),
             &None,
             &dry_run,
+            "P",
+            "K",
         );
-        assert!(text.contains("triggered: yes"));
+        assert!(text.contains("triggered: yes (queued)"));
         assert!(text.contains("service: all"));
+        assert!(!text.contains("warning:"));
         assert!(text.contains("code: ok"));
+        assert!(text.contains("state: check the run with `geectl service state P K`"));
     }
 
     #[test]
     fn trigger_dry_run_renders_no_trigger_and_the_plan() {
         let dry_run = DryRun::new(true);
         dry_run.allow("trigger services for P/K (service download_url)");
-        let text = render_trigger(&None, &Some("download_url".to_string()), &dry_run);
+        let text = render_trigger(&None, &Some("download_url".to_string()), &dry_run, "P", "K");
         assert!(text.contains("triggered: no"));
         assert!(text.contains("service: download_url"));
+        assert!(text.contains(
+            "warning: --service only validates the name; the server runs the whole service set"
+        ));
         assert!(!text.contains("code:"));
         assert!(text.contains("dry_run: true"));
+        assert!(!text.contains("state: check the run"));
         assert!(text.contains("[dry-run] would: trigger services for P/K (service download_url)"));
     }
 
@@ -640,9 +684,16 @@ mod tests {
         let payload = json!({
             "service": "download_url",
             "triggered": true,
+            "queued": true,
             "code": "ok",
         });
-        let text = render_trigger(&triggered, &Some("download_url".to_string()), &dry_run);
+        let text = render_trigger(
+            &triggered,
+            &Some("download_url".to_string()),
+            &dry_run,
+            "P",
+            "K",
+        );
         assert!(
             text.contains(&format!(
                 "service: {}",
@@ -651,8 +702,12 @@ mod tests {
             "trigger text misses service:\n{text}"
         );
         assert!(
-            text.contains("triggered: yes"),
+            text.contains("triggered: yes (queued)"),
             "trigger text misses triggered:\n{text}"
+        );
+        assert!(
+            payload["queued"].as_bool().expect("queued is a bool") && text.contains("(queued)"),
+            "trigger text misses queued:\n{text}"
         );
         assert!(
             text.contains(&format!(

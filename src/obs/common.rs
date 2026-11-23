@@ -598,36 +598,43 @@ pub(crate) fn action_tag_type(element: &str) -> Option<String> {
     tag_attr(element, "type")
 }
 
+/// The `<status ...>` element of `body` (without the closing
+/// `>`), or None when there is none. The tag name must end at the tag
+/// boundary, so `<statuscode>` is not a status element; the tag end
+/// is found quote-aware, so a `>` inside an earlier attribute's
+/// value does not cut the element short.
+fn status_element(body: &str) -> Option<&str> {
+    let pos = body.find("<status")?;
+    let after_tag = &body[pos + "<status".len()..];
+    // The tag name must end here: `<statuscode>` is not a status
+    // element. The next character is whitespace, `/`, or `>`.
+    let first = after_tag.chars().next()?;
+    if !(first.is_whitespace() || first == '/' || first == '>') {
+        return None;
+    }
+    let end = find_tag_end(after_tag)?;
+    Some(&after_tag[..end])
+}
+
 /// True when an OBS response body carries `<status code="ok" ...>`.
 /// The write endpoints (request `changestate`, source delete) answer
 /// `render_ok` on success; any other status code in the body — or no
 /// status element at all — reads as failure, never success.
 pub(crate) fn parse_status_ok(body: &str) -> bool {
-    let Some(pos) = body.find("<status") else {
-        return false;
-    };
-    let after_tag = &body[pos + "<status".len()..];
-    // The tag name must end here: `<statuscode>` is not a status
-    // element. The next character is whitespace, `/`, or `>`.
-    let first = match after_tag.chars().next() {
-        Some(c) => c,
-        None => return false,
-    };
-    if !(first.is_whitespace() || first == '/' || first == '>') {
-        return false;
-    }
     // The code must be an attribute of this element, not text after it
     // — and it must be the `code` attribute, not a longer name that
-    // ends in it (`mycode="ok"` is not `code="ok"`). The tag end is
-    // found quote-aware, so a `>` inside an earlier attribute's value
-    // does not cut the element short; the value is read with
-    // `xml_attr`, which is quote-aware and tolerates whitespace
+    // ends in it (`mycode="ok"` is not `code="ok"`). The value is read
+    // with `xml_attr`, which is quote-aware and tolerates whitespace
     // around `=`.
-    let Some(end) = find_tag_end(after_tag) else {
-        return false;
-    };
-    let element = &after_tag[..end];
-    xml_attr(element, "code").is_some_and(|code| code == "ok")
+    status_element(body)
+        .is_some_and(|element| xml_attr(element, "code").is_some_and(|code| code == "ok"))
+}
+
+/// The status code an OBS response body carries in its `<status>`
+/// element, or None when the body carries no status element or no
+/// `code` attribute.
+pub(crate) fn parse_status_code(body: &str) -> Option<String> {
+    status_element(body).and_then(|element| xml_attr(element, "code"))
 }
 
 /// The opening tag of the first `<name ...>` element in `body`
@@ -1198,6 +1205,23 @@ mod tests {
         // status code.
         assert!(!parse_status_ok("<status mycode=\"ok\" />"));
         assert!(parse_status_ok("<status code='ok' />"));
+    }
+
+    #[test]
+    fn parse_status_code_reads_the_code() {
+        assert_eq!(
+            parse_status_code("<status code=\"ok\" />"),
+            Some("ok".to_string())
+        );
+        assert_eq!(
+            parse_status_code(
+                "<status code=\"not_found\"><summary>no such request</summary></status>"
+            ),
+            Some("not_found".to_string())
+        );
+        assert_eq!(parse_status_code(""), None);
+        assert_eq!(parse_status_code("<request id=\"1398492\" />"), None);
+        assert_eq!(parse_status_code("<status mycode=\"ok\" />"), None);
     }
 
     #[test]
