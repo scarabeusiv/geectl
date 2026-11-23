@@ -3377,6 +3377,33 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// The shared `/search/owner` request behind `owners`,
+    /// `owners_for_binary`, and `owners_for_package`: build the URL
+    /// from `params`, GET it with credentials, and parse the
+    /// `<collection>` of `<owner>` elements. An unexpected response
+    /// (not a collection) is an error, never an empty list. The
+    /// caller validates the names and labels the error with `label`.
+    fn owner_search(
+        &self,
+        params: &[(&str, &str)],
+        label: &str,
+    ) -> Result<Vec<Owner>, GeectlError> {
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching owners requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let url = build_url(&self.base, &["search", "owner"], params);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_owners(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS owner search response for {label}"),
+            )
+        })
+    }
+
     /// The owners of package `package` in project `project` (`GET
     /// /search/owner?project=...&package=...`). Requires credentials;
     /// without them the search fails loudly before any request. An
@@ -3391,24 +3418,10 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        if !self.has_auth() {
-            return Err(GeectlError::new(
-                ErrorKind::ConfigError,
-                "searching owners requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
-            ));
-        }
-        let url = build_url(
-            &self.base,
-            &["search", "owner"],
+        self.owner_search(
             &[("project", project), ("package", package)],
-        );
-        let body = self.http.get_with(&url, &self.credentials)?;
-        parse_owners(&body).ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::ServerError,
-                format!("unexpected OBS owner search response for package {project}/{package}"),
-            )
-        })
+            &format!("package {project}/{package}"),
+        )
     }
 
     /// The owners of binary `binary` (`GET
@@ -3421,20 +3434,7 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS binary name: {binary:?}"),
             ));
         }
-        if !self.has_auth() {
-            return Err(GeectlError::new(
-                ErrorKind::ConfigError,
-                "searching owners requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
-            ));
-        }
-        let url = build_url(&self.base, &["search", "owner"], &[("binary", binary)]);
-        let body = self.http.get_with(&url, &self.credentials)?;
-        parse_owners(&body).ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::ServerError,
-                format!("unexpected OBS owner search response for binary {binary:?}"),
-            )
-        })
+        self.owner_search(&[("binary", binary)], &format!("binary {binary:?}"))
     }
 
     /// The owners of package `package`, across projects (`GET
@@ -3447,20 +3447,7 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS package name: {package:?}"),
             ));
         }
-        if !self.has_auth() {
-            return Err(GeectlError::new(
-                ErrorKind::ConfigError,
-                "searching owners requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
-            ));
-        }
-        let url = build_url(&self.base, &["search", "owner"], &[("package", package)]);
-        let body = self.http.get_with(&url, &self.credentials)?;
-        parse_owners(&body).ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::ServerError,
-                format!("unexpected OBS owner search response for package {package:?}"),
-            )
-        })
+        self.owner_search(&[("package", package)], &format!("package {package:?}"))
     }
 
     /// The maintainers of package `package` in project `project`:
