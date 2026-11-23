@@ -1796,10 +1796,10 @@ fn live_owners_call_succeeds() {
 }
 
 /// The package-only owner search runs against the real server:
-/// the same fresh package, found without naming its project. A
-/// fresh package has no explicit owners, so the call succeeding
-/// (not 401, not 404) is the assertion, plus the shape of
-/// whatever it returns.
+/// the same fresh package, found without naming its project. The
+/// package lives in no `OBS:OwnerRootProject` project, so the
+/// server 400s and the call returns no owners — that empty list,
+/// not an error, is the assertion.
 #[test]
 fn live_owners_for_package_call_succeeds() {
     let Some(base) = live_url() else {
@@ -1812,8 +1812,8 @@ fn live_owners_for_package_call_succeeds() {
         .owners_for_package(&package)
         .expect("package-only owner search on the live instance");
     assert!(
-        owners.iter().all(|owner| !owner.project.is_empty()),
-        "every returned owner must name a project; got {owners:?}"
+        owners.is_empty(),
+        "a package in no owner root project has no owners; got {owners:?}"
     );
 }
 

@@ -3439,7 +3439,15 @@ impl<'a> ObsClient<'a> {
 
     /// The owners of package `package`, across projects (`GET
     /// /search/owner?package=...`). Requires credentials; an
-    /// unexpected response is an error, never an empty list.
+    /// unexpected response is an error, never an empty list. A 400 or
+    /// 404 from the server means no owner root project holds the
+    /// package, so that is an empty list, not invalid input: the
+    /// server's `owner` action renders 400 `no_binary` exactly when
+    /// the package-only scan finds no owner root project holding
+    /// the package, and 404 exactly when the `OBS:OwnerRootProject`
+    /// attribute type itself is absent (`AttribType.find_by_name!`);
+    /// no other 400 comes out of that action for a package-only
+    /// search.
     pub fn owners_for_package(&self, package: &str) -> Result<Vec<Owner>, GeectlError> {
         if !valid_obs_name(package) {
             return Err(GeectlError::new(
@@ -3447,7 +3455,18 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS package name: {package:?}"),
             ));
         }
-        self.owner_search(&[("package", package)], &format!("package {package:?}"))
+        match self.owner_search(&[("package", package)], &format!("package {package:?}")) {
+            Ok(owners) => Ok(owners),
+            // A 400/404 here is the server saying the package lives
+            // in no owner root project — 400 `no_binary` when no root
+            // project holds it, 404 when the attribute type itself is
+            // absent — so it has no owners: an empty list, not a
+            // failed lookup. Any other failure stays an error.
+            Err(e) if e.kind() == ErrorKind::InvalidInput || e.kind() == ErrorKind::NotFound => {
+                Ok(Vec::new())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The maintainers of package `package` in project `project`:
