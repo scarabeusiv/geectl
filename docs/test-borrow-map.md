@@ -973,6 +973,22 @@ semantics and the project-set enumeration, not its tests).**
   for enumerating the dep set's source projects. The flag help
   (`osc/commandline.py:7788`, "trust packages from all projects") is
   the wording geectl's flag help follows.
+## Gap batch — periodic cache cleanup (#191)
+
+**Direct adoptions: 0. No osc test covers the prune pass or the
+scheduler entries.**
+
+- `tests/test_build.py` (2 tests — `test_name`, `test_glob`,
+  filename-glob only): nothing to adopt; osc has no prune,
+  eviction, or scheduling concept anywhere in its suite (no
+  `prune`/`evict`/`systemd`/`launchd`/`schtasks`/`periodic` in
+  `osc/*.py`, `tests/*.py`, or `behave/features/build.feature`).
+- The prune library (`prune_plan`/`prune_apply`) already exists with
+  its own tests, written from the design doc; this batch adds the
+  `prune` CLI leaf and the periodic install/uninstall/status leaves,
+  all tested from scratch against the design doc. The unit files
+  under `packaging/` are the single source of truth for the RPM
+  and the install command alike.
 
 ## Batch 13 — mirror-first dep fetch
 
@@ -1037,6 +1053,7 @@ semantics and the project-set enumeration, not its tests).**
 | 11 prjconf | 0 | 0 | 0 |
 | 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
 | 13 mirror-first dep fetch | 1 | 0 | 1 |
+| Gap batch — periodic cache cleanup (#191) | 0 | 0 | 0 |
 | **Total adopted** | **106** | **120** | **226** |
 
 Surveyed base: 272 behave scenarios + 707 unit tests = 979 items;

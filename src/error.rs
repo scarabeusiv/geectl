@@ -59,6 +59,9 @@ pub enum ErrorKind {
     MultibuildFlavorRequired,
     /// The requested architecture is not the host architecture.
     UnsupportedArch,
+    /// The requested operation has no implementation on the host
+    /// operating system (no periodic schedule ships there).
+    UnsupportedOs,
     /// The `build` engine binary is not installed.
     NoBuildEngine,
     /// The build image could not be pulled or resolved.
@@ -121,6 +124,7 @@ impl ErrorKind {
             ErrorKind::UntrustedProject => "untrusted_project",
             ErrorKind::MultibuildFlavorRequired => "multibuild_flavor_required",
             ErrorKind::UnsupportedArch => "unsupported_arch",
+            ErrorKind::UnsupportedOs => "unsupported_os",
             ErrorKind::NoBuildEngine => "no_build_engine",
             ErrorKind::ImageUnavailable => "image_unavailable",
             ErrorKind::CacheCorrupt => "cache_corrupt",
@@ -162,6 +166,7 @@ impl ErrorKind {
                 "the package is multibuild and no flavor was given"
             }
             ErrorKind::UnsupportedArch => "the requested architecture is not the host architecture",
+            ErrorKind::UnsupportedOs => "the host operating system is not supported",
             ErrorKind::NoBuildEngine => "the build engine is not installed",
             ErrorKind::ImageUnavailable => "the build image could not be pulled or resolved",
             ErrorKind::CacheCorrupt => "a cached package failed its hdrmd5 check",
@@ -222,6 +227,9 @@ impl ErrorKind {
             }
             ErrorKind::UnsupportedArch => {
                 "build locally only for the host architecture; other architectures go to the server"
+            }
+            ErrorKind::UnsupportedOs => {
+                "the periodic schedule ships only on Linux, macOS and Windows"
             }
             ErrorKind::NoBuildEngine => {
                 "install the openSUSE build package (zypper install build) or put the build script on PATH"
@@ -301,6 +309,7 @@ impl ErrorKind {
             ErrorKind::NothingToCommit => 30,
             ErrorKind::NoGit => 31,
             ErrorKind::TooManyRepositories => 32,
+            ErrorKind::UnsupportedOs => 33,
         }
     }
 
@@ -338,6 +347,7 @@ impl ErrorKind {
             ErrorKind::NothingToCommit,
             ErrorKind::NoGit,
             ErrorKind::TooManyRepositories,
+            ErrorKind::UnsupportedOs,
         ]
     }
 }

@@ -42,9 +42,8 @@ spec-cleaner inside an openSUSE container).
 
 What the vertical does NOT own:
 
-- Server-side service runs: the trigger landed as `service trigger`
-  (issue #182); wait and merge are still out — those are #19's
-  server operations, not local execution.
+- Server-side service runs (trigger/wait/merge) — those are #19's server
+  operations, not local execution.
 - `buildtime` services — they run on the OBS worker during the build,
   never in a checkout, never locally.
 - `runall` — never; mode-blind, it would fire `buildtime` services
@@ -63,6 +62,9 @@ into the build container is not specified here.
 | `build-wipe` | Delete a build root. Refuses when a build holds the root's lock, and refuses when the directory is not a geectl root (marker file). | None |
 | `build-log` | Read the last build's log (`<root>/.build.log`) — tail, or the whole log up to the 4 MiB read cap by default, uncapped on request — plus the recorded verdict. | None |
 | `build-prune` | Print the eviction plan (what would be evicted, in order, with bytes); delete only with `--apply`. Same policy and safeguards as automatic eviction. | None |
+| `periodic-install` | Write the scheduler entry for this platform and enable it (daily 03:00 `prune --apply`); dry-run is the default, `--live` performs the install. | None |
+| `periodic-uninstall` | Disable the scheduler entry, then remove its files; dry-run is the default, `--live` performs the uninstall. | None |
+| `periodic-status` | Show whether the daily cleanup is installed and enabled. Read-only. | None |
 
 `build` inputs: source directory (spec + sources — a checkout from #17,
 a git clone, or any dir with a spec), `repo` (explicit name, e.g.
@@ -410,6 +412,71 @@ adds an `eviction` object to every build record:
    build-start path is the only one that deletes without a prior
    proposal, and only under the safeguards above.
 
+## Periodic cleanup
+
+Eviction runs at build start only: a cache that stops being built
+against keeps its stale roots until the next build. The periodic
+cleanup runs the eviction pass on a daily schedule, under the same
+policy and safeguards as automatic eviction.
+
+- **The schedule runs `prune --apply` daily at 03:00 local time.**
+  The time is the same on every platform: the systemd timer carries
+  `OnCalendar=*-*-* 03:00:00`, the launchd agent a
+  `StartCalendarInterval` of hour 3, minute 0, and the scheduled task
+  a daily trigger at 03:00. Pinned by
+  `systemd_units_carry_the_binary_and_0300` (`src/periodic.rs:1073`),
+  `launchd_plist_carries_the_binary_log_and_0300`
+  (`src/periodic.rs:1101`) and
+  `scheduled_task_xml_carries_the_binary_and_daily_0300`
+  (`src/periodic.rs:1113`).
+- **Linux: a systemd user timer.** `geectl-prune.service` +
+  `geectl-prune.timer` in `~/.config/systemd/user/` (or
+  `$XDG_CONFIG_HOME/systemd/user/`), enabled with `systemctl --user
+  enable --now`. The unit files live under `packaging/systemd/` and
+  are the single source of truth: the install command renders them
+  with the running binary's path, and the RPM package will ship the
+  same files (separate packaging track; the spec substitutes
+  `@GEECTL_BIN@` with the packaged binary path). Pinned by
+  `linux_plan_writes_both_units_and_enables_the_timer`
+  (`src/periodic.rs:1154`).
+- **macOS: a launchd agent.** `io.github.scarabeusiv.geectl.prune.plist`
+  in `~/Library/LaunchAgents/`, loaded with `launchctl load`, logging
+  to `~/Library/Logs/geectl-prune.log`. A re-install unloads the
+  prior load first, so it picks up the new plist instead of failing
+  on an already-loaded agent; install and uninstall ask
+  `launchctl list` first and skip the unload when the query answers
+  that nothing is loaded, so they do not fail on the unload step
+  where load/unload cannot run — where the query itself fails, the
+  unload is still attempted. The dry run lists the full plan either
+  way. Pinned by
+  `macos_plan_writes_the_plist_and_loads_it` (`src/periodic.rs:1206`).
+- **Windows: a Task Scheduler task.** `geectl-prune`, created with
+  `schtasks /create /xml`, running as the creating user
+  (`InteractiveToken`, least privilege). Pinned by
+  `windows_plan_writes_the_xml_to_temp_and_creates_the_task`
+  (`src/periodic.rs:1251`).
+- **Install, uninstall and status are leaves, not packaging.**
+  `geectl local-build periodic-install --live` writes the entry and
+  enables it; without `--live` it prints the plan only. `geectl
+  local-build periodic-uninstall --live` disables the entry, then
+  removes its files — a disable failure leaves the files in place,
+  so a timer that may still fire never loses its unit file first,
+  and uninstalling a schedule that is already gone succeeds as a
+  no-op. `geectl local-build periodic-status` reports installed,
+  enabled and active; each reads `unknown` where the scheduler
+  cannot be asked or its answer names no known state — `installed`
+  only on Windows, where the query is the answer; elsewhere the
+  files answer it. The leaves parse as
+  `periodic_leaves_parse` (`src/cli_local_build.rs:1230`).
+- **The timer's command is exactly `prune --apply`.** `prune`
+  deletes only with its own `--apply` flag: the global `--live`
+  does not gate it, because the scheduled task runs
+  `geectl local-build prune --apply` and the leaf's confirmation is
+  the flag itself. Pinned by `prune_parses_defaults_and_apply`
+  (`src/cli_local_build.rs:1218`).
+- **No schedule ships off the three platforms.** Install, uninstall
+  and status fail with `UnsupportedOs` anywhere else.
+
 ## What "quick debug" covers, exactly
 
 - **Single native arch only.** `arch` must equal the host arch
@@ -456,9 +523,7 @@ adds an `eviction` object to every build record:
   reported, not hidden, because the server build aborts on it), `checks`
   (%check/ctest pass counts when parseable), `image_digest`,
   `engine_version`, `root_path`, `root_reused` (bool), cache stats
-  (pkg cache hits/misses/preferred, sccache hits),
-  `trusted_foreign_projects` (the foreign `home:` projects the flag
-  accepted, empty otherwise). Stdout carries only this payload
+  (pkg cache hits/misses/preferred, sccache hits). Stdout carries only this payload
   (R11); the full log stays on disk at `log_path` and is never dumped to
   stdout — `build-log` re-reads it.
 - **Trust: no prompts, ever (R1).** The op enumerates the `<bdep
@@ -468,17 +533,9 @@ adds an `eviction` object to every build record:
   `home:`. The build project itself is excluded from the set (osc parity,
   `check_trusted_projects(... if not i == prj)`, exact match only): a dep
   resolving from the project being built is the build's own output.
-  `--trust-all-projects` overrides that refusal for the dep set the
-  buildinfo enumerates, and only that refusal: non-`home:` projects
-  and the caller's own `home:` were always trusted, so the flag
-  lifts nothing for them. This is a deliberate difference from
-  osc's `trusted_prj` globs, which name the trusted projects: the
-  flag is all-or-nothing for the enumerated dep set, with no
-  per-project selection and no prompt. The build proceeds with
-  those deps, and the accepted foreign `home:` projects are
-  recorded in the build record (`trusted_foreign_projects`) and
-  reported on the debug channel. A dry run records the flag in
-  the plan without evaluating trust.
+  `--trust-all-projects` is accepted only after that check
+  passes — the flag cannot override a foreign-`home:` refusal; that
+  decision stays with the user.
 - **`--release N`** is supported (passes through to the engine; sets
   `BUILD_RELEASE` → `SOURCE_DATE_EPOCH`, which removes the local-only
   `python-bytecode-inconsistent-mtime` artifact for new packages).
@@ -553,7 +610,8 @@ packages lives in the working-copy layer (#17), not here.
 `BuildFailed` (exit code + log path + tail), `BuildTimeout`,
 `BuildInProgress`, `UntrustedProject` (names the foreign projects),
 `MultibuildFlavorRequired` (names the flavors), `UnsupportedArch`
-(non-native arch, OBS-ONLY named), `NoBuildEngine` (engine missing,
+(non-native arch, OBS-ONLY named), `UnsupportedOs` (periodic
+schedule off Linux, macOS and Windows), `NoBuildEngine` (engine missing,
 install named), `ImageUnavailable` (pull failed), `CacheCorrupt`
 (hdrmd5 mismatch after re-download), `BuildRootInUse` (destructive op
 while locked), `NotAGeectlBuildRoot` (wipe without the marker). Each

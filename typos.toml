@@ -5,6 +5,8 @@
 # only when it is a real word the dictionary does not know (a project
 # name, an API term), never to silence a genuine typo.
 [default.extend-words]
+# `fo` is the schtasks /fo (output format) flag value, not a typo.
+fo = "fo"
 
 # Verbatim upstream files are excluded: their text is not ours to fix.
 [files]

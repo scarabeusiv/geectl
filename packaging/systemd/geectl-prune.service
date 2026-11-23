@@ -1,0 +1,6 @@
+[Unit]
+Description=Prune the geectl local-build cache
+
+[Service]
+Type=oneshot
+ExecStart=@GEECTL_BIN@ local-build prune --apply

@@ -155,7 +155,7 @@ Commands:
   request       Read and act on OBS submit requests, and file new ones
   branch        Branch, copy, and link packages
   build         Build-status commands: results, logs, histories, binaries, buildconfig
-  local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, enter the preserved build root, and read the log of the last local build
+  local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, prune the cache, manage the daily periodic cleanup, enter the preserved build root, and read the log of the last local build
   maintenance   Maintenance operations: maintained-instances listing and maintenance branching
   service       Service reads and trigger: list a package's services, their run state, and trigger a server-side run
   gitea         Gitea operations: repository and branch reads and mutations on the configured instance
@@ -489,19 +489,23 @@ or a not-installed flag). Text output renders each dependency as
 ## `local-build` — podman build vertical
 
 ```
-Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, enter the preserved build root, and read the log of the last local build
+Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, prune the cache, manage the daily periodic cleanup, enter the preserved build root, and read the log of the last local build
 
 Usage: geectl local-build [OPTIONS] <COMMAND>
 
 Commands:
-  service-run   Run the `_service` file's services in the container, filtered by the run mode
-  precommit     The precommit gate: the `precommit`-mode service run, then `pre_checkin.sh` when the source directory carries one
-  spec-cleaner  Run `spec-cleaner` on a spec in the container
-  build         Build the package in the container: the run-mode service run, the precommit gate, then the engine build
-  wipe          Wipe a build root: delete its contents (the lock file stays). A mutation: dry-run is the default (only the plan is printed); `--live` performs the wipe. There is no force flag: the marker check and the in-use lock are safety invariants, never bypassed
-  chroot        Enter the preserved build root of the last build for the package and run repro commands there, read from stdin, one per line, joined with `&&` into one shell command. A mutation: dry-run is the default (only the plan is printed); `--live` runs the commands in the root. There is no interactive shell: a terminal on stdin is refused instead of blocking on a read that never arrives. A failing repro still exits 0: the exit code is data, in `exit:` and in `record.result.exit_code`
-  log           Read the log of the last local build: the `<root>/.build.log` the build's coordinates name. A read, not a mutation: no `--live` needed. The text is the log verbatim (design rule 4); the verdict, exit code, log path, and truncation flag ride in the JSON payload
-  help          Print this message or the help of the given subcommand(s)
+  service-run         Run the `_service` file's services in the container, filtered by the run mode
+  precommit           The precommit gate: the `precommit`-mode service run, then `pre_checkin.sh` when the source directory carries one
+  spec-cleaner        Run `spec-cleaner` on a spec in the container
+  build               Build the package in the container: the run-mode service run, the precommit gate, then the engine build
+  wipe                Wipe a build root: delete its contents (the lock file stays). A mutation: dry-run is the default (only the plan is printed); `--live` performs the wipe. There is no force flag: the marker check and the in-use lock are safety invariants, never bypassed
+  prune               Print the eviction plan (what would be evicted, in order, with bytes); delete only with `--apply`. The plan is the default: the global `--live` does not gate this leaf, the leaf's own `--apply` is the confirmation, so the scheduled task runs exactly `prune --apply`
+  periodic-install    Install the daily periodic cleanup for this platform: write the scheduler entry and enable it. A mutation: dry-run is the default (only the plan is printed); `--live` performs the install
+  periodic-uninstall  Remove the daily periodic cleanup for this platform: disable the scheduler entry, then remove its files. A mutation: dry-run is the default (only the plan is printed); `--live` performs the uninstall
+  periodic-status     Show whether the daily periodic cleanup is installed and enabled on this platform. Read-only
+  chroot              Enter the preserved build root of the last build for the package and run repro commands there, read from stdin, one per line, joined with `&&` into one shell command. A mutation: dry-run is the default (only the plan is printed); `--live` runs the commands in the root. There is no interactive shell: a terminal on stdin is refused instead of blocking on a read that never arrives. A failing repro still exits 0: the exit code is data, in `exit:` and in `record.result.exit_code`
+  log                 Read the log of the last local build: the `<root>/.build.log` the build's coordinates name. A read, not a mutation: no `--live` needed. The text is the log verbatim (design rule 4); the verdict, exit code, log path, and truncation flag ride in the JSON payload
+  help                Print this message or the help of the given subcommand(s)
 
 Options:
       --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
@@ -541,6 +545,62 @@ and takes no per-project selection, unlike osc's `trusted_prj` globs.
 The accepted foreign `home:` projects are recorded in the build record
 (`trusted_foreign_projects`). A dry run records the flag in the plan
 without evaluating trust.
+The eviction plan, and the delete switch:
+
+```
+Print the eviction plan (what would be evicted, in order, with bytes); delete only with `--apply`. The plan is the default: the global `--live` does not gate this leaf, the leaf's own `--apply` is the confirmation, so the scheduled task runs exactly `prune --apply`
+
+Usage: geectl local-build prune [OPTIONS]
+
+Options:
+      --apply            Delete what the plan lists
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+The daily periodic cleanup: install, uninstall, status.
+
+```
+Install the daily periodic cleanup for this platform: write the scheduler entry and enable it. A mutation: dry-run is the default (only the plan is printed); `--live` performs the install
+
+Usage: geectl local-build periodic-install [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Remove the daily periodic cleanup for this platform: disable the scheduler entry, then remove its files. A mutation: dry-run is the default (only the plan is printed); `--live` performs the uninstall
+
+Usage: geectl local-build periodic-uninstall [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Show whether the daily periodic cleanup is installed and enabled on this platform. Read-only
+
+Usage: geectl local-build periodic-status [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
 
 ## `maintenance` — maintained instances + branching
 

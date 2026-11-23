@@ -1,8 +1,9 @@
 //! `local-build` — the podman build vertical's command group: build
 //! a package in the container, run its `_service` services, the
-//! precommit gate, `spec-cleaner`, wipe a build root, enter the
-//! preserved build root to run repro commands, and read the log of
-//! the last local build.
+//! precommit gate, `spec-cleaner`, wipe a build root, prune the
+//! cache, manage the daily periodic cleanup, enter the preserved
+//! build root to run repro commands, and read the log of the last
+//! local build.
 //!
 //! Thin like `service` and `build`: the flags mirror the library
 //! parameters, the JSON payload carries the typed record, and the
@@ -17,7 +18,11 @@
 //! command prints the plan only (the library dry run) and touches
 //! nothing. With it, the run executes in the container. A failing
 //! service or a failing `pre_checkin.sh` fails the command with a
-//! non-zero exit.
+//! non-zero exit. One leaf is excepted: `prune` deletes only with
+//! its own `--apply` flag — the plan is the default, and the global
+//! `--live` does not gate it — because the scheduled task runs
+//! exactly `prune --apply` and the leaf's confirmation is the flag
+//! itself.
 //!
 //! Coordinate header (design rule 1): every text rendering opens
 //! with one header line echoing the query coordinates (`directory:
@@ -34,11 +39,12 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::local_build::{
-    validate_build_request, BuildLog, BuildRecord, BuildRequest, ChrootRecord, LocalBuild,
-    PrecommitRecord, ServiceRunMode, ServiceRunRecord, ServiceRunRequest, SpecCleanerResult,
-    WipeOutcome,
+    validate_build_request, BuildLog, BuildRecord, BuildRequest, ChrootRecord, EvictionReport,
+    LocalBuild, PrecommitRecord, ServiceRunMode, ServiceRunRecord, ServiceRunRequest,
+    SpecCleanerResult, WipeOutcome,
 };
 use geectl::obs::{ObsClient, OBS_API_BASE};
+use geectl::periodic::{self, PeriodicOs, PeriodicOutcome, PeriodicStatus};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
@@ -190,6 +196,29 @@ pub enum LocalBuildCommand {
         #[arg(long, conflicts_with_all = ["repo", "arch", "spec", "project", "flavor"])]
         root: Option<PathBuf>,
     },
+    /// Print the eviction plan (what would be evicted, in order,
+    /// with bytes); delete only with `--apply`. The plan is the
+    /// default: the global `--live` does not gate this leaf, the
+    /// leaf's own `--apply` is the confirmation, so the scheduled
+    /// task runs exactly `prune --apply`.
+    Prune {
+        /// Delete what the plan lists.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Install the daily periodic cleanup for this platform: write
+    /// the scheduler entry and enable it. A mutation: dry-run is
+    /// the default (only the plan is printed); `--live` performs
+    /// the install.
+    PeriodicInstall,
+    /// Remove the daily periodic cleanup for this platform: disable
+    /// the scheduler entry, then remove its files. A mutation:
+    /// dry-run is the default (only the plan is printed); `--live`
+    /// performs the uninstall.
+    PeriodicUninstall,
+    /// Show whether the daily periodic cleanup is installed and
+    /// enabled on this platform. Read-only.
+    PeriodicStatus,
     /// Enter the preserved build root of the last build for the
     /// package and run repro commands there, read from stdin, one
     /// per line, joined with `&&` into one shell command. A
@@ -500,6 +529,77 @@ pub fn run_local_build(
             });
             Ok((payload, text))
         }
+        LocalBuildCommand::Prune { apply } => {
+            // The leaf's own --apply is the confirmation, not the
+            // global --live: the scheduled task runs exactly
+            // `prune --apply`, and the plan is the default. A
+            // `--live` without `--apply` says so in text, so it
+            // never looks like a deletion that did not happen.
+            let report = if apply {
+                vertical.prune_apply()?
+            } else {
+                vertical.prune_plan()?
+            };
+            let header = format!("cache: {}", vertical.cache_dir().display());
+            let mut text = with_header(&header, render_prune(&report, apply));
+            if let Some(note) = prune_live_note(live, apply) {
+                text.push('\n');
+                text.push_str(note);
+            }
+            let payload = json!({
+                "cache_dir": vertical.cache_dir(),
+                "dry_run": !apply,
+                "report": report,
+            });
+            Ok((payload, text))
+        }
+        LocalBuildCommand::PeriodicInstall => {
+            let os = periodic_os()?;
+            let exe = std::env::current_exe().map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot resolve the geectl binary path: {e}"),
+                )
+            })?;
+            let home = periodic::resolve_home()?;
+            let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+            let outcome = periodic::install(os, &exe, &home, xdg.as_deref(), !live)?;
+            let header = format!("periodic: {}", os.name());
+            let text = with_header(&header, render_periodic_outcome(&outcome, true));
+            let payload = json!({
+                "platform": os.name(),
+                "dry_run": !live,
+                "outcome": outcome,
+            });
+            Ok((payload, text))
+        }
+        LocalBuildCommand::PeriodicUninstall => {
+            let os = periodic_os()?;
+            let home = periodic::resolve_home()?;
+            let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+            let outcome = periodic::uninstall(os, &home, xdg.as_deref(), !live)?;
+            let header = format!("periodic: {}", os.name());
+            let text = with_header(&header, render_periodic_outcome(&outcome, false));
+            let payload = json!({
+                "platform": os.name(),
+                "dry_run": !live,
+                "outcome": outcome,
+            });
+            Ok((payload, text))
+        }
+        LocalBuildCommand::PeriodicStatus => {
+            let os = periodic_os()?;
+            let home = periodic::resolve_home()?;
+            let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+            let status = periodic::status(os, &home, xdg.as_deref())?;
+            let header = format!("periodic: {}", os.name());
+            let text = with_header(&header, render_periodic_status(&status));
+            let payload = json!({
+                "platform": os.name(),
+                "status": status,
+            });
+            Ok((payload, text))
+        }
         LocalBuildCommand::Chroot {
             directory,
             project,
@@ -554,6 +654,17 @@ pub fn run_local_build(
             ))
         }
     }
+}
+
+/// The current platform's schedule, or `UnsupportedOs` where no
+/// schedule ships.
+fn periodic_os() -> Result<PeriodicOs, GeectlError> {
+    PeriodicOs::current().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::UnsupportedOs,
+            format!("no periodic cleanup ships on {}", std::env::consts::OS),
+        )
+    })
 }
 
 /// Prepend the one-line coordinate header to a text rendering
@@ -780,6 +891,89 @@ fn render_wipe(outcome: &WipeOutcome) -> String {
     }
 }
 
+/// The note appended to prune text when `--live` is passed
+/// without `--apply`: `--live` never deletes here, so a plan that
+/// follows it must say so instead of looking like a deletion that
+/// did not happen.
+fn prune_live_note(live: bool, apply: bool) -> Option<&'static str> {
+    if live && !apply {
+        Some("note: --live does not delete here; use --apply to delete")
+    } else {
+        None
+    }
+}
+
+/// A prune run as text: the plan, or the performed eviction. The
+/// plan lists what would be evicted, in order, with bytes; the
+/// applied run lists what was evicted. A run that evicts nothing
+/// says so, and a run skipped on the eviction lock says so — the
+/// lock failure is in the report either way.
+fn render_prune(report: &EvictionReport, applied: bool) -> String {
+    let mut lines = Vec::new();
+    if !report.ran {
+        if report.failures.is_empty() {
+            lines.push("eviction: nothing to evict".to_string());
+        } else {
+            lines.push("eviction: skipped, another eviction holds the lock".to_string());
+        }
+    } else if applied {
+        lines.push(format!(
+            "eviction: ran, freed {} bytes ({} items)",
+            report.freed_bytes,
+            report.evicted.len()
+        ));
+    } else {
+        lines.push(format!(
+            "eviction: plan, would free {} bytes ({} items)",
+            report.freed_bytes,
+            report.evicted.len()
+        ));
+    }
+    for item in &report.evicted {
+        lines.push(format!(
+            "eviction: {} {} ({} bytes, {})",
+            item.kind, item.path, item.bytes, item.reason
+        ));
+    }
+    if report.shortfall_bytes > 0 {
+        lines.push(format!(
+            "eviction shortfall: {} bytes",
+            report.shortfall_bytes
+        ));
+    }
+    if !report.failures.is_empty() {
+        lines.push(format!("eviction failures: {}", report.failures.join("; ")));
+    }
+    lines.join("\n")
+}
+
+/// An install or uninstall run as text: the plan in a dry run, the
+/// performed run with `--live`. Files first, then the commands.
+fn render_periodic_outcome(outcome: &PeriodicOutcome, install: bool) -> String {
+    let mut lines = vec![format!("task: {}", outcome.label)];
+    for file in &outcome.files {
+        let verb = if outcome.dry_run {
+            if install {
+                "would write"
+            } else {
+                "would remove"
+            }
+        } else if install {
+            "wrote"
+        } else {
+            "removed"
+        };
+        lines.push(format!("{verb}: {}", file.display()));
+    }
+    for command in &outcome.commands {
+        if outcome.dry_run {
+            lines.push(format!("would run: {}", command.join(" ")));
+        } else {
+            lines.push(format!("ran: {}", command.join(" ")));
+        }
+    }
+    lines.join("\n")
+}
 /// The largest stdin payload `chroot` reads: 64 KiB, matching the
 /// config and secret file caps, and far below the exec `ARG_MAX` the
 /// joined `--shell-cmd` would otherwise die at. An unbounded read
@@ -875,6 +1069,22 @@ fn render_chroot(record: &ChrootRecord) -> String {
     lines.join("\n")
 }
 
+/// The periodic status as text: installed, enabled and active, with
+/// `unknown` where the scheduler cannot be asked.
+fn render_periodic_status(status: &PeriodicStatus) -> String {
+    let state = |value: Option<bool>| match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    };
+    format!(
+        "task: {}\ninstalled: {}\nenabled: {}\nactive: {}",
+        status.label,
+        state(status.installed),
+        state(status.enabled),
+        state(status.active)
+    )
+}
 /// The `log` result: the payload carries the query coordinates,
 /// the read window (`tail`, `full`), and the log record (log path,
 /// lines, truncation flag, verdict, exit code); the text is the log
@@ -1454,6 +1664,200 @@ mod tests {
                 .as_str()
                 .expect("stderr is a string")
         ));
+    }
+
+    #[test]
+    fn prune_parses_defaults_and_apply() {
+        match parse(&["geectl", "local-build", "prune"]) {
+            LocalBuildCommand::Prune { apply } => assert!(!apply),
+            _ => panic!("wrong variant"),
+        }
+        match parse(&["geectl", "local-build", "prune", "--apply"]) {
+            LocalBuildCommand::Prune { apply } => assert!(apply),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn periodic_leaves_parse() {
+        assert!(matches!(
+            parse(&["geectl", "local-build", "periodic-install"]),
+            LocalBuildCommand::PeriodicInstall
+        ));
+        assert!(matches!(
+            parse(&["geectl", "local-build", "periodic-uninstall"]),
+            LocalBuildCommand::PeriodicUninstall
+        ));
+        assert!(matches!(
+            parse(&["geectl", "local-build", "periodic-status"]),
+            LocalBuildCommand::PeriodicStatus
+        ));
+    }
+
+    fn eviction_report(
+        ran: bool,
+        freed: u64,
+        items: Vec<EvictedItem>,
+        shortfall: u64,
+        failures: Vec<String>,
+    ) -> EvictionReport {
+        EvictionReport {
+            ran,
+            cap_bytes: 20 * 1024 * 1024 * 1024,
+            low_water_bytes: 16 * 1024 * 1024 * 1024,
+            bytes_before: 21 * 1024 * 1024 * 1024,
+            bytes_after: 21 * 1024 * 1024 * 1024 - freed,
+            freed_bytes: freed,
+            evicted: items,
+            failures,
+            protected_bytes: 0,
+            shortfall_bytes: shortfall,
+        }
+    }
+
+    #[test]
+    fn render_prune_reports_plan_applied_and_nothing() {
+        let empty = eviction_report(false, 0, vec![], 0, vec![]);
+        assert_eq!(render_prune(&empty, false), "eviction: nothing to evict");
+        let plan = eviction_report(
+            true,
+            4096,
+            vec![
+                EvictedItem {
+                    kind: "pkg".to_string(),
+                    path: "/cache/pkg/foo.rpm".to_string(),
+                    bytes: 1024,
+                    reason: "lru".to_string(),
+                },
+                EvictedItem {
+                    kind: "sccache".to_string(),
+                    path: "/cache/sccache/bar".to_string(),
+                    bytes: 3072,
+                    reason: "lru".to_string(),
+                },
+            ],
+            512,
+            vec![],
+        );
+        assert_eq!(
+            render_prune(&plan, false),
+            "eviction: plan, would free 4096 bytes (2 items)\n\
+             eviction: pkg /cache/pkg/foo.rpm (1024 bytes, lru)\n\
+             eviction: sccache /cache/sccache/bar (3072 bytes, lru)\n\
+             eviction shortfall: 512 bytes"
+        );
+        assert_eq!(
+            render_prune(&plan, true),
+            "eviction: ran, freed 4096 bytes (2 items)\n\
+             eviction: pkg /cache/pkg/foo.rpm (1024 bytes, lru)\n\
+             eviction: sccache /cache/sccache/bar (3072 bytes, lru)\n\
+             eviction shortfall: 512 bytes"
+        );
+    }
+
+    #[test]
+    fn prune_live_note_names_apply_only_without_it() {
+        assert_eq!(
+            prune_live_note(true, false),
+            Some("note: --live does not delete here; use --apply to delete")
+        );
+        assert_eq!(prune_live_note(true, true), None);
+        assert_eq!(prune_live_note(false, false), None);
+        assert_eq!(prune_live_note(false, true), None);
+    }
+
+    #[test]
+    fn render_prune_reports_a_lock_skip() {
+        let skipped = eviction_report(
+            false,
+            0,
+            vec![],
+            0,
+            vec!["eviction lock held by another build; eviction skipped".to_string()],
+        );
+        assert_eq!(
+            render_prune(&skipped, true),
+            "eviction: skipped, another eviction holds the lock\n\
+             eviction failures: eviction lock held by another build; eviction skipped"
+        );
+    }
+
+    #[test]
+    fn render_periodic_outcome_reports_plan_and_run() {
+        let planned = PeriodicOutcome {
+            platform: PeriodicOs::Linux,
+            label: "geectl-prune.timer".to_string(),
+            dry_run: true,
+            files: vec![PathBuf::from(
+                "/home/tester/.config/systemd/user/geectl-prune.timer",
+            )],
+            commands: vec![vec![
+                "systemctl".to_string(),
+                "--user".to_string(),
+                "enable".to_string(),
+                "--now".to_string(),
+                "geectl-prune.timer".to_string(),
+            ]],
+        };
+        assert_eq!(
+            render_periodic_outcome(&planned, true),
+            "task: geectl-prune.timer\n\
+             would write: /home/tester/.config/systemd/user/geectl-prune.timer\n\
+             would run: systemctl --user enable --now geectl-prune.timer"
+        );
+        let removed = PeriodicOutcome {
+            platform: PeriodicOs::Linux,
+            label: "geectl-prune.timer".to_string(),
+            dry_run: false,
+            files: vec![PathBuf::from(
+                "/home/tester/.config/systemd/user/geectl-prune.timer",
+            )],
+            commands: vec![vec![
+                "systemctl".to_string(),
+                "--user".to_string(),
+                "disable".to_string(),
+                "--now".to_string(),
+                "geectl-prune.timer".to_string(),
+            ]],
+        };
+        assert_eq!(
+            render_periodic_outcome(&removed, false),
+            "task: geectl-prune.timer\n\
+             removed: /home/tester/.config/systemd/user/geectl-prune.timer\n\
+             ran: systemctl --user disable --now geectl-prune.timer"
+        );
+    }
+
+    #[test]
+    fn render_periodic_status_reports_states() {
+        let status = PeriodicStatus {
+            platform: PeriodicOs::Linux,
+            label: "geectl-prune.timer".to_string(),
+            installed: Some(true),
+            enabled: Some(true),
+            active: None,
+            files: vec![],
+        };
+        assert_eq!(
+            render_periodic_status(&status),
+            "task: geectl-prune.timer\ninstalled: yes\nenabled: yes\nactive: unknown"
+        );
+    }
+
+    #[test]
+    fn render_periodic_status_reports_unknown_installed() {
+        let status = PeriodicStatus {
+            platform: PeriodicOs::Linux,
+            label: "geectl-prune.timer".to_string(),
+            installed: None,
+            enabled: None,
+            active: None,
+            files: vec![],
+        };
+        assert_eq!(
+            render_periodic_status(&status),
+            "task: geectl-prune.timer\ninstalled: unknown\nenabled: unknown\nactive: unknown"
+        );
     }
 
     fn dry_run_record() -> ServiceRunRecord {

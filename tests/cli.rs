@@ -5799,19 +5799,20 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 38 blocks (top level, 11 groups, 26 leaves) — a
+    // The docs carry 42 blocks (top level, 11 groups, 30 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
     // groups and one leaf each, plus `remote download`, plus the ten
-    // working-copy leaves — and the count assertion guards the docs
-    // side only.
+    // working-copy leaves, plus the local-build prune and periodic
+    // leaves, plus the three prjconf leaves — and the count assertion
+    // guards the docs side only.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let docs = fs::read_to_string(manifest.join("docs/cli.md")).expect("docs/cli.md");
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-            38,
-        "docs/cli.md should carry 38 --help blocks (top level, 11 groups, 26 leaves);          update this count when a block is deliberately added or removed"
+        42,
+        "docs/cli.md should carry 42 --help blocks (top level, 11 groups, 30 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();

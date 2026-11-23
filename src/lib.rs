@@ -51,6 +51,10 @@
 //!   status, diff, add, rm, addremove, commit, pull, and resolve
 //!   over one OBS package or one git-backed package, through the
 //!   `git` binary.
+//! - [`periodic`]: the daily periodic cache cleanup — the scheduler
+//!   entries that run `local-build prune --apply` once a day, on
+//!   Linux (systemd user timer), macOS (launchd agent) and Windows
+//!   (Task Scheduler).
 
 pub mod auth;
 pub mod changelog;
@@ -61,6 +65,7 @@ pub mod gitea;
 pub mod http;
 pub mod local_build;
 pub mod obs;
+pub mod periodic;
 pub mod pull_request;
 pub mod url;
 pub mod working_copy;
