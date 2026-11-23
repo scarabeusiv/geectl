@@ -154,8 +154,6 @@ with no osc counterpart.
 | `osc restartbuild [PROJECT [PACKAGE]]` | `build restart-build PROJECT PACKAGE REPOSITORY ARCH` | Same mapping; per-package only, no project-wide form |
 | `osc abortbuild [PROJECT [PACKAGE]]` | `build abort-build PROJECT PACKAGE REPOSITORY ARCH` | Same mapping; per-package only, no project-wide form |
 
-No geectl equivalent (coverage gaps, not deviations): `lbl` —
-local build log; out of scope (issue #43, podman vertical).
 `build build-status`, `build job-status`, `build
 fileinfo`, `build dependson`, `build check-constraints`, `build
 list-binaries` — new surface with no osc command (reachable in osc
@@ -168,6 +166,7 @@ only via `osc api`).
 | `build` | `local-build build DIRECTORY --project PROJECT --repo REPOSITORY` | One operation per the design: the run-mode service run, the precommit gate, then the engine build in one invocation; project and repo are explicit coordinates, arch defaults to the host arch; `--arch`, `--clean`, `--flavor`, `--release`, `--trust-all-projects`, `--refresh-image`, `--timeout-secs` are the only options in v1 |
 | `osc wipe [REPOSITORY ARCH]` (alias of `build`, sets `--wipe`) | `local-build wipe REPOSITORY ARCH SPEC --project PROJECT` | Wipes the root the build's own coordinates name; the package comes from the spec file in the source directory, like the build; `--root` names the root directly instead of the coordinates; no force flag — the marker check and the in-use lock are safety invariants |
 | `chroot [REPOSITORY [ARCH]]` (alias of `build`, in-directory form) | `local-build chroot DIRECTORY --project PROJECT --repo REPOSITORY` | Enters the preserved root of the last build for the package; the package comes from the spec file in the directory, like the build; arch defaults to the host arch; no cwd-inferred form — the directory, project, and repo are explicit coordinates. Repro commands come from stdin, one per line, joined with `&&` into one shell command; a failing repro still exits 0, the exit code is in `exit:` / `record.result.exit_code`; there is no interactive shell and no single-command `--shell-cmd` form |
+| `osc lbl [REPOSITORY [ARCH]]` | `local-build log REPOSITORY ARCH SPEC --project PROJECT` | Reads the `<root>/.build.log` the build's coordinates name; the package comes from the spec file in the source directory, like the wipe; the text is the log verbatim (design rule 4), the verdict and truncation flag ride in the JSON payload; `--tail N` prints only the last N lines, `--full` reads the whole log without the 4 MiB cap — the byte `--offset` and `--strip-time` forms have no equivalent |
 
 `--trust-all-projects` lifts only the foreign-`home:` refusal for the
 dep set the buildinfo enumerates: non-`home:` projects and the caller's

@@ -994,6 +994,27 @@ semantics and the project-set enumeration, not its tests).**
   that pin the mirror rules) are not adopted osc tests and are not
   counted here.
 
+## Gap batch 3 — local-build log (#178)
+
+**Direct adoptions: 0.**
+
+- `osc localbuildlog` (`osc/commandline.py:6897`, alias `lbl`):
+  no osc test covers it — no matches in `tests/` or `behave/` —
+  so there is nothing to adopt. The operation reads
+  `<buildroot>/.build.log`, failing when the file is missing; that
+  read is already pinned by geectl's own library tests
+  (`build_log_full_read_is_capped`,
+  `build_log_uncapped_read_returns_the_whole_log`, and the
+  `build_log_for_source_*` tests in this PR). Its `--offset`
+  (byte offset) and `--strip-time` options are surveyed, not
+  adopted: the library reads by lines — `--tail N` for the last
+  lines, `--full` for the uncapped whole log — under the 4 MiB cap
+  the design doc pins, and no osc test pins either option on the
+  local log.
+- `tests/test_build.py` (2 tests) and `behave/features/build.feature`
+  (3 scenarios) were already surveyed under batch 10: nothing to
+  adopt.
+
 ## Counts (direct adoptions, de-duplicated)
 
 | Batch | Unit | Behave | Total |
@@ -1012,6 +1033,7 @@ semantics and the project-set enumeration, not its tests).**
 | 10 local-build flag parity | 0 (+spec ref) | 0 | 0 (+spec) |
 | Gap batch 2, wave 3 (#175, #176) | 0 | 0 | 0 |
 | Gap batch 3 — buildconfig --alternative-project (#252) | 0 (+spec ref) | 0 | 0 (+spec) |
+| Gap batch 3 — local-build log (#178) | 0 | 0 | 0 |
 | 11 prjconf | 0 | 0 | 0 |
 | 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
 | 13 mirror-first dep fetch | 1 | 0 | 1 |

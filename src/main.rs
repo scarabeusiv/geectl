@@ -120,8 +120,8 @@ enum Command {
     },
     /// Local builds in the podman build vertical: build a package,
     /// run its `_service` services, the precommit gate,
-    /// `spec-cleaner`, wipe a build root, and enter the preserved
-    /// build root.
+    /// `spec-cleaner`, wipe a build root, enter the preserved build
+    /// root, and read the log of the last local build.
     LocalBuild {
         #[command(subcommand)]
         command: cli_local_build::LocalBuildCommand,

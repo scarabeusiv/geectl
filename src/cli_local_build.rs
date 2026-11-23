@@ -1,14 +1,15 @@
 //! `local-build` — the podman build vertical's command group: build
 //! a package in the container, run its `_service` services, the
-//! precommit gate, `spec-cleaner`, wipe a build root, and enter the
-//! preserved build root to run repro commands.
+//! precommit gate, `spec-cleaner`, wipe a build root, enter the
+//! preserved build root to run repro commands, and read the log of
+//! the last local build.
 //!
 //! Thin like `service` and `build`: the flags mirror the library
 //! parameters, the JSON payload carries the typed record, and the
 //! text renderer prints the same values in a human-readable form.
-//! The service leaves and the wipe leaf make no server calls, so
-//! no credentials resolve there: a half-set credential env never
-//! breaks a local run. The build leaf fetches buildinfo/buildconfig
+//! The service leaves, the wipe leaf, and the log leaf make no
+//! server calls, so no credentials resolve there: a half-set
+//! credential env never breaks a local run. The build leaf fetches buildinfo/buildconfig
 //! on a live run, so it resolves the endpoint's credentials; its
 //! dry run touches nothing and resolves none.
 //!
@@ -21,7 +22,10 @@
 //! Coordinate header (design rule 1): every text rendering opens
 //! with one header line echoing the query coordinates (`directory:
 //! …`, plus `mode: …` and `service: …` when the query carries
-//! them).
+//! them). The log leaf is a content command (design rule 4): its
+//! text is the log verbatim, so no header is prepended; the
+//! coordinates, log path, verdict, exit code, and truncation flag
+//! ride in the JSON payload only (a DOCUMENTED omission).
 
 use clap::Subcommand;
 use geectl::auth::{Credentials, EnvObsAuth};
@@ -30,8 +34,9 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::local_build::{
-    validate_build_request, BuildRecord, BuildRequest, ChrootRecord, LocalBuild, PrecommitRecord,
-    ServiceRunMode, ServiceRunRecord, ServiceRunRequest, SpecCleanerResult, WipeOutcome,
+    validate_build_request, BuildLog, BuildRecord, BuildRequest, ChrootRecord, LocalBuild,
+    PrecommitRecord, ServiceRunMode, ServiceRunRecord, ServiceRunRequest, SpecCleanerResult,
+    WipeOutcome,
 };
 use geectl::obs::{ObsClient, OBS_API_BASE};
 use serde_json::{json, Value};
@@ -214,6 +219,33 @@ pub enum LocalBuildCommand {
         /// Timeout in seconds for the whole run.
         #[arg(long, default_value_t = 3600)]
         timeout_secs: u64,
+    },
+    /// Read the log of the last local build: the `<root>/.build.log`
+    /// the build's coordinates name. A read, not a mutation: no
+    /// `--live` needed. The text is the log verbatim (design rule 4);
+    /// the verdict, exit code, log path, and truncation flag ride in
+    /// the JSON payload.
+    Log {
+        /// The repository the root was built for.
+        repo: String,
+        /// The architecture the root was built for.
+        arch: String,
+        /// The source directory (spec + sources); the package comes
+        /// from the spec file in it, like the build.
+        spec: PathBuf,
+        /// The OBS project the package belongs to.
+        #[arg(long)]
+        project: String,
+        /// The multibuild flavor; required when the source carries
+        /// a `_multibuild` file.
+        #[arg(long)]
+        flavor: Option<String>,
+        /// Print only the last N lines of the log.
+        #[arg(long)]
+        tail: Option<usize>,
+        /// Read the whole log without the 4 MiB cap.
+        #[arg(long)]
+        full: bool,
     },
 }
 
@@ -505,6 +537,21 @@ pub fn run_local_build(
                 "record": record,
             });
             Ok((payload, text))
+        }
+        LocalBuildCommand::Log {
+            repo,
+            arch,
+            spec,
+            project,
+            flavor,
+            tail,
+            full,
+        } => {
+            let log = vertical
+                .build_log_for_source(&spec, &project, &repo, &arch, &flavor, tail, full)?;
+            Ok(log_result(
+                &spec, &project, &repo, &arch, &flavor, tail, full, &log,
+            ))
         }
     }
 }
@@ -828,13 +875,49 @@ fn render_chroot(record: &ChrootRecord) -> String {
     lines.join("\n")
 }
 
+/// The `log` result: the payload carries the query coordinates,
+/// the read window (`tail`, `full`), and the log record (log path,
+/// lines, truncation flag, verdict, exit code); the text is the log
+/// lines verbatim (design rule 4 — a content command), so piping it
+/// to a file keeps the log intact. The verdict, exit code, log path,
+/// and truncation flag are a DOCUMENTED omission from the text: they
+/// ride in the JSON payload only.
+#[allow(clippy::too_many_arguments)]
+fn log_result(
+    spec: &PathBuf,
+    project: &str,
+    repo: &str,
+    arch: &str,
+    flavor: &Option<String>,
+    tail: Option<usize>,
+    full: bool,
+    log: &BuildLog,
+) -> (Value, String) {
+    let payload = json!({
+        "spec": spec,
+        "project": project,
+        "repo": repo,
+        "arch": arch,
+        "flavor": flavor,
+        "tail": tail,
+        "full": full,
+        "log": log,
+    });
+    (payload, render_build_log(log))
+}
+
+/// A build log as text: the log lines verbatim.
+fn render_build_log(log: &BuildLog) -> String {
+    log.lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Cli, Command};
     use clap::Parser;
     use geectl::local_build::{
-        BuildRecord, CacheStats, CheckSummary, EnginePlan, EvictedItem, EvictionReport,
+        BuildLog, BuildRecord, CacheStats, CheckSummary, EnginePlan, EvictedItem, EvictionReport,
         PlannedService, PrecheckinOutcome, RpmlintSummary, ServiceRunOutcome, ServiceRunPlan,
         ShellResult,
     };
@@ -1783,5 +1866,192 @@ mod tests {
                 .as_str()
                 .expect("arch is a string")
         ));
+    }
+
+    #[test]
+    fn log_parses_coordinates_and_flags() {
+        match parse(&[
+            "geectl",
+            "local-build",
+            "log",
+            "standard",
+            "x86_64",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+        ]) {
+            LocalBuildCommand::Log {
+                repo,
+                arch,
+                spec,
+                project,
+                flavor,
+                tail,
+                full,
+            } => {
+                assert_eq!(repo, "standard");
+                assert_eq!(arch, "x86_64");
+                assert_eq!(spec, PathBuf::from("/tmp/pkg"));
+                assert_eq!(project, "home:foo");
+                assert_eq!(flavor, None);
+                assert_eq!(tail, None);
+                assert!(!full);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match parse(&[
+            "geectl",
+            "local-build",
+            "log",
+            "standard",
+            "x86_64",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--flavor",
+            "lib",
+            "--tail",
+            "50",
+            "--full",
+        ]) {
+            LocalBuildCommand::Log {
+                flavor, tail, full, ..
+            } => {
+                assert_eq!(flavor.as_deref(), Some("lib"));
+                assert_eq!(tail, Some(50));
+                assert!(full);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // Coordinates are required.
+        assert!(Cli::try_parse_from(["geectl", "local-build", "log"]).is_err());
+        assert!(Cli::try_parse_from([
+            "geectl",
+            "local-build",
+            "log",
+            "standard",
+            "x86_64",
+            "/tmp/pkg",
+        ])
+        .is_err());
+        // A negative tail is not a line count: usize rejects it at parse.
+        assert!(Cli::try_parse_from([
+            "geectl",
+            "local-build",
+            "log",
+            "standard",
+            "x86_64",
+            "/tmp/pkg",
+            "--project",
+            "home:foo",
+            "--tail",
+            "-1",
+        ])
+        .is_err());
+    }
+
+    fn build_log_fixture() -> BuildLog {
+        BuildLog {
+            log_path: PathBuf::from("/tmp/root/.build.log"),
+            lines: vec![
+                "first line".to_string(),
+                "finished \"build foo.spec\"".to_string(),
+            ],
+            truncated: false,
+            verdict: Some("green".to_string()),
+            exit_code: Some(0),
+        }
+    }
+
+    #[test]
+    fn log_renders_the_lines_verbatim() {
+        let (_, text) = log_result(
+            &PathBuf::from("/tmp/pkg"),
+            "home:foo",
+            "standard",
+            "x86_64",
+            &None,
+            None,
+            false,
+            &build_log_fixture(),
+        );
+        assert_eq!(text, "first line\nfinished \"build foo.spec\"");
+        let empty = BuildLog {
+            lines: vec![],
+            ..build_log_fixture()
+        };
+        let (_, text) = log_result(
+            &PathBuf::from("/tmp/pkg"),
+            "home:foo",
+            "standard",
+            "x86_64",
+            &None,
+            None,
+            false,
+            &empty,
+        );
+        assert_eq!(text, "");
+    }
+
+    /// The agreement test: the text is the log lines verbatim, so
+    /// every payload line appears in the text in order; the verdict,
+    /// exit code, log path, and truncation flag are a DOCUMENTED
+    /// rule-4 omission — they ride in the JSON payload only, never
+    /// in the text.
+    #[test]
+    fn log_text_carries_every_line_and_the_payload_carries_the_rest() {
+        let log = build_log_fixture();
+        let (payload, text) = log_result(
+            &PathBuf::from("/tmp/pkg"),
+            "home:foo",
+            "standard",
+            "x86_64",
+            &None,
+            None,
+            false,
+            &log,
+        );
+        assert_eq!(payload["spec"], "/tmp/pkg");
+        assert_eq!(payload["project"], "home:foo");
+        assert_eq!(payload["repo"], "standard");
+        assert_eq!(payload["arch"], "x86_64");
+        assert_eq!(payload["flavor"], Value::Null);
+        assert_eq!(payload["tail"], Value::Null);
+        assert_eq!(payload["full"], false);
+        assert_eq!(payload["log"]["log_path"], "/tmp/root/.build.log");
+        assert_eq!(payload["log"]["verdict"], "green");
+        assert_eq!(payload["log"]["exit_code"], 0);
+        assert_eq!(payload["log"]["truncated"], false);
+        let lines = payload["log"]["lines"]
+            .as_array()
+            .expect("lines is an array");
+        assert_eq!(
+            text,
+            lines
+                .iter()
+                .map(|l| l.as_str().expect("line is a string"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "log text is not the payload lines verbatim"
+        );
+        // The truncated case: the flag is set in the payload, and
+        // the text stays verbatim (no truncation notice is prepended).
+        let mut truncated = build_log_fixture();
+        truncated.truncated = true;
+        let (payload, text) = log_result(
+            &PathBuf::from("/tmp/pkg"),
+            "home:foo",
+            "standard",
+            "x86_64",
+            &Some("lib".to_string()),
+            Some(50),
+            true,
+            &truncated,
+        );
+        assert_eq!(payload["log"]["truncated"], true);
+        assert_eq!(payload["flavor"], "lib");
+        assert_eq!(payload["tail"], 50);
+        assert_eq!(payload["full"], true);
+        assert!(!text.contains("truncated"));
     }
 }

@@ -4487,8 +4487,9 @@ fn validate_dep(dep: &BuildDep) -> Result<(), GeectlError> {
 
 /// All five cache-dir components of a build root: project, repo,
 /// arch, and the flavor when present. The package is checked by the
-/// caller once it is known (from the spec in `build`, from the
-/// argument in `build_shell`/`build_wipe`/`build_log`).
+/// caller once it is known (from the spec in `build` and in
+/// `package_for_source`, from the argument in
+/// `build_shell`/`build_wipe`/`build_log`).
 fn validate_cache_components(
     project: &str,
     repo: &str,
@@ -4552,6 +4553,65 @@ fn find_spec(source_dir: &Path) -> Result<PathBuf, GeectlError> {
             ))
         }
     }
+}
+
+/// The package a source directory names: the spec file's stem,
+/// validated as a package name, with the multibuild flavor
+/// requirement checked against the source's `_multibuild` file.
+/// Shared by the source-keyed leaves (`wipe_source_root`,
+/// `build_log_for_source`): the package comes from the spec file
+/// in the source directory, like the build.
+fn package_for_source(source_dir: &Path, flavor: &Option<String>) -> Result<String, GeectlError> {
+    let source_dir = std::path::absolute(source_dir).map_err(|e| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "cannot resolve source directory {}: {e}",
+                source_dir.display()
+            ),
+        )
+    })?;
+    let spec = find_spec(&source_dir)?;
+    let package = spec
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !valid_obs_name(&package) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "spec file name {:?} is not a valid package name",
+                spec.file_name().unwrap_or_default().to_string_lossy()
+            ),
+        ));
+    }
+    // The package is a cache-dir component too (see above).
+    validate_path_component("package", &package)?;
+    let flavors = multibuild_flavors(&source_dir)?;
+    if let Some(flavors) = &flavors {
+        match flavor {
+            None => {
+                return Err(GeectlError::new(
+                    ErrorKind::MultibuildFlavorRequired,
+                    format!(
+                        "package {package} is multibuild; pass one flavor ({})",
+                        flavors.join(", ")
+                    ),
+                ));
+            }
+            Some(flavor) if !flavors.iter().any(|f| f == flavor) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "unknown multibuild flavor {flavor:?} for {package}; known flavors: {}",
+                        flavors.join(", ")
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(package)
 }
 
 /// The multibuild flavors of a source directory, from `_multibuild`
@@ -6139,55 +6199,7 @@ impl<'a> LocalBuild<'a> {
         flavor: &Option<String>,
         dry_run: bool,
     ) -> Result<WipeOutcome, GeectlError> {
-        let source_dir = std::path::absolute(source_dir).map_err(|e| {
-            GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "cannot resolve source directory {}: {e}",
-                    source_dir.display()
-                ),
-            )
-        })?;
-        let spec = find_spec(&source_dir)?;
-        let package = spec
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !valid_obs_name(&package) {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "spec file name {:?} is not a valid package name",
-                    spec.file_name().unwrap_or_default().to_string_lossy()
-                ),
-            ));
-        }
-        // The package is a cache-dir component too (see above).
-        validate_path_component("package", &package)?;
-        let flavors = multibuild_flavors(&source_dir)?;
-        if let Some(flavors) = &flavors {
-            match flavor {
-                None => {
-                    return Err(GeectlError::new(
-                        ErrorKind::MultibuildFlavorRequired,
-                        format!(
-                            "package {package} is multibuild; pass one flavor ({})",
-                            flavors.join(", ")
-                        ),
-                    ));
-                }
-                Some(flavor) if !flavors.iter().any(|f| f == flavor) => {
-                    return Err(GeectlError::new(
-                        ErrorKind::InvalidInput,
-                        format!(
-                            "unknown multibuild flavor {flavor:?} for {package}; known flavors: {}",
-                            flavors.join(", ")
-                        ),
-                    ));
-                }
-                _ => {}
-            }
-        }
+        let package = package_for_source(source_dir, flavor)?;
         validate_cache_components(project, repo, arch, flavor)?;
         let root = self.root_path(project, &package, repo, arch, flavor);
         let expected = ExpectedMarker {
@@ -6474,6 +6486,27 @@ impl<'a> LocalBuild<'a> {
             lines: shown,
             truncated,
         })
+    }
+
+    /// Read the build log for the source in `source_dir`: the
+    /// package comes from the spec file in it, like the build and
+    /// the wipe, and the log is the one the build's own coordinates
+    /// name (`<root>/.build.log`). The read window is the
+    /// `build_log` one: the last `tail` lines, or the whole log up
+    /// to the 4 MiB cap by default, uncapped on request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_log_for_source(
+        &self,
+        source_dir: &Path,
+        project: &str,
+        repo: &str,
+        arch: &str,
+        flavor: &Option<String>,
+        tail: Option<usize>,
+        uncapped: bool,
+    ) -> Result<BuildLog, GeectlError> {
+        let package = package_for_source(source_dir, flavor)?;
+        self.build_log(project, &package, repo, arch, flavor, tail, uncapped)
     }
 }
 
@@ -7823,17 +7856,21 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// A temp dir unique per test (tests run in parallel threads of
-    /// one process, so the process id alone is not unique). Removed
-    /// on drop: a test that leaves files behind fails the no-crust
-    /// assertion in the end-to-end test, and this guard keeps the
-    /// machine clean either way.
+    /// A temp dir unique per test and per process (tests run in
+    /// parallel threads of one process, so the counter alone is not
+    /// unique across processes: two concurrent test runs share the
+    /// counter's sequence). Removed on drop: a test that leaves files
+    /// behind fails the no-crust assertion in the end-to-end test,
+    /// and this guard keeps the machine clean either way.
     struct TempDir(PathBuf);
 
     impl TempDir {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let dir = std::env::temp_dir().join(format!("geectl-local-build-test-{n}"));
+            let dir = std::env::temp_dir().join(format!(
+                "geectl-local-build-test-{}-{n}",
+                std::process::id()
+            ));
             fs::create_dir_all(&dir).unwrap();
             TempDir(dir)
         }
@@ -11254,6 +11291,241 @@ fi
                 )
                 .unwrap();
             assert!(log.truncated);
+        }
+
+        #[test]
+        fn build_log_for_source_reads_the_log_of_the_named_source() {
+            // The source-keyed read: the package comes from the spec
+            // file in the source directory, and the log is the one
+            // the build's own coordinates name — the same root the
+            // wipe fixture builds.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, source) = wipe_fixture(&dir);
+            fs::write(
+                root.join(BUILD_LOG),
+                b"first\nfinished \"build foo.spec\"\n",
+            )
+            .unwrap();
+            let log = vertical
+                .build_log_for_source(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    None,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(log.log_path, root.join(BUILD_LOG));
+            assert!(!log.truncated);
+            assert_eq!(
+                log.lines,
+                vec![
+                    "first".to_string(),
+                    "finished \"build foo.spec\"".to_string()
+                ]
+            );
+            // No build record: no verdict rides along.
+            assert_eq!(log.verdict, None);
+            assert_eq!(log.exit_code, None);
+            // The tail arm reads the last lines only.
+            let log = vertical
+                .build_log_for_source(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    Some(1),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(log.lines, vec!["finished \"build foo.spec\"".to_string()]);
+
+            // A multibuild source reads the named flavor's root, not
+            // the unflavoured one: the flavor rides the whole seam,
+            // so a dropped flavor would read the log above instead.
+            fs::write(
+                source.join("_multibuild"),
+                "<multibuild><package>flavor-a</package><package>flavor-b</package></multibuild>",
+            )
+            .unwrap();
+            let flavored_root = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("standard-{}-flavor-a", host_arch()));
+            fs::create_dir_all(&flavored_root).unwrap();
+            fs::write(
+                flavored_root.join(BUILD_LOG),
+                b"flavored first\nflavored last\n",
+            )
+            .unwrap();
+            let log = vertical
+                .build_log_for_source(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &Some("flavor-a".to_string()),
+                    None,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(log.log_path, flavored_root.join(BUILD_LOG));
+            assert_eq!(
+                log.lines,
+                vec!["flavored first".to_string(), "flavored last".to_string()]
+            );
+
+            // The tail arms through the leaf: zero lines, more lines
+            // than the log holds, and a full read combined with a
+            // tail all come back from the named flavor's log.
+            let log = vertical
+                .build_log_for_source(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &Some("flavor-a".to_string()),
+                    Some(0),
+                    false,
+                )
+                .unwrap();
+            assert!(log.lines.is_empty());
+            let log = vertical
+                .build_log_for_source(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &Some("flavor-a".to_string()),
+                    Some(99),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                log.lines,
+                vec!["flavored first".to_string(), "flavored last".to_string()]
+            );
+            let log = vertical
+                .build_log_for_source(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &Some("flavor-a".to_string()),
+                    Some(1),
+                    true,
+                )
+                .unwrap();
+            assert_eq!(log.lines, vec!["flavored last".to_string()]);
+
+            // An empty log reads as no lines, not an error.
+            fs::write(flavored_root.join(BUILD_LOG), b"").unwrap();
+            let log = vertical
+                .build_log_for_source(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &Some("flavor-a".to_string()),
+                    None,
+                    false,
+                )
+                .unwrap();
+            assert!(log.lines.is_empty());
+        }
+
+        #[test]
+        fn build_log_for_source_refuses_a_missing_log() {
+            // A root that never built has no log to read: InvalidInput
+            // naming the log path, like the coordinate-keyed read.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let source = write_source(dir.path(), "foo.spec");
+            let err = vertical
+                .build_log_for_source(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    None,
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn build_log_for_source_derives_the_package_from_the_spec() {
+            // The derivation is the shared one: a source without a
+            // spec, and a multibuild source without a flavor, fail
+            // before any log is read.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let empty = dir.path().join("empty");
+            fs::create_dir_all(&empty).unwrap();
+            let err = vertical
+                .build_log_for_source(
+                    &empty,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    None,
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            let source = write_source(dir.path(), "foo.spec");
+            fs::write(
+                source.join("_multibuild"),
+                "<multibuild><package>flavor-a</package><package>flavor-b</package></multibuild>",
+            )
+            .unwrap();
+            let err = vertical
+                .build_log_for_source(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &None,
+                    None,
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::MultibuildFlavorRequired);
+            // An unknown flavor is invalid input, not a missing log.
+            let err = vertical
+                .build_log_for_source(
+                    &source,
+                    "testproject",
+                    "standard",
+                    host_arch(),
+                    &Some("flavor-z".to_string()),
+                    None,
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
         }
 
         #[test]

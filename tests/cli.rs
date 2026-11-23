@@ -6896,3 +6896,155 @@ fn prjconf_validate_fails_closed_without_credentials() {
 fn prjconf_clean_fails_closed_without_credentials() {
     prjconf_fails_closed_without_credentials(&["prjconf", "clean", "openSUSE:Factory"]);
 }
+
+// --- local-build log integration tests ---
+
+/// Plant a build root's log under the isolated cache dir: the root
+/// the build's own coordinates name, with a spec source dir naming
+/// the package. Returns the source dir.
+fn local_build_log_fixture(dir: &TempDir) -> PathBuf {
+    let source = dir.0.join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("foo.spec"), "Name: foo\n").unwrap();
+    let root = dir
+        .0
+        .join("geectl")
+        .join("build-roots")
+        // The library percent-encodes `:` in cache paths, so the
+        // fixture plants the encoded name the log read looks up.
+        .join("home%3Afoo")
+        .join("foo")
+        .join(format!("standard-{}", std::env::consts::ARCH));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join(".build.log"),
+        "first\nfinished \"build foo.spec\"\n",
+    )
+    .unwrap();
+    source
+}
+
+#[test]
+fn local_build_log_prints_the_last_build_log() {
+    let dir = TempDir::new();
+    let source = local_build_log_fixture(&dir);
+    let arch = std::env::consts::ARCH;
+    // Text is the log verbatim (design rule 4): no header line.
+    let out = geectl_isolated(&dir)
+        .env("XDG_CACHE_HOME", &dir.0)
+        .args([
+            "--format",
+            "text",
+            "local-build",
+            "log",
+            "standard",
+            arch,
+            source.to_str().unwrap(),
+            "--project",
+            "home:foo",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "first\nfinished \"build foo.spec\"\n"
+    );
+    // The tail arm prints only the last lines.
+    let out = geectl_isolated(&dir)
+        .env("XDG_CACHE_HOME", &dir.0)
+        .args([
+            "--format",
+            "text",
+            "local-build",
+            "log",
+            "standard",
+            arch,
+            source.to_str().unwrap(),
+            "--project",
+            "home:foo",
+            "--tail",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "finished \"build foo.spec\"\n"
+    );
+    // JSON (the default format) carries the record: the lines, the
+    // truncation flag, and the verdict (null: no build record here).
+    let out = geectl_isolated(&dir)
+        .env("XDG_CACHE_HOME", &dir.0)
+        .args([
+            "local-build",
+            "log",
+            "standard",
+            arch,
+            source.to_str().unwrap(),
+            "--project",
+            "home:foo",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["project"], "home:foo");
+    assert_eq!(value["repo"], "standard");
+    assert_eq!(value["arch"], arch);
+    assert_eq!(value["log"]["truncated"], false);
+    assert_eq!(value["log"]["verdict"], serde_json::Value::Null);
+    assert_eq!(
+        value["log"]["lines"],
+        serde_json::json!(["first", "finished \"build foo.spec\""])
+    );
+}
+
+#[test]
+fn local_build_log_missing_log_fails_with_invalid_input() {
+    // A source whose package never built: no log file, so the read
+    // fails closed naming the log path.
+    let dir = TempDir::new();
+    let source = dir.0.join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("foo.spec"), "Name: foo\n").unwrap();
+    let out = geectl_isolated(&dir)
+        .env("XDG_CACHE_HOME", &dir.0)
+        .args([
+            "local-build",
+            "log",
+            "standard",
+            std::env::consts::ARCH,
+            source.to_str().unwrap(),
+            "--project",
+            "home:foo",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("no build log at"),
+        "stderr: {stderr}"
+    );
+}

@@ -155,7 +155,7 @@ Commands:
   request       Read and act on OBS submit requests, and file new ones
   branch        Branch, copy, and link packages
   build         Build-status commands: results, logs, histories, binaries, buildconfig
-  local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, and enter the preserved build root
+  local-build   Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, enter the preserved build root, and read the log of the last local build
   maintenance   Maintenance operations: maintained-instances listing and maintenance branching
   service       Service reads and trigger: list a package's services, their run state, and trigger a server-side run
   gitea         Gitea operations: repository and branch reads and mutations on the configured instance
@@ -489,7 +489,7 @@ or a not-installed flag). Text output renders each dependency as
 ## `local-build` — podman build vertical
 
 ```
-Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, and enter the preserved build root
+Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec-cleaner`, wipe a build root, enter the preserved build root, and read the log of the last local build
 
 Usage: geectl local-build [OPTIONS] <COMMAND>
 
@@ -500,6 +500,7 @@ Commands:
   build         Build the package in the container: the run-mode service run, the precommit gate, then the engine build
   wipe          Wipe a build root: delete its contents (the lock file stays). A mutation: dry-run is the default (only the plan is printed); `--live` performs the wipe. There is no force flag: the marker check and the in-use lock are safety invariants, never bypassed
   chroot        Enter the preserved build root of the last build for the package and run repro commands there, read from stdin, one per line, joined with `&&` into one shell command. A mutation: dry-run is the default (only the plan is printed); `--live` runs the commands in the root. There is no interactive shell: a terminal on stdin is refused instead of blocking on a read that never arrives. A failing repro still exits 0: the exit code is data, in `exit:` and in `record.result.exit_code`
+  log           Read the log of the last local build: the `<root>/.build.log` the build's coordinates name. A read, not a mutation: no `--live` needed. The text is the log verbatim (design rule 4); the verdict, exit code, log path, and truncation flag ride in the JSON payload
   help          Print this message or the help of the given subcommand(s)
 
 Options:
