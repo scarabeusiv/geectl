@@ -1646,7 +1646,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
     let mut repositories = Vec::new();
     for element in xml_child_elements(inner, "repository")? {
         let (tag, content) = xml_split_element(element, "repository");
-        let name = xml_attr(tag, "name").ok_or_else(|| {
+        let name = xml_attr_non_empty(tag, "name").ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
                 "unexpected OBS project meta response: <repository> without name",
@@ -1663,7 +1663,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
         let mut paths = Vec::new();
         for path in xml_elements(content, "path")? {
             let (path_tag, _) = xml_split_element(path, "path");
-            let project = xml_attr(path_tag, "project").ok_or_else(|| {
+            let project = xml_attr_non_empty(path_tag, "project").ok_or_else(|| {
                 GeectlError::new(
                     ErrorKind::ServerError,
                     "unexpected OBS project meta response: <path> without project",
@@ -1672,29 +1672,29 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
             // A path without a repository attribute names no
             // (project, repository) pair, so it is dropped - the
             // same rule project_meta applies to its paths.
-            if let Some(repository) = xml_attr(path_tag, "repository") {
+            if let Some(repository) = xml_attr_non_empty(path_tag, "repository") {
                 paths.push((project, repository));
             }
         }
         let mut downloads = Vec::new();
         for download in xml_elements(content, "download")? {
             let (download_tag, download_inner) = xml_split_element(download, "download");
-            let Some(url) = xml_attr(download_tag, "url") else {
+            let Some(url) = xml_attr_non_empty(download_tag, "url") else {
                 continue;
             };
             let master = xml_elements(download_inner, "master")?
                 .into_iter()
                 .find_map(|master_element| {
                     let (master_tag, _) = xml_split_element(master_element, "master");
-                    xml_attr(master_tag, "url").map(|master_url| DownloadMaster {
+                    xml_attr_non_empty(master_tag, "url").map(|master_url| DownloadMaster {
                         url: master_url,
-                        sslfingerprint: xml_attr(master_tag, "sslfingerprint"),
+                        sslfingerprint: xml_attr_non_empty(master_tag, "sslfingerprint"),
                     })
                 });
             downloads.push(RepositoryDownload {
-                arch: xml_attr(download_tag, "arch"),
+                arch: xml_attr_non_empty(download_tag, "arch"),
                 url,
-                repotype: xml_attr(download_tag, "repotype"),
+                repotype: xml_attr_non_empty(download_tag, "repotype"),
                 archfilter: xml_element_text(download_inner, "archfilter")
                     .filter(|value| !value.is_empty()),
                 pubkey: xml_element_text(download_inner, "pubkey")
@@ -1705,21 +1705,21 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
         let mut release_targets = Vec::new();
         for target in xml_elements(content, "releasetarget")? {
             let (target_tag, _) = xml_split_element(target, "releasetarget");
-            let Some(project) = xml_attr(target_tag, "project") else {
+            let Some(project) = xml_attr_non_empty(target_tag, "project") else {
                 continue;
             };
             release_targets.push(ReleaseTarget {
                 project,
-                repository: xml_attr(target_tag, "repository"),
-                trigger: xml_attr(target_tag, "trigger"),
+                repository: xml_attr_non_empty(target_tag, "repository"),
+                trigger: xml_attr_non_empty(target_tag, "trigger"),
             });
         }
         let mut hostsystem = Vec::new();
         for host_element in xml_elements(content, "hostsystem")? {
             let (host_tag, _) = xml_split_element(host_element, "hostsystem");
             if let (Some(project), Some(repository)) = (
-                xml_attr(host_tag, "project"),
-                xml_attr(host_tag, "repository"),
+                xml_attr_non_empty(host_tag, "project"),
+                xml_attr_non_empty(host_tag, "repository"),
             ) {
                 hostsystem.push((project, repository));
             }
@@ -1728,9 +1728,9 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
             name,
             arch,
             paths,
-            rebuild: xml_attr(tag, "rebuild"),
-            block: xml_attr(tag, "block"),
-            linkedbuild: xml_attr(tag, "linkedbuild"),
+            rebuild: xml_attr_non_empty(tag, "rebuild"),
+            block: xml_attr_non_empty(tag, "block"),
+            linkedbuild: xml_attr_non_empty(tag, "linkedbuild"),
             downloads,
             release_targets,
             hostsystem,
@@ -2304,8 +2304,19 @@ fn xml_attr_raw(element: &str, name: &str) -> Option<String> {
 }
 
 /// The attribute value, or None when the attribute is absent. An
-/// empty value reads as absent.
+/// empty value reads as present: only the repository parse collapses
+/// an empty value to absent (see [`xml_attr_non_empty`]).
 pub(crate) fn xml_attr(element: &str, name: &str) -> Option<String> {
+    xml_attr_raw(element, name)
+}
+
+/// The attribute value, or None when the attribute is absent or
+/// empty. Repository parsing only: the modeled Repository treats a
+/// blank flag or optional value as unset, and rendering drops empty
+/// values, so the parse must read them as absent to round-trip.
+/// Every other caller reads through [`xml_attr`], where an empty
+/// value stays present.
+fn xml_attr_non_empty(element: &str, name: &str) -> Option<String> {
     xml_attr_raw(element, name).filter(|value| !value.is_empty())
 }
 
@@ -3479,8 +3490,18 @@ mod tests {
         assert_eq!(xml_attr("code=failed", "code"), None);
         // Missing attribute is None.
         assert_eq!(xml_attr("code=\"failed\"", "state"), None);
-        // An empty value reads as absent.
-        assert_eq!(xml_attr("code=\"\"", "code"), None);
+        // An empty value reads as present.
+        assert_eq!(xml_attr("code=\"\"", "code"), Some(String::new()));
+    }
+
+    #[test]
+    fn xml_attr_non_empty_reads_an_empty_value_as_absent() {
+        assert_eq!(xml_attr_non_empty("code=\"\"", "code"), None);
+        assert_eq!(
+            xml_attr_non_empty("code=\"building\"", "code"),
+            Some("building".to_string())
+        );
+        assert_eq!(xml_attr_non_empty("code=\"failed\"", "state"), None);
     }
 
     #[test]
