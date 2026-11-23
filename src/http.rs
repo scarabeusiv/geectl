@@ -3564,6 +3564,7 @@ mod tests {
     /// `Sever` closes the socket mid-body; `Stall` holds it open
     /// past the client's read timeout, then closes it. `Once` fails
     /// only the first attempt, `Always` every attempt.
+    #[derive(Clone, Copy)]
     enum DownloadBehavior {
         SeverOnce,
         StallOnce,
@@ -3576,7 +3577,9 @@ mod tests {
     /// `body`, failing attempts per `behavior`. Returns the port,
     /// the request count, and the server thread. The server stays
     /// up past the longest backoff gap (4 s) so a retrying client
-    /// still finds it on its last attempt.
+    /// still finds it on its last attempt. Each connection runs on
+    /// its own thread, so a stalled connection never blocks the
+    /// retry behind it.
     fn serve_download(
         body: Vec<u8>,
         behavior: DownloadBehavior,
@@ -3591,47 +3594,60 @@ mod tests {
         let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_clone = count.clone();
         let handle = std::thread::spawn(move || {
-            use std::io::Write;
             let mut last_request: Option<std::time::Instant> = None;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
+                    Ok((stream, _)) => {
                         let n = count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         last_request = Some(std::time::Instant::now());
-                        // On macOS/BSD, the accepted stream inherits the
-                        // listener's non-blocking mode: without this
-                        // the read below returns WouldBlock at once
-                        // (and the read timeout is a no-op), so the
-                        // server answers a request it never read.
-                        let _ = stream.set_nonblocking(false);
-                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                        let _ = read_request(&mut stream);
-                        let fail = match behavior {
-                            DownloadBehavior::SeverOnce | DownloadBehavior::StallOnce => n == 0,
-                            DownloadBehavior::SeverAlways | DownloadBehavior::StallAlways => true,
-                            DownloadBehavior::AlwaysOk => false,
-                        };
-                        let headers = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        let _ = stream.write_all(headers.as_bytes());
-                        if fail {
-                            let half = body.len() / 2;
-                            let _ = stream.write_all(&body[..half]);
-                            if matches!(
-                                behavior,
-                                DownloadBehavior::StallOnce | DownloadBehavior::StallAlways
-                            ) {
-                                // Hold the socket open past the
-                                // client's read timeout (1 s in the
-                                // stall tests) before closing it.
-                                std::thread::sleep(std::time::Duration::from_secs(3));
+                        // One thread per connection: a stalled
+                        // connection holds its thread for the whole
+                        // stall sleep, and the retry must not wait
+                        // behind it. A real server answers
+                        // connections concurrently; the test server
+                        // does the same.
+                        let body = body.clone();
+                        std::thread::spawn(move || {
+                            let mut stream = stream;
+                            use std::io::Write;
+                            // On macOS/BSD, the accepted stream inherits the
+                            // listener's non-blocking mode: without this
+                            // the read below returns WouldBlock at once
+                            // (and the read timeout is a no-op), so the
+                            // server answers a request it never read.
+                            let _ = stream.set_nonblocking(false);
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let _ = read_request(&mut stream);
+                            let fail = match behavior {
+                                DownloadBehavior::SeverOnce | DownloadBehavior::StallOnce => n == 0,
+                                DownloadBehavior::SeverAlways | DownloadBehavior::StallAlways => {
+                                    true
+                                }
+                                DownloadBehavior::AlwaysOk => false,
+                            };
+                            let headers = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(headers.as_bytes());
+                            if fail {
+                                let half = body.len() / 2;
+                                let _ = stream.write_all(&body[..half]);
+                                if matches!(
+                                    behavior,
+                                    DownloadBehavior::StallOnce | DownloadBehavior::StallAlways
+                                ) {
+                                    // Hold the socket open past the
+                                    // client's read timeout (1 s in the
+                                    // stall tests) before closing it.
+                                    std::thread::sleep(std::time::Duration::from_secs(3));
+                                }
+                            } else {
+                                let _ = stream.write_all(&body);
                             }
-                        } else {
-                            let _ = stream.write_all(&body);
-                        }
+                        });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         if let Some(last) = last_request {
