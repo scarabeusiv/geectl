@@ -3667,14 +3667,20 @@ fn render_owners(owners: &[Owner]) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            format!(
-                "{} {} {}: persons: {}; groups: {}",
-                owner.root_project,
-                owner.project,
+            // An empty root project (the real Container response
+            // carries rootproject="") drops out of the head instead
+            // of leaving a leading space.
+            let head = [
+                owner.root_project.as_str(),
+                owner.project.as_str(),
                 owner.package.as_deref().unwrap_or("-"),
-                persons,
-                groups
-            )
+            ]
+            .iter()
+            .filter(|segment| !segment.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+            format!("{head}: persons: {persons}; groups: {groups}")
         })
         .collect();
     lines.join("\n")
@@ -6020,6 +6026,26 @@ mod tests {
         assert!(text.contains("persons: alice (maintainer)"));
         assert!(text.contains("groups: editors (bugowner)"));
         assert_eq!(render_owners(&[]), "no owners");
+    }
+
+    #[test]
+    fn owners_render_empty_root_project_without_leading_space() {
+        // The real Container response carries rootproject="": the
+        // owner still renders, with no leading space before the
+        // project.
+        let owners = vec![Owner {
+            root_project: String::new(),
+            project: "openSUSE:Factory".to_string(),
+            package: Some("vim".to_string()),
+            persons: vec![NamedRole {
+                name: "alice".to_string(),
+                role: "maintainer".to_string(),
+            }],
+            groups: vec![],
+        }];
+        let text = render_owners(&owners);
+        assert!(text.starts_with("openSUSE:Factory vim:"));
+        assert!(text.contains("persons: alice (maintainer)"));
     }
 
     #[test]
