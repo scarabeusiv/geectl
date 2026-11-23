@@ -827,6 +827,80 @@ fn remote_invalid_list_files_rev_fails_fast_without_network() {
 }
 
 #[test]
+fn remote_package_log_limit_returns_only_the_latest_entry() {
+    let addr = serve_once(
+        "<revisionlist>\
+        <revision rev=\"1\" vrev=\"1\">\
+        <srcmd5>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</srcmd5>\
+        <version>1.0</version><time>1700000000</time><user>Admin</user>\
+        <comment>Initial import</comment>\
+        </revision>\
+        <revision rev=\"2\" vrev=\"1\">\
+        <srcmd5>bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</srcmd5>\
+        <version>1.1</version><time>1700000001</time><user>Admin</user>\
+        <comment>Update to 1.1</comment>\
+        </revision>\
+        <revision rev=\"3\" vrev=\"1\">\
+        <srcmd5>cccccccccccccccccccccccccccccccc</srcmd5>\
+        <version>1.2</version><time>1700000002</time><user>Admin</user>\
+        <comment>Update to 1.2</comment><requestid>123</requestid>\
+        </revision>\
+        </revisionlist>",
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "package-log",
+            "openSUSE:Factory",
+            "foo",
+            "--limit",
+            "1",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["limit"].as_u64(), Some(1));
+    assert_eq!(
+        value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["rev"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+}
+
+#[test]
+fn remote_package_log_limit_zero_fails_fast_without_network() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "package-log",
+            "openSUSE:Factory",
+            "vim",
+            "--limit",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
 fn remote_unreachable_server_fails_with_network_error() {
     // The base URL points at a closed loopback port: no server
     // answers, so the library fails with a network error and the CLI

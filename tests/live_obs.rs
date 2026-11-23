@@ -1122,7 +1122,7 @@ fn wait_until_log(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let log = client
-            .package_log(project, package, None)
+            .package_log(project, package, None, None)
             .map_err(|err| redact_live_username(&format!("{err}")))
             .expect("read the package log on the live instance");
         if log.len() >= count {
@@ -1230,7 +1230,7 @@ fn live_cat_reads_back_uploaded_file() {
     // The same revision by its srcmd5: `request show` reports the
     // source revision as a hash, and `cat --rev` accepts it.
     let log = authed
-        .package_log(&source_project, &package, None)
+        .package_log(&source_project, &package, None, None)
         .expect("history on the live instance");
     let rev1 = log
         .iter()
@@ -1405,7 +1405,7 @@ fn live_list_files_at_revision() {
     // The same revision by its srcmd5: the history reports the
     // source revision as a hash, and `list-files --rev` accepts it.
     let log = authed
-        .package_log(&source_project, &package, None)
+        .package_log(&source_project, &package, None, None)
         .expect("history on the live instance");
     let srcmd5 = log
         .iter()
@@ -1486,12 +1486,32 @@ fn live_package_log_newest_first_and_range() {
             &source_project,
             &package,
             Some(&RevisionRange::parse("1").unwrap()),
+            None,
         )
         .expect("read the ranged log on the live instance");
     assert_eq!(
         first_only.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
         vec![1],
         "the range must narrow the log to revision 1"
+    );
+    let latest_only = authed
+        .package_log(&source_project, &package, None, Some(1))
+        .expect("read the limited log on the live instance");
+    assert_eq!(
+        latest_only
+            .iter()
+            .map(|entry| entry.rev)
+            .collect::<Vec<_>>(),
+        vec![2],
+        "the limit must keep only the newest entry"
+    );
+    let two_newest = authed
+        .package_log(&source_project, &package, None, Some(2))
+        .expect("read the two newest log entries on the live instance");
+    assert_eq!(
+        two_newest.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+        vec![2, 1],
+        "the limit must keep the two newest entries newest-first"
     );
 }
 

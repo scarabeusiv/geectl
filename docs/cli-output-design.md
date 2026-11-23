@@ -80,7 +80,7 @@ what "one coherent channel" means.
 - **Read-after-write retries** (the library's bounded retries, not the
   HTTP policy): each probe plus the remaining budget, e.g.
   `retry: create_package registration probe 1/30s: still not found`.
-  (test `src/obs/remote.rs:7914`).
+  (test `src/obs/remote.rs:8062`).
   These are retries with no output elsewhere — a retried
   `change_state` consuming its 60 s budget would otherwise leave no
   visible trace.
@@ -323,7 +323,7 @@ shape rules above. Six examples pin the shape:
 - **`download <package> <file> --output <path>`** (single object +
   confirmation): header `project: … package: … file: …`, then
   `downloaded <file> (<n> bytes) to <path>` — the bytes never ride
-  the text rendering. (tests/cli.rs:1063)
+  the text rendering. (tests/cli.rs:1242)
 - **`build results`** (list + summary, batch 5): a `project:`
   header line, then the table `REPOSITORY ARCH PACKAGE CODE`, then
   a summary line (`1 failed, 3 succeeded`, terms alphabetical) —

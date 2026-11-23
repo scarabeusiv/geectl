@@ -178,6 +178,9 @@ pub enum RemoteCommand {
         /// may be empty; a side is a revision number or a srcmd5).
         #[arg(long)]
         range: Option<String>,
+        /// At most this many entries.
+        #[arg(long)]
+        limit: Option<u32>,
     },
     /// Show the per-file diff of one revision against the previous one.
     /// Computed client-side from per-file reads (the library lists both
@@ -759,13 +762,15 @@ pub fn run_remote(
             project,
             package,
             range,
+            limit,
         } => {
             let parsed = range.as_deref().map(RevisionRange::parse).transpose()?;
-            let entries = client.package_log(&project, &package, parsed.as_ref())?;
+            let entries = client.package_log(&project, &package, parsed.as_ref(), limit)?;
             let payload = json!({
                 "project": project,
                 "package": package,
                 "range": range,
+                "limit": limit,
                 "entries": entries.iter().map(history_entry_json).collect::<Vec<_>>(),
             });
             Ok((
@@ -3198,6 +3203,25 @@ mod tests {
             parsed,
             RemoteCommand::PackageLog {
                 range: Some(range),
+                ..
+            } if range == "1:3"
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "package-log",
+            "P",
+            "K",
+            "--range",
+            "1:3",
+            "--limit",
+            "2",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::PackageLog {
+                range: Some(range),
+                limit: Some(2),
                 ..
             } if range == "1:3"
         ));

@@ -2155,18 +2155,24 @@ impl<'a> ObsClient<'a> {
 
     /// Read the history of package `package` in project `project`
     /// (`GET /source/<project>/<package>/_history`), optionally
-    /// restricted to `range`. The history has no public route, so the
-    /// read uses the client's credentials (whatever they are — no
-    /// fail-closed pre-check: a client without credentials gets the
-    /// server's 401 as an error, like any other authenticated read).
-    /// Entries come back newest first: the server lists them oldest
-    /// first, so the log is reversed before it is returned; a range
-    /// filter preserves the newest-first order.
+    /// restricted to `range` and to the newest `limit` entries. The
+    /// history has no public route, so the read uses the client's
+    /// credentials (whatever they are — no fail-closed pre-check: a
+    /// client without credentials gets the server's 401 as an error,
+    /// like any other authenticated read). Entries come back newest
+    /// first: the server lists them oldest first, so the log is
+    /// reversed before it is returned; a range filter preserves the
+    /// newest-first order. A limit of 0 is an error: it is rejected
+    /// before any request is sent. Without a range the limit
+    /// rides the request (`_history?limit=N`), so the server sends
+    /// only the newest entries; with a range the filter needs the
+    /// full history, so the limit truncates the ranged result.
     pub fn package_log(
         &self,
         project: &str,
         package: &str,
         range: Option<&RevisionRange>,
+        limit: Option<u32>,
     ) -> Result<Vec<HistoryEntry>, GeectlError> {
         for (label, value) in [("project", project), ("package", package)] {
             if !valid_obs_name(value) {
@@ -2176,7 +2182,30 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        let url = build_url(&self.base, &["source", project, package, "_history"], &[]);
+        if limit == Some(0) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "invalid limit: 0".to_string(),
+            ));
+        }
+        // Without a range the limit rides the request, so the server
+        // sends only the newest entries; with a range the filter
+        // needs the full history, so the limit truncates the ranged
+        // result instead (below).
+        let limit_text = if range.is_none() {
+            limit.map(|n| n.to_string())
+        } else {
+            None
+        };
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(limit) = &limit_text {
+            query.push(("limit", limit));
+        }
+        let url = build_url(
+            &self.base,
+            &["source", project, package, "_history"],
+            &query,
+        );
         let body = self.http.get_with(&url, &self.credentials)?;
         let entries = parse_history(&body)?;
         let mut entries = match range {
@@ -2185,6 +2214,12 @@ impl<'a> ObsClient<'a> {
         };
         // The server lists oldest first; a log reads newest first.
         entries.reverse();
+        // The server already limited the read without a range; the
+        // truncate enforces the same bound on the ranged result (and
+        // on a server that ignores the query).
+        if let Some(limit) = limit {
+            entries.truncate(limit as usize);
+        }
         Ok(entries)
     }
 
@@ -6650,7 +6685,9 @@ mod tests {
             HISTORY_FIXTURE,
         );
         let client = ObsClient::new(&http);
-        let entries = client.package_log("openSUSE:Factory", "foo", None).unwrap();
+        let entries = client
+            .package_log("openSUSE:Factory", "foo", None, None)
+            .unwrap();
         assert_eq!(
             entries.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
             vec![3, 2, 1]
@@ -6678,6 +6715,7 @@ mod tests {
                 "openSUSE:Factory",
                 "foo",
                 Some(&RevisionRange::parse("2").unwrap()),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -6690,6 +6728,7 @@ mod tests {
                 "openSUSE:Factory",
                 "foo",
                 Some(&RevisionRange::parse("1:2").unwrap()),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -6707,6 +6746,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -6728,6 +6768,7 @@ mod tests {
                 "openSUSE:Factory",
                 "foo",
                 Some(&RevisionRange::parse("dddddddddddddddddddddddddddddddd").unwrap()),
+                None,
             )
             .is_err());
         // A reversed range is an error.
@@ -6736,8 +6777,115 @@ mod tests {
                 "openSUSE:Factory",
                 "foo",
                 Some(&RevisionRange::parse("2:1").unwrap()),
+                None,
             )
             .is_err());
+    }
+
+    #[test]
+    fn package_log_limit_returns_only_the_newest_entries() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_history?limit=1",
+                HISTORY_FIXTURE,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_history?limit=2",
+                HISTORY_FIXTURE,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_history?limit=10",
+                HISTORY_FIXTURE,
+            );
+        let client = ObsClient::new(&http);
+        let entries = client
+            .package_log("openSUSE:Factory", "foo", None, Some(1))
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+            vec![3]
+        );
+        let entries = client
+            .package_log("openSUSE:Factory", "foo", None, Some(2))
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        // A limit past the end returns the whole history.
+        let entries = client
+            .package_log("openSUSE:Factory", "foo", None, Some(10))
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn package_log_limit_zero_is_an_error() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_history",
+            HISTORY_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        let err = client
+            .package_log("openSUSE:Factory", "foo", None, Some(0))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The check runs before the read: no request is made.
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn package_log_range_and_limit_take_the_newest_of_the_range() {
+        // With a range the limit truncates the ranged result: the
+        // request carries no limit, so the range still resolves
+        // against the full history.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_history",
+            HISTORY_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        let entries = client
+            .package_log(
+                "openSUSE:Factory",
+                "foo",
+                Some(&RevisionRange::parse("1:2").unwrap()),
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+            vec![2]
+        );
+        let entries = client
+            .package_log(
+                "openSUSE:Factory",
+                "foo",
+                Some(&RevisionRange::parse("1:3").unwrap()),
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.rev).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        // Both reads hit the plain history URL: no server-side limit
+        // with a range.
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                (
+                    "https://api.opensuse.org/source/openSUSE:Factory/foo/_history".to_string(),
+                    false
+                ),
+                (
+                    "https://api.opensuse.org/source/openSUSE:Factory/foo/_history".to_string(),
+                    false
+                ),
+            ]
+        );
     }
 
     fn patch_client() -> FakeHttp {
