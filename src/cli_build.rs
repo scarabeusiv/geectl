@@ -10,7 +10,9 @@
 //!
 //! Two shape notes. `download-binary` returns raw bytes, which cannot
 //! ride the JSON payload: it writes them to the `--output` path and
-//! the payload names the written file. `check-constraints` takes the
+//! the payload names the written file; with `--all` it writes every
+//! listed file into the `--output` directory and the payload names
+//! each one. `check-constraints` takes the
 //! constraints document inline (`--constraints`): the one place raw
 //! XML crosses the public API, because there is no typed constraints
 //! model. `buildconfig` returns raw text: the payload carries it as
@@ -41,15 +43,16 @@
 //! `dry_run:`, then the result line and the plan.
 
 use clap::{Args, Subcommand};
+use fs2::FileExt;
 use geectl::auth::{Credentials, EnvObsAuth};
 use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    BinaryFile, BuildHistoryEntry, BuildInfo, BuildLogQuery, BuildResults, DryRun, ExtDependency,
-    FileInfo, JobHistoryEntry, JobStatus, ObsClient, PackageDeps, ProvidedBy, Repository,
-    ResultsQuery, OBS_API_BASE,
+    valid_obs_filename, BinaryFile, BuildHistoryEntry, BuildInfo, BuildLogQuery, BuildResults,
+    DryRun, ExtDependency, FileInfo, JobHistoryEntry, JobStatus, ObsClient, PackageDeps,
+    ProvidedBy, Repository, ResultsQuery, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -233,7 +236,8 @@ pub enum BuildCommand {
         #[arg(long)]
         package: Option<String>,
     },
-    /// Download one built file by name.
+    /// Download one built file by name. With `--all`, every built
+    /// file.
     DownloadBinary {
         /// The project the package is in.
         project: String,
@@ -244,10 +248,20 @@ pub enum BuildCommand {
         /// The architecture the file was built for.
         arch: String,
         /// The file to download (e.g. `foo-1.0-1.x86_64.rpm`).
-        filename: String,
-        /// Where to write the downloaded bytes.
+        /// Required unless `--all` downloads every built file.
+        #[arg(required_unless_present = "all")]
+        filename: Option<String>,
+        /// Where to write the downloaded bytes: the file path (it
+        /// must not already exist), or the directory every built
+        /// file goes into with `--all`.
         #[arg(long)]
         output: PathBuf,
+        /// Download every built file into the `--output` directory;
+        /// a file already there refuses the run. The downloads are
+        /// sequential, not atomic: if one fails, the files already
+        /// downloaded stay.
+        #[arg(long, conflicts_with = "filename")]
+        all: bool,
     },
     /// Read the metadata of a built file: RPM header fields plus
     /// dependency lists.
@@ -634,35 +648,122 @@ pub fn run_build(
             arch,
             filename,
             output,
+            all,
         } => {
-            // Refuse an existing destination before downloading: the
-            // bytes would be refused by write_downloaded anyway, and
-            // the download is wasted work. The exclusive create in
-            // write_downloaded is still the enforcement.
-            if output.exists() {
-                return Err(GeectlError::new(
-                    ErrorKind::AlreadyExists,
-                    format!(
-                        "cannot create download file {}: already exists",
-                        output.display()
-                    ),
-                ));
+            if all {
+                // One list call plus one streaming download per
+                // file: the streamed download has no 10 MiB cap,
+                // and each file is created exclusively — a second
+                // run into the same directory refuses the files
+                // already there. The names are validated up front,
+                // before anything downloads, so a bad server name
+                // fails the run with nothing downloaded; the total
+                // size is checked against the output filesystem
+                // before the first download, so a disk that cannot
+                // hold the run fails fast instead of mid-run. A
+                // failure aborts the run; the files already
+                // downloaded stay, and the failed file's partial
+                // download is removed only when this run created
+                // it — a file that pre-existed (refused by
+                // exclusive create) or was never created (a
+                // failure before the first byte) is never
+                // deleted — so a retry is not refused by the
+                // partial.
+                let files = client.list_binaries(&project, Some(&package), &repository, &arch)?;
+                validate_download_names(&files)?;
+                let total_size = total_download_size(&files)?;
+                std::fs::create_dir_all(&output).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot create output directory {}: {e}", output.display()),
+                    )
+                })?;
+                let output_canonical = std::fs::canonicalize(&output).map_err(|e| {
+                    GeectlError::new(
+                        ErrorKind::InternalError,
+                        format!("cannot resolve output directory {}: {e}", output.display()),
+                    )
+                })?;
+                check_disk_space(&output, total_size)?;
+                let mut downloaded: Vec<(String, u64, PathBuf)> = Vec::new();
+                for file in &files {
+                    let dest = contained_dest(&output, &output_canonical, &file.name)?;
+                    let size = download_one_file(
+                        |dest| {
+                            client.download_binary_to_file(
+                                &project,
+                                &package,
+                                &repository,
+                                &arch,
+                                &file.name,
+                                dest,
+                            )
+                        },
+                        &dest,
+                    )?;
+                    downloaded.push((file.name.clone(), size, dest));
+                }
+                let payload = json!({
+                    "project": project,
+                    "package": package,
+                    "repository": repository,
+                    "arch": arch,
+                    "output": output.to_string_lossy(),
+                    "files": downloaded
+                        .iter()
+                        .map(|(filename, size, dest)| {
+                            json!({
+                                "filename": filename,
+                                "path": dest.to_string_lossy(),
+                                "size_bytes": size,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                });
+                let text = download_all_text(&downloaded);
+                Ok((payload, with_header(&header, text)))
+            } else {
+                let filename = match filename {
+                    Some(filename) => filename,
+                    // Unreachable: clap requires the filename
+                    // unless --all is set — kept as a defensive
+                    // error rather than an unwrap.
+                    None => {
+                        return Err(GeectlError::new(
+                            ErrorKind::InvalidInput,
+                            "download-binary needs a file name, or --all",
+                        ));
+                    }
+                };
+                // Refuse an existing destination before downloading: the
+                // bytes would be refused by write_downloaded anyway, and
+                // the download is wasted work. The exclusive create in
+                // write_downloaded is still the enforcement.
+                if output.exists() {
+                    return Err(GeectlError::new(
+                        ErrorKind::AlreadyExists,
+                        format!(
+                            "cannot create download file {}: already exists",
+                            output.display()
+                        ),
+                    ));
+                }
+                let bytes =
+                    client.download_binary(&project, &package, &repository, &arch, &filename)?;
+                write_downloaded(&output, &bytes)?;
+                let size = bytes.len() as u64;
+                let payload = json!({
+                    "project": project,
+                    "package": package,
+                    "repository": repository,
+                    "arch": arch,
+                    "filename": filename,
+                    "path": output.to_string_lossy(),
+                    "size_bytes": size,
+                });
+                let text = download_text(&filename, size, &output);
+                Ok((payload, with_header(&header, text)))
             }
-            let bytes =
-                client.download_binary(&project, &package, &repository, &arch, &filename)?;
-            write_downloaded(&output, &bytes)?;
-            let size = bytes.len();
-            let payload = json!({
-                "project": project,
-                "package": package,
-                "repository": repository,
-                "arch": arch,
-                "filename": filename,
-                "path": output.to_string_lossy(),
-                "size_bytes": size,
-            });
-            let text = download_text(&filename, size, &output);
-            Ok((payload, with_header(&header, text)))
         }
         BuildCommand::Fileinfo {
             project,
@@ -970,23 +1071,192 @@ fn mutation_result(
     (payload, lines.join("\n"))
 }
 
+/// A server-reported binary name is safe to join onto the output
+/// directory when it is a valid OBS filename with no backslash, NUL,
+/// or colon: `valid_obs_filename` rejects `/` and a leading `.`, the
+/// backslash is the Windows separator, and NUL and `:` (a
+/// drive-relative name on Windows) can never be a file name — so a
+/// safe name is a single path component on every platform.
+fn is_safe_download_name(name: &str) -> bool {
+    valid_obs_filename(name) && !name.contains('\\') && !name.contains('\0') && !name.contains(':')
+}
+
+/// Fail fast on the names a `--all` run would download: every name
+/// must be safe to join onto the output directory (see
+/// [`is_safe_download_name`]). A bad server name fails the run
+/// before anything downloads, instead of hard-failing mid-run after
+/// earlier files landed.
+fn validate_download_names(files: &[BinaryFile]) -> Result<(), GeectlError> {
+    for file in files {
+        let name = &file.name;
+        if !is_safe_download_name(name) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS binary filename: {name:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The total bytes a `--all` run expects, summed from the sizes the
+/// server reported. A file without a reported size contributes zero,
+/// so the total is a lower bound when any size is unknown.
+fn total_download_size(files: &[BinaryFile]) -> Result<u64, GeectlError> {
+    let mut total: u64 = 0;
+    for file in files {
+        if let Some(size) = file.size {
+            total = total.checked_add(size).ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "binary list sizes overflow: the server reported sizes that do not fit",
+                )
+            })?;
+        }
+    }
+    Ok(total)
+}
+
+/// Join a validated binary name onto the output directory, confined
+/// to it: the name is one path component (see
+/// [`is_safe_download_name`]), so joining it onto the canonical
+/// directory cannot escape it; the `starts_with` check is the runtime
+/// proof of that, against the resolved directory — a symlinked
+/// `--output` cannot fool it. The returned path keeps the caller's
+/// spelling of the directory.
+fn contained_dest(
+    output: &Path,
+    output_canonical: &Path,
+    name: &str,
+) -> Result<PathBuf, GeectlError> {
+    if !is_safe_download_name(name) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OBS binary filename: {name:?}"),
+        ));
+    }
+    let canonical_dest = output_canonical.join(name);
+    if !canonical_dest.starts_with(output_canonical) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("download name {name:?} escapes the output directory"),
+        ));
+    }
+    Ok(output.join(name))
+}
+
+/// Download one file, cleaning up only what this run created: the
+/// destination is recorded before the download starts, and a failure
+/// removes it only when it did not exist before — a file that
+/// pre-existed (refused by exclusive create) or was never created (a
+/// failure before the first byte) is never removed. An existence
+/// check that itself errors assumes the file existed: fail closed,
+/// never delete. The check does not follow links, so a dangling
+/// symlink counts as pre-existing and is never removed. The error
+/// kind cannot say this: a connect failure reports `NetworkError`
+/// before anything is created, and a mid-stream write failure reports
+/// `InternalError` after this run created the file.
+fn download_one_file(
+    download: impl FnOnce(&Path) -> Result<u64, GeectlError>,
+    dest: &Path,
+) -> Result<u64, GeectlError> {
+    let existed_before = match dest.symlink_metadata() {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    };
+    match download(dest) {
+        Ok(size) => Ok(size),
+        Err(e) => {
+            if !existed_before {
+                let _ = std::fs::remove_file(dest);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Create the disk-space probe, removing a leftover probe from a
+/// crashed run (same pid, recycled) once before giving up.
+/// Best-effort: any failure returns `None` and the run proceeds.
+fn create_probe_file(probe: &Path) -> Option<std::fs::File> {
+    match std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(probe)
+    {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(probe);
+            std::fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(probe)
+                .ok()
+        }
+        Err(_) => None,
+    }
+}
+
+/// Fail fast when the output filesystem cannot hold a `--all` run:
+/// allocate the run's total size in a probe file, then remove it. The
+/// probe is best-effort — only running out of space fails the run;
+/// any other allocation failure is ignored and the per-file writes
+/// stay the backstop. A zero total needs no probe.
+fn check_disk_space(dir: &Path, total_bytes: u64) -> Result<(), GeectlError> {
+    if total_bytes == 0 {
+        return Ok(());
+    }
+    let probe = dir.join(format!(".geectl-disk-probe-{}", std::process::id()));
+    let Some(file) = create_probe_file(&probe) else {
+        return Ok(());
+    };
+    let result = file.allocate(total_bytes);
+    let _ = std::fs::remove_file(&probe);
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::StorageFull => Err(GeectlError::new(
+            ErrorKind::InternalError,
+            format!(
+                "not enough disk space in {}: the download needs {total_bytes} bytes",
+                dir.display()
+            ),
+        )),
+        Err(_) => Ok(()),
+    }
+}
+
 /// The `download-binary` confirmation line: the file, its size, and
 /// where the bytes were written. The bytes themselves never ride the
 /// text rendering.
-fn download_text(filename: &str, size: usize, output: &Path) -> String {
+fn download_text(filename: &str, size: u64, output: &Path) -> String {
     format!(
         "downloaded {filename} ({size} bytes) to {}",
         output.display()
     )
 }
 
+/// The `--all` download as text: one confirmation line per file,
+/// or that there is nothing to download.
+fn download_all_text(downloaded: &[(String, u64, PathBuf)]) -> String {
+    if downloaded.is_empty() {
+        "no binaries".to_string()
+    } else {
+        downloaded
+            .iter()
+            .map(|(filename, size, dest)| download_text(filename, *size, dest))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 /// Write downloaded bytes to the `--output` path. The file is created
 /// exclusively: an existing destination is refused instead of silently
-/// overwritten, like `remote download`. A write failure is an internal
-/// error naming the path (the download itself already succeeded, so
-/// the failure is on our side, not the server's). A failed write
-/// removes the partial file, so a retry never hits AlreadyExists on
-/// the tool's own corrupt output.
+/// overwritten, like `remote download` and like `--all`. A write
+/// failure is an internal error naming the path (the download itself
+/// already succeeded, so the failure is on our side, not the
+/// server's). A failed write removes the partial file, so a retry
+/// never hits AlreadyExists on the tool's own corrupt output.
 fn write_downloaded(output: &PathBuf, bytes: &[u8]) -> Result<(), GeectlError> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -1005,6 +1275,9 @@ fn write_downloaded(output: &PathBuf, bytes: &[u8]) -> Result<(), GeectlError> {
             )
         })?;
     file.write_all(bytes).map_err(|e| {
+        // The file was just created exclusively by this call, so
+        // the partial is this run's: remove it, so a retry is not
+        // refused by it.
         let _ = std::fs::remove_file(output);
         GeectlError::new(
             ErrorKind::InternalError,
@@ -2035,6 +2308,259 @@ mod tests {
         );
     }
 
+    #[test]
+    fn download_binary_parses_all_and_single_forms() {
+        match parse_build(&[
+            "download-binary",
+            "p",
+            "k",
+            "r",
+            "a",
+            "--all",
+            "--output",
+            "/tmp/dir",
+        ]) {
+            BuildCommand::DownloadBinary {
+                filename,
+                output,
+                all,
+                ..
+            } => {
+                assert_eq!(filename, None);
+                assert_eq!(output, PathBuf::from("/tmp/dir"));
+                assert!(all);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match parse_build(&[
+            "download-binary",
+            "p",
+            "k",
+            "r",
+            "a",
+            "foo.rpm",
+            "--output",
+            "/tmp/foo.rpm",
+        ]) {
+            BuildCommand::DownloadBinary {
+                filename,
+                output,
+                all,
+                ..
+            } => {
+                assert_eq!(filename.as_deref(), Some("foo.rpm"));
+                assert_eq!(output, PathBuf::from("/tmp/foo.rpm"));
+                assert!(!all);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // --all conflicts with the filename.
+        assert!(build_command()
+            .try_get_matches_from([
+                "build",
+                "download-binary",
+                "p",
+                "k",
+                "r",
+                "a",
+                "foo.rpm",
+                "--all",
+                "--output",
+                "/tmp/dir",
+            ])
+            .is_err());
+        // Without --all the filename is required.
+        assert!(build_command()
+            .try_get_matches_from([
+                "build",
+                "download-binary",
+                "p",
+                "k",
+                "r",
+                "a",
+                "--output",
+                "/tmp/dir",
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn download_all_text_names_each_file_or_nothing() {
+        assert_eq!(download_all_text(&[]), "no binaries");
+        assert_eq!(
+            download_all_text(&[
+                ("a.rpm".to_string(), 10, PathBuf::from("/tmp/d/a.rpm")),
+                ("b.rpm".to_string(), 20, PathBuf::from("/tmp/d/b.rpm")),
+            ]),
+            "downloaded a.rpm (10 bytes) to /tmp/d/a.rpm\n".to_string()
+                + "downloaded b.rpm (20 bytes) to /tmp/d/b.rpm"
+        );
+    }
+
+    #[test]
+    fn download_name_safety_rejects_separators_and_reserved_names() {
+        assert!(is_safe_download_name("foo-1.0-1.x86_64.rpm"));
+        assert!(is_safe_download_name("_buildenv"));
+        assert!(!is_safe_download_name("../../victim"));
+        assert!(!is_safe_download_name("a/b.rpm"));
+        assert!(!is_safe_download_name("a\\b.rpm"));
+        assert!(!is_safe_download_name(".hidden"));
+        assert!(!is_safe_download_name("_log"));
+        assert!(!is_safe_download_name("x"));
+        assert!(!is_safe_download_name("C:"));
+        assert!(!is_safe_download_name("a:b.rpm"));
+        assert!(!is_safe_download_name("a\0b.rpm"));
+    }
+
+    #[test]
+    fn validate_download_names_fails_fast_naming_the_bad_name() {
+        let files = vec![
+            BinaryFile {
+                name: "good-1.0-1.x86_64.rpm".to_string(),
+                size: Some(10),
+                mtime: None,
+            },
+            BinaryFile {
+                name: "../bad.rpm".to_string(),
+                size: Some(10),
+                mtime: None,
+            },
+        ];
+        let err = validate_download_names(&files).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("../bad.rpm"));
+        assert!(validate_download_names(&files[..1]).is_ok());
+    }
+
+    #[test]
+    fn total_download_size_sums_known_sizes_and_ignores_unknown() {
+        let files = vec![
+            BinaryFile {
+                name: "a.rpm".to_string(),
+                size: Some(10),
+                mtime: None,
+            },
+            BinaryFile {
+                name: "b.rpm".to_string(),
+                size: None,
+                mtime: None,
+            },
+            BinaryFile {
+                name: "c.rpm".to_string(),
+                size: Some(20),
+                mtime: None,
+            },
+        ];
+        assert_eq!(total_download_size(&files).unwrap(), 30);
+        let overflowing = vec![
+            BinaryFile {
+                name: "a.rpm".to_string(),
+                size: Some(u64::MAX),
+                mtime: None,
+            },
+            BinaryFile {
+                name: "b.rpm".to_string(),
+                size: Some(1),
+                mtime: None,
+            },
+        ];
+        assert!(total_download_size(&overflowing).is_err());
+    }
+
+    #[test]
+    fn contained_dest_keeps_the_caller_spelling_and_confines() {
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-cli-build-test-{}-contained",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(
+            contained_dest(&dir, &canonical, "foo.rpm").unwrap(),
+            dir.join("foo.rpm")
+        );
+        assert!(contained_dest(&dir, &canonical, "../foo.rpm").is_err());
+        assert!(contained_dest(&dir, &canonical, "a\\b.rpm").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn download_one_file_removes_only_what_this_run_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-cli-build-test-{}-one-file",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A successful download keeps its file.
+        let dest = dir.join("ok.rpm");
+        let size = download_one_file(
+            |d| {
+                std::fs::write(d, b"bytes").unwrap();
+                Ok(5)
+            },
+            &dest,
+        )
+        .unwrap();
+        assert_eq!(size, 5);
+        assert!(dest.exists());
+        // A failure after this run created the file removes it.
+        let dest = dir.join("partial.rpm");
+        let err = download_one_file(
+            |d| {
+                std::fs::write(d, b"part").unwrap();
+                Err(GeectlError::new(ErrorKind::NetworkError, "down"))
+            },
+            &dest,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NetworkError);
+        assert!(!dest.exists());
+        // A failure with a pre-existing file keeps it.
+        let dest = dir.join("kept.rpm");
+        std::fs::write(&dest, b"good").unwrap();
+        let err = download_one_file(
+            |_| Err(GeectlError::new(ErrorKind::NetworkError, "down")),
+            &dest,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NetworkError);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"good");
+        // A failure with no file at all is an error, not a panic.
+        let dest = dir.join("absent.rpm");
+        assert!(
+            download_one_file(|_| Err(GeectlError::new(ErrorKind::Timeout, "slow")), &dest)
+                .is_err()
+        );
+        assert!(!dest.exists());
+        // A failure with a dangling pre-planted symlink keeps the
+        // link: it pre-existed, even though its target never did.
+        #[cfg(unix)]
+        {
+            let dest = dir.join("dangling.rpm");
+            std::os::unix::fs::symlink("/nonexistent-target-xyz", &dest).unwrap();
+            let err = download_one_file(
+                |_| Err(GeectlError::new(ErrorKind::NetworkError, "down")),
+                &dest,
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NetworkError);
+            assert!(dest.symlink_metadata().is_ok());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn download_all_text_keeps_u64_sizes() {
+        assert_eq!(
+            download_all_text(&[(
+                "big.rpm".to_string(),
+                5_000_000_000,
+                PathBuf::from("/tmp/d/big.rpm")
+            )]),
+            "downloaded big.rpm (5000000000 bytes) to /tmp/d/big.rpm"
+        );
+    }
+
     /// The agreement test for the single-object renderers: every id,
     /// name, and revision the JSON payload carries appears in the
     /// text rendering.
@@ -2469,6 +2995,60 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::AlreadyExists);
         assert!(err.context.contains("cannot create download file"));
         assert_eq!(std::fs::read(&path).unwrap(), b"bytes");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_disk_space_probes_and_leaves_nothing_behind() {
+        let dir =
+            std::env::temp_dir().join(format!("geectl-cli-build-test-{}-disk", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(check_disk_space(&dir, 0).is_ok());
+        assert!(check_disk_space(&dir, 1024).is_ok());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "the probe file is removed after the check"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_disk_space_removes_a_stale_probe_and_still_checks() {
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-cli-build-test-{}-disk-stale",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join(format!(".geectl-disk-probe-{}", std::process::id()));
+        std::fs::write(&probe, b"leftover").unwrap();
+        assert!(check_disk_space(&dir, 1024).is_ok());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "the stale probe is removed and the new probe after the check"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_disk_space_ignores_an_unusable_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-cli-build-test-{}-disk-ro",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        assert!(check_disk_space(&dir, 1024).is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

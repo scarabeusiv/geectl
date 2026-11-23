@@ -381,7 +381,7 @@ Commands:
   build-history      List the completed builds for a package, newest first
   job-history        List the build jobs that ran in a repository, newest first
   list-binaries      List the built files for a package (or the whole repository)
-  download-binary    Download one built file by name
+  download-binary    Download one built file by name. With `--all`, every built file
   fileinfo           Read the metadata of a built file: RPM header fields plus dependency lists
   dependson          List which packages each package depends on for its build
   whatdependson      List the packages that depend on a package for their build

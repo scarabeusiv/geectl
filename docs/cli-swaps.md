@@ -143,7 +143,7 @@ with no osc counterpart.
 | `repos [PROJECT] [PACKAGE]` | `build list-repositories PROJECT` | Verb-noun `list-*` scheme for listings; package argument dropped — the library reads project meta only, no per-package disabled-repo filtering |
 | `getbinaries …` | `build list-binaries` + `build download-binary` | One osc command split into list vs download, mirroring the library split |
 | `getbinaries` implicit cwd/subdir writes | `download-binary --output PATH` (required) | Explicit destination; no implicit writes into the working directory |
-| `getbinaries` whole-package/all-arch forms | Single FILE positional | One file per invocation |
+| `getbinaries PROJECT PACKAGE REPOSITORY ARCH` (whole package) | `build download-binary --all --output DIR PROJECT PACKAGE REPOSITORY ARCH` | One list call plus one streaming download per file, into the named directory; downloads every listed file, including the `.src.rpm` and `-debuginfo` files osc skips unless `--sources`/`--debuginfo`; the all-arch form (one invocation per architecture) has no equivalent |
 | `rpmlintlog` | No dedicated command (use `build download-binary … rpmlint.log --output …`) | One generic download instead of per-artifact shortcuts |
 | `whatdependson REPOSITORY ARCH` | `build whatdependson PROJECT PACKAGE REPOSITORY ARCH` | Explicit coordinates; package is a required positional per the library signature |
 | `osc rebuild [PROJECT [PACKAGE]]` | `build rebuild-package PROJECT PACKAGE REPOSITORY ARCH` | One command per library operation, explicit coordinates; osc's project-wide and `--all` forms have no library op (per-package only) |
