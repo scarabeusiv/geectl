@@ -2561,6 +2561,99 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// Search packages a person is involved in (`GET
+    /// /search/package?match=person/@userid='...'`): every package
+    /// whose meta names `userid` in a role. Requires credentials;
+    /// an unexpected response is an error, never an empty list. The
+    /// user id is validated like a search term — it goes into a
+    /// single-quoted XPath string literal, where a quote would break
+    /// out of the literal (XPath has no string escape).
+    ///
+    /// An agent searches by person to find the packages a maintainer
+    /// owns or watches, for example when routing a submission to the
+    /// right devel project.
+    pub fn search_packages_by_person(
+        &self,
+        userid: &str,
+    ) -> Result<Vec<PackageMatch>, GeectlError> {
+        let userid = validate_search_term(userid)?;
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching packages by person requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let match_expr = format!("person/@userid='{userid}'");
+        let url = build_url(
+            &self.base,
+            &["search", "package"],
+            &[("match", &match_expr)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_package_search(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS package search response for person {userid:?}"),
+            )
+        })
+    }
+
+    /// Search packages developed in project `project` (`GET
+    /// /search/package?match=devel/@project='...'`): every package
+    /// whose meta names `project` as its devel project. With `term`,
+    /// the substring match of [`ObsClient::search_packages`] is combined
+    /// with the devel predicate (XPath `and`); without one, every package the
+    /// devel project develops. Requires credentials; an unexpected
+    /// response is an error, never an empty list. The project is a
+    /// project name, validated as one; the term, when given, is
+    /// validated like a search term — both go into single-quoted
+    /// XPath string literals, where a quote would break out of the
+    /// literal (XPath has no string escape).
+    ///
+    /// An agent searches by devel project to list what a devel
+    /// project develops, for example when checking what lands in
+    /// Factory from it.
+    pub fn search_packages_by_devel_project(
+        &self,
+        project: &str,
+        term: Option<&str>,
+    ) -> Result<Vec<PackageMatch>, GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        let term = match term {
+            Some(term) => Some(validate_search_term(term)?),
+            None => None,
+        };
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching packages by devel project requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let match_expr = match term {
+            Some(term) => format!(
+                "(contains(@name,'{term}') or contains(title,'{term}') or contains(description,'{term}')) and devel/@project='{project}'"
+            ),
+            None => format!("devel/@project='{project}'"),
+        };
+        let url = build_url(
+            &self.base,
+            &["search", "package"],
+            &[("match", &match_expr)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_package_search(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS package search response for devel project {project:?}"),
+            )
+        })
+    }
+
     /// Count the projects whose scmsync URL starts with `url_prefix`
     /// (`GET /search/project/id?match=starts-with(scmsync,'...')`).
     /// Requires credentials; a response without a `matches` count is
@@ -7757,6 +7850,114 @@ mod tests {
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
         assert!(client.search_projects_by_person("scarabeus_iv").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn search_packages_by_person_sends_the_person_match_authed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/package?match=person%2F%40userid%3D%27scarabeus_iv%27",
+            PACKAGE_SEARCH_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let matches = client.search_packages_by_person("scarabeus_iv").unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].name, "foo");
+        // The search carries credentials.
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/search/package?match=person%2F%40userid%3D%27scarabeus_iv%27"
+                    .to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn search_packages_by_person_rejects_a_quoted_userid_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.search_packages_by_person("").is_err());
+        assert!(client.search_packages_by_person("x' or '1'='1").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn search_packages_by_person_requires_credentials() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.search_packages_by_person("scarabeus_iv").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn search_packages_by_devel_project_sends_the_devel_match_authed() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/package?match=devel%2F%40project%3D%27devel%3Alanguages%3Apython%27",
+            PACKAGE_SEARCH_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let matches = client
+            .search_packages_by_devel_project("devel:languages:python", None)
+            .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].name, "foo");
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/search/package?match=devel%2F%40project%3D%27devel%3Alanguages%3Apython%27"
+                    .to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn search_packages_by_devel_project_with_term_combines_the_substring_match() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/package?match=%28contains%28%40name%2C%27foo%27%29%20or%20contains%28title%2C%27foo%27%29%20or%20contains%28description%2C%27foo%27%29%29%20and%20devel%2F%40project%3D%27devel%3Alanguages%3Apython%27",
+            PACKAGE_SEARCH_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let matches = client
+            .search_packages_by_devel_project("devel:languages:python", Some("foo"))
+            .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].name, "foo");
+    }
+
+    #[test]
+    fn search_packages_by_devel_project_rejects_a_bad_project_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.search_packages_by_devel_project("", None).is_err());
+        assert!(client
+            .search_packages_by_devel_project("foo/bar", None)
+            .is_err());
+        assert!(client
+            .search_packages_by_devel_project("devel:languages:python", Some("x' or '1'='1"))
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn search_packages_by_devel_project_rejects_an_empty_term_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .search_packages_by_devel_project("devel:languages:python", Some(""))
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn search_packages_by_devel_project_requires_credentials() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client
+            .search_packages_by_devel_project("devel:languages:python", None)
+            .is_err());
         assert!(http.get_calls().is_empty());
     }
 

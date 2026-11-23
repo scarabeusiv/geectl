@@ -321,13 +321,19 @@ pub enum RemoteCommand {
     /// Search packages by name. Substring matches on name, title, and
     /// description by default; `--exact` keeps only exact-name matches
     /// (exact matching is not provided server-side, so the filter runs
-    /// client-side).
+    /// client-side). With `--devel-project`, only packages developed
+    /// in that project; without a term, every package the devel
+    /// project develops.
     SearchPackages {
-        /// The search term.
-        term: String,
+        /// The search term; required unless `--devel-project` is given.
+        #[arg(required_unless_present = "devel_project")]
+        term: Option<String>,
         /// Only show packages whose name is exactly the term.
-        #[arg(long)]
+        #[arg(long, requires = "term")]
         exact: bool,
+        /// Only show packages developed in this project.
+        #[arg(long)]
+        devel_project: Option<String>,
     },
     /// Search projects by name. Substring matches on name, title, and
     /// description by default; `--exact` keeps only exact-name matches
@@ -344,6 +350,12 @@ pub enum RemoteCommand {
     /// names the login in a role.
     SearchProjectsByPerson {
         /// The login to search projects for.
+        userid: String,
+    },
+    /// Search packages by a person's login: every package whose meta
+    /// names the login in a role.
+    SearchPackagesByPerson {
+        /// The login to search packages for.
         userid: String,
     },
     /// Count the projects syncing from a git URL prefix.
@@ -1009,21 +1021,49 @@ pub fn run_remote(
                 plan,
             ))
         }
-        RemoteCommand::SearchPackages { term, exact } => {
-            let matches = apply_exact(client.search_packages(&term)?, &term, exact, |match_| {
-                match_.name.as_str()
-            });
+        RemoteCommand::SearchPackages {
+            term,
+            exact,
+            devel_project,
+        } => {
+            let (matches, label, header) = match (term.as_deref(), devel_project.as_deref()) {
+                (Some(term), Some(devel)) => (
+                    client.search_packages_by_devel_project(devel, Some(term))?,
+                    format!("{term} in devel project {devel}"),
+                    format!("term: {term} devel-project: {devel}"),
+                ),
+                (None, Some(devel)) => (
+                    client.search_packages_by_devel_project(devel, None)?,
+                    format!("devel project {devel}"),
+                    format!("devel-project: {devel}"),
+                ),
+                (Some(term), None) => (
+                    client.search_packages(term)?,
+                    term.to_string(),
+                    format!("term: {term}"),
+                ),
+                (None, None) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        "search-packages needs a term unless --devel-project is given",
+                    ));
+                }
+            };
+            let matches = match term.as_deref() {
+                Some(term) => apply_exact(matches, term, exact, |match_| match_.name.as_str()),
+                // `--exact` requires a term (clap), so there is
+                // nothing to filter exactly on here.
+                None => matches,
+            };
             let payload = json!({
                 "term": term,
                 "exact": exact,
+                "devel_project": devel_project,
                 "packages": matches.iter().map(package_match_json).collect::<Vec<_>>(),
             });
             Ok((
                 payload,
-                with_header(
-                    &format!("term: {term}"),
-                    render_package_matches(&term, &matches),
-                ),
+                with_header(&header, render_package_matches(&label, &matches)),
             ))
         }
         RemoteCommand::SearchProjects { term, exact } => {
@@ -1052,6 +1092,18 @@ pub fn run_remote(
             let payload = json!({
                 "login": userid,
                 "projects": matches.iter().map(project_match_json).collect::<Vec<_>>(),
+            });
+            Ok((payload, text))
+        }
+        RemoteCommand::SearchPackagesByPerson { userid } => {
+            let matches = client.search_packages_by_person(&userid)?;
+            let text = with_header(
+                &format!("login: {userid}"),
+                render_package_matches(&userid, &matches),
+            );
+            let payload = json!({
+                "login": userid,
+                "packages": matches.iter().map(package_match_json).collect::<Vec<_>>(),
             });
             Ok((payload, text))
         }
@@ -3714,6 +3766,35 @@ mod tests {
             RemoteCommand::SearchPackages { exact: true, .. }
         ));
         assert!(matches!(
+            parse(&[
+                "geectl",
+                "remote",
+                "search-packages",
+                "--devel-project",
+                "devel:languages:python"
+            ]),
+            RemoteCommand::SearchPackages {
+                term: None,
+                exact: false,
+                devel_project: Some(_),
+            }
+        ));
+        assert!(matches!(
+            parse(&[
+                "geectl",
+                "remote",
+                "search-packages",
+                "vim",
+                "--devel-project",
+                "devel:languages:python"
+            ]),
+            RemoteCommand::SearchPackages {
+                term: Some(_),
+                exact: false,
+                devel_project: Some(_),
+            }
+        ));
+        assert!(matches!(
             parse(&["geectl", "remote", "search-projects", "openSUSE"]),
             RemoteCommand::SearchProjects { exact: false, .. }
         ));
@@ -5394,6 +5475,15 @@ mod tests {
         assert!(matches!(
             command,
             RemoteCommand::SearchProjectsByPerson { userid } if userid == "alice"
+        ));
+    }
+
+    #[test]
+    fn search_packages_by_person_parses_login_positional() {
+        let command = parse(&["geectl", "remote", "search-packages-by-person", "alice"]);
+        assert!(matches!(
+            command,
+            RemoteCommand::SearchPackagesByPerson { userid } if userid == "alice"
         ));
     }
 

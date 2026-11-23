@@ -6541,6 +6541,97 @@ fn live_search_projects_by_person_finds_the_maintainer() {
     );
 }
 
+/// The package person-match search finds a package once its
+/// maintainer is granted, and finds nothing for a user with no
+/// packages. Mirrors the project form, at package level: a freshly
+/// created package carries no person roles, so the maintainer grant
+/// (through the meta write) is part of the setup.
+#[test]
+fn live_search_packages_by_person_finds_the_maintainer() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let mut meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta on the live instance");
+    meta.persons = vec![NamedRole {
+        name: "Admin".to_string(),
+        role: "maintainer".to_string(),
+    }];
+    client
+        .set_package_meta(&project, &package, &meta, &DryRun::new(false))
+        .expect("grant Admin the maintainer role on the live instance");
+    let matches = client
+        .search_packages_by_person("Admin")
+        .expect("search packages by person on the live instance");
+    assert!(
+        matches
+            .iter()
+            .any(|found| found.name == package && found.project == project),
+        "the search must find the package Admin maintains {package}; got {matches:?}"
+    );
+    let nobody = format!("geectl-live-nobody-{}", unique_suffix());
+    let matches = client
+        .search_packages_by_person(&nobody)
+        .expect("search packages by a user with no packages on the live instance");
+    assert!(
+        matches.is_empty(),
+        "a user with no packages must match nothing; got {matches:?}"
+    );
+}
+
+/// The devel-project search finds a package once its devel project
+/// is set, and finds nothing for a project that develops nothing.
+/// The devel project is a second scratch project holding a package
+/// of the same name, so the devel reference resolves when the meta
+/// is written.
+#[test]
+fn live_search_packages_by_devel_project_finds_the_developed_package() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let devel_project = create_source_branch(&client, &package);
+    let mut meta = client
+        .package_meta(&project, &package)
+        .expect("read the package meta on the live instance");
+    meta.devel = Some((devel_project.clone(), package.clone()));
+    client
+        .set_package_meta(&project, &package, &meta, &DryRun::new(false))
+        .expect("set the devel project on the live instance");
+    let matches = client
+        .search_packages_by_devel_project(&devel_project, None)
+        .expect("search packages by devel project on the live instance");
+    assert!(
+        matches
+            .iter()
+            .any(|found| found.name == package && found.project == project),
+        "the search must find the package {package} developed in {devel_project}; got {matches:?}"
+    );
+    let matches = client
+        .search_packages_by_devel_project(&devel_project, Some(&package))
+        .expect("search packages by devel project with a term on the live instance");
+    assert!(
+        matches
+            .iter()
+            .any(|found| found.name == package && found.project == project),
+        "the term form must still find the package {package}; got {matches:?}"
+    );
+    let nothing = format!("geectl-live-nothing-{}", unique_suffix());
+    let matches = client
+        .search_packages_by_devel_project(&nothing, None)
+        .expect("search packages by a devel project with no packages on the live instance");
+    assert!(
+        matches.is_empty(),
+        "a devel project with no packages must match nothing; got {matches:?}"
+    );
+}
+
 /// The scmsync count counts the project whose scmsync starts with
 /// the prefix, and zero for a prefix nothing uses.
 #[test]

@@ -154,9 +154,10 @@ Commands:
   package-meta                   Show a package's meta (title, description, persons, devel project)
   set-package-meta               Set fields of a package's meta. A mutation: dry-run is the default (only the plan is printed); `--live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
   update-package-meta-from-spec  Update a package's meta from its spec file. A mutation: dry-run is the default (only the plan is printed); `--live` performs the update. The spec file is found by listing the package files when exactly one `*.spec` exists; otherwise name it with `--spec`
-  search-packages                Search packages by name. Substring matches on name, title, and description by default; `--exact` keeps only exact-name matches (exact matching is not provided server-side, so the filter runs client-side)
+  search-packages                Search packages by name. Substring matches on name, title, and description by default; `--exact` keeps only exact-name matches (exact matching is not provided server-side, so the filter runs client-side). With `--devel-project`, only packages developed in that project; without a term, every package the devel project develops
   search-projects                Search projects by name. Substring matches on name, title, and description by default; `--exact` keeps only exact-name matches (exact matching is not provided server-side, so the filter runs client-side)
   search-projects-by-person      Search projects by a person's login: every project whose meta names the login in a role
+  search-packages-by-person      Search packages by a person's login: every package whose meta names the login in a role
   count-scmsync-projects         Count the projects syncing from a git URL prefix
   owners                         Show the owners of a package (project/package scope)
   owners-for-binary              Show the owners of a binary package

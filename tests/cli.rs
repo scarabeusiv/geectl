@@ -1540,6 +1540,65 @@ fn remote_search_packages_with_half_set_credentials_fails_with_config_error() {
 }
 
 #[test]
+fn remote_search_packages_by_devel_project_with_half_set_credentials_fails_with_config_error() {
+    // The devel-project form is a credentialed read too, so it fails
+    // fast like the term form.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "search-packages",
+            "--devel-project",
+            "devel:languages:python",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_search_packages_exact_without_term_fails_with_invalid_input() {
+    // `--exact` needs a term to filter on: clap refuses it with
+    // --devel-project alone through the single JSON error path.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "search-packages",
+            "--exact",
+            "--devel-project",
+            "devel:languages:python",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn remote_search_packages_without_term_or_devel_project_fails_with_invalid_input() {
+    // A term is required unless --devel-project is given: clap
+    // refuses the bare leaf through the single JSON error path.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "search-packages"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
 fn remote_list_projects_with_half_set_credentials_fails_with_config_error() {
     // `list-projects` has no public route: it reads with the
     // client's credentials, so it fails fast like the searches.
@@ -1592,6 +1651,22 @@ fn remote_search_projects_by_person_with_half_set_credentials_fails_with_config_
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["remote", "search-projects-by-person", "alice"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_search_packages_by_person_with_half_set_credentials_fails_with_config_error() {
+    // The package person search needs credentials, so it fails fast
+    // like the project form.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "search-packages-by-person", "alice"])
         .env("GEECTL_OBS_USERNAME", "alice")
         .output()
         .unwrap();

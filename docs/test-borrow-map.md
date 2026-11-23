@@ -825,6 +825,27 @@ semantics, not its tests).**
 - `behave/features/build.feature` (3 scenarios — local buildroot/chroot,
   out of scope for v1 by design): nothing to adopt.
 
+## Gap batch 2, wave 3 — package search by person / by devel project (#175, #176)
+
+**Direct adoptions: 0. No osc test covers either form.**
+
+- `#175` (`remote search-packages-by-person`): the person-match
+  form (`person/@userid='…'`) is the same rule osc's `do_search`
+  builds for project and package search alike
+  (`osc/commandline.py:9288`, already adopted for
+  `search-projects-by-person` under batch 3); no osc test pins it
+  for packages — the map already records
+  `/search/package?match=person` as a gap — so the new tests are
+  written from scratch against the mocked HTTP shape.
+- `#176` (`remote search-packages --devel-project`): osc's search
+  has no devel-project option at all. The predicate
+  (`devel/@project='…'`) follows the package-meta shape — the
+  devel element lives in the meta (`osc/core.py:1402`
+  `show_devel_project`) — and the OBS search API evaluates the
+  match over complete package meta files (`/package[<match>]`).
+  With a term, the substring match is combined with the devel
+  predicate (parenthesised: XPath `and` binds tighter than `or`).
+
 ## Counts (direct adoptions, de-duplicated)
 
 | Batch | Unit | Behave | Total |
@@ -840,6 +861,7 @@ semantics, not its tests).**
 | 8 services | 0 | 1 | 1 |
 | 9 Gitea ops | 2 | 13 | 15 |
 | 10 local-build flag parity | 0 (+spec ref) | 0 | 0 (+spec) |
+| Gap batch 2, wave 3 (#175, #176) | 0 | 0 | 0 |
 | **Total adopted** | **105** | **120** | **225** |
 
 Surveyed base: 272 behave scenarios + 707 unit tests = 979 items;
