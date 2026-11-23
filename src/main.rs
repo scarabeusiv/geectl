@@ -15,6 +15,7 @@ mod cli_pull_request;
 mod cli_remote;
 mod cli_request;
 mod cli_service;
+mod cli_working_copy;
 mod maintenance;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -152,6 +153,58 @@ enum Command {
         #[command(subcommand)]
         command: cli_changelog::ChangelogCommand,
     },
+    /// Check out a package into a git working copy, under the
+    /// current directory.
+    Checkout {
+        /// The OBS project.
+        project: String,
+        /// The OBS package.
+        package: String,
+        /// The revision to check out (a number or a source md5).
+        /// The latest when omitted.
+        #[arg(long)]
+        rev: Option<String>,
+    },
+    /// Update the working copy in the current directory to the
+    /// latest base.
+    Update {
+        /// The revision to update to (a number or a source md5).
+        /// The latest when omitted.
+        #[arg(long)]
+        rev: Option<String>,
+    },
+    /// Show the working copy's state against the base.
+    Status,
+    /// Show the diff of the worktree and the index against the base.
+    Diff,
+    /// Stage files for commit.
+    Add {
+        /// The files to stage, relative to the checkout root.
+        #[arg(required = true)]
+        files: Vec<String>,
+    },
+    /// Remove files from the working copy.
+    Rm {
+        /// The files to remove, relative to the checkout root.
+        #[arg(required = true)]
+        files: Vec<String>,
+    },
+    /// Stage every change in the worktree.
+    Addremove,
+    /// Commit the staged changes.
+    Commit {
+        /// The commit message.
+        #[arg(long, short)]
+        message: String,
+        /// Skip the service gate (no source services, no
+        /// `pre_checkin.sh`).
+        #[arg(long)]
+        noservice: bool,
+    },
+    /// Pull a linked package to the link target's latest revision.
+    Pull,
+    /// Stage the resolved files and continue a stopped rebase.
+    Resolve,
 }
 
 /// The `config` subcommands.
@@ -211,6 +264,22 @@ fn run(
         Some(Command::Changelog { command }) => {
             cli_changelog::run_changelog(command, debug, cli.live)?
         }
+        Some(Command::Checkout {
+            project,
+            package,
+            rev,
+        }) => cli_working_copy::checkout(&project, &package, rev.as_deref(), debug, cli.live)?,
+        Some(Command::Update { rev }) => cli_working_copy::update(rev.as_deref(), debug, cli.live)?,
+        Some(Command::Status) => cli_working_copy::status(debug)?,
+        Some(Command::Diff) => cli_working_copy::diff(debug)?,
+        Some(Command::Add { files }) => cli_working_copy::add(&files, debug, cli.live)?,
+        Some(Command::Rm { files }) => cli_working_copy::rm(&files, debug, cli.live)?,
+        Some(Command::Addremove) => cli_working_copy::addremove(debug, cli.live)?,
+        Some(Command::Commit { message, noservice }) => {
+            cli_working_copy::commit(&message, noservice, debug, cli.live)?
+        }
+        Some(Command::Pull) => cli_working_copy::pull(debug, cli.live)?,
+        Some(Command::Resolve) => cli_working_copy::resolve(debug, cli.live)?,
     };
     Ok(match format {
         Format::Json => payload.to_string(),

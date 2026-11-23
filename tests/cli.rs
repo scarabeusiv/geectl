@@ -3695,6 +3695,27 @@ fn top_help_lists_the_pull_request_group() {
 }
 
 #[test]
+fn top_help_lists_the_working_copy_leaves() {
+    let out = geectl().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    for name in [
+        "checkout",
+        "update",
+        "status",
+        "diff",
+        "add",
+        "rm",
+        "addremove",
+        "commit",
+        "pull",
+        "resolve",
+    ] {
+        assert!(text.contains(name), "top --help misses {name}");
+    }
+}
+
+#[test]
 fn pull_request_merge_obs_dry_run_without_credentials_prints_plan() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
@@ -4298,18 +4319,19 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 23 blocks (top level, 10 groups, 12 leaves) — a
+    // The docs carry 33 blocks (top level, 10 groups, 22 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
-    // groups and one leaf each, plus `remote download` — and the count
-    // assertion guards the docs side only.
+    // groups and one leaf each, plus `remote download`, plus the ten
+    // working-copy leaves — and the count assertion guards the docs
+    // side only.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let docs = fs::read_to_string(manifest.join("docs/cli.md")).expect("docs/cli.md");
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-        23,
-        "docs/cli.md should carry 23 --help blocks (top level, 10 groups, 12 leaves);          update this count when a block is deliberately added or removed"
+        33,
+        "docs/cli.md should carry 33 --help blocks (top level, 10 groups, 22 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();
