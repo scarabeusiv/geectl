@@ -1,4 +1,4 @@
-//! The `vc` validation/generation layer for `.changes` entries.
+//! The `changelog` validation/generation layer for `.changes` entries.
 //!
 //! Validation is deterministic, with no LLM: V1–V8 and V10–V12 are
 //! exact checks, V9 a `needs-detail` heuristic. Generation emits the

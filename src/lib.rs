@@ -9,7 +9,7 @@
 //!   with code, message, remediation, and exit code).
 //! - [`url`]: the single URL builder (one encoder per context: path segments
 //!   vs query values).
-//! - [`vc`]: the `.changes` validation/generation layer — the V1–V12
+//! - [`changelog`]: the `.changes` validation/generation layer — the V1–V12
 //!   rules over a package snapshot, and the diff-derived skeleton
 //!   entry generator with upstream NEWS extraction.
 //! - [`http`]: the HTTP client trait with a bounded timeout, plus a ureq
@@ -49,6 +49,7 @@
 //!   of truth; local is for iterating fast.
 
 pub mod auth;
+pub mod changelog;
 pub mod config;
 pub mod debug;
 pub mod error;
@@ -58,6 +59,5 @@ pub mod local_build;
 pub mod obs;
 pub mod pull_request;
 pub mod url;
-pub mod vc;
 
 pub(crate) mod xml;

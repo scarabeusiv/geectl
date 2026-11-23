@@ -1,6 +1,6 @@
 //! Parsing of `.changes` files: entries, headers, timestamps.
 //!
-//! The format is the one `vc` writes: a 67-dash separator, a
+//! The format is the one `changelog` writes: a 67-dash separator, a
 //! `Day Mon DD HH:MM:SS UTC YYYY - Name <email>` header, a blank line,
 //! then `-` / `*` bullets with indented continuations. The parser is
 //! lenient about what it accepts — validation decides what is wrong —
@@ -8,7 +8,7 @@
 //! `None`, never a guessed date. No date library is involved: the
 //! civil-date conversion is the standard days-from-civil algorithm.
 
-/// The separator length `vc` writes (67 dashes).
+/// The separator length `changelog` writes (67 dashes).
 pub const SEPARATOR_LEN: usize = 67;
 
 /// A parsed entry header.

@@ -10,10 +10,10 @@
 //! line. `generate` never files anything; `--write` prepends the
 //! draft into the `.changes` file, and refuses an incomplete draft.
 
-use crate::vc::changes::{civil_from_days, separator_line, weekday_name, Header};
-use crate::vc::news::NewsSection;
-use crate::vc::spec::parse_spec;
-use crate::vc::validate::{is_mechanical_bullet, PackageSnapshot};
+use crate::changelog::changes::{civil_from_days, separator_line, weekday_name, Header};
+use crate::changelog::news::NewsSection;
+use crate::changelog::spec::parse_spec;
+use crate::changelog::validate::{is_mechanical_bullet, PackageSnapshot};
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -315,7 +315,7 @@ pub fn prepend_entry(old_content: &str, entry: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vc::news::NewsSection;
+    use crate::changelog::news::NewsSection;
 
     fn snapshot(files: &[(&str, &str)]) -> PackageSnapshot {
         PackageSnapshot {

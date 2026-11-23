@@ -16,8 +16,8 @@
 //! reason, never passed silently. A failed lookup (the target cannot
 //! be read at all) is the caller's error, not a skip — see the CLI.
 
-use crate::vc::changes::{parse_changes, ChangesFile, Entry};
-use crate::vc::spec::{parse_spec, SpecInfo};
+use crate::changelog::changes::{parse_changes, ChangesFile, Entry};
+use crate::changelog::spec::{parse_spec, SpecInfo};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// One validation rule.

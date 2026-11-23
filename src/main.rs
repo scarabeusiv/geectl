@@ -8,13 +8,13 @@
 
 mod cli_branch;
 mod cli_build;
+mod cli_changelog;
 mod cli_gitea;
 mod cli_local_build;
 mod cli_pull_request;
 mod cli_remote;
 mod cli_request;
 mod cli_service;
-mod cli_vc;
 mod maintenance;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -145,9 +145,9 @@ enum Command {
     },
     /// Validate and generate `.changes` entries in a package
     /// directory, pre-file.
-    Vc {
+    Changelog {
         #[command(subcommand)]
-        command: cli_vc::VcCommand,
+        command: cli_changelog::ChangelogCommand,
     },
 }
 
@@ -205,7 +205,9 @@ fn run(
         Some(Command::PullRequest { command }) => {
             cli_pull_request::run_pull_request(command, debug, cli.live)?
         }
-        Some(Command::Vc { command }) => cli_vc::run_vc(command, debug, cli.live)?,
+        Some(Command::Changelog { command }) => {
+            cli_changelog::run_changelog(command, debug, cli.live)?
+        }
     };
     Ok(match format {
         Format::Json => payload.to_string(),

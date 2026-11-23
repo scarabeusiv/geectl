@@ -1,4 +1,4 @@
-//! `vc` CLI commands (`geectl vc ...`).
+//! `changelog` CLI commands (`geectl changelog ...`).
 //!
 //! Pre-file validation/generation for `.changes` entries. The
 //! commands work on a package directory on disk, optionally compared
@@ -17,20 +17,20 @@
 //! rules — the same shape the skill's `changes-lint.sh` prints.
 
 use clap::Subcommand;
+use geectl::changelog::generate::{generate, prepend_entry};
+use geectl::changelog::news::{extract_news_section, find_tarball, NewsSection};
+use geectl::changelog::spec::parse_spec;
+use geectl::changelog::validate::{validate, PackageSnapshot, ValidateOptions};
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::ObsClient;
-use geectl::vc::generate::{generate, prepend_entry};
-use geectl::vc::news::{extract_news_section, find_tarball, NewsSection};
-use geectl::vc::spec::parse_spec;
-use geectl::vc::validate::{validate, PackageSnapshot, ValidateOptions};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-/// The `vc` command group: `.changes` validation and generation.
+/// The `changelog` command group: `.changes` validation and generation.
 #[derive(Debug, Subcommand)]
-pub enum VcCommand {
+pub enum ChangelogCommand {
     /// Validate the `.changes` entries in a package directory
     /// against the V1–V12 rules. Local-only by default; with
     /// `--target-project`/`--target-package` the target-relative
@@ -72,7 +72,7 @@ pub enum VcCommand {
         #[arg(long)]
         target_package: Option<String>,
         /// The author line for the entry header, in `Name <email>`
-        /// form — exactly what a bare `vc` invocation writes.
+        /// form — exactly what a bare `changelog` invocation writes.
         #[arg(long)]
         author: Option<String>,
         /// Prepend the draft into the package's `.changes` file
@@ -82,22 +82,22 @@ pub enum VcCommand {
     },
 }
 
-pub fn run_vc(
-    command: VcCommand,
+pub fn run_changelog(
+    command: ChangelogCommand,
     debug: &Debug,
     live: bool,
 ) -> Result<(Value, String), GeectlError> {
-    // `vc` performs no OBS mutation: `--live` is ignored, like
+    // `changelog` performs no OBS mutation: `--live` is ignored, like
     // `cat`. `--write` is the explicit local-write flag.
     let _ = live;
     match command {
-        VcCommand::Validate {
+        ChangelogCommand::Validate {
             dir,
             target_project,
             target_package,
             entries,
         } => run_validate(&dir, target_project, target_package, entries, debug),
-        VcCommand::Generate {
+        ChangelogCommand::Generate {
             dir,
             target_project,
             target_package,
@@ -217,8 +217,8 @@ fn run_validate(
     let report = validate(&local, target_snapshot.as_ref(), &options);
     let mut skipped = report.skipped.clone();
     if let Some(reason) = news_error {
-        skipped.push(geectl::vc::Skipped {
-            rule: geectl::vc::Rule::V9,
+        skipped.push(geectl::changelog::Skipped {
+            rule: geectl::changelog::Rule::V9,
             reason: format!("upstream NEWS lookup failed ({reason}) — V9 did not run"),
         });
     }

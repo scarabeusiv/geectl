@@ -1,6 +1,6 @@
 //! Upstream NEWS extraction from a source tarball.
 //!
-//! The tarball is on disk in the local checkout (the `vc generate`
+//! The tarball is on disk in the local checkout (the `changelog generate`
 //! / V9 source), so the extraction reads it with the `tar` command
 //! instead of a new native dependency: `tar -tf` lists members,
 //! `tar -xOf` extracts one to stdout. Both run under a bounded
@@ -493,7 +493,8 @@ mod tests {
         if Command::new("tar").arg("--version").output().is_err() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("geectl-vc-news-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("geectl-changelog-news-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("foo-2.0")).unwrap();
         std::fs::write(
@@ -524,8 +525,10 @@ mod tests {
     fn find_tarball_prefers_source0_then_version_then_sole() {
         // A distinct temp dir from the tar round-trip test: the two
         // run in parallel threads of one process.
-        let dir =
-            std::env::temp_dir().join(format!("geectl-vc-news-find-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "geectl-changelog-news-find-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for name in ["foo-1.0.tar.gz", "foo-2.0.tar.gz", "other.tar.gz"] {

@@ -4414,12 +4414,12 @@ fn config_show_reports_error_source_when_default_cache_dir_unresolvable() {
     assert!(stdout.contains("build_cache_dir: - (error)"), "{stdout}");
 }
 
-// --- vc validate / vc generate integration tests ---
+// --- changelog validate / changelog generate integration tests ---
 
 /// A package directory fixture: spec + `.changes` (+ optional NEWS
 /// tarball for the 2.0 version). `changes_entry` is the body of the
 /// newest entry.
-fn vc_fixture(dir: &TempDir, changes_entry: &str, with_news: bool) -> PathBuf {
+fn changelog_fixture(dir: &TempDir, changes_entry: &str, with_news: bool) -> PathBuf {
     let pkg = dir.0.join("foo");
     fs::create_dir_all(&pkg).unwrap();
     fs::write(
@@ -4455,15 +4455,15 @@ fn vc_fixture(dir: &TempDir, changes_entry: &str, with_news: bool) -> PathBuf {
 }
 
 #[test]
-fn vc_validate_clean_fixture_exits_zero() {
+fn changelog_validate_clean_fixture_exits_zero() {
     let dir = TempDir::new();
-    let pkg = vc_fixture(
+    let pkg = changelog_fixture(
         &dir,
         "- Update to 2.0\n- Fix a crash in the parser (boo#1234567)",
         false,
     );
     let out = geectl_isolated(&dir)
-        .args(["vc", "validate"])
+        .args(["changelog", "validate"])
         .arg(&pkg)
         .output()
         .unwrap();
@@ -4475,7 +4475,7 @@ fn vc_validate_clean_fixture_exits_zero() {
     // The text rendering opens with the coordinate header and ends
     // with the verdict line.
     let out = geectl_isolated(&dir)
-        .args(["--format", "text", "vc", "validate"])
+        .args(["--format", "text", "changelog", "validate"])
         .arg(&pkg)
         .output()
         .unwrap();
@@ -4486,11 +4486,11 @@ fn vc_validate_clean_fixture_exits_zero() {
 }
 
 #[test]
-fn vc_validate_bare_update_with_news_exits_24() {
+fn changelog_validate_bare_update_with_news_exits_24() {
     let dir = TempDir::new();
-    let pkg = vc_fixture(&dir, "- Update to 2.0", true);
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", true);
     let out = geectl_isolated(&dir)
-        .args(["vc", "validate"])
+        .args(["changelog", "validate"])
         .arg(&pkg)
         .output()
         .unwrap();
@@ -4505,10 +4505,10 @@ fn vc_validate_bare_update_with_news_exits_24() {
 }
 
 #[test]
-fn vc_validate_missing_dir_fails_with_invalid_input() {
+fn changelog_validate_missing_dir_fails_with_invalid_input() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
-        .args(["vc", "validate"])
+        .args(["changelog", "validate"])
         .arg(dir.0.join("no-such-package"))
         .output()
         .unwrap();
@@ -4519,11 +4519,11 @@ fn vc_validate_missing_dir_fails_with_invalid_input() {
 }
 
 #[test]
-fn vc_generate_prints_draft_with_news_slots() {
+fn changelog_generate_prints_draft_with_news_slots() {
     let dir = TempDir::new();
-    let pkg = vc_fixture(&dir, "- Update to 2.0", true);
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", true);
     let out = geectl_isolated(&dir)
-        .args(["vc", "generate"])
+        .args(["changelog", "generate"])
         .arg(&pkg)
         .args(["--author", "Jane Packager <jane@example.com>"])
         .output()
@@ -4539,7 +4539,7 @@ fn vc_generate_prints_draft_with_news_slots() {
     assert!(entry.contains("Fix a crash in the parser"));
     // The text rendering is the entry itself, verbatim.
     let out = geectl_isolated(&dir)
-        .args(["--format", "text", "vc", "generate"])
+        .args(["--format", "text", "changelog", "generate"])
         .arg(&pkg)
         .args(["--author", "Jane Packager <jane@example.com>"])
         .output()
@@ -4549,12 +4549,12 @@ fn vc_generate_prints_draft_with_news_slots() {
 }
 
 #[test]
-fn vc_generate_write_refuses_incomplete_draft() {
+fn changelog_generate_write_refuses_incomplete_draft() {
     let dir = TempDir::new();
-    let pkg = vc_fixture(&dir, "- Update to 2.0", true);
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", true);
     let before = fs::read_to_string(pkg.join("foo.changes")).unwrap();
     let out = geectl_isolated(&dir)
-        .args(["vc", "generate"])
+        .args(["changelog", "generate"])
         .arg(&pkg)
         .args(["--author", "Jane Packager <jane@example.com>", "--write"])
         .output()
@@ -4572,17 +4572,17 @@ fn vc_generate_write_refuses_incomplete_draft() {
 }
 
 #[test]
-fn vc_generate_write_refuses_slot_only_draft() {
+fn changelog_generate_write_refuses_slot_only_draft() {
     // No NEWS tarball: no detail is demanded, but the draft still
     // carries the no-news TODO slot — `--write` refuses it. (The
     // `--write` success path, a slot-free draft, needs a target diff
     // and is covered at the lib level by
     // `generate_license_only_change_has_no_slots`.)
     let dir = TempDir::new();
-    let pkg = vc_fixture(&dir, "- Update to 2.0", false);
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", false);
     let before = fs::read_to_string(pkg.join("foo.changes")).unwrap();
     let out = geectl_isolated(&dir)
-        .args(["vc", "generate"])
+        .args(["changelog", "generate"])
         .arg(&pkg)
         .args(["--author", "Jane Packager <jane@example.com>", "--write"])
         .output()
@@ -4604,11 +4604,11 @@ fn vc_generate_write_refuses_slot_only_draft() {
 }
 
 #[test]
-fn vc_target_flags_go_together() {
+fn changelog_target_flags_go_together() {
     let dir = TempDir::new();
-    let pkg = vc_fixture(&dir, "- Update to 2.0", false);
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", false);
     let out = geectl_isolated(&dir)
-        .args(["vc", "validate"])
+        .args(["changelog", "validate"])
         .arg(&pkg)
         .args(["--target-project", "openSUSE:Factory"])
         .output()
@@ -4620,11 +4620,11 @@ fn vc_target_flags_go_together() {
 }
 
 #[test]
-fn vc_generate_without_author_fails() {
+fn changelog_generate_without_author_fails() {
     let dir = TempDir::new();
-    let pkg = vc_fixture(&dir, "- Update to 2.0", false);
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", false);
     let out = geectl_isolated(&dir)
-        .args(["vc", "generate"])
+        .args(["changelog", "generate"])
         .arg(&pkg)
         .output()
         .unwrap();
@@ -4635,7 +4635,7 @@ fn vc_generate_without_author_fails() {
 }
 
 #[test]
-fn vc_validate_entries_flag_lints_older_entries() {
+fn changelog_validate_entries_flag_lints_older_entries() {
     // The older entry opens with a `* ` bullet at the top level: the
     // default `--entries 1` lints only the newest entry (pass), while
     // `--entries 2` lints it too (exit 24).
@@ -4656,13 +4656,13 @@ fn vc_validate_entries_flag_lints_older_entries() {
     )
     .unwrap();
     let out = geectl_isolated(&dir)
-        .args(["vc", "validate"])
+        .args(["changelog", "validate"])
         .arg(&pkg)
         .output()
         .unwrap();
     assert!(out.status.success());
     let out = geectl_isolated(&dir)
-        .args(["vc", "validate"])
+        .args(["changelog", "validate"])
         .arg(&pkg)
         .args(["--entries", "2"])
         .output()

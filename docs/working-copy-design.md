@@ -2,12 +2,12 @@
 
 Issue: https://github.com/scarabeusiv/geectl/issues/17
 Status: design. The layer is blocked until the Gitea ops surface exists (see "Git-backed commit").
-Depends on: https://github.com/scarabeusiv/geectl/issues/20 (Gitea ops surface), https://github.com/scarabeusiv/geectl/issues/112 (unified pull-request surface), https://github.com/scarabeusiv/geectl/issues/19 (services layer), https://github.com/scarabeusiv/geectl/issues/153 (vc layer).
+Depends on: https://github.com/scarabeusiv/geectl/issues/20 (Gitea ops surface), https://github.com/scarabeusiv/geectl/issues/112 (unified pull-request surface), https://github.com/scarabeusiv/geectl/issues/19 (services layer), https://github.com/scarabeusiv/geectl/issues/153 (changelog layer).
 
 ## The layer, up front
 
 The 9 local-state operations (`checkout`, `update`, `status`, `diff`,
-`add`/`rm`/`addremove`, `commit`, `vc`, `mkpac`, `pull`) are one design
+`add`/`rm`/`addremove`, `commit`, `changelog`, `mkpac`, `pull`) are one design
 decision, not nine API calls: geectl keeps a working copy, and the working
 copy is a git repository.
 
@@ -32,7 +32,7 @@ the two commit-protocol calls (see "Commit protocol").
 | `diff` | None for local diff; `project_diff` for remote-vs-remote | Local git diff of the working tree against the base commit. Binary files report "binary, no diff" as a structured result, not a failure. Remote-vs-remote diff reuses `project_diff`. |
 | `add` / `rm` / `addremove` | None (local intent only) | Stage into the index: `add` stages, `rm` removes from index and working tree. `addremove` is `status` + add of `?` + rm of `!`. `commit` sends the full file list derived from the base plus the staged diff. |
 | `commit` | `commit_filelist` (validate, then final) + staged file PUTs (`rev=repository`) + `open_requests_for_package` (report after) | Requires base rev == upstream rev, else `WorkingCopyOutdated`. One revision per commit, exactly (see protocol). Services run before commit, hard gate: a failing service run blocks the commit. Dispatches on the recorded backend kind (see "Git-backed commit"). Refreshes the base at the new rev: OBS-native, the new server revision becomes the new root commit and the committed local commits' content is in it, their separate identities gone; git-backed, the pushed HEAD is the new base. |
-| `vc` | None pre-commit; validate after filing reads `request diff` | `vc validate` + `vc generate` (see "`vc`"). Runs pre-commit in the hard gate, pre-file, and after filing. |
+| `changelog` | None pre-commit; validate after filing reads `request diff` | `changelog validate` + `changelog generate` (see "`changelog`"). Runs pre-commit in the hard gate, pre-file, and after filing. |
 | `mkpac` | `create_package` (exists) + `checkout` | No new operation. |
 | `pull` | Expanded directory read (`list_files` with expand) + `update` | Only for linked packages with a baserev and a clean WC (same gates as the existing tool: refuse on local changes, refuse on non-expanded links, refuse without baserev). Rebases link-target changes into the WC, like `update`. |
 
@@ -117,21 +117,21 @@ pre-commit gate. The gate applies to both commit paths (OBS
 `commitfilelist` (polled until settled, above); the local run does not
 replace them.
 
-## `vc`
+## `changelog`
 
-`vc` is a validation/generation layer for `.changes` entries. The rules
+`changelog` is a validation/generation layer for `.changes` entries. The rules
 and the evidence live in issue #153; the layer shape is:
 
-- `vc validate`: runs the deterministic rules (V1–V8, V10–V12) on the
+- `changelog validate`: runs the deterministic rules (V1–V8, V10–V12) on the
   working copy against its target (local diff before commit, `request diff`
   after filing), with the V9 too-terse rule as a `needs-detail` heuristic.
   Exit non-zero naming the failing rule. No LLM.
-- `vc generate`: emits the skeleton entry from the diff into the `.changes`
+- `changelog generate`: emits the skeleton entry from the diff into the `.changes`
   file, with explicit slots for what it cannot supply (reason, upstream
   highlights). It never emits a bare version-only entry: a version-only
   entry is always left flagged incomplete, whether or not upstream news
   exists. Flagged incomplete means the entry carries an explicit marker
-  naming what is missing, and `vc validate` fails it until a human fills
+  naming what is missing, and `changelog validate` fails it until a human fills
   the slots.
 - Human step: fill reasons and news bullets; the layer re-validates.
 - Placement: `validate` runs pre-commit (the working-copy hard gate),
@@ -220,7 +220,7 @@ cases. Vocabulary reference only: `test_package_status.py` /
 
 Does not transfer: every `.osc` store/bookkeeping test, `test_difffiles.py`
 (unified-diff rendering — the layer's diff output is JSON data),
-`test_vc.py` (the vc layer has its own tests under issue #153). Temporal
+`test_vc.py` (the changelog layer has its own tests under issue #153). Temporal
 live tests assert on server state per test: checkout lands the files,
 commit creates exactly one revision, update moves the base rev, a refused
 `commit` (conflicted, outdated, or nothing to do) leaves the server

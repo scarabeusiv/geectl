@@ -118,7 +118,7 @@ Commands:
   service       Service reads: list a package's services and their run state
   gitea         Gitea operations: repository and branch reads and mutations on the configured instance
   pull-request  Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface
-  vc            Validate and generate `.changes` entries in a package directory, pre-file
+  changelog     Validate and generate `.changes` entries in a package directory, pre-file
   help          Print this message or the help of the given subcommand(s)
 
 Options:
@@ -644,12 +644,12 @@ Options:
   -h, --help             Print help
 ```
 
-## `vc` — `.changes` validation and generation
+## `changelog` — `.changes` validation and generation
 
 ```
 Validate and generate `.changes` entries in a package directory, pre-file
 
-Usage: geectl vc [OPTIONS] <COMMAND>
+Usage: geectl changelog [OPTIONS] <COMMAND>
 
 Commands:
   validate  Validate the `.changes` entries in a package directory against the V1–V12 rules. Local-only by default; with `--target-project`/`--target-package` the target-relative rules (V2, V4, V5 newest-vs-target, V11 older entries) run against the target's current files. Exits non-zero naming the failing rule
@@ -667,7 +667,7 @@ Options:
 ```
 Validate the `.changes` entries in a package directory against the V1–V12 rules. Local-only by default; with `--target-project`/`--target-package` the target-relative rules (V2, V4, V5 newest-vs-target, V11 older entries) run against the target's current files. Exits non-zero naming the failing rule
 
-Usage: geectl vc validate [OPTIONS] [DIR]
+Usage: geectl changelog validate [OPTIONS] [DIR]
 
 Arguments:
   [DIR]  The package directory (default: the current directory) [default: .]
@@ -694,7 +694,7 @@ Options:
 ```
 Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball. The output is a draft: what the diff cannot supply arrives as explicit `TODO` slots for a human to fill. `--write` prepends the draft into the package's `.changes` file, and refuses an incomplete draft (V9 needs-detail)
 
-Usage: geectl vc generate [OPTIONS] [DIR]
+Usage: geectl changelog generate [OPTIONS] [DIR]
 
 Arguments:
   [DIR]  The package directory (default: the current directory) [default: .]
@@ -709,7 +709,7 @@ Options:
       --target-package <TARGET_PACKAGE>
           The target package to diff against
       --author <AUTHOR>
-          The author line for the entry header, in `Name <email>` form — exactly what a bare `vc` invocation writes
+          The author line for the entry header, in `Name <email>` form — exactly what a bare `changelog` invocation writes
       --debug-body
           Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
       --live
@@ -765,14 +765,14 @@ geectl pull-request show gitea:openSUSE/geectl#122
 geectl pull-request search --backend gitea --state open
 
 # .changes validation and generation (local, pre-file)
-geectl vc validate ~/work/foo
-geectl vc validate ~/work/foo --target-project openSUSE:Factory --target-package foo
-geectl vc generate ~/work/foo --author 'Jane Packager <jane@example.com>'
+geectl changelog validate ~/work/foo
+geectl changelog validate ~/work/foo --target-project openSUSE:Factory --target-package foo
+geectl changelog generate ~/work/foo --author 'Jane Packager <jane@example.com>'
 ```
 
-Validate a package directory before filing: `vc validate` exits
+Validate a package directory before filing: `changelog validate` exits
 24 (`validation_failed`) naming the failing rule, and lists the
-skipped target-relative rules when no target is given. `vc
+skipped target-relative rules when no target is given. `changelog
 generate` prints a draft entry — a bare version line plus explicit
 `TODO` slots — never a submission; `--write` prepends it into the
 package's `.changes` file and refuses a draft with unfilled

@@ -1,19 +1,19 @@
-# `vc` — `.changes` validation and generation
+# `changelog` — `.changes` validation and generation
 
-`vc validate` and `vc generate` work on a package directory on disk,
+`changelog validate` and `changelog generate` work on a package directory on disk,
 before filing. They never file anything, and nothing here wires into
 `commit` — pre-commit placement waits on the working-copy layer.
 
 ## Commands
 
 ```sh
-geectl vc validate <dir> [--target-project P --target-package PKG] [--entries N]
-geectl vc generate <dir> [--target-project P --target-package PKG] [--author 'Name <email>'] [--write]
+geectl changelog validate <dir> [--target-project P --target-package PKG] [--entries N]
+geectl changelog generate <dir> [--target-project P --target-package PKG] [--author 'Name <email>'] [--write]
 ```
 
 `dir` defaults to `.`. The target flags go together or not at all.
 `--author` is required for `generate` (no git identity is read, and
-geectl config carries none). `--live` is ignored: `vc` performs no
+geectl config carries none). `--live` is ignored: `changelog` performs no
 OBS mutation; `--write` is the explicit local-write flag.
 
 ## Rules (V1–V12)
