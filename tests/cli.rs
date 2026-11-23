@@ -3460,6 +3460,33 @@ fn build_results_without_credentials_renders_text_error() {
 }
 
 #[test]
+fn build_log_last_and_lastsucceeded_conflict() {
+    // The two selectors name different logs: clap refuses the
+    // combination as a parse error (exit 2) before any work runs.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "build",
+            "build-log",
+            "openSUSE:Factory",
+            "foo",
+            "standard",
+            "x86_64",
+            "--last",
+            "--lastsucceeded",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("lastsucceeded"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn build_download_binary_without_output_fails_with_parse_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)

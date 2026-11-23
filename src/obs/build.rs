@@ -275,9 +275,10 @@ pub struct BuildLogQuery {
     /// The last build's log instead of the current one. This skips
     /// the live-worker handoff and reads the local logfile, so on a
     /// currently-building package with no prior local log it reads
-    /// as no log (None) rather than the live log.
+    /// as no log (None) rather than the live log. Cannot combine
+    /// with `lastsucceeded`.
     pub last: bool,
-    /// The last succeeded build's log.
+    /// The last succeeded build's log. Cannot combine with `last`.
     pub lastsucceeded: bool,
 }
 
@@ -2667,6 +2668,12 @@ impl<'a> ObsClient<'a> {
         query: &BuildLogQuery,
     ) -> Result<Option<String>, GeectlError> {
         Self::validate_build_coordinates(project, Some(package), repository, arch)?;
+        if query.last && query.lastsucceeded {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--last and --lastsucceeded cannot be combined: pass at most one",
+            ));
+        }
         self.require_build_credentials()?;
         let start = query.start.map(|offset| offset.to_string());
         let mut pairs: Vec<(&str, &str)> = vec![("nostream", "1")];
@@ -4271,6 +4278,25 @@ mod tests {
                 .unwrap(),
             Some("flavor log".to_string())
         );
+    }
+
+    #[test]
+    fn build_log_refuses_both_last_and_lastsucceeded() {
+        // The two selectors name different logs: both together have
+        // no meaning, so the call fails before any HTTP.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let query = BuildLogQuery {
+            last: true,
+            lastsucceeded: true,
+            ..BuildLogQuery::default()
+        };
+        let err = client
+            .build_log("testproject", "foo", "standard", "x86_64", &query)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("pass at most one"));
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]

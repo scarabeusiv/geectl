@@ -99,10 +99,11 @@ pub enum BuildCommand {
         /// from the end of the log.
         #[arg(long, allow_hyphen_values = true)]
         start: Option<i64>,
-        /// The last build's log instead of the current one.
-        #[arg(long)]
+        /// The last build's log instead of the current one. Cannot
+        /// combine with `--lastsucceeded`.
+        #[arg(long, conflicts_with = "lastsucceeded")]
         last: bool,
-        /// The last succeeded build's log.
+        /// The last succeeded build's log. Cannot combine with `--last`.
         #[arg(long)]
         lastsucceeded: bool,
     },
