@@ -145,7 +145,19 @@ while true; do
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
         echo "download-on-demand daemon did not recheck $PROJECT/$REPO within ${DOD_RECHECK_TIMEOUT_SECONDS}s" >&2
-         -f "$compose_file" exec -T backend sh -c 'tail -40 /srv/obs/log/bs_dodup.log 2>&1' >&2 || true
+        # The daemon rescans only on startup or when the scheduler
+        # registers the repository (doddata file plus `.changed` in
+        # the dods directory), so show the scheduler's state
+        # alongside the daemon log. Never let the diagnostics mask
+        # the failure.
+        echo "--- fixture diagnostics (backend container) ---" >&2
+        $COMPOSE -f "$compose_file" exec -T backend sh -c 'ps aux | grep "[b]s_sched" || echo "scheduler process not running"' >&2 || true
+        $COMPOSE -f "$compose_file" exec -T backend sh -c 'tail -40 /srv/obs/log/scheduler_x86_64.crit.log 2>&1' >&2 || true
+        $COMPOSE -f "$compose_file" exec -T backend sh -c 'ls -la /srv/obs/dods/ 2>&1' >&2 || true
+        $COMPOSE -f "$compose_file" exec -T backend sh -c "ls /srv/obs/build/$PROJECT/$REPO/$ARCH/:full/ 2>&1 | head -20" >&2 || true
+        $COMPOSE -f "$compose_file" exec -T backend sh -c "cat /srv/obs/build/$PROJECT/$REPO/$ARCH/:full/doddata.cookie 2>&1" >&2 || true
+        $COMPOSE -f "$compose_file" exec -T backend sh -c 'tail -40 /srv/obs/log/bs_dodup.log 2>&1' >&2 || true
+        $COMPOSE -f "$compose_file" logs backend --tail 300 2>&1 | grep -iE 'sched|dod' | tail -40 >&2 || true
         exit 1
     fi
     sleep 10
