@@ -17,6 +17,7 @@
 //! rules — the same shape the skill's `changes-lint.sh` prints.
 
 use clap::Subcommand;
+use geectl::changelog::changes::normalize_changes_content;
 use geectl::changelog::generate::{generate, prepend_entry};
 use geectl::changelog::news::{extract_news_section, find_tarball, NewsSection};
 use geectl::changelog::spec::parse_spec;
@@ -82,6 +83,10 @@ pub enum ChangelogCommand {
         /// legacy encodings transcoded to UTF-8, a BOM stripped.
         /// The write is atomic and refuses a symlink destination,
         /// an unreadable file, or bytes no known encoding decodes.
+        /// A file decoded from a guessed single-byte encoding is
+        /// transcoded on the guess instead — a wrong guess cannot
+        /// be detected — and the write warns about it, naming the
+        /// encoding.
         #[arg(long)]
         write: bool,
     },
@@ -143,9 +148,12 @@ fn load_local(dir: &Path) -> Result<PackageSnapshot, GeectlError> {
 }
 
 /// Fetch the target's current files: the file list, plus the text of
-/// every `.spec` and `.changes` file. A target that does not exist
-/// is `None` (a new package), never an error; any other failure
-/// propagates — a failed lookup must never read as good news.
+/// every `.spec` file and the normalized text of every `.changes`
+/// file (fetched as bytes: a legacy-encoded target is not valid
+/// UTF-8, and `cat` would error on it instead of reaching V11). A
+/// target that does not exist is `None` (a new package), never an
+/// error; any other failure propagates — a failed lookup must never
+/// read as good news.
 fn fetch_target(
     debug: &Debug,
     project: &str,
@@ -163,7 +171,12 @@ fn fetch_target(
     };
     let mut snapshot = PackageSnapshot::default();
     for file in files {
-        if file.name.ends_with(".spec") || file.name.ends_with(".changes") {
+        if file.name.ends_with(".changes") {
+            let bytes = client.cat_bytes(project, package, &file.name, None)?;
+            snapshot
+                .files
+                .insert(file.name, normalize_changes_content(&bytes));
+        } else if file.name.ends_with(".spec") {
             let content = client.cat(project, package, &file.name, None)?;
             snapshot.files.insert(file.name, content);
         } else {

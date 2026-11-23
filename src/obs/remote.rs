@@ -2531,6 +2531,54 @@ impl<'a> ObsClient<'a> {
     }
 
     /// Read file `file` of package `package` in project `project`
+    /// as raw bytes (`GET /public/source/<project>/<package>/<file>`),
+    /// optionally at revision `rev`. The byte twin of `cat`: same
+    /// validation, same URL — but no UTF-8 check, so a legacy-encoded
+    /// `.changes` file reads instead of erroring ("response body is
+    /// not valid UTF-8"). A public read: no credentials. A missing
+    /// file is an error, never empty bytes.
+    pub fn cat_bytes(
+        &self,
+        project: &str,
+        package: &str,
+        file: &str,
+        rev: Option<RevisionSpec>,
+    ) -> Result<Vec<u8>, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        if !valid_obs_filename(file) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS filename: {file:?}"),
+            ));
+        }
+        if let Some(RevisionSpec::Rev(0)) = rev {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "invalid revision: 0",
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        let rev_text;
+        if let Some(rev) = rev {
+            rev_text = rev.to_string();
+            query.push(("rev", &rev_text));
+        }
+        let url = build_url(
+            &self.base,
+            &["public", "source", project, package, file],
+            &query,
+        );
+        self.http.get_bytes(&url, &Credentials::None)
+    }
+
+    /// Read file `file` of package `package` in project `project`
     /// via the authenticated source endpoint
     /// (`GET /source/<project>/<package>/<file>`). Same `_project`
     /// reason as `authed_directory_listing`: the public file route
@@ -7625,6 +7673,31 @@ mod tests {
     }
 
     #[test]
+    fn cat_bytes_reads_raw_bytes_without_credentials() {
+        // A legacy-encoded `.changes` file: `cat` would error on
+        // the non-UTF-8 bytes, `cat_bytes` returns them as-is.
+        let http = FakeHttp::new().with_get_bytes(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.changes",
+            b"Fix the th\xe9\n",
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .cat_bytes("openSUSE:Factory", "foo", "foo.changes", None)
+                .unwrap(),
+            b"Fix the th\xe9\n"
+        );
+        assert_eq!(
+            http.get_bytes_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.changes"
+                    .to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
     fn cat_at_revision_passes_rev() {
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec?rev=2",
@@ -7694,6 +7767,32 @@ mod tests {
             )
             .is_err());
         assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn cat_bytes_rejects_bad_inputs() {
+        // The byte twin of `cat`: same validation, so the same bad
+        // inputs fail before any request is made.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client
+            .cat_bytes("openSUSE:Factory", "foo/bar", "foo.changes", None)
+            .is_err());
+        assert!(client
+            .cat_bytes("openSUSE:Factory", "foo", ".hidden", None)
+            .is_err());
+        assert!(client
+            .cat_bytes("openSUSE:Factory", "foo", "a/b", None)
+            .is_err());
+        assert!(client
+            .cat_bytes(
+                "openSUSE:Factory",
+                "foo",
+                "foo.changes",
+                Some(RevisionSpec::Rev(0))
+            )
+            .is_err());
+        assert!(http.get_bytes_calls().is_empty());
     }
 
     #[test]

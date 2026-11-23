@@ -769,7 +769,7 @@ Options:
       --live
           Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
       --write
-          Prepend the draft into the package's `.changes` file instead of printing it. The whole file is normalized on write: trailing whitespace stripped, legacy encodings transcoded to UTF-8
+          Prepend the draft into the package's `.changes` file instead of printing it. The whole file is normalized on write: trailing ASCII whitespace stripped, CRLF→LF, legacy encodings transcoded to UTF-8, a BOM stripped. The write is atomic and refuses a symlink destination, an unreadable file, or bytes no known encoding decodes. A file decoded from a guessed single-byte encoding is transcoded on the guess instead — a wrong guess cannot be detected — and the write warns about it, naming the encoding
   -h, --help
           Print help
 ```
@@ -990,9 +990,20 @@ generate` prints a draft entry — a bare version line plus explicit
 `TODO` slots — never a submission; `--write` prepends it into the
 package's `.changes` file and refuses a draft with unfilled
 `TODO` slots or a needs-detail flag. Writing normalizes the whole
-file: trailing whitespace is stripped from every line and
-legacy-encoded bytes are transcoded to UTF-8, best-effort; valid
-UTF-8 is never re-decoded.
+file: trailing ASCII whitespace is stripped from every line,
+CRLF becomes LF, legacy-encoded bytes are transcoded to UTF-8
+(best-effort; valid UTF-8 is never re-decoded), a BOM is stripped,
+and a UTF-16 file is decoded whole first. The write is atomic (a
+temp file in the same directory, then a rename, keeping the
+destination's permissions) and refuses a symlink destination, an
+unreadable file, or bytes no known encoding decodes; the guessed
+encoding is named on the debug channel. One limit remains: a file
+decoded from a guessed single-byte encoding is transcoded on the
+guess, never refused — a single-byte guess cannot report a decode
+error, so a wrong guess (a corrupt byte disabling the multi-byte
+probers) still decodes cleanly and the valid UTF-8 half can be
+rewritten as mojibake. The write warns about the guess on stderr,
+naming the encoding, instead of staying silent.
 
 The `request file` flags above are illustrative — run
 `geectl request file --help` for the exact flag set. The same holds

@@ -19,10 +19,13 @@ OBS mutation; `--write` is the explicit local-write flag.
 ## Rules (V1–V12)
 
 Validation runs over a package snapshot (file name → text) plus an
-optional target snapshot. Target reads are public (`list_files` +
-`cat` for `.spec`/`.changes` only). A target that does not exist is a
-new package: the target-relative rules are skipped. Any other fetch
-failure is a hard error — a failed lookup never reads as good news.
+optional target snapshot. A `.changes` snapshot is the normalized
+form of the file (see below); target reads are public
+(`list_files`, plus `cat` for `.spec` and a byte fetch for
+`.changes`, normalized at load like the local files). A target that
+does not exist is a new package: the target-relative rules are
+skipped. Any other fetch failure is a hard error — a failed lookup
+never reads as good news.
 
 - V1 — every spec has a matching `<stem>.changes` file. (The
   reverse — every `.changes` file matching a subpackage or a
@@ -62,8 +65,9 @@ failure is a hard error — a failed lookup never reads as good news.
 - V11 — the newest N entries (default 1) pass the format lint
   (bullets `- ` at indent 0, `* ` nested at indent 2), and the
   submission carries at most N new entries vs the target; older
-  entries are byte-identical to the target's (sanctioned exceptions
-  are named in the message for the human to judge).
+  entries match the target's up to the whole-file normalization
+  `generate --write` applies (sanctioned exceptions are named in
+  the message for the human to judge).
 - V12 — bug references: a `bnc#` reference (the old abbreviation —
   use `boo#`/`bsc#`), incomplete CVE ids, a bare `CVE(s)` or
   security claim with no full id, and a CVE named as not fixed /
@@ -89,10 +93,19 @@ counts as substantive.
 draft has no substantive line beyond the version line (mechanical
 file/dependency/license lines never count). `--write`
 prepends the draft into the package's `.changes` file (verified:
-separator count +1, old content preserved as a byte suffix) and
-refuses a draft with unfilled `TODO` slots or a needs-detail flag,
-exit 24. `--write` also refuses when the destination `.changes`
-file is a symlink.
+separator count +1, old content preserved as its normalized form)
+and refuses a draft with unfilled `TODO` slots or a needs-detail
+flag, exit 24. The write normalizes the whole file — trailing
+whitespace stripped, CRLF→LF, legacy encodings transcoded to
+UTF-8, a BOM stripped — atomically (temp file in the same directory,
+then rename, keeping the destination's permissions and syncing the
+directory after the rename). `--write` also refuses when the
+destination `.changes` file is a symlink, when the file cannot be
+read (only a missing file reads as empty), or when the file has
+bytes no known encoding decodes; the guessed encoding is named on
+the debug channel. A file decoded from a guessed single-byte
+encoding is transcoded on the guess and the write warns about it,
+naming the encoding, instead of refusing.
 
 ## NEWS extraction
 
@@ -113,8 +126,11 @@ an error value, never an empty section.
 - No filing, no OBS mutation, no commit wiring.
 - No LLM: V1–V8 and V10–V12 are exact; V9 is a deterministic
   heuristic gated on the NEWS section existing.
-- No changelog rewrite of old entries: V11 checks the older entries
-  are untouched.
+- No changelog rewrite of old entries beyond the whole-file
+  normalization: `--write` normalizes the whole file (trailing
+  whitespace, CRLF→LF, legacy encodings to UTF-8, BOM stripped)
+  and V11 compares older entries after that normalization, so a
+  difference normalization alone explains is not a finding.
 
 ## Rule provenance
 

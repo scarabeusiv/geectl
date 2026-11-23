@@ -16,7 +16,7 @@
 //! reason, never passed silently. A failed lookup (the target cannot
 //! be read at all) is the caller's error, not a skip — see the CLI.
 
-use crate::changelog::changes::{parse_changes, ChangesFile, Entry};
+use crate::changelog::changes::{normalize_changes_content, parse_changes, ChangesFile, Entry};
 use crate::changelog::spec::{parse_spec, SpecInfo};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -116,8 +116,17 @@ impl PackageSnapshot {
             // Only .spec and .changes files are ever parsed; every
             // other file is needed by name alone (V7), so its content
             // stays empty — a source tarball must not be read into
-            // memory as text.
-            let content = if name.ends_with(".spec") || name.ends_with(".changes") {
+            // memory as text. A `.changes` file is normalized at
+            // load (the whole-file normalization `generate --write`
+            // applies), so V11 compares what the target holds after
+            // that normalization instead of a lossy re-decode: a
+            // Latin-1 entry and its UTF-8 twin read as the same
+            // entry. A `.spec` file is UTF-8 and keeps the lossy
+            // read.
+            let content = if name.ends_with(".changes") {
+                let bytes = std::fs::read(&path)?;
+                normalize_changes_content(&bytes)
+            } else if name.ends_with(".spec") {
                 let bytes = std::fs::read(&path)?;
                 String::from_utf8_lossy(&bytes).into_owned()
             } else {
@@ -1122,7 +1131,8 @@ fn check_target_rules(
     }
 
     // V11: the number of new entries, and the older entries
-    // byte-identical to the target's. Sanctioned exceptions (a typo
+    // identical to the target's up to the whole-file normalization
+    // `generate --write` applies. Sanctioned exceptions (a typo
     // fix, an added bug reference, a header the validator itself
     // rejects) are for the human to judge — the finding names them.
     for (name, file) in &parsed.changes {
@@ -1155,12 +1165,20 @@ fn check_target_rules(
         }
         for (i, old_entry) in file.entries.iter().skip(new_entries).enumerate() {
             let target_entry = &target_file.entries[i];
-            if old_entry.raw(&file.lines) != target_entry.raw(&target_file.lines) {
+            // Older entries are compared after the whole-file
+            // normalization: a difference in trailing whitespace,
+            // CRLF→LF, or a legacy encoding is the sanctioned
+            // rewrite, not an altered entry. (The
+            // snapshots already arrive normalized at load; this
+            // stays so the comparison does not depend on that.)
+            let local = normalize_changes_content(old_entry.raw(&file.lines).as_bytes());
+            let target = normalize_changes_content(target_entry.raw(&target_file.lines).as_bytes());
+            if local != target {
                 report.findings.push(Finding {
                     rule: Rule::V11,
                     file: name.clone(),
                     line: old_entry.separator_line,
-                    message: "an older entry differs from the target — never alter a previous entry (sanctioned exceptions only: a typo fix, an added bug reference, or a header the source validator itself rejects)"
+                    message: "an older entry differs from the target beyond the whole-file normalization `generate --write` applies — never alter a previous entry (sanctioned exceptions only: a typo fix, an added bug reference, or a header the source validator itself rejects)"
                         .to_string(),
                 });
                 break;
@@ -2131,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn target_rules_old_entries_must_stay_byte_identical() {
+    fn target_rules_old_entries_must_match_after_normalization() {
         let target = snapshot(&[
             ("foo.spec", SPEC),
             (
@@ -2148,6 +2166,73 @@ mod tests {
         ]);
         let report = validate(&local, Some(&target), &ValidateOptions::default());
         assert!(report
+            .findings
+            .iter()
+            .any(|f| f.rule == Rule::V11 && f.message.contains("older entry differs")));
+    }
+
+    #[test]
+    fn target_rules_old_entries_match_when_only_normalization_differs() {
+        // The older entry differs only by trailing whitespace —
+        // exactly what `generate --write` strips — so V11 stays
+        // silent. (CRLF never reaches the comparison: `lines()`
+        // strips it at parse time.) The local file carries one
+        // genuinely new entry on top, so the comparison runs over
+        // the two older entries, headers included.
+        let target = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file("- Update to 1.0", "- Initial package"),
+            ),
+        ]);
+        let sep = "-".repeat(67);
+        let local_changes = format!(
+            "{sep}\nThu May 28 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.0\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package   \n\n"
+        );
+        let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &local_changes)]);
+        let report = validate(&local, Some(&target), &ValidateOptions::default());
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.rule == Rule::V11 && f.message.contains("older entry differs")));
+    }
+
+    #[test]
+    fn target_rules_old_entries_match_across_legacy_encodings() {
+        // PROBE3: the local older entry is Latin-1 (`- Fix the
+        // thé` with a 0xE9 byte) and the target's is UTF-8. The
+        // local snapshot is normalized at load, so the two read as
+        // the same entry and V11 stays silent — a lossy re-decode
+        // (U+FFFD) would have flagged it.
+        let target = snapshot(&[
+            ("foo.spec", SPEC),
+            (
+                "foo.changes",
+                &changes_file("- Update to 1.0", "- Fix the thé"),
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("foo.spec"), SPEC).unwrap();
+        let sep = "-".repeat(67);
+        let local_changes = format!(
+            "{sep}\nThu May 28 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.0\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Fix the thé\n\n"
+        );
+        // The older entry's `thé` is Latin-1: its UTF-8 bytes
+        // C3 A9 become the single byte E9.
+        let mut local_bytes = local_changes.into_bytes();
+        let needle = "thé".as_bytes();
+        let pos = local_bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("the older entry carries thé");
+        local_bytes.splice(pos + 2..pos + 4, [0xE9]);
+        std::fs::write(dir.path().join("foo.changes"), &local_bytes).unwrap();
+        let local = PackageSnapshot::from_dir(dir.path()).unwrap();
+        assert!(local.files["foo.changes"].contains("Fix the thé"));
+        assert!(!local.files["foo.changes"].contains('\u{FFFD}'));
+        let report = validate(&local, Some(&target), &ValidateOptions::default());
+        assert!(!report
             .findings
             .iter()
             .any(|f| f.rule == Rule::V11 && f.message.contains("older entry differs")));
