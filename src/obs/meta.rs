@@ -686,8 +686,20 @@ impl<'a> ObsClient<'a> {
             // A dry run performs no fetch, so it cannot tell a
             // changed repository from a pre-existing one: it
             // validates every repository the write carries instead,
-            // before the dry-run gate records the write.
-            validate_repositories(&meta.repositories)?;
+            // before the dry-run gate records the write. The refusal
+            // says so: a live write validates only the repositories
+            // it changes, so a dry-run refusal can name a
+            // pre-existing repository the live write would leave
+            // alone.
+            validate_repositories(&meta.repositories).map_err(|err| {
+                GeectlError::new(
+                    err.kind(),
+                    format!(
+                        "{}; note: a dry run validates every repository the write carries, while a live write validates only the repositories it changes",
+                        err.context
+                    ),
+                )
+            })?;
         }
         if !dry_run.allow(&format!("set project meta of {project}")) {
             return Ok(());
@@ -2290,6 +2302,30 @@ mod tests {
             .set_project_meta("home:scarabeus_iv", &meta, &dry)
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
+        assert!(dry.plan().is_empty());
+    }
+
+    #[test]
+    fn set_project_meta_dry_run_rejects_an_invalid_repository() {
+        let http = FakeHttp::new();
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META).unwrap();
+        let mut repository = replacement_repository();
+        repository.rebuild = Some("bogus".to_string());
+        meta.repositories = vec![repository];
+        let dry = DryRun::new(true);
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &dry)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context
+                .contains("a dry run validates every repository the write carries"),
+            "{}",
+            err.context
+        );
         assert!(http.get_calls().is_empty());
         assert!(http.put_calls().is_empty());
         assert!(dry.plan().is_empty());
