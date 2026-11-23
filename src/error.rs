@@ -73,6 +73,10 @@ pub enum ErrorKind {
     /// non-zero, a package install failed, or pre_checkin.sh
     /// failed).
     ServiceFailed,
+    /// A `.changes` validation failed (one or more V-rules), or a
+    /// generation was refused (an incomplete draft must not be
+    /// written). The context names the findings.
+    ValidationFailed,
 }
 
 impl ErrorKind {
@@ -102,6 +106,7 @@ impl ErrorKind {
             ErrorKind::BuildRootInUse => "build_root_in_use",
             ErrorKind::NotAGeectlBuildRoot => "not_a_geectl_build_root",
             ErrorKind::ServiceFailed => "service_failed",
+            ErrorKind::ValidationFailed => "validation_failed",
         }
     }
 
@@ -135,6 +140,7 @@ impl ErrorKind {
             ErrorKind::BuildRootInUse => "the build root is in use",
             ErrorKind::NotAGeectlBuildRoot => "the directory is not a geectl build root",
             ErrorKind::ServiceFailed => "a source service failed",
+            ErrorKind::ValidationFailed => "the validation failed",
         }
     }
 
@@ -198,6 +204,7 @@ impl ErrorKind {
             ErrorKind::ServiceFailed => {
                 "read the failing service's output in the run record; fix the service or its inputs and retry"
             }
+            ErrorKind::ValidationFailed => "fix the findings and retry",
         }
     }
 
@@ -228,6 +235,7 @@ impl ErrorKind {
             ErrorKind::BuildRootInUse => 20,
             ErrorKind::NotAGeectlBuildRoot => 21,
             ErrorKind::ServiceFailed => 22,
+            ErrorKind::ValidationFailed => 24,
         }
     }
 
@@ -257,6 +265,7 @@ impl ErrorKind {
             ErrorKind::BuildRootInUse,
             ErrorKind::NotAGeectlBuildRoot,
             ErrorKind::ServiceFailed,
+            ErrorKind::ValidationFailed,
         ]
     }
 }

@@ -14,6 +14,7 @@ mod cli_pull_request;
 mod cli_remote;
 mod cli_request;
 mod cli_service;
+mod cli_vc;
 mod maintenance;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -142,6 +143,12 @@ enum Command {
         #[command(subcommand)]
         command: cli_pull_request::PullRequestCommand,
     },
+    /// Validate and generate `.changes` entries in a package
+    /// directory, pre-file.
+    Vc {
+        #[command(subcommand)]
+        command: cli_vc::VcCommand,
+    },
 }
 
 /// The `config` subcommands.
@@ -198,6 +205,7 @@ fn run(
         Some(Command::PullRequest { command }) => {
             cli_pull_request::run_pull_request(command, debug, cli.live)?
         }
+        Some(Command::Vc { command }) => cli_vc::run_vc(command, debug, cli.live)?,
     };
     Ok(match format {
         Format::Json => payload.to_string(),

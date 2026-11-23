@@ -1435,7 +1435,7 @@ pub fn run_remote(
 /// Here the dry-run mutations need none either, but the library proves
 /// it (its dry-run guard runs before the credentials check), so nothing
 /// is swallowed.
-fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
+pub(crate) fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
     let effective = config::effective_config(&file_config)?;
