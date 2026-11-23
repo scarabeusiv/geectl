@@ -3,7 +3,7 @@ name = "geectl"
 version = "0.2.1"
 edition = "2021"
 rust-version = "1.99.1"
-description = "Geeko Controller — a machine-first CLI for agents (OBS + src.opensuse.org)"
+description = "Geeko Controller — a CLI for openSUSE packaging workflows (OBS + src.opensuse.org)"
 license = "Apache-2.0"
 repository = "https://github.com/scarabeusiv/geectl"
 
