@@ -3437,6 +3437,32 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// The owners of package `package`, across projects (`GET
+    /// /search/owner?package=...`). Requires credentials; an
+    /// unexpected response is an error, never an empty list.
+    pub fn owners_for_package(&self, package: &str) -> Result<Vec<Owner>, GeectlError> {
+        if !valid_obs_name(package) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS package name: {package:?}"),
+            ));
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching owners requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let url = build_url(&self.base, &["search", "owner"], &[("package", package)]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_owners(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS owner search response for package {package:?}"),
+            )
+        })
+    }
+
     /// The maintainers of package `package` in project `project`:
     /// the owners filtered to role `maintainer`, as `(name, role)`
     /// pairs (persons and groups flattened).
@@ -9948,6 +9974,25 @@ mod tests {
     }
 
     #[test]
+    fn owners_for_package_searches_by_package() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/owner?package=foo",
+            OWNER_SEARCH_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let owners = client.owners_for_package("foo").unwrap();
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owners[0].package.as_deref(), Some("foo"));
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/search/owner?package=foo".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
     fn maintainers_filters_to_the_maintainer_role() {
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/search/owner?project=openSUSE%3AFactory&package=foo",
@@ -10015,6 +10060,7 @@ mod tests {
         let client = ObsClient::new(&http);
         assert!(client.owners("openSUSE:Factory", "foo").is_err());
         assert!(client.owners_for_binary("python3.11").is_err());
+        assert!(client.owners_for_package("foo").is_err());
         assert!(client.maintainers("openSUSE:Factory", "foo").is_err());
         assert!(client.whois("Admin").is_err());
         assert!(http.get_calls().is_empty());
@@ -10026,6 +10072,7 @@ mod tests {
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client.owners("openSUSE:Factory", "foo/bar").is_err());
         assert!(client.owners_for_binary("python3.11/x").is_err());
+        assert!(client.owners_for_package("foo/bar").is_err());
         assert!(client.whois("a").is_err());
         assert!(client.whois("a/b").is_err());
         assert!(http.get_calls().is_empty());

@@ -44,7 +44,8 @@
 //! `live_revision_patch_rev1_missing_package_errors`,
 //! `live_meta_reads_back`,
 //! `live_search_finds_package_and_project`,
-//! `live_owners_call_succeeds`, `live_whois_reads_admin`,
+//! `live_owners_call_succeeds`, `live_owners_for_package_call_succeeds`,
+//! `live_whois_reads_admin`,
 //! `live_link_target_reads_linkinfo`, and
 //! `live_project_diff_classifies`,
 //! `live_diff_packages_diffs_two_packages`, and
@@ -1788,6 +1789,28 @@ fn live_owners_call_succeeds() {
     let owners = authed
         .owners(&source_project, &package)
         .expect("owner search on the live instance");
+    assert!(
+        owners.iter().all(|owner| !owner.project.is_empty()),
+        "every returned owner must name a project; got {owners:?}"
+    );
+}
+
+/// The package-only owner search runs against the real server:
+/// the same fresh package, found without naming its project. A
+/// fresh package has no explicit owners, so the call succeeding
+/// (not 401, not 404) is the assertion, plus the shape of
+/// whatever it returns.
+#[test]
+fn live_owners_for_package_call_succeeds() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let _source_project = create_source_branch(&authed, &package);
+    let owners = authed
+        .owners_for_package(&package)
+        .expect("package-only owner search on the live instance");
     assert!(
         owners.iter().all(|owner| !owner.project.is_empty()),
         "every returned owner must name a project; got {owners:?}"

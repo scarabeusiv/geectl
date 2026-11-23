@@ -388,6 +388,11 @@ pub enum RemoteCommand {
         /// The binary package name.
         binary: String,
     },
+    /// Show the owners of a package by name alone, across projects.
+    OwnersForPackage {
+        /// The package name.
+        package: String,
+    },
     /// Show the maintainers of a package.
     Maintainers {
         /// The project the package lives in.
@@ -1182,6 +1187,17 @@ pub fn run_remote(
             Ok((
                 payload,
                 with_header(&format!("binary: {binary}"), render_owners(&owners)),
+            ))
+        }
+        RemoteCommand::OwnersForPackage { package } => {
+            let owners = client.owners_for_package(&package)?;
+            let payload = json!({
+                "package": package,
+                "owners": owners.iter().map(owner_json).collect::<Vec<_>>(),
+            });
+            Ok((
+                payload,
+                with_header(&format!("package: {package}"), render_owners(&owners)),
             ))
         }
         RemoteCommand::Maintainers { project, package } => {
@@ -3963,6 +3979,10 @@ mod tests {
         assert!(matches!(
             parse(&["geectl", "remote", "owners-for-binary", "vim"]),
             RemoteCommand::OwnersForBinary { .. }
+        ));
+        assert!(matches!(
+            parse(&["geectl", "remote", "owners-for-package", "vim"]),
+            RemoteCommand::OwnersForPackage { .. }
         ));
         assert!(matches!(
             parse(&["geectl", "remote", "maintainers", "P", "K"]),

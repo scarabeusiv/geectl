@@ -964,6 +964,7 @@ fn remote_help_lists_every_command() {
         "search-projects",
         "owners",
         "owners-for-binary",
+        "owners-for-package",
         "maintainers",
         "whois",
         "link-target",
