@@ -6563,6 +6563,37 @@ mod tests {
     }
 
     #[test]
+    fn both_repository_parsers_round_trip_entities() {
+        // Entities in attributes and text decode on parse and
+        // re-encode on render, so the value survives a
+        // parse-render-parse cycle through both parsers.
+        let body = "<project name=\"testproject\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com/?a=1&amp;b=2\" repotype=\"rpmmd\"><archfilter>x86_64&amp;arm</archfilter><master url=\"https://master.example.com/?x=&quot;y&quot;\"/><pubkey>key&amp;material</pubkey></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"a&lt;b\"/></repository></project>";
+        let via_project_meta = parse_project_meta(body).unwrap();
+        let via_repositories = parse_repositories(body).unwrap();
+        assert_eq!(via_project_meta.repositories, via_repositories);
+        let repo = &via_project_meta.repositories[0];
+        assert_eq!(repo.downloads[0].url, "https://example.com/?a=1&b=2");
+        assert_eq!(repo.downloads[0].archfilter.as_deref(), Some("x86_64&arm"));
+        assert_eq!(
+            repo.downloads[0].master.as_ref().unwrap().url,
+            "https://master.example.com/?x=\"y\""
+        );
+        assert_eq!(repo.downloads[0].pubkey.as_deref(), Some("key&material"));
+        assert_eq!(repo.release_targets[0].trigger.as_deref(), Some("a<b"));
+        let rendered = repository_element(repo);
+        let reparsed = parse_repositories(&format!(
+            "<project name=\"testproject\">{rendered}</project>"
+        ))
+        .unwrap();
+        assert_eq!(reparsed, via_repositories);
+        let reparsed = parse_project_meta(&format!(
+            "<project name=\"testproject\">{rendered}</project>"
+        ))
+        .unwrap();
+        assert_eq!(reparsed.repositories, via_repositories);
+    }
+
+    #[test]
     fn repository_element_escapes_values_in_the_full_shape() {
         let repo = Repository {
             name: "standard".to_string(),
