@@ -5,7 +5,7 @@
 //! green without podman, the engine, or a local OBS instance.
 //!
 //! With the marker set, the test builds the fixture package
-//! (`tests/local_build_e2e/hello.spec`) against the local OBS instance
+//! (`tests/local_build_e2e/geectl-e2e-hello.spec`) against the local OBS instance
 //! the job provisions: the instance serves the buildinfo, buildconfig,
 //! and base-system RPMs for the fixture project through a
 //! download-on-demand repository backed by the Tumbleweed OSS

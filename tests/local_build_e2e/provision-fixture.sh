@@ -6,7 +6,7 @@
 #      backed by a download-on-demand repository (the Tumbleweed OSS
 #      repository), so the scheduler can resolve the base-system dep
 #      set for the fixture package.
-#   2. Creates the `hello` package: a file upload into a package
+#   2. Creates the `geectl-e2e-hello` package: a file upload into a package
 #      that has no `_meta` yet answers 404, so the package is
 #      created before its sources are uploaded.
 #   3. Uploads the Tumbleweed build configuration as the project's
@@ -14,7 +14,7 @@
 #      configuration, no build type defined or detected", because the
 #      build type is guessed from the config's `Preinstall: rpm`.
 #      The config also defines the base-system dependency closure.
-#   4. Uploads the fixture spec as the `hello` package's source.
+#   4. Uploads the fixture spec as the `geectl-e2e-hello` package's source.
 #   5. Polls the buildinfo until the scheduler resolves it (no
 #      `<error>`, at least one `<bdep>`): the first resolution waits
 #      on the download-on-demand daemon fetching the repository
@@ -35,7 +35,7 @@ ADMIN_USER="${GEECTL_LIVE_OBS_USERNAME:-Admin}"
 ADMIN_PASS="${GEECTL_LIVE_OBS_PASSWORD:-opensuse}"
 PROJECT="geectl:e2e"
 REPO="standard"
-PACKAGE="hello"
+PACKAGE="geectl-e2e-hello"
 # The fixture repository covers the runner's arch: the test builds for
 # the host arch, so the two agree by construction.
 ARCH="${FIXTURE_ARCH:-$(uname -m)}"
@@ -75,8 +75,8 @@ echo "Uploading fixture spec as package $PACKAGE ..."
 # sends application/x-www-form-urlencoded, and Rack then parses the
 # spec body as a form and rejects its `%` macros as invalid
 # %-encoding before the controller reads the file.
-curl --fail-with-body -sS "${auth[@]}" -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$SCRIPT_DIR/hello.spec" \
-    "$BASE_URL/source/$PROJECT/$PACKAGE/hello.spec"
+curl --fail-with-body -sS "${auth[@]}" -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$SCRIPT_DIR/geectl-e2e-hello.spec" \
+    "$BASE_URL/source/$PROJECT/$PACKAGE/geectl-e2e-hello.spec"
 
 echo "Waiting for the buildinfo to resolve ..."
 buildinfo_url="$BASE_URL/build/$PROJECT/$REPO/$ARCH/$PACKAGE/_buildinfo"
