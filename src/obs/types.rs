@@ -273,6 +273,91 @@ pub struct SourceFile {
     pub md5: Option<String>,
 }
 
+/// One entry of a `commitfilelist` file list: the file name, its
+/// md5, and the sha256 the server asked for, when it challenged the
+/// entry (`hash="sha256:..."` on the resent list).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFileEntry {
+    /// File name.
+    pub name: String,
+    /// md5 of the file content.
+    pub md5: String,
+    /// sha256 hex digest, when the server challenged this entry.
+    pub sha256: Option<String>,
+}
+
+impl CommitFileEntry {
+    /// An entry with a name and md5, no sha256 challenge answered.
+    pub fn new(name: &str, md5: &str) -> Self {
+        CommitFileEntry {
+            name: name.to_string(),
+            md5: md5.to_string(),
+            sha256: None,
+        }
+    }
+}
+
+/// Options for one `commitfilelist` call: the commit message, the
+/// user the commit is recorded as, and the link flags. `validate`
+/// sends the `withvalidate=1` first pass; the final pass omits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFilelistOptions {
+    /// Commit message (`comment`).
+    pub comment: String,
+    /// User the commit is recorded as. `None` resolves to the OBS
+    /// Basic username on the client.
+    pub user: Option<String>,
+    /// First (validation) pass: `withvalidate=1`.
+    pub validate: bool,
+    /// Keep the link (`keeplink=1`): the package stays linked after
+    /// the commit.
+    pub keeplink: bool,
+    /// Link revision to keep (`linkrev`): the expanded srcmd5.
+    pub linkrev: Option<String>,
+    /// Repair the link (`repairlink=1`).
+    pub repairlink: bool,
+    /// Skip server-side services after the commit (`noservice=1`).
+    pub noservice: bool,
+}
+
+impl CommitFilelistOptions {
+    /// Options for a commit with this message: validation pass off,
+    /// no link flags, services run.
+    pub fn new(comment: &str) -> Self {
+        CommitFilelistOptions {
+            comment: comment.to_string(),
+            user: None,
+            validate: false,
+            keeplink: false,
+            linkrev: None,
+            repairlink: false,
+            noservice: false,
+        }
+    }
+}
+
+/// The parsed answer to one `commitfilelist` call: the new revision
+/// (final pass only), the files the server does not have yet, the
+/// files it challenged for a sha256, and whether a server-side
+/// service run is still in progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFilelistResponse {
+    /// New revision number, when the call created one.
+    pub rev: Option<u64>,
+    /// Source md5 of the new revision, when the call created one.
+    pub srcmd5: Option<String>,
+    /// Files the server does not have yet (`error="missing"`): stage
+    /// them with `rev=repository` and resend the list.
+    pub missing: Vec<String>,
+    /// Files the server challenged for a sha256 (`hash="new"`):
+    /// resend the list with `hash="sha256:..."` on these entries.
+    pub hash_challenge: Vec<String>,
+    /// A server-side service run is still in progress
+    /// (`<serviceinfo code="running">`): poll the directory until
+    /// it settles before refreshing the base.
+    pub service_running: bool,
+}
+
 /// A parsed OBS source directory listing: the files plus the link
 /// target, when the package links another package.
 #[derive(Debug, Clone, PartialEq, Eq)]
