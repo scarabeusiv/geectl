@@ -15,4 +15,5 @@ mkdir -p %{buildroot}/usr/share/doc/%{name}
 printf 'geectl local-build e2e\n' > %{buildroot}/usr/share/doc/%{name}/README
 
 %files
+%dir /usr/share/doc/%{name}
 /usr/share/doc/%{name}/README
