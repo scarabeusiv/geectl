@@ -116,9 +116,17 @@ jobs:
         include:
           # All legs pinned, not floating: a latest rollover must
           # never ship the arches from different OS baselines.
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          # glibc floor of the published tarballs, measured per leg:
+          # x86_64 GLIBC_2.34 (the 2.34 libpthread merge); its only
+          # GLIBC_2.39 references are weak (pidfd_spawnp, pidfd_getpid,
+          # fork/exec fallback). aarch64 GLIBC_2.39: the same two symbols
+          # carry a non-weak version need there, so the floor is 2.39.
+          # Ubuntu 22.04 (2.35) runs x86_64 only; 24.04 (2.39) runs both.
+          # Leap 15.6 (2.38) runs x86_64 only; 15.5 and earlier (2.31 and
+          # older) run neither.
+          - { os: ubuntu-26.04, target: x86_64-unknown-linux-gnu }
           # Native arm64 runner: no cross toolchain to maintain.
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-26.04-arm, target: aarch64-unknown-linux-gnu }
           # Native Windows runner, pinned like the Ubuntu legs: no
           # cross toolchain to maintain.
           - { os: windows-2025, target: x86_64-pc-windows-msvc }
