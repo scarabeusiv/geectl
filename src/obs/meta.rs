@@ -269,18 +269,12 @@ fn validate_repositories(repositories: &[Repository]) -> Result<(), GeectlError>
 /// `arch`, `archfilter`, `pubkey`); any child of `<download>`
 /// outside `archfilter`, `master`, and `pubkey`; a second
 /// `<master>`, `<archfilter>`, or `<pubkey>` in one `<download>`;
-/// and any child the parser drops for a missing required value (a
-/// `<repository>` without `name`, a `<download>` without `url`, a
-/// `<releasetarget>` without `project`, a `<hostsystem>` without
-/// `project` or `repository`, a `<path>` without `project` or
-/// `repository`, a `<master>` without `url`); and any content inside
-/// `<master>`, `<releasetarget>`, `<hostsystem>`, or `<path>`, which
-/// carry attributes only.
+/// and any content inside `<master>`, `<releasetarget>`,
+/// `<hostsystem>`, or `<path>`, which carry attributes only. A child
+/// missing a required value is malformed, not unmodeled: the parser
+/// errors on it before this check runs.
 fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<String>, GeectlError> {
     let mut found = Vec::new();
-    if tag_attr(open_tag, "name").is_none() {
-        push_finding(&mut found, "repository elements without name".to_string());
-    }
     for attr in tag_attr_names(open_tag) {
         if !matches!(attr.as_str(), "name" | "rebuild" | "block" | "linkedbuild") {
             push_finding(&mut found, format!("{attr} attribute"));
@@ -300,9 +294,6 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
         }
     }
     for (download_tag, download_inner) in elements(inner, "download")? {
-        if tag_attr(&download_tag, "url").is_none() {
-            push_finding(&mut found, "download elements without url".to_string());
-        }
         for attr in tag_attr_names(&download_tag) {
             if !matches!(attr.as_str(), "arch" | "url" | "repotype") {
                 push_finding(&mut found, format!("{attr} attribute on <download>"));
@@ -330,9 +321,6 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
             }
         }
         for (master_tag, master_inner) in elements(&download_inner, "master")? {
-            if tag_attr(&master_tag, "url").is_none() {
-                push_finding(&mut found, "master elements without url".to_string());
-            }
             if !master_inner.trim().is_empty() {
                 push_finding(&mut found, "master elements with content".to_string());
             }
@@ -351,12 +339,6 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
         }
     }
     for (target_tag, target_inner) in elements(inner, "releasetarget")? {
-        if tag_attr(&target_tag, "project").is_none() {
-            push_finding(
-                &mut found,
-                "releasetarget elements without project".to_string(),
-            );
-        }
         if !target_inner.trim().is_empty() {
             push_finding(
                 &mut found,
@@ -370,12 +352,6 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
         }
     }
     for (host_tag, host_inner) in elements(inner, "hostsystem")? {
-        if tag_attr(&host_tag, "project").is_none() || tag_attr(&host_tag, "repository").is_none() {
-            push_finding(
-                &mut found,
-                "hostsystem elements without project or repository".to_string(),
-            );
-        }
         if !host_inner.trim().is_empty() {
             push_finding(&mut found, "hostsystem elements with content".to_string());
         }
@@ -386,12 +362,6 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
         }
     }
     for (path_tag, path_inner) in elements(inner, "path")? {
-        if tag_attr(&path_tag, "project").is_none() || tag_attr(&path_tag, "repository").is_none() {
-            push_finding(
-                &mut found,
-                "path elements without project or repository".to_string(),
-            );
-        }
         if !path_inner.trim().is_empty() {
             push_finding(&mut found, "path elements with content".to_string());
         }
@@ -1317,27 +1287,48 @@ mod tests {
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_download_without_url() {
+    fn parse_project_meta_rejects_a_download_without_url() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" repotype=\"rpmmd\"/></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        let err = parse_project_meta(META).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_releasetarget_without_project() {
+    fn set_project_meta_fails_closed_on_a_download_without_url() {
+        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" repotype=\"rpmmd\"/></repository></project>";
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            META,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.title = Some("New title".to_string());
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.put_calls().is_empty());
+    }
+
+    #[test]
+    fn parse_project_meta_rejects_a_releasetarget_without_project() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><releasetarget repository=\"standard\"/></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        let err = parse_project_meta(META).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_hostsystem_without_repository() {
+    fn parse_project_meta_rejects_a_hostsystem_without_repository() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><hostsystem project=\"openSUSE:Factory\"/></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        let err = parse_project_meta(META).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_master_without_url() {
+    fn parse_project_meta_rejects_a_master_without_url() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master sslfingerprint=\"AB:CD\"/></download></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        let err = parse_project_meta(META).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]
@@ -1426,27 +1417,31 @@ mod tests {
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_path_without_a_project() {
+    fn parse_project_meta_rejects_a_path_without_a_project() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path repository=\"snapshot\"/></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        let err = parse_project_meta(META).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_path_without_a_repository() {
+    fn parse_project_meta_rejects_a_path_without_a_repository() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><path project=\"openSUSE:Factory\"/></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        let err = parse_project_meta(META).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_repository_without_a_name() {
+    fn parse_project_meta_rejects_a_repository_without_a_name() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository><arch>x86_64</arch></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        let err = parse_project_meta(META).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_repository_with_an_empty_name() {
+    fn parse_project_meta_rejects_a_repository_with_an_empty_name() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"\"><arch>x86_64</arch></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
+        let err = parse_project_meta(META).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
     }
 
     #[test]

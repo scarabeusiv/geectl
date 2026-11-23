@@ -1053,9 +1053,12 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
     };
     let mut repositories = Vec::new();
     for (element, repo_inner) in elements(inner, "repository")? {
-        let Some(repo_name) = tag_attr(&element, "name") else {
-            continue;
-        };
+        let repo_name = tag_attr(&element, "name").ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                "unexpected OBS project meta response: <repository> without name",
+            )
+        })?;
         let mut arch = Vec::new();
         for (_, text) in elements(&repo_inner, "arch")? {
             let arch_name = text.trim().to_string();
@@ -1065,28 +1068,47 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
         }
         let mut paths = Vec::new();
         for (path_element, _) in elements(&repo_inner, "path")? {
-            if let (Some(project), Some(repository)) = (
-                tag_attr(&path_element, "project"),
-                tag_attr(&path_element, "repository"),
-            ) {
-                paths.push((xml_unescape(&project), xml_unescape(&repository)));
-            }
+            let project = tag_attr(&path_element, "project").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <path> without project",
+                )
+            })?;
+            let repository = tag_attr(&path_element, "repository").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <path> without repository",
+                )
+            })?;
+            paths.push((xml_unescape(&project), xml_unescape(&repository)));
         }
         let mut downloads = Vec::new();
         for (download_tag, download_inner) in elements(&repo_inner, "download")? {
-            let Some(url) = tag_attr(&download_tag, "url") else {
-                continue;
-            };
-            let master =
-                elements(&download_inner, "master")?
-                    .into_iter()
-                    .find_map(|(master_tag, _)| {
-                        tag_attr(&master_tag, "url").map(|master_url| DownloadMaster {
+            let url = tag_attr(&download_tag, "url").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <download> without url",
+                )
+            })?;
+            let master = elements(&download_inner, "master")?
+                .into_iter()
+                .map(|(master_tag, _)| {
+                    tag_attr(&master_tag, "url")
+                        .map(|master_url| DownloadMaster {
                             url: xml_unescape(&master_url),
                             sslfingerprint: tag_attr(&master_tag, "sslfingerprint")
                                 .map(|value| xml_unescape(&value)),
                         })
-                    });
+                        .ok_or_else(|| {
+                            GeectlError::new(
+                                ErrorKind::ServerError,
+                                "unexpected OBS project meta response: <master> without url",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .next();
             downloads.push(RepositoryDownload {
                 arch: tag_attr(&download_tag, "arch").map(|value| xml_unescape(&value)),
                 url: xml_unescape(&url),
@@ -1102,9 +1124,12 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
         }
         let mut release_targets = Vec::new();
         for (target_tag, _) in elements(&repo_inner, "releasetarget")? {
-            let Some(project) = tag_attr(&target_tag, "project") else {
-                continue;
-            };
+            let project = tag_attr(&target_tag, "project").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <releasetarget> without project",
+                )
+            })?;
             release_targets.push(ReleaseTarget {
                 project: xml_unescape(&project),
                 repository: tag_attr(&target_tag, "repository").map(|value| xml_unescape(&value)),
@@ -1113,12 +1138,19 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
         }
         let mut hostsystem = Vec::new();
         for (host_tag, _) in elements(&repo_inner, "hostsystem")? {
-            if let (Some(project), Some(repository)) = (
-                tag_attr(&host_tag, "project"),
-                tag_attr(&host_tag, "repository"),
-            ) {
-                hostsystem.push((xml_unescape(&project), xml_unescape(&repository)));
-            }
+            let project = tag_attr(&host_tag, "project").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <hostsystem> without project",
+                )
+            })?;
+            let repository = tag_attr(&host_tag, "repository").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <hostsystem> without repository",
+                )
+            })?;
+            hostsystem.push((xml_unescape(&project), xml_unescape(&repository)));
         }
         repositories.push(Repository {
             name: xml_unescape(&repo_name),

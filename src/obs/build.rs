@@ -1670,27 +1670,45 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
                 )
             })?;
             // A path without a repository attribute names no
-            // (project, repository) pair, so it is dropped - the
-            // same rule project_meta applies to its paths.
-            if let Some(repository) = xml_attr_non_empty(path_tag, "repository") {
-                paths.push((project, repository));
-            }
+            // (project, repository) pair, so the response is
+            // malformed, not a path to keep: the server always
+            // names the repository a path builds against.
+            let repository = xml_attr_non_empty(path_tag, "repository").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <path> without repository",
+                )
+            })?;
+            paths.push((project, repository));
         }
         let mut downloads = Vec::new();
         for download in xml_elements(content, "download")? {
             let (download_tag, download_inner) = xml_split_element(download, "download");
-            let Some(url) = xml_attr_non_empty(download_tag, "url") else {
-                continue;
-            };
+            let url = xml_attr_non_empty(download_tag, "url").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <download> without url",
+                )
+            })?;
             let master = xml_elements(download_inner, "master")?
                 .into_iter()
-                .find_map(|master_element| {
+                .map(|master_element| {
                     let (master_tag, _) = xml_split_element(master_element, "master");
-                    xml_attr_non_empty(master_tag, "url").map(|master_url| DownloadMaster {
-                        url: master_url,
-                        sslfingerprint: xml_attr_non_empty(master_tag, "sslfingerprint"),
-                    })
-                });
+                    xml_attr_non_empty(master_tag, "url")
+                        .map(|master_url| DownloadMaster {
+                            url: master_url,
+                            sslfingerprint: xml_attr_non_empty(master_tag, "sslfingerprint"),
+                        })
+                        .ok_or_else(|| {
+                            GeectlError::new(
+                                ErrorKind::ServerError,
+                                "unexpected OBS project meta response: <master> without url",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .next();
             downloads.push(RepositoryDownload {
                 arch: xml_attr_non_empty(download_tag, "arch"),
                 url,
@@ -1705,9 +1723,12 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
         let mut release_targets = Vec::new();
         for target in xml_elements(content, "releasetarget")? {
             let (target_tag, _) = xml_split_element(target, "releasetarget");
-            let Some(project) = xml_attr_non_empty(target_tag, "project") else {
-                continue;
-            };
+            let project = xml_attr_non_empty(target_tag, "project").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <releasetarget> without project",
+                )
+            })?;
             release_targets.push(ReleaseTarget {
                 project,
                 repository: xml_attr_non_empty(target_tag, "repository"),
@@ -1717,12 +1738,19 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
         let mut hostsystem = Vec::new();
         for host_element in xml_elements(content, "hostsystem")? {
             let (host_tag, _) = xml_split_element(host_element, "hostsystem");
-            if let (Some(project), Some(repository)) = (
-                xml_attr_non_empty(host_tag, "project"),
-                xml_attr_non_empty(host_tag, "repository"),
-            ) {
-                hostsystem.push((project, repository));
-            }
+            let project = xml_attr_non_empty(host_tag, "project").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <hostsystem> without project",
+                )
+            })?;
+            let repository = xml_attr_non_empty(host_tag, "repository").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <hostsystem> without repository",
+                )
+            })?;
+            hostsystem.push((project, repository));
         }
         repositories.push(Repository {
             name,
@@ -5732,6 +5760,23 @@ mod tests {
     }
 
     #[test]
+    fn both_repository_parsers_reject_children_without_required_values() {
+        // Both parsers fail closed on the same malformed children.
+        for body in [
+            "<project name=\"p\"><repository><arch>x86_64</arch></repository></project>",
+            "<project name=\"p\"><repository name=\"\"><arch>x86_64</arch></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" repotype=\"rpmmd\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master sslfingerprint=\"AB:CD\"/></download></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget repository=\"standard\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><hostsystem project=\"openSUSE:Factory\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><path project=\"openSUSE:Factory\"/></repository></project>",
+        ] {
+            assert!(parse_project_meta(body).is_err(), "{body}");
+            assert!(parse_repositories(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
     fn both_repository_parsers_agree_on_empty_attribute_values() {
         let body = "<project name=\"testproject\"><repository name=\"standard\" rebuild=\"\" block=\"\" linkedbuild=\"\"><arch>x86_64</arch><download arch=\"\" url=\"https://example.com\" repotype=\"\"><archfilter> </archfilter><master url=\"https://master.example.com\" sslfingerprint=\"\"/><pubkey> </pubkey></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"\" trigger=\"\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
         let via_project_meta = parse_project_meta(body).unwrap();
@@ -5797,6 +5842,21 @@ mod tests {
             parse_repositories("<project name=\"p\"><title>t</title></project>").unwrap(),
             Vec::<Repository>::new()
         );
+    }
+
+    #[test]
+    fn parse_repositories_rejects_children_without_required_values() {
+        // A child missing a required value is malformed, not a child
+        // to drop: the server always names them.
+        for body in [
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" repotype=\"rpmmd\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master sslfingerprint=\"AB:CD\"/></download></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget repository=\"standard\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><hostsystem project=\"openSUSE:Factory\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><path project=\"openSUSE:Factory\"/></repository></project>",
+        ] {
+            assert!(parse_repositories(body).is_err(), "{body}");
+        }
     }
 
     #[test]
