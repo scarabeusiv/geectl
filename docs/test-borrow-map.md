@@ -905,6 +905,20 @@ semantics, not its tests).**
 - `behave/features/build.feature` (3 scenarios — local buildroot/chroot,
   out of scope for v1 by design): nothing to adopt.
 
+## Batch 11 — remote list-scmsync-projects (#210)
+
+**Direct adoptions: 0. Spec reference: the count's own endpoint and
+validation (`count_scmsync_projects`, already tested), not osc's tests.**
+
+- No osc test pins listing projects by scmsync prefix:
+  `starts-with(scmsync` appears nowhere in osc's `tests/` or `behave/`,
+  and no test hits `/search/project/id` — the scmsync-prefix search is
+  API-only in osc (the count is recorded as such in `docs/cli-swaps.md`).
+- The adjacent scmsync cases do not transfer to the list:
+  `test_scmsync_obsinfo.py` (3 tests — obsinfo parsing, already counted)
+  and the `rmkpac.feature` `--scmsync` scenarios (meta write, already
+  counted under batch 4).
+
 ## Gap batch 2, wave 3 — package search by person / by devel project
 
 **Direct adoptions: 0. No osc test covers either form.**
@@ -1085,6 +1099,7 @@ scheduler entries.**
 | 8 services | 0 | 1 | 1 |
 | 9 Gitea ops | 2 | 13 | 15 |
 | 10 local-build flag parity | 0 (+spec ref) | 0 | 0 (+spec) |
+| 11 list-scmsync-projects (#210) | 0 | 0 | 0 |
 | Gap batch 2, wave 3 (#175, #176) | 0 | 0 | 0 |
 | Gap batch 3 — buildconfig --alternative-project (#252) | 0 (+spec ref) | 0 | 0 (+spec) |
 | Gap batch 3 — local-build log (#178) | 0 | 0 | 0 |

@@ -7133,6 +7133,41 @@ fn live_count_scmsync_projects_counts_the_synced_project() {
     );
 }
 
+/// The scmsync list lists the project whose scmsync starts with
+/// the prefix, and nothing for a prefix nothing uses.
+#[test]
+fn live_list_scmsync_projects_lists_the_synced_project() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let prefix = format!("https://live.example-{}/", unique_suffix());
+    let mut meta = client
+        .project_meta(&project)
+        .expect("read the project meta on the live instance");
+    meta.scmsync = Some(format!("{prefix}repo.git#main"));
+    client
+        .set_project_meta(&project, &meta, &DryRun::new(false))
+        .expect("point the project at its git source on the live instance");
+    assert_eq!(
+        client
+            .list_scmsync_projects(&prefix)
+            .expect("list scmsync projects on the live instance"),
+        vec![ProjectMatch {
+            name: project.clone(),
+            title: None,
+            description: None,
+        }],
+        "exactly the one synced project must be listed"
+    );
+    assert!(client
+        .list_scmsync_projects("https://live.example-nobody/")
+        .expect("list scmsync projects for an unused prefix")
+        .is_empty());
+}
+
 /// The project meta write reads back what was written.
 #[test]
 fn live_set_project_meta_writes_and_reads_back() {

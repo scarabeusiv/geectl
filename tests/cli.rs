@@ -2332,6 +2332,24 @@ fn remote_count_scmsync_projects_with_half_set_credentials_fails_with_config_err
     assert_eq!(value["error"]["code"], "config_error");
 }
 
+#[test]
+fn remote_list_scmsync_projects_with_half_set_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-scmsync-projects",
+            "https://github.com/openSUSE/",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
 // --- unconfigured credentialed read (issue #108) ---
 //
 // With nothing configured the credentialed read goes out without

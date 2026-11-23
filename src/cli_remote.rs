@@ -376,6 +376,11 @@ pub enum RemoteCommand {
         /// The git URL prefix to count projects for.
         url_prefix: String,
     },
+    /// List the projects syncing from a git URL prefix.
+    ListScmsyncProjects {
+        /// The git URL prefix to list projects for.
+        url_prefix: String,
+    },
     /// Show the owners of a package (project/package scope).
     Owners {
         /// The project the package lives in.
@@ -1162,6 +1167,20 @@ pub fn run_remote(
                 "count": count,
             });
             Ok((payload, text))
+        }
+        RemoteCommand::ListScmsyncProjects { url_prefix } => {
+            let matches = client.list_scmsync_projects(&url_prefix)?;
+            let payload = json!({
+                "url_prefix": url_prefix,
+                "projects": matches.iter().map(project_match_json).collect::<Vec<_>>(),
+            });
+            Ok((
+                payload,
+                with_header(
+                    &format!("url-prefix: {url_prefix}"),
+                    render_project_matches(&url_prefix, &matches),
+                ),
+            ))
         }
         RemoteCommand::Owners { project, package } => {
             let owners = client.owners(&project, &package)?;
@@ -5722,6 +5741,33 @@ mod tests {
             RemoteCommand::CountScmsyncProjects { url_prefix }
                 if url_prefix == "https://github.com/openSUSE/"
         ));
+    }
+
+    #[test]
+    fn list_scmsync_projects_parses_url_prefix_positional() {
+        let command = parse(&[
+            "geectl",
+            "remote",
+            "list-scmsync-projects",
+            "https://github.com/openSUSE/",
+        ]);
+        assert!(matches!(
+            command,
+            RemoteCommand::ListScmsyncProjects { url_prefix }
+                if url_prefix == "https://github.com/openSUSE/"
+        ));
+    }
+
+    #[test]
+    fn list_scmsync_projects_renders_title_less_matches_as_dash() {
+        // The id search carries no title, so every row renders `-`.
+        let matches = vec![ProjectMatch {
+            name: "home:alice:branches:foo".to_string(),
+            title: None,
+            description: None,
+        }];
+        let text = render_project_matches("https://github.com/openSUSE/", &matches);
+        assert!(text.contains("home:alice:branches:foo -"));
     }
 
     #[test]

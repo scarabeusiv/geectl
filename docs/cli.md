@@ -210,6 +210,7 @@ Commands:
   search-projects-by-person      Search projects by a person's login: every project whose meta names the login in a role
   search-packages-by-person      Search packages by a person's login: every package whose meta names the login in a role
   count-scmsync-projects         Count the projects syncing from a git URL prefix
+  list-scmsync-projects          List the projects syncing from a git URL prefix
   owners                         Show the owners of a package (project/package scope)
   owners-for-binary              Show the owners of a binary package
   owners-for-package             Show the owners of a package by name alone, in the owner root projects

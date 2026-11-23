@@ -3417,6 +3417,46 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// List the projects whose scmsync URL starts with `url_prefix`
+    /// (`GET /search/project/id?match=starts-with(scmsync,'...')`):
+    /// the same search the count reads, returning the projects
+    /// themselves instead of their number. The id search carries no
+    /// title or description, so the matches carry names only.
+    /// Requires credentials; a malformed response is an error,
+    /// never an empty list. The prefix is validated like a search
+    /// term — it goes into a single-quoted XPath string literal,
+    /// where a quote would break out of the literal (XPath has no
+    /// string escape).
+    ///
+    /// An agent lists scmsync projects to see which projects a git
+    /// URL prefix already covers, for example when routing a
+    /// submission to the git-backed project instead of a plain one.
+    pub fn list_scmsync_projects(
+        &self,
+        url_prefix: &str,
+    ) -> Result<Vec<ProjectMatch>, GeectlError> {
+        let url_prefix = validate_search_term(url_prefix)?;
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "listing scmsync projects requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let match_expr = format!("starts-with(scmsync,'{url_prefix}')");
+        let url = build_url(
+            &self.base,
+            &["search", "project", "id"],
+            &[("match", &match_expr)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_project_search(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS scmsync search response for {url_prefix:?}"),
+            )
+        })
+    }
+
     /// The owners of package `package` in project `project` (`GET
     /// /search/owner?project=...&package=...`). Requires credentials;
     /// without them the search fails loudly before any request. An
@@ -9794,6 +9834,88 @@ mod tests {
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client
             .count_scmsync_projects("https://github.com/openSUSE/")
+            .is_err());
+    }
+
+    #[test]
+    fn list_scmsync_projects_returns_the_matching_project_names() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29",
+            "<collection matches=\"2\"><project name=\"home:alice:branches:foo\"/><project name=\"home:alice:branches:bar\"/></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .list_scmsync_projects("https://github.com/openSUSE/")
+                .unwrap(),
+            vec![
+                ProjectMatch {
+                    name: "home:alice:branches:foo".to_string(),
+                    title: None,
+                    description: None,
+                },
+                ProjectMatch {
+                    name: "home:alice:branches:bar".to_string(),
+                    title: None,
+                    description: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn list_scmsync_projects_returns_an_empty_list_for_no_match() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29",
+            "<collection matches=\"0\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .list_scmsync_projects("https://github.com/openSUSE/")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn list_scmsync_projects_rejects_a_quoted_prefix_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.list_scmsync_projects("").is_err());
+        assert!(client.list_scmsync_projects("x' or '1'='1").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn list_scmsync_projects_requires_credentials() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client
+            .list_scmsync_projects("https://github.com/openSUSE/")
+            .is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn list_scmsync_projects_response_without_a_count_is_an_error() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29",
+            "<collection/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .list_scmsync_projects("https://github.com/openSUSE/")
+            .is_err());
+    }
+
+    #[test]
+    fn list_scmsync_projects_response_with_matches_but_no_projects_is_an_error() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=starts-with%28scmsync%2C%27https%3A%2F%2Fgithub.com%2FopenSUSE%2F%27%29",
+            "<collection matches=\"2\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .list_scmsync_projects("https://github.com/openSUSE/")
             .is_err());
     }
 
