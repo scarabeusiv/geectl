@@ -875,6 +875,82 @@ struct RepoCreateRequest {
     default_branch: Option<String>,
 }
 
+/// The pull request to create: the head branch label, the base
+/// branch, the title, and the optional body and draft flag. The
+/// head is a branch name on the same repo, or `owner:branch` on a
+/// fork; the base is the branch the pull request targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrCreateOptions {
+    /// The branch the change comes from: a branch name, or
+    /// `owner:branch` when the branch lives on a fork.
+    pub head: String,
+    /// The branch the pull request targets.
+    pub base: String,
+    /// The pull request title.
+    pub title: String,
+    /// The pull request body; omitted when unset.
+    pub body: Option<String>,
+    /// Open the pull request as a draft.
+    pub draft: bool,
+}
+
+impl PrCreateOptions {
+    /// Build and validate the options: the head is a branch name
+    /// or an `owner:branch` label, the base is a branch name, and
+    /// the title is non-empty.
+    pub fn new(head: &str, base: &str, title: &str) -> Result<Self, GeectlError> {
+        let options = PrCreateOptions {
+            head: head.to_string(),
+            base: base.to_string(),
+            title: title.to_string(),
+            body: None,
+            draft: false,
+        };
+        options.validate()?;
+        Ok(options)
+    }
+
+    /// The checks `new` runs: the head label and the base branch
+    /// name, and a non-empty title.
+    pub fn validate(&self) -> Result<(), GeectlError> {
+        validate_head_label(&self.head)?;
+        validate_git_branch_name(&self.base)?;
+        if self.title.trim().is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a pull request needs a non-empty title",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Validate a pull-request head label: a branch name, or
+/// `owner:branch` when the branch lives on a fork. A branch name
+/// never contains `:`, so the split is unambiguous.
+fn validate_head_label(head: &str) -> Result<(), GeectlError> {
+    match head.split_once(':') {
+        Some((owner, branch)) => {
+            validate_gitea_name(owner, "head owner")?;
+            validate_git_branch_name(branch)
+        }
+        None => validate_git_branch_name(head),
+    }
+}
+
+/// The body of `POST /api/v1/repos/{owner}/{repo}/pulls`: the head
+/// and base branches and the title always; the body only when set,
+/// the draft flag always (Gitea defaults it to false).
+#[derive(Debug, Serialize)]
+struct PrCreateRequest {
+    head: String,
+    base: String,
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    draft: bool,
+}
+
 /// The page size for Gitea list calls (`limit=50`, like osc's
 /// fork list), and the page bound: past it the call fails instead
 /// of reading unboundedly or silently truncating.
@@ -2761,6 +2837,54 @@ impl<'a> GiteaClient<'a> {
         self.edit_issue_state(owner, repo, number, "open", "reopen", dry_run)
     }
 
+    /// Create a pull request (`POST
+    /// /api/v1/repos/{owner}/{repo}/pulls`) and return the created
+    /// PR. DryRun-guarded like `pr_review`: the guard runs before
+    /// the POST, and the result is `None` in dry-run.
+    pub fn pr_create(
+        &self,
+        owner: &str,
+        repo: &str,
+        options: &PrCreateOptions,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaPullRequest>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        options.validate()?;
+        if !dry_run.allow(&format!(
+            "create pull request in {owner}/{repo} from {} to {}",
+            options.head, options.base
+        )) {
+            return Ok(None);
+        }
+        let request = PrCreateRequest {
+            head: options.head.clone(),
+            base: options.base.clone(),
+            title: options.title.clone(),
+            body: options.body.clone(),
+            draft: options.draft,
+        };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea pull-request create request: {err}"),
+            )
+        })?;
+        let url = build_url(
+            &self.base,
+            &["api", "v1", "repos", owner, repo, "pulls"],
+            &[],
+        );
+        let response = self.http.post_json_with(&url, &body, &self.credentials)?;
+        let parsed: GiteaPullRequest = serde_json::from_str(&response).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected Gitea pull-request response for {owner}/{repo}: {err}"),
+            )
+        })?;
+        Ok(Some(parsed))
+    }
+
     /// PATCH an issue's state and return the edited issue.
     fn edit_issue_state(
         &self,
@@ -3139,7 +3263,12 @@ impl<'a> GiteaClient<'a> {
 /// on a loopback host (a test instance only). Anything else is
 /// refused at construction, not at the first request. A trailing
 /// slash is stripped, not a path.
-fn validate_gitea_base(base: &str) -> Result<(), GeectlError> {
+/// Validate a Gitea base URL: scheme plus authority only, no path,
+/// query, fragment, or userinfo. `with_base` runs this before any
+/// client exists; callers that resolve credentials first call it
+/// first, so a misconfigured base reports itself instead of a
+/// misleading token error.
+pub fn validate_gitea_base(base: &str) -> Result<(), GeectlError> {
     // A base is scheme plus authority only: anything after the
     // authority would be string-concatenated into every Gitea URL
     // (see `build_url`), so a base such as
@@ -5245,6 +5374,98 @@ mod tests {
             .unwrap();
         assert!(review.is_none());
         assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_create_posts_the_create() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls",
+            &pr_json(123, "open", false),
+        );
+        let mut options = PrCreateOptions::new("feature", "main", "Add feature").unwrap();
+        options.body = Some("The feature body.".to_string());
+        let created = client(&http)
+            .pr_create("openSUSE", "geectl", &options, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(created.number, 123);
+        assert_eq!(created.title, "change_review_state");
+        assert_eq!(created.head.branch, "change-review-state");
+        assert_eq!(created.base.branch, "main");
+        let calls = http.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            r#"{"head":"feature","base":"main","title":"Add feature","body":"The feature body.","draft":false}"#
+        );
+        assert!(calls[0].2);
+    }
+
+    #[test]
+    fn pr_create_without_body_omits_it() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls",
+            &pr_json(123, "open", false),
+        );
+        let options = PrCreateOptions::new("feature", "main", "Add feature").unwrap();
+        client(&http)
+            .pr_create("openSUSE", "geectl", &options, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(
+            http.post_calls()[0].1,
+            r#"{"head":"feature","base":"main","title":"Add feature","draft":false}"#
+        );
+    }
+
+    #[test]
+    fn pr_create_draft_sends_draft_true() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls",
+            &pr_json(123, "open", false),
+        );
+        let mut options =
+            PrCreateOptions::new("scarabeusiv:feature", "main", "Add feature").unwrap();
+        options.draft = true;
+        client(&http)
+            .pr_create("openSUSE", "geectl", &options, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(
+            http.post_calls()[0].1,
+            r#"{"head":"scarabeusiv:feature","base":"main","title":"Add feature","draft":true}"#
+        );
+    }
+
+    #[test]
+    fn pr_create_dry_run_posts_nothing() {
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/pulls",
+            &pr_json(123, "open", false),
+        );
+        let options = PrCreateOptions::new("feature", "main", "Add feature").unwrap();
+        let created = client(&http)
+            .pr_create("openSUSE", "geectl", &options, &DryRun::new(true))
+            .unwrap();
+        assert!(created.is_none());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn pr_create_options_rejects_bad_head_base_and_title() {
+        for (head, base, title) in [
+            ("", "main", "Add feature"),
+            ("a b", "main", "Add feature"),
+            ("a..b", "main", "Add feature"),
+            ("own er:feature", "main", "Add feature"),
+            ("feature", "", "Add feature"),
+            ("feature", "a b", "Add feature"),
+            ("feature", "main", ""),
+            ("feature", "main", "   "),
+        ] {
+            assert!(
+                PrCreateOptions::new(head, base, title).is_err(),
+                "{head:?} to {base:?} with title {title:?} must not build"
+            );
+        }
     }
 
     #[test]
