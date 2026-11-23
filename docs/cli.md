@@ -3,7 +3,9 @@
 The command reference for the geectl binary: one subcommand per
 operation, grouped under a top-level noun (`remote`, `request`,
 `branch`, `build`, `maintenance`, `service`, `gitea`, `pull-request`), plus `version`
-and `config`.
+and `config`, plus the ten working-copy leaves (`checkout`, `update`,
+`status`, `diff`, `add`, `rm`, `addremove`, `commit`, `pull`,
+`resolve`) that operate on the checkout in the current directory.
 Every `--help` block below is the real output of the built binary;
 run `geectl --help` or `geectl <group> --help` for the same text live.
 
@@ -121,6 +123,16 @@ Commands:
   gitea         Gitea operations: repository and branch reads and mutations on the configured instance
   pull-request  Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface
   changelog     Validate and generate `.changes` entries in a package directory, pre-file
+  checkout      Check out a package into a git working copy, under the current directory
+  update        Update the working copy in the current directory to the latest base
+  status        Show the working copy's state against the base
+  diff          Show the diff of the worktree and the index against the base
+  add           Stage files for commit
+  rm            Remove files from the working copy
+  addremove     Stage every change in the worktree
+  commit        Commit the staged changes
+  pull          Pull a linked package to the link target's latest revision
+  resolve       Stage the resolved files and continue a stopped rebase
   help          Print this message or the help of the given subcommand(s)
 
 Options:
@@ -739,6 +751,161 @@ Options:
           Prepend the draft into the package's `.changes` file instead of printing it
   -h, --help
           Print help
+```
+
+## Working copy — git working copy
+
+The working-copy leaves operate on the checkout in the current
+directory: `checkout` writes `<dir>/<project>/<package>/` under the
+current directory (a `:` in a project or package name becomes `_` in
+the directory name), the rest open the checkout found there. `commit`
+runs the source services and `pre_checkin.sh` before sending, unless
+`--noservice` is passed. The base record lives in the checkout's git
+config (`geectl.apiurl`, `geectl.project`, `geectl.package`,
+`geectl.backend`, `geectl.base-rev`, `geectl.base-srcmd5`).
+
+```
+Check out a package into a git working copy, under the current directory
+
+Usage: geectl checkout [OPTIONS] <PROJECT> <PACKAGE>
+
+Arguments:
+  <PROJECT>  The OBS project
+  <PACKAGE>  The OBS package
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --rev <REV>        The revision to check out (a number or a source md5). The latest when omitted
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Update the working copy in the current directory to the latest base
+
+Usage: geectl update [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --rev <REV>        The revision to update to (a number or a source md5). The latest when omitted
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Show the working copy's state against the base
+
+Usage: geectl status [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Show the diff of the worktree and the index against the base
+
+Usage: geectl diff [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Stage files for commit
+
+Usage: geectl add [OPTIONS] <FILES>...
+
+Arguments:
+  <FILES>...  The files to stage, relative to the checkout root
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Remove files from the working copy
+
+Usage: geectl rm [OPTIONS] <FILES>...
+
+Arguments:
+  <FILES>...  The files to remove, relative to the checkout root
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Stage every change in the worktree
+
+Usage: geectl addremove [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Commit the staged changes
+
+Usage: geectl commit [OPTIONS] --message <MESSAGE>
+
+Options:
+      --format <FORMAT>    Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+  -m, --message <MESSAGE>  The commit message
+      --debug              Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --noservice          Skip the service gate (no source services, no `pre_checkin.sh`)
+      --debug-body         Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live               Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help               Print help
+```
+
+```
+Pull a linked package to the link target's latest revision
+
+Usage: geectl pull [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
+```
+Stage the resolved files and continue a stopped rebase
+
+Usage: geectl resolve [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
 ```
 
 ## Common tasks

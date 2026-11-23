@@ -553,7 +553,34 @@ geectl unit tests.
 
 ## Batch 6 — working-copy layer
 
-**Direct adoptions: 0. Spec reference: 36 tests.**
+**Direct adoptions: 6 (5 commit-protocol cases + 1 status-vocabulary
+reference). Live new-from-scratch: 2 tests.**
+
+Adopted in this batch, each pinned by a geectl test:
+
+- `tests/test_commit.py:37` `test_simple` — validate → final
+  `commitfilelist`, per-file staged PUT, open-request check, revision 2:
+  `working_copy::tests::commit_obs_sends_the_index_state` + the live
+  `live_working_copy_checkout_edit_commit_update`.
+- `tests/test_commit.py:113` — refuse with nothing to do:
+  `working_copy::tests::commit_obs_refuses_nothing_to_commit`.
+- `tests/test_commit.py:264` `test_expand` — expanded-package `keeplink=1`:
+  `obs::remote::tests::commit_filelist_keeplink_passes_the_flag`.
+- `tests/test_commit.py:338` / `:363` — SHA256 digest variants:
+  `obs::remote::tests::commit_filelist_sha256_challenge_names_the_files`.
+- `tests/test_package_status.py` (8) — the status vocabulary (A/?/D/!/R/M/S/` `/C):
+  `working_copy::tests::status_maps_porcelain_codes`.
+
+Not adopted as tests in this batch (implemented, no pinning test):
+refuse on conflict (`test_commit.py:100`), partial commit by file list
+(`:165`), added-file-missing refusal (`:277`, `:296`), remote-exists
+idempotence (`:238`), IOError mid-PUT abort (`:190`), server 500 on the
+final `commitfilelist` (`:316`). `tests/test_update.py` (20) transfers
+as file-list diff semantics through the rebase mechanics, pinned by
+`working_copy::tests::update_obs_rebases_local_commits_onto_the_new_base`
+and the live update test — no individual case adopted one-to-one;
+size-limit skipping does not transfer (no size refusal), and the resume
+cases become "an interrupted update leaves a valid old base".
 
 osc's WC tests are the only specification of the commit/update protocol;
 whether they transfer depends on the API-only-vs-`.osc`-compatible decision.
@@ -800,7 +827,8 @@ Batch in brackets:
   `test_project_status.py` (17), `test_addfiles.py` (6),
   `test_deletefiles.py` (16), `test_revertfiles.py` (9),
   `test_init_package.py` (6), `test_init_project.py` (5), `test_vc.py` (4);
-  Behave checkout/add/rm/mv/repairwc scenarios — geectl has no working copy.
+  Behave checkout/add/rm/mv/repairwc scenarios — they pin the `.osc`
+  layout and osc's CLI text, not the git working copy.
 - CLI text/arity/formatting: `test_request.py` display tests (`:431`,
   `:449`, `:464`, `:500`), `test_commandline.py` arg-parsing class (18 of the
   slice — `TestPopProjectPackageRepositoryArchFromArgs` or

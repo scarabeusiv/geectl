@@ -17,7 +17,7 @@ The backend kind selects the implementation underneath.
 
 The agent-facing flow is one flow with five steps, identical on both
 backends (governing target: issue #23). The backend kind (OBS-native vs
-git-backed, recorded in `.geectl/wc.json` at checkout, #17) selects the
+git-backed, recorded in git config `geectl.*` at checkout, #17) selects the
 implementation underneath; it never changes the call the agent makes,
 and no Gitea/OBS name leaks into the user-facing surface. The separate
 `GiteaClient` (§ "Typed API shape") stays internal plumbing — the
@@ -28,7 +28,7 @@ surface.
 |---|---|---|---|
 | `update` | Working-copy `update` (#17): `list_files` at latest rev + `cat` for changed files, three-way compare, base manifest swap | The same `update` call: the OBS source API serves the synced tree, so the same code path runs | Settled as the same call; whether `update` itself verifies sync freshness is open (decision 8) |
 | `changes` (`status` / `diff`) | Local disk vs base manifest vs remote listing (#17) | Identical — local comparison only; the backend never changes the read path | Settled |
-| `commit` | `commit_filelist` + staged PUTs (`rev=repository`) → exactly one revision (#17) | The #17 dispatch point: the same `commit` call dispatches on the recorded backend kind. The agent pushes with the git CLI (geectl never shells out to git); `commit` takes the pushed head SHA and polls the OBS side until the synced commit matches (bounded 60 s), then reports; without a head SHA it refuses with `ScmsyncReadOnly` | Settled in shape; poll-vs-refuse is open (decision 3) |
+| `commit` | `commit_filelist` + staged PUTs (`rev=repository`) → exactly one revision (#17) | The #17 dispatch point: the same `commit` call dispatches on the backend kind recorded in git config `geectl.*` at checkout. The agent pushes with the git binary through the working-copy `Git` wrapper (argv-only); `commit` takes the pushed head SHA and polls the OBS side until the synced commit matches (bounded 60 s), then reports | Settled |
 | `submit` | OBS submit request: `file`/`refile` via `SrFiling` → request id (batch 2) | Gitea PR: `pr_create` (phase 3) — the same `submit` operation, different backend. The user sees `submit` and a pull-request reference; the backend decides whether that is an SR or a PR | Settled in principle; the unified return type is settled (decision 7) |
 | `maintenance revisions` | OBS maintenance incident: `file_maintenance_incident` (batch 6) → incident + request | Open question (decision 9): the incident machinery is OBS-side, so the likely shape is the same OBS incident filed from the synced sources — but the Gitea-side route (a PR against the maintenance branch) is the alternative if that proves unworkable | Open |
 
@@ -604,8 +604,8 @@ else; construction fails closed when no token is configured.
   (`already_exists`) — ForkExists / a repo of the requested name
   already existing. It is a distinct, actionable state (reuse the
   fork, pick another name), not an `InvalidInput` and not a
-  `ServerError`. `ScmsyncReadOnly` stays in #17 (the working-copy
-  commit refusal), not this batch.
+  `ServerError`. `commit` on a git-backed checkout (push + poll) is
+  the working-copy layer's (#17), not this batch's.
 - Redirects: Gitea answers 301s on several operations (osc's
   `test_gitea_exceptions.py` maps one per operation). The client
   never follows a redirect to a different host — the token must
@@ -630,20 +630,23 @@ so fork never waits.
 ## The #17 dispatch point (git-backed commit)
 
 The working-copy design records the backend kind (`obs` | `git`)
-in `.geectl/wc.json` at checkout and refuses `commit` on a
-git-backed checkout with structured `ScmsyncReadOnly` until this
-batch lands. What this batch provides for that dispatch:
+in git config `geectl.*` at checkout. On a git-backed checkout,
+`commit` pushes with the git binary through the working-copy `Git`
+wrapper (argv-only), takes the pushed head SHA, and polls the OBS
+side (`_scmsync.obsinfo` `commit:`) until the synced commit matches,
+bounded 60 s, then reports. What this batch provides for that
+dispatch:
 
 - `branch_head` (phase 2): the SHA to compare against.
 - `repo_get` (phase 1): the fork's parent and default branch, for
   the refusal message ("push to the fork, then sync").
-- Nothing else: the push itself is the agent's `git push` (git
-  CLI), and the sync wait is decision 3. The commit dispatch
-  itself (refuse vs poll-until-synced) is a small follow-up batch
-  after phase 2, not part of #20 — it needs the sync-wait design
-  decided first, and it must not block the `branch`/`submit`
-  operations. This dispatch is the `commit` step of the uniform flow
-  (§ "Uniform flow").
+- The `_scmsync.obsinfo` parse rules (adopted from
+  `test_scmsync_obsinfo.py`): the `commit:` field the poll compares
+  against.
+
+The push itself is the agent's `git push` through the `Git` wrapper,
+and the sync wait is the 60 s bounded poll. This dispatch is the
+`commit` step of the uniform flow (§ "Uniform flow").
 
 ## Debug channel (#51)
 
@@ -762,9 +765,9 @@ with unique repo names per test (same rule as the OBS live suite).
   being designed in parallel; the batches are independent. The
   gap-map order (services 8, Gitea 9) is about landing order, not
   design order.
-- The working-copy layer (#17) stays OBS-native; its
-  `ScmsyncReadOnly` refusal is the interim behaviour until the
-  commit dispatch lands, not a gap to work around.
+- The working-copy layer (#17) covers both backends: OBS-native
+  commit through `commitfilelist`, git-backed commit through push +
+  poll (see the #17 dispatch point).
 
 ## Out of scope (v1) — decided here, not deferred silently
 
@@ -810,8 +813,7 @@ with unique repo names per test (same rule as the OBS live suite).
    synced?** Recommend poll-with-bound: the #17 commit dispatch
    takes the pushed head SHA and polls the OBS side until the
    synced commit matches (bounded, 60 s like the accept retry),
-   then reports; without a head SHA it refuses with
-   `ScmsyncReadOnly`. The alternative (refuse always until the
+   then reports. The alternative (refuse always until the
    filer proves freshness) stalls every git-backed commit on a
    manual check.
 4. **PR scope in v1: read/act only, or staging + new-package-

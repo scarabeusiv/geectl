@@ -8,7 +8,8 @@
 //!
 //! All ten commands take explicit `--project`/`--package` (etc.)
 //! flags, always required: no positionals, no working-copy defaults
-//! (geectl has no working copy). Mutations are dry-run by
+//! (the branch leaves take explicit coordinates; the working-copy
+//! leaves are the ones that use the checkout). Mutations are dry-run by
 //! default; the global `--live` flag performs them.
 //!
 //! Text rendering: every command's text starts

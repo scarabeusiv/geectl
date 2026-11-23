@@ -3,17 +3,17 @@
 Every deliberate deviation from osc's command/flag shape in the CLI
 rollout, with the consistency reason. Where geectl matches osc, there
 is no row. The scheme-level rows apply across all
-seven groups and are listed once; the per-group sections list only
+nine groups and are listed once; the per-group sections list only
 what is specific to that group.
 
 ## Scheme-level (all groups)
 
 | osc | geectl | Why |
 |---|---|---|
-| Positional `PROJECT`/`PACKAGE` args, often defaulting to the working copy | Explicit `--project`/`--package` (etc.) flags, always required; required coordinates that stay positional are the query itself | No positionals for options, no working-copy defaults (geectl has no working copy, issue #17) |
-| Short flags (`-f`, `-r`, `-m`, `-e`, `-k`, `-d`, `-N`, `-M`, `-c`, `-R`, `-u`, `-t`, `-a`, `-l`, `-w`, `-s`, `-b`, `-V`, `-F`, `-o`) | Long forms only, no short flags | Agents type full names; one flag name per concept, no aliasing |
+| Positional `PROJECT`/`PACKAGE` args, often defaulting to the working copy | Explicit `--project`/`--package` (etc.) flags, always required; required coordinates that stay positional are the query itself | No positionals for options; the grouped commands name their coordinates explicitly. The working-copy leaves are the exception: they operate on the checkout in the current directory and take no coordinates, apart from `checkout`'s project/package positionals |
+| Short flags (`-f`, `-r`, `-m`, `-e`, `-k`, `-d`, `-N`, `-M`, `-c`, `-R`, `-u`, `-t`, `-a`, `-l`, `-w`, `-s`, `-b`, `-V`, `-F`, `-o`) | Long forms only, except `commit -m` | Agents type full names; one flag name per concept, no aliasing. `commit -m` is the one short flag, carried over from the working-copy command shape |
 | Command aliases (`r`, `bl`, `blt`, `buildhist`, `jobhist`, `rpmlint`, `lint`, `bco`, `branchco`, `getpac`, …) | No aliases | Full names only; no aliases |
-| Working-copy inference (project/package from the `.osc` checkout) | Explicit coordinates always | Geectl has no working copy (issue #17); every command names its project |
+| Working-copy inference (project/package from the `.osc` checkout) | Explicit coordinates always, except the working-copy leaves, which read project/package from the checkout in the current directory | The grouped commands name their coordinates; the working-copy leaves are the ones that use the checkout |
 | Per-command output formats (`--xml`, `--csv`, `--format` with named-field interpolation) and human text only | One global `--format json\|text` | One output switch for the whole CLI, per the #51/#52 design; every command returns `(payload, text)` |
 | `osc` mutates on invocation | Every mutation is dry-run by default; the global `--live` performs it | Geectl-wide rule (library `DryRun` default): an agent sees the plan before anything changes. The dry run prints the plan on stderr and returns `dry_run: true` |
 | `osc -m/--message` for several meanings | `--comment` for state-change, review, and branch messages; `--description` for a filing's description | One flag name per concept everywhere, instead of one flag carrying two meanings |
@@ -86,7 +86,7 @@ no row.
 | Flat top-level commands (`branch`, `copypac`, `linkpac`, …) | `branch <subcommand>` group | Uniform grouping: one top-level noun per library module across all seven CLI groups; osc's flat list doesn't scale and collides (`branch` vs `mbranch`) |
 | `osc branch` | `branch branch-package` | Grouped + spelled-out operation name (kebab-case library name) |
 | `osc branch --nodevelproject` | `--no-devel-project` | Kebab-case flag names everywhere (osc concatenates) |
-| `osc branch -c/--checkout` | Dropped (aliases `bco`/`branchco`/`getpac` go with it) | Branches AND checks out a working copy; geectl has no working copy |
+| `osc branch -c/--checkout` | `branch branch-package` then `checkout PROJECT PACKAGE` (aliases `bco`/`branchco`/`getpac` have no equivalent) | Branches AND checks out a working copy; geectl does the two steps as two commands — the branch, then a checkout of the new package |
 | `osc branch --disable-build` | Dropped | No corresponding option on `BranchOptions`; branch meta build flags are out of the branch op's scope |
 | `osc copypac` | `branch copy-package` | Grouped + spelled-out (osc abbreviates to `copypac`) |
 | `osc copypac -c/--client-side-copy` | Dropped (same-instance form) | Client-side download/upload copy of a single package; the cross-instance form exists as `--to-apiurl`, but there is no same-instance client-side mode — the same-instance copy stays server-side |
@@ -180,7 +180,7 @@ without evaluating trust.
 |---|---|---|
 | `osc mbranch [SOURCEPACKAGE [TARGETPROJECT]]` (flat top-level command, positionals) | `maintenance maintenance-branch --package … [--target-project …]` | Grouped under the maintenance noun; package and target are named flags, no positionals anywhere in geectl |
 | `osc maintained` / `osc sm` (aliases of `mbranch`, list-only) | `maintenance maintained-instances --package …` | The list form is its own leaf, not an alias or a mode flag on the branch command. Semantics match for `sm`: both are the dry-run branch call that reports without branching. `osc maintained` additionally prints `[git] org/package:branch` lines from the Gitea cache, which geectl does not reproduce (Gitea scope, issue #20) |
-| `osc mbranch -c/--checkout` | Dropped | Branches AND checks out a working copy; geectl has no working copy. (The `--checkout` help calls `osc bco` a shorthand for it, but `bco` is a separate branch/getpac command, not an mbranch alias.) |
+| `osc mbranch -c/--checkout` | `maintenance maintenance-branch` then `checkout PROJECT PACKAGE` | Branches AND checks out a working copy; geectl does the two steps as two commands — the branch, then a checkout of the new package. (The `--checkout` help calls `osc bco` a shorthand for it, but `bco` is a separate branch/getpac command, not an mbranch alias.) |
 | `osc mbranch --noaccess`, `--nodevelproject` | Dropped | No corresponding option on `MaintenanceBranchOptions` |
 | `osc mbranch --version` (print version of the maintained package) | Dropped | No geectl equivalent; the top-level `version` command reports geectl itself |
 
@@ -208,3 +208,20 @@ file-maintenance-incident`, issue #73).
 | `osc fork` | `gitea repo-fork` (Gitea half only) | `osc fork` is a composite: Gitea fork + OBS branch. `gitea repo-fork` is the Gitea half; the `branch` composite (Gitea fork + OBS `cmd=fork`) has no CLI command. `osc fork` is also scmsync-only, and it clones the fork locally and inits `.osc` — neither of which the Gitea half does |
 
 Scope note: the sibling `git-obs` entry point has `repo list` and `repo fork` (`osc/commands_git/repo_list.py`, `repo_fork.py`); they are `git-obs` commands, not `osc` commands, so they sit outside this table's stated scope — `git-obs repo list` requires `--org`/`--user` (no own-repos form).
+
+## Working copy — git working copy
+
+| osc | geectl | Why |
+|---|---|---|
+| `osc checkout` / `co` / `getpac` / `bco` `PROJECT PACKAGE` | `checkout PROJECT PACKAGE [--rev REV]` | Same checkout, different metadata: osc records the checkout in `.osc`; geectl checks the package out as a git working copy under `<dir>/<project>/<package>/` and records the base in git config (`geectl.apiurl`, `geectl.project`, `geectl.package`, `geectl.backend`, `geectl.base-rev`, `geectl.base-srcmd5`). A git-backed package is a real clone; an OBS-native package gets a synthesized repo with the base as its root commit. `checkout` streams every listed file to disk, with no size refusal |
+| `osc update` / `up` | `update [--rev REV]` | Same update, different merge: osc merges the new revision into the working copy; geectl rebases the local work onto the new base, and a conflict stays in the tree for the agent to resolve |
+| `osc status` / `st` | `status` | Same state read; the one-letter codes are `A` (added), `M` (modified), `D` (deleted), `?` (untracked), `!` (missing), `C` (conflict), `R` (renamed) |
+| `osc diff` | `diff` | The diff of the worktree and the index against the base, rendered verbatim; a linked package's link diff is out of scope |
+| `osc add FILE...` | `add FILE...` | Same stage |
+| `osc delete` / `rm FILE...` | `rm FILE...` | Same remove |
+| `osc addremove` | `addremove` | Same stage-everything |
+| `osc commit` / `ci` / `checkin` | `commit --message MSG [--noservice]` | Same commit, plus a hard gate: the source services and `pre_checkin.sh` run before the send, unless `--noservice` is passed. The send is the staged-plus-committed state against the base; unstaged worktree changes are not sent, except an unstaged edit to a file the service gate changed, which is staged whole with the gate's output |
+| `osc pull` | `pull` | Linked packages only: pulls the link target's latest revision into the checkout; a clean working copy (no uncommitted changes and no untracked files) and a recorded baserev are required |
+| `osc resolved` | `resolve` | Stages the resolved files; when a rebase is in progress and every conflict is resolved, continues it |
+| `osc mkpac PROJECT PACKAGE` | `remote create-package` then `checkout PROJECT PACKAGE` | `mkpac` creates the package AND checks it out; geectl has no such leaf — the create and the checkout are two commands |
+| `osc vc` | `changelog` (separate layer) | The changelog validation/generation layer is its own surface; the working copy does not validate the changelog before commit |
