@@ -130,6 +130,10 @@ pub enum RemoteCommand {
         project: String,
         /// The package to list.
         package: String,
+        /// List the files as of this revision (default: latest):
+        /// a revision number or a srcmd5.
+        #[arg(long)]
+        rev: Option<String>,
     },
     /// List the packages of a project.
     ListPackages {
@@ -674,11 +678,21 @@ pub fn run_remote(
                 bytes,
             ))
         }
-        RemoteCommand::ListFiles { project, package } => {
-            let files = client.list_files(&project, &package)?;
+        RemoteCommand::ListFiles {
+            project,
+            package,
+            rev,
+        } => {
+            let rev = rev.as_deref().map(RevisionSpec::parse).transpose()?;
+            let files = client.list_files(&project, &package, rev.as_ref())?;
             let payload = json!({
                 "project": project,
                 "package": package,
+                "rev": match &rev {
+                    None => Value::Null,
+                    Some(RevisionSpec::Rev(n)) => json!(n),
+                    Some(RevisionSpec::Md5(md5)) => json!(md5),
+                },
                 "files": files.iter().map(source_file_json).collect::<Vec<_>>(),
             });
             Ok((
@@ -3100,6 +3114,33 @@ mod tests {
         ]);
         assert!(
             matches!(parsed, RemoteCommand::Cat { rev: Some(ref r), .. } if r == "0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn list_files_parses_optional_rev() {
+        let parsed = parse(&["geectl", "remote", "list-files", "P", "K"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::ListFiles {
+                project,
+                package,
+                rev: None,
+            } if project == "P" && package == "K"
+        ));
+        let parsed = parse(&["geectl", "remote", "list-files", "P", "K", "--rev", "12"]);
+        assert!(matches!(parsed, RemoteCommand::ListFiles { rev: Some(ref r), .. } if r == "12"));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "list-files",
+            "P",
+            "K",
+            "--rev",
+            "0123456789abcdef0123456789abcdef",
+        ]);
+        assert!(
+            matches!(parsed, RemoteCommand::ListFiles { rev: Some(ref r), .. } if r == "0123456789abcdef0123456789abcdef")
         );
     }
 

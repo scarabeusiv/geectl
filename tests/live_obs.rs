@@ -1335,7 +1335,7 @@ fn live_list_files_and_packages_read_back() {
         .expect("upload b.spec on the live instance");
     let public = live_client(&base);
     let files = public
-        .list_files(&source_project, &package)
+        .list_files(&source_project, &package, None)
         .expect("list the package files on the live instance");
     let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
     assert!(
@@ -1348,6 +1348,82 @@ fn live_list_files_and_packages_read_back() {
     assert!(
         packages.contains(&package),
         "the project listing must hold the created package {package}; got {packages:?}"
+    );
+}
+
+/// Listing at a revision reads back the files of that revision:
+/// the rev-1 listing holds only the first file, the rev-2 listing
+/// holds both, the same revision by its srcmd5 matches rev 1, and
+/// the unpinned listing holds the latest.
+#[test]
+fn live_list_files_at_revision() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "a.spec",
+            "Name: a\nVersion: 1.0\n",
+            &DryRun::new(false),
+        )
+        .expect("upload a.spec on the live instance");
+    authed
+        .upload_file(
+            &source_project,
+            &package,
+            "b.spec",
+            "Name: b\nVersion: 1.0\n",
+            &DryRun::new(false),
+        )
+        .expect("upload b.spec on the live instance");
+    let public = live_client(&base);
+    let rev1_spec = RevisionSpec::Rev(1);
+    let rev2_spec = RevisionSpec::Rev(2);
+    let names_at = |rev: Option<&RevisionSpec>| {
+        public
+            .list_files(&source_project, &package, rev)
+            .expect("list the package files on the live instance")
+            .iter()
+            .map(|file| file.name.clone())
+            .collect::<Vec<String>>()
+    };
+    let rev1 = names_at(Some(&rev1_spec));
+    assert!(
+        rev1.contains(&"a.spec".to_string()) && !rev1.contains(&"b.spec".to_string()),
+        "rev 1 holds only the first file; got {rev1:?}"
+    );
+    let rev2 = names_at(Some(&rev2_spec));
+    assert!(
+        rev2.contains(&"a.spec".to_string()) && rev2.contains(&"b.spec".to_string()),
+        "rev 2 holds both files; got {rev2:?}"
+    );
+    // The same revision by its srcmd5: the history reports the
+    // source revision as a hash, and `list-files --rev` accepts it.
+    let log = authed
+        .package_log(&source_project, &package, None)
+        .expect("history on the live instance");
+    let srcmd5 = log
+        .iter()
+        .find(|entry| entry.rev == 1)
+        .expect("revision 1 in the history")
+        .srcmd5
+        .clone()
+        .expect("revision 1 carries a srcmd5");
+    let md5_spec = RevisionSpec::Md5(srcmd5);
+    let by_hash = names_at(Some(&md5_spec));
+    assert!(
+        by_hash.contains(&"a.spec".to_string()) && !by_hash.contains(&"b.spec".to_string()),
+        "rev 1 by srcmd5 holds only the first file; got {by_hash:?}"
+    );
+    let latest = names_at(None);
+    assert!(
+        latest.contains(&"a.spec".to_string()) && latest.contains(&"b.spec".to_string()),
+        "the unpinned listing holds the latest files; got {latest:?}"
     );
 }
 

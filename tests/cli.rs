@@ -806,6 +806,27 @@ fn remote_invalid_range_fails_fast_without_network() {
 }
 
 #[test]
+fn remote_invalid_list_files_rev_fails_fast_without_network() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-files",
+            "openSUSE:Factory",
+            "vim",
+            "--rev",
+            "not-a-rev",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
 fn remote_unreachable_server_fails_with_network_error() {
     // The base URL points at a closed loopback port: no server
     // answers, so the library fails with a network error and the CLI
@@ -971,6 +992,90 @@ fn remote_list_files_text_mode_opens_with_the_coordinate_header() {
     assert!(stdout.contains("vim.spec"), "{stdout}");
     // The md5 stays JSON-only.
     assert!(!stdout.contains("deadbeef"), "{stdout}");
+}
+
+#[test]
+fn remote_list_files_rev_carries_rev_in_the_payload_and_keeps_the_text_table() {
+    // The fixture answers the one request whatever its query is; the
+    // library unit tests pin `?rev=` on the wire. This pins the CLI
+    // half: the payload carries the parsed revision — a number as a
+    // number, an md5 as a string — and the text stays the design
+    // table under the coordinate header.
+    let body = "<directory><entry name=\"vim.spec\" size=\"1234\" mtime=\"1700000000\" md5=\"deadbeef\"/></directory>";
+    let dir = TempDir::new();
+    let addr = serve_once(body);
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-files",
+            "openSUSE:Factory",
+            "vim",
+            "--rev",
+            "2",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["rev"].as_u64(), Some(2));
+    assert_eq!(value["files"][0]["name"], "vim.spec");
+    let addr = serve_once(body);
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "list-files",
+            "openSUSE:Factory",
+            "vim",
+            "--rev",
+            "0123456789abcdef0123456789abcdef",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        value["rev"].as_str(),
+        Some("0123456789abcdef0123456789abcdef")
+    );
+    let addr = serve_once(body);
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "list-files",
+            "openSUSE:Factory",
+            "vim",
+            "--rev",
+            "2",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.lines().next(),
+        Some("project: openSUSE:Factory package: vim"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("vim.spec"), "{stdout}");
 }
 
 #[test]

@@ -236,7 +236,7 @@ impl ObsClient<'_> {
         if package == "_project" {
             self.authed_directory_listing(project, package)
         } else {
-            self.directory_listing(project, package)
+            self.directory_listing(project, package, None)
         }
     }
 

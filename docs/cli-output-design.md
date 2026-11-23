@@ -80,7 +80,7 @@ what "one coherent channel" means.
 - **Read-after-write retries** (the library's bounded retries, not the
   HTTP policy): each probe plus the remaining budget, e.g.
   `retry: create_package registration probe 1/30s: still not found`.
-  (test `src/obs/remote.rs:7676`).
+  (test `src/obs/remote.rs:7742`).
   These are retries with no output elsewhere — a retried
   `change_state` consuming its 60 s budget would otherwise leave no
   visible trace.

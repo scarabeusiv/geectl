@@ -1808,10 +1808,14 @@ impl<'a> ObsClient<'a> {
     /// parse it. A public read: no credentials. The path is the
     /// segments after `/public/source` (a project, or a
     /// project/package pair).
-    fn public_directory(&self, path: &[&str]) -> Result<DirectoryListing, GeectlError> {
+    fn public_directory(
+        &self,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<DirectoryListing, GeectlError> {
         let mut segments: Vec<&str> = vec!["public", "source"];
         segments.extend_from_slice(path);
-        let url = build_url(&self.base, &segments, &[]);
+        let url = build_url(&self.base, &segments, query);
         let body = self.http.get_with(&url, &Credentials::None)?;
         parse_directory(&body)
     }
@@ -1970,7 +1974,9 @@ impl<'a> ObsClient<'a> {
         self.http.get_to_file(&url, &Credentials::None, dest)
     }
 
-    /// GET a public directory listing (`/public/source/...`) and
+    /// GET a public directory listing (`/public/source/...`),
+    /// optionally at revision `rev` (`?rev=N` for a number,
+    /// `?rev=<srcmd5>` for the revision carrying that hash), and
     /// parse it, returning the full listing: files, link target, and
     /// service state. A public read: no credentials. Shared by the
     /// listing readers that need more than the file entries
@@ -1979,6 +1985,7 @@ impl<'a> ObsClient<'a> {
         &self,
         project: &str,
         package: &str,
+        rev: Option<&RevisionSpec>,
     ) -> Result<DirectoryListing, GeectlError> {
         for (label, value) in [("project", project), ("package", package)] {
             if !valid_obs_name(value) {
@@ -1988,15 +1995,35 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        self.public_directory(&[project, package])
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        let rev_text;
+        if let Some(rev) = rev {
+            rev_text = rev.to_string();
+            query.push(("rev", &rev_text));
+        }
+        self.public_directory(&[project, package], &query)
     }
 
     /// List the files of package `package` in project `project`
-    /// (`GET /public/source/<project>/<package>`). A public read: no
-    /// credentials. The listing carries each file's name, size,
-    /// modification time, and md5, in server order.
-    pub fn list_files(&self, project: &str, package: &str) -> Result<Vec<SourceFile>, GeectlError> {
-        Ok(self.directory_listing(project, package)?.entries)
+    /// (`GET /public/source/<project>/<package>`), optionally at
+    /// revision `rev` (`?rev=N` for a number, `?rev=<srcmd5>` for
+    /// the revision carrying that hash — the backend resolves the
+    /// hash). A public read: no credentials. The listing carries
+    /// each file's name, size, modification time, and md5, in
+    /// server order.
+    pub fn list_files(
+        &self,
+        project: &str,
+        package: &str,
+        rev: Option<&RevisionSpec>,
+    ) -> Result<Vec<SourceFile>, GeectlError> {
+        if let Some(RevisionSpec::Rev(0)) = rev {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "invalid revision: 0",
+            ));
+        }
+        Ok(self.directory_listing(project, package, rev)?.entries)
     }
 
     /// List the packages of project `project` (`GET
@@ -2010,7 +2037,7 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS project name: {project:?}"),
             ));
         }
-        let listing = self.public_directory(&[project])?;
+        let listing = self.public_directory(&[project], &[])?;
         Ok(listing
             .entries
             .into_iter()
@@ -2034,26 +2061,6 @@ impl<'a> ObsClient<'a> {
             .collect();
         names.sort();
         Ok(names)
-    }
-
-    /// List the files of a package at a revision (`GET
-    /// /public/source/<project>/<package>?rev=N`): the `rev`-carrying
-    /// form of [`ObsClient::list_files`], for diffing two revisions.
-    fn list_files_rev(
-        &self,
-        project: &str,
-        package: &str,
-        rev: Option<u64>,
-    ) -> Result<Vec<SourceFile>, GeectlError> {
-        let mut query: Vec<(&str, &str)> = Vec::new();
-        let rev_text;
-        if let Some(rev) = rev {
-            rev_text = rev.to_string();
-            query.push(("rev", &rev_text));
-        }
-        let url = build_url(&self.base, &["public", "source", project, package], &query);
-        let body = self.http.get_with(&url, &Credentials::None)?;
-        Ok(parse_directory(&body)?.entries)
     }
 
     /// Read the history of package `package` in project `project`
@@ -2136,14 +2143,14 @@ impl<'a> ObsClient<'a> {
             // empty — but only once the package is known to exist: a
             // bare short-circuit would also report an empty patch
             // for a package that is not there at all.
-            self.list_files_rev(project, package, Some(1))?;
+            self.list_files(project, package, Some(&RevisionSpec::Rev(1)))?;
             return Ok(RevisionPatch {
                 rev,
                 files: Vec::new(),
             });
         }
-        let new_files = self.list_files_rev(project, package, Some(rev))?;
-        let old_files = self.list_files_rev(project, package, Some(rev - 1))?;
+        let new_files = self.list_files(project, package, Some(&RevisionSpec::Rev(rev)))?;
+        let old_files = self.list_files(project, package, Some(&RevisionSpec::Rev(rev - 1)))?;
         let mut patches = Vec::new();
         for new in &new_files {
             match old_files.iter().find(|old| old.name == new.name) {
@@ -2509,7 +2516,7 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        Ok(self.public_directory(&[project, package])?.linkinfo)
+        Ok(self.public_directory(&[project, package], &[])?.linkinfo)
     }
 
     /// The per-file diff between two listings, one per package:
@@ -2606,8 +2613,8 @@ impl<'a> ObsClient<'a> {
                 ));
             }
         }
-        let old_files = self.list_files(old_project, old_package)?;
-        let new_files = self.list_files(new_project, new_package)?;
+        let old_files = self.list_files(old_project, old_package, None)?;
+        let new_files = self.list_files(new_project, new_package, None)?;
         self.diff_files(
             old_project,
             old_package,
@@ -2693,8 +2700,8 @@ impl<'a> ObsClient<'a> {
                 (true, false) => (PackageDiffStatus::OnlyInOld, Vec::new()),
                 (false, true) => (PackageDiffStatus::OnlyInNew, Vec::new()),
                 (true, true) => {
-                    let old_files = self.list_files(old, &name)?;
-                    let new_files = self.list_files(new, &name)?;
+                    let old_files = self.list_files(old, &name, None)?;
+                    let new_files = self.list_files(new, &name, None)?;
                     let files = self.diff_files(old, &name, &old_files, new, &name, &new_files)?;
                     let status = if files.is_empty() {
                         PackageDiffStatus::Identical
@@ -6244,7 +6251,7 @@ mod tests {
             DIRECTORY_FIXTURE,
         );
         let client = ObsClient::new(&http);
-        let files = client.list_files("openSUSE:Factory", "foo").unwrap();
+        let files = client.list_files("openSUSE:Factory", "foo", None).unwrap();
         assert_eq!(files.len(), 3);
         assert_eq!(files[0].name, "foo.spec");
         assert_eq!(files[2].name, "_link");
@@ -6255,6 +6262,63 @@ mod tests {
                 false
             )]
         );
+    }
+
+    #[test]
+    fn list_files_at_revision_passes_rev() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo?rev=2",
+            DIRECTORY_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        let files = client
+            .list_files("openSUSE:Factory", "foo", Some(&RevisionSpec::Rev(2)))
+            .unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].name, "foo.spec");
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo?rev=2".to_string(),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn list_files_at_srcmd5_passes_the_hash_as_rev() {
+        let hash = "0123456789abcdef0123456789abcdef";
+        let http = FakeHttp::new().with_get(
+            &format!("https://api.opensuse.org/public/source/openSUSE:Factory/foo?rev={hash}"),
+            DIRECTORY_FIXTURE,
+        );
+        let client = ObsClient::new(&http);
+        let files = client
+            .list_files(
+                "openSUSE:Factory",
+                "foo",
+                Some(&RevisionSpec::Md5(hash.to_string())),
+            )
+            .unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                format!("https://api.opensuse.org/public/source/openSUSE:Factory/foo?rev={hash}"),
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn list_files_rejects_rev_zero() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let err = client
+            .list_files("openSUSE:Factory", "foo", Some(&RevisionSpec::Rev(0)))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]
@@ -6323,7 +6387,9 @@ mod tests {
     fn list_calls_reject_bad_names() {
         let http = FakeHttp::new();
         let client = ObsClient::new(&http);
-        assert!(client.list_files("openSUSE:Factory", "foo/bar").is_err());
+        assert!(client
+            .list_files("openSUSE:Factory", "foo/bar", None)
+            .is_err());
         assert!(client.list_packages("openSUSE:Factory/x").is_err());
         assert!(http.get_calls().is_empty());
     }
