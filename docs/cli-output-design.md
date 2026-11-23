@@ -93,7 +93,7 @@ what "one coherent channel" means.
   `list_services <project>/<package>: <n> service(s)` — emitted by the services
   reads, unprefixed (the verb names the operation, as with the startup line;
   emit sites `src/obs/services.rs:277,281,307,314`).
-- **Startup line**: `geectl 0.2.1 request show 1398977` — the invoked
+- **Startup line**: `geectl <version> request show 1398977` — the invoked
   command line, so a pasted debug transcript is self-describing.
   There are no secret-valued flags, so nothing to redact; any
   secret-valued flag must be masked here by construction, never
