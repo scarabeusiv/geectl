@@ -26,6 +26,27 @@ fn version_flag_exits_zero() {
     assert!(text.contains("geectl"));
 }
 
+/// The binary must run under a 1 MiB main-thread stack: the Windows
+/// main thread carries 1 MiB, and the unoptimized CLI parse needs
+/// more than that. The limit is set in a shell wrapper so the test
+/// needs no unsafe code.
+#[test]
+#[cfg(unix)]
+fn version_flag_exits_zero_under_one_mib_stack() {
+    let out = Command::new("sh")
+        .args([
+            "-c",
+            "ulimit -s 1024; exec \"$@\"",
+            "sh",
+            env!("CARGO_BIN_EXE_geectl"),
+            "--version",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("geectl"));
+}
+
 #[test]
 fn version_subcommand_prints_json_on_stdout() {
     let out = geectl().arg("version").output().unwrap();
@@ -2535,9 +2556,12 @@ fn remote_mutation_invalid_input_fails(args: &[String], context: &str) {
 fn remote_upload_file_missing_from_fails_with_invalid_input() {
     let dir = TempDir::new();
     let missing = dir.0.join("missing.spec");
+    // The operating system text for a missing file differs per
+    // platform; derive it from the platform.
     let context = format!(
-        "cannot read {}: No such file or directory (os error 2)",
-        missing.display()
+        "cannot read {}: {}",
+        missing.display(),
+        std::io::Error::from_raw_os_error(2)
     );
     remote_mutation_invalid_input_fails(
         &[
@@ -4267,7 +4291,12 @@ fn config_show_reports_build_values_from_config_file() {
     );
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
-    assert_eq!(value["build_cache_dir"], "/srv/geectl-cache");
+    // The binary absolutizes the configured dir with
+    // `std::path::absolute`, which on Windows adds the current drive
+    // and normalizes the separators; the expectation uses the same call.
+    let expected = std::path::absolute("/srv/geectl-cache")
+        .unwrap_or_else(|_| std::path::PathBuf::from("/srv/geectl-cache"));
+    assert_eq!(value["build_cache_dir"], expected.to_str().unwrap());
     assert_eq!(value["build_cache_dir_source"], "config");
     assert_eq!(value["build_cache_cap_gib"], 40);
     assert_eq!(value["build_cache_cap_gib_source"], "config");
@@ -4277,7 +4306,10 @@ fn config_show_reports_build_values_from_config_file() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("build_cache_dir: /srv/geectl-cache (config)"),
+        stdout.contains(&format!(
+            "build_cache_dir: {} (config)",
+            expected.to_str().unwrap()
+        )),
         "{stdout}"
     );
     assert!(
@@ -4308,10 +4340,11 @@ fn config_show_reports_build_cache_dir_from_config_file_when_cap_unset() {
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     // A relative configured dir is reported absolutized, the way
-    // the build resolves it, not verbatim.
-    let expected = std::env::current_dir()
-        .unwrap()
-        .join("relative/geectl-cache");
+    // the build resolves it, not verbatim. The expectation uses the
+    // same `std::path::absolute` call the binary uses, so the
+    // separators match on every platform.
+    let expected = std::path::absolute("relative/geectl-cache")
+        .unwrap_or_else(|_| std::path::PathBuf::from("relative/geectl-cache"));
     assert_eq!(value["build_cache_dir"], expected.to_str().unwrap());
     assert_eq!(value["build_cache_dir_source"], "config");
     assert_eq!(value["build_cache_cap_gib"], 20);
@@ -4385,8 +4418,12 @@ fn config_show_reports_build_cap_from_config_file_when_dir_unset() {
 #[test]
 fn config_show_reports_error_source_when_default_cache_dir_unresolvable() {
     let dir = TempDir::new();
+    // USERPROFILE is the Windows home fallback: without clearing
+    // it the cache dir resolves on Windows and the error is not
+    // exercised.
     let out = geectl_isolated(&dir)
         .env_remove("XDG_CACHE_HOME")
+        .env_remove("USERPROFILE")
         .env("HOME", "")
         .args(["config", "show"])
         .output()
@@ -4406,6 +4443,7 @@ fn config_show_reports_error_source_when_default_cache_dir_unresolvable() {
     assert_eq!(value["build_cache_cap_gib_source"], "default");
     let out = geectl_isolated(&dir)
         .env_remove("XDG_CACHE_HOME")
+        .env_remove("USERPROFILE")
         .env("HOME", "")
         .args(["--format", "text", "config", "show"])
         .output()

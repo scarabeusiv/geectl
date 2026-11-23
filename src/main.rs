@@ -45,9 +45,12 @@ impl Format {
     }
 }
 
+// The binary name is pinned so --help reads the same on every
+// platform: without it clap prints argv[0], `geectl.exe` on Windows.
 #[derive(Debug, Parser)]
 #[command(
     name = "geectl",
+    bin_name = "geectl",
     version,
     about = "Geeko Controller — a CLI for openSUSE packaging workflows (OBS + src.opensuse.org)",
     long_about = None
@@ -601,6 +604,34 @@ remediation: {}",
 }
 
 fn main() -> ExitCode {
+    // The Windows main thread carries a 1 MiB stack, and the CLI
+    // parse in an unoptimized build needs more than that (measured
+    // 1.0-1.5 MiB for `--version` on arm64 debug, over 1 MiB on
+    // x86_64 debug). Run the real
+    // entry on a thread with an explicit stack; 32 MiB is virtual
+    // reservation only, committed on demand. The thread is named
+    // `main` so panic reports keep naming it, and a panic resumes
+    // on the joining thread so the exit behaviour is unchanged.
+    // A thread that cannot start leaves no other way to run: run
+    // inline on the current stack instead of failing outright.
+    const STACK_SIZE: usize = 32 * 1024 * 1024;
+    match std::thread::Builder::new()
+        .name("main".to_string())
+        .stack_size(STACK_SIZE)
+        .spawn(real_main)
+    {
+        Ok(child) => match child.join() {
+            Ok(code) => code,
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+        Err(err) => {
+            eprintln!("geectl: cannot start the main thread ({err}); running inline");
+            real_main()
+        }
+    }
+}
+
+fn real_main() -> ExitCode {
     // Parse errors go through the single error path, not clap's
     // default (usage on stderr, exit 2, no JSON). Help and version are
     // the exception: they print clap's text to stdout and exit 0.

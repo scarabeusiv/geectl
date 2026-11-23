@@ -246,7 +246,7 @@ fn validate_format(value: &str, source: &str) -> Result<String, GeectlError> {
 /// `XDG_CONFIG_HOME` is set and absolute — a relative value is
 /// ignored per the XDG spec) and the `~/.config` default (only when
 /// `HOME` is absolute — a relative HOME would make a CWD-relative
-/// config path).
+/// config path). On Windows, `USERPROFILE` stands in for `HOME`.
 fn candidate_paths(
     xdg_config_home: Option<&str>,
     home: Option<&str>,
@@ -263,15 +263,40 @@ fn candidate_paths(
     (xdg, default)
 }
 
+/// The home directory for path resolution: `HOME`, except on
+/// Windows, where Git Bash sets `HOME` to a POSIX-style path
+/// (`/c/Users/u`) that is not a Windows-absolute path — there
+/// `HOME` counts only when absolute, and `USERPROFILE` is the
+/// fallback.
+pub(crate) fn home_dir<'a>(home: Option<&'a str>, userprofile: Option<&'a str>) -> Option<&'a str> {
+    #[cfg(windows)]
+    {
+        home.filter(|h| Path::new(*h).is_absolute()).or(userprofile)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = userprofile;
+        home
+    }
+}
+
 /// Resolve the config file path from the environment. The XDG path
 /// wins when set; if both candidates exist and differ, that is an
 /// error — two live config files with one answer is a
 /// misconfiguration, and silently picking one would hide it. A
 /// missing file is not an error: `load_config` treats it as empty.
 pub fn config_path() -> Result<PathBuf, GeectlError> {
-    let env = snapshot_env(&["XDG_CONFIG_HOME", "HOME"])?;
+    let env = snapshot_env(&[
+        "XDG_CONFIG_HOME",
+        "HOME",
+        #[cfg(windows)]
+        "USERPROFILE",
+    ])?;
     let xdg = env.get("XDG_CONFIG_HOME").map(String::as_str);
-    let home = env.get("HOME").map(String::as_str);
+    let home = home_dir(
+        env.get("HOME").map(String::as_str),
+        env.get("USERPROFILE").map(String::as_str),
+    );
     let (xdg_path, default_path) = candidate_paths(xdg, home);
     let xdg_exists = xdg_path.as_ref().is_some_and(|p| p.exists());
     let default_exists = default_path.as_ref().is_some_and(|p| p.exists());
@@ -1006,19 +1031,71 @@ mod tests {
         PathBuf::from("/x/geectl/config.toml")
     }
 
+    /// Absolute fake homes for the path-resolution tests: unix
+    /// paths on unix, drive-letter paths on Windows — a bare
+    /// `/home/u` is not absolute on Windows.
+    #[cfg(unix)]
+    const TEST_HOME: &str = "/home/u";
+    #[cfg(windows)]
+    const TEST_HOME: &str = r"C:\Users\u";
+    #[cfg(unix)]
+    const TEST_XDG: &str = "/xdg";
+    #[cfg(windows)]
+    const TEST_XDG: &str = r"C:\xdg";
+
+    fn home_config_path() -> PathBuf {
+        PathBuf::from(TEST_HOME)
+            .join(".config")
+            .join("geectl")
+            .join("config.toml")
+    }
+
+    fn xdg_config_path() -> PathBuf {
+        PathBuf::from(TEST_XDG).join("geectl").join("config.toml")
+    }
+
+    #[test]
+    fn home_dir_selection() {
+        // An absolute HOME always wins.
+        #[cfg(unix)]
+        {
+            assert_eq!(home_dir(Some("/home/u"), Some("/other")), Some("/home/u"));
+            assert_eq!(home_dir(None, Some("/other")), None);
+            assert_eq!(
+                home_dir(Some("relative/home"), Some("/other")),
+                Some("relative/home")
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                home_dir(Some(r"C:\Users\u"), Some(r"C:\Other")),
+                Some(r"C:\Users\u")
+            );
+            assert_eq!(home_dir(None, Some(r"C:\Users\u")), Some(r"C:\Users\u"));
+            // A POSIX-style HOME (Git Bash) is not Windows-absolute,
+            // so USERPROFILE wins.
+            assert_eq!(
+                home_dir(Some("/c/Users/u"), Some(r"C:\Users\u")),
+                Some(r"C:\Users\u")
+            );
+            assert_eq!(home_dir(None, None), None);
+        }
+    }
+
     #[test]
     fn xdg_path_wins_when_set() {
         assert_eq!(
-            resolve_config_path(Some("/xdg"), Some("/home/u"), false, false).unwrap(),
-            PathBuf::from("/xdg/geectl/config.toml")
+            resolve_config_path(Some(TEST_XDG), Some(TEST_HOME), false, false).unwrap(),
+            xdg_config_path()
         );
     }
 
     #[test]
     fn default_path_when_xdg_unset() {
         assert_eq!(
-            resolve_config_path(None, Some("/home/u"), false, false).unwrap(),
-            PathBuf::from("/home/u/.config/geectl/config.toml")
+            resolve_config_path(None, Some(TEST_HOME), false, false).unwrap(),
+            home_config_path()
         );
     }
 
@@ -1026,17 +1103,21 @@ mod tests {
     fn relative_xdg_is_ignored() {
         // A relative XDG_CONFIG_HOME is invalid per the XDG spec.
         assert_eq!(
-            resolve_config_path(Some("relative/xdg"), Some("/home/u"), false, false).unwrap(),
-            PathBuf::from("/home/u/.config/geectl/config.toml")
+            resolve_config_path(Some("relative/xdg"), Some(TEST_HOME), false, false).unwrap(),
+            home_config_path()
         );
     }
 
     #[test]
     fn two_existing_files_are_an_error() {
-        let err = resolve_config_path(Some("/xdg"), Some("/home/u"), true, true).unwrap_err();
+        let err = resolve_config_path(Some(TEST_XDG), Some(TEST_HOME), true, true).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
-        assert!(err.context.contains("/xdg/geectl/config.toml"));
-        assert!(err.context.contains("/home/u/.config/geectl/config.toml"));
+        assert!(err
+            .context
+            .contains(&xdg_config_path().display().to_string()));
+        assert!(err
+            .context
+            .contains(&home_config_path().display().to_string()));
     }
 
     #[test]
@@ -1044,12 +1125,12 @@ mod tests {
         // Only the default exists: the XDG path still wins (it is the
         // location), and the default file is simply not the config.
         assert_eq!(
-            resolve_config_path(Some("/xdg"), Some("/home/u"), false, true).unwrap(),
-            PathBuf::from("/xdg/geectl/config.toml")
+            resolve_config_path(Some(TEST_XDG), Some(TEST_HOME), false, true).unwrap(),
+            xdg_config_path()
         );
         assert_eq!(
-            resolve_config_path(Some("/xdg"), Some("/home/u"), true, false).unwrap(),
-            PathBuf::from("/xdg/geectl/config.toml")
+            resolve_config_path(Some(TEST_XDG), Some(TEST_HOME), true, false).unwrap(),
+            xdg_config_path()
         );
     }
 
@@ -1657,8 +1738,8 @@ mod tests {
         );
         // With an absolute XDG set, the relative HOME is irrelevant.
         assert_eq!(
-            resolve_config_path(Some("/xdg"), Some("relative/home"), false, false).unwrap(),
-            PathBuf::from("/xdg/geectl/config.toml")
+            resolve_config_path(Some(TEST_XDG), Some("relative/home"), false, false).unwrap(),
+            xdg_config_path()
         );
     }
 

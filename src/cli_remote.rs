@@ -4990,30 +4990,33 @@ mod tests {
 
     #[test]
     fn download_result_carries_path_size_and_rev() {
-        let (payload, text) = download_result(
-            "openSUSE:Factory",
-            "vim",
-            "vim-9.1.tar.gz",
-            None,
-            Path::new("/tmp/vim-9.1.tar.gz"),
-            6,
-        );
+        // The expected path strings come from the path's display:
+        // a `/tmp/...` literal renders with backslashes on Windows.
+        let path = Path::new("/tmp/vim-9.1.tar.gz");
+        let (payload, text) =
+            download_result("openSUSE:Factory", "vim", "vim-9.1.tar.gz", None, path, 6);
         assert_eq!(payload["project"], "openSUSE:Factory");
         assert_eq!(payload["package"], "vim");
         assert_eq!(payload["file"], "vim-9.1.tar.gz");
         assert_eq!(payload["rev"], Value::Null);
-        assert_eq!(payload["path"], "/tmp/vim-9.1.tar.gz");
+        assert_eq!(
+            payload["path"].as_str().unwrap(),
+            path.to_string_lossy().as_ref()
+        );
         assert_eq!(payload["size_bytes"], 6);
         assert_eq!(
             text,
-            "project: openSUSE:Factory package: vim file: vim-9.1.tar.gz\ndownloaded vim-9.1.tar.gz (6 bytes) to /tmp/vim-9.1.tar.gz"
+            format!(
+                "project: openSUSE:Factory package: vim file: vim-9.1.tar.gz\ndownloaded vim-9.1.tar.gz (6 bytes) to {}",
+                path.display()
+            )
         );
         let (payload, text) = download_result(
             "openSUSE:Factory",
             "vim",
             "vim-9.1.tar.gz",
             Some(&RevisionSpec::Rev(2)),
-            Path::new("/tmp/vim-9.1.tar.gz"),
+            path,
             6,
         );
         assert_eq!(payload["rev"], "2");
@@ -5024,7 +5027,7 @@ mod tests {
             "vim",
             "vim-9.1.tar.gz",
             Some(&md5),
-            Path::new("/tmp/vim-9.1.tar.gz"),
+            path,
             6,
         );
         assert_eq!(payload["rev"], "aabbccddaabbccddaabbccddaabbccdd");

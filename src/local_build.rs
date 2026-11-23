@@ -47,6 +47,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -97,6 +98,8 @@ pub const GRACE_PERIOD_SECS: u64 = 24 * 3600;
 /// The default build timeout (seconds).
 pub const DEFAULT_BUILD_TIMEOUT_SECS: u64 = 3600;
 /// How long the timeout kill waits after SIGTERM before SIGKILL.
+/// Unix only — the Windows kill is immediate.
+#[cfg(unix)]
 const KILL_GRACE_SECS: u64 = 5;
 /// How long a one-shot engine/podman probe may take (seconds):
 /// `--version`, image inspect, image listing, image size, image
@@ -693,7 +696,9 @@ impl<'a> LocalBuild<'a> {
 
 /// The default cache directory: `$XDG_CACHE_HOME/geectl/`, or
 /// `~/.cache/geectl/` when `XDG_CACHE_HOME` is unset. No home is a
-/// configuration error, never a silent fallback.
+/// configuration error, never a silent fallback. On Windows, `HOME`
+/// counts only when it is a Windows-absolute path — Git Bash sets a
+/// POSIX-style `HOME` — and `USERPROFILE` is the fallback.
 pub fn default_cache_dir() -> Result<PathBuf, GeectlError> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
         let xdg = xdg.trim();
@@ -701,17 +706,20 @@ pub fn default_cache_dir() -> Result<PathBuf, GeectlError> {
             return Ok(PathBuf::from(xdg).join("geectl"));
         }
     }
-    let home = std::env::var("HOME").map_err(|_| {
-        GeectlError::new(
-            ErrorKind::ConfigError,
-            "no HOME and no XDG_CACHE_HOME: cannot resolve the local-build cache directory",
-        )
-    })?;
+    let home_var = std::env::var("HOME").ok();
+    let userprofile_var = std::env::var("USERPROFILE").ok();
+    // On Windows the home lookup also tries USERPROFILE; name it
+    // so the error lists every variable that was actually consulted.
+    let no_home = if cfg!(windows) {
+        "no HOME, no USERPROFILE and no XDG_CACHE_HOME: cannot resolve the local-build cache directory"
+    } else {
+        "no HOME and no XDG_CACHE_HOME: cannot resolve the local-build cache directory"
+    };
+    let home = crate::config::home_dir(home_var.as_deref(), userprofile_var.as_deref())
+        .map(|s| s.to_owned())
+        .ok_or_else(|| GeectlError::new(ErrorKind::ConfigError, no_home))?;
     if home.trim().is_empty() {
-        return Err(GeectlError::new(
-            ErrorKind::ConfigError,
-            "no HOME and no XDG_CACHE_HOME: cannot resolve the local-build cache directory",
-        ));
+        return Err(GeectlError::new(ErrorKind::ConfigError, no_home));
     }
     Ok(PathBuf::from(home).join(".cache").join("geectl"))
 }
@@ -2312,10 +2320,16 @@ impl<'a> LocalBuild<'a> {
         // for aging while it is still being built.
         touch(&self.sccache_dir(&req.project, package, &req.repo, &req.arch, &req.flavor));
         if outcome.timed_out {
+            // On unix the timeout kills the engine's process group;
+            // on Windows only the direct child is killed.
+            #[cfg(unix)]
+            let killed = "the engine's process group was killed";
+            #[cfg(not(unix))]
+            let killed = "the engine process was killed; its children may still be running";
             return Err(GeectlError::new(
                 ErrorKind::BuildTimeout,
                 format!(
-                    "build of {package} timed out after {}s; partial log at {}; the engine's process group was killed, but the container it started may still be running",
+                    "build of {package} timed out after {}s; partial log at {}; {killed}, but the container it started may still be running",
                     req_timeout(req),
                     log_path.display()
                 ),
@@ -2361,15 +2375,16 @@ struct EngineOutcome {
 /// Run the engine with a bounded timeout, draining its stdout and
 /// stderr (capped) while waiting. Returns the exit, whether the
 /// timeout killed it, and the captured output (stdout, stderr).
-/// The engine spawns in its own process group (`process_group(0)`),
-/// so on timeout the kill reaches the engine and its children in
-/// the host process group — killing the wrapper alone would leave
-/// the engine running. The container the engine started is NOT
-/// stopped by that kill: it lives in its own pid namespace, and
-/// conmon keeps it running after podman dies — stopping it needs
-/// the container id, which the engine does not report (see the
-/// design doc's "Timeout and abort"). The child gets SIGTERM, then
-/// SIGKILL after a grace period (see [`kill_child`]).
+/// On unix, the engine spawns in its own process group
+/// (`process_group(0)`), so on timeout the kill reaches the engine
+/// and its children in the host process group — killing the wrapper
+/// alone would leave the engine running. The container the engine
+/// started is NOT stopped by that kill: it lives in its own pid
+/// namespace, and conmon keeps it running after podman dies —
+/// stopping it needs the container id, which the engine does not
+/// report (see the design doc's "Timeout and abort"). On unix, the
+/// child gets SIGTERM, then SIGKILL after a grace period (see
+/// [`kill_child`]); on Windows only the direct child is killed.
 fn run_engine(
     argv: &[String],
     cwd: &Path,
@@ -2382,20 +2397,22 @@ fn run_engine(
         ));
     }
     let mut child = spawn_with_retry(|| {
-        Command::new(&argv[0])
-            .args(&argv[1..])
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Its own process group: the timeout kill signals the group
-            // (`kill -- -$pgid`), not just the wrapper — the engine and
-            // its host-side children die with it. The container does
-            // not: it lives in its own pid namespace (see the doc above).
-            // `process_group` is safe std, no `unsafe`, so the crate's
-            // `unsafe` forbid still holds.
-            .process_group(0)
-            .spawn()
+            .stderr(Stdio::piped());
+        // Its own process group: the timeout kill signals the group
+        // (`kill -- -$pgid`), not just the wrapper — the engine and
+        // its host-side children die with it. The container does
+        // not: it lives in its own pid namespace (see the doc above).
+        // `process_group` is safe std, no `unsafe`, so the crate's
+        // `unsafe` forbid still holds. Unix-only: Windows has no
+        // process groups in std.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.spawn()
     })
     .map_err(|e| {
         GeectlError::new(
@@ -2450,15 +2467,18 @@ fn run_engine(
     }
 }
 
-/// SIGTERM the child's process group, then SIGKILL after a grace
-/// period. The engine runs in its own process group (see
+/// On unix, SIGTERM the child's process group, then SIGKILL after a
+/// grace period. The engine runs in its own process group (see
 /// [`run_engine`]), so the signal reaches the engine and its
 /// host-side children — killing the wrapper alone would leave the
 /// engine running. It does NOT stop the container the engine
 /// started (own pid namespace; conmon keeps it running) — see
 /// [`run_engine`]. `kill` is the system binary (present on Linux
 /// and macOS); when it is missing the SIGKILL below is the whole
-/// kill, and only the direct child dies.
+/// kill, and only the direct child dies. On Windows there is no
+/// `kill` binary and no process group to signal, so the child is
+/// killed directly instead (see below).
+#[cfg(unix)]
 fn kill_child(child: &mut std::process::Child) {
     let pgid = child.id();
     let _ = Command::new("kill")
@@ -2486,6 +2506,15 @@ fn kill_child(child: &mut std::process::Child) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    let _ = child.kill();
+}
+
+/// Kill the direct child immediately. Windows has no `kill`
+/// binary and no process group to signal, so the grace-period
+/// wait would only burn time polling a child nothing terminates.
+/// Grandchildren are not stopped.
+#[cfg(not(unix))]
+fn kill_child(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
@@ -4256,10 +4285,16 @@ impl<'a> LocalBuild<'a> {
         let (outcome, stdout, stderr) =
             run_engine(&argv, &root, Duration::from_secs(timeout_secs))?;
         if outcome.timed_out {
+            // On unix the timeout kills the engine's process group;
+            // on Windows only the direct child is killed.
+            #[cfg(unix)]
+            let killed = "the engine's process group was killed";
+            #[cfg(not(unix))]
+            let killed = "the engine process was killed; its children may still be running";
             return Err(GeectlError::new(
                 ErrorKind::BuildTimeout,
                 format!(
-                    "shell in build root {} timed out after {timeout_secs}s; the engine's process group was killed, but the container it started may still be running",
+                    "shell in build root {} timed out after {timeout_secs}s; {killed}, but the container it started may still be running",
                     root.display()
                 ),
             ));
