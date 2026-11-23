@@ -3447,7 +3447,11 @@ impl<'a> ObsClient<'a> {
     /// the package, and 404 exactly when the `OBS:OwnerRootProject`
     /// attribute type itself is absent (`AttribType.find_by_name!`);
     /// no other 400 comes out of that action for a package-only
-    /// search.
+    /// search. No `limit` or `devel` parameter is sent: the server's
+    /// defaults
+    /// apply — a package search returns every hit (the limit default
+    /// of 1 covers binary searches only), so the result is every
+    /// owner the server reports.
     pub fn owners_for_package(&self, package: &str) -> Result<Vec<Owner>, GeectlError> {
         if !valid_obs_name(package) {
             return Err(GeectlError::new(
