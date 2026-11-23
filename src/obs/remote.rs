@@ -1426,6 +1426,9 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
             })?;
             release_targets.push(ReleaseTarget {
                 project: xml_unescape(&project),
+                // A release target without a repository reads as
+                // None: the read tolerates it, only a write refuses
+                // it (see `validate_repository_settings`).
                 repository: tag_attr(&target_tag, "repository").map(|value| xml_unescape(&value)),
                 trigger: tag_attr(&target_tag, "trigger").map(|value| xml_unescape(&value)),
             });

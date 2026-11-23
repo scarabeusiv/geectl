@@ -1965,6 +1965,11 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
                     "unexpected OBS project meta response: <releasetarget> without project",
                 )
             })?;
+            // A release target without a repository reads as None:
+            // the server looks a target up by (project, repository),
+            // but a missing repository is state the read tolerates;
+            // only a write refuses it (see
+            // `validate_repository_settings`).
             release_targets.push(ReleaseTarget {
                 project,
                 repository: xml_attr_non_empty(target_tag, "repository"),
@@ -6513,6 +6518,24 @@ mod tests {
         ] {
             assert!(parse_project_meta(body).is_err(), "{body}");
             assert!(parse_repositories(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn both_repository_parsers_tolerate_a_release_target_without_a_repository() {
+        // A release target without a repository reads as None: the
+        // read tolerates server state a write refuses (the settings
+        // check requires the repository on a changed repository).
+        for body in [
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" trigger=\"manual\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"\" trigger=\"manual\"/></repository></project>",
+        ] {
+            for parsed in [
+                parse_repositories(body).unwrap(),
+                parse_project_meta(body).unwrap().repositories,
+            ] {
+                assert_eq!(parsed[0].release_targets[0].repository, None, "{body}");
+            }
         }
     }
 
