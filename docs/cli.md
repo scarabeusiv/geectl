@@ -661,6 +661,7 @@ geectl build list-binaries openSUSE:Factory standard x86_64 --package vim
 # Submit requests
 geectl request show 1398977
 geectl request search --creator alice --state new
+geectl request search --reviewer alice
 geectl request diff 1398977
 
 # Branch, then file (dry-run first, `--live` to perform)

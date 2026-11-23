@@ -415,6 +415,13 @@ pub enum RequestAction {
         /// The package in the target project, when the action names
         /// one.
         target_package: Option<String>,
+        /// What happens to the source branch on accept, when the
+        /// request sets it.
+        sourceupdate: Option<SourceUpdate>,
+        /// Whether the request makes the origin older on accept.
+        makeoriginolder: bool,
+        /// The accept revision, when the request was accepted.
+        acceptinfo: Option<AcceptInfo>,
     },
     /// Release a maintenance incident to the maintenance project.
     MaintenanceRelease {
@@ -427,6 +434,13 @@ pub enum RequestAction {
         /// The package in the target project, when the action names
         /// one.
         target_package: Option<String>,
+        /// What happens to the source branch on accept, when the
+        /// request sets it.
+        sourceupdate: Option<SourceUpdate>,
+        /// Whether the request makes the origin older on accept.
+        makeoriginolder: bool,
+        /// The accept revision, when the request was accepted.
+        acceptinfo: Option<AcceptInfo>,
     },
     /// Release a package to another project.
     Release {
@@ -439,6 +453,13 @@ pub enum RequestAction {
         /// The package in the target project, when the action names
         /// one.
         target_package: Option<String>,
+        /// What happens to the source branch on accept, when the
+        /// request sets it.
+        sourceupdate: Option<SourceUpdate>,
+        /// Whether the request makes the origin older on accept.
+        makeoriginolder: bool,
+        /// The accept revision, when the request was accepted.
+        acceptinfo: Option<AcceptInfo>,
     },
 }
 
@@ -857,6 +878,29 @@ fn action_target(element: &Element<'_>) -> Option<Option<TargetRef>> {
     Some(target)
 }
 
+/// Parse an `<acceptinfo>` element: `rev` and `srcmd5` are required
+/// and non-empty; the origin attributes are optional. The element
+/// carries no text.
+fn parse_acceptinfo(element: &Element<'_>) -> Option<AcceptInfo> {
+    if !element.inner.trim().is_empty() {
+        return None;
+    }
+    let rev = attr_value(element.attrs, "rev")?;
+    let srcmd5 = attr_value(element.attrs, "srcmd5")?;
+    if rev.is_empty() || srcmd5.is_empty() {
+        return None;
+    }
+    Some(AcceptInfo {
+        rev: rev.to_string(),
+        srcmd5: srcmd5.to_string(),
+        oproject: attr_value(element.attrs, "oproject").map(str::to_string),
+        opackage: attr_value(element.attrs, "opackage").map(str::to_string),
+        osrcmd5: attr_value(element.attrs, "osrcmd5").map(str::to_string),
+        xsrcmd5: attr_value(element.attrs, "xsrcmd5").map(str::to_string),
+        oxsrcmd5: attr_value(element.attrs, "oxsrcmd5").map(str::to_string),
+    })
+}
+
 /// Parse a `<submit>` action: a source, an optional target, optional
 /// options, and an optional acceptinfo. Any other child fails.
 fn parse_submit_action(element: &Element<'_>) -> Option<RequestAction> {
@@ -907,23 +951,7 @@ fn parse_submit_action(element: &Element<'_>) -> Option<RequestAction> {
                     return None;
                 }
                 seen_acceptinfo = true;
-                if !child.inner.trim().is_empty() {
-                    return None;
-                }
-                let rev = attr_value(child.attrs, "rev")?;
-                let srcmd5 = attr_value(child.attrs, "srcmd5")?;
-                if rev.is_empty() || srcmd5.is_empty() {
-                    return None;
-                }
-                acceptinfo = Some(AcceptInfo {
-                    rev: rev.to_string(),
-                    srcmd5: srcmd5.to_string(),
-                    oproject: attr_value(child.attrs, "oproject").map(str::to_string),
-                    opackage: attr_value(child.attrs, "opackage").map(str::to_string),
-                    osrcmd5: attr_value(child.attrs, "osrcmd5").map(str::to_string),
-                    xsrcmd5: attr_value(child.attrs, "xsrcmd5").map(str::to_string),
-                    oxsrcmd5: attr_value(child.attrs, "oxsrcmd5").map(str::to_string),
-                });
+                acceptinfo = Some(parse_acceptinfo(&child)?);
             }
             _ => return None,
         }
@@ -1094,12 +1122,53 @@ fn parse_change_devel_action(element: &Element<'_>) -> Option<RequestAction> {
     })
 }
 
-/// Parse a maintenance or release action: a source and a target,
-/// both naming a project; the target package is optional.
+/// Parse a `<maintenance_incident>`, `<maintenance_release>`, or
+/// `<release>` action: a source, a target, optional options, and
+/// an optional acceptinfo. The options name what the accept does
+/// with the source: the source update and whether the origin is
+/// made older. Any other child — and any other option — fails.
 fn parse_source_target_action(element: &Element<'_>, action_type: &str) -> Option<RequestAction> {
+    let mut sourceupdate: Option<SourceUpdate> = None;
+    let mut makeoriginolder = false;
+    let mut seen_makeoriginolder = false;
+    let mut acceptinfo: Option<AcceptInfo> = None;
+    let mut seen_options = false;
+    let mut seen_acceptinfo = false;
     for child in child_elements(element.inner)? {
-        if child.name != "source" && child.name != "target" {
-            return None;
+        match child.name {
+            "source" | "target" => {}
+            "options" => {
+                if seen_options {
+                    return None;
+                }
+                seen_options = true;
+                for option in child_elements(child.inner)? {
+                    match option.name {
+                        "sourceupdate" => {
+                            if sourceupdate.is_some() {
+                                return None;
+                            }
+                            sourceupdate = Some(parse_sourceupdate(&leaf_text(option.inner)?)?);
+                        }
+                        "makeoriginolder" => {
+                            if seen_makeoriginolder {
+                                return None;
+                            }
+                            seen_makeoriginolder = true;
+                            makeoriginolder = parse_option_bool(&leaf_text(option.inner)?)?;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            "acceptinfo" => {
+                if seen_acceptinfo {
+                    return None;
+                }
+                seen_acceptinfo = true;
+                acceptinfo = Some(parse_acceptinfo(&child)?);
+            }
+            _ => return None,
         }
     }
     let (source_project, source_package, _) = action_source(element)?;
@@ -1110,18 +1179,27 @@ fn parse_source_target_action(element: &Element<'_>, action_type: &str) -> Optio
             source_package,
             target_project,
             target_package,
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
         }),
         "maintenance_release" => Some(RequestAction::MaintenanceRelease {
             source_project,
             source_package,
             target_project,
             target_package,
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
         }),
         "release" => Some(RequestAction::Release {
             source_project,
             source_package,
             target_project,
             target_package,
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
         }),
         _ => None,
     }
@@ -1283,6 +1361,29 @@ fn parse_request_history(element: &Element<'_>) -> Option<RequestHistory> {
 /// Render one action as XML, in the server's shape: the same
 /// elements, in the server's order, with the same attribute order
 /// (`project` before `package`, `rev` last on a source).
+/// Render an `<acceptinfo>` element: `rev` and `srcmd5` always,
+/// the origin attributes only when set.
+fn acceptinfo_to_xml(info: &AcceptInfo) -> String {
+    let mut out = format!(
+        "    <acceptinfo rev=\"{}\" srcmd5=\"{}\"",
+        xml_escape(&info.rev),
+        xml_escape(&info.srcmd5)
+    );
+    for (name, value) in [
+        ("oproject", &info.oproject),
+        ("opackage", &info.opackage),
+        ("osrcmd5", &info.osrcmd5),
+        ("xsrcmd5", &info.xsrcmd5),
+        ("oxsrcmd5", &info.oxsrcmd5),
+    ] {
+        if let Some(value) = value {
+            out.push_str(&format!(" {name}=\"{}\"", xml_escape(value)));
+        }
+    }
+    out.push_str(" />\n");
+    out
+}
+
 fn action_to_xml(action: &RequestAction) -> String {
     let mut out = String::new();
     match action {
@@ -1327,23 +1428,7 @@ fn action_to_xml(action: &RequestAction) -> String {
                 out.push_str("    </options>\n");
             }
             if let Some(info) = acceptinfo {
-                out.push_str(&format!(
-                    "    <acceptinfo rev=\"{}\" srcmd5=\"{}\"",
-                    xml_escape(&info.rev),
-                    xml_escape(&info.srcmd5)
-                ));
-                for (name, value) in [
-                    ("oproject", &info.oproject),
-                    ("opackage", &info.opackage),
-                    ("osrcmd5", &info.osrcmd5),
-                    ("xsrcmd5", &info.xsrcmd5),
-                    ("oxsrcmd5", &info.oxsrcmd5),
-                ] {
-                    if let Some(value) = value {
-                        out.push_str(&format!(" {name}=\"{}\"", xml_escape(value)));
-                    }
-                }
-                out.push_str(" />\n");
+                out.push_str(&acceptinfo_to_xml(info));
             }
             out.push_str("  </action>\n");
         }
@@ -1424,18 +1509,27 @@ fn action_to_xml(action: &RequestAction) -> String {
             source_package,
             target_project,
             target_package,
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
         }
         | RequestAction::MaintenanceRelease {
             source_project,
             source_package,
             target_project,
             target_package,
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
         }
         | RequestAction::Release {
             source_project,
             source_package,
             target_project,
             target_package,
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
         } => {
             out.push_str(&format!("  <action type=\"{}\">\n", action.type_name()));
             out.push_str(&source_to_xml(source_project, source_package, None));
@@ -1444,6 +1538,22 @@ fn action_to_xml(action: &RequestAction) -> String {
                 target_package.as_deref(),
                 None,
             ));
+            if sourceupdate.is_some() || *makeoriginolder {
+                out.push_str("    <options>\n");
+                if let Some(update) = sourceupdate {
+                    out.push_str(&format!(
+                        "      <sourceupdate>{}</sourceupdate>\n",
+                        update.as_str()
+                    ));
+                }
+                if *makeoriginolder {
+                    out.push_str("      <makeoriginolder>true</makeoriginolder>\n");
+                }
+                out.push_str("    </options>\n");
+            }
+            if let Some(info) = acceptinfo {
+                out.push_str(&acceptinfo_to_xml(info));
+            }
             out.push_str("  </action>\n");
         }
     }
@@ -1946,13 +2056,15 @@ const KNOWN_ACTION_TYPES: &[&str] = &[
 /// filter is a list, and a list matches when any of its values
 /// matches; the filters themselves are `and`-joined. The clause order
 /// is fixed (ids, projects, packages, source, target, creators, who,
-/// states, since, types, exclusions), so the same search always builds
-/// the same expression.
+/// reviewers, states, since, types, exclusions), so the same search always
+/// builds the same expression.
 ///
 /// The states default to the open states — `new`, `review`,
-/// `declined` — the set a tool triaging open work wants. Pass an
-/// explicit (possibly empty) state list to override: an empty list
-/// means no state filter at all.
+/// `declined` — the set a tool triaging open work wants. With a
+/// reviewer filter the default narrows to `new` and `review`: a
+/// declined or accepted request keeps its open reviews, so it is
+/// not awaiting review. Pass an explicit (possibly empty) state
+/// list to override: an empty list means no state filter at all.
 ///
 /// The `source_packages` / `target_packages` filters use the
 /// singular attribute (`source[@package='…']`): the search engine's
@@ -1998,6 +2110,9 @@ pub struct RequestSearch {
     /// Match requests one of these users interacted with (as the last
     /// actor on the state, or in the history).
     who: Vec<String>,
+    /// Match requests with an open review addressed to one of these
+    /// users (`by_user`, state `new`).
+    reviewers: Vec<String>,
     /// Match requests in one of these states. `None` is the default
     /// open states; `Some(vec![])` is no state filter.
     states: Option<Vec<RequestState>>,
@@ -2078,6 +2193,13 @@ impl RequestSearch {
     /// Match requests one of these users interacted with.
     pub fn who(mut self, who: Vec<String>) -> Self {
         self.who = who;
+        self
+    }
+
+    /// Match requests with an open review addressed to one of these
+    /// users.
+    pub fn reviewers(mut self, reviewers: Vec<String>) -> Self {
+        self.reviewers = reviewers;
         self
     }
 
@@ -2176,7 +2298,11 @@ impl RequestSearch {
                 }
             }
         }
-        for (label, values) in [("creator", &self.creators), ("user", &self.who)] {
+        for (label, values) in [
+            ("creator", &self.creators),
+            ("user", &self.who),
+            ("reviewer", &self.reviewers),
+        ] {
             for value in values {
                 validate_xpath_value(label, value)?;
             }
@@ -2260,8 +2386,27 @@ impl RequestSearch {
                 )),
             ));
         }
+        if !self.reviewers.is_empty() {
+            // An open review addressed to the user: `by_user` names
+            // who the review is addressed to, and `new` is the open
+            // review state.
+            clauses.push(XpathQuery::Pred(
+                "review".to_string(),
+                Box::new(XpathQuery::and_all(vec![
+                    XpathQuery::eq_list("@by_user", &self.reviewers),
+                    XpathQuery::Eq("@state".to_string(), "new".to_string()),
+                ])),
+            ));
+        }
         let states = match &self.states {
             Some(states) => states.clone(),
+            // With a reviewer filter the default narrows to the
+            // states a request can still be reviewed in: a declined
+            // or accepted request keeps its open reviews, so it is
+            // not awaiting review.
+            None if !self.reviewers.is_empty() => {
+                vec![RequestState::New, RequestState::Review]
+            }
             None => vec![
                 RequestState::New,
                 RequestState::Review,
@@ -4315,6 +4460,114 @@ description</description>
     }
 
     #[test]
+    fn request_action_from_xml_maintenance_incident_with_options_parses_and_round_trips() {
+        // A maintenance incident filed with cleanup carries
+        // `<options>` on the action; a search result holding such a
+        // request parses with the options in it.
+        let xml = request_document_with_action(
+            "<action type=\"maintenance_incident\">\n  <source package=\"foo\" project=\"home:alice:branches:openSUSE:Maintenance\" />\n  <target project=\"openSUSE:Maintenance\" releaseproject=\"openSUSE:Backports:SLE-15-SP7:Update\" />\n  <options>\n    <sourceupdate>cleanup</sourceupdate>\n  </options>\n</action>",
+        );
+        let request = parse_request(&xml).expect("incident with options parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::MaintenanceIncident {
+                source_project: "home:alice:branches:openSUSE:Maintenance".to_string(),
+                source_package: "foo".to_string(),
+                target_project: "openSUSE:Maintenance".to_string(),
+                target_package: None,
+                sourceupdate: Some(SourceUpdate::Cleanup),
+                makeoriginolder: false,
+                acceptinfo: None,
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_action_from_xml_release_with_makeoriginolder_parses_and_round_trips() {
+        let xml = request_document_with_action(
+            "<action type=\"release\">\n  <source package=\"foo\" project=\"home:alice\" />\n  <target package=\"foo\" project=\"openSUSE:Maintenance\" />\n  <options>\n    <makeoriginolder>true</makeoriginolder>\n  </options>\n</action>",
+        );
+        let request = parse_request(&xml).expect("release with options parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::Release {
+                source_project: "home:alice".to_string(),
+                source_package: "foo".to_string(),
+                target_project: "openSUSE:Maintenance".to_string(),
+                target_package: Some("foo".to_string()),
+                sourceupdate: None,
+                makeoriginolder: true,
+                acceptinfo: None,
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_action_from_xml_maintenance_incident_with_acceptinfo_parses_and_round_trips() {
+        // An accepted incident carries `<acceptinfo>` on the action,
+        // like a submit; the parser accepts it on all three variants.
+        let xml = request_document_with_action(
+            "<action type=\"maintenance_incident\">\n  <source package=\"foo\" project=\"home:alice:branches:openSUSE:Maintenance\" />\n  <target project=\"openSUSE:Maintenance\" />\n  <acceptinfo rev=\"5\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />\n</action>",
+        );
+        let request = parse_request(&xml).expect("incident with acceptinfo parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::MaintenanceIncident {
+                source_project: "home:alice:branches:openSUSE:Maintenance".to_string(),
+                source_package: "foo".to_string(),
+                target_project: "openSUSE:Maintenance".to_string(),
+                target_package: None,
+                sourceupdate: None,
+                makeoriginolder: false,
+                acceptinfo: Some(AcceptInfo {
+                    rev: "5".to_string(),
+                    srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    oproject: None,
+                    opackage: None,
+                    osrcmd5: None,
+                    xsrcmd5: None,
+                    oxsrcmd5: None,
+                }),
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_action_from_xml_maintenance_release_options_acceptinfo_round_trips() {
+        // A maintenance release carrying both `<options>` and
+        // `<acceptinfo>` parses with both in it: the release arm
+        // wires the options and the acceptinfo like the incident arm.
+        let xml = request_document_with_action(
+            "<action type=\"maintenance_release\">\n  <source package=\"foo\" project=\"home:alice\" />\n  <target package=\"foo\" project=\"openSUSE:Maintenance\" />\n  <options>\n    <sourceupdate>cleanup</sourceupdate>\n    <makeoriginolder>true</makeoriginolder>\n  </options>\n  <acceptinfo rev=\"5\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />\n</action>",
+        );
+        let request = parse_request(&xml).expect("release with options and acceptinfo parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::MaintenanceRelease {
+                source_project: "home:alice".to_string(),
+                source_package: "foo".to_string(),
+                target_project: "openSUSE:Maintenance".to_string(),
+                target_package: Some("foo".to_string()),
+                sourceupdate: Some(SourceUpdate::Cleanup),
+                makeoriginolder: true,
+                acceptinfo: Some(AcceptInfo {
+                    rev: "5".to_string(),
+                    srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    oproject: None,
+                    opackage: None,
+                    osrcmd5: None,
+                    xsrcmd5: None,
+                    oxsrcmd5: None,
+                }),
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
     fn request_action_from_xml_submit_with_acceptinfo_parses_and_round_trips() {
         let xml = request_document_with_action(
             "<action type=\"submit\">\n  <source package=\"bar\" project=\"testprj\" />\n  <target package=\"baz\" project=\"foobar\" />\n  <acceptinfo rev=\"5\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" xsrcmd5=\"ffffffffffffffffffffffffffffffff\" />\n</action>",
@@ -4964,6 +5217,43 @@ description</description>
     }
 
     #[test]
+    fn search_reviewers_match_open_reviews_by_user() {
+        let search = search_without_states().reviewers(vec!["foo".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "review[@by_user='foo' and @state='new']"
+        );
+        let search = search_without_states().reviewers(vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "review[(@by_user='foo' or @by_user='bar') and @state='new']"
+        );
+    }
+
+    #[test]
+    fn search_reviewer_with_default_states() {
+        // The default narrows to the states a request can still be
+        // reviewed in: declined and accepted requests keep their
+        // open reviews.
+        let search = RequestSearch::new().reviewers(vec!["foo".to_string()]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "review[@by_user='foo' and @state='new'] and state[@name='new' or @name='review']"
+        );
+    }
+
+    #[test]
+    fn search_reviewer_with_named_states_keeps_them() {
+        let search = RequestSearch::new()
+            .reviewers(vec!["foo".to_string()])
+            .states(vec![RequestState::Declined]);
+        assert_eq!(
+            search.match_expr().unwrap(),
+            "review[@by_user='foo' and @state='new'] and state[@name='declined']"
+        );
+    }
+
+    #[test]
     fn search_states_match_the_given_states() {
         let search = RequestSearch::new().states(vec![RequestState::New, RequestState::Review]);
         assert_eq!(
@@ -5019,6 +5309,13 @@ description</description>
     #[test]
     fn search_rejects_an_invalid_project_name() {
         let search = search_without_states().projects(vec!["foo' or '1'='1".to_string()]);
+        let err = search.match_expr().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn search_rejects_a_quoted_reviewer() {
+        let search = search_without_states().reviewers(vec!["o'brien".to_string()]);
         let err = search.match_expr().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
@@ -6010,6 +6307,56 @@ description</description>
     }
 
     #[test]
+    fn search_requests_with_reviewer_searches_open_reviews() {
+        let search = RequestSearch::new().reviewers(vec!["alice".to_string()]);
+        let url = build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[("match", &search.match_expr().unwrap())],
+        );
+        let http = FakeHttp::new().with_get(&url, "<collection matches=\"0\"></collection>");
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let requests = obs
+            .search_requests(&search)
+            .expect("reviewer search parses");
+        assert!(requests.is_empty());
+        assert_eq!(http.get_calls()[0].0, url);
+    }
+
+    #[test]
+    fn search_requests_with_incident_options_parses() {
+        // A reviewer search whose result holds an incident filed
+        // with cleanup: the collection parses with the incident's
+        // `<options>` in it.
+        let collection = "<collection matches=\"1\"><request creator=\"alice\" id=\"42\">\n  <action type=\"maintenance_incident\">\n    <source project=\"home:alice:branches:openSUSE:Maintenance\" package=\"foo\" />\n    <target project=\"openSUSE:Maintenance\" />\n    <options>\n      <sourceupdate>cleanup</sourceupdate>\n    </options>\n  </action>\n  <state name=\"review\" when=\"2010-12-27T01:36:29\" who=\"alice\" />\n  <review state=\"new\" when=\"2010-12-27T01:36:29\" by_user=\"bob\" />\n</request></collection>";
+        let search = RequestSearch::new().reviewers(vec!["bob".to_string()]);
+        let url = build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[("match", &search.match_expr().unwrap())],
+        );
+        let http = FakeHttp::new().with_get(&url, collection);
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let requests = obs
+            .search_requests(&search)
+            .expect("incident search parses");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, 42);
+        assert_eq!(
+            requests[0].actions[0],
+            RequestAction::MaintenanceIncident {
+                source_project: "home:alice:branches:openSUSE:Maintenance".to_string(),
+                source_package: "foo".to_string(),
+                target_project: "openSUSE:Maintenance".to_string(),
+                target_package: None,
+                sourceupdate: Some(SourceUpdate::Cleanup),
+                makeoriginolder: false,
+                acceptinfo: None,
+            }
+        );
+    }
+
+    #[test]
     fn search_requests_empty_collection_is_empty() {
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/search/request?match=state%5B%40name%3D%27new%27%20or%20%40name%3D%27review%27%20or%20%40name%3D%27declined%27%5D",
@@ -6289,29 +6636,29 @@ description</description>
         let (debug, lines) = Debug::captured(true, false);
         let http = FakeHttp::new()
             .with_post_error_sequence(
-                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                "https://api.opensuse.org/request/1398977?cmd=changestate&newstate=accepted",
                 &[ErrorKind::ServerError],
             )
             .with_post(
-                "https://api.opensuse.org/request/42?cmd=changestate&newstate=accepted",
+                "https://api.opensuse.org/request/1398977?cmd=changestate&newstate=accepted",
                 "<status code=\"ok\" />",
             )
             .with_get(
-                "https://api.opensuse.org/request/42?withhistory=1",
+                "https://api.opensuse.org/request/1398977?withhistory=1",
                 &REQUEST1_XML.replace("name=\"accepted\"", "name=\"new\""),
             );
         let obs = ObsClient::with_credentials(&http, basic_credentials())
             .unwrap()
             .with_debug(debug);
         let dry = DryRun::new(false);
-        obs.change_state("42", RequestState::Accepted, "looks good", false, &dry)
+        obs.change_state("1398977", RequestState::Accepted, "looks good", false, &dry)
             .expect("accept retries and lands");
         let got: Vec<String> = lines.lock().unwrap().clone();
         assert_eq!(
             got,
             [
-                "retry: change_state request 42 probe 1/60s: still new".to_string(),
-                "decision: request 42 still new, re-issuing accepted".to_string(),
+                "retry: change_state request 1398977 probe 1/60s: still new".to_string(),
+                "decision: request 1398977 still new, re-issuing accepted".to_string(),
             ]
         );
     }

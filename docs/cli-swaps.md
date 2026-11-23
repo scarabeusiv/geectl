@@ -65,6 +65,7 @@ what is specific to that group.
 | `osc request review add` | `request add-review --user/--group/--project/--package` | Verb-first leaf; the review target is named by flags |
 | `osc comment list/create request ID` (top-level `comment` command with a `request` target word) | `request list-comments`, `request add-comment [--parent …]` | Comments live under the request they belong to, not under a top-level `comment` command. (osc itself has no `request comment` subcommand — comments are API-only there.) |
 | `osc request list` | `request search` | The library op is a typed search (`RequestSearch`), and the name says what it does; filters are named flags (`--creator`, `--state`, `--project`, …). Default states new/review/declined when no `--state` is given |
+| `osc review list -U USER` | `request search --reviewer USER` | The reviewer filter is a search flag, not a separate list command: it matches open reviews addressed to the user. With no `--state`, only new and review requests are listed, since a declined or accepted request keeps its open reviews. Group and project reviews have no flag. |
 | `request supersede` | `request supersede` acts immediately, no dry-run | The library's raw supersede has no dry-run; `request refile` is the dry-runnable supersede flow. Documented on the subcommand |
 
 Not swaps (kept as-is): `request show`, `request log`, `request

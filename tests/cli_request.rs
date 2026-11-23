@@ -235,6 +235,17 @@ fn request_search_without_credentials_fails_with_config_error() {
 }
 
 #[test]
+fn request_search_with_reviewer_without_credentials_fails_with_config_error() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "search", "--reviewer", "alice"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    assert_eq!(error_of(&out)["error"]["code"], "config_error");
+}
+
+#[test]
 fn request_list_without_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
@@ -979,6 +990,19 @@ fn request_search_with_unknown_type_fails_before_credentials() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["request", "search", "--type", "bogus"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(error_of(&out)["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn request_search_with_quoted_reviewer_fails_before_credentials() {
+    // As for an unknown type: the reviewer value is validated when
+    // the search is built, before any credential resolution.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "search", "--reviewer", "o'brien"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));

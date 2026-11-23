@@ -115,8 +115,13 @@ pub enum RequestCommand {
         /// Only requests involving these users.
         #[arg(long)]
         who: Vec<String>,
+        /// Only requests with an open review addressed to these users.
+        /// With no `--state`, only new and review requests are listed.
+        #[arg(long)]
+        reviewer: Vec<String>,
         /// Only requests in these states. When none are given, only
-        /// new, review and declined requests are listed.
+        /// new, review and declined requests are listed; `--reviewer`
+        /// narrows this to new and review.
         #[arg(long, value_parser = [
             "new", "review", "accepted", "declined", "revoked", "superseded", "deleted",
         ])]
@@ -462,6 +467,7 @@ pub fn run(
             target_package,
             creator,
             who,
+            reviewer,
             state,
             types,
             exclude_target_project,
@@ -489,6 +495,7 @@ pub fn run(
                 ("target-package", &target_package),
                 ("creator", &creator),
                 ("who", &who),
+                ("reviewer", &reviewer),
                 ("state", &state),
                 ("type", &types),
                 ("exclude-target-project", &exclude_target_project),
@@ -505,6 +512,7 @@ pub fn run(
                 target_package,
                 creator,
                 who,
+                reviewer,
                 state,
                 types,
                 exclude_target_project,
@@ -548,6 +556,7 @@ pub fn run(
                 vec![],
                 project,
                 package,
+                vec![],
                 vec![],
                 vec![],
                 vec![],
@@ -944,6 +953,7 @@ fn build_search(
     target_package: Vec<String>,
     creator: Vec<String>,
     who: Vec<String>,
+    reviewer: Vec<String>,
     state: Vec<String>,
     types: Vec<String>,
     exclude_target_project: Vec<String>,
@@ -974,6 +984,7 @@ fn build_search(
         .target_packages(target_package)
         .creators(creator)
         .who(who)
+        .reviewers(reviewer)
         .types(types)
         .exclude_target_projects(exclude_target_project)
         .with_history(with_history)
@@ -1428,36 +1439,54 @@ fn action_json(action: &RequestAction) -> Value {
             source_package,
             target_project,
             target_package,
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
         } => json!({
             "type": "maintenance_incident",
             "source_project": source_project,
             "source_package": source_package,
             "target_project": target_project,
             "target_package": target_package,
+            "sourceupdate": sourceupdate.map(|update| update.as_str()),
+            "makeoriginolder": makeoriginolder,
+            "acceptinfo": acceptinfo.as_ref().map(accept_info_json),
         }),
         RequestAction::MaintenanceRelease {
             source_project,
             source_package,
             target_project,
             target_package,
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
         } => json!({
             "type": "maintenance_release",
             "source_project": source_project,
             "source_package": source_package,
             "target_project": target_project,
             "target_package": target_package,
+            "sourceupdate": sourceupdate.map(|update| update.as_str()),
+            "makeoriginolder": makeoriginolder,
+            "acceptinfo": acceptinfo.as_ref().map(accept_info_json),
         }),
         RequestAction::Release {
             source_project,
             source_package,
             target_project,
             target_package,
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
         } => json!({
             "type": "release",
             "source_project": source_project,
             "source_package": source_package,
             "target_project": target_project,
             "target_package": target_package,
+            "sourceupdate": sourceupdate.map(|update| update.as_str()),
+            "makeoriginolder": makeoriginolder,
+            "acceptinfo": acceptinfo.as_ref().map(accept_info_json),
         }),
     }
 }
@@ -1702,28 +1731,73 @@ fn action_text(action: &RequestAction) -> String {
             source_package,
             target_project,
             target_package,
-        } => format!(
-            "maintenance_incident {source_project}/{source_package} -> {}",
-            target_text(Some(target_project), target_package.as_deref())
-        ),
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
+        } => {
+            let mut line = format!(
+                "maintenance_incident {source_project}/{source_package} -> {}",
+                target_text(Some(target_project), target_package.as_deref())
+            );
+            if let Some(update) = sourceupdate {
+                line.push_str(&format!(" ({})", update.as_str()));
+            }
+            if *makeoriginolder {
+                line.push_str(" (makeoriginolder)");
+            }
+            if let Some(info) = acceptinfo {
+                line.push_str(&format!(" (accepted rev {})", info.rev));
+            }
+            line
+        }
         RequestAction::MaintenanceRelease {
             source_project,
             source_package,
             target_project,
             target_package,
-        } => format!(
-            "maintenance_release {source_project}/{source_package} -> {}",
-            target_text(Some(target_project), target_package.as_deref())
-        ),
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
+        } => {
+            let mut line = format!(
+                "maintenance_release {source_project}/{source_package} -> {}",
+                target_text(Some(target_project), target_package.as_deref())
+            );
+            if let Some(update) = sourceupdate {
+                line.push_str(&format!(" ({})", update.as_str()));
+            }
+            if *makeoriginolder {
+                line.push_str(" (makeoriginolder)");
+            }
+            if let Some(info) = acceptinfo {
+                line.push_str(&format!(" (accepted rev {})", info.rev));
+            }
+            line
+        }
         RequestAction::Release {
             source_project,
             source_package,
             target_project,
             target_package,
-        } => format!(
-            "release {source_project}/{source_package} -> {}",
-            target_text(Some(target_project), target_package.as_deref())
-        ),
+            sourceupdate,
+            makeoriginolder,
+            acceptinfo,
+        } => {
+            let mut line = format!(
+                "release {source_project}/{source_package} -> {}",
+                target_text(Some(target_project), target_package.as_deref())
+            );
+            if let Some(update) = sourceupdate {
+                line.push_str(&format!(" ({})", update.as_str()));
+            }
+            if *makeoriginolder {
+                line.push_str(" (makeoriginolder)");
+            }
+            if let Some(info) = acceptinfo {
+                line.push_str(&format!(" (accepted rev {})", info.rev));
+            }
+            line
+        }
     }
 }
 
@@ -2385,6 +2459,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             false,
             false,
             None,
@@ -2396,6 +2471,7 @@ mod tests {
             assert!(expr.contains(state), "default match names {state}: {expr}");
         }
         let search = build_search(
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2422,6 +2498,34 @@ mod tests {
         assert!(
             !expr.contains("declined"),
             "named match drops the default: {expr}"
+        );
+    }
+
+    #[test]
+    fn build_search_passes_reviewer_through() {
+        let search = build_search(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["alice".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+            None,
+            None,
+        )
+        .expect("a reviewer search builds");
+        assert_eq!(
+            search.match_expr().expect("a match builds"),
+            "review[@by_user='alice' and @state='new'] and state[@name='new' or @name='review']"
         );
     }
 
@@ -2787,6 +2891,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
             false,
             false,
             Some("2026-10-01".to_string()),
@@ -2808,6 +2913,7 @@ mod tests {
     #[test]
     fn build_search_refuses_a_zero_limit() {
         let err = build_search(
+            vec![],
             vec![],
             vec![],
             vec![],
