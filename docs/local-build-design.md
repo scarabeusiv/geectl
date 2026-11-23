@@ -380,7 +380,9 @@ adds an `eviction` object to every build record:
   reported, not hidden, because the server build aborts on it), `checks`
   (%check/ctest pass counts when parseable), `image_digest`,
   `engine_version`, `root_path`, `root_reused` (bool), cache stats
-  (pkg cache hits/misses/preferred, sccache hits). Stdout carries only this payload
+  (pkg cache hits/misses/preferred, sccache hits),
+  `trusted_foreign_projects` (the foreign `home:` projects the flag
+  accepted, empty otherwise). Stdout carries only this payload
   (R11); the full log stays on disk at `log_path` and is never dumped to
   stdout — `build-log` re-reads it.
 - **Trust: no prompts, ever (R1).** The op enumerates the `<bdep
@@ -391,9 +393,16 @@ adds an `eviction` object to every build record:
   `check_trusted_projects(... if not i == prj)`, exact match only): a dep
   resolving from the project being built is the build's own output.
   `--trust-all-projects` overrides that refusal for the dep set the
-  buildinfo enumerates: the build proceeds with those deps, and the
-  accepted foreign `home:` projects are reported on the debug
-  channel.
+  buildinfo enumerates, and only that refusal: non-`home:` projects
+  and the caller's own `home:` were always trusted, so the flag
+  lifts nothing for them. This is a deliberate difference from
+  osc's `trusted_prj` globs, which name the trusted projects: the
+  flag is all-or-nothing for the enumerated dep set, with no
+  per-project selection and no prompt. The build proceeds with
+  those deps, and the accepted foreign `home:` projects are
+  recorded in the build record (`trusted_foreign_projects`) and
+  reported on the debug channel. A dry run records the flag in
+  the plan without evaluating trust.
 - **`--release N`** is supported (passes through to the engine; sets
   `BUILD_RELEASE` → `SOURCE_DATE_EPOCH`, which removes the local-only
   `python-bytecode-inconsistent-mtime` artifact for new packages).

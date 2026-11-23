@@ -425,6 +425,12 @@ Options:
   -h, --help                     Print help
 ```
 
+`build buildinfo` as JSON carries the dependency names in `bdeps` (strings)
+and the project each resolves from in the parallel `bdep_projects` array,
+aligned by index (`null` when the server did not say — a virtual provide
+or a not-installed flag). Text output renders each dependency as
+`name (project)` when the server said one.
+
 ## `local-build` — podman build vertical
 
 ```
@@ -468,6 +474,16 @@ Options:
       --live                         Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
   -h, --help                         Print help
 ```
+
+`local-build build --trust-all-projects` allows build dependencies from
+other users' `home:` projects: their packages run code in the build root,
+so without the flag such builds are refused. The flag lifts only the
+foreign-`home:` refusal for the dep set the buildinfo enumerates —
+non-`home:` projects and the caller's own `home:` were always trusted —
+and takes no per-project selection, unlike osc's `trusted_prj` globs.
+The accepted foreign `home:` projects are recorded in the build record
+(`trusted_foreign_projects`). A dry run records the flag in the plan
+without evaluating trust.
 
 ## `maintenance` — maintained instances + branching
 

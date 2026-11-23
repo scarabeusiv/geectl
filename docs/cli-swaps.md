@@ -165,6 +165,15 @@ only via `osc api`).
 | `build` | `local-build build DIRECTORY --project PROJECT --repo REPOSITORY` | One operation per the design: the run-mode service run, the precommit gate, then the engine build in one invocation; project and repo are explicit coordinates, arch defaults to the host arch; `--arch`, `--clean`, `--flavor`, `--release`, `--trust-all-projects`, `--refresh-image`, `--timeout-secs` are the only options in v1 |
 | `osc wipe [REPOSITORY ARCH]` (alias of `build`, sets `--wipe`) | `local-build wipe REPOSITORY ARCH SPEC --project PROJECT` | Wipes the root the build's own coordinates name; the package comes from the spec file in the source directory, like the build; `--root` names the root directly instead of the coordinates; no force flag — the marker check and the in-use lock are safety invariants |
 
+`--trust-all-projects` lifts only the foreign-`home:` refusal for the
+dep set the buildinfo enumerates: non-`home:` projects and the caller's
+own `home:` were always trusted. That is a deliberate difference from
+osc's `trusted_prj` globs, which name the trusted projects — geectl
+takes no per-project selection and never prompts. The accepted foreign
+`home:` projects are recorded in the build record
+(`trusted_foreign_projects`); a dry run records the flag in the plan
+without evaluating trust.
+
 ## `maintenance` — maintained instances + branching (issue #69)
 
 | osc | geectl | Why |
