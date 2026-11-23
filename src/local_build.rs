@@ -53,6 +53,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -723,6 +724,13 @@ pub struct LocalBuild<'a> {
     engine: PathBuf,
     podman: PathBuf,
     debug: Debug,
+    /// Pause between warm retries (fixed). Tests set it to
+    /// milliseconds so a retry test does not sleep real seconds.
+    warm_retry_delay: Duration,
+    /// Warm retries, at most, per build, shared across deps.
+    warm_retry_budget: u32,
+    /// Warm retries already taken from the per-build budget.
+    warm_retries_used: AtomicU32,
 }
 
 impl<'a> LocalBuild<'a> {
@@ -739,6 +747,9 @@ impl<'a> LocalBuild<'a> {
             engine: PathBuf::from("build"),
             podman: PathBuf::from("podman"),
             debug: Debug::disabled(),
+            warm_retry_delay: WARM_RETRY_DELAY,
+            warm_retry_budget: WARM_RETRY_BUDGET,
+            warm_retries_used: AtomicU32::new(0),
         }
     }
 
@@ -785,6 +796,20 @@ impl<'a> LocalBuild<'a> {
     /// Report decision lines to `debug` instead of dropping them.
     pub fn with_debug(mut self, debug: Debug) -> Self {
         self.debug = debug;
+        self
+    }
+
+    /// The pause between warm retries (default 1 s). Tests set it
+    /// to milliseconds so a retry test does not sleep real seconds.
+    pub fn with_warm_retry_delay(mut self, delay: Duration) -> Self {
+        self.warm_retry_delay = delay;
+        self
+    }
+
+    /// The per-build warm retry budget (default 6). Tests set it
+    /// small to pin the sharing without stalling many deps.
+    pub fn with_warm_retry_budget(mut self, budget: u32) -> Self {
+        self.warm_retry_budget = budget;
         self
     }
 
@@ -2722,6 +2747,32 @@ impl<'a> LocalBuild<'a> {
         Ok(path)
     }
 
+    /// Take one warm retry from the per-build budget: true while
+    /// retries remain, false once the budget is spent. The first
+    /// warm attempt of a dep never calls this: it triggers the
+    /// fetch, so it is always allowed.
+    fn take_warm_retry(&self) -> bool {
+        // Compare-exchange: only a granted retry increments the
+        // counter, so it never grows past the budget — a denied
+        // take leaves the count at the budget instead of counting
+        // the denial.
+        let mut used = self.warm_retries_used.load(Ordering::Relaxed);
+        loop {
+            if used >= self.warm_retry_budget {
+                return false;
+            }
+            match self.warm_retries_used.compare_exchange_weak(
+                used,
+                used + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => used = actual,
+            }
+        }
+    }
+
     /// Download one dep RPM. A dep over the transport's 10 MiB body
     /// cap streams to a temp file in the cache directory instead of
     /// failing: the bytes never sit in memory at once, and the
@@ -2740,13 +2791,23 @@ impl<'a> LocalBuild<'a> {
     /// (`<binary>.<suffix>`): the fetched file is stored under
     /// that name. A package in a repodata module is stored under
     /// the full EVRA filename instead, so the EVRA filename is the
-    /// second retry candidate. A warm failure keeps the original
-    /// 404; a retry failure is returned as-is. The retry runs even
-    /// when the warm reports the binary unavailable: the listing only
-    /// triggers the fetch, the download is the check. The
-    /// returned digest is the one the warm reported for the
-    /// binary, when the download went through the warm; it is
-    /// the digest to verify the downloaded file against.
+    /// second retry candidate. A warm that times out retries: the
+    /// listing blocks until the server fetches the binary, and a
+    /// cold fetch can outlast the transport's retry budget
+    /// (observed: not landed after ~128 s). At most three warm
+    /// attempts per dep, and at most six warm retries per build
+    /// shared across deps: the retries add at most ~25 minutes to
+    /// a build whatever the dep count, and each dep still gets one
+    /// warm attempt — it triggers the fetch. Once the retries are
+    /// spent, a warm that still times out returns a timeout error
+    /// naming the dep, not the original 404. Any other warm failure keeps
+    /// the original 404, and a download retry failure is returned
+    /// as-is. The retry runs even when the warm reports the binary
+    /// unavailable: the listing only triggers the fetch, the
+    /// download is the check. The returned digest is the one the
+    /// warm reported for the binary, when the download went through
+    /// the warm; it is the digest to verify the downloaded file
+    /// against.
     fn download_dep(
         &self,
         req: &BuildRequest,
@@ -2767,7 +2828,33 @@ impl<'a> LocalBuild<'a> {
                 self.stream_dep(req, dep, project, filename, None, dir)
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                match self.obs.binary_versions(project, repo, arch, &dep.name) {
+                // A warm that times out retries: re-asking only
+                // triggers (or joins) the server-side fetch, so a
+                // later attempt succeeds once the binary lands.
+                // Only a timeout retries: the listing is a GET, so
+                // the transport already retried retryable failures
+                // (a network error included) inside the attempt —
+                // a surviving failure repeats, it does not clear.
+                let mut warm_attempts = 0;
+                let warmed = loop {
+                    match self.obs.binary_versions(project, repo, arch, &dep.name) {
+                        Ok(versions) => break Ok(versions),
+                        Err(warm)
+                            if warm.kind() == ErrorKind::Timeout
+                                && warm_attempts + 1 < WARM_RETRY_ATTEMPTS
+                                && self.take_warm_retry() =>
+                        {
+                            warm_attempts += 1;
+                            self.debug.emit(&format!(
+                                "local-build: warming dependency {} timed out (warm attempt {} of {}); retrying",
+                                dep.name, warm_attempts, WARM_RETRY_ATTEMPTS
+                            ));
+                            std::thread::sleep(self.warm_retry_delay);
+                        }
+                        Err(warm) => break Err(warm),
+                    }
+                };
+                match warmed {
                     Ok(versions) => {
                         // The listing reports the name the server
                         // stored the fetched binary under
@@ -2811,6 +2898,36 @@ impl<'a> LocalBuild<'a> {
                             Some(err) => Err(err),
                             None => Err(e),
                         }
+                    }
+                    Err(warm) if warm.kind() == ErrorKind::Timeout => {
+                        let attempts = warm_attempts + 1;
+                        let attempt_word = if attempts == 1 { "attempt" } else { "attempts" };
+                        // The budget spent the retry only when
+                        // this dep still had attempts left: a dep
+                        // that hit its per-dep cap ended on the cap
+                        // even when the budget happens to be spent
+                        // too.
+                        let budget_spent = warm_attempts + 1 < WARM_RETRY_ATTEMPTS
+                            && self.warm_retries_used.load(Ordering::Relaxed)
+                                >= self.warm_retry_budget;
+                        self.debug.emit(&format!(
+                            "local-build: warming dependency {} timed out after {} warm {}{}; reporting the timeout, not the original 404",
+                            dep.name,
+                            attempts,
+                            attempt_word,
+                            if budget_spent {
+                                " (per-build warm retry budget spent)"
+                            } else {
+                                ""
+                            },
+                        ));
+                        Err(GeectlError::new(
+                            ErrorKind::Timeout,
+                            format!(
+                                "warming dependency {} timed out after {} warm {}; the download 404'd and the binary never landed",
+                                dep.name, attempts, attempt_word
+                            ),
+                        ))
                     }
                     Err(warm) => {
                         self.debug.emit(&format!(
@@ -3283,6 +3400,28 @@ fn kill_child(child: &mut std::process::Child) {
 const SPAWN_RETRY_ATTEMPTS: u32 = 3;
 /// Pause between spawn retries.
 const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Warm attempts, at most, per dependency: one listing blocks
+/// until the server fetches the binary, and a cold
+/// download-on-demand fetch can outlast the transport's retry
+/// budget — so a timed-out warm gets more than one chance.
+const WARM_RETRY_ATTEMPTS: u32 = 3;
+/// Warm retries, at most, per build, shared across deps: each
+/// retry is one blocking listing call (~247 s worst case: four
+/// attempts at `DEFAULT_TOTAL_TIMEOUT` plus 7 s of backoff; ~128 s
+/// in the observed no-data stall mode, four `DEFAULT_READ_TIMEOUT`
+/// stalls plus the same backoff), so without a shared budget a
+/// cold repo with many stalling deps retries per dep and takes
+/// hours before failing. Six retries bound the retry tail at
+/// ~25 minutes whatever the dep count, while still letting a
+/// couple of stalling deps use their full per-dep retries. The
+/// first warm attempt of a dep never draws from the budget: it
+/// triggers the fetch.
+const WARM_RETRY_BUDGET: u32 = 6;
+/// Pause between warm retries. Fixed, not doubling: a second is
+/// negligible next to a blocking call of 100+ s, so a backoff
+/// buys nothing.
+const WARM_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Whether an I/O error from spawning a child is transient and
 /// worth one more attempt: resource exhaustion (EAGAIN/ENOMEM, or
@@ -11320,6 +11459,301 @@ exit 0
         }
 
         #[test]
+        fn download_dep_warm_timeout_retries_until_the_binary_lands() {
+            // The warm listing blocks until the server fetches the
+            // binary, and a cold download-on-demand fetch takes
+            // minutes — longer than the transport's per-attempt read
+            // timeout, whose retries the stall outlasts. A warm that
+            // times out retries instead of keeping the 404 at once:
+            // two timed-out listings, then the listing answers and
+            // the retry under the reported name finds the binary.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=glibc"
+            );
+            let warmed_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
+                .with_get_error_sequence(
+                    &warm_url,
+                    &[ErrorKind::Timeout, ErrorKind::Timeout],
+                )
+                .with_get_bytes(&warmed_url, b"fake glibc rpm")
+                .with_get(
+                    &warm_url,
+                    "<binaryversionlist><binary name=\"glibc.rpm\" hdrmd5=\"abc\" sizek=\"10\"/></binaryversionlist>",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman)
+                .with_warm_retry_delay(Duration::from_millis(1));
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let DownloadedDep::InMemory(bytes, warmed) = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap()
+            else {
+                panic!("expected an in-memory download");
+            };
+            assert_eq!(bytes, b"fake glibc rpm".to_vec());
+            assert_eq!(warmed.as_deref(), Some("abc"));
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warm_url)
+                    .count(),
+                3
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &download_url)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warmed_url)
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn download_dep_warm_timeout_three_times_reports_the_timeout() {
+            // Three consecutive timed-out warms report the timeout,
+            // not the original 404: the caller sees the stall, not
+            // a missing binary. Exactly three warm calls: the
+            // per-dep attempts cap binds, not the per-build
+            // budget (six retries, two used). The delay is
+            // milliseconds so the two retries do not sleep real
+            // seconds.
+
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=glibc"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
+                .with_get_error_sequence(
+                    &warm_url,
+                    &[ErrorKind::Timeout, ErrorKind::Timeout, ErrorKind::Timeout],
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman)
+                .with_warm_retry_delay(Duration::from_millis(1));
+
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let err = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Timeout);
+            assert!(
+                err.to_string().contains("timed out"),
+                "the error names the timeout: {err}"
+            );
+            assert!(
+                err.to_string().contains("glibc"),
+                "the error names the dep: {err}"
+            );
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warm_url)
+                    .count(),
+                3
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &download_url)
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn download_dep_warm_retries_share_one_budget_per_build() {
+            // The warm retry budget is shared across deps: with a
+            // budget of two, the first stalling dep uses both
+            // retries (three warm calls) and the second gets none
+            // (one warm call), even though its per-dep attempts
+            // allow more. The delay is milliseconds so the retries
+            // do not sleep real seconds.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let glibc_download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let glibc_warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=glibc"
+            );
+            let zlib_download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/zlib-1.3-1.{arch}.rpm"
+            );
+            let zlib_warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=zlib"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(&glibc_download_url, &[ErrorKind::NotFound])
+                .with_get_error_sequence(
+                    &glibc_warm_url,
+                    &[ErrorKind::Timeout, ErrorKind::Timeout, ErrorKind::Timeout],
+                )
+                .with_get_bytes_error_sequence(&zlib_download_url, &[ErrorKind::NotFound])
+                .with_get_error_sequence(
+                    &zlib_warm_url,
+                    &[ErrorKind::Timeout, ErrorKind::Timeout, ErrorKind::Timeout],
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman)
+                .with_warm_retry_delay(Duration::from_millis(1))
+                .with_warm_retry_budget(2);
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let glibc = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let zlib = BuildDep {
+                name: "zlib".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let glibc_err = vertical
+                .download_dep(
+                    &req,
+                    &glibc,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap_err();
+            assert_eq!(glibc_err.kind(), ErrorKind::Timeout);
+            let zlib_err = vertical
+                .download_dep(
+                    &req,
+                    &zlib,
+                    "testproject",
+                    &format!("zlib-1.3-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap_err();
+            assert_eq!(zlib_err.kind(), ErrorKind::Timeout);
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &glibc_warm_url)
+                    .count(),
+                3
+            );
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &zlib_warm_url)
+                    .count(),
+                1
+            );
+            // A denied take must not grow the counter past the
+            // budget: the second dep's timeout drew nothing, so the
+            // count stays at the two retries the first dep spent.
+            assert_eq!(vertical.warm_retries_used.load(Ordering::Relaxed), 2);
+        }
+
+        #[test]
         fn download_dep_warmed_name_404_falls_back_to_evra_filename() {
             // The warm reports the stored name, but a package in a
             // repodata module is stored under the full EVRA filename
@@ -11543,6 +11977,74 @@ exit 0
         }
 
         #[test]
+        fn download_dep_warm_network_error_is_attempted_once() {
+            // A warm that fails with a network error is attempted
+            // exactly once: only a timeout retries, and the caller
+            // still sees the original 404, not the warm failure.
+
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=glibc"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(&download_url, &[ErrorKind::NotFound])
+                .with_get_error(&warm_url, ErrorKind::NetworkError);
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let err = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotFound);
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warm_url)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &download_url)
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
         fn download_dep_other_errors_do_not_warm() {
             // Only a 404 warms: a server error fails straight away
             // with no listing request.
@@ -11587,6 +12089,91 @@ exit 0
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ServerError);
             assert!(http.get_calls().is_empty());
+        }
+
+        #[test]
+        fn download_dep_download_timeout_after_a_successful_warm_is_not_retried() {
+            // A download that times out after a successful warm is
+            // returned as-is: the warm is not retried for a download
+            // failure, and the error is the timeout, not the 404.
+
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let arch = host_arch();
+            let download_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc-2.38-1.{arch}.rpm"
+            );
+            let warm_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository?view=binaryversions&binary=glibc"
+            );
+            let warmed_url = format!(
+                "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/glibc.rpm"
+            );
+            let http = FakeHttp::new()
+                .with_get_bytes_error_sequence(
+                    &download_url,
+                    &[ErrorKind::NotFound, ErrorKind::Timeout],
+                )
+                .with_get_bytes_error_sequence(&warmed_url, &[ErrorKind::Timeout])
+                .with_get(
+                    &warm_url,
+                    "<binaryversionlist><binary name=\"glibc.rpm\" hdrmd5=\"abc\" sizek=\"10\"/></binaryversionlist>",
+                );
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+
+            let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            let dep = BuildDep {
+                name: "glibc".to_string(),
+                project: Some("testproject".to_string()),
+                repository: Some("standard".to_string()),
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: true,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let err = vertical
+                .download_dep(
+                    &req,
+                    &dep,
+                    "testproject",
+                    &format!("glibc-2.38-1.{arch}.rpm"),
+                    dir.path(),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Timeout);
+            assert_eq!(
+                http.get_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warm_url)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &download_url)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                http.get_bytes_calls()
+                    .iter()
+                    .filter(|(url, _)| url == &warmed_url)
+                    .count(),
+                1
+            );
         }
 
         #[test]
