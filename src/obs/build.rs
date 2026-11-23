@@ -2043,8 +2043,7 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
         download_arches.push(lower);
         if !has_url_scheme(&download.url) {
             return Err(invalid(&format!(
-                "download url {:?} has no scheme",
-                download.url
+                "download arch {arch:?} has a url with no scheme"
             )));
         }
         let repotype = match &download.repotype {
@@ -2060,8 +2059,7 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
         if let Some(master) = &download.master {
             if !has_url_scheme(&master.url) {
                 return Err(invalid(&format!(
-                    "download master url {:?} has no scheme",
-                    master.url
+                    "download arch {arch:?} has a master url with no scheme"
                 )));
             }
         }
@@ -6527,6 +6525,12 @@ mod tests {
         assert!(validate_repository_settings(&repo).is_err());
         repo.downloads[0].url = "https://example.com/\u{1}".to_string();
         assert!(validate_repository_settings(&repo).is_err());
+        // A validation error never carries the url itself: it may
+        // hold credentials.
+        repo.downloads[0].url = "//user:secret@example.com/path".to_string();
+        let err = validate_repository_settings(&repo).unwrap_err();
+        assert!(!err.context.contains("secret"), "{}", err.context);
+        assert!(!err.context.contains("user:secret"), "{}", err.context);
         repo.downloads[0].url = "https://example.com".to_string();
         repo.downloads[0].repotype = None;
         assert!(validate_repository_settings(&repo).is_err());
@@ -6543,6 +6547,10 @@ mod tests {
             sslfingerprint: None,
         });
         assert!(validate_repository_settings(&repo).is_err());
+        repo.downloads[0].master.as_mut().unwrap().url =
+            "//user:secret@example.com/master".to_string();
+        let err = validate_repository_settings(&repo).unwrap_err();
+        assert!(!err.context.contains("secret"), "{}", err.context);
         repo.downloads[0].master.as_mut().unwrap().url = "https://master.example.com".to_string();
         assert!(validate_repository_settings(&repo).is_ok());
         repo.downloads = vec![];
