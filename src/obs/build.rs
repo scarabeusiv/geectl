@@ -2191,17 +2191,17 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
                 "download arch {arch:?} is not one of the repository's architectures"
             )));
         }
-        // Case-insensitive, like the server's download-arch
-        // uniqueness: the repository-arch check normally fires first
-        // when both casings are listed, but this is the validator's
-        // own guarantee for a download pair that differs only by case.
-        let lower = arch.to_lowercase();
-        if download_arches.contains(&lower) {
+        // Exact match: a download arch that differs only by case
+        // from a repository architecture is rejected by the
+        // membership check above, and a repository listing both
+        // casings is rejected by the repository-arch check, so no
+        // case-folding is needed here.
+        if download_arches.contains(arch) {
             return Err(invalid(&format!(
                 "download arch {arch:?} is used more than once"
             )));
         }
-        download_arches.push(lower);
+        download_arches.push(arch.clone());
         if !has_url_scheme(&download.url) {
             return Err(invalid(&format!(
                 "download arch {arch:?} has a url with no scheme"
@@ -6868,20 +6868,6 @@ mod tests {
         });
         assert!(validate_repository_settings(&repo).is_err());
         repo.downloads.pop();
-        // The duplicate check is case-insensitive: both casings are
-        // in the repository's architectures, so only dedup rejects.
-        repo.arch.push("X86_64".to_string());
-        repo.downloads.push(RepositoryDownload {
-            arch: Some("X86_64".to_string()),
-            url: "https://other.example.com".to_string(),
-            repotype: Some("deb".to_string()),
-            archfilter: None,
-            pubkey: None,
-            master: None,
-        });
-        assert!(validate_repository_settings(&repo).is_err());
-        repo.downloads.pop();
-        repo.arch.pop();
         // The url needs a scheme; the repotype is required and one of
         // the server's types.
         repo.downloads[0].url = "example.com/no-scheme".to_string();
@@ -6974,6 +6960,35 @@ mod tests {
         assert!(validate_repository(&repo).is_err());
         repo.arch.pop();
         assert!(validate_repository(&repo).is_ok());
+    }
+
+    #[test]
+    fn validate_repository_rejects_a_download_arch_that_differs_only_by_case() {
+        let mut repo = new_repo();
+        repo.downloads.push(RepositoryDownload {
+            arch: Some("x86_64".to_string()),
+            url: "https://example.com".to_string(),
+            repotype: Some("rpmmd".to_string()),
+            archfilter: None,
+            pubkey: None,
+            master: None,
+        });
+        repo.downloads.push(RepositoryDownload {
+            arch: Some("X86_64".to_string()),
+            url: "https://other.example.com".to_string(),
+            repotype: Some("deb".to_string()),
+            archfilter: None,
+            pubkey: None,
+            master: None,
+        });
+        let err = validate_repository(&repo).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context
+                .contains("is not one of the repository's architectures"),
+            "{}",
+            err.context
+        );
     }
 
     #[test]

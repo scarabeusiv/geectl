@@ -1840,8 +1840,8 @@ mod tests {
         // membership check is case-sensitive, so a download arch that
         // differs only by case is rejected here, not by the dedup.
         // (A repository listing both casings is rejected by the
-        // repository-arch check; the download dedup's own
-        // case-insensitivity is pinned by the settings unit test.)
+        // repository-arch check; the download dedup compares arches
+        // exactly.)
         meta.repositories[0].downloads.push(RepositoryDownload {
             arch: Some("X86_64".to_string()),
             url: "https://other.example.com".to_string(),
