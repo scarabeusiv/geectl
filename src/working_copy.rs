@@ -2750,12 +2750,15 @@ fn add_to_tmp_index(
 /// the tree SHA. `link_baserev` rewrites the `_link` file's baserev
 /// before hashing (a pull moves the link to the target's latest
 /// revision). The expanded listing never carries `_link`, so a pull
-/// fetches it through the unexpanded route.
+/// fetches it through the unexpanded route, pinned to `link_rev`:
+/// the link package's own revision, not the expanded pin.
+/// `link_rev` must be `Some` whenever `link_baserev` is `Some`.
 fn build_base_tree(
     client: &ObsClient,
     wc: &WorkingCopy,
     listing: &DirectoryListing,
     rev: Option<&RevisionSpec>,
+    link_rev: Option<&RevisionSpec>,
     link_baserev: Option<&str>,
     expand: bool,
 ) -> Result<String, GeectlError> {
@@ -2823,15 +2826,17 @@ fn build_base_tree(
         // unexpanded route — it is the link package's own file —
         // and rewrite its baserev to the pulled target revision.
         let dest = tmp_dir.join("_link");
-        // Pinned to `rev` like every other download; no md5 to
-        // verify against — the expanded listing never carries
-        // `_link`.
+        // Pinned to the link package's own revision, not the
+        // expanded pin: the expanded md5 names the expanded tree,
+        // not a revision of the link package, so it cannot pin the
+        // unexpanded `_link` read. No md5 to verify against — the
+        // expanded listing never carries `_link`.
         download_verified(
             client,
             &wc.project,
             &wc.package,
             "_link",
-            rev,
+            link_rev,
             &dest,
             None,
             false,
@@ -3280,7 +3285,7 @@ fn update_obs(
         )
     })?;
     let pinned = RevisionSpec::Rev(pinned_rev);
-    let tree = build_base_tree(client, wc, &listing, Some(&pinned), None, false)?;
+    let tree = build_base_tree(client, wc, &listing, Some(&pinned), None, None, false)?;
     let new_root = git(
         &wc.root,
         "commit-tree",
@@ -3638,25 +3643,37 @@ pub fn pull(
     // listing's revision, like the update path pins to its
     // listing's revision: an unpinned pull would download files
     // the listing never named, so a listing with an unparsable
-    // revision errors instead of pulling.
-    let pinned = expanded_rev
-        .parse::<u64>()
-        .ok()
-        .map(RevisionSpec::Rev)
-        .ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::ServerError,
-                format!(
-                    "the server did not return a revision for {}/{}",
-                    wc.project, wc.package
-                ),
-            )
-        })?;
+    // revision errors instead of pulling. The expanded revision
+    // is the expanded content's md5 for a linked package, not a
+    // number, so the pin is a revision spec, which accepts both.
+    let pinned = RevisionSpec::parse(&expanded_rev).map_err(|_| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "the expanded listing for {}/{} carries an invalid revision: {expanded_rev:?}",
+                wc.project, wc.package
+            ),
+        )
+    })?;
+    // The `_link` file is not in the expanded tree: it downloads
+    // through the unexpanded route, pinned to the link package's
+    // own revision — the expanded md5 names the expanded tree,
+    // not a revision of the link package.
+    let own_pinned = RevisionSpec::parse(&own_rev).map_err(|_| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "the server returned an invalid own revision for {}/{}: {own_rev:?}",
+                wc.project, wc.package
+            ),
+        )
+    })?;
     let tree = build_base_tree(
         client,
         wc,
         &listing,
         Some(&pinned),
+        Some(&own_pinned),
         Some(&new_baserev),
         true,
     )?;
@@ -7369,6 +7386,75 @@ mod tests {
             .filter(|(url, _)| url == "https://api.opensuse.org/source/home:alice/foo?expand=1")
             .count();
         assert_eq!(expanded_reads, 2);
+        let _ = dir;
+    }
+
+    #[test]
+    fn pull_pins_the_expanded_downloads_by_an_md5_revision() {
+        // The expanded listing of a linked package carries the
+        // expanded content's md5 as its revision, not a number:
+        // the pull pins the expanded downloads by revision spec,
+        // which accepts the md5, and the `_link` download stays
+        // pinned to the link package's own numeric revision.
+        let md5_expanded = format!(
+            "<directory name=\"foo\" rev=\"{EXPANDED_SRCMD5}\" srcmd5=\"{EXPANDED_SRCMD5}\" vrev=\"1\">\
+            <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047303\" name=\"bar.spec\" size=\"10\" />\
+            </directory>"
+        );
+        let http = pull_http()
+            .with_get_sequence(
+                "https://api.opensuse.org/source/home:alice/foo?expand=1",
+                &[&md5_expanded],
+            )
+            .with_get_to_file(
+                &format!(
+                    "https://api.opensuse.org/source/home:alice/foo/bar.spec?expand=1&rev={EXPANDED_SRCMD5}"
+                ),
+                b"Name: bar\n",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dir = TempDirGuard::new("pull-md5-rev");
+        let mut wc = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            None,
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        let report = pull(&mut wc, &client, &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        assert!(report.updated);
+        assert_eq!(report.new_baserev, TARGET_SRCMD5);
+        // The expanded file downloaded pinned to the md5, and the
+        // `_link` download stayed pinned to the own revision:
+        // checkout downloaded it once, the pull once more.
+        let file_downloads: Vec<String> = http
+            .get_to_file_calls()
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect();
+        assert!(
+            file_downloads.contains(
+                &format!(
+                    "https://api.opensuse.org/source/home:alice/foo/bar.spec?expand=1&rev={EXPANDED_SRCMD5}"
+                )
+            ),
+            "expanded download was not pinned to the md5: {file_downloads:?}"
+        );
+        assert_eq!(
+            file_downloads
+                .iter()
+                .filter(|url| url.as_str()
+                    == "https://api.opensuse.org/public/source/home:alice/foo/_link?rev=1")
+                .count(),
+            2,
+            "_link download was not pinned to the own revision: {file_downloads:?}"
+        );
         let _ = dir;
     }
 
