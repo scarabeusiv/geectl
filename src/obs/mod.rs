@@ -164,6 +164,7 @@ pub(crate) use self::common::parse_status_invoked;
 pub(crate) use self::common::parse_status_ok;
 pub(crate) use self::common::parse_submit_request_ids;
 pub(crate) use self::common::parse_submit_request_ids_for_creator;
+pub(crate) use self::common::quoted_attr_value;
 pub(crate) use self::common::request_block_matches_action;
 pub use self::common::split_slash_segments;
 pub(crate) use self::common::status_data;

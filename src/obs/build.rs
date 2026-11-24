@@ -1829,27 +1829,39 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
         let mut downloads = Vec::new();
         for download in xml_elements(content, "download")? {
             let (download_tag, download_inner) = xml_split_element(download, "download");
-            let url = xml_attr_non_empty(download_tag, "url").ok_or_else(|| {
-                GeectlError::new(
-                    ErrorKind::ServerError,
-                    "unexpected OBS project meta response: <download> without url",
-                )
-            })?;
+            let url = match xml_attr(download_tag, "url") {
+                Some(url) if !url.is_empty() => url,
+                Some(_) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::ServerError,
+                        "unexpected OBS project meta response: <download> with empty url",
+                    ));
+                }
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::ServerError,
+                        "unexpected OBS project meta response: <download> without url",
+                    ));
+                }
+            };
             let master = xml_elements(download_inner, "master")?
                 .into_iter()
                 .map(|master_element| {
                     let (master_tag, _) = xml_split_element(master_element, "master");
-                    xml_attr_non_empty(master_tag, "url")
-                        .map(|master_url| DownloadMaster {
-                            url: master_url,
+                    match xml_attr(master_tag, "url") {
+                        Some(url) if !url.is_empty() => Ok(DownloadMaster {
+                            url,
                             sslfingerprint: xml_attr_non_empty(master_tag, "sslfingerprint"),
-                        })
-                        .ok_or_else(|| {
-                            GeectlError::new(
-                                ErrorKind::ServerError,
-                                "unexpected OBS project meta response: <master> without url",
-                            )
-                        })
+                        }),
+                        Some(_) => Err(GeectlError::new(
+                            ErrorKind::ServerError,
+                            "unexpected OBS project meta response: <master> with empty url",
+                        )),
+                        None => Err(GeectlError::new(
+                            ErrorKind::ServerError,
+                            "unexpected OBS project meta response: <master> without url",
+                        )),
+                    }
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
@@ -2514,7 +2526,9 @@ pub(crate) fn xml_attr(element: &str, name: &str) -> Option<String> {
 /// blank flag or optional value as unset, and rendering drops empty
 /// values, so the parse must read them as absent to round-trip.
 /// Every other caller reads through [`xml_attr`], where an empty
-/// value stays present.
+/// value stays present. A required repository attribute whose empty
+/// value fails closed reads through [`xml_attr`] too: the empty case
+/// errors, so no empty value can round-trip.
 fn xml_attr_non_empty(element: &str, name: &str) -> Option<String> {
     xml_attr_raw(element, name).filter(|value| !value.is_empty())
 }
@@ -6397,6 +6411,30 @@ mod tests {
         ] {
             assert!(parse_repositories(body).is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn parse_repositories_distinguishes_an_empty_url_from_a_missing_one() {
+        let missing_download = "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" repotype=\"rpmmd\"/></repository></project>";
+        let empty_download = "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"\" repotype=\"rpmmd\"/></repository></project>";
+        assert!(parse_repositories(missing_download)
+            .unwrap_err()
+            .context
+            .contains("<download> without url"));
+        assert!(parse_repositories(empty_download)
+            .unwrap_err()
+            .context
+            .contains("<download> with empty url"));
+        let missing_master = "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master sslfingerprint=\"AB:CD\"/></download></repository></project>";
+        let empty_master = "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"\" sslfingerprint=\"AB:CD\"/></download></repository></project>";
+        assert!(parse_repositories(missing_master)
+            .unwrap_err()
+            .context
+            .contains("<master> without url"));
+        assert!(parse_repositories(empty_master)
+            .unwrap_err()
+            .context
+            .contains("<master> with empty url"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use super::meta_roles;
 use super::parse_search_matches;
 use super::parse_status_invoked;
 use super::parse_status_ok;
+use super::quoted_attr_value;
 use super::tag_attr;
 use super::valid_obs_filename;
 use super::valid_obs_name;
@@ -1345,35 +1346,61 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
         }
         let mut downloads = Vec::new();
         for (download_tag, download_inner) in elements(&repo_inner, "download")? {
-            let url = tag_attr(&download_tag, "url").ok_or_else(|| {
-                GeectlError::new(
-                    ErrorKind::ServerError,
-                    "unexpected OBS project meta response: <download> without url",
-                )
-            })?;
+            let url = match quoted_attr_value(&download_tag, "url") {
+                Some(url) if !url.is_empty() => url,
+                Some(_) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::ServerError,
+                        "unexpected OBS project meta response: <download> with empty url",
+                    ));
+                }
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::ServerError,
+                        "unexpected OBS project meta response: <download> without url",
+                    ));
+                }
+            };
+            // The optional download attributes read an empty value as
+            // absent, like `xml_attr_non_empty` in build.rs: the model
+            // treats a blank optional value as unset and rendering
+            // drops empty values, so the parse must read them as
+            // absent to round-trip. Only the required `url` above
+            // distinguishes an empty value from a missing one, and
+            // the `<archfilter>` and `<pubkey>` text children below
+            // read the same way through `element_text`, which
+            // unescapes; their trim and empty filter are the same
+            // absent rule.
+            let opt_attr = |tag: &str, name: &str| {
+                quoted_attr_value(tag, name)
+                    .map(|value| xml_unescape(&value))
+                    .filter(|value| !value.is_empty())
+            };
             let master = elements(&download_inner, "master")?
                 .into_iter()
-                .map(|(master_tag, _)| {
-                    tag_attr(&master_tag, "url")
-                        .map(|master_url| DownloadMaster {
-                            url: xml_unescape(&master_url),
-                            sslfingerprint: tag_attr(&master_tag, "sslfingerprint")
-                                .map(|value| xml_unescape(&value)),
-                        })
-                        .ok_or_else(|| {
-                            GeectlError::new(
-                                ErrorKind::ServerError,
-                                "unexpected OBS project meta response: <master> without url",
-                            )
-                        })
-                })
+                .map(
+                    |(master_tag, _)| match quoted_attr_value(&master_tag, "url") {
+                        Some(url) if !url.is_empty() => Ok(DownloadMaster {
+                            url: xml_unescape(&url),
+                            sslfingerprint: opt_attr(&master_tag, "sslfingerprint"),
+                        }),
+                        Some(_) => Err(GeectlError::new(
+                            ErrorKind::ServerError,
+                            "unexpected OBS project meta response: <master> with empty url",
+                        )),
+                        None => Err(GeectlError::new(
+                            ErrorKind::ServerError,
+                            "unexpected OBS project meta response: <master> without url",
+                        )),
+                    },
+                )
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .next();
             downloads.push(RepositoryDownload {
-                arch: tag_attr(&download_tag, "arch").map(|value| xml_unescape(&value)),
+                arch: opt_attr(&download_tag, "arch"),
                 url: xml_unescape(&url),
-                repotype: tag_attr(&download_tag, "repotype").map(|value| xml_unescape(&value)),
+                repotype: opt_attr(&download_tag, "repotype"),
                 archfilter: element_text(&download_inner, "archfilter")
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty()),
@@ -9206,6 +9233,61 @@ mod tests {
             meta.repositories[0].downloads[0].url,
             "https://example.com/?a=b>c"
         );
+    }
+
+    #[test]
+    fn project_meta_distinguishes_an_empty_url_from_a_missing_one() {
+        let missing_download = "<project name=\"home:scarabeus_iv\"><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" repotype=\"rpmmd\"/></repository></project>";
+        let empty_download = "<project name=\"home:scarabeus_iv\"><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"\" repotype=\"rpmmd\"/></repository></project>";
+        assert!(parse_project_meta(missing_download)
+            .unwrap_err()
+            .context
+            .contains("<download> without url"));
+        assert!(parse_project_meta(empty_download)
+            .unwrap_err()
+            .context
+            .contains("<download> with empty url"));
+        let missing_master = "<project name=\"home:scarabeus_iv\"><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master sslfingerprint=\"AB:CD\"/></download></repository></project>";
+        let empty_master = "<project name=\"home:scarabeus_iv\"><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"\" sslfingerprint=\"AB:CD\"/></download></repository></project>";
+        assert!(parse_project_meta(missing_master)
+            .unwrap_err()
+            .context
+            .contains("<master> without url"));
+        assert!(parse_project_meta(empty_master)
+            .unwrap_err()
+            .context
+            .contains("<master> with empty url"));
+    }
+
+    #[test]
+    fn project_meta_download_siblings_unescape_and_read_empty_as_absent() {
+        let body = "<project name=\"home:scarabeus_iv\"><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com/?a=1&amp;b=2\" repotype=\"rpm&amp;md\"><archfilter>x86_64 &amp; aarch64</archfilter><pubkey>key &amp; more</pubkey><master url=\"https://master.example.com/?a=1&amp;b=2\" sslfingerprint=\"AB&amp;CD\"/></download></repository></project>";
+        let meta = parse_project_meta(body).unwrap();
+        let download = &meta.repositories[0].downloads[0];
+        assert_eq!(download.url, "https://example.com/?a=1&b=2");
+        assert_eq!(download.arch.as_deref(), Some("x86_64"));
+        assert_eq!(download.repotype.as_deref(), Some("rpm&md"));
+        assert_eq!(download.archfilter.as_deref(), Some("x86_64 & aarch64"));
+        assert_eq!(download.pubkey.as_deref(), Some("key & more"));
+        let master = download.master.as_ref().unwrap();
+        assert_eq!(master.url, "https://master.example.com/?a=1&b=2");
+        assert_eq!(master.sslfingerprint.as_deref(), Some("AB&CD"));
+        // An empty optional value reads as absent, the same as in
+        // build.rs: the model treats a blank optional value as unset
+        // and rendering drops it.
+        let empty = "<project name=\"home:scarabeus_iv\"><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"\" url=\"https://example.com\" repotype=\"\"><archfilter></archfilter><pubkey>   </pubkey><master url=\"https://master.example.com\" sslfingerprint=\"\"/></download></repository></project>";
+        let empty_meta = parse_project_meta(empty).unwrap();
+        let empty_download = &empty_meta.repositories[0].downloads[0];
+        assert_eq!(empty_download.arch, None);
+        assert_eq!(empty_download.repotype, None);
+        assert_eq!(empty_download.archfilter, None);
+        assert_eq!(empty_download.pubkey, None);
+        assert_eq!(empty_download.master.as_ref().unwrap().sslfingerprint, None);
+        // Both project-meta parsers agree on the download: the
+        // remote.rs parse and the build.rs parse read the same
+        // fields the same way.
+        let from_build = crate::obs::build::parse_repositories(body).unwrap();
+        assert_eq!(from_build[0].downloads, meta.repositories[0].downloads);
     }
 
     #[test]
