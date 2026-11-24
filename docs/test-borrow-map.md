@@ -1028,6 +1028,28 @@ to adopt.**
   test covers it, so the new tests are written from scratch against
   both parsers (missing and empty `repository` rejected).
 
+## Gap batch 3 — project-meta dry-run validation (#262)
+
+**Direct adoptions: 0. No reference test pins the dry-run half;
+the new tests are geectl's own.**
+
+- The reference `repo add` flow (`osc/commands/repo_add.py`) PUTs
+  the whole project meta back without validating the repositories
+  already in it (see the #157 OCR follow-ups entry above): a meta
+  write validates only the repositories it changes. The live path
+  already did that; the dry-run path validated every repository
+  the write carried instead, since it performs no fetch and cannot
+  tell a changed repository from a pre-existing one — so an
+  unrelated repository blocked an unrelated change. The dry-run
+  path now validates no repositories: any whole-list check can
+  name a pre-existing repository the live write would leave
+  alone, and the live write remains the arbiter for repository
+  validity.
+- osc has no dry-run meta write to borrow from: `osc meta`
+  (`osc/core.py:1723` `edit_meta`) syncs the edited file to the
+  API with no repository validation at all, and no behave scenario
+  or unit test pins a dry-run refusal.
+
 Counts unchanged: 0 new adoptions.
 
 ## Batch 11 — prjconf

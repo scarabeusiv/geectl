@@ -228,12 +228,9 @@ pub enum RemoteCommand {
     /// rollback. Dry-run does not read the live meta, so a removal
     /// is not validated there: a login holding no role, and the
     /// last-maintainer refusal, only fail with `--live`. A dry run
-    /// also validates every repository the write carries, since it
     /// performs no fetch and cannot tell a changed repository from
-    /// a pre-existing one: it can refuse a write whose repositories
-    /// it did not change when a carried repository is invalid,
-    /// while `--live` only validates the repositories when they
-    /// change.
+    /// a pre-existing one, so it validates no repositories, while
+    /// `--live` validates only the repositories it changes.
     SetProjectMeta {
         /// The project whose meta is written.
         project: String,

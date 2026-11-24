@@ -216,6 +216,10 @@ fn remove_role_from_lists(
 /// `X86_64` are the same architecture), and its settings must be
 /// valid. The name must not repeat across the list — that check
 /// lives with the caller, which sees the whole list.
+/// Deliberately lenient about shape: valid server state can have
+/// no architectures or no paths (a hostsystem-only repository has
+/// neither), so this check requires neither. The add path keeps
+/// its own stricter check.
 fn validate_repository_entry(repository: &Repository) -> Result<(), GeectlError> {
     if !valid_obs_name(&repository.name) {
         return Err(GeectlError::new(
@@ -258,28 +262,6 @@ fn validate_repository_entry(repository: &Repository) -> Result<(), GeectlError>
         }
     }
     validate_repository_settings(repository)
-}
-
-/// Validate the repositories of a project meta write: each name,
-/// architecture, and path entry must be a valid OBS name, each
-/// repository's settings must be valid, and no name may repeat.
-/// Deliberately lenient about shape: valid server
-/// state can have no architectures or no paths (a hostsystem-only
-/// repository has neither), so this write-path check requires
-/// neither. The add path keeps its own stricter check.
-fn validate_repositories(repositories: &[Repository]) -> Result<(), GeectlError> {
-    let mut names = Vec::new();
-    for repository in repositories {
-        validate_repository_entry(repository)?;
-        if names.contains(&repository.name) {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!("duplicate repository {:?} in project meta", repository.name),
-            ));
-        }
-        names.push(repository.name.clone());
-    }
-    Ok(())
 }
 
 /// Validate only the repositories that changed against the fetched
@@ -652,13 +634,12 @@ impl<'a> ObsClient<'a> {
     /// dry-run the write is recorded in the plan and nothing is
     /// written — the guard runs before the credentials check, like
     /// `create_package`. Repository validation runs on what will
-    /// actually be written: the live path validates the
-    /// repositories when they change, and a dry run validates
-    /// every repository the write carries before its dry-run gate,
-    /// since it performs no fetch and cannot tell a changed
-    /// repository from a pre-existing one — so a dry run can refuse
-    /// a write whose repositories it did not change when a carried
-    /// repository is invalid.
+    /// actually be written: the live path validates only the
+    /// repositories it changes. A dry run performs no fetch and
+    /// cannot tell a changed repository from a pre-existing one,
+    /// so it validates no repositories: an unrelated repository
+    /// cannot block an unrelated change in either mode, and the
+    /// live write remains the arbiter for repository validity.
     ///
     /// An agent writes project meta to correct a project's title or
     /// description, point it at its git source, or change who
@@ -682,25 +663,11 @@ impl<'a> ObsClient<'a> {
             ));
         }
         validate_roles(&meta.persons, &meta.groups)?;
-        if dry_run.enabled() {
-            // A dry run performs no fetch, so it cannot tell a
-            // changed repository from a pre-existing one: it
-            // validates every repository the write carries instead,
-            // before the dry-run gate records the write. The refusal
-            // says so: a live write validates only the repositories
-            // it changes, so a dry-run refusal can name a
-            // pre-existing repository the live write would leave
-            // alone.
-            validate_repositories(&meta.repositories).map_err(|err| {
-                GeectlError::new(
-                    err.kind(),
-                    format!(
-                        "{}; note: a dry run validates every repository the write carries, while a live write validates only the repositories it changes",
-                        err.context
-                    ),
-                )
-            })?;
-        }
+        // A dry run performs no fetch, so it cannot tell a changed
+        // repository from a pre-existing one: it validates no
+        // repositories, and the live write remains the arbiter —
+        // validating the whole list here would let an unrelated
+        // repository block an unrelated change.
         if !dry_run.allow(&format!("set project meta of {project}")) {
             return Ok(());
         }
@@ -2277,59 +2244,58 @@ mod tests {
     }
 
     #[test]
-    fn set_project_meta_dry_run_refuses_a_duplicate_repository() {
+    fn set_project_meta_dry_run_accepts_a_duplicate_repository() {
         let http = FakeHttp::new();
         let client = project_client(&http);
         let mut meta = parse_project_meta(PROJECT_META).unwrap();
         meta.repositories.push(meta.repositories[0].clone());
         let dry = DryRun::new(true);
-        let err = client
+        assert!(client
             .set_project_meta("home:scarabeus_iv", &meta, &dry)
-            .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            .is_ok());
         assert!(http.get_calls().is_empty());
         assert!(http.put_calls().is_empty());
-        assert!(dry.plan().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: set project meta of home:scarabeus_iv".to_string()]
+        );
     }
 
     #[test]
-    fn set_project_meta_dry_run_refuses_a_repository_with_invalid_settings() {
+    fn set_project_meta_dry_run_accepts_a_repository_with_invalid_settings() {
         let http = FakeHttp::new();
         let client = project_client(&http);
         let mut meta = parse_project_meta(PROJECT_META).unwrap();
         meta.repositories[0].rebuild = Some("bogus".to_string());
         let dry = DryRun::new(true);
-        let err = client
+        assert!(client
             .set_project_meta("home:scarabeus_iv", &meta, &dry)
-            .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            .is_ok());
         assert!(http.get_calls().is_empty());
         assert!(http.put_calls().is_empty());
-        assert!(dry.plan().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: set project meta of home:scarabeus_iv".to_string()]
+        );
     }
 
     #[test]
-    fn set_project_meta_dry_run_rejects_an_invalid_repository() {
+    fn set_project_meta_dry_run_accepts_a_title_change_with_an_invalid_repository() {
         let http = FakeHttp::new();
         let client = project_client(&http);
         let mut meta = parse_project_meta(PROJECT_META).unwrap();
-        let mut repository = replacement_repository();
-        repository.rebuild = Some("bogus".to_string());
-        meta.repositories = vec![repository];
+        meta.title = Some("New title".to_string());
+        meta.repositories[0].rebuild = Some("bogus".to_string());
         let dry = DryRun::new(true);
-        let err = client
+        assert!(client
             .set_project_meta("home:scarabeus_iv", &meta, &dry)
-            .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(
-            err.context
-                .contains("a dry run validates every repository the write carries"),
-            "{}",
-            err.context
-        );
+            .is_ok());
         assert!(http.get_calls().is_empty());
         assert!(http.put_calls().is_empty());
-        assert!(dry.plan().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec!["[dry-run] would: set project meta of home:scarabeus_iv".to_string()]
+        );
     }
 
     #[test]
