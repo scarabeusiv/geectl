@@ -1426,12 +1426,17 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
                     "unexpected OBS project meta response: <releasetarget> without project",
                 )
             })?;
+            let repository = tag_attr(&target_tag, "repository").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <releasetarget> without repository",
+                )
+            })?;
             release_targets.push(ReleaseTarget {
                 project: xml_unescape(&project),
-                // A release target without a repository reads as
-                // None: the read tolerates it, only a write refuses
-                // it (see `validate_repository_settings`).
-                repository: tag_attr(&target_tag, "repository").map(|value| xml_unescape(&value)),
+                // A release target without a repository is malformed:
+                // the server requires both `project` and `repository`.
+                repository: Some(xml_unescape(&repository)),
                 trigger: tag_attr(&target_tag, "trigger").map(|value| xml_unescape(&value)),
             });
         }
@@ -9363,7 +9368,7 @@ mod tests {
     #[test]
     fn project_meta_parses_the_full_repository_shape() {
         let meta = parse_project_meta(
-            "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" rebuild=\"local\" block=\"never\" linkedbuild=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><master url=\"https://master.example.com\" sslfingerprint=\"AB:CD\"/><pubkey>key-material</pubkey></download><download url=\"https://other.example.com\"/><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/><releasetarget project=\"openSUSE:Leap:15.5\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>",
+            "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" rebuild=\"local\" block=\"never\" linkedbuild=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><master url=\"https://master.example.com\" sslfingerprint=\"AB:CD\"/><pubkey>key-material</pubkey></download><download url=\"https://other.example.com\"/><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/><releasetarget project=\"openSUSE:Leap:15.5\" repository=\"ports\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>",
         )
         .unwrap();
         assert_eq!(meta.repositories.len(), 1);
@@ -9405,7 +9410,7 @@ mod tests {
                     },
                     ReleaseTarget {
                         project: "openSUSE:Leap:15.5".to_string(),
-                        repository: None,
+                        repository: Some("ports".to_string()),
                         trigger: None,
                     },
                 ],

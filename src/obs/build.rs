@@ -1965,14 +1965,17 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
                     "unexpected OBS project meta response: <releasetarget> without project",
                 )
             })?;
-            // A release target without a repository reads as None:
-            // the server looks a target up by (project, repository),
-            // but a missing repository is state the read tolerates;
-            // only a write refuses it (see
-            // `validate_repository_settings`).
+            // A release target without a repository is malformed:
+            // the server requires both `project` and `repository`.
+            let repository = xml_attr_non_empty(target_tag, "repository").ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: <releasetarget> without repository",
+                )
+            })?;
             release_targets.push(ReleaseTarget {
                 project,
-                repository: xml_attr_non_empty(target_tag, "repository"),
+                repository: Some(repository),
                 trigger: xml_attr_non_empty(target_tag, "trigger"),
             });
         }
@@ -6434,6 +6437,9 @@ mod tests {
 
     #[test]
     fn repository_element_drops_empty_optional_values() {
+        // The emitted `<releasetarget project="..."/>` drops the empty
+        // `repository` and is therefore no longer re-parseable: both
+        // parsers now reject a release target without a repository.
         let repo = Repository {
             name: "standard".to_string(),
             arch: vec!["x86_64".to_string()],
@@ -6530,26 +6536,34 @@ mod tests {
     }
 
     #[test]
-    fn both_repository_parsers_tolerate_a_release_target_without_a_repository() {
-        // A release target without a repository reads as None: the
-        // read tolerates server state a write refuses (the settings
-        // check requires the repository on a changed repository).
+    fn both_repository_parsers_reject_a_release_target_without_a_repository() {
+        // A release target without a repository is malformed: the
+        // server requires both `project` and `repository`, as the
+        // settings check already requires on a write.
         for body in [
             "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" trigger=\"manual\"/></repository></project>",
             "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"\" trigger=\"manual\"/></repository></project>",
         ] {
-            for parsed in [
-                parse_repositories(body).unwrap(),
-                parse_project_meta(body).unwrap().repositories,
-            ] {
-                assert_eq!(parsed[0].release_targets[0].repository, None, "{body}");
-            }
+            let err = parse_repositories(body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError, "{body}");
+            assert!(
+                err.context.contains("without repository"),
+                "{}",
+                err.context
+            );
+            let err = parse_project_meta(body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError, "{body}");
+            assert!(
+                err.context.contains("without repository"),
+                "{}",
+                err.context
+            );
         }
     }
 
     #[test]
     fn both_repository_parsers_agree_on_empty_attribute_values() {
-        let body = "<project name=\"testproject\"><repository name=\"standard\" rebuild=\"\" block=\"\" linkedbuild=\"\"><arch>x86_64</arch><download arch=\"\" url=\"https://example.com\" repotype=\"\"><archfilter> </archfilter><master url=\"https://master.example.com\" sslfingerprint=\"\"/><pubkey> </pubkey></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"\" trigger=\"\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        let body = "<project name=\"testproject\"><repository name=\"standard\" rebuild=\"\" block=\"\" linkedbuild=\"\"><arch>x86_64</arch><download arch=\"\" url=\"https://example.com\" repotype=\"\"><archfilter> </archfilter><master url=\"https://master.example.com\" sslfingerprint=\"\"/><pubkey> </pubkey></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
         let via_project_meta = parse_project_meta(body).unwrap();
         let via_repositories = parse_repositories(body).unwrap();
         assert_eq!(via_project_meta.repositories, via_repositories);
@@ -6566,7 +6580,10 @@ mod tests {
             repo.downloads[0].master.as_ref().unwrap().sslfingerprint,
             None
         );
-        assert_eq!(repo.release_targets[0].repository, None);
+        assert_eq!(
+            repo.release_targets[0].repository.as_deref(),
+            Some("standard")
+        );
         assert_eq!(repo.release_targets[0].trigger, None);
     }
 

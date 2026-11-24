@@ -1014,6 +1014,22 @@ meta write; same mining as the #157 section above.**
   `live_full_repository_shape_round_trips` test already pins
   through `add_repository`.
 
+## Gap batch — releasetarget repository required (#265)
+
+**Direct adoptions: 0. The reference suite has no releasetarget test
+to adopt.**
+
+- The reference releasetarget model
+  (`osc/obs_api/repository_releasetarget.py`) types `repository` as
+  required while `trigger` is optional — the shape the validator
+  already required and the two parsers now follow: a `<releasetarget>`
+  without a repository is malformed, not a target that reads as
+  `None`. No behave scenario mentions `releasetarget` and no unit
+  test covers it, so the new tests are written from scratch against
+  both parsers (missing and empty `repository` rejected).
+
+Counts unchanged: 0 new adoptions.
+
 ## Batch 11 — prjconf
 
 **Direct adoptions: 0. osc has no prjconf tests.**
@@ -1144,6 +1160,7 @@ scheduler entries.**
 | Gap batch 3 — local-build log (#178) | 0 | 0 | 0 |
 | Gap batch 3 — Repository shape in the meta write (#157 OCR follow-ups) | 0 (+source pins) | 0 | 0 (+pins) |
 | Gap batch 3 — project-meta full-shape write test (#266) | 0 | 0 | 0 |
+| Gap batch — releasetarget repository required (#265) | 0 | 0 | 0 |
 | 11 prjconf | 0 | 0 | 0 |
 | 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
 | 13 mirror-first dep fetch | 1 | 0 | 1 |
