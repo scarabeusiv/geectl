@@ -164,7 +164,20 @@ overridable by config `build.cache_dir`):
 - `build-roots/<project>/<package>/<repo>-<arch>[-<flavor>]/` — the
   build root, named the same way the existing tool's `build-root` template
   names it (project/package/repo/arch), so `build-summary`-style tooling
-  and humans can find it. The root carries a `.geectl-build-root` marker
+  and humans can find it. A `:` in a project, package, repository,
+  arch, or flavor name is percent-encoded in the directory (`:`
+  becomes `%3A`, `%` becomes `%25`); the encoding is injective, so
+  `home:foo` and `home_foo` are different projects with different
+  roots, and the marker keeps the real name. The same encoded form
+  is used for the `sccache/` and `pkg/` layouts above. Directories
+  written before the encoding keep raw `:` in their names; new
+  builds never reuse them, but eviction still walks and can delete
+  them. A pkg lock held by a concurrently running pre-upgrade
+  binary is not honored for those legacy paths, because the lock
+  lookup uses the encoded form. A legacy sccache store is still
+  guarded at delete time — its root lock is held via the verbatim
+  store-to-root path, so a locked root is not deleted under a
+  running build (only the plan-time protection misses it). The root carries a `.geectl-build-root` marker
   file (image digest, engine version, repo/arch/flavor, created time,
   last build time — the eviction policy orders roots by it);
   `build-wipe` refuses a directory without the marker.

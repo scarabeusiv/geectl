@@ -1348,15 +1348,77 @@ impl<'a> LocalBuild<'a> {
         self.cache_cap_bytes / LOW_WATER_DEN * LOW_WATER_NUM
     }
 
+    /// A path segment for a project, package, repository, arch, or
+    /// flavor name: `:` is legal in an OBS name but not in a Windows
+    /// path, so it is percent-encoded (`:` becomes `%3A`, `%`
+    /// becomes `%25`). The encoding is injective — distinct names
+    /// always map to distinct directories — and reversible (see
+    /// `decode_path_segment`); a name without `%` or `:` is
+    /// unchanged. Only `:` needs encoding: it is the one
+    /// Windows-illegal character a validated OBS name
+    /// (`[A-Za-z0-9_.+-:]`) can carry, and `%` is escaped so the
+    /// encoding stays injective even for unvalidated input. The
+    /// marker in the build root keeps the real name; the directory
+    /// name never names the project or package back. This differs
+    /// from the working copy's lossy `:` to `_` mapping on purpose:
+    /// a second checkout there fails on the existing target, while a
+    /// build here reuses a root by path alone — the marker is never
+    /// compared against the requested build — so a lossy mapping
+    /// would silently run one project's tree as another's.
+    fn encode_path_segment(name: &str) -> String {
+        let mut out = String::with_capacity(name.len());
+        for c in name.chars() {
+            match c {
+                '%' => out.push_str("%25"),
+                ':' => out.push_str("%3A"),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// The inverse of `encode_path_segment`: `%25` becomes `%`,
+    /// `%3A` becomes `:`. A `%` not followed by `25`, `3A`, or `3a`
+    /// passes through unchanged, so decoding a directory name the
+    /// encoder never wrote still yields a usable name for a lock
+    /// lookup, never a failure.
+    fn decode_path_segment(segment: &str) -> String {
+        let mut out = String::with_capacity(segment.len());
+        let mut rest = segment;
+        while let Some(at) = rest.find('%') {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + 1..];
+            if let Some(tail) = after.strip_prefix("25") {
+                out.push('%');
+                rest = tail;
+            } else if let Some(tail) = after
+                .strip_prefix("3A")
+                .or_else(|| after.strip_prefix("3a"))
+            {
+                out.push(':');
+                rest = tail;
+            } else {
+                out.push('%');
+                rest = after;
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// The root's name inside its project/package dirs:
     /// `<repo>-<arch>` plus `-<flavor>` when the build carries one.
     /// Shared by the build-root path and the sccache store path, so
     /// a root and its store always name the same build.
     fn root_name(repo: &str, arch: &str, flavor: &Option<String>) -> String {
-        let mut name = format!("{repo}-{arch}");
+        let mut name = format!(
+            "{}-{}",
+            Self::encode_path_segment(repo),
+            Self::encode_path_segment(arch)
+        );
         if let Some(flavor) = flavor {
             name.push('-');
-            name.push_str(flavor);
+            name.push_str(&Self::encode_path_segment(flavor));
         }
         name
     }
@@ -1372,8 +1434,8 @@ impl<'a> LocalBuild<'a> {
     ) -> PathBuf {
         self.cache_dir
             .join("build-roots")
-            .join(project)
-            .join(package)
+            .join(Self::encode_path_segment(project))
+            .join(Self::encode_path_segment(package))
             .join(Self::root_name(repo, arch, flavor))
     }
 
@@ -1395,8 +1457,8 @@ impl<'a> LocalBuild<'a> {
     ) -> PathBuf {
         self.cache_dir
             .join("sccache")
-            .join(project)
-            .join(package)
+            .join(Self::encode_path_segment(project))
+            .join(Self::encode_path_segment(package))
             .join(Self::root_name(repo, arch, flavor))
     }
 
@@ -1428,7 +1490,10 @@ impl<'a> LocalBuild<'a> {
     /// check on it cannot match the wrong (project, package) and
     /// the caller protects it instead. Both the plan-time retain
     /// and the apply-time re-probe use this one helper, so the two
-    /// parses cannot drift apart again.
+    /// parses cannot drift apart again. The pair is the encoded
+    /// directory form (see `encode_path_segment`): a store for
+    /// `home:foo` reads back as `home%3Afoo`, matching the encoded
+    /// keys `locked_root_keys` returns.
     fn store_project_package(&self, path: &Path) -> Option<(String, String)> {
         let rel = path.strip_prefix(self.cache_dir.join("sccache")).ok()?;
         let mut parts = rel.components();
@@ -1444,7 +1509,10 @@ impl<'a> LocalBuild<'a> {
     /// The build root for a sccache store path: the store layout is
     /// `sccache/<project>/<package>/<root-name>/`, and the root of
     /// the same build is `build-roots/<project>/<package>/<root-name>/`.
-    /// None for a path of any other shape — the caller never deletes
+    /// The components are the encoded directory forms (see
+    /// `encode_path_segment`); they re-join as-is, so no decode is
+    /// needed — the root of the same build sits at the same encoded
+    /// path. None for a path of any other shape — the caller never deletes
     /// a store it cannot attribute to a root.
     fn store_root_path(&self, path: &Path) -> Option<PathBuf> {
         let rel = path.strip_prefix(self.cache_dir.join("sccache")).ok()?;
@@ -2515,12 +2583,7 @@ impl<'a> LocalBuild<'a> {
         let project = dep.project.as_deref().unwrap_or(req.fetch_project());
         let repo = Self::dep_repo(dep, req);
         let arch = Self::dep_arch(dep, req);
-        let dir = self
-            .cache_dir
-            .join("pkg")
-            .join(project)
-            .join(repo)
-            .join(arch);
+        let dir = self.pkg_dir(project, repo, arch);
         fs::create_dir_all(&dir).map_err(|e| {
             GeectlError::new(
                 ErrorKind::InternalError,
@@ -4111,17 +4174,33 @@ impl<'a> LocalBuild<'a> {
         }
     }
 
+    /// The package cache dir for a project, repository and arch:
+    /// `pkg/<project>/<repo>/<arch>/`, with every component encoded
+    /// (see `encode_path_segment`). The download/write path builds
+    /// its dir through this helper; the lock path builds the same
+    /// encoded components itself, so the two can never disagree
+    /// about where a project's files live.
+    fn pkg_dir(&self, project: &str, repo: &str, arch: &str) -> PathBuf {
+        self.cache_dir
+            .join("pkg")
+            .join(Self::encode_path_segment(project))
+            .join(Self::encode_path_segment(repo))
+            .join(Self::encode_path_segment(arch))
+    }
+
     /// The project-repo-arch lock file:
     /// `pkg/<project>/<repo>/<arch>.lock`, next to the pkg files it
     /// guards. The project is part of the key: the same repo name
     /// in two projects is two different cache dirs, so it needs two
-    /// different locks.
+    /// different locks. Every component is encoded (see
+    /// `encode_path_segment`), including the arch in the file name,
+    /// so the lock path is the encoded form of the real coordinates.
     fn pkg_lock_path(&self, project: &str, repo: &str, arch: &str) -> PathBuf {
         self.cache_dir
             .join("pkg")
-            .join(project)
-            .join(repo)
-            .join(format!("{arch}.lock"))
+            .join(Self::encode_path_segment(project))
+            .join(Self::encode_path_segment(repo))
+            .join(format!("{}.lock", Self::encode_path_segment(arch)))
     }
 
     /// Open a project-repo-arch lock file (no truncate: the file
@@ -4316,6 +4395,10 @@ impl<'a> LocalBuild<'a> {
 
     /// The (project, package) pairs with a build root whose lock is
     /// held: a sccache store for such a package is never evicted.
+    /// The pairs are the encoded directory forms (see
+    /// `encode_path_segment`), matching what
+    /// `store_project_package` reads from a store path — the marker
+    /// keeps the real names, so the marker side encodes here.
     fn locked_root_keys(&self) -> std::collections::HashSet<(String, String)> {
         let mut locked = std::collections::HashSet::new();
         let roots = self.cache_dir.join("build-roots");
@@ -4341,7 +4424,10 @@ impl<'a> LocalBuild<'a> {
                         continue;
                     };
                     if root_lock_held(root) {
-                        locked.insert((marker.project, marker.package));
+                        locked.insert((
+                            Self::encode_path_segment(&marker.project),
+                            Self::encode_path_segment(&marker.package),
+                        ));
                     }
                 }
             }
@@ -4481,8 +4567,15 @@ impl<'a> LocalBuild<'a> {
         // 3. Build roots, oldest last-build first. A locked root, the
         // most recent root per (project, package), and anything in
         // the 24h grace period never evict. The grouping is by
-        // project+package: one root per 5-tuple key exists (the path
-        // is the key), so grouping by the full key protected every
+        // project+package, keyed on the marker's real coordinates —
+        // deliberately not the encoded directory form: grouping is
+        // by project identity, so two distinct projects must never
+        // group together (`home:foo` and `home_foo` are different
+        // projects with different roots), and the marker is the only
+        // source of the real coordinates. The key is never compared
+        // against a directory-derived key, so no encoding is needed
+        // here. One root per 5-tuple key exists (the path is the
+        // key), so grouping by the full key protected every
         // root that carries a parseable marker and roots effectively
         // never evicted. Only the newest root of the package is
         // protected, and an older root in another repo, arch or
@@ -4756,7 +4849,16 @@ impl<'a> LocalBuild<'a> {
         if parts.next().is_some() {
             return None;
         }
-        self.try_pkg_lock(&project, &repo, &arch)
+        // The components on disk are the encoded forms: decode
+        // them back to the real coordinates before the lock lookup,
+        // or `pkg_lock_path` would encode the `%` a second time
+        // (`home%3Afoo` becoming `home%253Afoo`) and the lock would
+        // never match the one the download holds.
+        self.try_pkg_lock(
+            &Self::decode_path_segment(&project),
+            &Self::decode_path_segment(&repo),
+            &Self::decode_path_segment(&arch),
+        )
     }
 
     /// Select superseded images for the plan: digests of this
@@ -12137,6 +12239,207 @@ exit 0
         }
 
         #[test]
+        fn cache_paths_encode_colon_in_obs_names() {
+            // `:` is legal in an OBS name but not in a Windows path:
+            // every cache path encodes it as `%3A`, on every
+            // platform, so a `home:foo` build creates usable
+            // directories on Windows too. The encoding is injective:
+            // `home:foo` and `home_foo` get distinct roots.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let cache = dir.path().join("cache");
+            let no_flavor: Option<String> = None;
+            assert_eq!(
+                vertical.root_path("home:foo", "foo", "standard", "x86_64", &no_flavor),
+                cache
+                    .join("build-roots")
+                    .join("home%3Afoo")
+                    .join("foo")
+                    .join("standard-x86_64")
+            );
+            assert_eq!(
+                vertical.sccache_dir("home:foo", "foo", "standard", "x86_64", &no_flavor),
+                cache
+                    .join("sccache")
+                    .join("home%3Afoo")
+                    .join("foo")
+                    .join("standard-x86_64")
+            );
+            assert_eq!(
+                vertical.pkg_lock_path("home:foo", "standard", "x86_64"),
+                cache
+                    .join("pkg")
+                    .join("home%3Afoo")
+                    .join("standard")
+                    .join("x86_64.lock")
+            );
+            // The pkg dir helper encodes the project too:
+            // `ensure_cached` builds its dir through `pkg_dir`, so
+            // this pins the dir a `home:foo` dep's files land in.
+            assert_eq!(
+                vertical.pkg_dir("home:foo", "standard", "x86_64"),
+                cache
+                    .join("pkg")
+                    .join("home%3Afoo")
+                    .join("standard")
+                    .join("x86_64")
+            );
+            // The root name encodes a colon in the flavor too.
+            assert_eq!(
+                LocalBuild::root_name("standard", "x86_64", &Some("a:b".to_string())),
+                "standard-x86_64-a%3Ab"
+            );
+            // Names without `%` or `:` are unchanged.
+            assert_eq!(LocalBuild::encode_path_segment("home_foo"), "home_foo");
+            assert_eq!(LocalBuild::encode_path_segment("home:foo"), "home%3Afoo");
+            // `%` itself is escaped, so a literal `%3A` in a name
+            // cannot collide with an encoded `:`.
+            assert_eq!(
+                LocalBuild::encode_path_segment("home%3Afoo"),
+                "home%253Afoo"
+            );
+            // The encoding round-trips.
+            for name in ["home:foo", "home%3Afoo", "home_foo", "plain"] {
+                assert_eq!(
+                    LocalBuild::decode_path_segment(&LocalBuild::encode_path_segment(name)),
+                    name
+                );
+            }
+            // Distinct names stay distinct: `home:foo` and
+            // `home_foo` are different projects with different
+            // roots — the second build never reuses the first root.
+            assert_ne!(
+                vertical.root_path("home:foo", "foo", "standard", "x86_64", &no_flavor),
+                vertical.root_path("home_foo", "foo", "standard", "x86_64", &no_flavor)
+            );
+        }
+
+        #[test]
+        fn encoded_locked_keys_match_store_paths() {
+            // The eviction locked-root check compares the
+            // (project, package) read from a store path against the
+            // keys read from root markers: the marker keeps the real
+            // name (`home:foo`) while the store path carries the
+            // encoded one (`home%3Afoo`), so the marker side
+            // encodes too — otherwise a locked root's store
+            // evicts while the root is in use.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let no_flavor: Option<String> = None;
+            let root = vertical.root_path("home:foo", "foo", "standard", "x86_64", &no_flavor);
+            fs::create_dir_all(&root).unwrap();
+            let marker = RootMarker {
+                project: "home:foo".to_string(),
+                package: "foo".to_string(),
+                repo: "standard".to_string(),
+                arch: "x86_64".to_string(),
+                flavor: None,
+                image_digest: None,
+                engine_version: None,
+                created_unix: 0,
+                last_build_unix: 0,
+                last_success_digest: None,
+            };
+            fs::write(
+                root.join(ROOT_MARKER),
+                serde_json::to_string(&marker).unwrap(),
+            )
+            .unwrap();
+            let _lock = vertical.acquire_root_lock(&root, "foo").unwrap();
+            let store = vertical.sccache_dir("home:foo", "foo", "standard", "x86_64", &no_flavor);
+            assert_eq!(
+                vertical.store_project_package(&store),
+                Some(("home%3Afoo".to_string(), "foo".to_string()))
+            );
+            assert!(vertical
+                .locked_root_keys()
+                .contains(&("home%3Afoo".to_string(), "foo".to_string())));
+        }
+
+        #[test]
+        fn colon_names_get_distinct_roots_with_distinct_markers() {
+            // `home:foo` and `home_foo` are different projects: the
+            // encoding gives them different roots, and the marker
+            // check tells them apart — wiping one project's root
+            // never touches the other's, and a marker written for
+            // one never validates the other.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let no_flavor: Option<String> = None;
+            let colon_root =
+                vertical.root_path("home:foo", "foo", "standard", "x86_64", &no_flavor);
+            let plain_root =
+                vertical.root_path("home_foo", "foo", "standard", "x86_64", &no_flavor);
+            assert_ne!(colon_root, plain_root);
+            let marker = |project: &str| RootMarker {
+                project: project.to_string(),
+                package: "foo".to_string(),
+                repo: "standard".to_string(),
+                arch: "x86_64".to_string(),
+                flavor: None,
+                image_digest: None,
+                engine_version: None,
+                created_unix: 0,
+                last_build_unix: 0,
+                last_success_digest: None,
+            };
+            for (root, project) in [(&colon_root, "home:foo"), (&plain_root, "home_foo")] {
+                fs::create_dir_all(root).unwrap();
+                fs::write(
+                    root.join(ROOT_MARKER),
+                    serde_json::to_string(&marker(project)).unwrap(),
+                )
+                .unwrap();
+            }
+            let colon_expected = ExpectedMarker {
+                project: "home:foo",
+                package: "foo",
+                repo: "standard",
+                arch: "x86_64",
+                flavor: &no_flavor,
+            };
+            let plain_expected = ExpectedMarker {
+                project: "home_foo",
+                package: "foo",
+                repo: "standard",
+                arch: "x86_64",
+                flavor: &no_flavor,
+            };
+            assert!(LocalBuild::check_marker(&colon_root, Some(&colon_expected)).unwrap());
+            assert!(LocalBuild::check_marker(&plain_root, Some(&plain_expected)).unwrap());
+            assert!(LocalBuild::check_marker(&colon_root, Some(&plain_expected)).is_err());
+            assert!(LocalBuild::check_marker(&plain_root, Some(&colon_expected)).is_err());
+            // And the wipe itself: wiping `home_foo` removes only
+            // its root's contents (the directory stays — the wipe
+            // clears contents, not the root), and wiping `home:foo`
+            // then removes its own.
+            vertical
+                .build_wipe("home_foo", "foo", "standard", "x86_64", &no_flavor)
+                .unwrap();
+            assert!(plain_root.is_dir());
+            assert!(!plain_root.join(ROOT_MARKER).exists());
+            assert!(colon_root.is_dir());
+            assert!(colon_root.join(ROOT_MARKER).exists());
+            vertical
+                .build_wipe("home:foo", "foo", "standard", "x86_64", &no_flavor)
+                .unwrap();
+            assert!(colon_root.is_dir());
+            assert!(!colon_root.join(ROOT_MARKER).exists());
+        }
+
+        #[test]
         fn pkg_lock_for_path_rejects_a_legacy_two_level_path() {
             // A legacy pkg/<repo>/<arch>/<file> path must not be
             // read as project/repo/arch: the lock it would take
@@ -12168,6 +12471,37 @@ exit 0
                 .join("standard")
                 .join(host_arch())
                 .join("glibc-2.38-1.x86_64.rpm");
+            assert!(vertical.pkg_lock_for_path(&current).is_some());
+        }
+
+        #[test]
+        fn pkg_lock_for_path_matches_the_download_lock_for_a_colon_project() {
+            // The lock `pkg_lock_for_path` takes for an encoded
+            // `home:foo` file must be the same lock `acquire_pkg_lock`
+            // takes for the real coordinates: the path components
+            // are decoded before the lookup, or the lookup would
+            // encode the `%` a second time and take a different
+            // lock — a download in flight would not block the delete.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let cache = dir.path().join("cache");
+            let current = cache
+                .join("pkg")
+                .join("home%3Afoo")
+                .join("standard")
+                .join(host_arch())
+                .join("glibc-2.38-1.x86_64.rpm");
+            // Hold the download lock for the real coordinates: the
+            // lookup for the encoded file must contend with it.
+            let held = vertical
+                .acquire_pkg_lock("home:foo", "standard", host_arch())
+                .unwrap();
+            assert!(vertical.pkg_lock_for_path(&current).is_none());
+            drop(held);
             assert!(vertical.pkg_lock_for_path(&current).is_some());
         }
 
