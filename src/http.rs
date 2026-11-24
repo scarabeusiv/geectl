@@ -282,7 +282,10 @@ fn download_io_error(phase: DownloadIoPhase, path: &Path, e: &std::io::Error) ->
 /// `application/xml` (`Accept` header): a path that exists in both
 /// the API and WebUI route sets serves the WebUI HTML page unless
 /// the request asks for XML.
-pub trait HttpClient {
+/// Shared across threads by the parallel dep download: the
+/// production client is thread-safe, and the test fake guards
+/// its state with a mutex for the same reason.
+pub trait HttpClient: Sync {
     fn get(&self, url: &str) -> Result<String, GeectlError>;
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError>;
     /// GET a URL and return the raw response bytes. The byte

@@ -53,8 +53,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -311,6 +313,20 @@ pub struct CacheStats {
     /// downloaded.
     pub pkg_preferred: u64,
     pub sccache_hits: Option<u64>,
+}
+
+impl std::ops::AddAssign for CacheStats {
+    fn add_assign(&mut self, other: Self) {
+        self.pkg_hits += other.pkg_hits;
+        self.pkg_misses += other.pkg_misses;
+        self.pkg_preferred += other.pkg_preferred;
+        // `sccache_hits` is log-derived, set after `prepare_deps`
+        // from the engine log — no worker ever produces one, so
+        // this keeps the first set value instead of summing.
+        if self.sccache_hits.is_none() {
+            self.sccache_hits = other.sccache_hits;
+        }
+    }
 }
 
 /// The cache usage: total bytes and per-area bytes, plus the cap and
@@ -2274,6 +2290,18 @@ struct ImageInfo {
     digest: Option<String>,
 }
 
+/// One dep's download work: the dep and its resolved file name.
+/// The file name is resolved sequentially in `prepare_deps`; the
+/// download itself runs in parallel in `ensure_all_cached`. A
+/// validation or resolution failure is recorded here, not returned
+/// at once, so the dep-order collect returns it in place —
+/// exactly as the sequential loop did, where a later dep's failure
+/// never masked an earlier dep's download failure.
+struct DepWork<'d> {
+    dep: &'d BuildDep,
+    filename: Result<String, GeectlError>,
+}
+
 /// Image resolution and dep preparation.
 impl<'a> LocalBuild<'a> {
     /// Resolve the build image: the local digest when present, a
@@ -2603,11 +2631,11 @@ impl<'a> LocalBuild<'a> {
             ));
             return Ok(None);
         }
-        // The per-file download/write path takes the
-        // project-repo-arch lock (blocking, briefly): eviction takes
-        // the same lock while deleting that dir's pkg files, so a
-        // delete can never race a download's atomic rename — the
-        // same lock `ensure_cached` holds for a dep.
+        // The download path takes the project-repo-arch lock
+        // shared: eviction takes it exclusive while deleting that
+        // dir's pkg files, so a delete can never race a download's
+        // atomic rename — the same lock `ensure_cached` holds for
+        // a dep.
         let _pkg_lock = match self.acquire_pkg_lock(project, repo, arch) {
             Ok(lock) => lock,
             Err(e) => {
@@ -2802,7 +2830,8 @@ impl<'a> LocalBuild<'a> {
     /// `sysroot: ` prefix. A dep the offered image covers keeps its
     /// place in the install lists (see `prepare_preinstall_image`):
     /// the engine installs it from the image, and the rpmlist
-    /// carries the image lines.
+    /// carries the image lines. Downloads run in parallel, bounded
+    /// (see `ensure_all_cached`); the rpmlist keeps dep order.
     fn prepare_deps(
         &self,
         req: &BuildRequest,
@@ -2823,17 +2852,27 @@ impl<'a> LocalBuild<'a> {
         let mut runscripts: Vec<String> = Vec::new();
         let mut noinstall: Vec<String> = Vec::new();
         let mut installonly: Vec<String> = Vec::new();
-        // Mirrors that failed with a health failure (transport,
-        // 5xx, timeout, redirect, over-cap) for one (project,
-        // repo): a dead mirror is tried once per build, not once
-        // per dep — the next dep for the same pair goes straight
-        // to the API. A per-file failure (404, hdrmd5 mismatch)
-        // does not mark the mirror dead: the host may serve the
-        // next dep fine.
-        let mut dead_mirrors: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
+        // One work item per dep that needs a download:
+        // classification and file-name resolution stay sequential
+        // (the install lists and the rpmlist keep dep order), the
+        // downloads run in parallel below, and the rpmlist lines
+        // are assembled in dep order from the parallel results.
+        // File-name resolution runs for every dep up front, so a
+        // failing build may list binaries for deps the sequential
+        // loop never reached; those listings are read-only and the
+        // build fails either way.
+        let mut work: Vec<DepWork<'_>> = Vec::new();
         for dep in &info.bdeps {
-            validate_dep(dep)?;
+            // Validation and file-name resolution record their
+            // failure in the work item instead of returning at
+            // once, so the dep-order collect returns the first
+            // error in dep order, exactly as the sequential loop
+            // did — a later dep's bad name never masks an earlier
+            // dep's download failure.
+            let filename = validate_dep(dep).and_then(|()| match &dep.binary {
+                Some(binary) => Ok(binary.clone()),
+                None => self.resolve_dep_filename(req, dep),
+            });
             if dep.preinstall {
                 preinstall.push(dep.name.clone());
             }
@@ -2861,16 +2900,14 @@ impl<'a> LocalBuild<'a> {
             if covered.contains(dep.name.as_str()) {
                 continue;
             }
-            let filename = match &dep.binary {
-                Some(binary) => binary.clone(),
-                None => self.resolve_dep_filename(req, dep)?,
-            };
-            let cached =
-                self.ensure_cached(req, info, dep, &filename, &mut stats, &mut dead_mirrors)?;
-            if dep.sysroot {
-                lines.push(format!("sysroot: {} {}", dep.name, cached.display()));
+            work.push(DepWork { dep, filename });
+        }
+        let cached = self.ensure_all_cached(req, info, &work, &mut stats)?;
+        for (item, path) in work.iter().zip(cached.iter()) {
+            if item.dep.sysroot {
+                lines.push(format!("sysroot: {} {}", item.dep.name, path.display()));
             } else {
-                lines.push(format!("{} {}", dep.name, cached.display()));
+                lines.push(format!("{} {}", item.dep.name, path.display()));
             }
         }
         // The rpmlist shape: one `<name> <file>` line per dep, the
@@ -2964,6 +3001,177 @@ impl<'a> LocalBuild<'a> {
         }
     }
 
+    /// Download every work item's dep into the pkg cache, in
+    /// parallel and bounded: at most `PARALLEL_DEP_DOWNLOADS`
+    /// downloads in flight. Results are collected per work item,
+    /// so the caller keeps dep order whatever the completion
+    /// order. The first error in dep order fails the build, as the
+    /// sequential loop did; a failure stops workers starting new
+    /// downloads — one that already passed the check may still
+    /// claim one — and in-flight ones finish. Cache statistics merge
+    /// from the workers. A cache path shared by two deps downloads
+    /// sequentially, in dep order, after the parallel phase, so
+    /// two downloads never race one file's atomic rename.
+    fn ensure_all_cached(
+        &self,
+        req: &BuildRequest,
+        info: &crate::obs::BuildInfo,
+        work: &[DepWork<'_>],
+        stats: &mut CacheStats,
+    ) -> Result<Vec<PathBuf>, GeectlError> {
+        if work.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One slot per work item, in dep order: the parallel
+        // phase, the sequential tail, and the resolution failures
+        // below each fill their item's slot, and the collect at
+        // the end reads them in dep order.
+        let results: Vec<Mutex<Option<Result<PathBuf, GeectlError>>>> =
+            (0..work.len()).map(|_| Mutex::new(None)).collect();
+        // Partition by cache path: a path's first item downloads
+        // in parallel; later items for the same path run
+        // sequentially after, in dep order. The key is the path as
+        // spelled: on a case-insensitive filesystem two names
+        // differing only by case alias to one file, so this cannot
+        // separate them. A resolution failure
+        // downloads nothing: its error is recorded in its slot, so
+        // the dep-order collect below returns it in place.
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut parallel: Vec<(usize, &str)> = Vec::new();
+        let mut sequential: Vec<(usize, &str)> = Vec::new();
+        for (index, item) in work.iter().enumerate() {
+            match &item.filename {
+                Ok(filename) => {
+                    if seen.insert(self.cache_path_for(req, item.dep, filename)) {
+                        parallel.push((index, filename.as_str()));
+                    } else {
+                        sequential.push((index, filename.as_str()));
+                    }
+                }
+                Err(e) => {
+                    let mut slot = results[index].lock().unwrap();
+                    *slot = Some(Err(e.clone()));
+                }
+            }
+        }
+        // Mirrors that failed with a health failure (transport,
+        // 5xx, timeout, redirect, over-cap) for one (project,
+        // repo): a dead mirror costs at most one attempt per worker
+        // in flight (four per build), not one per dep — once one
+        // worker marks it dead, the next dep for the same pair goes
+        // straight to the API. A per-file failure (404, hdrmd5
+        // mismatch) does not mark the mirror dead: the host may
+        // serve the next dep fine.
+        let dead_mirrors = Mutex::new(std::collections::HashSet::new());
+        let failed = AtomicBool::new(false);
+        let next = AtomicUsize::new(0);
+        let merged_stats = Mutex::new(CacheStats::default());
+        let workers = PARALLEL_DEP_DOWNLOADS.min(parallel.len());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    let mut local_stats = CacheStats::default();
+                    loop {
+                        if failed.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let position = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(index, filename)) = parallel.get(position) else {
+                            break;
+                        };
+                        let item = &work[index];
+                        let result = self.ensure_cached(
+                            req,
+                            info,
+                            item.dep,
+                            filename,
+                            &mut local_stats,
+                            &dead_mirrors,
+                        );
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        // Slots are single-writer, so a poisoned
+                        // lock still holds this worker's own slot:
+                        // taking it keeps one worker's panic from
+                        // cascading into a panic storm.
+                        let mut slot = results[index]
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        *slot = Some(result);
+                    }
+                    let mut acc = merged_stats
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *acc += local_stats;
+                });
+            }
+        });
+        *stats += merged_stats.into_inner().unwrap();
+        // The sequential tail only runs on a clean parallel phase:
+        // the build fails anyway once an error exists, and the
+        // duplicate's file is the one the parallel phase just
+        // downloaded (a hit) or failed to (an error the caller
+        // returns below).
+        if !failed.load(Ordering::Relaxed) {
+            for &(index, filename) in &sequential {
+                let item = &work[index];
+                let mut local_stats = CacheStats::default();
+                let result = self.ensure_cached(
+                    req,
+                    info,
+                    item.dep,
+                    filename,
+                    &mut local_stats,
+                    &dead_mirrors,
+                );
+                *stats += local_stats;
+                let mut slot = results[index].lock().unwrap();
+                *slot = Some(result);
+            }
+        }
+        // Dep order, not completion order: the first error in dep
+        // order fails the build. A slot is empty only when its item
+        // was never started, which happens only after a failure —
+        // but a sequential item's slot can be empty while a later
+        // parallel item's error is already filled, so the scan
+        // keeps going past empty slots and returns the first
+        // filled error; the internal error below fires only when
+        // no error was recorded at all.
+        let mut cached = Vec::with_capacity(work.len());
+        let mut first_error: Option<GeectlError> = None;
+        let mut missing = false;
+        for slot in &results {
+            match slot.lock().unwrap().take() {
+                Some(Ok(path)) => cached.push(path),
+                Some(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                None => missing = true,
+            }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        if missing {
+            return Err(GeectlError::new(
+                ErrorKind::InternalError,
+                "parallel dep download lost a result; the build cannot continue",
+            ));
+        }
+        Ok(cached)
+    }
+
+    /// The cache path one work item downloads into.
+    fn cache_path_for(&self, req: &BuildRequest, dep: &BuildDep, filename: &str) -> PathBuf {
+        let project = dep.project.as_deref().unwrap_or(req.fetch_project());
+        let repo = Self::dep_repo(dep, req);
+        let arch = Self::dep_arch(dep, req);
+        self.pkg_dir(project, repo, arch).join(filename)
+    }
+
     /// Ensure one dep RPM is in the pkg cache, verified against the
     /// buildinfo hdrmd5 when the server sent one. A cached file that
     /// fails verification is re-downloaded once, then refused with
@@ -2976,7 +3184,7 @@ impl<'a> LocalBuild<'a> {
         dep: &BuildDep,
         filename: &str,
         stats: &mut CacheStats,
-        dead_mirrors: &mut std::collections::HashSet<(String, String)>,
+        dead_mirrors: &std::sync::Mutex<std::collections::HashSet<(String, String)>>,
     ) -> Result<PathBuf, GeectlError> {
         // The resolved file name is the one dep-derived path
         // component `validate_dep` cannot see: it comes from the
@@ -3006,13 +3214,14 @@ impl<'a> LocalBuild<'a> {
                 format!("cannot create package cache {}: {e}", dir.display()),
             )
         })?;
-        // The per-file download/write path takes the
-        // project-repo-arch lock (blocking, briefly): eviction
-        // takes the same lock while deleting that dir's pkg files,
-        // so a delete can never race a download's atomic rename.
-        // The lock is held for the whole ensure — check, download,
-        // write, verify — so a concurrent eviction cannot delete
-        // the file between the existence check and the verify.
+        // The download path takes the project-repo-arch lock
+        // shared: eviction takes it exclusive while deleting that
+        // dir's pkg files, so a delete can never race a download's
+        // atomic rename. The lock is held for the whole ensure —
+        // check, download, write, verify — so a concurrent
+        // eviction cannot delete the file between the existence
+        // check and the verify, while deps in one repo still
+        // download in parallel.
         let _pkg_lock = self.acquire_pkg_lock(project, repo, arch)?;
         let path = dir.join(filename);
         // Preferred packages win over the cache and the download:
@@ -3039,7 +3248,13 @@ impl<'a> LocalBuild<'a> {
                             ),
                         )
                     })?;
-                let tmp = dir.join(format!(".{filename}.preferred"));
+                // The temp name is unique per call, not just per
+                // process: two concurrent builds share the pkg lock
+                // now, so a deterministic name would collide — one
+                // build's copy would be renamed away under the
+                // other's.
+                let n = PREFERRED_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let tmp = dir.join(format!(".{filename}.preferred-{}-{n}", std::process::id()));
                 fs::copy(&candidate, &tmp).map_err(|e| {
                     GeectlError::new(
                         ErrorKind::InternalError,
@@ -3160,7 +3375,10 @@ impl<'a> LocalBuild<'a> {
         // Compare-exchange: only a granted retry increments the
         // counter, so it never grows past the budget — a denied
         // take leaves the count at the budget instead of counting
-        // the denial.
+        // the denial. The budget is shared across the parallel
+        // downloads: whichever worker's dep hits a cold binary
+        // first takes from it — allocation is first-come-first-
+        // served, not dep-ordered.
         let mut used = self.warm_retries_used.load(Ordering::Relaxed);
         loop {
             if used >= self.warm_retry_budget {
@@ -3225,7 +3443,7 @@ impl<'a> LocalBuild<'a> {
         project: &str,
         filename: &str,
         dir: &Path,
-        dead_mirrors: &mut std::collections::HashSet<(String, String)>,
+        dead_mirrors: &std::sync::Mutex<std::collections::HashSet<(String, String)>>,
     ) -> Result<DownloadedDep, GeectlError> {
         let package = dep.package.as_deref().unwrap_or("_repository");
         let repo = Self::dep_repo(dep, req);
@@ -3245,7 +3463,11 @@ impl<'a> LocalBuild<'a> {
         // inside the attempt, never the build.
         let mirror_key = (project.to_string(), repo.to_string());
         if let Some(expected) = Self::effective_hdrmd5(dep, None) {
-            if !dead_mirrors.contains(&mirror_key) {
+            if !dead_mirrors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&mirror_key)
+            {
                 if let Some(url) = self.mirror_url(info, project, dep, req, filename) {
                     match self.download_mirror(
                         filename,
@@ -3468,7 +3690,7 @@ impl<'a> LocalBuild<'a> {
         url: &str,
         dir: &Path,
         expected: &str,
-        dead_mirrors: &mut std::collections::HashSet<(String, String)>,
+        dead_mirrors: &std::sync::Mutex<std::collections::HashSet<(String, String)>>,
         mirror_key: &(String, String),
     ) -> Result<DownloadedDep, GeectlError> {
         let tmp = self
@@ -3478,7 +3700,10 @@ impl<'a> LocalBuild<'a> {
             })
             .inspect_err(|e| {
                 if e.kind() != ErrorKind::NotFound {
-                    dead_mirrors.insert(mirror_key.clone());
+                    dead_mirrors
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(mirror_key.clone());
                 }
             })?;
         if let Err(e) = self.verify_mirror_file(&tmp, filename, expected) {
@@ -4022,6 +4247,22 @@ const WARM_RETRY_BUDGET: u32 = 6;
 /// buys nothing.
 const WARM_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// Dep downloads in flight at once in `prepare_deps`: four bounds
+/// the load on one mirror or API host while still overlapping the
+/// slow part (the network wait) across deps.
+const PARALLEL_DEP_DOWNLOADS: usize = 4;
+
+/// Temp names for the preferred copy draw from this counter (see
+/// `ensure_cached`): the name is unique per call, not just per
+/// process.
+static PREFERRED_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Temp names for streamed downloads draw from this counter (see
+/// `fresh_temp_path`): the name is unique per call, in its own
+/// `.geectl-stream-<pid>-<n>` scheme, apart from `write_atomic`'s
+/// `.geectl-tmp-<pid>-<n>` names.
+static STREAM_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Whether an I/O error from spawning a child is transient and
 /// worth one more attempt: resource exhaustion (EAGAIN/ENOMEM, or
 /// a full file-descriptor table, EMFILE/ENFILE) under parallel
@@ -4272,22 +4513,20 @@ enum DownloadedDep {
     StreamedVerified(PathBuf),
 }
 
-/// A temp file name in `parent` that does not exist yet, in the same
-/// `.geectl-tmp-<pid>-<n>` scheme `write_atomic` uses, so a streamed
-/// download lands beside its final path (an atomic rename needs the
-/// same filesystem). The name is only allocated, not created: the
-/// writer creates it exclusively.
+/// A temp file name in `parent`, unique per call: the name draws
+/// from a process-wide counter in its own `.geectl-stream-<pid>-<n>`
+/// scheme, apart from `write_atomic`'s `.geectl-tmp-<pid>-<n>`
+/// names, so a streamed download lands beside its final path (an
+/// atomic rename needs the same filesystem) without ever sharing a
+/// name with another streamed download or an atomic write in this
+/// process. A first-free-name scan would hand the same name to
+/// parallel callers, so one call's error path could delete another
+/// call's in-flight temp file and a rename-by-path could land the
+/// other download's bytes in this file. The name is only allocated,
+/// not created: the writer creates it exclusively.
 fn fresh_temp_path(parent: &Path) -> std::io::Result<PathBuf> {
-    for n in 0..1000 {
-        let tmp = parent.join(format!(".geectl-tmp-{}-{n}", std::process::id()));
-        if !tmp.exists() {
-            return Ok(tmp);
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "no free temp file name",
-    ))
+    let n = STREAM_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(parent.join(format!(".geectl-stream-{}-{n}", std::process::id())))
 }
 
 /// Write a file via temp file + atomic rename, so a half-written
@@ -5141,13 +5380,16 @@ impl<'a> LocalBuild<'a> {
             })
     }
 
-    /// Take a project-repo-arch lock, blocking: the per-file
-    /// download/write path holds it for the whole ensure (check,
-    /// download, write, verify). A download is bounded by the
-    /// transport's global timeout plus verify time, so the hold is
-    /// bounded; a build that waits here is waiting on another
-    /// build's download of the same project-repo-arch, not on a
-    /// build.
+    /// Take a project-repo-arch lock, shared and blocking: the
+    /// download path holds it for the whole ensure (check, download,
+    /// write, verify). Shared, so deps in one repo download in
+    /// parallel; eviction takes the same lock exclusive while
+    /// deleting that dir's pkg files, so a delete can never race a
+    /// download's atomic rename, and a build that waits here is
+    /// waiting on an eviction, not on another download. Two
+    /// downloads of one file race only on the atomic rename; the
+    /// parallel phase never starts two for one path (see
+    /// `ensure_all_cached`).
     fn acquire_pkg_lock(
         &self,
         project: &str,
@@ -5155,7 +5397,7 @@ impl<'a> LocalBuild<'a> {
         arch: &str,
     ) -> Result<BuildLock, GeectlError> {
         let file = self.open_pkg_lock(project, repo, arch)?;
-        file.lock_exclusive().map_err(|e| {
+        file.lock_shared().map_err(|e| {
             GeectlError::new(
                 ErrorKind::InternalError,
                 format!("cannot lock package cache {project}/{repo}/{arch}: {e}"),
@@ -8515,6 +8757,440 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
     }
 
+    fn api_dep(name: &str, binary: &str, hdrmd5: String) -> BuildDep {
+        BuildDep {
+            name: name.to_string(),
+            project: Some("testproject".to_string()),
+            repository: Some("standard".to_string()),
+            package: None,
+            binary: Some(binary.to_string()),
+            version: None,
+            release: None,
+            arch: None,
+            epoch: None,
+            hdrmd5: Some(hdrmd5),
+            preinstall: false,
+            vminstall: false,
+            runscripts: false,
+            noinstall: false,
+            repoarch: None,
+            installonly: false,
+            sysroot: false,
+        }
+    }
+
+    fn api_url(arch: &str, binary: &str) -> String {
+        format!("https://api.opensuse.org/build/testproject/standard/{arch}/_repository/{binary}")
+    }
+
+    #[test]
+    fn pkg_lock_is_shared_so_parallel_downloads_hold_it_together() {
+        // Two downloads of one repo hold the pkg lock at the same
+        // time: the lock is shared, so one repo's deps download in
+        // parallel — and while any download holds it, eviction's
+        // exclusive try refuses, so no in-flight file is deleted.
+        let dir = TempDir::new();
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        // A second shared hold coexists with the first: the
+        // non-blocking try fails at once if the lock regressed to
+        // exclusive, instead of hanging a rendezvous.
+        let first = vertical
+            .acquire_pkg_lock("testproject", "standard", host_arch())
+            .unwrap();
+        {
+            let file = vertical
+                .open_pkg_lock("testproject", "standard", host_arch())
+                .unwrap();
+            file.try_lock_shared().unwrap();
+        }
+        assert!(vertical
+            .try_pkg_lock("testproject", "standard", host_arch())
+            .is_none());
+        drop(first);
+        assert!(vertical
+            .try_pkg_lock("testproject", "standard", host_arch())
+            .is_some());
+    }
+
+    #[test]
+    fn preferred_copy_temp_is_unique_per_call_under_concurrency() {
+        // Two concurrent callers preferring the same file: the temp
+        // must be unique per call, or one caller's rename would
+        // take the temp away under the other's copy. Ten rounds
+        // with a barrier start, each on a fresh cache, so the race
+        // is exercised rather than assumed away.
+        let arch = host_arch();
+        let rpm = make_rpm(b"preferred payload");
+        let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+        let binary = format!("preferred-1.0-1.{arch}.rpm");
+        let prefer_base = TempDir::new();
+        let prefer = prefer_base.path().join("prefer");
+        fs::create_dir_all(&prefer).unwrap();
+        fs::write(prefer.join(&binary), &rpm).unwrap();
+        let dep = api_dep("preferred", &binary, hdrmd5);
+        let info = crate::obs::BuildInfo {
+            error: None,
+            bdeps: Vec::new(),
+            preinstall_image: None,
+            urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
+        };
+        for _ in 0..10 {
+            let dir = TempDir::new();
+            let http = FakeHttp::new();
+            let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+            let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+            let vertical = &vertical;
+            let mut req =
+                BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+            req.prefer_packages = Some(prefer.clone());
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let dead_mirrors = std::sync::Mutex::new(std::collections::HashSet::new());
+            let req = &req;
+            let info = &info;
+            let dep = &dep;
+            let binary = &binary;
+            let dead_mirrors = &dead_mirrors;
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for _ in 0..2 {
+                    let start = std::sync::Arc::clone(&start);
+                    handles.push(scope.spawn(move || {
+                        start.wait();
+                        let mut stats = CacheStats::default();
+                        vertical.ensure_cached(req, info, dep, binary, &mut stats, dead_mirrors)
+                    }));
+                }
+                for handle in handles {
+                    handle.join().unwrap().unwrap();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn prepare_deps_downloads_in_parallel_keeping_dep_order() {
+        // Six deps, four workers: the downloads overlap (the fake
+        // records more than one `get_bytes` in flight at once) while
+        // the rpmlist keeps dep order and the statistics add up.
+        // A second run finds everything cached: six hits, no
+        // further download.
+        let dir = TempDir::new();
+        let arch = host_arch();
+        let mut http = FakeHttp::new().with_get_bytes_delay(std::time::Duration::from_millis(50));
+        let mut info = crate::obs::BuildInfo {
+            error: None,
+            bdeps: Vec::new(),
+            preinstall_image: None,
+            urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
+        };
+        for index in 0..6 {
+            let rpm = make_rpm(format!("dep{index} payload").as_bytes());
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let binary = format!("dep{index}-1.0-1.{arch}.rpm");
+            http = http.with_get_bytes(&api_url(arch, &binary), &rpm);
+            info.bdeps
+                .push(api_dep(&format!("dep{index}"), &binary, hdrmd5));
+        }
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+        let (stats, rpmlist, image) = vertical
+            .prepare_deps(&req, &info, dir.path(), "foo")
+            .unwrap();
+        assert!(image.is_none());
+        assert_eq!(stats.pkg_misses, 6);
+        assert_eq!(stats.pkg_hits, 0);
+        assert!(http.max_concurrent_get_bytes() >= 2);
+        let lines: Vec<&str> = rpmlist.lines().collect();
+        assert_eq!(lines.len(), 9);
+        for (index, line) in lines.iter().enumerate().take(6) {
+            let binary = format!("dep{index}-1.0-1.{arch}.rpm");
+            assert!(line.starts_with(&format!("dep{index} ")), "{line}");
+            let path = line.split_once(' ').unwrap().1;
+            // The rpmlist carries the native path, so the file name
+            // is compared as a path component, not against a `/`
+            // suffix: on Windows the line ends in `\dep0-...rpm`.
+            assert_eq!(
+                std::path::Path::new(path).file_name().unwrap(),
+                std::ffi::OsStr::new(&binary),
+                "{line}"
+            );
+            assert!(std::path::Path::new(path).exists(), "{path}");
+        }
+        assert_eq!(http.get_bytes_calls().len(), 6);
+        let (stats, _, _) = vertical
+            .prepare_deps(&req, &info, dir.path(), "foo")
+            .unwrap();
+        assert_eq!(stats.pkg_misses, 0);
+        assert_eq!(stats.pkg_hits, 6);
+        assert_eq!(http.get_bytes_calls().len(), 6);
+    }
+
+    #[test]
+    fn prepare_deps_returns_the_first_error_in_dep_order() {
+        // Two deps fail (no canned bytes); the build fails on the
+        // first in dep order, not on whichever worker finished
+        // first.
+        let dir = TempDir::new();
+        let arch = host_arch();
+        let mut http = FakeHttp::new();
+        let mut info = crate::obs::BuildInfo {
+            error: None,
+            bdeps: Vec::new(),
+            preinstall_image: None,
+            urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
+        };
+        for index in 0..6 {
+            let rpm = make_rpm(format!("dep{index} payload").as_bytes());
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let binary = format!("dep{index}-1.0-1.{arch}.rpm");
+            if index != 1 && index != 4 {
+                http = http.with_get_bytes(&api_url(arch, &binary), &rpm);
+            }
+            info.bdeps
+                .push(api_dep(&format!("dep{index}"), &binary, hdrmd5));
+        }
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+        let err = vertical
+            .prepare_deps(&req, &info, dir.path(), "foo")
+            .unwrap_err();
+        assert!(err.to_string().contains("dep1-1.0-1"), "{err}");
+        assert!(!err.to_string().contains("dep4-1.0-1"), "{err}");
+    }
+
+    #[test]
+    fn prepare_deps_returns_the_first_error_when_a_later_dep_fails_to_resolve() {
+        // The first dep's download fails and a later dep's file
+        // name fails to resolve: the build fails on the first in
+        // dep order — the later resolution failure never masks
+        // the earlier download failure, as the sequential loop
+        // did.
+        let dir = TempDir::new();
+        let arch = host_arch();
+        let mut http = FakeHttp::new();
+        let mut info = crate::obs::BuildInfo {
+            error: None,
+            bdeps: Vec::new(),
+            preinstall_image: None,
+            urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
+        };
+        for index in 0..3 {
+            let rpm = make_rpm(format!("dep{index} payload").as_bytes());
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let binary = format!("dep{index}-1.0-1.{arch}.rpm");
+            if index != 0 {
+                http = http.with_get_bytes(&api_url(arch, &binary), &rpm);
+            }
+            info.bdeps
+                .push(api_dep(&format!("dep{index}"), &binary, hdrmd5));
+        }
+        info.bdeps.push(BuildDep {
+            name: "dep3".to_string(),
+            project: Some("testproject".to_string()),
+            repository: Some("standard".to_string()),
+            package: None,
+            binary: None,
+            version: None,
+            release: None,
+            arch: None,
+            epoch: None,
+            hdrmd5: None,
+            preinstall: false,
+            vminstall: false,
+            runscripts: false,
+            noinstall: false,
+            repoarch: None,
+            installonly: false,
+            sysroot: false,
+        });
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+        let err = vertical
+            .prepare_deps(&req, &info, dir.path(), "foo")
+            .unwrap_err();
+        assert!(err.to_string().contains("GET bytes"), "{err}");
+        assert!(err.to_string().contains("dep0-1.0-1"), "{err}");
+    }
+
+    #[test]
+    fn prepare_deps_returns_the_first_error_past_an_unstarted_duplicate() {
+        // dep0 and dep1 resolve to the same cache file (dep0
+        // downloads in parallel, dep1 waits for the sequential
+        // tail) and dep2's download fails: the tail is skipped, so
+        // dep1's slot stays empty — the build still fails with
+        // dep2's error, not with an internal error for the empty
+        // slot.
+        let dir = TempDir::new();
+        let arch = host_arch();
+        let rpm = make_rpm(b"shared payload");
+        let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+        let shared = format!("shared-1.0-1.{arch}.rpm");
+        let http = FakeHttp::new().with_get_bytes(&api_url(arch, &shared), &rpm);
+        let mut info = crate::obs::BuildInfo {
+            error: None,
+            bdeps: vec![
+                api_dep("dep0", &shared, hdrmd5.clone()),
+                api_dep("dep1", &shared, hdrmd5),
+            ],
+            preinstall_image: None,
+            urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
+        };
+        let rpm2 = make_rpm(b"dep2 payload");
+        let hdrmd5_2 = format!("{:x}", md5::compute(&rpm2[112..]));
+        let binary2 = format!("dep2-1.0-1.{arch}.rpm");
+        info.bdeps.push(api_dep("dep2", &binary2, hdrmd5_2));
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+        let err = vertical
+            .prepare_deps(&req, &info, dir.path(), "foo")
+            .unwrap_err();
+        assert!(err.to_string().contains("GET bytes"), "{err}");
+        assert!(err.to_string().contains("dep2-1.0-1"), "{err}");
+    }
+
+    #[test]
+    fn prepare_deps_returns_the_first_error_when_a_later_dep_fails_validation() {
+        // The first dep's download fails and a later dep's name is
+        // invalid: the build fails on the first in dep order — the
+        // later validation failure never masks the earlier download
+        // failure, as the sequential loop did.
+        let dir = TempDir::new();
+        let arch = host_arch();
+        let mut http = FakeHttp::new();
+        let mut info = crate::obs::BuildInfo {
+            error: None,
+            bdeps: Vec::new(),
+            preinstall_image: None,
+            urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
+        };
+        for index in 0..3 {
+            let rpm = make_rpm(format!("dep{index} payload").as_bytes());
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let binary = format!("dep{index}-1.0-1.{arch}.rpm");
+            if index != 0 {
+                http = http.with_get_bytes(&api_url(arch, &binary), &rpm);
+            }
+            info.bdeps
+                .push(api_dep(&format!("dep{index}"), &binary, hdrmd5));
+        }
+        // dep1's name is invalid: a `/` is not a path component.
+        info.bdeps[1].name = "bad/name".to_string();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+        let err = vertical
+            .prepare_deps(&req, &info, dir.path(), "foo")
+            .unwrap_err();
+        assert!(err.to_string().contains("GET bytes"), "{err}");
+        assert!(err.to_string().contains("dep0-1.0-1"), "{err}");
+    }
+
+    #[test]
+    fn prepare_deps_attempts_a_dead_mirror_at_most_once_per_worker() {
+        // Eight deps from one repo, the mirror failing with a
+        // health error for each: once one worker marks the mirror
+        // dead the rest go straight to the API, so the dead mirror
+        // is attempted at most once per worker in flight, not once
+        // per dep — and every dep still lands from the API.
+        let dir = TempDir::new();
+        let arch = host_arch();
+        let mut http = FakeHttp::new();
+        let mut urls = std::collections::HashMap::new();
+        urls.insert(
+            ("testproject".to_string(), "standard".to_string()),
+            "https://mirror.example.com/repos/testproject/standard/".to_string(),
+        );
+        let mut info = crate::obs::BuildInfo {
+            error: None,
+            bdeps: Vec::new(),
+            preinstall_image: None,
+            urls,
+            skipped_paths: 0,
+        };
+        for index in 0..8 {
+            let rpm = make_rpm(format!("dep{index} payload").as_bytes());
+            let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+            let binary = format!("dep{index}-1.0-1.{arch}.rpm");
+            let mirror_url =
+                format!("https://mirror.example.com/repos/testproject/standard/{arch}/{binary}");
+            http = http
+                .with_mirror_error(&mirror_url, ErrorKind::ServerError)
+                .with_get_bytes(&api_url(arch, &binary), &rpm);
+            info.bdeps
+                .push(api_dep(&format!("dep{index}"), &binary, hdrmd5));
+        }
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+        let (stats, _, _) = vertical
+            .prepare_deps(&req, &info, dir.path(), "foo")
+            .unwrap();
+        assert_eq!(stats.pkg_misses, 8);
+        assert!(
+            (1..=4).contains(&http.mirror_calls().len()),
+            "{:?}",
+            http.mirror_calls()
+        );
+    }
+
+    #[test]
+    fn prepare_deps_downloads_a_shared_cache_path_once() {
+        // Two deps resolving to the same cache file: the first
+        // downloads it, the second finds it cached — one download,
+        // one miss plus one hit, both rpmlist lines in dep order.
+        let dir = TempDir::new();
+        let arch = host_arch();
+        let rpm = make_rpm(b"shared payload");
+        let hdrmd5 = format!("{:x}", md5::compute(&rpm[112..]));
+        let binary = format!("shared-1.0-1.{arch}.rpm");
+        let http = FakeHttp::new().with_get_bytes(&api_url(arch, &binary), &rpm);
+        let info = crate::obs::BuildInfo {
+            error: None,
+            bdeps: vec![
+                api_dep("first", &binary, hdrmd5.clone()),
+                api_dep("second", &binary, hdrmd5),
+            ],
+            preinstall_image: None,
+            urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
+        };
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let vertical = LocalBuild::new(&client, dir.path().join("cache"));
+        let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
+        let (stats, rpmlist, _) = vertical
+            .prepare_deps(&req, &info, dir.path(), "foo")
+            .unwrap();
+        assert_eq!(stats.pkg_misses, 1);
+        assert_eq!(stats.pkg_hits, 1);
+        assert_eq!(http.get_bytes_calls().len(), 1);
+        let lines: Vec<&str> = rpmlist.lines().collect();
+        assert!(lines[0].starts_with("first "), "{}", lines[0]);
+        assert!(lines[1].starts_with("second "), "{}", lines[1]);
+        // The rpmlist carries the native path: compare the file
+        // name as a path component, not against a `/` suffix, which
+        // never matches on Windows.
+        for line in lines.iter().take(2) {
+            let path = line.split_once(' ').unwrap().1;
+            assert_eq!(
+                std::path::Path::new(path).file_name().unwrap(),
+                std::ffi::OsStr::new(&binary),
+                "{line}"
+            );
+        }
+    }
+
     /// The stub tests below run shell scripts, so they are unix-only.
     /// They prove the flow end to end against a stub engine and a
     /// stub podman — no real build runs in CI.
@@ -10243,13 +10919,11 @@ fi
                     let path = entry.path();
                     if path.is_dir() {
                         stack.push(path);
-                    } else if path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .starts_with(".geectl-tmp-")
-                    {
-                        crust.push(path);
+                    } else {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        if name.starts_with(".geectl-tmp-") || name.starts_with(".geectl-stream-") {
+                            crust.push(path);
+                        }
                     }
                 }
             }
@@ -10539,10 +11213,10 @@ fi
             // per-root rule on exactly the path taken after every
             // failure. The wipe must preserve the lock file, so the
             // held flock still refuses a second acquirer afterwards.
-            // (The fake HTTP client is RefCell-based, so the
-            // vertical cannot move into a thread for a live
-            // two-build race; this pins the exact invariant the
-            // race depends on instead.)
+            // (The fake HTTP client is thread-safe, so the
+            // vertical moves into a thread; this pins the exact
+            // invariant the race depends on instead of running a
+            // live two-build race.)
             let dir = TempDir::new();
             let (engine, _) = stub_engine(dir.path());
             let (podman, _) = stub_podman(dir.path(), true);
@@ -13209,7 +13883,7 @@ exit 0
                     &dep,
                     &filename,
                     &mut stats,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -13279,7 +13953,7 @@ exit 0
                     &dep,
                     &filename,
                     &mut stats,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             assert_eq!(fs::read(&path).unwrap(), rpm);
@@ -13361,7 +14035,7 @@ exit 0
                     &dep,
                     &filename,
                     &mut stats,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             assert_eq!(fs::read(&path).unwrap(), rpm);
@@ -13431,7 +14105,7 @@ exit 0
                     &dep,
                     &filename,
                     &mut stats,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
@@ -13509,7 +14183,7 @@ exit 0
                     &dep,
                     &filename,
                     &mut stats,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
@@ -13607,7 +14281,7 @@ exit 0
                     &dep,
                     &filename,
                     &mut stats,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             assert_eq!(fs::read(&path).unwrap(), rpm);
@@ -13623,7 +14297,8 @@ exit 0
             for entry in fs::read_dir(&cache_dir).unwrap() {
                 let name = entry.unwrap().file_name();
                 assert!(
-                    !name.to_string_lossy().starts_with(".geectl-tmp-"),
+                    !name.to_string_lossy().starts_with(".geectl-tmp-")
+                        && !name.to_string_lossy().starts_with(".geectl-stream-"),
                     "temp file left in the cache dir: {name:?}"
                 );
             }
@@ -13688,7 +14363,7 @@ exit 0
                     &dep,
                     &filename,
                     &mut stats,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::CacheCorrupt);
@@ -13703,7 +14378,8 @@ exit 0
             for entry in fs::read_dir(&cache_dir).unwrap() {
                 let name = entry.unwrap().file_name();
                 assert!(
-                    !name.to_string_lossy().starts_with(".geectl-tmp-"),
+                    !name.to_string_lossy().starts_with(".geectl-tmp-")
+                        && !name.to_string_lossy().starts_with(".geectl-stream-"),
                     "temp file left in the cache dir: {name:?}"
                 );
             }
@@ -13773,7 +14449,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -13868,7 +14544,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -13957,7 +14633,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::Timeout);
@@ -14071,7 +14747,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(glibc_err.kind(), ErrorKind::Timeout);
@@ -14083,7 +14759,7 @@ exit 0
                     "testproject",
                     &format!("zlib-1.3-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(zlib_err.kind(), ErrorKind::Timeout);
@@ -14164,7 +14840,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -14249,7 +14925,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -14316,7 +14992,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -14386,7 +15062,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -14448,7 +15124,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ServerError);
@@ -14515,7 +15191,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::Timeout);
@@ -14588,7 +15264,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             let DownloadedDep::Streamed(tmp, warmed) = downloaded else {
@@ -14647,14 +15323,15 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::NetworkError);
             for entry in fs::read_dir(dir.path()).unwrap() {
                 let name = entry.unwrap().file_name();
                 assert!(
-                    !name.to_string_lossy().starts_with(".geectl-tmp-"),
+                    !name.to_string_lossy().starts_with(".geectl-tmp-")
+                        && !name.to_string_lossy().starts_with(".geectl-stream-"),
                     "temp file left in the directory: {name:?}"
                 );
             }
@@ -14712,7 +15389,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::AlreadyExists);
@@ -14720,7 +15397,8 @@ exit 0
             for entry in fs::read_dir(dir.path()).unwrap() {
                 let name = entry.unwrap().file_name();
                 assert!(
-                    !name.to_string_lossy().starts_with(".geectl-tmp-"),
+                    !name.to_string_lossy().starts_with(".geectl-tmp-")
+                        && !name.to_string_lossy().starts_with(".geectl-stream-"),
                     "temp file left in the directory: {name:?}"
                 );
             }
@@ -14772,7 +15450,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             let DownloadedDep::StreamedVerified(tmp) = downloaded else {
@@ -14834,7 +15512,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -14900,7 +15578,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -14965,7 +15643,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15033,7 +15711,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     &dl,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15092,7 +15770,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             let DownloadedDep::StreamedVerified(tmp) = downloaded else {
@@ -15161,7 +15839,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15230,7 +15908,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             let DownloadedDep::StreamedVerified(tmp) = downloaded else {
@@ -15287,7 +15965,7 @@ exit 0
                     &dep,
                     &filename,
                     &mut stats,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             assert_eq!(fs::read(&cached).unwrap(), rpm);
@@ -15348,7 +16026,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15386,7 +16064,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15432,7 +16110,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     &dl,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15484,7 +16162,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15528,7 +16206,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             let DownloadedDep::StreamedVerified(tmp) = downloaded else {
@@ -15578,7 +16256,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15622,7 +16300,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15672,7 +16350,7 @@ exit 0
                     "testproject",
                     "glibc-2.38-1.noarch.rpm",
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             let DownloadedDep::StreamedVerified(tmp) = downloaded else {
@@ -15708,8 +16386,8 @@ exit 0
             let vertical = vertical(&client, dir.path(), engine, podman);
             let req = BuildRequest::new(dir.path().join("source"), "testproject", "standard", arch);
             let dep = mirror_dep(Some(hdrmd5));
-            let mut dead_mirrors: std::collections::HashSet<(String, String)> =
-                std::collections::HashSet::new();
+            let dead_mirrors: std::sync::Mutex<std::collections::HashSet<(String, String)>> =
+                std::sync::Mutex::new(std::collections::HashSet::new());
             for _ in 0..2 {
                 let DownloadedDep::InMemory(bytes, warmed) = vertical
                     .download_dep(
@@ -15719,7 +16397,7 @@ exit 0
                         "testproject",
                         &format!("glibc-2.38-1.{arch}.rpm"),
                         dir.path(),
-                        &mut dead_mirrors,
+                        &dead_mirrors,
                     )
                     .unwrap()
                 else {
@@ -15728,7 +16406,10 @@ exit 0
                 assert_eq!(bytes, rpm);
                 assert_eq!(warmed, None);
             }
-            assert!(dead_mirrors.contains(&("testproject".to_string(), "standard".to_string())));
+            assert!(dead_mirrors
+                .lock()
+                .unwrap()
+                .contains(&("testproject".to_string(), "standard".to_string())));
             assert_eq!(http.mirror_calls(), vec![(mirror_url, false)]);
             assert_eq!(
                 http.get_bytes_calls(),
@@ -15774,7 +16455,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     &dl,
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15815,7 +16496,7 @@ exit 0
                     "testproject",
                     &filename,
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             let DownloadedDep::StreamedVerified(tmp) = downloaded else {
@@ -15857,7 +16538,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap()
             else {
@@ -15917,7 +16598,7 @@ exit 0
                     "testproject",
                     &format!("glibc-2.38-1.{arch}.rpm"),
                     dir.path(),
-                    &mut std::collections::HashSet::new(),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
                 )
                 .unwrap();
             let DownloadedDep::Streamed(tmp, warmed) = downloaded else {
@@ -15925,17 +16606,24 @@ exit 0
             };
             assert_eq!(warmed, None);
             assert_eq!(http.get_to_file_calls().len(), 2);
-            assert_eq!(
-                tmp.file_name().unwrap().to_string_lossy(),
-                format!(".geectl-tmp-{}-1", std::process::id())
+            // The retry lands under the next counter name, not the
+            // collided one: the name is unique per call, so its
+            // number depends on earlier allocations in this process
+            // and only the scheme is pinned here.
+            let tmp_name = tmp.file_name().unwrap().to_string_lossy();
+            assert!(
+                tmp_name.starts_with(".geectl-stream-"),
+                "unexpected streamed temp name: {tmp_name}"
             );
             assert_eq!(fs::read(&tmp).unwrap(), rpm);
             // The collided name is still there: the retry must not
             // delete a file it did not create.
-            let collided = dir
-                .path()
-                .join(format!(".geectl-tmp-{}-0", std::process::id()));
-            assert!(collided.exists());
+            let collided = fs::read_dir(dir.path()).unwrap().any(|entry| {
+                let name = entry.unwrap().file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(".geectl-stream-") && name != tmp_name
+            });
+            assert!(collided, "collided temp file is gone");
         }
 
         #[test]

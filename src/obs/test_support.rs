@@ -4,101 +4,114 @@ use crate::auth::Credentials;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::http::{follow_mirror_redirects, HttpClient, MirrorHop, MAX_BODY_BYTES};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 /// A fake HTTP client with canned responses, for fixtures. GET,
 /// POST, PATCH, and DELETE are keyed separately by URL; a URL with
 /// no canned response is a transport error. Calls are recorded so
 /// tests can assert on the method, the URL, whether auth was
 /// sent, and (for POST and PATCH) the body.
 pub(crate) struct FakeHttp {
-    gets: RefCell<HashMap<String, String>>,
-    get_sequences: RefCell<HashMap<String, VecDeque<String>>>,
-    get_errors: RefCell<HashMap<String, ErrorKind>>,
-    get_error_sequences: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
-    posts: RefCell<HashMap<String, String>>,
-    post_sequences: RefCell<HashMap<String, VecDeque<String>>>,
-    post_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
-    patches: RefCell<HashMap<String, String>>,
-    patch_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
-    deletes: RefCell<HashMap<String, String>>,
-    delete_errors: RefCell<HashMap<String, ErrorKind>>,
-    puts: RefCell<HashMap<String, String>>,
-    put_errors: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
-    get_calls: RefCell<Vec<(String, bool)>>,
-    get_bearer_tokens: RefCell<Vec<(String, Option<String>)>>,
-    get_bytes: RefCell<HashMap<String, Vec<u8>>>,
-    get_bytes_error_sequences: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
-    get_bytes_cap_errors: RefCell<HashSet<String>>,
-    get_to_file: RefCell<HashMap<String, Vec<u8>>>,
-    get_to_file_errors: RefCell<HashMap<String, ErrorKind>>,
-    get_to_file_error_writes: RefCell<HashMap<String, Vec<u8>>>,
-    get_to_file_error_sequences: RefCell<HashMap<String, VecDeque<ErrorKind>>>,
-    get_to_file_calls: RefCell<Vec<(String, bool)>>,
-    mirror_files: RefCell<HashMap<String, Vec<u8>>>,
-    mirror_redirects: RefCell<HashMap<String, String>>,
-    mirror_errors: RefCell<HashMap<String, ErrorKind>>,
-    mirror_error_writes: RefCell<HashMap<String, Vec<u8>>>,
-    mirror_calls: RefCell<Vec<(String, bool)>>,
-    get_bytes_calls: RefCell<Vec<(String, bool)>>,
-    post_calls: RefCell<Vec<(String, String, bool)>>,
-    delete_calls: RefCell<Vec<(String, bool)>>,
-    delete_json_calls: RefCell<Vec<(String, String, bool)>>,
-    patch_calls: RefCell<Vec<(String, String, bool)>>,
-    mutation_calls: RefCell<Vec<(String, String)>>,
-    put_calls: RefCell<Vec<(String, String, bool)>>,
-    put_bytes: RefCell<HashMap<String, String>>,
-    put_bytes_calls: RefCell<Vec<(String, Vec<u8>, bool)>>,
+    gets: Mutex<HashMap<String, String>>,
+    get_sequences: Mutex<HashMap<String, VecDeque<String>>>,
+    get_errors: Mutex<HashMap<String, ErrorKind>>,
+    get_error_sequences: Mutex<HashMap<String, VecDeque<ErrorKind>>>,
+    posts: Mutex<HashMap<String, String>>,
+    post_sequences: Mutex<HashMap<String, VecDeque<String>>>,
+    post_errors: Mutex<HashMap<String, VecDeque<ErrorKind>>>,
+    patches: Mutex<HashMap<String, String>>,
+    patch_errors: Mutex<HashMap<String, VecDeque<ErrorKind>>>,
+    deletes: Mutex<HashMap<String, String>>,
+    delete_errors: Mutex<HashMap<String, ErrorKind>>,
+    puts: Mutex<HashMap<String, String>>,
+    put_errors: Mutex<HashMap<String, VecDeque<ErrorKind>>>,
+    get_calls: Mutex<Vec<(String, bool)>>,
+    get_bearer_tokens: Mutex<Vec<(String, Option<String>)>>,
+    get_bytes: Mutex<HashMap<String, Vec<u8>>>,
+    get_bytes_error_sequences: Mutex<HashMap<String, VecDeque<ErrorKind>>>,
+    get_bytes_cap_errors: Mutex<HashSet<String>>,
+    get_to_file: Mutex<HashMap<String, Vec<u8>>>,
+    get_to_file_errors: Mutex<HashMap<String, ErrorKind>>,
+    get_to_file_error_writes: Mutex<HashMap<String, Vec<u8>>>,
+    get_to_file_error_sequences: Mutex<HashMap<String, VecDeque<ErrorKind>>>,
+    get_to_file_calls: Mutex<Vec<(String, bool)>>,
+    mirror_files: Mutex<HashMap<String, Vec<u8>>>,
+    mirror_redirects: Mutex<HashMap<String, String>>,
+    mirror_errors: Mutex<HashMap<String, ErrorKind>>,
+    mirror_error_writes: Mutex<HashMap<String, Vec<u8>>>,
+    mirror_calls: Mutex<Vec<(String, bool)>>,
+    get_bytes_calls: Mutex<Vec<(String, bool)>>,
+    /// Hold each `get_bytes` call this long before answering, so a
+    /// test can tell parallel calls apart from sequential ones.
+    get_bytes_delay: std::time::Duration,
+    /// `get_bytes` calls in flight right now.
+    get_bytes_in_flight: AtomicUsize,
+    /// The most `get_bytes` calls in flight at once so far.
+    get_bytes_max_in_flight: AtomicUsize,
+    post_calls: Mutex<Vec<(String, String, bool)>>,
+    delete_calls: Mutex<Vec<(String, bool)>>,
+    delete_json_calls: Mutex<Vec<(String, String, bool)>>,
+    patch_calls: Mutex<Vec<(String, String, bool)>>,
+    mutation_calls: Mutex<Vec<(String, String)>>,
+    put_calls: Mutex<Vec<(String, String, bool)>>,
+    put_bytes: Mutex<HashMap<String, String>>,
+    put_bytes_calls: Mutex<Vec<(String, Vec<u8>, bool)>>,
 }
 
 impl FakeHttp {
     pub(crate) fn new() -> Self {
         FakeHttp {
-            gets: RefCell::new(HashMap::new()),
-            get_sequences: RefCell::new(HashMap::new()),
-            get_errors: RefCell::new(HashMap::new()),
-            get_error_sequences: RefCell::new(HashMap::new()),
-            posts: RefCell::new(HashMap::new()),
-            post_sequences: RefCell::new(HashMap::new()),
-            post_errors: RefCell::new(HashMap::new()),
-            patches: RefCell::new(HashMap::new()),
-            patch_errors: RefCell::new(HashMap::new()),
-            deletes: RefCell::new(HashMap::new()),
-            delete_errors: RefCell::new(HashMap::new()),
-            puts: RefCell::new(HashMap::new()),
-            put_errors: RefCell::new(HashMap::new()),
-            get_calls: RefCell::new(Vec::new()),
-            get_bearer_tokens: RefCell::new(Vec::new()),
-            get_bytes: RefCell::new(HashMap::new()),
-            get_bytes_error_sequences: RefCell::new(HashMap::new()),
-            get_bytes_cap_errors: RefCell::new(HashSet::new()),
-            get_to_file: RefCell::new(HashMap::new()),
-            get_to_file_errors: RefCell::new(HashMap::new()),
-            get_to_file_error_writes: RefCell::new(HashMap::new()),
-            get_to_file_error_sequences: RefCell::new(HashMap::new()),
-            get_to_file_calls: RefCell::new(Vec::new()),
-            mirror_files: RefCell::new(HashMap::new()),
-            mirror_redirects: RefCell::new(HashMap::new()),
-            mirror_errors: RefCell::new(HashMap::new()),
-            mirror_error_writes: RefCell::new(HashMap::new()),
-            mirror_calls: RefCell::new(Vec::new()),
-            get_bytes_calls: RefCell::new(Vec::new()),
-            post_calls: RefCell::new(Vec::new()),
-            delete_calls: RefCell::new(Vec::new()),
-            delete_json_calls: RefCell::new(Vec::new()),
-            patch_calls: RefCell::new(Vec::new()),
-            mutation_calls: RefCell::new(Vec::new()),
-            put_calls: RefCell::new(Vec::new()),
-            put_bytes: RefCell::new(HashMap::new()),
-            put_bytes_calls: RefCell::new(Vec::new()),
+            gets: Mutex::new(HashMap::new()),
+            get_sequences: Mutex::new(HashMap::new()),
+            get_errors: Mutex::new(HashMap::new()),
+            get_error_sequences: Mutex::new(HashMap::new()),
+            posts: Mutex::new(HashMap::new()),
+            post_sequences: Mutex::new(HashMap::new()),
+            post_errors: Mutex::new(HashMap::new()),
+            patches: Mutex::new(HashMap::new()),
+            patch_errors: Mutex::new(HashMap::new()),
+            deletes: Mutex::new(HashMap::new()),
+            delete_errors: Mutex::new(HashMap::new()),
+            puts: Mutex::new(HashMap::new()),
+            put_errors: Mutex::new(HashMap::new()),
+            get_calls: Mutex::new(Vec::new()),
+            get_bearer_tokens: Mutex::new(Vec::new()),
+            get_bytes: Mutex::new(HashMap::new()),
+            get_bytes_error_sequences: Mutex::new(HashMap::new()),
+            get_bytes_cap_errors: Mutex::new(HashSet::new()),
+            get_to_file: Mutex::new(HashMap::new()),
+            get_to_file_errors: Mutex::new(HashMap::new()),
+            get_to_file_error_writes: Mutex::new(HashMap::new()),
+            get_to_file_error_sequences: Mutex::new(HashMap::new()),
+            get_to_file_calls: Mutex::new(Vec::new()),
+            mirror_files: Mutex::new(HashMap::new()),
+            mirror_redirects: Mutex::new(HashMap::new()),
+            mirror_errors: Mutex::new(HashMap::new()),
+            mirror_error_writes: Mutex::new(HashMap::new()),
+            mirror_calls: Mutex::new(Vec::new()),
+            get_bytes_calls: Mutex::new(Vec::new()),
+            get_bytes_delay: std::time::Duration::ZERO,
+            get_bytes_in_flight: AtomicUsize::new(0),
+            get_bytes_max_in_flight: AtomicUsize::new(0),
+            post_calls: Mutex::new(Vec::new()),
+            delete_calls: Mutex::new(Vec::new()),
+            delete_json_calls: Mutex::new(Vec::new()),
+            patch_calls: Mutex::new(Vec::new()),
+            mutation_calls: Mutex::new(Vec::new()),
+            put_calls: Mutex::new(Vec::new()),
+            put_bytes: Mutex::new(HashMap::new()),
+            put_bytes_calls: Mutex::new(Vec::new()),
         }
     }
 
     pub(crate) fn with_get(self, url: &str, body: &str) -> Self {
         self.gets
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_string());
         self
     }
@@ -107,7 +120,7 @@ impl FakeHttp {
     /// once the queue is empty, the plain canned response (if
     /// any) answers.
     pub(crate) fn with_get_sequence(self, url: &str, bodies: &[&str]) -> Self {
-        self.get_sequences.borrow_mut().insert(
+        self.get_sequences.lock().unwrap().insert(
             url.to_string(),
             bodies.iter().map(|body| body.to_string()).collect(),
         );
@@ -116,13 +129,26 @@ impl FakeHttp {
 
     pub(crate) fn with_get_bytes(self, url: &str, body: &[u8]) -> Self {
         self.get_bytes
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_vec());
         self
     }
 
+    /// Hold each `get_bytes` call for `delay` before answering, so
+    /// a test can tell parallel calls apart from sequential ones:
+    /// with several workers in flight at once the recorded maximum
+    /// concurrency rises above one.
+    pub(crate) fn with_get_bytes_delay(mut self, delay: std::time::Duration) -> Self {
+        self.get_bytes_delay = delay;
+        self
+    }
+
     pub(crate) fn with_get_error(self, url: &str, kind: ErrorKind) -> Self {
-        self.get_errors.borrow_mut().insert(url.to_string(), kind);
+        self.get_errors
+            .lock()
+            .unwrap()
+            .insert(url.to_string(), kind);
         self
     }
 
@@ -133,7 +159,8 @@ impl FakeHttp {
     /// pre-check 404 followed by the re-read 200).
     pub(crate) fn with_get_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
         self.get_error_sequences
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), kinds.iter().copied().collect());
         self
     }
@@ -146,7 +173,8 @@ impl FakeHttp {
     /// warms it).
     pub(crate) fn with_get_bytes_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
         self.get_bytes_error_sequences
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), kinds.iter().copied().collect());
         self
     }
@@ -158,7 +186,8 @@ impl FakeHttp {
     /// 10 MiB body.
     pub(crate) fn with_get_bytes_cap_error(self, url: &str) -> Self {
         self.get_bytes_cap_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string());
         self
     }
@@ -167,7 +196,8 @@ impl FakeHttp {
     /// fake writes to the destination file.
     pub(crate) fn with_get_to_file(self, url: &str, body: &[u8]) -> Self {
         self.get_to_file
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_vec());
         self
     }
@@ -184,10 +214,12 @@ impl FakeHttp {
         kind: ErrorKind,
     ) -> Self {
         self.get_to_file_error_writes
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_vec());
         self.get_to_file_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), kind);
         self
     }
@@ -203,7 +235,8 @@ impl FakeHttp {
     /// is popped, so a retry never recreates it.
     pub(crate) fn with_get_to_file_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
         self.get_to_file_error_sequences
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), kinds.iter().copied().collect());
         self
     }
@@ -214,7 +247,8 @@ impl FakeHttp {
     /// mirror download.
     pub(crate) fn with_mirror_file(self, url: &str, body: &[u8]) -> Self {
         self.mirror_files
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_vec());
         self
     }
@@ -225,7 +259,8 @@ impl FakeHttp {
     /// the 302 a download mirror answers with.
     pub(crate) fn with_mirror_redirect(self, url: &str, location: &str) -> Self {
         self.mirror_redirects
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), location.to_string());
         self
     }
@@ -236,7 +271,8 @@ impl FakeHttp {
     /// once.
     pub(crate) fn with_mirror_error(self, url: &str, kind: ErrorKind) -> Self {
         self.mirror_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), kind);
         self
     }
@@ -253,17 +289,20 @@ impl FakeHttp {
         kind: ErrorKind,
     ) -> Self {
         self.mirror_error_writes
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_vec());
         self.mirror_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), kind);
         self
     }
 
     pub(crate) fn with_post_error(self, url: &str, kind: ErrorKind) -> Self {
         self.post_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), VecDeque::from([kind]));
         self
     }
@@ -274,14 +313,16 @@ impl FakeHttp {
     /// model a backend that is not ready yet and then catches up.
     pub(crate) fn with_post_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
         self.post_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), kinds.iter().copied().collect());
         self
     }
 
     pub(crate) fn with_post(self, url: &str, body: &str) -> Self {
         self.posts
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_string());
         self
     }
@@ -292,7 +333,7 @@ impl FakeHttp {
     /// (a validate pass that reports missing files, then a clean
     /// re-validate after the stage).
     pub(crate) fn with_post_sequence(self, url: &str, bodies: &[&str]) -> Self {
-        self.post_sequences.borrow_mut().insert(
+        self.post_sequences.lock().unwrap().insert(
             url.to_string(),
             bodies.iter().map(|body| body.to_string()).collect(),
         );
@@ -301,35 +342,40 @@ impl FakeHttp {
 
     pub(crate) fn with_patch(self, url: &str, body: &str) -> Self {
         self.patches
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_string());
         self
     }
 
     pub(crate) fn with_patch_error(self, url: &str, kind: ErrorKind) -> Self {
         self.patch_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), VecDeque::from([kind]));
         self
     }
 
     pub(crate) fn with_delete(self, url: &str, body: &str) -> Self {
         self.deletes
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_string());
         self
     }
 
     pub(crate) fn with_delete_error(self, url: &str, kind: ErrorKind) -> Self {
         self.delete_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), kind);
         self
     }
 
     pub(crate) fn with_put(self, url: &str, body: &str) -> Self {
         self.puts
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_string());
         self
     }
@@ -342,20 +388,22 @@ impl FakeHttp {
     /// document the server returns after storing the file).
     pub(crate) fn with_put_bytes(self, url: &str, body: &str) -> Self {
         self.put_bytes
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), body.to_string());
         self
     }
 
     pub(crate) fn with_put_error_sequence(self, url: &str, kinds: &[ErrorKind]) -> Self {
         self.put_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(url.to_string(), kinds.iter().copied().collect());
         self
     }
 
     pub(crate) fn get_calls(&self) -> Vec<(String, bool)> {
-        self.get_calls.borrow().clone()
+        self.get_calls.lock().unwrap().clone()
     }
 
     /// The Bearer token each GET carried, in call order: (url,
@@ -364,38 +412,43 @@ impl FakeHttp {
     /// tokens asserts here — `None` when the call carried no
     /// Bearer token. Test-only fake values, never real secrets.
     pub(crate) fn get_bearer_tokens(&self) -> Vec<(String, Option<String>)> {
-        self.get_bearer_tokens.borrow().clone()
+        self.get_bearer_tokens.lock().unwrap().clone()
     }
 
     pub(crate) fn get_bytes_calls(&self) -> Vec<(String, bool)> {
-        self.get_bytes_calls.borrow().clone()
+        self.get_bytes_calls.lock().unwrap().clone()
+    }
+
+    /// The most `get_bytes` calls in flight at once so far.
+    pub(crate) fn max_concurrent_get_bytes(&self) -> usize {
+        self.get_bytes_max_in_flight.load(Ordering::SeqCst)
     }
 
     pub(crate) fn get_to_file_calls(&self) -> Vec<(String, bool)> {
-        self.get_to_file_calls.borrow().clone()
+        self.get_to_file_calls.lock().unwrap().clone()
     }
 
     /// The mirror downloads in order (url, authed): one entry per
     /// hop, so a test can assert a redirect was followed (two
     /// entries) or a dead mirror was tried once (one entry).
     pub(crate) fn mirror_calls(&self) -> Vec<(String, bool)> {
-        self.mirror_calls.borrow().clone()
+        self.mirror_calls.lock().unwrap().clone()
     }
 
     pub(crate) fn post_calls(&self) -> Vec<(String, String, bool)> {
-        self.post_calls.borrow().clone()
+        self.post_calls.lock().unwrap().clone()
     }
 
     pub(crate) fn delete_calls(&self) -> Vec<(String, bool)> {
-        self.delete_calls.borrow().clone()
+        self.delete_calls.lock().unwrap().clone()
     }
 
     pub(crate) fn delete_json_calls(&self) -> Vec<(String, String, bool)> {
-        self.delete_json_calls.borrow().clone()
+        self.delete_json_calls.lock().unwrap().clone()
     }
 
     pub(crate) fn patch_calls(&self) -> Vec<(String, String, bool)> {
-        self.patch_calls.borrow().clone()
+        self.patch_calls.lock().unwrap().clone()
     }
 
     /// The mutation calls in order (method, url): POST, PATCH,
@@ -403,15 +456,15 @@ impl FakeHttp {
     /// mutation happened before another - the decline comment
     /// before the close PATCH, for instance.
     pub(crate) fn mutation_calls(&self) -> Vec<(String, String)> {
-        self.mutation_calls.borrow().clone()
+        self.mutation_calls.lock().unwrap().clone()
     }
 
     pub(crate) fn put_calls(&self) -> Vec<(String, String, bool)> {
-        self.put_calls.borrow().clone()
+        self.put_calls.lock().unwrap().clone()
     }
 
     pub(crate) fn put_bytes_calls(&self) -> Vec<(String, Vec<u8>, bool)> {
-        self.put_bytes_calls.borrow().clone()
+        self.put_bytes_calls.lock().unwrap().clone()
     }
 
     fn patch(
@@ -424,14 +477,17 @@ impl FakeHttp {
         // tests in `http.rs` assert the header PATCH sends.
         let authed = !matches!(credentials, Credentials::None);
         self.patch_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((url.to_string(), body.to_string(), authed));
         self.mutation_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(("PATCH".to_string(), url.to_string()));
         if let Some(kind) = self
             .patch_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .get_mut(url)
             .and_then(|queue| queue.pop_front())
         {
@@ -440,12 +496,27 @@ impl FakeHttp {
                 format!("canned PATCH error for {url}"),
             ));
         }
-        self.patches.borrow().get(url).cloned().ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::NetworkError,
-                format!("no canned PATCH response for {url}"),
-            )
-        })
+        self.patches
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::NetworkError,
+                    format!("no canned PATCH response for {url}"),
+                )
+            })
+    }
+}
+
+/// Decrements a counter when it drops: the `get_bytes` in-flight
+/// count, so an early error return cannot leak an increment.
+struct InFlightGuard<'a>(&'a AtomicUsize);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -456,17 +527,22 @@ impl HttpClient for FakeHttp {
 
     fn get_with(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
         let authed = !matches!(credentials, Credentials::None);
-        self.get_calls.borrow_mut().push((url.to_string(), authed));
+        self.get_calls
+            .lock()
+            .unwrap()
+            .push((url.to_string(), authed));
         let bearer = match credentials {
             Credentials::Bearer { token } => Some(token.clone()),
             _ => None,
         };
         self.get_bearer_tokens
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((url.to_string(), bearer));
         if let Some(kind) = self
             .get_error_sequences
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .get_mut(url)
             .and_then(|queue| queue.pop_front())
         {
@@ -475,7 +551,7 @@ impl HttpClient for FakeHttp {
                 format!("canned GET error for {url}"),
             ));
         }
-        if let Some(kind) = self.get_errors.borrow().get(url).cloned() {
+        if let Some(kind) = self.get_errors.lock().unwrap().get(url).cloned() {
             return Err(GeectlError::new(
                 kind,
                 format!("canned GET error for {url}"),
@@ -483,13 +559,14 @@ impl HttpClient for FakeHttp {
         }
         if let Some(body) = self
             .get_sequences
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .get_mut(url)
             .and_then(|queue| queue.pop_front())
         {
             return Ok(body);
         }
-        self.gets.borrow().get(url).cloned().ok_or_else(|| {
+        self.gets.lock().unwrap().get(url).cloned().ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::NetworkError,
                 format!("no canned GET response for {url}"),
@@ -500,9 +577,17 @@ impl HttpClient for FakeHttp {
     fn get_bytes(&self, url: &str, credentials: &Credentials) -> Result<Vec<u8>, GeectlError> {
         let authed = !matches!(credentials, Credentials::None);
         self.get_bytes_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((url.to_string(), authed));
-        if self.get_bytes_cap_errors.borrow().contains(url) {
+        let in_flight = self.get_bytes_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.get_bytes_max_in_flight
+            .fetch_max(in_flight, Ordering::SeqCst);
+        let _guard = InFlightGuard(&self.get_bytes_in_flight);
+        if !self.get_bytes_delay.is_zero() {
+            std::thread::sleep(self.get_bytes_delay);
+        }
+        if self.get_bytes_cap_errors.lock().unwrap().contains(url) {
             return Err(GeectlError::new(
                 ErrorKind::ServerError,
                 format!("response body exceeds the {MAX_BODY_BYTES}-byte limit"),
@@ -510,7 +595,8 @@ impl HttpClient for FakeHttp {
         }
         if let Some(kind) = self
             .get_bytes_error_sequences
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .get_mut(url)
             .and_then(|queue| queue.pop_front())
         {
@@ -519,18 +605,23 @@ impl HttpClient for FakeHttp {
                 format!("canned GET error for {url}"),
             ));
         }
-        if let Some(kind) = self.get_errors.borrow().get(url).cloned() {
+        if let Some(kind) = self.get_errors.lock().unwrap().get(url).cloned() {
             return Err(GeectlError::new(
                 kind,
                 format!("canned GET error for {url}"),
             ));
         }
-        self.get_bytes.borrow().get(url).cloned().ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::NetworkError,
-                format!("no canned GET bytes response for {url}"),
-            )
-        })
+        self.get_bytes
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::NetworkError,
+                    format!("no canned GET bytes response for {url}"),
+                )
+            })
     }
 
     fn get_to_file(
@@ -541,11 +632,13 @@ impl HttpClient for FakeHttp {
     ) -> Result<u64, GeectlError> {
         let authed = !matches!(credentials, Credentials::None);
         self.get_to_file_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((url.to_string(), authed));
         if let Some(kind) = self
             .get_to_file_error_sequences
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .get_mut(url)
             .and_then(|queue| queue.pop_front())
         {
@@ -566,7 +659,7 @@ impl HttpClient for FakeHttp {
                 format!("canned GET error for {url}"),
             ));
         }
-        if let Some(kind) = self.get_to_file_errors.borrow().get(url).cloned() {
+        if let Some(kind) = self.get_to_file_errors.lock().unwrap().get(url).cloned() {
             // A server 409 reports `AlreadyExists` without creating
             // the file: writing a partial first would make the caller
             // read the error as a temp-name collision and retry,
@@ -574,7 +667,11 @@ impl HttpClient for FakeHttp {
             let partial = if kind == ErrorKind::AlreadyExists {
                 None
             } else {
-                self.get_to_file_error_writes.borrow().get(url).cloned()
+                self.get_to_file_error_writes
+                    .lock()
+                    .unwrap()
+                    .get(url)
+                    .cloned()
             };
             if let Some(partial) = partial {
                 // The partial file is created the way the real client
@@ -607,12 +704,18 @@ impl HttpClient for FakeHttp {
                 format!("canned GET error for {url}"),
             ));
         }
-        let body = self.get_to_file.borrow().get(url).cloned().ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::NetworkError,
-                format!("no canned GET bytes response for {url}"),
-            )
-        })?;
+        let body = self
+            .get_to_file
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::NetworkError,
+                    format!("no canned GET bytes response for {url}"),
+                )
+            })?;
         let mut file = std::fs::File::options()
             .write(true)
             .create_new(true)
@@ -659,10 +762,17 @@ impl HttpClient for FakeHttp {
                 false
             };
             self.mirror_calls
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push((current.to_string(), authed));
-            if let Some(kind) = self.mirror_errors.borrow().get(current).copied() {
-                if let Some(partial) = self.mirror_error_writes.borrow().get(current).cloned() {
+            if let Some(kind) = self.mirror_errors.lock().unwrap().get(current).copied() {
+                if let Some(partial) = self
+                    .mirror_error_writes
+                    .lock()
+                    .unwrap()
+                    .get(current)
+                    .cloned()
+                {
                     // A stream that fails mid-download leaves a
                     // partial file for the caller to delete, like
                     // the real client: created exclusively, so a
@@ -695,12 +805,13 @@ impl HttpClient for FakeHttp {
                     format!("canned mirror error for {current}"),
                 ));
             }
-            if let Some(location) = self.mirror_redirects.borrow().get(current).cloned() {
+            if let Some(location) = self.mirror_redirects.lock().unwrap().get(current).cloned() {
                 return Ok(MirrorHop::Redirect(location));
             }
             let body = self
                 .mirror_files
-                .borrow()
+                .lock()
+                .unwrap()
                 .get(current)
                 .cloned()
                 .ok_or_else(|| {
@@ -748,14 +859,17 @@ impl HttpClient for FakeHttp {
     ) -> Result<String, GeectlError> {
         let authed = !matches!(credentials, Credentials::None);
         self.post_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((url.to_string(), body.to_string(), authed));
         self.mutation_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(("POST".to_string(), url.to_string()));
         if let Some(kind) = self
             .post_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .get_mut(url)
             .and_then(|queue| queue.pop_front())
         {
@@ -766,13 +880,14 @@ impl HttpClient for FakeHttp {
         }
         if let Some(body) = self
             .post_sequences
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .get_mut(url)
             .and_then(|queue| queue.pop_front())
         {
             return Ok(body);
         }
-        self.posts.borrow().get(url).cloned().ok_or_else(|| {
+        self.posts.lock().unwrap().get(url).cloned().ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::NetworkError,
                 format!("no canned POST response for {url}"),
@@ -841,23 +956,30 @@ impl HttpClient for FakeHttp {
     fn delete(&self, url: &str, credentials: &Credentials) -> Result<String, GeectlError> {
         let authed = !matches!(credentials, Credentials::None);
         self.delete_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((url.to_string(), authed));
         self.mutation_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(("DELETE".to_string(), url.to_string()));
-        if let Some(kind) = self.delete_errors.borrow().get(url).cloned() {
+        if let Some(kind) = self.delete_errors.lock().unwrap().get(url).cloned() {
             return Err(GeectlError::new(
                 kind,
                 format!("canned DELETE error for {url}"),
             ));
         }
-        self.deletes.borrow().get(url).cloned().ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::NetworkError,
-                format!("no canned DELETE response for {url}"),
-            )
-        })
+        self.deletes
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::NetworkError,
+                    format!("no canned DELETE response for {url}"),
+                )
+            })
     }
 
     fn delete_json_with(
@@ -871,14 +993,20 @@ impl HttpClient for FakeHttp {
         // the reviewer list.
         let authed = !matches!(credentials, Credentials::None);
         self.delete_json_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((url.to_string(), body.to_string(), authed));
-        self.deletes.borrow().get(url).cloned().ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::NetworkError,
-                format!("no canned DELETE response for {url}"),
-            )
-        })
+        self.deletes
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::NetworkError,
+                    format!("no canned DELETE response for {url}"),
+                )
+            })
     }
 
     fn put(&self, url: &str, body: &str, credentials: &Credentials) -> Result<String, GeectlError> {
@@ -886,14 +1014,17 @@ impl HttpClient for FakeHttp {
         // tests in `http.rs` assert the header PUT sends.
         let authed = !matches!(credentials, Credentials::None);
         self.put_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((url.to_string(), body.to_string(), authed));
         self.mutation_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(("PUT".to_string(), url.to_string()));
         if let Some(kind) = self
             .put_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .get_mut(url)
             .and_then(|queue| queue.pop_front())
         {
@@ -902,7 +1033,7 @@ impl HttpClient for FakeHttp {
                 format!("canned PUT error for {url}"),
             ));
         }
-        self.puts.borrow().get(url).cloned().ok_or_else(|| {
+        self.puts.lock().unwrap().get(url).cloned().ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::NetworkError,
                 format!("no canned PUT response for {url}"),
@@ -933,13 +1064,15 @@ impl HttpClient for FakeHttp {
         // exact bytes a binary upload carried.
         let authed = !matches!(credentials, Credentials::None);
         self.put_bytes_calls
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((url.to_string(), body.to_vec(), authed));
         // A byte PUT is a PUT: the same canned error sequence
         // applies as for a text PUT.
         if let Some(kind) = self
             .put_errors
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .get_mut(url)
             .and_then(|queue| queue.pop_front())
         {
@@ -948,12 +1081,17 @@ impl HttpClient for FakeHttp {
                 format!("canned PUT error for {url}"),
             ));
         }
-        self.put_bytes.borrow().get(url).cloned().ok_or_else(|| {
-            GeectlError::new(
-                ErrorKind::NetworkError,
-                format!("no canned PUT bytes response for {url}"),
-            )
-        })
+        self.put_bytes
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::NetworkError,
+                    format!("no canned PUT bytes response for {url}"),
+                )
+            })
     }
 }
 
