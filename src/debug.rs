@@ -491,6 +491,31 @@ fn is_binary_body(body: &str) -> bool {
 /// a character boundary, with a marker naming the original body's
 /// total length (the redacted form can be shorter, so the marker
 /// never names the redacted length).
+pub fn format_body_preview(body: &str) -> String {
+    if is_binary_body(body) {
+        return format!("<binary body, {} bytes>", body.len());
+    }
+    let redacted = redact_body(body);
+    // Terminal control and bidirectional / format characters are
+    // stripped: the preview is printed raw to the terminal, and a
+    // text body may carry a raw C1 control character (the binary
+    // check only catches C0 bytes). Newlines survive: they are
+    // the preview's own line structure.
+    let redacted = strip_terminal_controls(&redacted);
+    if redacted.len() <= DEBUG_BODY_CAP {
+        return redacted;
+    }
+    let mut end = DEBUG_BODY_CAP;
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}... [truncated, {} bytes total]",
+        &redacted[..end],
+        body.len()
+    )
+}
+
 /// Strip the characters that must not reach the terminal from a
 /// string: C0/C1 control characters (except newline) and the
 /// bidirectional / format characters that reorder displayed text
@@ -512,25 +537,6 @@ pub(crate) fn strip_terminal_controls(text: &str) -> String {
                     ))
         })
         .collect()
-}
-
-pub fn format_body_preview(body: &str) -> String {
-    if is_binary_body(body) {
-        return format!("<binary body, {} bytes>", body.len());
-    }
-    let redacted = redact_body(body);
-    if redacted.len() <= DEBUG_BODY_CAP {
-        return redacted;
-    }
-    let mut end = DEBUG_BODY_CAP;
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}... [truncated, {} bytes total]",
-        &redacted[..end],
-        body.len()
-    )
 }
 
 #[cfg(test)]
@@ -872,6 +878,18 @@ Host: api.opensuse.org";
     fn body_preview_never_dumps_binary_bodies() {
         let body = "ok\0binary";
         assert_eq!(format_body_preview(body), "<binary body, 9 bytes>");
+    }
+
+    #[test]
+    fn body_preview_strips_terminal_controls() {
+        // A raw C1 control character is not caught by the binary
+        // check (it only looks at C0 bytes), so the preview must
+        // strip it; a bidirectional mark is stripped too. The
+        // preview is printed raw to the terminal.
+        let preview = format_body_preview("ok\u{9b}te\u{202e}xt");
+        assert!(!preview.chars().any(|c| c.is_control() && c != '\n'));
+        assert!(!preview.contains('\u{202e}'));
+        assert!(preview.contains("text"));
     }
 
     #[test]
