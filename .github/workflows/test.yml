@@ -27,14 +27,23 @@ jobs:
           persist-credentials: false
       # Pinned to the v1 tag's commit so the action cannot move under us
       # and the SHA cannot be garbage-collected; Dependabot tracks SHA
-      # pins and proposes updates. The toolchain is pinned to 1.99.1
-      # (matching rust-toolchain.toml): the action requires an
-      # explicit toolchain and does not read rust-toolchain.toml,
-      # so CI and local developers use the same compiler.
+      # pins and proposes updates. The toolchain is derived from
+      # Cargo.toml `rust-version` (the single source of truth) by the
+      # shared read-rust-version step, which also exports RUSTUP_TOOLCHAIN
+      # so the derived toolchain outranks rust-toolchain.toml; the
+      # assert below proves the derived toolchain is the one in use.
+      - uses: ./.github/actions/read-rust-version
+        id: toolchain
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.99.1
+          toolchain: ${{ steps.toolchain.outputs.value }}
           components: rustfmt, clippy
+      - name: Assert derived toolchain
+        env:
+          TOOLCHAIN: ${{ steps.toolchain.outputs.value }}
+        run: |
+          rustc --version
+          rustc --version | grep -Fq "$TOOLCHAIN"
       # Pinned to the v2 tag's commit; Dependabot tracks SHA pins and
       # proposes updates. Plain cache (no OS-release scoping): geectl
       # is pure Rust with no bindgen or system libraries, so the cache
@@ -119,37 +128,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Read MSRV from Cargo.toml
+      - uses: ./.github/actions/read-rust-version
         id: msrv
-        run: |
-          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          test -n "$msrv" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
-          # The value comes from Cargo.toml (PR-controlled), so validate
-          # its shape before any later step uses it.
-          [[ "$msrv" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "invalid rust-version: $msrv" >&2; exit 1; }
-          echo "value=$msrv" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.value }}
-      # dtolnay/rust-toolchain sets the rustup default, which
-      # rust-toolchain.toml outranks; export RUSTUP_TOOLCHAIN so the MSRV
-      # is actually used, and assert.
+      # The shared step exports RUSTUP_TOOLCHAIN, so the MSRV is actually
+      # used despite rust-toolchain.toml outranking the rustup default;
+      # assert it here.
       - name: Assert MSRV toolchain
         env:
           MSRV: ${{ steps.msrv.outputs.value }}
         run: |
-          export RUSTUP_TOOLCHAIN="$MSRV"
           rustc --version
           rustc --version | grep -Fq "$MSRV"
       # cargo check, not build, over --all-targets: an MSRV break in test
       # code or a dev-dependency otherwise passes here and only bites a
       # contributor.
       - name: cargo check at MSRV
-        env:
-          MSRV: ${{ steps.msrv.outputs.value }}
-        run: |
-          export RUSTUP_TOOLCHAIN="$MSRV"
-          cargo check --all-targets --locked
+        run: cargo check --all-targets --locked
 
   # Platform spread: the CLI must build and pass its tests on macOS too.
   # Clippy is platform-independent and Linux clippy covers it, so macOS
@@ -161,12 +158,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The toolchain is pinned to 1.99.1 (matching
-      # rust-toolchain.toml): the action requires an explicit
-      # toolchain and does not read rust-toolchain.toml.
+      # The toolchain is derived from Cargo.toml `rust-version` (the
+      # single source of truth) by the shared read-rust-version step,
+      # which also exports RUSTUP_TOOLCHAIN so the derived toolchain
+      # outranks rust-toolchain.toml; the assert below proves the
+      # derived toolchain is the one in use.
+      - uses: ./.github/actions/read-rust-version
+        id: toolchain
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.99.1
+          toolchain: ${{ steps.toolchain.outputs.value }}
+      - name: Assert derived toolchain
+        env:
+          TOOLCHAIN: ${{ steps.toolchain.outputs.value }}
+        run: |
+          rustc --version
+          rustc --version | grep -Fq "$TOOLCHAIN"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
@@ -184,23 +191,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Derive the toolchain from Cargo.toml `rust-version` — the
-      # single source of truth; the action requires an explicit
-      # toolchain and does not read rust-toolchain.toml. Same
-      # extraction as the release derivation.
-      - name: Derive the toolchain from Cargo.toml
+      # The toolchain is derived from Cargo.toml `rust-version` (the
+      # single source of truth) by the shared read-rust-version step,
+      # which also exports RUSTUP_TOOLCHAIN so the derived toolchain
+      # outranks rust-toolchain.toml; the assert below proves the
+      # derived toolchain is the one in use.
+      - uses: ./.github/actions/read-rust-version
         id: toolchain
-        # sed needs bash: the Windows runner defaults to PowerShell.
-        shell: bash
-        run: |
-          toolchain=$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"/\1/p' Cargo.toml | head -1)
-          test -n "$toolchain" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
-          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
-          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           # Derived from Cargo.toml rust-version, not floating stable.
-          toolchain: ${{ steps.toolchain.outputs.toolchain }}
+          toolchain: ${{ steps.toolchain.outputs.value }}
+      - name: Assert derived toolchain
+        env:
+          TOOLCHAIN: ${{ steps.toolchain.outputs.value }}
+        # The Windows runner defaults to PowerShell; the assert is bash.
+        shell: bash
+        run: |
+          rustc --version
+          rustc --version | grep -Fq "$TOOLCHAIN"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
