@@ -210,6 +210,35 @@ fn delete_package_option_suffix(options: &DeletePackageOptions) -> String {
     }
 }
 
+/// The option suffix for a project-delete plan line: the set
+/// options, so a dry-run plan reads what the delete would have
+/// done. The comment is truncated to its first 80 characters, like
+/// the package-delete message: the plan is one line, and the full
+/// comment rides the payload.
+fn delete_project_option_suffix(options: &DeleteProjectOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if options.force {
+        parts.push("force".to_string());
+    }
+    if let Some(comment) = &options.comment {
+        // Comments are validated single-line before the plan is
+        // built, so truncation cuts length only, never a line.
+        const PLAN_COMMENT_LEN: usize = 80;
+        let shown: String = comment.chars().take(PLAN_COMMENT_LEN).collect();
+        let more = if comment.chars().count() > PLAN_COMMENT_LEN {
+            "…"
+        } else {
+            ""
+        };
+        parts.push(format!("comment {shown}{more}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 /// The option suffix for a package-creation plan line: the set
 /// options, so a dry-run plan reads what the creation would have
 /// done.
@@ -3771,6 +3800,10 @@ impl<'a> ObsClient<'a> {
     /// `recursive` the packages are listed first and a project
     /// holding packages is refused. `force` ignores other projects
     /// depending on this one; `comment` is recorded on the delete.
+    /// A set comment is validated before the dry-run guard — empty,
+    /// longer than 2048 bytes, or containing control characters is
+    /// refused, like the delete-package message — and the dry-run
+    /// plan names it, truncated to its first 80 characters.
     ///
     /// The list-then-delete is best-effort, not atomic: a package
     /// created between the listing and the delete is deleted with
@@ -3795,16 +3828,22 @@ impl<'a> ObsClient<'a> {
                 format!("invalid OBS project name: {project:?}"),
             ));
         }
+        // Validate the comment before the dry-run guard, so a
+        // dry-run plan never promises a delete the server would
+        // refuse — the same rule as the delete-package message.
+        if let Some(comment) = &options.comment {
+            validate_delete_message(comment)?;
+        }
         let mut plan = format!("delete project {project}");
         if options.recursive {
             plan.push_str(" with all its packages");
         }
-        if options.force {
-            plan.push_str(" (force)");
-        }
+        plan.push_str(&delete_project_option_suffix(options));
         // The dry-run guard: in dry-run the delete is recorded in
         // the plan and nothing is deleted — not even the credentials
-        // check runs, and the package list is not read.
+        // check runs, and the package list is not read. The plan
+        // names the set options, including the comment: a plan that
+        // hides it misstates the delete.
         if !dry_run.allow(&plan) {
             return Ok(());
         }
@@ -5002,6 +5041,208 @@ mod tests {
             dry_run.plan(),
             vec![
                 "[dry-run] would: delete project test:factory with all its packages (force)"
+                    .to_string()
+            ]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_project_rejects_empty_comment_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = DeleteProjectOptions {
+            comment: Some(String::new()),
+            ..Default::default()
+        };
+        let err = client
+            .delete_project("test:factory", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+        // The validation runs before the dry-run guard: a dry run
+        // never promises a delete the server would refuse.
+        let dry_run = DryRun::new(true);
+        let err = client
+            .delete_project("test:factory", &options, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(dry_run.plan().is_empty());
+    }
+
+    #[test]
+    fn delete_project_rejects_whitespace_only_comment_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions {
+                    comment: Some("   ".to_string()),
+                    ..Default::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_project_rejects_overlong_comment_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions {
+                    comment: Some("x".repeat(2049)),
+                    ..Default::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_project_rejects_control_characters_in_comment_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        for comment in ["clean\nup", "clean\tup"] {
+            let err = client
+                .delete_project(
+                    "test:factory",
+                    &DeleteProjectOptions {
+                        comment: Some(comment.to_string()),
+                        ..Default::default()
+                    },
+                    &DryRun::new(false),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_project_accepts_a_2048_byte_comment_in_dry_run() {
+        // The cap is 2048 bytes: a comment of exactly that length is
+        // accepted, and the plan shows its first 80 characters.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions {
+                    comment: Some("x".repeat(2048)),
+                    ..Default::default()
+                },
+                &dry_run,
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![format!(
+                "[dry-run] would: delete project test:factory (comment {}…)",
+                "x".repeat(80)
+            )]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn delete_project_dry_run_shows_the_comment_in_the_plan() {
+        // The plan is one line: a comment longer than 80 characters
+        // is cut there with an ellipsis, while a comment of exactly
+        // 80 characters is shown whole — the same rule as the
+        // delete-package message.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions {
+                    comment: Some("x".repeat(100)),
+                    ..Default::default()
+                },
+                &dry_run,
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![format!(
+                "[dry-run] would: delete project test:factory (comment {}…)",
+                "x".repeat(80)
+            )]
+        );
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions {
+                    comment: Some("x".repeat(80)),
+                    ..Default::default()
+                },
+                &dry_run,
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![format!(
+                "[dry-run] would: delete project test:factory (comment {})",
+                "x".repeat(80)
+            )]
+        );
+        // One character over the cap truncates: the boundary is
+        // exactly 80, not 79 or 81.
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions {
+                    comment: Some("x".repeat(81)),
+                    ..Default::default()
+                },
+                &dry_run,
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![format!(
+                "[dry-run] would: delete project test:factory (comment {}…)",
+                "x".repeat(80)
+            )]
+        );
+        // The full option set reads in one line: recursive, force,
+        // and the comment the delete would send — the `rdelete -r -f
+        // -m 'cleanup'` shape, shown in the plan before anything is
+        // deleted.
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .delete_project(
+                "test:factory",
+                &DeleteProjectOptions {
+                    recursive: true,
+                    force: true,
+                    comment: Some("cleanup".to_string()),
+                },
+                &dry_run,
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: delete project test:factory with all its packages (force, comment cleanup)"
                     .to_string()
             ]
         );
