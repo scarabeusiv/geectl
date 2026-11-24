@@ -3034,6 +3034,27 @@ impl<'a> ObsClient<'a> {
         parse_project_meta(&body)
     }
 
+    /// Read the meta of project `project` with the client's
+    /// credentials (`GET /source/<project>/_meta`). The
+    /// authenticated twin of [`ObsClient::project_meta`]: the public
+    /// read answers 404 for a project that exists but is hidden
+    /// (access-disabled), so a create-if-missing caller that trusted
+    /// the public read alone would PUT bare meta over it and wipe
+    /// its repositories, persons, and lock/access flags. A 404 here
+    /// means the project really is missing for this caller; any
+    /// other failure fails loudly, like the public read.
+    pub fn project_meta_authenticated(&self, project: &str) -> Result<ProjectMeta, GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        let url = build_url(&self.base, &["source", project, "_meta"], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_project_meta(&body)
+    }
+
     /// Read the meta of package `package` in project `project` (`GET
     /// /public/source/<project>/<package>/_meta`). A public read: no
     /// credentials. The meta carries the title, description, url,
@@ -8983,6 +9004,31 @@ mod tests {
                     hostsystem: vec![],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn project_meta_authenticated_reads_the_authenticated_endpoint() {
+        // The authenticated project-meta read hits the plain
+        // `/source/…/_meta` endpoint with the client's credentials
+        // — the read a create-if-missing caller uses to tell a
+        // hidden project apart from a missing one.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            "<project name=\"home:scarabeus_iv\"><title>Home</title></project>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let meta = client
+            .project_meta_authenticated("home:scarabeus_iv")
+            .unwrap();
+        assert_eq!(meta.name, "home:scarabeus_iv");
+        assert_eq!(meta.title.as_deref(), Some("Home"));
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta".to_string(),
+                true
+            )]
         );
     }
 

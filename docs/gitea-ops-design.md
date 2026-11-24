@@ -175,12 +175,20 @@ delete) plus the one read it cannot be verified without.
     stands and the agent is not told the reusable fork's name.
     `repo_list` is the primitive for finding the fork under a
     different name.
-4. OBS fork: `POST /source/{project}/{package}?cmd=fork` with
+4. Ensure the target project exists: the explicit target, or the
+   server default `home:<user>:branches:<project>` when the acting
+   OBS username is known — a missing one is generated with
+   `create_project` (titled as a branch project for the package,
+   and described as the test project for the git branch it is wired
+   to) and the creation is reported on the debug channel. With
+   Bearer credentials the default cannot be named client-side, so
+   the server's branch path generates it.
+5. OBS fork: `POST /source/{project}/{package}?cmd=fork` with
    `scmsync={fork-owner}/{fork-repo}#{fork_branch}` (package
    `"_project"` for a project fork), `target_project` defaulting to
    `home:<user>:branches`, `target_package` defaulting to the
    package name. The server answers the target project/package.
-5. Return, typed: the fork repo (`owner`, `name`, `branch`),
+6. Return, typed: the fork repo (`owner`, `name`, `branch`),
    the scmsync URL, the OBS target project/package, and the
    `clone_url` / `ssh_url` for the agent's own `git clone`.
    No local clone is made (decision 1).
