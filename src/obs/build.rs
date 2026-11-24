@@ -3623,6 +3623,47 @@ impl<'a> ObsClient<'a> {
     }
 }
 
+/// One configured instance's read of the build-results matrix for
+/// the merged view: the results, or the failure that kept them from
+/// being read. A failure is data, not an abort: the merged view
+/// renders it next to the other instances' results, so one
+/// unreachable instance never drops the rest.
+#[derive(Debug)]
+pub struct InstanceBuildResults {
+    /// The instance's alias from the `[instances]` table, or
+    /// `default` for the configured instance with no alias.
+    pub alias: String,
+    /// The instance's API base URL.
+    pub api_url: String,
+    /// The instance's results, or the failure that kept them from
+    /// being read.
+    pub outcome: Result<BuildResults, GeectlError>,
+}
+
+/// Read the build results for `project` from every endpoint in
+/// `endpoints`, in order, through `read`: one read per endpoint, and
+/// a failure is recorded for that endpoint instead of aborting the
+/// run, so one unreachable instance never drops the others'
+/// results. The caller supplies the per-endpoint read (client plus
+/// that instance's credentials), so a credential failure is an
+/// endpoint failure like any other. An empty endpoint list reads
+/// nothing and returns no outcomes.
+pub fn results_across_instances(
+    endpoints: &[(&str, &str)],
+    project: &str,
+    query: &ResultsQuery,
+    read: impl Fn(&str, &str, &ResultsQuery) -> Result<BuildResults, GeectlError>,
+) -> Vec<InstanceBuildResults> {
+    endpoints
+        .iter()
+        .map(|(alias, api_url)| InstanceBuildResults {
+            alias: (*alias).to_string(),
+            api_url: (*api_url).to_string(),
+            outcome: read(api_url, project, query),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4055,6 +4096,107 @@ mod tests {
             .results("nosuchproject", &ResultsQuery::default())
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn results_across_instances_reads_each_endpoint_in_order() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.one.example/build/testproject/_result",
+                "<resultlist state=\"aaa\"><result project=\"testproject\" repository=\"standard\" arch=\"x86_64\" code=\"published\" state=\"published\"><status package=\"foo\" code=\"succeeded\" /></result></resultlist>",
+            )
+            .with_get(
+                "https://api.two.example/build/testproject/_result",
+                "<resultlist state=\"bbb\"><result project=\"testproject\" repository=\"standard\" arch=\"x86_64\" code=\"published\" state=\"published\"><status package=\"foo\" code=\"failed\" /></result></resultlist>",
+            );
+        let query = ResultsQuery::default();
+        let outcomes = results_across_instances(
+            &[
+                ("one", "https://api.one.example"),
+                ("two", "https://api.two.example"),
+            ],
+            "testproject",
+            &query,
+            |url, project, query| {
+                let client =
+                    ObsClient::with_base_and_credentials(&http, url, basic_credentials()).unwrap();
+                client.results(project, query)
+            },
+        );
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].alias, "one");
+        assert_eq!(outcomes[0].api_url, "https://api.one.example");
+        let first = outcomes[0].outcome.as_ref().unwrap();
+        assert_eq!(first.state.as_deref(), Some("aaa"));
+        assert_eq!(first.results[0].statuses[0].code, "succeeded");
+        assert_eq!(outcomes[1].alias, "two");
+        assert_eq!(outcomes[1].api_url, "https://api.two.example");
+        let second = outcomes[1].outcome.as_ref().unwrap();
+        assert_eq!(second.state.as_deref(), Some("bbb"));
+        assert_eq!(second.results[0].statuses[0].code, "failed");
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                (
+                    "https://api.one.example/build/testproject/_result".to_string(),
+                    true
+                ),
+                (
+                    "https://api.two.example/build/testproject/_result".to_string(),
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn results_across_instances_records_a_failure_without_dropping_the_other() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.one.example/build/testproject/_result",
+                RESULTS_FIXTURE,
+            )
+            .with_get_error(
+                "https://api.two.example/build/testproject/_result",
+                ErrorKind::NotFound,
+            );
+        let query = ResultsQuery::default();
+        let outcomes = results_across_instances(
+            &[
+                ("one", "https://api.one.example"),
+                ("two", "https://api.two.example"),
+            ],
+            "testproject",
+            &query,
+            |url, project, query| {
+                let client =
+                    ObsClient::with_base_and_credentials(&http, url, basic_credentials()).unwrap();
+                client.results(project, query)
+            },
+        );
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].outcome.is_ok());
+        assert_eq!(
+            outcomes[1].outcome.as_ref().unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        // Both endpoints were attempted: the failure did not abort
+        // the run.
+        assert_eq!(http.get_calls().len(), 2);
+    }
+
+    #[test]
+    fn results_across_instances_with_no_endpoints_reads_nothing() {
+        let http = FakeHttp::new();
+        let outcomes =
+            results_across_instances(&[], "testproject", &ResultsQuery::default(), |_, _, _| {
+                Ok(BuildResults {
+                    state: None,
+                    results: Vec::new(),
+                })
+            });
+        assert!(outcomes.is_empty());
+        assert!(http.get_calls().is_empty());
     }
 
     #[test]

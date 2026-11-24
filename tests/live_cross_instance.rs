@@ -1,4 +1,4 @@
-//! Live cross-instance copy test: two disposable OBS instances.
+//! Live cross-instance tests: two disposable OBS instances.
 //!
 //! The proof for `branch copy-package --to-apiurl` (osc `copypac
 //! -t`): a package copied from one OBS instance to another, client-
@@ -14,6 +14,11 @@
 //! 3001 — see `tests/live/README.md`). They are skipped unless BOTH
 //! `GEECTL_LIVE_URL` and `GEECTL_LIVE_URL_2` are set, so `cargo
 //! test` stays green without any instance.
+//!
+//! The results test proves the merged results view
+//! (`build results --all-instances`) against the same two
+//! instances: a project that exists on one only reads there, and
+//! the other instance's failure is recorded, not dropped.
 //!
 //! The harness helpers are copied from `tests/live.rs` (as
 //! `tests/live_obs.rs` does): one copy per live test target, since
@@ -32,7 +37,9 @@
 use geectl::auth::Credentials;
 use geectl::error::ErrorKind;
 use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{CopyOptions, DryRun, LinkOptions, ObsClient, SourceFile};
+use geectl::obs::{
+    results_across_instances, CopyOptions, DryRun, LinkOptions, ObsClient, ResultsQuery, SourceFile,
+};
 
 /// Whether `url` points at a loopback host.
 ///
@@ -558,6 +565,62 @@ fn live_cross_instance_copy() {
         err.kind(),
         ErrorKind::NotFound,
         "a missing package must map to NotFound; got {err:?}"
+    );
+}
+
+/// Merged build results across two live instances: a project that
+/// exists on one instance only reads on that instance, and the other
+/// instance's failure is recorded instead of dropping it — the
+/// no-silent-drop contract against real servers, not fixtures.
+#[test]
+fn live_cross_instance_results() {
+    let Some((base_a, base_b)) = live_urls() else {
+        return;
+    };
+    let source = live_client_authed(&base_a);
+    let target = live_client_authed(&base_b);
+    let live = DryRun::new(false);
+    let stamp = unique_stamp();
+    let project = format!("geectl-xinst-results-{stamp}");
+    source
+        .create_project(
+            &project,
+            "Cross-instance results",
+            "Created by the geectl cross-instance live test; the instances are destroyed after the run.",
+            &live,
+        )
+        .expect("create the project on instance A");
+    let query = ResultsQuery::default();
+    let outcomes = results_across_instances(
+        &[("a", base_a.as_str()), ("b", base_b.as_str())],
+        &project,
+        &query,
+        |url, project, query| {
+            let client = if url == base_a.as_str() {
+                &source
+            } else {
+                &target
+            };
+            client.results(project, query)
+        },
+    );
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0].alias, "a");
+    assert_eq!(outcomes[0].api_url, base_a);
+    let first = outcomes[0]
+        .outcome
+        .as_ref()
+        .expect("results from instance A");
+    assert!(
+        first.results.is_empty(),
+        "a fresh project has no repositories, so its matrix is empty"
+    );
+    assert_eq!(outcomes[1].alias, "b");
+    assert_eq!(outcomes[1].api_url, base_b);
+    assert_eq!(
+        outcomes[1].outcome.as_ref().unwrap_err().kind(),
+        ErrorKind::NotFound,
+        "the project does not exist on instance B, so its read fails instead of returning an empty matrix"
     );
 }
 

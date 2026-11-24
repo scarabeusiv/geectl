@@ -590,12 +590,19 @@ pub fn same_api_url(a: &str, b: &str) -> Result<bool, GeectlError> {
 /// when no alias names this URL. The alias is returned as written
 /// in the config; the env-var names derive from its uppercased
 /// form (see [`obs_alias_vars`] and [`gitea_alias_vars`]).
+///
+/// A malformed lookup URL is the caller's error, reported as
+/// before. A malformed entry in the table matches nothing, so one
+/// bad `[instances]` entry never poisons the lookup for the other
+/// instances: a caller that reads per instance records that
+/// entry's failure for the entry alone.
 pub fn alias_for_url<'a>(
     url: &str,
     instances: &'a [(String, String)],
 ) -> Result<Option<&'a str>, GeectlError> {
+    split_api_url(url)?;
     for (alias, instance_url) in instances {
-        if same_api_url(url, instance_url)? {
+        if same_api_url(url, instance_url).unwrap_or(false) {
             return Ok(Some(alias.as_str()));
         }
     }
@@ -1463,6 +1470,26 @@ mod tests {
         assert_eq!(
             alias_for_url("https://api.example.org", &table).unwrap(),
             Some("alpha")
+        );
+    }
+
+    #[test]
+    fn alias_for_url_skips_a_malformed_entry() {
+        // One bad `[instances]` entry never poisons the lookup for
+        // the others: it matches nothing, and a later entry still
+        // matches.
+        let table = instances(&[
+            ("broken", "notaurl"),
+            ("example", "https://api.example.org"),
+        ]);
+        assert_eq!(
+            alias_for_url("https://api.example.org", &table).unwrap(),
+            Some("example")
+        );
+        // A malformed lookup URL is still the caller's error.
+        assert_eq!(
+            alias_for_url("notaurl", &table).unwrap_err().kind(),
+            ErrorKind::InvalidInput
         );
     }
 

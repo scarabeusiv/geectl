@@ -327,7 +327,9 @@ shape rules above. Six examples pin the shape:
 - **`build results`** (list + summary, batch 5): a `project:`
   header line, then the table `REPOSITORY ARCH PACKAGE CODE`, then
   a summary line (`1 failed, 3 succeeded`, terms alphabetical) —
-  the summary is derived from the same data, not a new fact.
+  the summary is derived from the same data, not a new fact. With
+  `--all-instances` the view repeats that shape once per configured
+  instance, each section headed `instance: factory (https://api.example.org)` (test `src/cli_build.rs:2718`); an instance that fails to answer renders `instance: local (http://127.0.0.1:3001): error: ...` in place of its table, so the failure stays visible instead of dropping that instance (test `src/cli_build.rs:2730`).
 
 ### Opt-in via `--format text` everywhere
 

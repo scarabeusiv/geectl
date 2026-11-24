@@ -438,6 +438,7 @@ Options:
       --locallink                Follow local links when expanding multibuild flavors
       --lastbuild                The last build's results instead of the current state
       --oldstate <OLDSTATE>      Poll for changes since this state hash (from a previous run). Only `results` takes it: `wait-for-results` polls plainly, and the library strips a caller-set `oldstate` there (a held reply would outlast the read timeout), so the flag is not offered on the wait
+      --all-instances            Merge the results from every configured instance into one view, instead of only the instance currently pointed at. Cannot combine with `--oldstate`: a state hash is per instance
   -h, --help                     Print help
 ```
 

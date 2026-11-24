@@ -44,15 +44,16 @@
 
 use clap::{Args, Subcommand};
 use fs2::FileExt;
-use geectl::auth::{Credentials, EnvObsAuth};
+use geectl::auth::{alias_for_url, same_api_url, Credentials, EnvObsAuth};
 use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    parse_build_log_url, valid_obs_filename, valid_obs_name, BinaryFile, BuildHistoryEntry,
-    BuildInfo, BuildLogQuery, BuildResults, DryRun, ExtDependency, FileInfo, JobHistoryEntry,
-    JobStatus, ObsClient, PackageDeps, ProvidedBy, Repository, ResultsQuery, OBS_API_BASE,
+    parse_build_log_url, results_across_instances, valid_obs_filename, valid_obs_name, BinaryFile,
+    BuildHistoryEntry, BuildInfo, BuildLogQuery, BuildResults, DryRun, ExtDependency, FileInfo,
+    InstanceBuildResults, JobHistoryEntry, JobStatus, ObsClient, PackageDeps, ProvidedBy,
+    Repository, ResultsQuery, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -76,6 +77,12 @@ pub enum BuildCommand {
         /// the flag is not offered on the wait.
         #[arg(long)]
         oldstate: Option<String>,
+        /// Merge the results from every configured instance into
+        /// one view, instead of only the instance currently pointed
+        /// at. Cannot combine with `--oldstate`: a state hash is
+        /// per instance.
+        #[arg(long, conflicts_with = "oldstate")]
+        all_instances: bool,
     },
     /// Poll the build results until they settle, or the deadline passes.
     WaitForResults {
@@ -513,6 +520,14 @@ pub fn run_build(
     };
     let credentials = match &command {
         BuildCommand::ListRepositories { .. } => Credentials::None,
+        // `results --all-instances` resolves credentials per
+        // instance inside the merged read: a half-set pair for one
+        // instance surfaces as that instance's error instead of
+        // failing the run before the other instances are read.
+        BuildCommand::Results {
+            all_instances: true,
+            ..
+        } => Credentials::None,
         BuildCommand::RebuildPackage { .. }
         | BuildCommand::RestartBuild { .. }
         | BuildCommand::AbortBuild { .. }
@@ -542,13 +557,18 @@ pub fn run_build(
             project,
             query,
             oldstate,
+            all_instances,
         } => {
             let query = query.into_query(oldstate);
-            let results = client.results(&project, &query)?;
-            Ok((
-                results_payload(&results),
-                with_header(&header, render_results_text(&results)),
-            ))
+            if all_instances {
+                results_all_instances(&http, debug, &base, &instances, &project, &query, &header)
+            } else {
+                let results = client.results(&project, &query)?;
+                Ok((
+                    results_payload(&results),
+                    with_header(&header, render_results_text(&results)),
+                ))
+            }
         }
         BuildCommand::WaitForResults {
             project,
@@ -1607,6 +1627,166 @@ fn code_with_details(code: &str, details: &Option<String>) -> String {
     }
 }
 
+/// The configured instances for a merged results read, in view
+/// order: the configured (default) instance first, then the
+/// `[instances]` table in alias order. An `[instances]` entry whose
+/// URL matches the default instance's URL names the same instance,
+/// so it is skipped, not read twice. The default instance is
+/// labelled with its alias when the `[instances]` table names it,
+/// else `default`. An entry whose URL fails to parse matches
+/// nothing, so it is listed as its own endpoint and its read fails
+/// for that instance alone instead of aborting the whole read.
+fn merged_endpoints(
+    base: &str,
+    instances: &[(String, String)],
+) -> Result<Vec<(String, String)>, GeectlError> {
+    let label = alias_for_url(base, instances)?.unwrap_or("default");
+    let mut endpoints = vec![(label.to_string(), base.to_string())];
+    for (alias, url) in instances {
+        let mut seen = false;
+        for (_, seen_url) in &endpoints {
+            if same_api_url(seen_url, url).unwrap_or(false) {
+                seen = true;
+                break;
+            }
+        }
+        if seen {
+            continue;
+        }
+        endpoints.push((alias.clone(), url.clone()));
+    }
+    Ok(endpoints)
+}
+
+/// The merged build-results view for `results --all-instances`:
+/// one read per configured instance, each with that instance's own
+/// credentials, merged into one view. A per-instance failure is
+/// recorded for that instance and rendered next to the other
+/// instances' results, never dropped silently. Every instance
+/// failing is an error: there is no view to show — a single
+/// configured instance reports its own failure unchanged. A single
+/// configured instance that succeeds still renders the merged
+/// shape (one `instance:` section in text, one entry in the
+/// payload's `instances` array), so the flag changes the view even
+/// then; only the failure is identical to the plain read.
+fn results_all_instances(
+    http: &UreqClient,
+    debug: &Debug,
+    base: &str,
+    instances: &[(String, String)],
+    project: &str,
+    query: &ResultsQuery,
+    header: &str,
+) -> Result<(Value, String), GeectlError> {
+    let endpoints = merged_endpoints(base, instances)?;
+    let refs: Vec<(&str, &str)> = endpoints
+        .iter()
+        .map(|(alias, url)| (alias.as_str(), url.as_str()))
+        .collect();
+    let outcomes = results_across_instances(&refs, project, query, |url, project, query| {
+        let credentials = EnvObsAuth::credentials_for_url(url, base, instances)?;
+        let client =
+            ObsClient::with_base_and_credentials(http, url, credentials)?.with_debug(debug.clone());
+        client.results(project, query)
+    });
+    if outcomes.iter().all(|outcome| outcome.outcome.is_err()) {
+        if let [only] = outcomes.as_slice() {
+            return Err(only.outcome.as_ref().unwrap_err().clone());
+        }
+        let kind = all_failed_kind(&outcomes);
+        let detail = outcomes
+            .iter()
+            .map(|outcome| {
+                format!(
+                    "{}: {}",
+                    outcome.alias,
+                    outcome.outcome.as_ref().unwrap_err()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(GeectlError::new(
+            kind,
+            format!("build results failed on every configured instance: {detail}"),
+        ));
+    }
+    Ok((
+        merged_results_payload(project, &outcomes),
+        with_header(header, render_merged_results_text(&outcomes)),
+    ))
+}
+
+/// The error kind for an every-instance failure: the kind most
+/// instances failed with, ties broken by the smallest kind code —
+/// deterministic regardless of instance order, so the same
+/// configuration reports the same kind however the `[instances]`
+/// table is ordered.
+fn all_failed_kind(outcomes: &[InstanceBuildResults]) -> ErrorKind {
+    let mut counts: BTreeMap<&str, (usize, ErrorKind)> = BTreeMap::new();
+    for outcome in outcomes {
+        let err = outcome.outcome.as_ref().unwrap_err();
+        let entry = counts.entry(err.kind().code()).or_insert((0, err.kind()));
+        entry.0 += 1;
+    }
+    let mut kinds: Vec<(usize, &str, ErrorKind)> = counts
+        .into_iter()
+        .map(|(code, (count, kind))| (count, code, kind))
+        .collect();
+    // Most failures first; ties broken by the smallest kind code.
+    kinds.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    kinds
+        .first()
+        .map(|(_, _, kind)| *kind)
+        .expect("an every-instance failure has at least one outcome")
+}
+
+/// The merged results as JSON: the project plus one object per
+/// configured instance, in view order. A read instance carries its
+/// state hash and matrix (the `results_payload` shape, plus its
+/// alias and API URL); a failed instance carries its error instead
+/// of a matrix, so the failure stays in the payload.
+fn merged_results_payload(project: &str, outcomes: &[InstanceBuildResults]) -> Value {
+    json!({
+        "project": project,
+        "instances": outcomes
+            .iter()
+            .map(|outcome| {
+                let mut entry = match &outcome.outcome {
+                    Ok(results) => results_payload(results),
+                    Err(err) => json!({ "error": err.to_json()["error"].clone() }),
+                };
+                entry["alias"] = json!(outcome.alias);
+                entry["api_url"] = json!(outcome.api_url);
+                entry
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The merged results as text: one section per configured instance,
+/// in view order, each headed `instance: <alias> (<url>)` and
+/// carrying that instance's own table, summary, and state hash —
+/// or, for a failed instance, an `error:` line in place of its
+/// table, so the failure is visible, never dropped.
+fn render_merged_results_text(outcomes: &[InstanceBuildResults]) -> String {
+    outcomes
+        .iter()
+        .map(|outcome| match &outcome.outcome {
+            Ok(results) => format!(
+                "instance: {} ({})\n{}",
+                outcome.alias,
+                outcome.api_url,
+                render_results_text(results)
+            ),
+            Err(err) => format!(
+                "instance: {} ({}): error: {err}",
+                outcome.alias, outcome.api_url
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A running job (or the absence of one) as JSON.
 fn job_status_payload(
     project: &str,
@@ -2143,7 +2323,7 @@ fn render_repositories_text(repositories: &[Repository]) -> String {
 mod tests {
     use super::*;
     use clap::FromArgMatches;
-    use geectl::obs::{BuildDep, BuildResult, PackageBuildStatus};
+    use geectl::obs::{BuildDep, BuildResult, InstanceBuildResults, PackageBuildStatus};
 
     /// The clap `Command` for the `build` group, built from the
     /// `Subcommand` derive: there is no `CommandFactory` for a
@@ -2494,6 +2674,175 @@ mod tests {
             text,
             "project: openSUSE:Factory\nREPOSITORY  ARCH    PACKAGE  CODE\nstandard    x86_64  foo      succeeded\nstandard    x86_64  bar      succeeded\nstandard    x86_64  baz      succeeded\nstandard    x86_64  qux      failed\n1 failed, 3 succeeded"
         );
+    }
+
+    /// Two faked instances for the merged view: the configured
+    /// instance (`factory`) and a named one (`local`), each with
+    /// its own state hash and matrix.
+    fn merged_outcomes() -> Vec<InstanceBuildResults> {
+        vec![
+            InstanceBuildResults {
+                alias: "factory".to_string(),
+                api_url: "https://api.example.org".to_string(),
+                outcome: Ok(results_fixture()),
+            },
+            InstanceBuildResults {
+                alias: "local".to_string(),
+                api_url: "http://127.0.0.1:3001".to_string(),
+                outcome: Ok(BuildResults {
+                    state: Some("def456".to_string()),
+                    results: vec![BuildResult {
+                        project: "openSUSE:Factory".to_string(),
+                        repository: "standard".to_string(),
+                        arch: "x86_64".to_string(),
+                        code: "published".to_string(),
+                        state: "published".to_string(),
+                        dirty: false,
+                        details: None,
+                        statuses: vec![PackageBuildStatus {
+                            package: "foo".to_string(),
+                            code: "failed".to_string(),
+                            details: Some("missing foo".to_string()),
+                        }],
+                    }],
+                }),
+            },
+        ]
+    }
+
+    /// The merged view, pinned literally: one `instance:` section
+    /// per configured instance, each with its own table, summary,
+    /// and state hash — the shape the design doc's `build results`
+    /// example cites.
+    #[test]
+    fn merged_results_text_sections_per_instance() {
+        let text = with_header(
+            "project: openSUSE:Factory package: foo",
+            render_merged_results_text(&merged_outcomes()),
+        );
+        assert_eq!(
+            text,
+            "project: openSUSE:Factory package: foo\ninstance: factory (https://api.example.org)\nREPOSITORY  ARCH    PACKAGE  CODE\nstandard    x86_64  foo      succeeded\nstandard    x86_64  bar      failed (missing foo)\n1 failed, 1 succeeded\nstate: abc123\ninstance: local (http://127.0.0.1:3001)\nREPOSITORY  ARCH    PACKAGE  CODE\nstandard    x86_64  foo      failed (missing foo)\n1 failed\nstate: def456"
+        );
+    }
+
+    #[test]
+    fn merged_results_text_surfaces_a_failed_instance() {
+        let mut outcomes = merged_outcomes();
+        outcomes[1].outcome = Err(GeectlError::new(
+            ErrorKind::NetworkError,
+            "connection refused",
+        ));
+        let text = render_merged_results_text(&outcomes);
+        assert!(text.contains("instance: factory (https://api.example.org)"));
+        assert!(text.contains("1 failed, 1 succeeded"));
+        assert!(text.contains(
+            "instance: local (http://127.0.0.1:3001): error: network_error: a network error occurred (connection refused)"
+        ));
+    }
+
+    #[test]
+    fn merged_results_payload_shape() {
+        let mut outcomes = merged_outcomes();
+        outcomes[1].outcome = Err(GeectlError::new(ErrorKind::NotFound, "no such project"));
+        let payload = merged_results_payload("openSUSE:Factory", &outcomes);
+        assert_eq!(payload["project"], "openSUSE:Factory");
+        assert_eq!(payload["instances"][0]["alias"], "factory");
+        assert_eq!(
+            payload["instances"][0]["api_url"],
+            "https://api.example.org"
+        );
+        assert_eq!(payload["instances"][0]["state"], "abc123");
+        assert_eq!(
+            payload["instances"][0]["results"][0]["statuses"][1]["code"],
+            "failed"
+        );
+        assert_eq!(payload["instances"][1]["alias"], "local");
+        assert_eq!(payload["instances"][1]["error"]["code"], "not_found");
+        assert_eq!(
+            payload["instances"][1]["error"]["context"],
+            "no such project"
+        );
+    }
+
+    #[test]
+    fn merged_endpoints_puts_the_default_first_and_dedupes() {
+        let instances = vec![
+            ("factory".to_string(), "https://api.example.org".to_string()),
+            ("local".to_string(), "http://127.0.0.1:3001".to_string()),
+        ];
+        // The default URL matches the `factory` entry: it labels
+        // the default instance and the entry itself is skipped, not
+        // read twice.
+        assert_eq!(
+            merged_endpoints("https://api.example.org", &instances).unwrap(),
+            vec![
+                ("factory".to_string(), "https://api.example.org".to_string()),
+                ("local".to_string(), "http://127.0.0.1:3001".to_string()),
+            ]
+        );
+        // A default URL the table does not name is labelled
+        // `default` and reads first, then the table in alias order.
+        assert_eq!(
+            merged_endpoints("https://api.other.example", &instances).unwrap(),
+            vec![
+                (
+                    "default".to_string(),
+                    "https://api.other.example".to_string()
+                ),
+                ("factory".to_string(), "https://api.example.org".to_string()),
+                ("local".to_string(), "http://127.0.0.1:3001".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_endpoints_keeps_a_malformed_entry_as_its_own_endpoint() {
+        // One malformed `[instances]` URL never aborts the merged
+        // read: it matches nothing, so it is listed as its own
+        // endpoint, and its read fails for that instance alone.
+        let instances = vec![
+            ("broken".to_string(), "notaurl".to_string()),
+            ("local".to_string(), "http://127.0.0.1:3001".to_string()),
+        ];
+        assert_eq!(
+            merged_endpoints("https://api.example.org", &instances).unwrap(),
+            vec![
+                ("default".to_string(), "https://api.example.org".to_string()),
+                ("broken".to_string(), "notaurl".to_string()),
+                ("local".to_string(), "http://127.0.0.1:3001".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_failed_kind_is_deterministic_regardless_of_instance_order() {
+        // The same failures in the opposite order report the same
+        // kind: the kind is a property of the failure set, not of
+        // the `[instances]` order.
+        let failed = |kind: ErrorKind| InstanceBuildResults {
+            alias: "x".to_string(),
+            api_url: "https://api.example.org".to_string(),
+            outcome: Err(GeectlError::new(kind, "failed")),
+        };
+        let forward = vec![failed(ErrorKind::NotFound), failed(ErrorKind::NetworkError)];
+        let backward = vec![failed(ErrorKind::NetworkError), failed(ErrorKind::NotFound)];
+        assert_eq!(all_failed_kind(&forward), all_failed_kind(&backward));
+        // A tie breaks by the smallest kind code.
+        assert_eq!(all_failed_kind(&forward), ErrorKind::NetworkError);
+        // A majority wins regardless of order.
+        let majority_first = vec![
+            failed(ErrorKind::NotFound),
+            failed(ErrorKind::NotFound),
+            failed(ErrorKind::NetworkError),
+        ];
+        let majority_last = vec![
+            failed(ErrorKind::NetworkError),
+            failed(ErrorKind::NotFound),
+            failed(ErrorKind::NotFound),
+        ];
+        assert_eq!(all_failed_kind(&majority_first), ErrorKind::NotFound);
+        assert_eq!(all_failed_kind(&majority_last), ErrorKind::NotFound);
     }
 
     #[test]
@@ -3438,14 +3787,42 @@ mod tests {
                 project,
                 query,
                 oldstate,
+                all_instances,
             } => {
                 assert_eq!(project, "openSUSE:Factory");
                 assert_eq!(query.package.as_deref(), Some("foo"));
                 assert_eq!(query.code.as_deref(), Some("failed"));
                 assert_eq!(oldstate.as_deref(), Some("abc123"));
+                assert!(!all_instances);
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_results_all_instances() {
+        match parse_build(&["results", "openSUSE:Factory", "--all-instances"]) {
+            BuildCommand::Results {
+                project,
+                all_instances,
+                ..
+            } => {
+                assert_eq!(project, "openSUSE:Factory");
+                assert!(all_instances);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // `--oldstate` is per instance, so the merged read refuses
+        // it as a parse error, not a silent ignore.
+        let matches = build_command().try_get_matches_from([
+            "build",
+            "results",
+            "openSUSE:Factory",
+            "--all-instances",
+            "--oldstate",
+            "abc123",
+        ]);
+        assert!(matches.is_err());
     }
 
     #[test]

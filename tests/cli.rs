@@ -4104,6 +4104,125 @@ fn build_results_without_credentials_renders_text_error() {
 }
 
 #[test]
+fn build_results_all_instances_conflicts_with_oldstate() {
+    // A state hash is per instance, so the merged read refuses it:
+    // clap refuses the combination as a parse error (exit 2) before
+    // any work runs.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "build",
+            "results",
+            "openSUSE:Factory",
+            "--all-instances",
+            "--oldstate",
+            "abc123",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("all-instances"), "stderr: {stderr}");
+    assert!(stderr.contains("oldstate"), "stderr: {stderr}");
+}
+
+#[test]
+fn build_results_all_instances_without_credentials_fails_with_config_error() {
+    // One configured instance only: the merged read reports that
+    // instance's own failure unchanged (exit 9, the missing
+    // credentials named).
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["build", "results", "openSUSE:Factory", "--all-instances"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("GEECTL_OBS_USERNAME"));
+}
+
+#[test]
+fn build_results_all_instances_merges_two_stub_instances() {
+    // The merged read itself (`results_all_instances`) against two
+    // stub instances: the default instance answers one matrix, the
+    // `[instances]` entry another, and one view carries both — text
+    // and JSON alike.
+    let factory = serve_many("<resultlist state=\"aaa\"><result project=\"testproject\" repository=\"standard\" arch=\"x86_64\" code=\"published\" state=\"published\"><status package=\"foo\" code=\"succeeded\" /></result></resultlist>");
+    let local = serve_many("<resultlist state=\"bbb\"><result project=\"testproject\" repository=\"standard\" arch=\"x86_64\" code=\"published\" state=\"published\"><status package=\"foo\" code=\"failed\" /></result></resultlist>");
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!("[instances]\nlocal = \"http://{local}\"\n"),
+    )
+    .unwrap();
+    let run = |format: &str| {
+        geectl_isolated(&dir)
+            .args([
+                "--format",
+                format,
+                "build",
+                "results",
+                "testproject",
+                "--all-instances",
+            ])
+            .env("GEECTL_OBS_URL", format!("http://{factory}"))
+            .env("GEECTL_OBS_USERNAME", "factory-user")
+            .env("GEECTL_OBS_PASSWORD", "factory-secret")
+            .env("GEECTL_OBS_USERNAME_LOCAL", "local-user")
+            .env("GEECTL_OBS_PASSWORD_LOCAL", "local-secret")
+            .output()
+            .unwrap()
+    };
+    let out = run("text");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!(
+            "project: testproject\ninstance: default (http://{factory})\nREPOSITORY  ARCH    PACKAGE  CODE\nstandard    x86_64  foo      succeeded\n1 succeeded\nstate: aaa\ninstance: local (http://{local})\nREPOSITORY  ARCH    PACKAGE  CODE\nstandard    x86_64  foo      failed\n1 failed\nstate: bbb"
+        )
+    );
+    let out = run("json");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["project"], "testproject");
+    assert_eq!(value["instances"][0]["alias"], "default");
+    assert_eq!(
+        value["instances"][0]["api_url"],
+        format!("http://{factory}")
+    );
+    assert_eq!(value["instances"][0]["state"], "aaa");
+    assert_eq!(
+        value["instances"][0]["results"][0]["statuses"][0]["code"],
+        "succeeded"
+    );
+    assert_eq!(value["instances"][1]["alias"], "local");
+    assert_eq!(value["instances"][1]["api_url"], format!("http://{local}"));
+    assert_eq!(value["instances"][1]["state"], "bbb");
+    assert_eq!(
+        value["instances"][1]["results"][0]["statuses"][0]["code"],
+        "failed"
+    );
+}
+
+#[test]
 fn build_log_last_and_lastsucceeded_conflict() {
     // The two selectors name different logs: clap refuses the
     // combination as a parse error (exit 2) before any work runs.
