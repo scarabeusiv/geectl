@@ -64,6 +64,7 @@ pub mod error;
 pub mod gitea;
 pub mod http;
 pub mod local_build;
+pub mod meta;
 pub mod obs;
 pub mod periodic;
 pub mod person;

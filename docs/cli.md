@@ -2,7 +2,7 @@
 
 The command reference for the geectl binary: one subcommand per
 operation, grouped under a top-level noun (`remote`, `request`,
-`branch`, `build`, `maintenance`, `service`, `gitea`, `pull-request`, `person`), plus `version`
+`branch`, `build`, `maintenance`, `service`, `gitea`, `pull-request`, `person`, `meta`), plus `version`
 and `config`, plus the ten working-copy leaves (`checkout`, `update`,
 `status`, `diff`, `add`, `rm`, `addremove`, `commit`, `pull`,
 `resolve`) that operate on the checkout in the current directory.
@@ -76,7 +76,7 @@ in dry-run too, since a dry run previews a live run
 (`service`'s trigger is the mutation there; its reads are public
 but resolve credentials up front).
 `request` swallows it in dry-run (a preview performs no write;
-the dropped error goes to the debug channel). `remote` and `build`
+the dropped error goes to the debug channel). `meta` takes the same leniency on its OBS arm: a dry-run `meta set --project` prints the plan while any credential-resolution error (a half-configured pair or a conflicting set) is reported on the debug channel and as a stderr warning. The Gitea arm resolves its token up front: a dry-run `meta set --repo` reports a missing token as a configuration error. `remote` and `build`
 resolve credentials per command instead: the public reads (see
 Credentials in `docs/architecture.md`) skip credentials, so a half-set
 env leaves them working; a dry-run `remote` mutation
@@ -133,6 +133,7 @@ Commands:
   gitea         Gitea operations: repository and branch reads and mutations on the configured instance
   pull-request  Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface
   person        Search for a person: the OBS projects naming the login and the Gitea users matching the keyword, as one operation
+  meta          Set the meta of an OBS project, an OBS package, or a Gitea repository as one operation: the target selects the backend
   changelog     Validate and generate `.changes` entries in a package directory, pre-file
   checkout      Check out a package into a git working copy, under the current directory
   update        Update the working copy in the current directory to the latest base
@@ -797,6 +798,25 @@ Options:
   -h, --help             Print help
 ```
 
+## `meta` — unified meta write
+
+```
+Set the meta of an OBS project, an OBS package, or a Gitea repository as one operation: the target selects the backend
+
+Usage: geectl meta [OPTIONS] <COMMAND>
+
+Commands:
+  set   Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `--project` (with `--package` for a package) writes OBS meta, `--repo` writes Gitea repo settings. A mutation: dry-run is the default (only the plan is printed); `--live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --format <FORMAT>  Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --debug            Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --debug-body       Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --live             Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+  -h, --help             Print help
+```
+
 ```
 Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword. With no `--backend` both arms run, OBS first then Gitea
 
@@ -812,6 +832,24 @@ Options:
       --debug-body         Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
       --live               Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
   -h, --help               Print help
+```
+
+```
+Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `--project` (with `--package` for a package) writes OBS meta, `--repo` writes Gitea repo settings. A mutation: dry-run is the default (only the plan is printed); `--live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
+
+Usage: geectl meta set [OPTIONS]
+
+Options:
+      --format <FORMAT>            Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json` [possible values: json, text]
+      --project <PROJECT>          The OBS project whose meta to set
+      --debug                      Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+      --package <PACKAGE>          The OBS package in `--project` whose meta to set; the project meta when omitted
+      --debug-body                 Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`
+      --repo <REPO>                The Gitea repository, as `owner/repo`, whose settings to set
+      --description <DESCRIPTION>  A short description
+      --live                       Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations
+      --url <URL>                  A URL with more information; the repository website on the Gitea arm
+  -h, --help                       Print help
 ```
 
 ## `changelog` — `.changes` validation and generation
@@ -1196,6 +1234,10 @@ geectl pull-request search --backend gitea --state open
 # Person search (OBS + Gitea as one operation)
 geectl person search alice
 geectl person search alice --backend gitea
+
+# Meta (OBS + Gitea as one surface)
+geectl meta set --project home:scarabeus_iv --description "New description"
+geectl meta set --repo pool/systemd --description "New description" --url https://example.com/systemd
 
 # .changes validation and generation (local, pre-file)
 geectl changelog validate ~/work/foo

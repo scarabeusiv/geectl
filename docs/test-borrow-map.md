@@ -23,6 +23,7 @@ Surveyed: osc's Behave suite (77 feature files, 272 scenarios) and unit suite (5
 - Upload revision-response body (`<revision rev="N"/>` as PUT success).
 - `remote delete-file`: a working copy deletes the file and commits it; `test_deletefiles.py` pins working-copy delete semantics only (see "Adoption exclusions").
 - `remote list-scmsync-projects`: the scmsync-prefix project list. No osc test pins it; the command's own endpoint and validation are the spec reference.
+- `meta set` (unified meta write): OBS project/package meta and Gitea repo settings. No osc test pins writing project or package meta, and osc's Gitea `Repo` has no edit method; the OBS arm follows the `set-project-meta` / `set-package-meta` behaviour, and the Gitea endpoint is the spec for the client method.
 
 ## Adoption exclusions (and why)
 

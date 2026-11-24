@@ -11,6 +11,7 @@ mod cli_build;
 mod cli_changelog;
 mod cli_gitea;
 mod cli_local_build;
+mod cli_meta;
 mod cli_person;
 mod cli_prjconf;
 mod cli_pull_request;
@@ -158,6 +159,12 @@ enum Command {
         #[command(subcommand)]
         command: cli_person::PersonCommand,
     },
+    /// Set the meta of an OBS project, an OBS package, or a Gitea
+    /// repository as one operation: the target selects the backend.
+    Meta {
+        #[command(subcommand)]
+        command: cli_meta::MetaCommand,
+    },
     /// Validate and generate `.changes` entries in a package
     /// directory, pre-file.
     Changelog {
@@ -279,6 +286,7 @@ fn run(
             cli_pull_request::run_pull_request(command, debug, cli.live)?
         }
         Some(Command::Person { command }) => cli_person::run_person(command, debug, cli.live)?,
+        Some(Command::Meta { command }) => cli_meta::run_meta(command, debug, cli.live)?,
         Some(Command::Changelog { command }) => {
             cli_changelog::run_changelog(command, debug, cli.live)?
         }

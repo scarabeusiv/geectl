@@ -1,5 +1,5 @@
 //! The Gitea operations for git-backed packages: repo read, fork,
-//! repo delete, repo list, repo create, branch read and branch head,
+//! repo delete, repo list, repo create, repo edit, branch read and branch head,
 //! maintainership read, and the `branch` composite (Gitea fork +
 //! OBS `cmd=fork`) behind the uniform flow.
 //!
@@ -102,7 +102,8 @@ pub struct GiteaParent {
 }
 
 /// A Gitea repository: only the fields the operations need are modelled — identity, parent, default
-/// branch, privacy, and the clone URLs the fork result returns. A
+/// branch, privacy, description and website (the repo edit reads
+/// them back), and the clone URLs the fork result returns. A
 /// field the operation does not need is not parsed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GiteaRepository {
@@ -119,6 +120,12 @@ pub struct GiteaRepository {
     pub default_branch: String,
     /// Whether the repo is private.
     pub private: bool,
+    /// The repo's short description, when the server sent one.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The repo's website URL, when the server sent one.
+    #[serde(default)]
+    pub website: Option<String>,
     /// The HTTPS clone URL.
     pub clone_url: String,
     /// The SSH clone URL.
@@ -896,6 +903,67 @@ struct RepoCreateRequest {
     default_branch: Option<String>,
 }
 
+/// Options for the Gitea-side repo-settings write (`repo_edit`):
+/// the fields the unified meta write sets — the description and
+/// the website. Only the fields that are set change on the
+/// server; the rest of the repo settings are untouched. A rename,
+/// a privacy change, and a default-branch change are not meta
+/// fields and stay out of this operation by scope: the convergent
+/// field set is description + website. Renaming is an identity
+/// change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoEditOptions {
+    /// A short description; omitted when unset.
+    pub description: Option<String>,
+    /// A URL with more information about the repository; omitted
+    /// when unset.
+    pub website: Option<String>,
+}
+
+impl RepoEditOptions {
+    /// True when at least one field is set: an edit with nothing
+    /// to edit is a no-op, refused before any call.
+    pub fn has_fields(&self) -> bool {
+        self.description.is_some() || self.website.is_some()
+    }
+
+    /// Validate the options: at least one field set, and no field
+    /// empty — there is no flag to clear a field, so an empty
+    /// value is an input error, not a clear.
+    pub fn validate(&self) -> Result<(), GeectlError> {
+        if !self.has_fields() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "repo edit needs at least one of --description, --url",
+            ));
+        }
+        if self.description.as_deref() == Some("") {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--description must not be empty: there is no flag to clear a field",
+            ));
+        }
+        if self.website.as_deref() == Some("") {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--url must not be empty: there is no flag to clear a field",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The body of `PATCH /api/v1/repos/{owner}/{repo}`: only the
+/// fields that are set are sent — the server changes only the
+/// fields it receives.
+#[derive(Debug, Serialize)]
+struct RepoEditRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    website: Option<String>,
+}
+
 /// The pull request to create: the head branch label, the base
 /// branch, the title, and the optional body and draft flag. The
 /// head is a branch name on the same repo, or `owner:branch` on a
@@ -1550,6 +1618,72 @@ impl<'a> GiteaClient<'a> {
             ));
         }
         Ok(Some(created))
+    }
+
+    /// Edit a repository's settings (`PATCH
+    /// /api/v1/repos/{owner}/{repo}`): the description and the
+    /// website. Only the fields that are set are sent, and the
+    /// server changes only the fields it receives, so the rest of
+    /// the repo settings survive untouched. The edited repo is
+    /// read back from the PATCH response and the requested fields
+    /// verified against it — like `repo_create` verifies the
+    /// requested options — so a server that silently ignored a
+    /// field must not report success. In dry-run the edit is
+    /// recorded in the plan and nothing is edited — the guard
+    /// runs before any server call, like `repo_create`.
+    pub fn repo_edit(
+        &self,
+        owner: &str,
+        repo: &str,
+        options: &RepoEditOptions,
+        dry_run: &DryRun,
+    ) -> Result<Option<GiteaRepository>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        options.validate()?;
+        if !dry_run.allow(&format!("edit repository {owner}/{repo}")) {
+            return Ok(None);
+        }
+        let request = RepoEditRequest {
+            description: options.description.clone(),
+            website: options.website.clone(),
+        };
+        let body = serde_json::to_string(&request).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("cannot serialize the Gitea repo-edit request: {err}"),
+            )
+        })?;
+        let url = build_url(&self.base, &["api", "v1", "repos", owner, repo], &[]);
+        let response = self.http.patch_json_with(&url, &body, &self.credentials)?;
+        let edited = parse_repository(&response, owner, repo)?;
+        // The edit is verified against what was asked for: a
+        // server that silently kept the old description or
+        // website must not report success — the options are the
+        // caller's instruction, not a hint.
+        if let Some(description) = &options.description {
+            if edited.description.as_deref() != Some(description.as_str()) {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected Gitea repository response for the edited repository {owner}/{repo}: the server answered with description {:?}, not {description:?}",
+                        edited.description
+                    ),
+                ));
+            }
+        }
+        if let Some(website) = &options.website {
+            if edited.website.as_deref() != Some(website.as_str()) {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected Gitea repository response for the edited repository {owner}/{repo}: the server answered with website {:?}, not {website:?}",
+                        edited.website
+                    ),
+                ));
+            }
+        }
+        Ok(Some(edited))
     }
 
     /// List a repository's collaborators (`GET
@@ -5357,6 +5491,205 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(http.post_calls().is_empty());
+    }
+
+    /// A repo JSON body with the given description and website,
+    /// shaped like Gitea 1.24.7 answers: the edited repo the
+    /// PATCH response carries.
+    fn repo_json_with_meta(owner: &str, name: &str, description: &str, website: &str) -> String {
+        format!(
+            r#"{{"id": 7, "owner": {{"login": "{owner}", "future_field": 1}}, "name": "{name}", "full_name": "{owner}/{name}", "description": "{description}", "website": "{website}", "empty": false, "private": false, "fork": false, "parent": null, "future_field": "tolerated", "html_url": "{BASE}/{owner}/{name}", "ssh_url": "gitea@src.opensuse.org:{owner}/{name}.git", "clone_url": "{BASE}/{owner}/{name}.git", "default_branch": "factory", "created_at": "2026-11-21T00:00:00Z"}}"#
+        )
+    }
+
+    #[test]
+    fn repo_edit_patches_only_the_set_fields_and_parses_the_edited_repo() {
+        let options = RepoEditOptions {
+            description: Some("sources for a package".to_string()),
+            website: Some("https://example.com/package".to_string()),
+        };
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json_with_meta(
+                "pool",
+                "systemd",
+                "sources for a package",
+                "https://example.com/package",
+            ),
+        );
+        let edited = client(&http)
+            .repo_edit("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run edit returns the repo");
+        assert_eq!(edited.full_name, "pool/systemd");
+        assert_eq!(edited.description.as_deref(), Some("sources for a package"));
+        assert_eq!(
+            edited.website.as_deref(),
+            Some("https://example.com/package")
+        );
+        assert_eq!(
+            http.patch_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd".to_string(),
+                r#"{"description":"sources for a package","website":"https://example.com/package"}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn repo_edit_posts_the_single_field_body() {
+        // One field set: only it is sent — the other is omitted
+        // when unset, never sent as null, so the server leaves it
+        // alone.
+        let options = RepoEditOptions {
+            description: Some("sources for a package".to_string()),
+            website: None,
+        };
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json_with_meta("pool", "systemd", "sources for a package", ""),
+        );
+        let edited = client(&http)
+            .repo_edit("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap()
+            .expect("a non-dry-run edit returns the repo");
+        assert_eq!(edited.description.as_deref(), Some("sources for a package"));
+        assert_eq!(
+            http.patch_calls(),
+            vec![(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd".to_string(),
+                r#"{"description":"sources for a package"}"#.to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn repo_edit_dry_run_records_plan_and_edits_nothing() {
+        let options = RepoEditOptions {
+            description: Some("sources for a package".to_string()),
+            website: None,
+        };
+        let http = FakeHttp::new();
+        let dry_run = DryRun::new(true);
+        let edited = client(&http)
+            .repo_edit("pool", "systemd", &options, &dry_run)
+            .unwrap();
+        assert!(edited.is_none());
+        assert!(http.patch_calls().is_empty());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: edit repository pool/systemd".to_string()]
+        );
+    }
+
+    #[test]
+    fn repo_edit_verifies_the_requested_fields() {
+        // A server that silently kept the old description must not
+        // report success.
+        let options = RepoEditOptions {
+            description: Some("sources for a package".to_string()),
+            website: Some("https://example.com/package".to_string()),
+        };
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json_with_meta(
+                "pool",
+                "systemd",
+                "old description",
+                "https://example.com/package",
+            ),
+        );
+        let err = client(&http)
+            .repo_edit("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        // And a kept website.
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json_with_meta(
+                "pool",
+                "systemd",
+                "sources for a package",
+                "https://example.com/old",
+            ),
+        );
+        let err = client(&http)
+            .repo_edit("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn repo_edit_response_naming_another_repo_is_a_server_error() {
+        let options = RepoEditOptions {
+            description: Some("sources for a package".to_string()),
+            website: None,
+        };
+        let http = FakeHttp::new().with_patch(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json_with_meta("pool", "libstrophe", "sources for a package", ""),
+        );
+        let err = client(&http)
+            .repo_edit("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn repo_edit_needs_at_least_one_field() {
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .repo_edit(
+                "pool",
+                "systemd",
+                &RepoEditOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.patch_calls().is_empty());
+    }
+
+    #[test]
+    fn repo_edit_refuses_an_empty_field() {
+        let http = FakeHttp::new();
+        let options = RepoEditOptions {
+            description: Some(String::new()),
+            website: None,
+        };
+        let err = client(&http)
+            .repo_edit("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let options = RepoEditOptions {
+            description: None,
+            website: Some(String::new()),
+        };
+        let err = client(&http)
+            .repo_edit("pool", "systemd", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.patch_calls().is_empty());
+    }
+
+    #[test]
+    fn repo_edit_validates_names_before_any_call() {
+        let options = RepoEditOptions {
+            description: Some("sources for a package".to_string()),
+            website: None,
+        };
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .repo_edit("po/ol", "systemd", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = client(&http)
+            .repo_edit("pool", "sys/temd", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.patch_calls().is_empty());
     }
 
     #[test]

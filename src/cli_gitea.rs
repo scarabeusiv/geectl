@@ -30,8 +30,9 @@
 //! JSON payload) and no fork parent (the parent is in the JSON
 //! payload); `branch-list` text carries the full head SHA (the
 //! sync-verification primitive) but no commit message (long free
-//! text); `repo-create` text carries no description (long free
-//! text). The JSON payload remains the complete record in every case.
+//! text); `repo-get` text carries no description or website (long
+//! free text) and `repo-create` text carries no description (long
+//! free text). The JSON payload remains the complete record in every case.
 
 use clap::{Args, Subcommand};
 use geectl::auth::EnvGiteaAuth;
@@ -335,9 +336,9 @@ pub fn run_gitea(
 /// the plain variables otherwise — reporting on the debug channel.
 /// Construction fails closed without a token — even in dry-run, even
 /// for reads (see the `gitea` group's module docs). The one
-/// construction for both the `gitea` group and the `pull-request`
-/// group's Gitea backend, so the credential resolution cannot drift
-/// between them.
+/// construction for the `gitea` group, the `pull-request` group's
+/// Gitea backend, and the `meta` group's Gitea arm, so the credential
+/// resolution cannot drift between them.
 pub(crate) fn gitea_client<'a>(
     http: &'a dyn HttpClient,
     debug: &Debug,
@@ -463,6 +464,8 @@ fn gitea_repository_json(repository: &GiteaRepository) -> Value {
         })),
         "default_branch": repository.default_branch,
         "private": repository.private,
+        "description": repository.description,
+        "website": repository.website,
         "clone_url": repository.clone_url,
         "ssh_url": repository.ssh_url,
     })
@@ -849,6 +852,8 @@ mod tests {
             parent: None,
             default_branch: "factory".to_string(),
             private: false,
+            description: None,
+            website: None,
             clone_url: "https://src.opensuse.org/pool/systemd.git".to_string(),
             ssh_url: "git@src.opensuse.org:pool/systemd.git".to_string(),
         }

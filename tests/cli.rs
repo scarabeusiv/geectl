@@ -5555,6 +5555,32 @@ fn top_help_lists_the_pull_request_group() {
 }
 
 #[test]
+fn top_help_lists_the_meta_group() {
+    let out = geectl().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("meta"), "top --help misses the meta group");
+}
+
+#[test]
+fn meta_help_lists_the_set_subcommand() {
+    let out = geectl().args(["meta", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("set"), "meta --help misses set");
+}
+
+#[test]
+fn meta_set_help_names_the_target_and_field_flags() {
+    let out = geectl().args(["meta", "set", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    for flag in ["--project", "--package", "--repo", "--description", "--url"] {
+        assert!(text.contains(flag), "meta set --help misses {flag}");
+    }
+}
+
+#[test]
 fn top_help_lists_the_working_copy_leaves() {
     let out = geectl().arg("--help").output().unwrap();
     assert!(out.status.success());
@@ -7077,7 +7103,7 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 44 blocks (top level, 12 groups, 31 leaves) — a
+    // The docs carry 46 blocks (top level, 13 groups, 32 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
     // groups and one leaf each, plus `remote download`, plus the ten
@@ -7089,8 +7115,8 @@ fn docs_help_blocks_match_the_binary() {
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-        44,
-        "docs/cli.md should carry 44 --help blocks (top level, 12 groups, 31 leaves);          update this count when a block is deliberately added or removed"
+        46,
+        "docs/cli.md should carry 46 --help blocks (top level, 13 groups, 32 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();
