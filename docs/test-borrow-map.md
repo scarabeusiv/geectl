@@ -966,7 +966,7 @@ behaviours; the fixes are pinned by the source model instead.**
   sslfingerprint/archfilter/pubkey.
 - No full-shape write scenario exists in the reference suite: the
   only behave scenario that PUTs project meta
-  (`behave/features/linkpac.feature:48`) carries no `<repository>`
+  (`behave/features/linkpac.feature:46`) carries no `<repository>`
   at all, and no scenario mentions `download` or `releasetarget`;
   the `repo add` scenario (`behave/features/repo.feature:24`)
   covers arch + path only.
@@ -983,7 +983,7 @@ but not in this tree's map) and is not changed by it.
 meta write; same mining as the #157 section above.**
 
 - The only behave scenario that PUTs project meta
-  (`behave/features/linkpac.feature:48`) carries no `<repository>`
+  (`behave/features/linkpac.feature:46`) carries no `<repository>`
   at all, and no scenario mentions `download` or `releasetarget`;
   the `repo add` scenario (`behave/features/repo.feature:24`)
   covers arch + path only. No unit test mentions `releasetarget`
@@ -1102,6 +1102,7 @@ scheduler entries.**
 | Gap batch 3 — buildconfig --alternative-project (#252) | 0 (+spec ref) | 0 | 0 (+spec) |
 | Gap batch 3 — local-build log (#178) | 0 | 0 | 0 |
 | Gap batch 3 — Repository shape in the meta write (#157 OCR follow-ups) | 0 (+source pins) | 0 | 0 (+pins) |
+| Gap batch 3 — project-meta full-shape write test (#266) | 0 | 0 | 0 |
 | 11 prjconf | 0 | 0 | 0 |
 | 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
 | 13 mirror-first dep fetch | 1 | 0 | 1 |
