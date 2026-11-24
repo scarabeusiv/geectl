@@ -5,8 +5,9 @@
 //! against a target project/package on the instance (public reads,
 //! no credentials). `validate` runs the V1–V12 rules; `generate`
 //! emits the diff-derived skeleton entry as a draft for a human to
-//! complete. Neither command files anything, and neither wires into
-//! `commit` — pre-commit placement waits on the working-copy layer.
+//! complete. Neither command files anything. `commit` runs the
+//! changelog gate on the staged `.changes` entries, before anything
+//! is filed.
 //!
 //! Coordinate header (design rule 1): `validate` text opens with
 //! `dir: <dir>` (plus `target: <project>/<package>` when given).

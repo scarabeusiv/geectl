@@ -1,8 +1,8 @@
 # `changelog` — `.changes` validation and generation
 
 `changelog validate` and `changelog generate` work on a package directory on disk,
-before filing. They never file anything, and nothing here wires into
-`commit` — pre-commit placement waits on the working-copy layer.
+before filing. They never file anything. `commit` runs the changelog gate on the
+staged `.changes` entries, before anything is filed.
 
 ## Commands
 

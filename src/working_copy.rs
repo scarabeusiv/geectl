@@ -25,6 +25,8 @@
 //! repo-local identity `geectl` / `geectl@localhost`, never a real
 //! person's identity.
 
+use crate::changelog::changes::normalize_changes_content;
+use crate::changelog::validate::{validate, PackageSnapshot, ValidateOptions};
 use crate::config::Config;
 use crate::error::{ErrorKind, GeectlError};
 use crate::local_build::LocalBuild;
@@ -2091,6 +2093,101 @@ fn run_service_gate(client: &ObsClient, config: &Config, dir: &Path) -> Result<(
     Ok(())
 }
 
+/// The changelog gate: validate the `.changes` entries the commit
+/// sends, before a commit files anything. The snapshot is the index
+/// state — the tree the commit sends, never the worktree — with
+/// `.spec` and `.changes` content read from the index blobs and
+/// every other top-level file present by name only. Only findings
+/// in a `.changes` file the commit sends refuse the commit: a
+/// violation in a file the commit does not touch is pre-existing
+/// state, not this commit's entry, and the target-relative rules
+/// are skipped (local-only mode) — the gate validates what this
+/// commit sends, it does not require an entry. A deletion carries
+/// no content to validate. The gate runs after the service gate,
+/// on the final index state, on both commit paths; a violation
+/// fails the commit with the findings, naming the entries. The
+/// sent set is the index state against the base, so on the
+/// git-backed path a violating `.changes` in a local commit ahead
+/// of the base refuses the commit too, not only a staged file.
+fn run_changelog_gate(wc: &WorkingCopy) -> Result<(), GeectlError> {
+    let changed = index_file_list(wc)?;
+    let mut staged_changes: Vec<String> = Vec::new();
+    for name in changed {
+        if name.ends_with(".changes") && !name.contains('/') && index_has(wc, &name)? {
+            staged_changes.push(name);
+        }
+    }
+    if staged_changes.is_empty() {
+        return Ok(());
+    }
+    let index = ls_files_entries(wc)?;
+    let mut files = std::collections::BTreeMap::new();
+    for name in index.keys() {
+        if name.contains('/') {
+            continue;
+        }
+        let content = if name.ends_with(".changes") {
+            normalize_changes_content(&index_content(wc, name)?)
+        } else if name.ends_with(".spec") {
+            String::from_utf8_lossy(&index_content(wc, name)?).into_owned()
+        } else {
+            String::new()
+        };
+        files.insert(name.clone(), content);
+    }
+    let report = validate(
+        &PackageSnapshot { files },
+        None,
+        &ValidateOptions::default(),
+    );
+    let staged: std::collections::HashSet<&str> =
+        staged_changes.iter().map(String::as_str).collect();
+    let findings: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|finding| staged.contains(finding.file.as_str()))
+        .collect();
+    let lines: Vec<String> = findings
+        .iter()
+        .map(|finding| {
+            format!(
+                "{}:{}: {}: {}",
+                finding.file,
+                finding.line,
+                finding.rule.id(),
+                finding.message
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let entries: std::collections::HashSet<&str> = findings
+        .iter()
+        .map(|finding| finding.file.as_str())
+        .collect();
+    Err(GeectlError::new(
+        ErrorKind::ValidationFailed,
+        format!(
+            "commit refused: {} {} in {} staged .changes {} {} validation:\n{}",
+            lines.len(),
+            if lines.len() == 1 {
+                "finding"
+            } else {
+                "findings"
+            },
+            entries.len(),
+            if entries.len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            if lines.len() == 1 { "fails" } else { "fail" },
+            lines.join("\n")
+        ),
+    ))
+}
+
 /// The file list for an OBS-native commit: the full list derived
 /// from the base plus the staged diff — every base file with the
 /// base content's md5, overridden by the staged diff (a changed or
@@ -2152,7 +2249,8 @@ fn refresh_base(wc: &mut WorkingCopy, rev: &str, srcmd5: &str) -> Result<(), Gee
 }
 
 /// Commit the working copy: the index state against the base, with
-/// the service gate (unless `noservice`). An OBS-native commit
+/// the service gate (unless `noservice`) and the changelog gate on
+/// the `.changes` entries the commit sends. An OBS-native commit
 /// sends the file list through the `commitfilelist` protocol and
 /// refreshes the base to the new revision; a git-backed commit
 /// pushes the local commits and polls the OBS side until the sync
@@ -2299,6 +2397,8 @@ fn attach_sha256(entries: &mut [CommitFileEntry], name: &str, content: &[u8]) {
 /// before the service gate, in order: outdated base, conflicts,
 /// nothing to commit. The gate runs last of the checks, and its
 /// outputs are staged into the index, so the commit sends them.
+/// The changelog gate runs after the service gate's outputs are
+/// staged, on the final staged state, before anything is filed.
 fn commit_obs(
     wc: &mut WorkingCopy,
     client: &ObsClient,
@@ -2332,6 +2432,10 @@ fn commit_obs(
             "there is nothing to commit: the index matches the base",
         ));
     }
+    // The changelog gate runs on the final staged state — after
+    // the service gate staged its outputs — and before anything
+    // is filed.
+    run_changelog_gate(wc)?;
     let keeplink = index_has(wc, "_link")?;
     // One validate pass: learn what the server lacks and any sha256
     // challenges. A validate pass with a complete file list commits
@@ -2549,7 +2653,9 @@ fn commit_obs(
 /// refusals run before the service gate, in order: the remote has
 /// commits the checkout lacks, conflicts, nothing to commit. The
 /// gate runs last of the checks, and its outputs are staged into
-/// the index, so the commit sends them.
+/// the index, so the commit sends them. The changelog gate runs
+/// after the service gate's outputs are staged, on the final
+/// staged state, before the staged changes become a commit.
 fn commit_git(
     wc: &mut WorkingCopy,
     client: &ObsClient,
@@ -2601,6 +2707,10 @@ fn commit_git(
         run_service_gate(client, config, &wc.root)?;
     }
     stage_gate_changes(wc, &snapshot)?;
+    // The changelog gate runs on the final staged state — after
+    // the service gate staged its outputs — and before the
+    // staged changes become a commit.
+    run_changelog_gate(wc)?;
     // Staged changes become one synthesized commit. Unstaged
     // worktree changes are not sent: the commit sends the index
     // state plus the local commits, never the worktree.
@@ -5937,6 +6047,250 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(report.rev, Some(2));
+        let _ = dir;
+    }
+
+    /// A valid staged `.changes` entry: 67-dash separators,
+    /// descending headers, a substantive newest body.
+    fn valid_changes() -> String {
+        let sep = "-".repeat(67);
+        format!(
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash (boo#123456)\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package\n\n"
+        )
+    }
+
+    /// A violating staged `.changes` entry: a 20-dash separator
+    /// where V11 demands exactly 67.
+    fn violating_changes() -> String {
+        let sep = "-".repeat(20);
+        format!(
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n"
+        )
+    }
+
+    #[test]
+    fn commit_obs_refuses_a_violating_changes_entry() {
+        // The gate runs before anything is filed: no
+        // commitfilelist mock is registered, so any filing would
+        // fail the test on an unmatched request.
+        let http = checkout_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "foo.changes", &violating_changes());
+        add(&wc, &["foo.changes".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValidationFailed);
+        let message = err.to_string();
+        assert!(
+            message.contains("foo.changes") && message.contains("V11"),
+            "message: {message}"
+        );
+        assert!(http.post_calls().is_empty());
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_obs_accepts_a_valid_changes_entry() {
+        // A validate pass with nothing missing commits: the
+        // server commits whenever the file list is complete.
+        let validate_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv&withvalidate=1";
+        let http = checkout_http().with_post(
+            validate_url,
+            &format!("<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\" />"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "foo.changes", &valid_changes());
+        add(&wc, &["foo.changes".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.rev, Some(2));
+        assert_eq!(report.files, vec!["foo.changes".to_string()]);
+        assert_eq!(http.post_calls().len(), 1);
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_obs_accepts_a_staged_changes_deletion() {
+        // The base carries a valid foo.changes; the commit deletes
+        // it, so the gate has no content to validate and the commit
+        // goes through.
+        let dir = TempDirGuard::new("changelog-deletion");
+        init_repo(&dir.path);
+        write_file(&dir.path, "foo.spec", "Name: foo\n");
+        write_file(&dir.path, "foo.changes", &valid_changes());
+        write_file(&dir.path, "foo.tar.gz", "");
+        git_ok(&dir.path, &["add", "-A"]);
+        git_ok(
+            &dir.path,
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                &format!("geectl base {REV1} {SRCMD5_1}"),
+            ],
+        );
+        record_obs(&dir.path, REV1, SRCMD5_1);
+        let validate_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv&withvalidate=1";
+        let http = checkout_http().with_post(
+            validate_url,
+            &format!("<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\" />"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let mut wc = open(&dir.path).unwrap();
+        rm(&wc, &["foo.changes".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.rev, Some(2));
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_obs_refuses_an_empty_changes_entry() {
+        // An empty staged `.changes` file: V11 fires at line 0.
+        let http = checkout_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "foo.changes", "");
+        add(&wc, &["foo.changes".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValidationFailed);
+        let message = err.to_string();
+        assert!(message.contains("foo.changes:0: V11"), "message: {message}");
+        assert!(http.post_calls().is_empty());
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_obs_ignores_a_violation_in_an_untouched_changes_file() {
+        // The base carries a violating foo.changes; the commit
+        // stages only a spec change, so the gate has no staged
+        // .changes entry to validate and the commit goes through.
+        let dir = TempDirGuard::new("changelog-untouched");
+        init_repo(&dir.path);
+        write_file(&dir.path, "foo.spec", "Name: foo\n");
+        write_file(&dir.path, "foo.changes", &violating_changes());
+        write_file(&dir.path, "foo.tar.gz", "");
+        git_ok(&dir.path, &["add", "-A"]);
+        git_ok(
+            &dir.path,
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                &format!("geectl base {REV1} {SRCMD5_1}"),
+            ],
+        );
+        record_obs(&dir.path, REV1, SRCMD5_1);
+        let validate_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv&withvalidate=1";
+        let http = checkout_http().with_post(
+            validate_url,
+            &format!("<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\" />"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let mut wc = open(&dir.path).unwrap();
+        write_file(&wc.root, "foo.spec", "Name: bar\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.rev, Some(2));
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_git_refuses_a_violating_changes_entry() {
+        let dir = TempDirGuard::new("git-changelog-gate");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_file(&wc.root, "foo.changes", &violating_changes());
+        add(&wc, &["foo.changes".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let auth = test_auth();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValidationFailed);
+        let message = err.to_string();
+        assert!(
+            message.contains("foo.changes") && message.contains("V11"),
+            "message: {message}"
+        );
+        // Nothing was pushed: the origin still sits on its initial head.
+        assert_eq!(
+            git(&origin.path, "rev-parse", &["main"], &[])
+                .unwrap()
+                .trim(),
+            origin_head
+        );
         let _ = dir;
     }
 
