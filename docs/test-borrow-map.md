@@ -1031,6 +1031,27 @@ scheduler entries.**
   (3 scenarios) were already surveyed under batch 10: nothing to
   adopt.
 
+## Unified person search (#300)
+
+**Direct adoptions: 1 unit test.**
+
+- `test_gitea_api_user.py::test_object` — login, full name, and
+  email parse → `user_search_parses_users_and_ignores_unknown_fields`
+  (the Gitea `User` object the search answers). The composite
+  renderings (`full_name_email`, `login_full_name_email`) are not
+  adopted: geectl renders no such string. The borrow map already
+  recorded this case as modelled differently, not adopted, because
+  `GiteaOwner` models the login only; `GiteaUser` now models all
+  three fields, so the parse adopts.
+- osc has no Gitea user search: `osc/gitea_api/user.py` is
+  `User.get` only (one user by login, or the current user), and no
+  behave scenario or unit test touches `GET /api/v1/users/search`.
+  The endpoint and the wrapped `{"ok": true, "data": [...]}` shape
+  come from the Gitea API, not osc. The OBS arm's person-match form
+  (`person/@userid='…'`) was already adopted for
+  `search-projects-by-person` under batch 3; no new osc case pins
+  the unified leaf itself.
+
 ## Counts (direct adoptions, de-duplicated)
 
 | Batch | Unit | Behave | Total |
@@ -1054,15 +1075,16 @@ scheduler entries.**
 | 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
 | 13 mirror-first dep fetch | 1 | 0 | 1 |
 | Gap batch — periodic cache cleanup (#191) | 0 | 0 | 0 |
-| **Total adopted** | **106** | **120** | **226** |
+| Unified person search (#300) | 1 | 0 | 1 |
+| **Total adopted** | **107** | **120** | **227** |
 
 Surveyed base: 272 behave scenarios + 707 unit tests = 979 items;
-adoptable as written: 226 of them (120 behave scenarios, 106 unit tests),
+adoptable as written: 227 of them (120 behave scenarios, 107 unit tests),
 plus the batch 1/6 protocol specs. The rest is SKIP (osc-internal),
 stdout-only, covered by geectl's existing tests, or a gap for a batch
-that has not landed. The table sums to 226; issue #40 counts 241
-(125 behave + 116 unit) — the 15-count gap (5 behave + 10 unit)
-predates this batch and is unresolved: 6 of the unit gap is #217's
+that has not landed. The table sums to 227; issue #40 counts 242
+(126 behave + 116 unit) — the 15-count gap (6 behave + 9 unit)
+is unresolved: 6 of the unit gap is #217's
 working-copy adoptions, recorded in the issue but not in this table.
 
 ## Quirks in osc's own tests

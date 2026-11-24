@@ -61,7 +61,7 @@ the setup step. Renames made for this decision:
 **What exists.** The OBS client is split (`src/obs/`) and the Gitea
 client is a separate module (`src/gitea.rs`, `GiteaClient`) with the
 phase 1–2 operations (fork, repo read/list/create/delete, branch
-read/head, user, SSH keys, teams, collaborators) and the phase-3
+read/head, user read/search, SSH keys, teams, collaborators) and the phase-3
 read operations (`pr_get`, `pr_list`, `pr_search`, `pr_reviews`)
 plus the review-level act operations (`pr_review`,
 `pr_comments`, `pr_comment_add`, `pr_review_cancel_request`)
@@ -70,7 +70,7 @@ and the pull-request-level act operations (`pr_merge`,
 The unified pull-request surface (`src/pull_request.rs`,
 `PullRequestClient`, `pull-request` CLI group) carries the read
 surface, the review-level act operations and the
-pull-request-level act operations; labels are not implemented yet. The OBS side has the typed `change_review_state`
+pull-request-level act operations; labels are not implemented yet. The unified person search (`src/person.rs`, `PersonClient`, `person search`) carries the OBS person-match and the Gitea user search under one operation. The OBS side has the typed `change_review_state`
 (`src/obs/request.rs`).
 
 - Config (`src/config.rs`): `gitea_url` (default
@@ -504,6 +504,26 @@ library layer the uniform operations dispatch to (`pr_get`,
 `GiteaReviewEvent`, `GiteaMergeMethod`, `GiteaLabel`) modelled the
 same way as `GiteaRepository` and `GiteaBranch` — only the fields
 each operation needs, unknown fields ignored.
+
+#### The CLI surface: the `person` group
+
+One group, one subcommand for the uniform operation. The group
+follows the CLI scheme: kebab-case names, long flags only, no
+aliases, one global `--format json|text`.
+
+| Subcommand | Agent use |
+|---|---|
+| `person search <QUERY> [--backend obs\|gitea]` | Find a person: the OBS projects naming the login, and the Gitea users matching the keyword, on either backend or both |
+
+`person search` with no `--backend` runs both arms — OBS first,
+then Gitea — and returns both lists under the one payload. The
+OBS arm matches the login exactly (`search_projects_by_person`);
+the Gitea arm matches the keyword against login, full name, and
+email (`user_search`). A scoped search on an arm whose
+credentials are not configured fails closed naming them; a
+both-arms search fails on the first missing credential — at
+client construction for the Gitea token, at the OBS arm for
+OBS credentials — before any HTTP in either case.
 
 #### Implementation order
 

@@ -11,6 +11,7 @@ mod cli_build;
 mod cli_changelog;
 mod cli_gitea;
 mod cli_local_build;
+mod cli_person;
 mod cli_prjconf;
 mod cli_pull_request;
 mod cli_remote;
@@ -151,6 +152,12 @@ enum Command {
         #[command(subcommand)]
         command: cli_pull_request::PullRequestCommand,
     },
+    /// Search for a person: the OBS projects naming the login
+    /// and the Gitea users matching the keyword, as one operation.
+    Person {
+        #[command(subcommand)]
+        command: cli_person::PersonCommand,
+    },
     /// Validate and generate `.changes` entries in a package
     /// directory, pre-file.
     Changelog {
@@ -271,6 +278,7 @@ fn run(
         Some(Command::PullRequest { command }) => {
             cli_pull_request::run_pull_request(command, debug, cli.live)?
         }
+        Some(Command::Person { command }) => cli_person::run_person(command, debug, cli.live)?,
         Some(Command::Changelog { command }) => {
             cli_changelog::run_changelog(command, debug, cli.live)?
         }

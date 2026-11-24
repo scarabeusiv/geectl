@@ -66,6 +66,7 @@ pub mod http;
 pub mod local_build;
 pub mod obs;
 pub mod periodic;
+pub mod person;
 pub mod pull_request;
 pub mod url;
 pub mod working_copy;

@@ -2224,6 +2224,223 @@ fn remote_search_packages_by_person_with_half_set_credentials_fails_with_config_
 }
 
 #[test]
+fn person_search_both_arms_returns_projects_and_users() {
+    // Both arms run against fixture servers: the OBS
+    // person-match answers one project, the Gitea user search
+    // one user. The JSON payload carries both lists.
+    let obs_addr = serve_once(
+        "<collection matches=\"1\"><project name=\"devel:languages:python\"><title>Python</title><description>Python packages</description></project></collection>",
+    );
+    let gitea_addr = serve_once(
+        r#"{"ok": true, "data": [{"login": "alice", "full_name": "Alice", "email": "alice@example.com"}]}"#,
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["person", "search", "alice"])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["query"], "alice");
+    assert!(value["backend"].is_null());
+    assert_eq!(value["projects"][0]["name"], "devel:languages:python");
+    assert_eq!(value["projects"][0]["title"], "Python");
+    assert_eq!(value["users"][0]["login"], "alice");
+    assert_eq!(value["users"][0]["full_name"], "Alice");
+    assert_eq!(value["users"][0]["email"], "alice@example.com");
+}
+
+#[test]
+fn person_search_text_mode_renders_both_sections() {
+    let obs_addr = serve_once(
+        "<collection matches=\"1\"><project name=\"devel:languages:python\"><title>Python</title><description>Python packages</description></project></collection>",
+    );
+    let gitea_addr = serve_once(
+        r#"{"ok": true, "data": [{"login": "alice", "full_name": "Alice", "email": "alice@example.com"}]}"#,
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "person", "search", "alice"])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("query: alice"), "stdout: {stdout}");
+    assert!(stdout.contains("OBS projects:"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("devel:languages:python"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("Gitea users:"), "stdout: {stdout}");
+    assert!(stdout.contains("alice@example.com"), "stdout: {stdout}");
+}
+
+#[test]
+fn person_search_with_no_credentials_fails_with_config_error() {
+    // No arm has credentials: both clients build before the
+    // search runs, so the missing Gitea token fails first — the
+    // same construction order as `pull-request search`.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["person", "search", "alice"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(
+        stderr.contains("no Gitea token configured"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn person_search_gitea_scoped_with_no_token_fails_with_config_error() {
+    // Scoped to Gitea, the OBS arm never runs: only the missing
+    // token fails the search.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["person", "search", "alice", "--backend", "gitea"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(stderr.contains("Gitea token"), "stderr: {stderr}");
+}
+
+#[test]
+fn person_search_both_arms_with_only_a_gitea_token_fails_on_obs_credentials() {
+    // Only the Gitea token is configured: both clients construct
+    // (OBS construction accepts Credentials::None by design), and
+    // the failure surfaces at the OBS arm, before any HTTP — the
+    // Gitea arm never runs, and no OBS request is attempted. The
+    // recording stub proves the last point: a request would land
+    // in its channel before the process exits.
+    let (obs_addr, obs_requests) = serve_once_recording(
+        "<collection matches=\"1\"><project name=\"devel:languages:python\"><title>Python</title><description>Python packages</description></project></collection>",
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["person", "search", "alice"])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(stderr.contains("OBS credentials"), "stderr: {stderr}");
+    assert!(
+        obs_requests
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_err(),
+        "the OBS arm must fail before any OBS request is attempted"
+    );
+}
+
+#[test]
+fn person_search_obs_scoped_returns_only_projects() {
+    // Scoped to OBS, the Gitea arm never runs: no token is
+    // configured, and its construction would fail if touched.
+    // The payload names the backend and carries only the OBS list.
+    let obs_addr = serve_once(
+        "<collection matches=\"1\"><project name=\"devel:languages:python\"><title>Python</title><description>Python packages</description></project></collection>",
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["person", "search", "alice", "--backend", "obs"])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["query"], "alice");
+    assert_eq!(value["backend"], "obs");
+    assert_eq!(value["projects"][0]["name"], "devel:languages:python");
+    assert_eq!(value["projects"][0]["title"], "Python");
+    assert!(value["users"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn person_search_gitea_scoped_returns_only_users() {
+    // Scoped to Gitea, the OBS arm never runs: no OBS credentials
+    // are configured, and its arm would fail if touched. The
+    // payload names the backend and carries only the Gitea list.
+    let gitea_addr = serve_once(
+        r#"{"ok": true, "data": [{"login": "alice", "full_name": "Alice", "email": "alice@example.com"}]}"#,
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["person", "search", "alice", "--backend", "gitea"])
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["query"], "alice");
+    assert_eq!(value["backend"], "gitea");
+    assert_eq!(value["users"][0]["login"], "alice");
+    assert_eq!(value["users"][0]["full_name"], "Alice");
+    assert_eq!(value["users"][0]["email"], "alice@example.com");
+    assert!(value["projects"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn person_search_obs_scoped_with_no_obs_credentials_fails_with_config_error() {
+    // Scoped to OBS, the Gitea arm never runs: only the missing
+    // OBS credentials fail the search.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["person", "search", "alice", "--backend", "obs"])
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(stderr.contains("OBS credentials"), "stderr: {stderr}");
+}
+
+#[test]
 fn remote_count_scmsync_projects_with_half_set_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
@@ -5799,7 +6016,7 @@ fn docs_help_blocks_match_the_binary() {
     // The docs carry the binary's --help output verbatim; this test
     // makes that permanent. A block that drifts fails here — regenerate
     // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 42 blocks (top level, 11 groups, 30 leaves) — a
+    // The docs carry 44 blocks (top level, 12 groups, 31 leaves) — a
     // sampled surface, not every leaf: a leaf with no docs block can
     // change --help undetected. That is deliberate — the docs show the
     // groups and one leaf each, plus `remote download`, plus the ten
@@ -5811,8 +6028,8 @@ fn docs_help_blocks_match_the_binary() {
     let blocks = help_blocks(&docs);
     assert_eq!(
         blocks.len(),
-        42,
-        "docs/cli.md should carry 42 --help blocks (top level, 11 groups, 30 leaves);          update this count when a block is deliberately added or removed"
+        44,
+        "docs/cli.md should carry 44 --help blocks (top level, 12 groups, 31 leaves);          update this count when a block is deliberately added or removed"
     );
     for (argv, expected) in blocks {
         let mut cmd = geectl();

@@ -55,11 +55,31 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// A Gitea user: only the login is modelled (the fork target-owner
-/// resolution reads it from `GET /api/v1/user`).
+/// A Gitea user: the login, full name, and email. The user search
+/// (`GET /api/v1/users/search`) answers all three; the fork
+/// target-owner resolution reads the login alone from `GET
+/// /api/v1/user`. Full name and email are empty when the account
+/// sets none — the server always sends the keys.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaUser {
+    /// The login name.
+    pub login: String,
+    /// The full name, empty when unset.
+    #[serde(default)]
+    pub full_name: String,
+    /// The email address, empty when hidden or unset.
+    #[serde(default)]
+    pub email: String,
+}
+
+/// A Gitea search response: the `ok` flag plus the `data` page.
+/// The search endpoints (`/api/v1/repos/search`,
+/// `/api/v1/users/search`) wrap the page in this object instead of
+/// answering a bare array like the list endpoints.
 #[derive(Debug, Deserialize)]
-struct GiteaUser {
-    login: String,
+struct SearchResults<T> {
+    ok: bool,
+    data: Vec<T>,
 }
 
 /// A Gitea account (owner): only the login is modelled.
@@ -2334,6 +2354,28 @@ impl<'a> GiteaClient<'a> {
         )
     }
 
+    /// Search users across the instance (`GET
+    /// /api/v1/users/search?q=...`): the keyword matches login,
+    /// full name, and email. The search answers a wrapped page
+    /// (`{"ok": true, "data": [...]}`), paginated internally and
+    /// bounded like `repo_list`; past the bound the call fails
+    /// naming the list, never a silent truncation — narrow the
+    /// query instead. An empty query is an error before any call.
+    pub fn user_search(&self, query: &str) -> Result<Vec<GiteaUser>, GeectlError> {
+        if query.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "user search query must not be empty",
+            ));
+        }
+        self.search_paged::<GiteaUser>(
+            &["api", "v1", "users", "search"],
+            &[("q", query)],
+            &format!("users matching {query:?}"),
+            "narrow the search query",
+        )
+    }
+
     /// List the reviews on a pull request (`GET
     /// /api/v1/repos/{owner}/{repo}/pulls/{number}/reviews`): one
     /// entry per review, in order. Paginates internally and is
@@ -2934,52 +2976,28 @@ impl<'a> GiteaClient<'a> {
         Ok(Some(issue))
     }
 
-    /// Read every page of a list endpoint (`page`/`limit` query)
-    /// into one typed list. A page shorter than the page size ends
-    /// the list; a page of exactly the page size fetches the next
-    /// one. Past `MAX_LIST_PAGES` full pages the call reads one
-    /// more page to prove the list is longer: an empty page 11
-    /// means the list is exactly at the bound and is returned, a
+    /// Read every page of a paged endpoint (`page`/`limit` query)
+    /// into one typed list, fetching each page through
+    /// `fetch_page`. A page shorter than the page size ends the
+    /// list; a page of exactly the page size fetches the next one.
+    /// Past `MAX_LIST_PAGES` full pages the call reads one more
+    /// page to prove the list is longer: an empty page 11 means
+    /// the list is exactly at the bound and is returned, a
     /// non-empty one fails with `InvalidInput` naming `scope` and
     /// the per-call-site `remedy` — what the caller can do about
     /// it — instead of silently truncating or reading unboundedly.
     /// The remedy is per call site because not every list can be
     /// narrowed: the token owner's own repos can (list one user or
     /// org instead), a single user, a single org, and a repo's
-    /// branches cannot.
-    fn list_paged<T>(
-        &self,
-        segments: &[&str],
-        params: &[(&str, &str)],
+    /// branches cannot — while a search can (narrow the query).
+    fn read_paged<T>(
         scope: &str,
         remedy: &str,
-    ) -> Result<Vec<T>, GeectlError>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
+        fetch_page: impl Fn(u32) -> Result<Vec<T>, GeectlError>,
+    ) -> Result<Vec<T>, GeectlError> {
         let mut items = Vec::new();
         for page in 1..=MAX_LIST_PAGES {
-            let page_arg = page.to_string();
-            let limit_arg = LIST_PAGE_SIZE.to_string();
-            let mut query: Vec<(&str, &str)> = params.to_vec();
-            query.push(("page", &page_arg));
-            query.push(("limit", &limit_arg));
-            let url = build_url(&self.base, segments, &query);
-            let body = self.http.get_with(&url, &self.credentials)?;
-            // Gitea answers a JSON `null` body for an empty list —
-            // verified live on the branches endpoint of
-            // an empty repo (`pool/systemd` before its first
-            // commit). Parse as an optional list so a null page is
-            // an empty page, not a server error. Any other shape
-            // still fails with the same message as before.
-            let page_items: Vec<T> = serde_json::from_str::<Option<Vec<T>>>(&body)
-                .map_err(|err| {
-                    GeectlError::new(
-                        ErrorKind::ServerError,
-                        format!("unexpected Gitea {scope} response (page {page}): {err}"),
-                    )
-                })?
-                .unwrap_or_default();
+            let page_items = fetch_page(page)?;
             let full = page_items.len() == LIST_PAGE_SIZE as usize;
             items.extend(page_items);
             if !full {
@@ -2992,22 +3010,7 @@ impl<'a> GiteaClient<'a> {
         // on it proves more than 500, and only then does the call
         // fail. Without this read a list of exactly 500 would fail
         // on an unproven "more than 500 entries".
-        let page = MAX_LIST_PAGES + 1;
-        let page_arg = page.to_string();
-        let limit_arg = LIST_PAGE_SIZE.to_string();
-        let mut query: Vec<(&str, &str)> = params.to_vec();
-        query.push(("page", &page_arg));
-        query.push(("limit", &limit_arg));
-        let url = build_url(&self.base, segments, &query);
-        let body = self.http.get_with(&url, &self.credentials)?;
-        let page_items: Vec<T> = serde_json::from_str::<Option<Vec<T>>>(&body)
-            .map_err(|err| {
-                GeectlError::new(
-                    ErrorKind::ServerError,
-                    format!("unexpected Gitea {scope} response (page {page}): {err}"),
-                )
-            })?
-            .unwrap_or_default();
+        let page_items = fetch_page(MAX_LIST_PAGES + 1)?;
         if page_items.is_empty() {
             return Ok(items);
         }
@@ -3019,6 +3022,83 @@ impl<'a> GiteaClient<'a> {
                 MAX_LIST_PAGES
             ),
         ))
+    }
+
+    /// Read every page of a list endpoint (`page`/`limit` query)
+    /// into one typed list. Gitea answers a JSON `null` body for
+    /// an empty list — verified live on the branches endpoint of
+    /// an empty repo (`pool/systemd` before its first commit).
+    /// Parse as an optional list so a null page is an empty page,
+    /// not a server error. Any other shape still fails with the
+    /// same message as before. The wrapped search endpoints use
+    /// `search_paged` instead.
+    fn list_paged<T>(
+        &self,
+        segments: &[&str],
+        params: &[(&str, &str)],
+        scope: &str,
+        remedy: &str,
+    ) -> Result<Vec<T>, GeectlError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        Self::read_paged(scope, remedy, |page| {
+            let page_arg = page.to_string();
+            let limit_arg = LIST_PAGE_SIZE.to_string();
+            let mut query: Vec<(&str, &str)> = params.to_vec();
+            query.push(("page", &page_arg));
+            query.push(("limit", &limit_arg));
+            let url = build_url(&self.base, segments, &query);
+            let body = self.http.get_with(&url, &self.credentials)?;
+            let page_items: Vec<T> = serde_json::from_str::<Option<Vec<T>>>(&body)
+                .map_err(|err| {
+                    GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!("unexpected Gitea {scope} response (page {page}): {err}"),
+                    )
+                })?
+                .unwrap_or_default();
+            Ok(page_items)
+        })
+    }
+
+    /// Read every page of a search endpoint (`page`/`limit` query)
+    /// into one typed list. The search endpoints wrap the page in
+    /// `{"ok": true, "data": [...]}`; an `ok: false` page fails
+    /// as a server error naming the search, never an empty list.
+    /// Any other shape fails like a list page.
+    fn search_paged<T>(
+        &self,
+        segments: &[&str],
+        params: &[(&str, &str)],
+        scope: &str,
+        remedy: &str,
+    ) -> Result<Vec<T>, GeectlError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        Self::read_paged(scope, remedy, |page| {
+            let page_arg = page.to_string();
+            let limit_arg = LIST_PAGE_SIZE.to_string();
+            let mut query: Vec<(&str, &str)> = params.to_vec();
+            query.push(("page", &page_arg));
+            query.push(("limit", &limit_arg));
+            let url = build_url(&self.base, segments, &query);
+            let body = self.http.get_with(&url, &self.credentials)?;
+            let results: SearchResults<T> = serde_json::from_str(&body).map_err(|err| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("unexpected Gitea {scope} response (page {page}): {err}"),
+                )
+            })?;
+            if !results.ok {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("Gitea search for {scope} failed"),
+                ));
+            }
+            Ok(results.data)
+        })
     }
 
     /// Give the agent a place to work on a git-backed package (or
@@ -5425,6 +5505,163 @@ mod tests {
             .pr_search(GiteaPullRequestState::Closed)
             .unwrap();
         assert!(items.is_empty());
+    }
+
+    /// A user-search JSON body, shaped like Gitea 1.24.7 answers
+    /// for `GET /api/v1/users/search`: the `ok` flag plus the
+    /// `data` page of user objects. The unknown field proves it
+    /// is ignored.
+    fn user_json(login: &str, full_name: &str, email: &str) -> String {
+        format!(
+            r#"{{"login": "{login}", "full_name": "{full_name}", "email": "{email}", "future_field": "tolerated"}}"#
+        )
+    }
+
+    fn user_search_json(users: &[String]) -> String {
+        format!(r#"{{"ok": true, "data": [{}]}}"#, users.join(","))
+    }
+
+    /// Fifty users, named `user-00` … — the full page the
+    /// pagination tests fill.
+    fn fifty_users() -> Vec<String> {
+        (0..50)
+            .map(|n| user_json(&format!("user-{n:02}"), "", ""))
+            .collect()
+    }
+
+    #[test]
+    fn user_search_parses_users_and_ignores_unknown_fields() {
+        // osc `test_gitea_api_user.py::test_object`: login,
+        // full_name, email parse. The composite renderings
+        // (`full_name_email`, `login_full_name_email`) are not
+        // adopted: geectl renders no such string.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/users/search?q=alice&page=1&limit=50",
+            &user_search_json(&[
+                user_json("alice", "Alice", "alice@example.com"),
+                user_json("alice2", "", ""),
+            ]),
+        );
+        let users = client(&http).user_search("alice").unwrap();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].login, "alice");
+        assert_eq!(users[0].full_name, "Alice");
+        assert_eq!(users[0].email, "alice@example.com");
+        assert_eq!(users[1].login, "alice2");
+        assert_eq!(users[1].full_name, "");
+        assert_eq!(users[1].email, "");
+    }
+
+    #[test]
+    fn user_search_empty_data_is_an_empty_list() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/users/search?q=nobody&page=1&limit=50",
+            r#"{"ok": true, "data": []}"#,
+        );
+        let users = client(&http).user_search("nobody").unwrap();
+        assert!(users.is_empty());
+    }
+
+    #[test]
+    fn user_search_not_ok_fails() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/users/search?q=alice&page=1&limit=50",
+            r#"{"ok": false, "data": []}"#,
+        );
+        let err = client(&http)
+            .user_search("alice")
+            .expect_err("an ok:false search must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.to_string().contains("users matching \"alice\""),
+            "the search failure must name the search; got {err}"
+        );
+    }
+
+    #[test]
+    fn user_search_unexpected_shape_fails() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/users/search?q=alice&page=1&limit=50",
+            "[{\"login\": \"alice\"}]",
+        );
+        let err = client(&http)
+            .user_search("alice")
+            .expect_err("a bare array is not a search response");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn user_search_rejects_an_empty_query_without_http() {
+        let http = FakeHttp::new();
+        assert!(client(&http).user_search("").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn user_search_paginates() {
+        let page1 = fifty_users();
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/users/search?q=user&page=1&limit=50",
+                &user_search_json(&page1),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/users/search?q=user&page=2&limit=50",
+                &user_search_json(&[user_json("user-50", "", "")]),
+            );
+        let users = client(&http).user_search("user").unwrap();
+        assert_eq!(users.len(), 51);
+        assert_eq!(users[50].login, "user-50");
+    }
+
+    #[test]
+    fn user_search_bound_fails_instead_of_truncating() {
+        // Ten full pages (500 users) and page 11 still has one
+        // more: the call fails naming the query and the remedy,
+        // instead of silently returning the first 500.
+        let page = user_search_json(&fifty_users());
+        let mut http = FakeHttp::new();
+        for n in 1..=10 {
+            http = http.with_get(
+                &format!("https://src.opensuse.org/api/v1/users/search?q=user&page={n}&limit=50"),
+                &page,
+            );
+        }
+        http = http.with_get(
+            "https://src.opensuse.org/api/v1/users/search?q=user&page=11&limit=50",
+            &user_search_json(&[user_json("user-500", "", "")]),
+        );
+        let err = client(&http).user_search("user").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("users matching \"user\""),
+            "the bound error must name the query; got {err}"
+        );
+        assert!(
+            err.to_string().contains("narrow the search query"),
+            "a search can be narrowed, so the error must name the remedy; got {err}"
+        );
+    }
+
+    #[test]
+    fn user_search_exactly_at_the_bound_is_returned() {
+        // Ten full pages (500 users) and page 11 is empty: the
+        // list is exactly at the bound, not past it, so it is
+        // returned — the page-11 read is what proves it.
+        let page = user_search_json(&fifty_users());
+        let mut http = FakeHttp::new();
+        for n in 1..=10 {
+            http = http.with_get(
+                &format!("https://src.opensuse.org/api/v1/users/search?q=user&page={n}&limit=50"),
+                &page,
+            );
+        }
+        http = http.with_get(
+            "https://src.opensuse.org/api/v1/users/search?q=user&page=11&limit=50",
+            r#"{"ok": true, "data": []}"#,
+        );
+        let users = client(&http).user_search("user").unwrap();
+        assert_eq!(users.len(), 500);
     }
 
     #[test]
