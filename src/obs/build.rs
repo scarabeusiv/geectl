@@ -6194,6 +6194,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_repositories_round_trips_entity_escaped_values() {
+        // The escape direction is pinned by
+        // `repository_element_escapes_values_in_the_full_shape`; this
+        // pins the parse direction: entity-containing XML parses back
+        // to the unescaped values and re-renders to the same escaped
+        // output.
+        let body = "<project name=\"testproject\"><repository name=\"standard\" rebuild=\"local\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com/?a=1&amp;b=2\" repotype=\"rpmmd\"><archfilter>a&amp;b</archfilter><master url=\"https://master.example.com/?x=&quot;y&quot;\"/></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"a&lt;b&gt;c&apos;d\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
+        let parsed = parse_repositories(body).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].downloads[0].url, "https://example.com/?a=1&b=2");
+        assert_eq!(
+            parsed[0].downloads[0].master.as_ref().unwrap().url,
+            "https://master.example.com/?x=\"y\""
+        );
+        assert_eq!(parsed[0].downloads[0].archfilter.as_deref(), Some("a&b"));
+        assert_eq!(
+            parsed[0].release_targets[0].trigger.as_deref(),
+            Some("a<b>c'd")
+        );
+        let rendered = repository_element(&parsed[0]);
+        assert_eq!(
+            rendered,
+            "<repository name=\"standard\" rebuild=\"local\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com/?a=1&amp;b=2\" repotype=\"rpmmd\"><archfilter>a&amp;b</archfilter><master url=\"https://master.example.com/?x=&quot;y&quot;\"/></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"a&lt;b&gt;c&apos;d\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository>"
+        );
+        // Re-parsing the re-rendered output is stable, and the project
+        // meta parser agrees.
+        assert_eq!(
+            parse_repositories(&format!(
+                "<project name=\"testproject\">{rendered}</project>"
+            ))
+            .unwrap(),
+            parsed
+        );
+        assert_eq!(parse_project_meta(body).unwrap().repositories, parsed);
+    }
+
+    #[test]
     fn parse_repositories_empty_is_an_empty_list() {
         assert_eq!(
             parse_repositories("<project name=\"p\"/>").unwrap(),
