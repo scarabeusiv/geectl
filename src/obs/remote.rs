@@ -63,6 +63,7 @@ use crate::xml::skip_xml_prolog;
 use crate::xml::xml_attr_blank;
 use crate::xml::xml_elements;
 use crate::xml::xml_escape;
+use crate::xml::xml_reject_stray_text;
 use crate::xml::xml_unescape;
 use crate::xml::XmlDoc;
 use std::path::Path;
@@ -1353,7 +1354,13 @@ pub(crate) fn unified_diff(old_path: &str, old: &str, new_path: &str, new: &str)
 /// flags, downloads, release targets, and host systems).
 /// The body must be a `<project>` document with a `name` attribute:
 /// either is missing and the parse is an error, never a meta with
-/// no name.
+/// no name. Stray text or a CDATA section inside a `<repository>`
+/// or `<download>` is an error too: neither element carries text
+/// content. The same rule holds at the project level: stray text or
+/// a CDATA section directly under `<project>`, markup inside a text
+/// child, and a modeled tag hidden in skipped content are errors
+/// too — a `<repository>` hidden in a comment would otherwise read
+/// as real.
 pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
     let malformed = || {
         GeectlError::new(
@@ -1362,6 +1369,11 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
         )
     };
     let (open_tag, inner) = meta_envelope(body, "project")?;
+    // The same fail-closed rule one level up: a modeled tag hidden
+    // in skipped content at the project level would still be read
+    // by the descendant readers below, so the gate runs before any
+    // of them.
+    xml_reject_stray_text(inner, "project")?;
     let name = tag_attr(&open_tag, "name").ok_or_else(malformed)?;
     let devel = {
         let mut found = None;
@@ -1375,6 +1387,8 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
     };
     let mut repositories = Vec::new();
     for (element, repo_inner) in elements(inner, "repository")? {
+        // The typed model drops this content, so the parse fails closed on it.
+        xml_reject_stray_text(&repo_inner, "repository")?;
         let repo_name = tag_attr(&element, "name").ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
@@ -1406,6 +1420,8 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
         }
         let mut downloads = Vec::new();
         for (download_tag, download_inner) in elements(&repo_inner, "download")? {
+            // Same fail-closed rule inside `<download>`.
+            xml_reject_stray_text(&download_inner, "download")?;
             let url = match quoted_attr_value(&download_tag, "url") {
                 Some(url) if !url.is_empty() => url,
                 Some(_) => {
@@ -10071,8 +10087,9 @@ mod tests {
             assert!(parse_project_meta(&body).is_err(), "{body}");
         }
         // An unterminated single-value child is an error, not an
-        // absent value: the old readers returned None here, the
-        // strict readers reject the malformed response instead.
+        // absent value: the stray-text gate rejects the unclosed
+        // child before the readers run, so the response fails here
+        // instead of reading as absent.
         for (children, child) in [
             ("<archfilter>x86_64", "archfilter"),
             ("<pubkey>aaa", "pubkey"),
@@ -10082,7 +10099,7 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::ServerError);
             assert!(
                 err.context
-                    .contains(&format!("malformed <{child}> element")),
+                    .contains(&format!("unterminated <{child}> in <download>")),
                 "{body}: {}",
                 err.context
             );

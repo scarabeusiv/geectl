@@ -222,6 +222,13 @@ pub(crate) fn xml_attr_blank(value: &str) -> bool {
     value.trim().is_empty()
 }
 
+/// Whether `text` is blank in the element-content sense: the four
+/// XML whitespace characters only (see `xml_attr_blank` for the
+/// split — NBSP is character data here, not whitespace).
+pub(crate) fn xml_content_blank(text: &str) -> bool {
+    text.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+}
+
 /// Unescape XML text or an attribute value: the five entities
 /// [`xml_escape`] produces, plus numeric character references
 /// (`&#65;`, `&#x41;`). Anything else is left verbatim: an unknown
@@ -1085,80 +1092,232 @@ pub(crate) fn xml_child_elements<'a>(
     Ok(out)
 }
 
-/// The character data directly inside `inner` (the content between
-/// an element's open and close tags): the text between child
-/// elements, plus the content of CDATA sections there. Comments and
-/// processing instructions are skipped, not text. Text inside a
-/// child element belongs to that element, not to this level. None
-/// when a child element, comment, processing instruction, or CDATA
-/// section never closes, or a closing tag appears at this level:
-/// the callers that need a well-formed document fail it themselves
-/// before collecting.
-pub(crate) fn xml_top_level_text(inner: &str) -> Option<String> {
-    let mut out = String::new();
+/// Reject stray text and CDATA sections in `inner`, the content
+/// between an element's open and close tags. The typed model carries
+/// no text for the element, so dropped content would otherwise read
+/// as valid while the parse silently loses it — hence fail closed.
+/// A `-->` overlapping the comment opener (`<!-->`, `<!--->`) is an
+/// unterminated comment, not a closed one. A section inside a modeled
+/// text child is rejected: the readers decode entities only, so it
+/// would read as the literal wrapper in the field value. Any markup
+/// inside such a child is rejected for the same reason, and a modeled
+/// tag hidden in skipped content is rejected too: the descendant
+/// readers search raw text and would still find it there. Errors carry
+/// the byte offset of the offending content within `inner`.
+pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), GeectlError> {
+    let stray_text = |at: usize| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected OBS project meta response: stray text in <{element}> at offset {at}"
+            ),
+        )
+    };
+    let cdata = |at: usize| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected OBS project meta response: CDATA section in <{element}> at offset {at}"
+            ),
+        )
+    };
+    let cdata_in_child = |child: &str, at: usize| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS project meta response: CDATA section in <{child}> in <{element}> at offset {at}"),
+        )
+    };
+    let markup_in_child = |child: &str, at: usize| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS project meta response: markup in <{child}> in <{element}> at offset {at}"),
+        )
+    };
+    let hidden_modeled_tag = |tag: &str, at: usize| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS project meta response: hidden <{tag}> in <{element}> at offset {at}"),
+        )
+    };
+    // The tags the typed parsers read out of this element. The
+    // descendant readers search raw text, so a modeled tag hidden
+    // in skipped content would still be found: any occurrence of
+    // one in skipped content is rejected, markup or not.
+    let modeled_tags: &[&str] = match element {
+        "repository" => &["arch", "path", "download", "releasetarget", "hostsystem"],
+        "download" => &["archfilter", "master", "pubkey"],
+        "project" => &[
+            "repository",
+            "devel",
+            "person",
+            "group",
+            "title",
+            "description",
+            "url",
+            "scmsync",
+        ],
+        _ => &[],
+    };
+    // The offset of a modeled tag's open marker in `span`, if one
+    // occurs as a tag (not as a longer name like `<archx>`).
+    let hidden_tag = |span: &str| -> Option<(&str, usize)> {
+        for &tag in modeled_tags {
+            let marker = format!("<{tag}");
+            let mut from = 0;
+            while let Some(rel) = span[from..].find(&marker) {
+                let at = from + rel;
+                let after = &span[at + marker.len()..];
+                if after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || c == '/' || c == '>')
+                {
+                    return Some((tag, at));
+                }
+                from = at + marker.len();
+            }
+        }
+        None
+    };
+    let unterminated = |at: usize| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected OBS response: unterminated content in <{element}> at offset {at}"),
+        )
+    };
+    let unterminated_child = |child: &str, at: usize| {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            format!(
+                "unexpected OBS response: unterminated <{child}> in <{element}> at offset {at}"
+            ),
+        )
+    };
+    // Stray text starts at the first non-whitespace character, not
+    // at the whitespace before it.
+    let first_content = |text: &str| {
+        text.find(|c: char| !matches!(c, ' ' | '\t' | '\r' | '\n'))
+            .unwrap_or(text.len())
+    };
     let mut offset = 0;
     while offset < inner.len() {
         let rest = &inner[offset..];
         let Some(lt) = rest.find('<') else {
-            out.push_str(rest);
-            break;
+            if !xml_content_blank(rest) {
+                return Err(stray_text(offset + first_content(rest)));
+            }
+            return Ok(());
         };
-        out.push_str(&rest[..lt]);
+        if !xml_content_blank(&rest[..lt]) {
+            return Err(stray_text(offset + first_content(&rest[..lt])));
+        }
         let tag_start = offset + lt;
         let after_lt = &rest[lt + 1..];
+        if after_lt.starts_with("![CDATA[") {
+            // A CDATA section is character data, not markup.
+            return Err(cdata(tag_start));
+        }
         if let Some(content) = after_lt.strip_prefix("!--") {
-            // Comment: skip to `-->`, not to the first `>`. The
-            // search starts past the opener: a `-->` overlapping
-            // it (`<!-->`, `<!--->`) is not a terminator.
-            let rel = content.find("-->")?;
-            let end = 3 + rel;
-            offset = tag_start + 1 + end + 3;
+            // Search past the opener: a `-->` overlapping it
+            // (`<!-->`, `<!--->`) is an unterminated comment.
+            let Some(rel) = content.find("-->") else {
+                return Err(unterminated(tag_start));
+            };
+            offset = tag_start + 1 + 3 + rel + 3;
+            if let Some((tag, rel)) = hidden_tag(&inner[tag_start..offset]) {
+                return Err(hidden_modeled_tag(tag, tag_start + rel));
+            }
             continue;
         }
         if after_lt.starts_with('?') {
-            // Processing instruction: skip to `?>`.
-            let end = after_lt.find("?>")?;
+            let Some(end) = after_lt.find("?>") else {
+                return Err(unterminated(tag_start));
+            };
             offset = tag_start + 1 + end + 2;
+            if let Some((tag, rel)) = hidden_tag(&inner[tag_start..offset]) {
+                return Err(hidden_modeled_tag(tag, tag_start + rel));
+            }
             continue;
         }
-        if after_lt.starts_with("![CDATA[") {
-            // A CDATA section is character data at this level: its
-            // content counts as text, unlike a comment.
-            let end = after_lt.find("]]>")?;
-            out.push_str(&after_lt["![CDATA[".len()..end]);
-            offset = tag_start + 1 + end + 3;
+        if after_lt.starts_with('!') {
+            let Some(end) = after_lt.find('>') else {
+                return Err(unterminated(tag_start));
+            };
+            offset = tag_start + 1 + end + 1;
+            if let Some((tag, rel)) = hidden_tag(&inner[tag_start..offset]) {
+                return Err(hidden_modeled_tag(tag, tag_start + rel));
+            }
             continue;
         }
         if after_lt.starts_with('/') {
-            // A closing tag at this level is stray: the parent's
-            // close was stripped by the caller, so nothing may close
-            // here.
-            return None;
-        }
-        if after_lt.starts_with('!') {
-            // Other markup (e.g. a doctype): skip to `>`.
-            let end = after_lt.find('>')?;
-            offset = tag_start + 1 + end + 1;
-            continue;
+            // The parent's close was stripped by the caller, so nothing may close here.
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS response: stray closing tag in <{element}> at offset {tag_start}"),
+            ));
         }
         let name_end = after_lt
             .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
             .unwrap_or(after_lt.len());
         let tag_name = &after_lt[..name_end];
+        let Some(gt) = find_tag_end(after_lt) else {
+            return Err(unterminated(tag_start));
+        };
         if tag_name.is_empty() {
-            return None;
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "unexpected OBS response: empty tag name in <{element}> at offset {tag_start}"
+                ),
+            ));
         }
-        let gt = find_tag_end(after_lt)?;
         let tag_end = tag_start + 1 + gt + 1;
         if after_lt[..gt].trim_end().ends_with('/') {
-            // Self-closing: no content to skip.
+            // Self-closing child: skip it whole, past its own tag
+            // name so the name itself is not read as hidden.
+            let after_name = tag_start + 1 + tag_name.len();
+            if let Some((tag, rel)) = hidden_tag(&inner[after_name..tag_end]) {
+                return Err(hidden_modeled_tag(tag, after_name + rel));
+            }
             offset = tag_end;
             continue;
         }
-        let elem_end = xml_element_end(inner, tag_start, tag_name)?;
+        let Some(elem_end) = xml_element_end(inner, tag_start, tag_name) else {
+            return Err(unterminated_child(tag_name, tag_start));
+        };
+        // A modeled text child holds plain text only: the readers
+        // decode entities only, so any markup inside it would read
+        // as the literal value. Any other child is skipped whole,
+        // but a modeled tag hidden in one would still be found by
+        // the descendant readers, so any occurrence is rejected.
+        if matches!(
+            (element, tag_name),
+            ("repository", "arch")
+                | ("download", "archfilter")
+                | ("download", "pubkey")
+                | ("project", "title")
+                | ("project", "description")
+                | ("project", "url")
+                | ("project", "scmsync")
+        ) {
+            let tail = &inner[tag_end..elem_end];
+            let close = tail.rfind('<').unwrap_or(tail.len());
+            if let Some(rel) = tail[..close].find('<') {
+                let at = tag_end + rel;
+                if tail[rel..].starts_with("<![CDATA[") {
+                    return Err(cdata_in_child(tag_name, at));
+                }
+                return Err(markup_in_child(tag_name, at));
+            }
+        } else {
+            let after_name = tag_start + 1 + tag_name.len();
+            if let Some((tag, rel)) = hidden_tag(&inner[after_name..elem_end]) {
+                return Err(hidden_modeled_tag(tag, after_name + rel));
+            }
+        }
         offset = elem_end;
     }
-    Some(out)
+    Ok(())
 }
 
 /// The bodies of the `<!-- ... -->` comments that are direct
@@ -1572,6 +1731,15 @@ mod tests {
     }
 
     #[test]
+    fn xml_content_blank_reads_only_the_four_xml_whitespace_characters_as_blank() {
+        assert!(xml_content_blank(""));
+        assert!(xml_content_blank("  \t\r\n "));
+        // NBSP is character data, not whitespace.
+        assert!(!xml_content_blank("\u{a0}"));
+        assert!(!xml_content_blank(" x "));
+    }
+
+    #[test]
     fn xml_unescape_replaces_ampersand_last() {
         // `&amp;lt;` is an escaped `&lt;`, not a `<`: unescaping
         // `&amp;` first would read it as a literal `<`.
@@ -1847,49 +2015,243 @@ mod tests {
     }
 
     #[test]
-    fn xml_top_level_text_degenerate_openers_are_unterminated() {
-        // A `-->` overlapping the comment opener is not a
-        // terminator: the text is unterminated, like in the other
-        // scanners.
-        assert!(xml_top_level_text("<!-->").is_none());
-        assert!(xml_top_level_text("<!---><arch>x</arch>").is_none());
+    fn xml_reject_stray_text_accepts_whitespace_children_and_comments() {
+        assert!(xml_reject_stray_text("", "repository").is_ok());
+        assert!(xml_reject_stray_text(
+            "\n  <arch>x86_64</arch>\n  <path project=\"p\" repository=\"r\"/>\n",
+            "repository"
+        )
+        .is_ok());
+        assert!(
+            xml_reject_stray_text("<!-- note --><arch>x86_64</arch><?pi data?>", "repository")
+                .is_ok()
+        );
+        // Text left after a whole child is still stray, CDATA or not.
+        assert!(xml_reject_stray_text("<arch><![CDATA[x]]></arch>]]>", "repository").is_err());
     }
 
     #[test]
-    fn xml_top_level_text_reads_text_between_elements_and_cdata() {
-        assert_eq!(
-            xml_top_level_text("junk<arch>x86_64</arch>more"),
-            Some("junkmore".to_string())
+    fn xml_reject_stray_text_rejects_text_between_children() {
+        assert!(xml_reject_stray_text("stray<arch>x86_64</arch>", "repository").is_err());
+        assert!(xml_reject_stray_text("<arch>x86_64</arch>stray", "repository").is_err());
+        assert!(xml_reject_stray_text(
+            "<arch>x86_64</arch> stray <path project=\"p\" repository=\"r\"/>",
+            "repository"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text("   stray   ", "repository").is_err());
+        // NBSP is character data, not whitespace: it is stray text.
+        assert!(xml_reject_stray_text("<arch>x86_64</arch>\u{a0}", "repository").is_err());
+    }
+
+    #[test]
+    fn xml_reject_stray_text_rejects_any_cdata_section() {
+        assert!(xml_reject_stray_text("<![CDATA[stray]]>", "repository").is_err());
+        assert!(xml_reject_stray_text("<![CDATA[]]>", "repository").is_err());
+        assert!(xml_reject_stray_text("<arch>x86_64</arch><![CDATA[x]]>", "download").is_err());
+    }
+
+    #[test]
+    fn xml_reject_stray_text_rejects_cdata_inside_a_modeled_child() {
+        // The readers decode entities only, so a section here would read
+        // as the literal wrapper. The `<![CDATA[x></arch>]]>` shape still
+        // ends the child where the CDATA-aware walk says it ends.
+        assert!(xml_reject_stray_text("<arch><![CDATA[x86_64]]></arch>", "repository").is_err());
+        assert!(xml_reject_stray_text("<arch><![CDATA[x></arch>]]></arch>", "repository").is_err());
+        assert!(
+            xml_reject_stray_text("<archfilter><![CDATA[x86_64]]></archfilter>", "download")
+                .is_err()
         );
-        assert_eq!(
-            xml_top_level_text("<arch>x86_64</arch>"),
-            Some(String::new())
+        assert!(xml_reject_stray_text("<pubkey><![CDATA[key]]></pubkey>", "download").is_err());
+        // A section inside a child no reader reads as a value is
+        // skipped with the child.
+        assert!(xml_reject_stray_text("<status><![CDATA[x]]></status>", "repository").is_ok());
+    }
+
+    #[test]
+    fn xml_reject_stray_text_rejects_markup_inside_a_modeled_child() {
+        // The readers return the child's text verbatim (entities
+        // only), so a comment, processing instruction, or nested
+        // tag inside a modeled text child would read as the literal
+        // value — including a close-looking sequence inside the
+        // comment or CDATA section, which the descendant readers
+        // would also truncate on.
+        assert!(xml_reject_stray_text("<arch>x<!-- c --></arch>", "repository").is_err());
+        assert!(xml_reject_stray_text("<arch>x<!-- </arch> --></arch>", "repository").is_err());
+        assert!(xml_reject_stray_text("<arch><![CDATA[</arch>]]></arch>", "repository").is_err());
+        assert!(xml_reject_stray_text("<arch><b>x86_64</b></arch>", "repository").is_err());
+        assert!(xml_reject_stray_text("<arch>x<?pi data?></arch>", "repository").is_err());
+        assert!(xml_reject_stray_text(
+            "<archfilter>x<!-- </archfilter> --></archfilter>",
+            "download"
+        )
+        .is_err());
+        assert!(
+            xml_reject_stray_text("<pubkey>key<!-- </pubkey> --></pubkey>", "download").is_err()
         );
-        assert_eq!(
-            xml_top_level_text("<![CDATA[junk]]><arch>x86_64</arch>"),
-            Some("junk".to_string())
+        // Plain text with entities still parses: only literal
+        // markup is rejected.
+        assert!(xml_reject_stray_text("<arch>x86_64</arch>", "repository").is_ok());
+        assert!(
+            xml_reject_stray_text("<archfilter>x86_64&amp;arm</archfilter>", "download").is_ok()
         );
-        assert_eq!(
-            xml_top_level_text("  \n  <arch>x86_64</arch>\n  "),
-            Some("  \n  \n  ".to_string())
+    }
+
+    #[test]
+    fn xml_reject_stray_text_rejects_a_modeled_tag_hidden_in_skipped_content() {
+        // The descendant readers search raw text, so a modeled tag
+        // hidden in a comment, a processing instruction, or another
+        // child would still be read as a value: the gate rejects
+        // any occurrence in skipped content, markup or not.
+        assert!(xml_reject_stray_text("<!-- <arch>x86_64</arch> -->", "repository").is_err());
+        assert!(xml_reject_stray_text("<foo><arch>x86_64</arch></foo>", "repository").is_err());
+        assert!(xml_reject_stray_text(
+            "<path project=\"p\" repository=\"r\"><arch>x86_64</arch></path>",
+            "repository"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text("<?pi <arch>x86_64</arch> ?>", "repository").is_err());
+        assert!(xml_reject_stray_text(
+            "<download url=\"https://example.com\"><arch>x86_64</arch></download>",
+            "repository"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<!-- <download url=\"https://example.com\"/> -->",
+            "repository"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<foo><path project=\"p\" repository=\"r\"/></foo>",
+            "repository"
+        )
+        .is_err());
+        assert!(
+            xml_reject_stray_text("<!-- <archfilter>x86_64</archfilter> -->", "download").is_err()
         );
-        // Comments and processing instructions are skipped, not
-        // text; text inside a child belongs to the child.
-        assert_eq!(
-            xml_top_level_text("<!-- a note --><arch>x86_64</arch><?pi data?>"),
-            Some(String::new())
+        assert!(xml_reject_stray_text(
+            "<master url=\"https://example.com\"><pubkey>key</pubkey></master>",
+            "download"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text(
+            "<foo><master url=\"https://example.com\"/></foo>",
+            "download"
+        )
+        .is_err());
+        // Skipped content without a modeled tag still parses: a
+        // plain comment, and an unmodeled child carrying neither a
+        // modeled tag nor a section the readers would find.
+        assert!(xml_reject_stray_text("<!-- note -->", "repository").is_ok());
+        assert!(xml_reject_stray_text("<foo><bar>x</bar></foo>", "repository").is_ok());
+        assert!(xml_reject_stray_text("<status><![CDATA[x]]></status>", "repository").is_ok());
+    }
+
+    #[test]
+    fn xml_reject_stray_text_rejects_a_modeled_tag_hidden_at_project_level() {
+        // The project parser reads its modeled children with the
+        // same descendant readers, so a modeled tag hidden in a
+        // comment, a processing instruction, or another child would
+        // still be read as a value: the gate rejects any occurrence
+        // in skipped content, markup or not.
+        assert!(xml_reject_stray_text(
+            "<!-- <repository name=\"hidden\"><arch>x86_64</arch></repository> -->",
+            "project"
+        )
+        .is_err());
+        assert!(
+            xml_reject_stray_text("<foo><repository name=\"hidden\"/></foo>", "project").is_err()
         );
-        // A nested element of the same name is skipped whole.
-        assert_eq!(
-            xml_top_level_text("<a><a>inner</a>tail</a>after"),
-            Some("after".to_string())
+        assert!(xml_reject_stray_text("<!-- <devel project=\"d:p\"/> -->", "project").is_err());
+        assert!(xml_reject_stray_text("<!-- <title>Hidden</title> -->", "project").is_err());
+        assert!(xml_reject_stray_text(
+            "<!-- <person userid=\"x\" role=\"maintainer\"/> -->",
+            "project"
+        )
+        .is_err());
+        assert!(xml_reject_stray_text("<?pi <repository name=\"hidden\"/> ?>", "project").is_err());
+        // Skipped content without a modeled tag still parses.
+        assert!(xml_reject_stray_text("<!-- note --><repository name=\"r\"/>", "project").is_ok());
+        assert!(xml_reject_stray_text("<foo><bar>x</bar></foo>", "project").is_ok());
+    }
+
+    #[test]
+    fn xml_reject_stray_text_rejects_markup_inside_a_project_text_child() {
+        // The readers return the child's text verbatim (entities
+        // only), so a comment, processing instruction, nested tag,
+        // or CDATA section inside a project text child would read
+        // as the literal value.
+        assert!(xml_reject_stray_text("<title>See <b>x</b></title>", "project").is_err());
+        assert!(xml_reject_stray_text("<title><![CDATA[Foo]]></title>", "project").is_err());
+        assert!(xml_reject_stray_text("<title><![CDATA[</title>]]></title>", "project").is_err());
+        assert!(xml_reject_stray_text("<title>x<!-- </title> --></title>", "project").is_err());
+        assert!(
+            xml_reject_stray_text("<description>x<?pi data?></description>", "project").is_err()
         );
-        // Malformed content is None, never a partial read.
-        assert_eq!(xml_top_level_text("</arch>"), None);
-        assert_eq!(xml_top_level_text("<!-- never closed"), None);
-        assert_eq!(xml_top_level_text("<![CDATA[never closed"), None);
-        assert_eq!(xml_top_level_text("<arch>x86_64"), None);
-        assert_eq!(xml_top_level_text("<>"), None);
+        // Plain text with entities still parses: only literal
+        // markup is rejected.
+        assert!(xml_reject_stray_text("<title>Foo &amp; Bar</title>", "project").is_ok());
+        assert!(xml_reject_stray_text("<description>plain text</description>", "project").is_ok());
+    }
+
+    #[test]
+    fn xml_reject_stray_text_accepts_comments_and_whitespace_at_project_level() {
+        assert!(xml_reject_stray_text("", "project").is_ok());
+        assert!(xml_reject_stray_text(
+            "\n  <title>Factory</title>\n  <!-- note -->\n  <repository name=\"standard\"/>\n",
+            "project"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn xml_reject_stray_text_errors_carry_the_offset_in_the_element() {
+        let err = xml_reject_stray_text("stray<arch>x86_64</arch>", "repository").unwrap_err();
+        assert!(
+            err.context
+                .contains("stray text in <repository> at offset 0"),
+            "{}",
+            err.context
+        );
+        let err =
+            xml_reject_stray_text("<arch>x86_64</arch><![CDATA[x]]>", "repository").unwrap_err();
+        assert!(
+            err.context
+                .contains("CDATA section in <repository> at offset 19"),
+            "{}",
+            err.context
+        );
+        let err =
+            xml_reject_stray_text("<arch><![CDATA[x86_64]]></arch>", "repository").unwrap_err();
+        assert!(
+            err.context
+                .contains("CDATA section in <arch> in <repository> at offset 6"),
+            "{}",
+            err.context
+        );
+        let err = xml_reject_stray_text("<!-- never closed", "repository").unwrap_err();
+        assert!(
+            err.context
+                .contains("unterminated content in <repository> at offset 0"),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn xml_reject_stray_text_rejects_malformed_remainders() {
+        // A `-->` overlapping the comment opener (`<!-->`,
+        // `<!--->`) is not a terminator, it is an unterminated
+        // comment: the search starts past the `!--` opener, as in
+        // `xml_child_elements` and `xml_element_end`.
+        assert!(xml_reject_stray_text("<!-->", "repository").is_err());
+        assert!(xml_reject_stray_text("<!--->", "repository").is_err());
+        assert!(xml_reject_stray_text("<arch>x86_64</arch><!-->", "repository").is_err());
+        assert!(xml_reject_stray_text("<!-- never closed", "repository").is_err());
+        assert!(xml_reject_stray_text("<?pi never closed", "repository").is_err());
+        assert!(xml_reject_stray_text("<arch>x86_64</arch", "repository").is_err());
+        assert!(xml_reject_stray_text("</arch>", "repository").is_err());
+        assert!(xml_reject_stray_text("<></>", "repository").is_err());
     }
 
     #[test]

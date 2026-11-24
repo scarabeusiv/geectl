@@ -5485,8 +5485,11 @@ mod tests {
 
     #[test]
     fn read_project_meta_file_rejects_an_unterminated_element() {
-        // The element scan's error shape carries a server-response
-        // prefix; the file error keeps only the detail.
+        // The project-level gate catches the unterminated child
+        // before the descendant readers do, so the rejection names
+        // the element and its offset; the file error keeps only the
+        // detail.
+
         let path = write_temp_meta_file(
             "<project name=\"home:alice\">\
              <person userid=\"alice\" role=\"maintainer\"></project>",
@@ -5497,7 +5500,7 @@ mod tests {
         assert_eq!(
             err.context,
             format!(
-                "cannot parse meta file {}: malformed <person> element",
+                "cannot parse meta file {}: unterminated <person> in <project> at offset 0",
                 path.display()
             )
         );

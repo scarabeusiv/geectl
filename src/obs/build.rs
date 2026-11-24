@@ -18,6 +18,7 @@ use crate::xml::xml_attr_blank;
 use crate::xml::xml_child_elements;
 use crate::xml::xml_elements;
 use crate::xml::xml_escape;
+use crate::xml::xml_reject_stray_text;
 use crate::xml::xml_unescape;
 use crate::xml::XmlDoc;
 use std::collections::HashMap;
@@ -1806,8 +1807,9 @@ pub(crate) fn parse_builddepinfo(body: &str) -> Result<Vec<PackageDeps>, GeectlE
 /// project's repositories, with each repository's rebuild, block,
 /// and linkedbuild flags, downloads, release targets, and host
 /// systems. A document that is not a project — or a `<repository>`
-/// without a name, or a `<path>` without a project — is a server
-/// error, never an empty list.
+/// without a name, a `<path>` without a project, or stray text or a
+/// CDATA section inside a `<repository>` or `<download>` — is a
+/// server error, never an empty list.
 pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlError> {
     let body = body.trim();
     // A malformed project meta response still fails closed, but the error
@@ -1863,9 +1865,15 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
         return Err(malformed());
     }
     let inner = &inner[..close];
+    // The same fail-closed rule at the project level as the project
+    // meta parser: a modeled tag hidden in skipped content is
+    // rejected here, not silently dropped.
+    xml_reject_stray_text(inner, "project")?;
     let mut repositories = Vec::new();
     for element in xml_child_elements(inner, "repository")? {
         let (tag, content) = xml_split_element(element, "repository");
+        // The typed model drops this content, so the parse fails closed on it.
+        xml_reject_stray_text(content, "repository")?;
         let name = xml_attr_non_blank(tag, "name").ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
@@ -1904,6 +1912,8 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
         let mut downloads = Vec::new();
         for download in xml_elements(content, "download")? {
             let (download_tag, download_inner) = xml_split_element(download, "download");
+            // Same fail-closed rule inside `<download>`.
+            xml_reject_stray_text(download_inner, "download")?;
             let url = match xml_attr(download_tag, "url") {
                 Some(url) if !url.is_empty() => url,
                 Some(_) => {
@@ -6661,6 +6671,91 @@ mod tests {
     }
 
     #[test]
+    fn both_repository_parsers_reject_stray_text_and_cdata_in_repository_and_download() {
+        for body in [
+            "<project name=\"p\"><repository name=\"standard\">stray<arch>x86_64</arch></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch>stray</repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch>stray<path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><![CDATA[stray]]><arch>x86_64</arch></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><![CDATA[]]></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\">stray<master url=\"https://master.example.com\"/></download></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\"><![CDATA[stray]]></download></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\"><master url=\"https://master.example.com\"/>stray</download></repository></project>",
+            // A `-->` overlapping the opener is an unterminated comment, not a closed one.
+            "<project name=\"p\"><repository name=\"r\"><!--></repository></project>",
+            "<project name=\"p\"><repository name=\"r\"><!---></repository></project>",
+            // A section here would read as the literal wrapper in the field value.
+            "<project name=\"p\"><repository name=\"r\"><arch><![CDATA[x86_64]]></arch></repository></project>",
+            "<project name=\"p\"><repository name=\"r\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\"><archfilter><![CDATA[x86_64]]></archfilter></download></repository></project>",
+            // Markup inside a modeled text child would read as the
+            // literal value, and a close-looking sequence inside a
+            // comment or CDATA section would truncate it at the
+            // descendant readers' raw close-tag search.
+            "<project name=\"p\"><repository name=\"r\"><arch><b>x86_64</b></arch></repository></project>",
+            "<project name=\"p\"><repository name=\"r\"><arch>x<!-- </arch> --></arch></repository></project>",
+            "<project name=\"p\"><repository name=\"r\"><arch><![CDATA[</arch>]]></arch></repository></project>",
+            "<project name=\"p\"><repository name=\"r\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\"><archfilter>x<!-- </archfilter> --></archfilter></download></repository></project>",
+            // A modeled tag hidden in a comment or another child
+            // would still be found by the descendant readers: both
+            // parsers reject it instead of reading the hidden value.
+            "<project name=\"p\"><repository name=\"r\"><!-- <arch>x86_64</arch> --><path project=\"p\" repository=\"r\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"r\"><foo><arch>x86_64</arch></foo><path project=\"p\" repository=\"r\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"r\"><arch>x86_64</arch><!-- <download url=\"https://example.com\"/> --></repository></project>",
+            "<project name=\"p\"><repository name=\"r\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\"><!-- <pubkey>key</pubkey> --></download></repository></project>",
+            "<project name=\"p\"><repository name=\"r\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\"><foo><archfilter>x86_64</archfilter></foo></download></repository></project>",
+        ] {
+            assert!(parse_project_meta(body).is_err(), "{body}");
+            assert!(parse_repositories(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn both_repository_parsers_accept_whitespace_and_comments_between_children() {
+        let body = "<project name=\"p\">\n  <repository name=\"standard\">\n    <!-- note -->\n    <arch>x86_64</arch>\n    <download arch=\"x86_64\" url=\"https://example.com\">\n      <master url=\"https://master.example.com\"/>\n    </download>\n  </repository>\n</project>";
+        assert!(parse_project_meta(body).is_ok(), "{body}");
+        assert!(parse_repositories(body).is_ok(), "{body}");
+    }
+
+    #[test]
+    fn both_project_parsers_reject_a_modeled_tag_hidden_at_project_level() {
+        // The project parser reads its modeled children with
+        // descendant readers, so a modeled tag hidden in a comment,
+        // a processing instruction, or another child would still be
+        // read as a value; the repositories parser would silently
+        // drop it. Both reject it instead.
+        for body in [
+            "<project name=\"p\"><!-- <repository name=\"hidden\"><arch>x86_64</arch></repository> --></project>",
+            "<project name=\"p\"><foo><repository name=\"hidden\"><arch>x86_64</arch></repository></foo></project>",
+            "<project name=\"p\"><!-- <devel project=\"d:p\"/> --></project>",
+            "<project name=\"p\"><!-- <title>Hidden</title> --></project>",
+            "<project name=\"p\"><!-- <person userid=\"x\" role=\"maintainer\"/> --></project>",
+            "<project name=\"p\"><?pi <repository name=\"hidden\"/> ?></project>",
+            // Markup or a section inside a project text child would
+            // read as the literal value, including a close-looking
+            // sequence inside the comment or CDATA section.
+            "<project name=\"p\"><title>See <b>x</b></title></project>",
+            "<project name=\"p\"><title><![CDATA[Foo]]></title></project>",
+            "<project name=\"p\"><title><![CDATA[</title>]]></title></project>",
+            "<project name=\"p\"><title>x<!-- </title> --></title></project>",
+            "<project name=\"p\"><description>x<?pi data?></description></project>",
+            // Stray text or a section directly under <project> is
+            // dropped content, so the parse fails closed on it.
+            "<project name=\"p\">stray<repository name=\"r\"/></project>",
+            "<project name=\"p\"><![CDATA[stray]]><repository name=\"r\"/></project>",
+        ] {
+            assert!(parse_project_meta(body).is_err(), "{body}");
+            assert!(parse_repositories(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn both_project_parsers_accept_a_comment_between_project_children() {
+        let body = "<project name=\"p\">\n  <title>Factory</title>\n  <!-- note -->\n  <repository name=\"standard\">\n    <arch>x86_64</arch>\n  </repository>\n</project>";
+        assert!(parse_project_meta(body).is_ok(), "{body}");
+        assert!(parse_repositories(body).is_ok(), "{body}");
+    }
+
+    #[test]
     fn both_repository_parsers_agree_on_empty_attribute_values() {
         let body = "<project name=\"testproject\"><repository name=\"standard\" rebuild=\"\" block=\"\" linkedbuild=\"\"><arch>x86_64</arch><download arch=\"\" url=\"https://example.com\" repotype=\"\"><archfilter> </archfilter><master url=\"https://master.example.com\" sslfingerprint=\"\"/><pubkey> </pubkey></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
         let via_project_meta = parse_project_meta(body).unwrap();
@@ -6996,8 +7091,7 @@ mod tests {
             assert!(parse_repositories(&body).is_err(), "{body}");
         }
         // An unterminated single-value child is an error, not an
-        // absent value: the old readers returned None here, the
-        // strict readers reject the malformed response instead.
+        // absent value: the stray-text gate rejects it first.
         for (children, child) in [
             ("<archfilter>x86_64", "archfilter"),
             ("<pubkey>aaa", "pubkey"),
@@ -7007,7 +7101,7 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::ServerError);
             assert!(
                 err.context
-                    .contains(&format!("malformed <{child}> element")),
+                    .contains(&format!("unterminated <{child}> in <download>")),
                 "{body}: {}",
                 err.context
             );
