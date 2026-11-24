@@ -15,52 +15,21 @@ run `geectl --help` or `geectl <group> --help` for the same text live.
 geectl [--format json|text] [--debug] [--debug-body] [--live] <group> <command> [args] [flags]
 ```
 
-- Required coordinates are positionals where the leaf takes them;
-  the build group orders them project, package, repository, arch.
-  Branch and maintenance take coordinates as long flags. The exact
-  order per leaf is in its `--help` block below. Everything else is
-  a named long flag. No short flags on group/leaf options apart from
-  clap's built-in `-h`/`-V`, and no command aliases.
-- `--format` selects the stdout payload: `json` (default — the only
-  format an agent should parse) or `text` (a human rendering of the
-  same data). The same invocation produces the same bytes in every
-  context; there is no terminal sniffing. A persistent default comes
-  from `GEECTL_FORMAT`, else the `format` key in the config file;
-  `--format` wins over both. Agent invocations pass
-  `--format json` explicitly.
-- `--debug` prints human-readable diagnostic lines on stderr (HTTP
-  attempts, retries, library decisions); `GEECTL_DEBUG=1` enables it
-  without the flag. `--debug-body` additionally prints request and
-  response bodies (capped, redacted, never headers). Debug never
-  changes stdout.
-- Mutations are dry-run by default: without `--live` only the plan is
-  printed (on stderr as it is recorded, and in the payload as
-  `dry_run: true` with a `plan`). Pass the global `--live` to perform
-  the mutation. The one exception is `request supersede`, which has
-  no dry-run at all: without `--live` it refuses — the library's raw
-  supersede cannot be previewed, so use `request refile --supersede`
-  for the dry-runnable supersede flow.
-- `remote set-project-meta` in dry-run validates no repositories:
-  it performs no fetch and cannot tell a changed repository from a
-  pre-existing one, so an unrelated repository cannot block an
-  unrelated change in either mode; `--live` validates only the
-  repositories it changes.
-- `request file-delete` deletes a whole project only with
-  `--whole-project`: omitting `--package` and `--repository` without
-  it refuses.
-- Errors go to stderr in the selected format (JSON payload, or
-  `error:` + `remediation:` lines in text mode) with the error kind's
-  exit code. A parse error has no parsed CLI yet, so it stays JSON.
-- Text renderings open with one header line echoing the query
-  coordinates (`project: … package: … …`); tables follow as designed.
-  Content commands (`remote cat`, `remote revision-patch`,
-  `remote project-diff`, `remote diff-packages`, `build build-log`,
-  `request diff`, `gitea branch-head`)
-  render verbatim, with no header — the coordinates live in the JSON
-  payload. Two renderings keep no header either: `remote
-  list-projects` (the query names nothing to echo) and the request
-  action texts (one-line outcome summaries; the plan is on stderr
-  and in the payload).
+Required coordinates are positionals where the leaf takes them; the build group orders them project, package, repository, arch. Branch and maintenance take coordinates as long flags. The exact order per leaf is in its `--help` block below. Everything else is a named long flag. Group/leaf options take long flags only, apart from clap's built-in `-h`/`-V`. Each command has a single name.
+
+`--format` selects the stdout payload: `json` (default — the format agents parse) or `text` (a human rendering of the same data). The same invocation produces the same bytes in every context. A persistent default comes from `GEECTL_FORMAT`, else the `format` key in the config file; `--format` wins over both. Agent invocations pass `--format json` explicitly.
+
+`--debug` prints human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions); `GEECTL_DEBUG=1` enables it without the flag. `--debug-body` additionally prints request and response bodies (capped, redacted, header-free). Debug leaves stdout alone.
+
+Mutations are dry-run by default: without `--live` only the plan is printed (on stderr as it is recorded, and in the payload as `dry_run: true` with a `plan`). Pass the global `--live` to perform the mutation. The one exception is `request supersede`, which has no dry-run: without `--live` it refuses — the library's raw supersede has no preview, so use `request refile --supersede` for the dry-runnable supersede flow.
+
+`remote set-project-meta` in dry-run validates no repositories: it performs no fetch and reads every carried repository as pre-existing; `--live` validates only the repositories it changes.
+
+`request file-delete` deletes a whole project only with `--whole-project`: omitting `--package` and `--repository` without it refuses.
+
+Errors go to stderr in the selected format (JSON payload, or `error:` + `remediation:` lines in text mode) with the error kind's exit code. A parse error has no CLI to format, so it stays JSON.
+
+Text renderings open with one header line echoing the query coordinates (`project: … package: … …`); tables follow as designed. Content commands (`remote cat`, `remote revision-patch`, `remote project-diff`, `remote diff-packages`, `build build-log`, `request diff`, `gitea branch-head`) render verbatim, opening with the content — the coordinates live in the JSON payload. Two renderings open with the content directly too: `remote list-projects` (the query names the instance only) and the request action texts (one-line outcome summaries; the plan is on stderr and in the payload).
 
 ### Credentials in dry-run
 
@@ -70,14 +39,14 @@ alias to URL, and the credential variables use the alias uppercased:
 
 ```toml
 [instances]
-myloveinstance = "https://api.opensuse.org"
+example = "https://api.opensuse.org"
 local = "http://127.0.0.1:3001"
 ```
 
 ```sh
-GEECTL_OBS_USERNAME_MYLOVEINSTANCE=... GEECTL_OBS_PASSWORD_MYLOVEINSTANCE=...
+GEECTL_OBS_USERNAME_EXAMPLE=... GEECTL_OBS_PASSWORD_EXAMPLE=...
 GEECTL_OBS_USERNAME_LOCAL=... GEECTL_OBS_PASSWORD_FILE_LOCAL=/run/secrets/local-password
-GEECTL_OBS_APIKEY_MYLOVEINSTANCE=...   # a token instead of the pair
+GEECTL_OBS_APIKEY_EXAMPLE=...   # a token instead of the pair
 ```
 
 The plain `GEECTL_OBS_APIKEY` (or `..._APIKEY_FILE`) or
@@ -85,12 +54,12 @@ The plain `GEECTL_OBS_APIKEY` (or `..._APIKEY_FILE`) or
 `..._PASSWORD_FILE`) apply to the configured instance; a call to
 another instance resolves the alias whose configured URL matches
 it (same scheme, host, and effective port — `https://host` and
-`https://host:443` are the same instance, `http://host:3000` and
-`https://host:3000` are not) and uses that alias's variables. A
-call to another instance with no credentials configured for it
-fails clearly naming what to set — the alias variables when an
-alias matches, the `[instances]` entry to add when none does — and
-the configured instance's credentials are never forwarded.
+`https://host:443` resolve to one instance; `http://host:3000` and
+`https://host:3000` resolve to two) and uses that alias's variables. A
+call to another instance with zero configured credentials
+fails naming what to set — the alias variables for a matching
+alias, the `[instances]` entry to add otherwise — and
+the configured instance's credentials stay with it.
 `branch copy-package --to-apiurl` resolves the target's
 credentials this way.
 
@@ -98,22 +67,21 @@ The same rule applies to Gitea: `GEECTL_GITEA_TOKEN_<ALIAS>` (or
 `GEECTL_GITEA_TOKEN_FILE_<ALIAS>`) for the instance named in
 `[instances]`, e.g. `GEECTL_GITEA_TOKEN_LIVE` for an instance named
 `live`; the plain `GEECTL_GITEA_TOKEN` (or
-`GEECTL_GITEA_TOKEN_FILE`) applies to the configured Gitea URL and
-is never forwarded to another instance.
+`GEECTL_GITEA_TOKEN_FILE`) applies to the configured Gitea URL only.
 
-A half-configured credential pair (a username with no password source,
-or the reverse) is handled per group. `branch`, `maintenance`, and
+A half-configured credential pair (username only, or password
+only) is handled per group. `branch`, `maintenance`, and
 `service` fail fast on it before any work — `branch` and `maintenance`
-in dry-run too, since a dry run that cannot be performed live is not a
-useful preview (`service`'s trigger is the mutation there; its reads
-need no credentials but resolve them up front).
-`request` swallows it in dry-run (a preview never needs credentials;
+in dry-run too, since a dry run previews a live run
+(`service`'s trigger is the mutation there; its reads are public
+but resolve credentials up front).
+`request` swallows it in dry-run (a preview performs no write;
 the dropped error goes to the debug channel). `remote` and `build`
 resolve credentials per command instead: the public reads (see
-Credentials in `docs/architecture.md`) never touch them, so a half-set
-env must not break them, and neither does a dry-run `remote` mutation
-preview; every other command in those groups fails fast on a half-set
-pair up front. `remote list-files --include-deleted` resolves
+Credentials in `docs/architecture.md`) skip credentials, so a half-set
+env leaves them working; a dry-run `remote` mutation
+preview leaves them working too; every other command in those groups
+fails fast on a half-set pair up front. `remote list-files --include-deleted` resolves
 credentials too: the deleted listing reads the authenticated route.
 Setting both a token and a Basic pair for one instance
 is a configuration error at the same resolution points.
@@ -125,27 +93,25 @@ without exporting them, when the run opts in with `GEECTL_DOTENV=1` in
 the real process environment: geectl loads it at startup and merges it into
 the environment snapshot, with a real environment variable winning
 over the same key in the file. Only `GEECTL_*` keys are honoured. A
-key starting with `GEEC` that is not a valid `GEECTL_*` key, or a
-`GEECTL_*` key with anything but ASCII letters, digits, or `_` after
+key starting with `GEEC` that fails the `GEECTL_*` shape, or a
+`GEECTL_*` key carrying anything outside ASCII letters, digits, or `_` after
 the prefix, is a typo for a geectl variable and fails as a config
-error rather than being silently ignored. The syntax is minimal —
+error. The syntax is minimal —
 `KEY=value`, `#` comments, blank lines, an optional `export` prefix
-followed by whitespace (a key glued to `export` is malformed), and optional single or double quotes — with no
-variable interpolation and no multi-line values. A duplicate key keeps
-its last value, and quoted values are literal inside the quotes, with
-no escapes. The file must be a regular file, at most 64 KiB, and
+followed by whitespace (a key glued to `export` is malformed), and optional single or double quotes — values stay literal, one line each. A duplicate key keeps
+its last value, and quoted values are literal inside the quotes. The file must be a regular file, at most 64 KiB, and
 readable only by its owner (`chmod 600`) on Unix — on non-Unix the
-mode cannot be checked, and the opt-in is the guard there. A missing
-file is fine, and so is a file that carries no `GEECTL_*` keys,
+mode goes unchecked, and the opt-in is the guard there. A missing
+file is fine, and so is a file with zero `GEECTL_*` keys,
 whatever its mode or syntax — but an unreadable, malformed, or
 group/other-readable file that carries `GEECTL_*` keys fails at
 startup as a config error naming the file (and the line, for a
-malformed line), never the value. `--version` and `--help` print and
-exit before the file is loaded, so they never fail on it. `--debug`
-reports that a `.env`
-file was loaded, never its values. Values from the file report their
-source as `environment` in `config show`. No parent directory is
-searched, and `.env.*` files are not loaded.
+malformed line) only. `--version` and `--help` print and
+exit before the file is loaded, so they ignore it. `--debug`
+reports a `.env`
+load; the values stay in the file. Values from the file report their
+source as `environment` in `config show`. The load covers the working
+directory's `.env` only.
 
 ## Top level
 
@@ -492,7 +458,7 @@ Options:
 
 `build buildinfo` as JSON carries the dependency names in `bdeps` (strings)
 and the project each resolves from in the parallel `bdep_projects` array,
-aligned by index (`null` when the server did not say — a virtual provide
+aligned by index (`null` for a silent server — a virtual provide
 or a not-installed flag). Text output renders each dependency as
 `name (project)` when the server said one.
 
@@ -548,10 +514,10 @@ Options:
 
 `local-build build --trust-all-projects` allows build dependencies from
 other users' `home:` projects: their packages run code in the build root,
-so without the flag such builds are refused. The flag lifts only the
-foreign-`home:` refusal for the dep set the buildinfo enumerates —
-non-`home:` projects and the caller's own `home:` were always trusted —
-and takes no per-project selection, unlike osc's `trusted_prj` globs.
+so the flag gates such builds. The flag lifts the
+foreign-`home:` refusal only, for the dep set the buildinfo enumerates —
+non-`home:` projects and the caller's own `home:` are trusted —
+and covers the whole dep set at once, unlike osc's `trusted_prj` globs.
 The accepted foreign `home:` projects are recorded in the build record
 (`trusted_foreign_projects`). A dry run records the flag in the plan
 without evaluating trust.
@@ -930,8 +896,8 @@ The working-copy leaves operate on the checkout in the current
 directory: `checkout` writes `<dir>/<project>/<package>/` under the
 current directory (a `:` in a project or package name becomes `_` in
 the directory name), the rest open the checkout found there. `commit`
-runs the source services and `pre_checkin.sh` before sending, unless
-`--noservice` is passed. The base record lives in the checkout's git
+runs the source services and `pre_checkin.sh` before sending, with
+`--noservice` skipping that gate. The base record lives in the checkout's git
 config (`geectl.apiurl`, `geectl.project`, `geectl.package`,
 `geectl.backend`, `geectl.base-rev`, `geectl.base-srcmd5`).
 
@@ -1241,23 +1207,22 @@ Validate a package directory before filing: `changelog validate` exits
 24 (`validation_failed`) naming the failing rule, and lists the
 skipped target-relative rules when no target is given. `changelog
 generate` prints a draft entry — a bare version line plus explicit
-`TODO` slots — never a submission; `--write` prepends it into the
+`TODO` slots — a draft only; `--write` prepends it into the
 package's `.changes` file and refuses a draft with unfilled
 `TODO` slots or a needs-detail flag. Writing normalizes the whole
 file: trailing ASCII whitespace is stripped from every line,
 CRLF becomes LF, legacy-encoded bytes are transcoded to UTF-8
-(best-effort; valid UTF-8 is never re-decoded), a BOM is stripped,
+(best-effort; valid UTF-8 passes through untouched), a BOM is stripped,
 and a UTF-16 file is decoded whole first. The write is atomic (a
 temp file in the same directory, then a rename, keeping the
 destination's permissions) and refuses a symlink destination, an
-unreadable file, or bytes no known encoding decodes; the guessed
+unreadable file, or bytes outside every known encoding; the guessed
 encoding is named on the debug channel. One limit remains: a file
 decoded from a guessed single-byte encoding is transcoded on the
-guess, never refused — a single-byte guess cannot report a decode
-error, so a wrong guess (a corrupt byte disabling the multi-byte
+guess — a single-byte guess always decodes, so a wrong guess (a corrupt byte disabling the multi-byte
 probers) still decodes cleanly and the valid UTF-8 half can be
 rewritten as mojibake. The write warns about the guess on stderr,
-naming the encoding, instead of staying silent.
+naming the encoding.
 
 The `request file` flags above are illustrative — run
 `geectl request file --help` for the exact flag set. The same holds
@@ -1266,12 +1231,12 @@ reproduces it verbatim where it quotes it.
 
 The `request file` JSON's `cve` field carries the `--cve` values
 parsed and normalized to uppercase `CVE-<year>-<number>` (year 1999
-or later, number at least 4 digits), never the raw strings.
+or later, number at least 4 digits); raw strings become normalized values.
 
 ## How it differs from osc
 
-geectl is not osc with a new name: one noun per operation family,
-explicit flags instead of positionals, no working-copy inference,
+geectl differs from osc: one noun per operation family,
+explicit flags instead of positionals, explicit working-copy leaves,
 JSON by default with opt-in text, and dry-run by default for
 mutations. The full list of deliberate deviations, with reasons, is
 [docs/cli-swaps.md](cli-swaps.md).

@@ -6323,11 +6323,10 @@ fn live_list_repositories_reads_back_the_added_repo() {
     assert_eq!(repos[0].paths[0].1, "standard");
 }
 
-/// Add a repository through the library, verified by re-listing
-/// (the borrow-map batch-5 `:24` case): `new-repo` with two
-/// architectures and two paths reads back with its name,
-/// architectures, and paths. Adding the same repository again is an
-/// error, not a no-op.
+/// Add a repository through the library, verified by re-listing:
+/// `new-repo` with two architectures and two paths reads back with
+/// its name, architectures, and paths. Adding the same repository
+/// again is an error, not a no-op.
 #[test]
 fn live_add_repository_round_trips() {
     let Some(base) = live_url() else {
@@ -6432,10 +6431,9 @@ fn live_full_repository_shape_round_trips() {
     assert_eq!(meta.repositories, vec![repository]);
 }
 
-/// Remove a repository through the library, verified by re-listing
-/// (the borrow-map batch-5 `:45` case): removing `standard` empties
-/// the list, and removing a repository that is not there is not an
-/// error and writes nothing.
+/// Remove a repository through the library, verified by re-listing:
+/// removing `standard` empties the list, and removing a repository
+/// that is not there is not an error and writes nothing.
 #[test]
 fn live_remove_repository_round_trips() {
     let Some(base) = live_url() else {

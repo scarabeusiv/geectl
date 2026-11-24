@@ -63,7 +63,7 @@ pub struct Config {
     pub format: Option<String>,
     /// Named instances from the config file's `[instances]`
     /// table, sorted by alias: `(alias, url)` pairs, e.g.
-    /// `myloveinstance = "https://api.opensuse.org"`. The alias
+    /// `example = "https://api.opensuse.org"`. The alias
     /// names the instance's credential variables
     /// (`GEECTL_OBS_APIKEY[_FILE]_<ALIAS>` or
     /// `GEECTL_OBS_USERNAME_<ALIAS>` and friends — see
@@ -1159,25 +1159,25 @@ mod tests {
     #[test]
     fn instances_table_parses_sorted_by_alias() {
         let config = parse_config(
-            "[instances]\nmyloveinstance = \"https://api.opensuse.org\"\nlocal = \"http://127.0.0.1:3001\"\n",
+            "[instances]\nexample = \"https://api.opensuse.org\"\nlocal = \"http://127.0.0.1:3001\"\n",
             &config_path(),
         )
         .unwrap();
         assert_eq!(
             config.instances,
             vec![
-                ("local".to_string(), "http://127.0.0.1:3001".to_string()),
                 (
-                    "myloveinstance".to_string(),
+                    "example".to_string(),
                     "https://api.opensuse.org".to_string()
                 ),
+                ("local".to_string(), "http://127.0.0.1:3001".to_string()),
             ]
         );
     }
 
     #[test]
     fn instances_alias_must_be_an_env_var_segment() {
-        for alias in ["my-instance", "my instance", "mylove.instance"] {
+        for alias in ["my-instance", "my instance", "example.instance"] {
             let text = format!("[instances]\n\"{alias}\" = \"https://api.opensuse.org\"\n");
             let err = parse_config(&text, &config_path()).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ConfigError, "alias {alias:?}");
@@ -1292,9 +1292,9 @@ mod tests {
 
     #[test]
     fn instances_value_must_be_a_url_string() {
-        let err = parse_config("[instances]\nmyloveinstance = 42\n", &config_path()).unwrap_err();
+        let err = parse_config("[instances]\nexample = 42\n", &config_path()).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConfigError);
-        assert!(err.context.contains("myloveinstance"));
+        assert!(err.context.contains("example"));
     }
 
     #[test]
