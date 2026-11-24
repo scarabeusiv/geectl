@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -1166,6 +1167,48 @@ fn ls_files_entries(
     Ok(entries)
 }
 
+/// The index's stage-0 `(name, mode, blob SHA)` entries: one
+/// `ls-files` for the whole index. Conflicted paths carry stages
+/// 1-3 instead of a stage 0, so they are absent here: a caller
+/// that overlays the index on a tree falls back to the tree's
+/// version for them instead of failing on the conflict.
+fn ls_files_stage0_entries(wc: &WorkingCopy) -> Result<Vec<(String, String, String)>, GeectlError> {
+    let out = git(&wc.root, "ls-files", &["-s", "-z"], &[])?;
+    let mut entries = Vec::new();
+    for field in split_nul(&out) {
+        let Some((meta, name)) = field.split_once('\t') else {
+            return Err(GeectlError::new(
+                ErrorKind::WorkingCopyInconsistent,
+                "git ls-files output is malformed: an entry has no name",
+            ));
+        };
+        let mut parts = meta.split_whitespace();
+        let Some(mode) = parts.next() else {
+            return Err(GeectlError::new(
+                ErrorKind::WorkingCopyInconsistent,
+                "git ls-files output is malformed: an entry has no mode",
+            ));
+        };
+        let Some(sha) = parts.next() else {
+            return Err(GeectlError::new(
+                ErrorKind::WorkingCopyInconsistent,
+                "git ls-files output is malformed: an entry has no blob SHA",
+            ));
+        };
+        let Some(stage) = parts.next() else {
+            return Err(GeectlError::new(
+                ErrorKind::WorkingCopyInconsistent,
+                "git ls-files output is malformed: an entry has no stage",
+            ));
+        };
+        if stage != "0" {
+            continue;
+        }
+        entries.push((name.to_string(), mode.to_string(), sha.to_string()));
+    }
+    Ok(entries)
+}
+
 /// Whether `path` is in the index.
 fn index_has(wc: &WorkingCopy, path: &str) -> Result<bool, GeectlError> {
     let (success, stdout, _) = git_status(
@@ -1807,8 +1850,23 @@ fn is_unmerged(x: char, y: char) -> bool {
 /// (the index against the base) plus the unstaged half (the
 /// worktree against the index) cover every change exactly once: a
 /// single `git diff <base>` sees only the worktree, so a
-/// staged-only change would be invisible.
-pub fn diff(wc: &WorkingCopy) -> Result<String, GeectlError> {
+/// staged-only change would be invisible. On a linked checkout the
+/// link diff follows: the staged index, overlaid on the link
+/// target's content at the pinned revision, diffed against that
+/// content — the link's delta over its target, in the same
+/// staged/worktree split (the worktree half above already covers
+/// the unstaged edits to the link's own files). `client` is the
+/// OBS client for the link-target read; `None` keeps the local
+/// diff only, and a linked checkout with no client is an error.
+/// The second return value is the skipped-link note: when the
+/// link-target read fails, the plain halves still stand and the
+/// note names the failure (the caller prints it to stderr) —
+/// the diff used to be purely local git, and a failed target
+/// read must not discard it.
+pub fn diff(
+    wc: &WorkingCopy,
+    client: Option<&ObsClient>,
+) -> Result<(String, Option<String>), GeectlError> {
     let base = wc.base_commit()?;
     let mut out = git(
         &wc.root,
@@ -1828,6 +1886,23 @@ pub fn diff(wc: &WorkingCopy) -> Result<String, GeectlError> {
         &["--no-ext-diff", "--no-color", "--no-textconv"],
         &[],
     )?);
+    // A link-target read failure degrades instead of failing the
+    // whole diff: the plain halves are already computed and stand
+    // on their own, and `diff` on a linked checkout used to be
+    // purely local git. The note carries the failure for the
+    // caller's stderr. A linked checkout with no client is a
+    // caller error, not a read failure, so it still errors.
+    let mut note = None;
+    match link_diff_section(wc, client) {
+        Ok(Some(link)) => out.push_str(&link),
+        Ok(None) => {}
+        Err(err) => {
+            if client.is_none() {
+                return Err(err);
+            }
+            note = Some(format!("warning: skipping the link diff: {err}"));
+        }
+    }
     let untracked = git(
         &wc.root,
         "ls-files",
@@ -1842,7 +1917,230 @@ pub fn diff(wc: &WorkingCopy) -> Result<String, GeectlError> {
             out.push('\n');
         }
     }
-    Ok(out)
+    Ok((out, note))
+}
+
+/// Whether the checkout is a linked OBS package: the OBS backend
+/// with a `_link` file in the index. A git-backed checkout never
+/// counts, even when it carries a file named `_link`.
+pub fn is_linked(wc: &WorkingCopy) -> Result<bool, GeectlError> {
+    Ok(wc.backend == Backend::Obs && index_has(wc, "_link")?)
+}
+
+/// The link diff section for a linked checkout: the staged index
+/// overlaid on the link target's content, diffed against that
+/// content. `None` when the checkout is not linked, or when the
+/// link adds nothing over its target. A linked checkout needs the
+/// client for the target read: without one the section is an
+/// error, not a silent skip.
+fn link_diff_section(
+    wc: &WorkingCopy,
+    client: Option<&ObsClient>,
+) -> Result<Option<String>, GeectlError> {
+    if !is_linked(wc)? {
+        return Ok(None);
+    }
+    // A conflicted `_link` has no single staged version to read:
+    // the link section is skipped and the plain halves (which show
+    // the conflict) still stand.
+    if unmerged_files(wc)?.iter().any(|path| path == "_link") {
+        return Ok(None);
+    }
+    let Some(client) = client else {
+        return Err(GeectlError::new(
+            ErrorKind::InternalError,
+            "diff on a linked checkout needs an OBS client for the link target read",
+        ));
+    };
+    let (link_project, link_package, pin, mut listing) = link_target_listing(wc, client)?;
+    // `_link` is the link itself, not linked content: the target
+    // tree never carries it, so a chained link's own `_link` does
+    // not read as a deletion either.
+    listing.entries.retain(|entry| entry.name != "_link");
+    let target_tree = build_base_tree(
+        client,
+        wc,
+        &listing,
+        &link_project,
+        &link_package,
+        Some(&pin),
+        None,
+        None,
+        false,
+    )?;
+    let staged_tree = build_staged_link_tree(wc, &target_tree)?;
+    let diff = git(
+        &wc.root,
+        "diff",
+        &[
+            "--no-ext-diff",
+            "--no-color",
+            "--no-textconv",
+            &target_tree,
+            &staged_tree,
+        ],
+        &[],
+    )?;
+    if diff.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "\nLink diff ({link_project}/{link_package} at {pin}):\n{diff}"
+    )))
+}
+
+/// The link target and its listing at the pinned revision: the
+/// `_link` baserev when the link carries one, else the target's
+/// latest srcmd5 from its own listing (a baserev-less link has no
+/// recorded base; the listing's srcmd5 pins the downloads that
+/// follow). The listing is the target's own files: a chained link
+/// resolves one level — the immediate target's files, not its
+/// target's.
+fn link_target_listing(
+    wc: &WorkingCopy,
+    client: &ObsClient,
+) -> Result<(String, String, RevisionSpec, DirectoryListing), GeectlError> {
+    let link_content = index_content(wc, "_link")?;
+    let link_text = String::from_utf8_lossy(&link_content);
+    let doc = XmlDoc::parse(&link_text)?;
+    let (link_project, link_package) = link_target(&doc)?;
+    match doc.root_attr("baserev") {
+        Some(baserev) => {
+            let pin = RevisionSpec::parse(&baserev)?;
+            let (listing, _) =
+                client.directory_listing_rev(&link_project, &link_package, Some(&pin))?;
+            Ok((link_project, link_package, pin, listing))
+        }
+        None => {
+            let (listing, (_, _, srcmd5)) =
+                client.directory_listing_rev(&link_project, &link_package, None)?;
+            let srcmd5 = srcmd5.ok_or_else(|| {
+                GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "the server did not return a source md5 for {link_project}/{link_package}"
+                    ),
+                )
+            })?;
+            Ok((
+                link_project,
+                link_package,
+                RevisionSpec::parse(&srcmd5)?,
+                listing,
+            ))
+        }
+    }
+}
+
+/// The staged link tree: the target tree overlaid with the staged
+/// index (minus `_link`). A path the index carries wins over the
+/// target's version; a path the index drops falls back to the
+/// target's version (the link stops overriding it); a path the
+/// index never carried stays the target's. Conflicted paths have
+/// no stage-0 entry, so they fall back to the target's version
+/// instead of failing the diff: the plain halves already show the
+/// conflict.
+/// Counter for unique temporary link-index names: concurrent
+/// `diff`s each build their own staged link tree, so a fixed index
+/// name would let one call's `read-tree`/`update-index` interleave
+/// with another's `write-tree` and write a mixed tree.
+static LINK_TMP_INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn build_staged_link_tree(wc: &WorkingCopy, target_tree: &str) -> Result<String, GeectlError> {
+    let git_dir = git(&wc.root, "rev-parse", &["--absolute-git-dir"], &[])?;
+    let git_dir = PathBuf::from(git_dir.trim());
+    // Unique per call: a fixed name is shared by concurrent
+    // `diff`s, and interleaved remove/create/read-tree/update-index
+    // can `write-tree` a mixed index — silent wrong output. The
+    // pid separates processes, the counter separates calls (and
+    // threads) within one process.
+    let n = LINK_TMP_INDEX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_index = git_dir.join(format!("geectl-link-tmp-index-{}-{n}", std::process::id()));
+    let _cleanup = TempCleanup {
+        paths: vec![tmp_index.clone()],
+    };
+    let _ = std::fs::remove_file(&tmp_index);
+    let tmp_index_str = tmp_index.to_string_lossy().into_owned();
+    let index_env = [("GIT_INDEX_FILE", tmp_index_str.as_str())];
+    git(&wc.root, "read-tree", &["--empty"], &index_env)?;
+    // The target tree first: every target file lands in the
+    // staged tree unless the index overrides it below. Target
+    // entries are 100644 by construction (`build_base_tree`
+    // inserts that mode: the server listing carries none).
+    let target_entries: Vec<(String, String, String)> = ls_tree_entries(wc, target_tree)?
+        .into_iter()
+        .map(|(name, sha)| (name, "100644".to_string(), sha))
+        .collect();
+    add_cacheinfo_entries(wc, &index_env, &target_entries)?;
+    let staged: Vec<(String, String, String)> = ls_files_stage0_entries(wc)?
+        .into_iter()
+        .filter(|(name, _, _)| name != "_link")
+        .collect();
+    add_cacheinfo_entries(wc, &index_env, &staged)?;
+    let tree = git(&wc.root, "write-tree", &[], &index_env)?;
+    Ok(tree.trim().to_string())
+}
+
+/// Cap on one `git update-index` call's argv bytes: one
+/// `--cacheinfo` value is `mode,sha,path` plus its flag, and the cap
+/// keeps the call well under the smallest Unix `ARG_MAX` (macOS:
+/// 256 KiB), environment included. Windows is stricter:
+/// `CreateProcess` caps the whole command line at 32,767
+/// characters, program path and quoting included, so there the cap
+/// is 16 KiB — under half the limit, leaving the other half for the
+/// program path, the `update-index --add` prefix and quoting of
+/// paths with spaces.
+#[cfg(windows)]
+const BATCH_ARG_BYTES: usize = 16 * 1024;
+#[cfg(not(windows))]
+const BATCH_ARG_BYTES: usize = 64 * 1024;
+
+/// Add `entries` (`name`, `mode`, blob SHA) to the temporary
+/// index, in batches: a large target costs a few spawns, not one
+/// per file — and no single call's argv approaches the platform cap,
+/// which one call for the whole list would exceed on a large target
+/// and degrade the whole section to a stderr note.
+fn add_cacheinfo_entries(
+    wc: &WorkingCopy,
+    index_env: &[(&str, &str)],
+    entries: &[(String, String, String)],
+) -> Result<(), GeectlError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut batch: Vec<String> = Vec::new();
+    let mut batch_bytes = 0;
+    for (name, mode, sha) in entries {
+        let value = format!("{mode},{sha},{name}");
+        let cost = "--cacheinfo".len() + 1 + value.len() + 1;
+        if !batch.is_empty() && batch_bytes + cost > BATCH_ARG_BYTES {
+            update_index_batch(wc, index_env, &batch)?;
+            batch.clear();
+            batch_bytes = 0;
+        }
+        batch_bytes += cost;
+        batch.push(value);
+    }
+    if !batch.is_empty() {
+        update_index_batch(wc, index_env, &batch)?;
+    }
+    Ok(())
+}
+
+/// One `update-index` call for a batch of `--cacheinfo` values:
+/// `--cacheinfo` takes one `mode,sha,path` value per flag.
+fn update_index_batch(
+    wc: &WorkingCopy,
+    index_env: &[(&str, &str)],
+    values: &[String],
+) -> Result<(), GeectlError> {
+    let mut args: Vec<&str> = vec!["--add"];
+    for value in values {
+        args.push("--cacheinfo");
+        args.push(value);
+    }
+    git(&wc.root, "update-index", &args, index_env)?;
+    Ok(())
 }
 
 /// Refuse paths that are absolute or escape the checkout root.
@@ -2744,19 +3042,25 @@ fn add_to_tmp_index(
     Ok(())
 }
 
-/// Build the base tree for an update or a pull: download every file
-/// of `listing` into a temporary directory, hash each into the
+/// Build a tree from a server listing: download every file of
+/// `listing` into a temporary directory, hash each into the
 /// object store, and write the tree into a temporary index. Returns
-/// the tree SHA. `link_baserev` rewrites the `_link` file's baserev
-/// before hashing (a pull moves the link to the target's latest
+/// the tree SHA. `project`/`package` name the package the listing
+/// belongs to: an update or a pull builds the checked-out
+/// package's tree, a link diff builds the link target's tree.
+/// `link_baserev` rewrites the `_link` file's baserev before
+/// hashing (a pull moves the link to the target's latest
 /// revision). The expanded listing never carries `_link`, so a pull
 /// fetches it through the unexpanded route, pinned to `link_rev`:
 /// the link package's own revision, not the expanded pin.
 /// `link_rev` must be `Some` whenever `link_baserev` is `Some`.
+#[allow(clippy::too_many_arguments)]
 fn build_base_tree(
     client: &ObsClient,
     wc: &WorkingCopy,
     listing: &DirectoryListing,
+    project: &str,
+    package: &str,
     rev: Option<&RevisionSpec>,
     link_rev: Option<&RevisionSpec>,
     link_baserev: Option<&str>,
@@ -2808,8 +3112,8 @@ fn build_base_tree(
             // `rev` and verified against the listing's md5.
             download_verified(
                 client,
-                &wc.project,
-                &wc.package,
+                project,
+                package,
                 &entry.name,
                 rev,
                 &dest,
@@ -2832,14 +3136,7 @@ fn build_base_tree(
         // unexpanded `_link` read. No md5 to verify against — the
         // expanded listing never carries `_link`.
         download_verified(
-            client,
-            &wc.project,
-            &wc.package,
-            "_link",
-            link_rev,
-            &dest,
-            None,
-            false,
+            client, project, package, "_link", link_rev, &dest, None, false,
         )?;
         let text = std::fs::read_to_string(&dest).map_err(|e| {
             GeectlError::new(
@@ -3285,7 +3582,17 @@ fn update_obs(
         )
     })?;
     let pinned = RevisionSpec::Rev(pinned_rev);
-    let tree = build_base_tree(client, wc, &listing, Some(&pinned), None, None, false)?;
+    let tree = build_base_tree(
+        client,
+        wc,
+        &listing,
+        &wc.project,
+        &wc.package,
+        Some(&pinned),
+        None,
+        None,
+        false,
+    )?;
     let new_root = git(
         &wc.root,
         "commit-tree",
@@ -3672,6 +3979,8 @@ pub fn pull(
         client,
         wc,
         &listing,
+        &wc.project,
+        &wc.package,
         Some(&pinned),
         Some(&own_pinned),
         Some(&new_baserev),
@@ -4440,7 +4749,7 @@ mod tests {
         let wc = open(&dir.path).unwrap();
         write_file(&dir.path, "foo.spec", "Name: bar\n");
         write_file(&dir.path, "u.txt", "untracked\n");
-        let out = diff(&wc).unwrap();
+        let (out, _) = diff(&wc, None).unwrap();
         assert!(out.contains("Name: foo"));
         assert!(out.contains("Name: bar"));
         assert!(out.contains("Untracked:\nu.txt"));
@@ -4458,7 +4767,7 @@ mod tests {
         // `git diff <base>` is empty here, and only the staged
         // half shows the change.
         write_file(&dir.path, "foo.spec", "Name: foo\n");
-        let out = diff(&wc).unwrap();
+        let (out, _) = diff(&wc, None).unwrap();
         assert!(out.contains("Name: bar"), "diff: {out}");
         let found: Vec<(String, StatusCode)> = status(&wc)
             .unwrap()
@@ -4477,7 +4786,7 @@ mod tests {
         write_file(&dir.path, "new.txt", "new\n");
         git_ok(&dir.path, &["add", "new.txt"]);
         std::fs::remove_file(dir.path.join("new.txt")).unwrap();
-        let out = diff(&wc).unwrap();
+        let (out, _) = diff(&wc, None).unwrap();
         assert!(out.contains("new.txt"), "diff: {out}");
         let found: Vec<(String, StatusCode)> = status(&wc)
             .unwrap()
@@ -4485,6 +4794,523 @@ mod tests {
             .map(|entry| (entry.path, entry.code))
             .collect();
         assert_eq!(found, vec![("new.txt".to_string(), StatusCode::Added)]);
+    }
+
+    fn link_diff_http() -> FakeHttp {
+        let foo_rev1 = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"235ee045c185e683ce770f81607ade06\" mtime=\"1282047302\" name=\"_link\" size=\"85\" />\
+            <entry md5=\"80783c104f8d73dba07eca77249120a2\" mtime=\"1282047302\" name=\"notes.txt\" size=\"11\" />\
+            <entry md5=\"6f273a56360232f10af47fa5176c08ea\" mtime=\"1282047302\" name=\"bar.spec\" size=\"15\" />\
+            </directory>"
+        );
+        let bar_at_baserev = format!(
+            "<directory name=\"bar\" rev=\"5\" srcmd5=\"{LINK_OLD_BASEREV}\" vrev=\"5\">\
+            <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047303\" name=\"bar.spec\" size=\"10\" />\
+            <entry md5=\"0c2710c14e36d184252ea92fc65093f4\" mtime=\"1282047303\" name=\"shared.txt\" size=\"7\" />\
+            </directory>"
+        );
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &foo_rev1,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/_link?rev=1",
+                link_xml(LINK_OLD_BASEREV).as_bytes(),
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/notes.txt?rev=1",
+                b"link notes\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/bar.spec?rev=1",
+                b"Name: bar-link\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/bar?rev=dddddddddddddddddddddddddddddddd",
+                &bar_at_baserev,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/bar/bar.spec?rev=dddddddddddddddddddddddddddddddd",
+                b"Name: bar\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/bar/shared.txt?rev=dddddddddddddddddddddddddddddddd",
+                b"shared\n",
+            )
+    }
+
+    fn plain_link_diff_http() -> FakeHttp {
+        let foo_rev1 = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"235ee045c185e683ce770f81607ade06\" mtime=\"1282047302\" name=\"_link\" size=\"85\" />\
+            </directory>"
+        );
+        let bar_at_baserev = format!(
+            "<directory name=\"bar\" rev=\"5\" srcmd5=\"{LINK_OLD_BASEREV}\" vrev=\"5\"></directory>"
+        );
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &foo_rev1,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/_link?rev=1",
+                link_xml(LINK_OLD_BASEREV).as_bytes(),
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/bar?rev=dddddddddddddddddddddddddddddddd",
+                &bar_at_baserev,
+            )
+    }
+
+    fn baserev_less_link_diff_http() -> FakeHttp {
+        let foo_rev1 = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"06fdfe4ae579612460946a90ebe748b2\" mtime=\"1282047302\" name=\"_link\" size=\"42\" />\
+            <entry md5=\"80783c104f8d73dba07eca77249120a2\" mtime=\"1282047302\" name=\"notes.txt\" size=\"11\" />\
+            </directory>"
+        );
+        let bar_latest = format!(
+            "<directory name=\"bar\" rev=\"7\" srcmd5=\"{TARGET_SRCMD5}\" vrev=\"7\">\
+            <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047303\" name=\"bar.spec\" size=\"10\" />\
+            </directory>"
+        );
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &foo_rev1,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/_link?rev=1",
+                b"<link project=\"home:alice\" package=\"bar\"/>",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/notes.txt?rev=1",
+                b"link notes\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/bar",
+                &bar_latest,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/bar/bar.spec?rev=cccccccccccccccccccccccccccccccc",
+                b"Name: bar\n",
+            )
+    }
+
+    fn no_srcmd5_link_diff_http() -> FakeHttp {
+        let foo_rev1 = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"06fdfe4ae579612460946a90ebe748b2\" mtime=\"1282047302\" name=\"_link\" size=\"42\" />\
+            <entry md5=\"80783c104f8d73dba07eca77249120a2\" mtime=\"1282047302\" name=\"notes.txt\" size=\"11\" />\
+            </directory>"
+        );
+        // The target listing carries no srcmd5: the server never
+        // recorded a revision for it.
+        let bar_no_srcmd5 = "<directory name=\"bar\" rev=\"7\" vrev=\"7\">\
+            <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047303\" name=\"bar.spec\" size=\"10\" />\
+            </directory>";
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &foo_rev1,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/_link?rev=1",
+                b"<link project=\"home:alice\" package=\"bar\"/>",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/notes.txt?rev=1",
+                b"link notes\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/bar",
+                bar_no_srcmd5,
+            )
+    }
+
+    fn deleted_target_link_diff_http() -> FakeHttp {
+        let foo_rev1 = format!(
+            "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+            <entry md5=\"06fdfe4ae579612460946a90ebe748b2\" mtime=\"1282047302\" name=\"_link\" size=\"42\" />\
+            <entry md5=\"80783c104f8d73dba07eca77249120a2\" mtime=\"1282047302\" name=\"notes.txt\" size=\"11\" />\
+            </directory>"
+        );
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo/_meta",
+                "<package name=\"foo\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                &foo_rev1,
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/_link?rev=1",
+                b"<link project=\"home:alice\" package=\"bar\"/>",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/notes.txt?rev=1",
+                b"link notes\n",
+            )
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:alice/bar",
+                ErrorKind::NotFound,
+            )
+    }
+
+    fn link_diff_checkout(http: &FakeHttp) -> (TempDirGuard, WorkingCopy) {
+        let client = ObsClient::with_credentials(http, basic_credentials()).unwrap();
+        let dir = TempDirGuard::new("link-diff");
+        let wc = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            None,
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        (dir, wc)
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_shows_the_link_target_content_diff() {
+        let http = link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        let (out, note) = diff(&wc, Some(&client)).unwrap();
+        assert!(note.is_none(), "the link read succeeded: {note:?}");
+        assert!(
+            out.contains("Link diff (home:alice/bar at dddddddddddddddddddddddddddddddd):"),
+            "diff: {out}"
+        );
+        // The link's own files over the target: notes.txt is new,
+        // bar.spec overrides the target's version.
+        assert!(out.contains("diff --git a/notes.txt"), "diff: {out}");
+        assert!(out.contains("link notes"), "diff: {out}");
+        assert!(out.contains("-Name: bar\n+Name: bar-link"), "diff: {out}");
+        // A target file the link inherits unchanged shows no hunk,
+        // and `_link` itself is not linked content.
+        assert!(!out.contains("shared.txt"), "diff: {out}");
+        assert!(!out.contains("_link"), "diff: {out}");
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_shows_staged_edits_against_the_target() {
+        let http = link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        write_file(&wc.root, "notes.txt", "staged notes\n");
+        git_ok(&wc.root, &["add", "notes.txt"]);
+        let (out, _) = diff(&wc, Some(&client)).unwrap();
+        // The link section shows the staged content against the
+        // target (which has no notes.txt), not the base content.
+        let link_section = out.split("Link diff").nth(1).expect("the link section");
+        assert!(link_section.contains("staged notes"), "diff: {out}");
+        assert!(!link_section.contains("link notes"), "diff: {out}");
+        // The plain staged half still shows the edit against the base.
+        assert!(out.contains("-link notes\n+staged notes"), "diff: {out}");
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_keeps_the_worktree_half_unstaged() {
+        let http = link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        write_file(&wc.root, "notes.txt", "worktree notes\n");
+        let (out, _) = diff(&wc, Some(&client)).unwrap();
+        // The unstaged half shows the worktree edit against the index.
+        let plain = out.split("Link diff").next().unwrap();
+        assert!(
+            plain.contains("-link notes\n+worktree notes"),
+            "diff: {out}"
+        );
+        // The link section still shows the staged content only.
+        let link_section = out.split("Link diff").nth(1).expect("the link section");
+        assert!(link_section.contains("link notes"), "diff: {out}");
+        assert!(!link_section.contains("worktree notes"), "diff: {out}");
+    }
+
+    #[test]
+    fn diff_on_a_plain_link_has_no_link_section() {
+        let http = plain_link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        let (out, _) = diff(&wc, Some(&client)).unwrap();
+        assert!(out.is_empty(), "diff: {out}");
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_with_a_conflicted_link_still_shows_the_plain_diff() {
+        let http = link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        // Two branches that change `_link` differently: merging
+        // them leaves `_link` unmerged in the index, so the link
+        // section has no single staged `_link` to read.
+        git_ok(&wc.root, &["config", "--local", "user.name", "geectl"]);
+        git_ok(
+            &wc.root,
+            &["config", "--local", "user.email", "geectl@localhost"],
+        );
+        let branch = git(&wc.root, "branch", &["--show-current"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_file(
+            &wc.root,
+            "_link",
+            &link_xml("cccccccccccccccccccccccccccccccc"),
+        );
+        git_ok(&wc.root, &["add", "_link"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "ours"]);
+        git_ok(&wc.root, &["checkout", "--quiet", "-b", "side", "HEAD~1"]);
+        write_file(
+            &wc.root,
+            "_link",
+            &link_xml("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
+        git_ok(&wc.root, &["add", "_link"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "theirs"]);
+        git_ok(&wc.root, &["checkout", "--quiet", &branch]);
+        let _ = git(&wc.root, "merge", &["side"], &[]);
+        let conflicts = status(&wc).unwrap();
+        assert!(
+            conflicts
+                .iter()
+                .any(|entry| entry.path == "_link" && entry.code == StatusCode::Conflicted),
+            "conflicts: {conflicts:?}"
+        );
+        let (out, _) = diff(&wc, Some(&client)).unwrap();
+        assert!(!out.contains("Link diff"), "diff: {out}");
+        assert!(out.contains("_link"), "diff: {out}");
+    }
+
+    #[test]
+    fn staged_link_tree_builds_are_isolated_across_threads() {
+        let http = link_diff_http();
+        let (_dir, wc) = link_diff_checkout(&http);
+        let target = wc.base_commit().unwrap();
+        let expected = build_staged_link_tree(&wc, &target).unwrap();
+        // Concurrent `diff`s used to share one fixed temp index, so
+        // interleaved builds could `write-tree` a mixed index; each
+        // build now has its own, so every thread sees the same tree.
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                handles.push(scope.spawn(|| {
+                    for _ in 0..4 {
+                        assert_eq!(build_staged_link_tree(&wc, &target).unwrap(), expected);
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn add_cacheinfo_entries_batches_a_large_target() {
+        let http = link_diff_http();
+        let (_dir, wc) = link_diff_checkout(&http);
+        let base = wc.base_commit().unwrap();
+        let entries = ls_tree_entries(&wc, &base).unwrap();
+        let (_, sha) = entries.first().expect("the base tree has a file");
+        // 2,000 entries at ~60 bytes of argv each: ~120 KiB,
+        // several batches under the platform cap (two at the 64 KiB
+        // Unix cap, eight at the 16 KiB Windows cap) — one call
+        // before the fix, past `ARG_MAX` on a large enough target,
+        // and past the Windows command-line limit even sooner.
+        let many: Vec<(String, String, String)> = (0..2000)
+            .map(|i| {
+                (
+                    format!("file-{i:04}.txt"),
+                    "100644".to_string(),
+                    sha.clone(),
+                )
+            })
+            .collect();
+        let git_dir = git(&wc.root, "rev-parse", &["--absolute-git-dir"], &[]).unwrap();
+        let tmp_index = PathBuf::from(git_dir.trim()).join("geectl-test-batch-index");
+        let _cleanup = TempCleanup {
+            paths: vec![tmp_index.clone()],
+        };
+        let tmp_index_str = tmp_index.to_string_lossy().into_owned();
+        let index_env = [("GIT_INDEX_FILE", tmp_index_str.as_str())];
+        git(&wc.root, "read-tree", &["--empty"], &index_env).unwrap();
+        add_cacheinfo_entries(&wc, &index_env, &many).unwrap();
+        let staged = git(&wc.root, "ls-files", &["--stage"], &index_env).unwrap();
+        assert_eq!(staged.lines().count(), 2000, "staged: {staged}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn update_index_batch_cap_fits_the_windows_command_line_limit() {
+        // CreateProcess caps the whole command line at 32,767
+        // characters, program path and quoting included: the batch
+        // cap keeps one call under half the limit, leaving the other
+        // half for the program path, the `update-index --add` prefix
+        // and quoting of paths with spaces.
+        assert!(BATCH_ARG_BYTES <= 16 * 1024, "cap: {BATCH_ARG_BYTES}");
+    }
+
+    #[test]
+    fn diff_without_a_client_on_an_unlinked_checkout_touches_no_network() {
+        let dir = TempDirGuard::new("diff-noclient");
+        init_repo(&dir.path);
+        base_commit_with(&dir.path, REV1, SRCMD5_1);
+        let wc = open(&dir.path).unwrap();
+        write_file(&dir.path, "foo.spec", "Name: bar\n");
+        // A client on an empty FakeHttp: any HTTP call errors, so
+        // a passing diff proves the unlinked path never reads.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (with_client, _) = diff(&wc, Some(&client)).unwrap();
+        let (without_client, _) = diff(&wc, None).unwrap();
+        assert_eq!(with_client, without_client);
+        assert!(with_client.contains("Name: bar"), "diff: {with_client}");
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_without_a_client_errors() {
+        let http = link_diff_http();
+        let (_dir, wc) = link_diff_checkout(&http);
+        let err = diff(&wc, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InternalError);
+        assert!(
+            err.to_string().contains("needs an OBS client"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn diff_on_a_baserev_less_link_reads_the_target_at_latest() {
+        let http = baserev_less_link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        let (out, _) = diff(&wc, Some(&client)).unwrap();
+        assert!(
+            out.contains("Link diff (home:alice/bar at cccccccccccccccccccccccccccccccc):"),
+            "diff: {out}"
+        );
+        assert!(out.contains("diff --git a/notes.txt"), "diff: {out}");
+        assert!(out.contains("link notes"), "diff: {out}");
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_with_no_target_srcmd5_keeps_the_plain_diff() {
+        let http = no_srcmd5_link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        write_file(&wc.root, "notes.txt", "staged notes\n");
+        git_ok(&wc.root, &["add", "notes.txt"]);
+        let (out, note) = diff(&wc, Some(&client)).unwrap();
+        // The plain staged half still shows the edit against the
+        // base, and the link section is skipped, not an error.
+        assert!(out.contains("-link notes\n+staged notes"), "diff: {out}");
+        assert!(!out.contains("Link diff"), "diff: {out}");
+        let note = note.expect("the skipped link section is noted");
+        assert!(note.contains("source md5"), "note: {note}");
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_with_a_deleted_target_keeps_the_plain_diff() {
+        let http = deleted_target_link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        write_file(&wc.root, "notes.txt", "staged notes\n");
+        git_ok(&wc.root, &["add", "notes.txt"]);
+        let (out, note) = diff(&wc, Some(&client)).unwrap();
+        assert!(out.contains("-link notes\n+staged notes"), "diff: {out}");
+        assert!(!out.contains("Link diff"), "diff: {out}");
+        let note = note.expect("the skipped link section is noted");
+        assert!(note.contains("home:alice/bar"), "note: {note}");
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_with_a_conflicted_file_falls_back_to_the_target_version() {
+        let http = link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        // Two branches that change `bar.spec` differently: merging
+        // them leaves `bar.spec` unmerged in the index, so the
+        // staged link tree has no stage-0 entry for it.
+        git_ok(&wc.root, &["config", "--local", "user.name", "geectl"]);
+        git_ok(
+            &wc.root,
+            &["config", "--local", "user.email", "geectl@localhost"],
+        );
+        let branch = git(&wc.root, "branch", &["--show-current"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_file(&wc.root, "bar.spec", "Name: ours\n");
+        git_ok(&wc.root, &["add", "bar.spec"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "ours"]);
+        git_ok(&wc.root, &["checkout", "--quiet", "-b", "side", "HEAD~1"]);
+        write_file(&wc.root, "bar.spec", "Name: theirs\n");
+        git_ok(&wc.root, &["add", "bar.spec"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "theirs"]);
+        git_ok(&wc.root, &["checkout", "--quiet", &branch]);
+        let _ = git(&wc.root, "merge", &["side"], &[]);
+        let conflicts = status(&wc).unwrap();
+        assert!(
+            conflicts
+                .iter()
+                .any(|entry| entry.path == "bar.spec" && entry.code == StatusCode::Conflicted),
+            "conflicts: {conflicts:?}"
+        );
+        let (out, note) = diff(&wc, Some(&client)).unwrap();
+        assert!(note.is_none(), "the link section is present: {note:?}");
+        let link_section = out.split("Link diff").nth(1).expect("the link section");
+        // The conflicted file falls back to the target's version:
+        // no bar.spec hunk in the link section...
+        assert!(!link_section.contains("bar.spec"), "diff: {out}");
+        // ...while the link's other file still shows.
+        assert!(
+            link_section.contains("diff --git a/notes.txt"),
+            "diff: {out}"
+        );
+        // The plain halves still show the conflict.
+        assert!(out.contains("bar.spec"), "diff: {out}");
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_orders_the_link_section_before_the_untracked_trailer() {
+        let http = link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        write_file(&wc.root, "notes.txt", "staged notes\n");
+        git_ok(&wc.root, &["add", "notes.txt"]);
+        write_file(&wc.root, "scratch.txt", "scratch\n");
+        let (out, note) = diff(&wc, Some(&client)).unwrap();
+        assert!(note.is_none(), "the link section is present: {note:?}");
+        let plain = out.find("staged notes").expect("the plain half");
+        let link = out.find("Link diff").expect("the link section");
+        let untracked = out.find("Untracked:").expect("the untracked trailer");
+        assert!(plain < link && link < untracked, "diff: {out}");
     }
 
     #[test]

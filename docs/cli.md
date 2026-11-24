@@ -127,7 +127,7 @@ Commands:
   checkout      Check out a package into a git working copy, under the current directory
   update        Update the working copy in the current directory to the latest base
   status        Show the working copy's state against the base
-  diff          Show the diff of the worktree and the index against the base
+  diff          Show the diff of the worktree and the index against the base, plus the link diff on a linked checkout
   add           Stage files for commit
   rm            Remove files from the working copy
   addremove     Stage new files and worktree deletions
@@ -833,7 +833,7 @@ Options:
 ```
 
 ```
-Show the diff of the worktree and the index against the base
+Show the diff of the worktree and the index against the base, plus the link diff on a linked checkout
 
 Usage: geectl diff [OPTIONS]
 

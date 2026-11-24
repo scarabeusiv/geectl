@@ -417,11 +417,28 @@ fn status_result(wc: &WorkingCopy, entries: &[working_copy::StatusEntry]) -> (Va
 }
 
 /// Show the diff of the worktree and the index against the base.
-/// A content command: the text IS the diff.
+/// A content command: the text IS the diff. A failed link-target
+/// read degrades: the plain halves print and the failure is a
+/// stderr note, not an error.
 pub fn diff(debug: &Debug) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let wc = open_working_copy(false)?;
-    let diff = working_copy::diff(&wc)?;
+    // The link read runs only on a linked checkout: an unlinked
+    // `diff` stays purely local — no HTTP client, no config, no
+    // credentials — exactly as before. The client carries no
+    // credentials: the link-target read is a public listing plus
+    // public downloads.
+    let (diff, note) = if working_copy::is_linked(&wc)? {
+        let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+        let endpoints = endpoints()?;
+        let client = obs_client(&http, &endpoints, "diff", false, debug)?;
+        working_copy::diff(&wc, Some(&client))?
+    } else {
+        working_copy::diff(&wc, None)?
+    };
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
     Ok(diff_result(&wc, &diff))
 }
 
@@ -950,9 +967,9 @@ mod tests {
     #[test]
     fn leaf_credential_wiring_pins_which_leaves_need_credentials() {
         // `pull` reads the authed expanded routes and `commit`
-        // mutates: without credentials both 401. `checkout` and
-        // `update` read public routes only. `obs_client` is the
-        // single choke point for the table, so this pins the
+        // mutates: without credentials both 401. `checkout`,
+        // `update`, and `diff` read public routes only. `obs_client`
+        // is the single choke point for the table, so this pins the
         // wiring: a leaf names itself there, and the table
         // decides.
         assert!(needs_obs_credentials("pull"));
@@ -960,6 +977,7 @@ mod tests {
         assert!(!needs_obs_credentials("checkout"));
         assert!(!needs_obs_credentials("update"));
         assert!(!needs_obs_credentials("status"));
+        assert!(!needs_obs_credentials("diff"));
     }
 
     #[test]

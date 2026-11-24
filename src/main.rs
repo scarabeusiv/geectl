@@ -177,7 +177,8 @@ enum Command {
     },
     /// Show the working copy's state against the base.
     Status,
-    /// Show the diff of the worktree and the index against the base.
+    /// Show the diff of the worktree and the index against the base,
+    /// plus the link diff on a linked checkout.
     Diff,
     /// Stage files for commit.
     Add {

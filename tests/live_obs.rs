@@ -7917,6 +7917,134 @@ fn live_working_copy_pull_pulls_a_linked_package() {
         "the working copy is clean after the pull"
     );
 }
+/// `diff` on a linked checkout shows the link target's content
+/// diff: the link package's own files against the target's files
+/// at the pinned baserev, in the same staged/worktree split.
+#[test]
+fn live_working_copy_diff_shows_the_link_target_content_diff() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&client, &package);
+    let spec = format!("{package}.spec");
+    let v1 = "Name: geectl-live-pkg\nVersion: 1.0\n";
+    client
+        .upload_file(&source_project, &package, &spec, v1, &DryRun::new(false))
+        .expect("upload the v1 spec to the live instance");
+    let notes = "notes.txt";
+    let notes_v1 = "geectl live notes\n";
+    client
+        .upload_file(
+            &source_project,
+            &package,
+            notes,
+            notes_v1,
+            &DryRun::new(false),
+        )
+        .expect("upload the notes file to the live instance");
+    let source_srcmd5 = directory_srcmd5(&base, &source_project, &package);
+    let link_package = format!("{package}-link");
+    client
+        .create_package(
+            &source_project,
+            &link_package,
+            "geectl live test link package",
+            "Created by the geectl live test; the instance is destroyed after the run.",
+            &DryRun::new(false),
+        )
+        .expect("create the link package on the live instance");
+    client
+        .upload_file(
+            &source_project,
+            &link_package,
+            "_link",
+            &format!(
+                "<link project=\"{source_project}\" package=\"{package}\" baserev=\"{source_srcmd5}\"/>"
+            ),
+            &DryRun::new(false),
+        )
+        .expect("upload the _link file on the live instance");
+    // The link's own override of the target's notes file.
+    let link_notes = "geectl live link notes\n";
+    client
+        .upload_file(
+            &source_project,
+            &link_package,
+            notes,
+            link_notes,
+            &DryRun::new(false),
+        )
+        .expect("upload the link notes file on the live instance");
+    let dir = TempDir::new();
+    let wc = working_copy::checkout(
+        &client,
+        &source_project,
+        &link_package,
+        None,
+        dir.path(),
+        None,
+        &DryRun::new(false),
+    )
+    .expect("checkout the link package")
+    .expect("checkout is live, not a dry run");
+    assert!(
+        !wc.root.join(&spec).exists(),
+        "the link checkout holds no target files before pull"
+    );
+    let (out, note) = working_copy::diff(&wc, Some(&client)).expect("diff the linked checkout");
+    assert!(
+        note.is_none(),
+        "the authed link read has no skip note: {note:?}"
+    );
+    assert!(
+        out.contains(&format!(
+            "Link diff ({source_project}/{package} at {source_srcmd5}):"
+        )),
+        "diff: {out}"
+    );
+    // The override shows against the target's version; the
+    // inherited spec shows nothing.
+    assert!(
+        out.contains("-geectl live notes\n+geectl live link notes"),
+        "diff: {out}"
+    );
+    assert!(!out.contains(&spec), "diff: {out}");
+    // Stage an edit: the link section follows the staged content.
+    let staged_notes = "geectl live staged notes\n";
+    std::fs::write(wc.root.join(notes), staged_notes).expect("edit the notes file");
+    working_copy::add(
+        &wc,
+        std::slice::from_ref(&notes.to_string()),
+        &DryRun::new(false),
+    )
+    .expect("stage the edit");
+    let (out, note) = working_copy::diff(&wc, Some(&client)).expect("diff after staging");
+    assert!(
+        note.is_none(),
+        "the authed link read after staging has no skip note: {note:?}"
+    );
+    let link_section = out.split("Link diff").nth(1).expect("the link section");
+    assert!(link_section.contains(staged_notes), "diff: {out}");
+    assert!(!link_section.contains(link_notes), "diff: {out}");
+    // The link-target read is a public listing plus public
+    // downloads: the same section comes back with no credentials.
+    let public = live_client(&base);
+    let (public_out, public_note) = working_copy::diff(&wc, Some(&public))
+        .expect("diff the linked checkout without credentials");
+    assert!(
+        public_note.is_none(),
+        "the public link read has no skip note: {public_note:?}"
+    );
+    assert!(
+        public_out.contains(&format!(
+            "Link diff ({source_project}/{package} at {source_srcmd5}):"
+        )),
+        "diff: {public_out}"
+    );
+}
+
 /// A prjconf with one finding of each parser-level kind the live
 /// flow can prove with no package path: a dead removal, a duplicate
 /// token, and a dead `%if` branch. `package` is the package created
