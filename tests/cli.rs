@@ -148,6 +148,7 @@ fn geectl_isolated(dir: &TempDir) -> Command {
         .env_remove("GEECTL_GITEA_TOKEN_FILE")
         .env_remove("GEECTL_GITEA_SSH_KEY")
         .env_remove("GEECTL_DEBUG")
+        .env_remove("GEECTL_DOTENV")
         .env_remove("GEECTL_FORMAT");
     cmd
 }
@@ -224,6 +225,246 @@ fn config_show_reports_environment_source() {
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(value["obs_url"], "https://obs.example.com");
     assert_eq!(value["obs_url_source"], "environment");
+}
+
+/// Write a `.env` file into the temp dir (0600 on unix, so the mode
+/// check passes) and return its path.
+fn write_dotenv(dir: &TempDir, content: &str) -> PathBuf {
+    let path = dir.0.join(".env");
+    fs::write(&path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    path
+}
+
+#[test]
+fn config_show_reports_dotenv_source() {
+    let dir = TempDir::new();
+    write_dotenv(&dir, "GEECTL_OBS_URL=https://obs.example.com\n");
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DOTENV", "1")
+        .args(["config", "show"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    // A value from the file resolves like the equivalent environment
+    // variable, and reports the same source.
+    assert_eq!(value["obs_url"], "https://obs.example.com");
+    assert_eq!(value["obs_url_source"], "environment");
+}
+
+#[test]
+fn dotenv_credentials_resolve_like_environment_variables() {
+    let dir = TempDir::new();
+    write_dotenv(
+        &dir,
+        "GEECTL_OBS_USERNAME=alice\nGEECTL_OBS_PASSWORD=s3cr3t\n",
+    );
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DOTENV", "1")
+        .args(["config", "show"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["obs_auth"]["status"], "configured");
+    assert_eq!(value["obs_auth"]["username"], "alice");
+    // The password must not appear anywhere in the output.
+    assert!(!stdout.contains("s3cr3t"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("s3cr3t"));
+}
+
+#[test]
+fn real_environment_overrides_dotenv() {
+    let dir = TempDir::new();
+    write_dotenv(&dir, "GEECTL_OBS_URL=https://file.example.com\n");
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DOTENV", "1")
+        .args(["config", "show"])
+        .current_dir(&dir.0)
+        .env("GEECTL_OBS_URL", "https://real.example.com")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["obs_url"], "https://real.example.com");
+    assert_eq!(value["obs_url_source"], "environment");
+}
+
+#[test]
+fn dotenv_malformed_file_fails_fast() {
+    let dir = TempDir::new();
+    write_dotenv(&dir, "GEECTL_OBS_PASSWORD=s3cr3t-value\nBROKEN LINE\n");
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DOTENV", "1")
+        .arg("version")
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    let context = value["error"]["context"].as_str().unwrap();
+    assert!(context.contains(".env"), "{context}");
+    assert!(context.contains("line 2"), "{context}");
+    assert!(!stderr.contains("s3cr3t-value"));
+}
+
+#[test]
+#[cfg(unix)]
+fn dotenv_group_readable_file_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let path = write_dotenv(&dir, "GEECTL_OBS_PASSWORD=s3cr3t-value\n");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DOTENV", "1")
+        .arg("version")
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    let context = value["error"]["context"].as_str().unwrap();
+    assert!(context.contains("readable by group or other"), "{context}");
+    assert!(context.contains("chmod 600"), "{context}");
+    assert!(!stderr.contains("s3cr3t-value"));
+}
+
+#[test]
+fn dotenv_without_opt_in_is_ignored() {
+    let dir = TempDir::new();
+    // A 0644 file carrying geectl keys — and a malformed line — must
+    // not fail a run that never opted into `.env` loading.
+    let path = write_dotenv(
+        &dir,
+        "GEECTL_OBS_URL=https://file.example.com\nBROKEN LINE\n",
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let out = geectl_isolated(&dir)
+        .arg("version")
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn dotenv_opted_in_ignores_a_file_without_geectl_keys() {
+    let dir = TempDir::new();
+    let path = write_dotenv(&dir, "OTHER=1\nBROKEN LINE\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DOTENV", "1")
+        .arg("version")
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn dotenv_glued_export_is_malformed() {
+    let dir = TempDir::new();
+    write_dotenv(&dir, "exportGEECTL_OBS_URL=https://file.example.com\n");
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DOTENV", "1")
+        .arg("version")
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    let context = value["error"]["context"].as_str().unwrap();
+    assert!(context.contains(".env"), "{context}");
+    assert!(context.contains("line 1"), "{context}");
+    assert!(!stderr.contains("file.example.com"));
+}
+
+#[test]
+fn dotenv_opt_in_from_the_file_itself_does_not_count() {
+    let dir = TempDir::new();
+    // GEECTL_DOTENV=1 in the file must not opt the file in.
+    write_dotenv(
+        &dir,
+        "GEECTL_DOTENV=1\nGEECTL_OBS_URL=https://file.example.com\n",
+    );
+    let out = geectl_isolated(&dir)
+        .args(["config", "show"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["obs_url"], "https://api.opensuse.org");
+    assert_eq!(value["obs_url_source"], "default");
+}
+
+#[test]
+fn debug_reports_dotenv_loaded_without_values() {
+    let dir = TempDir::new();
+    write_dotenv(&dir, "GEECTL_GITEA_TOKEN=sekrit-token-value\n");
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DOTENV", "1")
+        .args(["--debug", "version"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("loaded .env"), "{stderr}");
+    assert!(!stderr.contains("sekrit-token-value"), "{stderr}");
 }
 
 #[test]
@@ -542,6 +783,49 @@ fn debug_env_enables_without_flag() {
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         expected_debug_lines("version")
+    );
+}
+
+#[test]
+fn dotenv_debug_enables_without_flag() {
+    let dir = TempDir::new();
+    write_dotenv(&dir, "GEECTL_DEBUG=1\n");
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DOTENV", "1")
+        .arg("version")
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The file supplies GEECTL_DEBUG through the same path as the
+    // flag: the startup line, the loaded-file line, then the config
+    // line, all on stderr.
+    let expected = format!(
+        "geectl {} version\nloaded .env\nconfig: obs api.opensuse.org (auth: none), gitea src.opensuse.org (auth: none)\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), expected);
+}
+
+#[test]
+fn real_debug_env_overrides_dotenv() {
+    let dir = TempDir::new();
+    write_dotenv(&dir, "GEECTL_DEBUG=1\n");
+    let out = geectl_isolated(&dir)
+        .env("GEECTL_DOTENV", "1")
+        .env("GEECTL_DEBUG", "0")
+        .arg("version")
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "real GEECTL_DEBUG=0 must win over GEECTL_DEBUG=1 in the file"
     );
 }
 

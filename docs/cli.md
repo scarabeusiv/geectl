@@ -104,6 +104,35 @@ preview; every other command in those groups fails fast on a half-set
 pair up front. Setting both a token and a Basic pair for one instance
 is a configuration error at the same resolution points.
 
+### `.env` file
+
+A `.env` file in the working directory supplies `GEECTL_*` variables
+without exporting them, when the run opts in with `GEECTL_DOTENV=1` in
+the real process environment: geectl loads it at startup and merges it into
+the environment snapshot, with a real environment variable winning
+over the same key in the file. Only `GEECTL_*` keys are honoured. A
+key starting with `GEEC` that is not a valid `GEECTL_*` key, or a
+`GEECTL_*` key with anything but ASCII letters, digits, or `_` after
+the prefix, is a typo for a geectl variable and fails as a config
+error rather than being silently ignored. The syntax is minimal —
+`KEY=value`, `#` comments, blank lines, an optional `export` prefix
+followed by whitespace (a key glued to `export` is malformed), and optional single or double quotes — with no
+variable interpolation and no multi-line values. A duplicate key keeps
+its last value, and quoted values are literal inside the quotes, with
+no escapes. The file must be a regular file, at most 64 KiB, and
+readable only by its owner (`chmod 600`) on Unix — on non-Unix the
+mode cannot be checked, and the opt-in is the guard there. A missing
+file is fine, and so is a file that carries no `GEECTL_*` keys,
+whatever its mode or syntax — but an unreadable, malformed, or
+group/other-readable file that carries `GEECTL_*` keys fails at
+startup as a config error naming the file (and the line, for a
+malformed line), never the value. `--version` and `--help` print and
+exit before the file is loaded, so they never fail on it. `--debug`
+reports that a `.env`
+file was loaded, never its values. Values from the file report their
+source as `environment` in `config show`. No parent directory is
+searched, and `.env.*` files are not loaded.
+
 ## Top level
 
 ```

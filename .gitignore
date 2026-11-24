@@ -1,4 +1,6 @@
 /target
+# Local geectl credentials (see README: `.env` support). Never committed.
+/.env
 # The disposable Gitea instance's token, written by tests/gitea/provision.sh
 # (0600). Never committed; removed by tests/gitea/teardown.sh.
 /tests/gitea/.gitea-token

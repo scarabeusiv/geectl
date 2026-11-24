@@ -20,7 +20,7 @@ mod cli_working_copy;
 mod maintenance;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use geectl::auth::{AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
+use geectl::auth::{load_dotenv, AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
 use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
@@ -759,6 +759,24 @@ fn real_main() -> ExitCode {
             }
         }
     };
+    // The .env file loads at startup, before any command runs, and
+    // only with explicit opt-in (`GEECTL_DOTENV=1` in the real
+    // environment; see `load_dotenv`): without it the file is never
+    // read. A missing file is fine, but a malformed, unreadable, or
+    // group/other-readable file that carries `GEECTL_*` keys fails
+    // fast as a config error — including for `version`, like a
+    // malformed config file (see `resolve_format`). The loaded values
+    // supply `GEECTL_DEBUG` below, and every later `snapshot_env`
+    // call reuses the same loaded snapshot; the load itself never
+    // prints a value.
+    let dotenv = match load_dotenv() {
+        Ok(dotenv) => dotenv,
+        Err(err) => {
+            write_error(&err, Format::Json);
+            return ExitCode::from(err.exit_code() as u8);
+        }
+    };
+    let dotenv_loaded = dotenv.is_some();
     // The debug channel: one backend install for the process,
     // then the startup and config lines on stderr. Off by default,
     // so without `--debug` / `GEECTL_DEBUG=1` this is a no-op.
@@ -768,17 +786,26 @@ fn real_main() -> ExitCode {
     // channel is on: installing it unconditionally would raise the
     // global max level for every run, and ureq's own `debug!`
     // records would print on the first real HTTP command.
-    let (debug_enabled, debug_bodies) = resolve_debug(
-        cli.debug,
-        cli.debug_body,
-        std::env::var("GEECTL_DEBUG").ok().as_deref(),
-    );
+    // GEECTL_DEBUG comes from the real environment first, else the
+    // .env file — the same precedence `snapshot_env` applies
+    // everywhere else (main reads it before any snapshot exists).
+    let debug_env = std::env::var("GEECTL_DEBUG").ok().or_else(|| {
+        dotenv
+            .as_ref()
+            .and_then(|map| map.get("GEECTL_DEBUG").cloned())
+    });
+    let (debug_enabled, debug_bodies) =
+        resolve_debug(cli.debug, cli.debug_body, debug_env.as_deref());
     if debug_enabled {
         geectl::debug::install();
     }
     let debug = Debug::new(debug_enabled, debug_bodies);
     if debug.enabled() {
         debug.emit(&startup_line(&argv));
+        if dotenv_loaded {
+            // The file name only, never a key or a value.
+            debug.emit("loaded .env");
+        }
         if let Some(line) = debug_config_line() {
             debug.emit(&line);
         }

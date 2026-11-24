@@ -23,7 +23,8 @@ input primitive at all.
 ### Never read a secret from the terminal
 
 Secrets come only from environment variables or mounted secret files (or
-a config file for humans, never prompted). Nothing in geectl touches
+a config file for humans, never prompted; a `.env` file in the working
+directory supplies environment variables). Nothing in geectl touches
 `/dev/tty`, and there is no `getpass`-style prompt.
 
 Rationale: a terminal read bypasses stdin redirection, so the identical
@@ -117,8 +118,9 @@ document can itself leak document content into logs.
 
 ### No credentials in config files, in any form
 
-Credentials come from environment variables or mounted secret files
-only. There is no plaintext fallback and no obfuscation option. If a
+Credentials come from environment variables (or a `.env` file in the
+working directory, which merges into the environment) or mounted secret
+files only. There is no plaintext fallback and no obfuscation option. If a
 config file contains a credential-shaped value, geectl refuses to run
 and names the variable/file to use instead.
 
@@ -157,7 +159,11 @@ OBS takes a username and password (`GEECTL_OBS_USERNAME` +
 password); Gitea takes an API token (`GEECTL_GITEA_TOKEN`, or
 `GEECTL_GITEA_TOKEN_FILE`) and, for git operations, an SSH private
 key (`GEECTL_GITEA_SSH_KEY`). The `*_FILE` form names a file whose
-whole content is the secret — the mounted-secret shape. A
+whole content is the secret — the mounted-secret shape. A `.env` file
+in the working directory supplies the same variables when the run opts
+in with `GEECTL_DOTENV=1` (see
+`docs/cli.md`); a real environment variable wins over the same key in
+the file, and only `GEECTL_*` keys are honoured. A
 half-configured pair, both secret sources set, or a malformed value
 fails at startup as a config error naming the variable, never the
 value, for any command that resolves credentials, so a bad credential never reaches a request. Which commands never resolve credentials is stated in the Credentials
@@ -277,7 +283,11 @@ mysterious re-authentication.
 One config file: `$XDG_CONFIG_HOME/geectl/config.toml` (default
 `~/.config/geectl/config.toml`). Explicit precedence, documented in
 one place: flag > environment variable > config file > built-in
-default. A `config show` command prints the effective configuration
+default. A `.env` file in the working directory supplies environment
+variables when the run opts in with `GEECTL_DOTENV=1` — a real
+environment variable wins over the same key in the file — and reports
+its source as `environment`. A `config show` command
+prints the effective configuration
 with the source of each value; `config init` writes the template and
 refuses to overwrite. If two config files are found, that is an
 error, not a warning.

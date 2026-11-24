@@ -53,7 +53,8 @@ mutations. The full list of deliberate deviations, with reasons, is
   (`src/error.rs`). Agents can distinguish not-found, auth-failed,
   server-error, and invalid-input programmatically.
 - **Bounded timeouts on every request.** No unbounded request anywhere.
-- **Credentials from environment variables or mounted secret files only.**
+- **Credentials from environment variables (or a `.env` file in the
+  working directory — see below) or mounted secret files only.**
   Never in a config file, never prompted, never logged. There is no
   plaintext fallback and no obfuscation option.
 - **No option to disable TLS verification.** Ever.
@@ -79,6 +80,32 @@ a container secret) is used. Setting both a variable and its `_FILE`
 form is an error, as is a half-configured pair or setting both a token
 and a Basic pair for one instance. A malformed value fails
 at startup as a config error naming the variable, never the value.
+
+A `.env` file in the working directory supplies the same variables, when the run opts in with `GEECTL_DOTENV=1` in the real process environment:
+geectl loads it at startup and merges it into the environment, with a
+real environment variable winning over the same key in the file. Only
+`GEECTL_*` keys are honoured, so a project `.env` meant for other tools
+cannot change geectl behaviour. A key starting with `GEEC` that is not
+a valid `GEECTL_*` key, or a `GEECTL_*` key with anything but ASCII
+letters, digits, or `_` after the prefix, is a typo for a geectl
+variable and fails as a config error rather than being silently
+ignored. The syntax is minimal — `KEY=value`, `#` comments, blank
+lines, an optional `export` prefix followed by whitespace (a key glued to `export` is malformed), and
+optional single or double quotes — with no variable interpolation and
+no multi-line values. A duplicate key keeps its last value, and quoted
+values are literal inside the quotes, with no escapes. The file must be
+a regular file, at most 64 KiB, and not readable by group or others
+(`chmod 600`) on Unix — on non-Unix the mode cannot be checked, and
+the opt-in is the guard there. A missing file is fine, and so is a
+file that carries no `GEECTL_*` keys, whatever its mode or syntax —
+but an unreadable or malformed file that carries `GEECTL_*` keys
+fails at startup as a config error naming the file (and the line,
+for a malformed line), never the value. `--version` and `--help` print
+and exit before the file is loaded, so they never fail on it.
+`--debug` reports that a
+`.env` file was loaded, never its values. Values from the file report
+their source as `environment` in `config show`. No parent directory is
+searched, and `.env.*` files are not loaded.
 
 OBS does not issue personal API tokens yet; the client accepts one so
 it works when the server ships it — until then a token login fails

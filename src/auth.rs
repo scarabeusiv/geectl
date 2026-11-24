@@ -7,9 +7,13 @@
 //! credentials and reads none from a config file, a prompt, or
 //! `/dev/tty`: providers supply credentials from environment
 //! variables or mounted secret files, and the HTTP client applies
-//! them. There is no plaintext fallback and no obfuscation option,
-//! and a credential-shaped value in a config file is a refusal to
-//! run (see the design doc and `crate::config`).
+//! them. A `.env` file in the working directory is an
+//! environment-variable source, not a config file: with explicit
+//! opt-in (see [`load_dotenv`]) it merges into the environment
+//! snapshot (see [`snapshot_env`]). There is no
+//! plaintext fallback and no obfuscation option, and a
+//! credential-shaped value in a config file is a refusal to run
+//! (see the design doc and `crate::config`).
 //!
 //! Credential types covered:
 //! - OBS: API token (Bearer) or username/password (Basic auth).
@@ -26,6 +30,7 @@ use crate::error::{ErrorKind, GeectlError};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// The credentials a provider supplies, as data. The HTTP client applies
 /// them to a request; the provider never touches a request itself.
@@ -1127,11 +1132,287 @@ pub fn resolve_gitea_ssh_key(
     Ok(Credentials::SshKey { path })
 }
 
-/// Read the named environment variables once, into a map. A set
-/// variable that is not valid UTF-8 is a `ConfigError` naming the
-/// variable — it must not silently become "not set": the user
-/// configured a credential and would get a confusing "nothing
-/// configured" outcome instead of an error.
+/// The `.env` file name, looked up in the current working directory
+/// only — never in a parent directory.
+const DOTENV_FILE: &str = ".env";
+
+/// The opt-in variable for `.env` loading: `GEECTL_DOTENV=1` in the
+/// real process environment, never in the file itself. The file lives
+/// in the working directory, which is a trust boundary — a `.env`
+/// dropped into a checkout or unpacked from a tarball must not
+/// redirect authed requests on its own. Only the literal value `1`
+/// opts in, like `GEECTL_DEBUG` (see `resolve_debug` in `main.rs`).
+const DOTENV_OPT_IN_VAR: &str = "GEECTL_DOTENV";
+
+/// Whether the value of the opt-in variable opts into `.env` loading.
+/// Pure, for tests: the real-environment read is in [`load_dotenv`].
+fn dotenv_opted_in_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Whether the `.env` content carries any `GEECTL_*` assignment: a
+/// line — after an optional `export` prefix, glued or spaced — whose
+/// key starts with `GEECTL_`. Comments and blank lines do not count,
+/// and neither does a key that merely mentions geectl. Pure, for
+/// tests. A file with no such line is not a geectl file at all, so
+/// strictness (mode, malformed lines) never applies to it — a
+/// conventional project `.env` for other tools must not fail a run.
+fn dotenv_carries_geectl_keys(content: &str) -> bool {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    content.lines().any(|raw_line| {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line).trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        let line = line.strip_prefix("export").unwrap_or(line).trim_start();
+        line.starts_with("GEECTL_")
+    })
+}
+
+/// A `.env` error naming the file and the line, never the value: the
+/// file holds secrets, so even a malformed line must not be echoed.
+fn dotenv_error(path: &Path, lineno: usize, what: &str) -> GeectlError {
+    GeectlError::new(
+        ErrorKind::ConfigError,
+        format!("{}: line {lineno}: {what}", path.display()),
+    )
+}
+
+/// Parse `.env` content: one `KEY=value` per line, `#` comments,
+/// blank lines, an optional `export` prefix followed by whitespace,
+/// and optional single or double quotes around the value. No
+/// variable interpolation and no multi-line values: a quote that does
+/// not close on its line is malformed, and a `$` stays literal. Only
+/// `GEECTL_*` keys are honoured — every other key is ignored without
+/// parsing its value, so a project `.env` meant for other tools
+/// cannot change geectl behaviour (a proxy or `GIT_*` variable, for
+/// example). A key starting with `GEEC` that is not a valid
+/// `GEECTL_*` key is a near-miss typo for a geectl variable, so it
+/// fails rather than being silently ignored, like a malformed
+/// `GEECTL_*` suffix. A key glued to `export` (`exportGEECTL_A`) is
+/// the same kind of typo and fails too. A line with no `=`, an
+/// unterminated quote, text after a quoted value, a near-miss `GEEC`
+/// prefix, a key glued to `export`, or a `GEECTL_*` key with
+/// anything but ASCII letters, digits, or `_` after the prefix is a
+/// `ConfigError` naming the file and the line.
+///
+/// An unquoted value runs to the end of the line, except that a `#`
+/// preceded by whitespace starts a comment; a `#` inside quotes, or
+/// not preceded by whitespace, is literal. Quoted values are literal
+/// inside the quotes (no escapes); unquoted values are trimmed. A
+/// duplicate key keeps its last value.
+fn parse_dotenv(content: &str, path: &Path) -> Result<HashMap<String, String>, GeectlError> {
+    let mut map = HashMap::new();
+    // A leading BOM (editors and copy-paste add one) must not make
+    // the first key look invalid.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    for (index, raw_line) in content.lines().enumerate() {
+        let lineno = index + 1;
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // `export` followed by any whitespace (space or tab),
+        // not exactly one space: `export\tKEY=value` is the same
+        // prefix. A key glued to `export` (`exportGEECTL_A`) is not.
+        let line = line
+            .strip_prefix("export")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .map(str::trim_start)
+            .unwrap_or(line);
+        let Some(eq) = line.find('=') else {
+            return Err(dotenv_error(path, lineno, "expected KEY=value"));
+        };
+        let key = line[..eq].trim_end();
+        if key.is_empty() {
+            return Err(dotenv_error(path, lineno, "expected KEY=value"));
+        }
+        // A key glued to `export` (`exportGEECTL_A`) is a typo for
+        // an exported geectl variable, so it fails rather than being
+        // silently ignored like any other non-geectl key.
+        if let Some(rest) = key.strip_prefix("export") {
+            if rest.starts_with("GEEC") {
+                return Err(dotenv_error(path, lineno, "invalid variable name"));
+            }
+        }
+        if !key.starts_with("GEECTL_") {
+            // A near-miss prefix is a typo for a geectl variable, so
+            // it fails rather than being silently ignored: the user
+            // meant to configure geectl.
+            if key.starts_with("GEEC") {
+                return Err(dotenv_error(path, lineno, "invalid variable name"));
+            }
+            continue;
+        }
+        // A GEECTL_* key that is not a plain variable name is a typo
+        // for a geectl variable, so it fails rather than being
+        // silently ignored: the user meant to configure geectl.
+        let suffix = &key["GEECTL_".len()..];
+        if suffix.is_empty()
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(dotenv_error(path, lineno, "invalid variable name"));
+        }
+        let raw_value = line[eq + 1..].trim_start();
+        let value = if let Some(rest) = raw_value.strip_prefix('\'') {
+            let Some(end) = rest.find('\'') else {
+                return Err(dotenv_error(path, lineno, "unterminated quote"));
+            };
+            check_dotenv_trailing(&rest[end + 1..], path, lineno)?;
+            rest[..end].to_string()
+        } else if let Some(rest) = raw_value.strip_prefix('"') {
+            let Some(end) = rest.find('"') else {
+                return Err(dotenv_error(path, lineno, "unterminated quote"));
+            };
+            check_dotenv_trailing(&rest[end + 1..], path, lineno)?;
+            rest[..end].to_string()
+        } else {
+            // Unquoted: to the end of the line, minus a comment
+            // starting at a `#` preceded by whitespace.
+            let comment = raw_value
+                .char_indices()
+                .find(|(i, c)| {
+                    *c == '#' && *i > 0 && raw_value.as_bytes()[i - 1].is_ascii_whitespace()
+                })
+                .map(|(i, _)| i);
+            match comment {
+                Some(comment) => raw_value[..comment].trim_end().to_string(),
+                None => raw_value.trim_end().to_string(),
+            }
+        };
+        map.insert(key.to_string(), value);
+    }
+    Ok(map)
+}
+
+/// The text after a quoted `.env` value must be nothing but
+/// whitespace and an optional `#` comment; anything else is a
+/// malformed line.
+fn check_dotenv_trailing(text: &str, path: &Path, lineno: usize) -> Result<(), GeectlError> {
+    let trailing = text.trim_start();
+    if trailing.is_empty() || trailing.starts_with('#') {
+        Ok(())
+    } else {
+        Err(dotenv_error(
+            path,
+            lineno,
+            "unexpected text after quoted value",
+        ))
+    }
+}
+
+/// Load and parse the `.env` file at `path`: `Ok(None)` when the
+/// file is missing, or when it carries no `GEECTL_*` key — a missing
+/// file is not an error, and a file for other tools is ignored whole,
+/// whatever its mode or syntax. Any other failure is a `ConfigError`
+/// naming the file (and the line, for a malformed line) and never the
+/// value. The file is read through [`open_secret_file_production`],
+/// so it must be a regular file, at most [`MAX_SECRET_FILE_BYTES`]
+/// long, and not a symlink; and a file readable by group or other is
+/// refused, like the SSH key in [`resolve_gitea_ssh_key`] — it holds
+/// secrets, so a warning would leave the secret readable. On
+/// non-Unix there is no mode to check (`None`): the explicit opt-in
+/// in [`load_dotenv`] is the guard there, not a permission check.
+fn load_dotenv_at(path: &Path) -> Result<Option<HashMap<String, String>>, GeectlError> {
+    let (mode, content) = match open_secret_file_production(path) {
+        Ok(found) => found,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!("cannot read {}: {err}", path.display()),
+            ));
+        }
+    };
+    // Strictness applies only to a file that carries geectl keys:
+    // a project `.env` for other tools is ignored whole, whatever
+    // its mode or syntax, so a conventional 0644 file never fails a
+    // run that does not use it.
+    if !dotenv_carries_geectl_keys(&content) {
+        return Ok(None);
+    }
+    if let Some(mode) = mode {
+        if mode & 0o077 != 0 {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "{} is readable by group or other (mode {:o}); run `chmod 600 {}`",
+                    path.display(),
+                    mode & 0o777,
+                    path.display()
+                ),
+            ));
+        }
+    }
+    parse_dotenv(&content, path).map(Some)
+}
+
+/// The `.env` file, loaded once per process: the first caller reads
+/// it, every later caller reuses the same snapshot, so the file
+/// cannot change under a run between the startup load in `main.rs`
+/// and a later [`snapshot_env`] call. [`load_dotenv_at`] stays
+/// uncached, for tests that load explicit paths.
+static DOTENV_CACHE: OnceLock<Result<Option<HashMap<String, String>>, GeectlError>> =
+    OnceLock::new();
+
+/// Load the `.env` file from the current working directory, if
+/// present — see [`load_dotenv_at`]. The file is looked up in the
+/// working directory only, never in a parent directory, and only
+/// when the real process environment opts in with `GEECTL_DOTENV=1`:
+/// without the opt-in the file is never read, so a stray `.env` in a
+/// working copy cannot change a run. The opt-in is read from the real
+/// environment only — a `GEECTL_DOTENV=1` line in the file itself
+/// never opts in. The loaded snapshot is cached for the process (see
+/// `DOTENV_CACHE`).
+pub fn load_dotenv() -> Result<Option<HashMap<String, String>>, GeectlError> {
+    DOTENV_CACHE.get_or_init(load_dotenv_uncached).clone()
+}
+
+/// Read the working-directory `.env` file once, uncached: the
+/// `OnceLock` initializer for [`load_dotenv`].
+fn load_dotenv_uncached() -> Result<Option<HashMap<String, String>>, GeectlError> {
+    if !dotenv_opted_in_from(std::env::var(DOTENV_OPT_IN_VAR).ok().as_deref()) {
+        return Ok(None);
+    }
+    load_dotenv_at(Path::new(DOTENV_FILE))
+}
+
+/// Merge one environment snapshot: the real process environment
+/// wins, and the `.env` file fills only the names the environment
+/// leaves unset. Pure, for tests: the process environment is not
+/// touched here.
+fn merge_snapshot(
+    names: &[&str],
+    real: &HashMap<String, String>,
+    dotenv: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for name in names {
+        if let Some(value) = real.get(*name).or_else(|| dotenv.get(*name)) {
+            map.insert(name.to_string(), value.clone());
+        }
+    }
+    map
+}
+
+/// Read the named environment variables once, into a map, merging
+/// the `.env` file from the current working directory underneath:
+/// a real process environment variable wins over the same key in the
+/// file, and the file fills only the names the environment leaves
+/// unset (see [`load_dotenv`]). A set variable that is not valid
+/// UTF-8 is a `ConfigError` naming the variable — it must not
+/// silently become "not set": the user configured a credential and
+/// would get a confusing "nothing configured" outcome instead of an
+/// error. The `.env` file loads only with explicit opt-in (see
+/// [`load_dotenv`]) and only when it carries `GEECTL_*` keys; it
+/// loads even when every requested variable is already set: once
+/// opted into, a malformed file is a misconfiguration, not a value
+/// the caller happens not to need. The file is read once per process
+/// and the snapshot reused, so every call in a run sees the same
+/// file.
 ///
 /// Reading each variable once (instead of a check pass plus a read
 /// pass) means resolution sees one consistent view of the
@@ -1140,16 +1421,17 @@ pub fn resolve_gitea_ssh_key(
 /// (see the `VarLookup` closures in the providers, and
 /// `crate::config`).
 pub(crate) fn snapshot_env(names: &[&str]) -> Result<HashMap<String, String>, GeectlError> {
-    let mut map = HashMap::new();
+    let mut real = HashMap::new();
     for name in names {
         if let Some(value) = std::env::var_os(name) {
             let value = value.into_string().map_err(|_| {
                 GeectlError::new(ErrorKind::ConfigError, format!("{name} is not valid UTF-8"))
             })?;
-            map.insert(name.to_string(), value);
+            real.insert(name.to_string(), value);
         }
     }
-    Ok(map)
+    let dotenv = load_dotenv()?.unwrap_or_default();
+    Ok(merge_snapshot(names, &real, &dotenv))
 }
 
 /// OBS credentials from the process environment. See
@@ -2527,5 +2809,339 @@ mod tests {
             "instances entry missing from the error"
         );
         assert!(!err.context.contains("plain-token"));
+    }
+
+    // --- `.env` file tests ---
+
+    #[test]
+    fn dotenv_parses_minimal_syntax() {
+        let content = "# a comment\n\
+            \n\
+            GEECTL_OBS_URL=https://api.opensuse.org\n\
+            export GEECTL_FORMAT=text\n\
+            GEECTL_GITEA_TOKEN='tok en'\n\
+            GEECTL_OBS_USERNAME=\"user name\"\n\
+            GEECTL_OBS_PASSWORD=secret # trailing comment\n\
+            GEECTL_DEBUG=1\n\
+            GEECTL_DEBUG=0\n";
+        let map = parse_dotenv(content, Path::new(".env")).unwrap();
+        assert_eq!(map["GEECTL_OBS_URL"], "https://api.opensuse.org");
+        assert_eq!(map["GEECTL_FORMAT"], "text");
+        assert_eq!(map["GEECTL_GITEA_TOKEN"], "tok en");
+        assert_eq!(map["GEECTL_OBS_USERNAME"], "user name");
+        assert_eq!(map["GEECTL_OBS_PASSWORD"], "secret");
+        // A duplicate key keeps its last value.
+        assert_eq!(map["GEECTL_DEBUG"], "0");
+    }
+
+    #[test]
+    fn dotenv_ignores_non_geectl_keys() {
+        let content = "OTHER=1\n\
+            GIT_DIR=/tmp/repo\n\
+            https_proxy=http://proxy.example.org:8080\n\
+            geectl_lower=bar\n\
+            export OTHER=2\n\
+            FOO BAR=baz\n";
+        // `exportGEECTL_A` is not here: a key glued to `export` is a
+        // malformed geectl line, not an ignored key (see
+        // `dotenv_glued_export_is_malformed`).
+        let map = parse_dotenv(content, Path::new(".env")).unwrap();
+        assert!(map.is_empty(), "non-GEECTL keys must be ignored: {map:?}");
+    }
+
+    #[test]
+    fn dotenv_hash_and_dollar_are_literal() {
+        let map = parse_dotenv(
+            "GEECTL_A=a#b\nGEECTL_B=\"a#b\"\nGEECTL_C='a$b'\nGEECTL_D=a=b=c\n",
+            Path::new(".env"),
+        )
+        .unwrap();
+        // A `#` not preceded by whitespace is part of the value,
+        // in and out of quotes; a `$` is never interpolated.
+        assert_eq!(map["GEECTL_A"], "a#b");
+        assert_eq!(map["GEECTL_B"], "a#b");
+        assert_eq!(map["GEECTL_C"], "a$b");
+        // The value splits on the first `=` only.
+        assert_eq!(map["GEECTL_D"], "a=b=c");
+    }
+
+    #[test]
+    fn dotenv_export_prefix_accepts_a_tab() {
+        let map = parse_dotenv("export\tGEECTL_A=1\n", Path::new(".env")).unwrap();
+        assert_eq!(map["GEECTL_A"], "1");
+    }
+
+    #[test]
+    fn dotenv_tab_before_hash_starts_a_comment() {
+        let map = parse_dotenv("GEECTL_A=value\t# comment\n", Path::new(".env")).unwrap();
+        assert_eq!(map["GEECTL_A"], "value");
+    }
+
+    #[test]
+    fn dotenv_trims_whitespace_bom_crlf_and_empty_values() {
+        let content = "\u{feff}  GEECTL_A = spaced  \r\n\
+            export  GEECTL_B=\"quoted\" # note\r\n\
+            GEECTL_C=\r\n\
+            GEECTL_D=''\n";
+        let map = parse_dotenv(content, Path::new(".env")).unwrap();
+        assert_eq!(map["GEECTL_A"], "spaced");
+        assert_eq!(map["GEECTL_B"], "quoted");
+        assert_eq!(map["GEECTL_C"], "");
+        assert_eq!(map["GEECTL_D"], "");
+    }
+
+    #[test]
+    fn dotenv_line_without_equals_is_a_config_error_naming_file_and_line() {
+        let err =
+            parse_dotenv("GEECTL_A=sekrit-value\nNOT_A_PAIR\n", Path::new(".env")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains(".env"), "{}", err.context);
+        assert!(err.context.contains("line 2"), "{}", err.context);
+        assert!(!err.context.contains("sekrit-value"), "{}", err.context);
+    }
+
+    #[test]
+    fn dotenv_unterminated_quote_is_a_config_error() {
+        let err = parse_dotenv("GEECTL_A=\"abc\n", Path::new(".env")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("line 1"), "{}", err.context);
+        assert!(
+            err.context.contains("unterminated quote"),
+            "{}",
+            err.context
+        );
+        assert!(!err.context.contains("abc"), "{}", err.context);
+    }
+
+    #[test]
+    fn dotenv_text_after_a_quoted_value_is_a_config_error() {
+        let err = parse_dotenv("GEECTL_A=\"v\" junk\n", Path::new(".env")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("line 1"), "{}", err.context);
+        assert!(
+            err.context.contains("unexpected text after quoted value"),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn dotenv_invalid_geectl_key_is_a_config_error() {
+        for bad in [
+            "GEECTL_FOO-BAR=sekrit\n",
+            "GEECTL_=sekrit\n",
+            // Near-miss prefixes: a typo for a geectl variable.
+            "GEECCTL_FOO=sekrit\n",
+            "GEECT_FOO=sekrit\n",
+            "GEECTL=sekrit\n",
+            "GEECTLX=sekrit\n",
+            "GEECTLFOO=sekrit\n",
+            "GEEC-FOO=sekrit\n",
+        ] {
+            let err = parse_dotenv(bad, Path::new(".env")).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError);
+            assert!(err.context.contains("line 1"), "{}", err.context);
+            assert!(
+                err.context.contains("invalid variable name"),
+                "{}",
+                err.context
+            );
+            assert!(!err.context.contains("sekrit"), "{}", err.context);
+        }
+    }
+
+    #[test]
+    fn merge_snapshot_prefers_real_env_over_dotenv() {
+        let real = vars(&[("GEECTL_OBS_URL", "https://real.example.org")]);
+        let dotenv = vars(&[
+            ("GEECTL_OBS_URL", "https://file.example.org"),
+            ("GEECTL_FORMAT", "text"),
+        ]);
+        let map = merge_snapshot(
+            &["GEECTL_OBS_URL", "GEECTL_FORMAT", "GEECTL_DEBUG"],
+            &real,
+            &dotenv,
+        );
+        assert_eq!(map["GEECTL_OBS_URL"], "https://real.example.org");
+        // The file fills only the names the environment leaves unset.
+        assert_eq!(map["GEECTL_FORMAT"], "text");
+        assert!(!map.contains_key("GEECTL_DEBUG"));
+    }
+
+    fn write_dotenv(dir: &tempfile::TempDir, content: &[u8]) -> PathBuf {
+        let path = dir.path().join(".env");
+        std::fs::write(&path, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn load_dotenv_at_returns_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_dotenv_at(&dir.path().join(".env")).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_dotenv_at_loads_a_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dotenv(
+            &dir,
+            b"GEECTL_OBS_URL=https://api.opensuse.org\nOTHER=ignored\n",
+        );
+        let map = load_dotenv_at(&path).unwrap().unwrap();
+        assert_eq!(map["GEECTL_OBS_URL"], "https://api.opensuse.org");
+        assert_eq!(map.len(), 1, "only GEECTL_* keys are honoured");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_dotenv_at_refuses_a_group_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dotenv(&dir, b"GEECTL_OBS_URL=https://api.opensuse.org\n");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = load_dotenv_at(&path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains(&path.display().to_string()),
+            "{}",
+            err.context
+        );
+        assert!(
+            err.context.contains("readable by group or other"),
+            "{}",
+            err.context
+        );
+        assert!(
+            !err.context.contains("https://api.opensuse.org"),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn load_dotenv_at_reports_a_malformed_file_with_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dotenv(&dir, b"GEECTL_A=sekrit-value\nBROKEN LINE\n");
+        let err = load_dotenv_at(&path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains(&path.display().to_string()),
+            "{}",
+            err.context
+        );
+        assert!(err.context.contains("line 2"), "{}", err.context);
+        assert!(!err.context.contains("sekrit-value"), "{}", err.context);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_dotenv_at_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = write_dotenv(&dir, b"GEECTL_A=sekrit-value\n");
+        let link = dir.path().join(".env-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = load_dotenv_at(&link).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains(&link.display().to_string()),
+            "{}",
+            err.context
+        );
+        assert!(!err.context.contains("sekrit-value"), "{}", err.context);
+    }
+
+    #[test]
+    fn load_dotenv_at_rejects_non_utf8_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dotenv(&dir, b"GEECTL_A=\xff\n");
+        let err = load_dotenv_at(&path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains(&path.display().to_string()),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn load_dotenv_at_refuses_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_dotenv_at(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains(&dir.path().display().to_string()),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn load_dotenv_at_refuses_an_oversize_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dotenv(&dir, &vec![b'x'; MAX_SECRET_FILE_BYTES + 1]);
+        let err = load_dotenv_at(&path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains(&path.display().to_string()),
+            "{}",
+            err.context
+        );
+    }
+
+    #[test]
+    fn dotenv_opt_in_requires_the_literal_one() {
+        assert!(dotenv_opted_in_from(Some("1")));
+        assert!(!dotenv_opted_in_from(None));
+        assert!(!dotenv_opted_in_from(Some("")));
+        assert!(!dotenv_opted_in_from(Some("0")));
+        assert!(!dotenv_opted_in_from(Some("yes")));
+    }
+
+    #[test]
+    fn dotenv_carries_geectl_keys_spots_assignments_only() {
+        assert!(dotenv_carries_geectl_keys("GEECTL_A=1\n"));
+        assert!(dotenv_carries_geectl_keys("export GEECTL_A=1\n"));
+        assert!(dotenv_carries_geectl_keys("export\tGEECTL_A=1\n"));
+        assert!(dotenv_carries_geectl_keys("exportGEECTL_A=1\n"));
+        assert!(dotenv_carries_geectl_keys("OTHER=1\nGEECTL_A\n"));
+        assert!(!dotenv_carries_geectl_keys("OTHER=1\n"));
+        assert!(!dotenv_carries_geectl_keys("# GEECTL_A=1\n"));
+        assert!(!dotenv_carries_geectl_keys("GEECTLX=1\n"));
+        assert!(!dotenv_carries_geectl_keys(""));
+    }
+
+    #[test]
+    fn dotenv_glued_export_is_malformed() {
+        for bad in ["exportGEECTL_A=1\n", "exportGEEC_A=1\n"] {
+            let err = parse_dotenv(bad, Path::new(".env")).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ConfigError);
+            assert!(
+                err.context.contains("invalid variable name"),
+                "{}",
+                err.context
+            );
+        }
+        // The spaced prefix stays valid.
+        let map = parse_dotenv("export GEECTL_A=1\n", Path::new(".env")).unwrap();
+        assert_eq!(map["GEECTL_A"], "1");
+    }
+
+    #[test]
+    fn load_dotenv_at_ignores_a_file_without_geectl_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dotenv(&dir, b"OTHER=1\nBROKEN LINE\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        // No GEECTL_* key: neither the loose mode nor the malformed
+        // line matters — the file is not a geectl file.
+        assert!(load_dotenv_at(&path).unwrap().is_none());
     }
 }
