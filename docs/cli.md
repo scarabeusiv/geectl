@@ -40,6 +40,12 @@ geectl [--format json|text] [--debug] [--debug-body] [--live] <group> <command> 
   no dry-run at all: without `--live` it refuses — the library's raw
   supersede cannot be previewed, so use `request refile --supersede`
   for the dry-runnable supersede flow.
+- `remote set-project-meta` in dry-run validates every repository
+  the write carries, since it performs no fetch and cannot tell a
+  changed repository from a pre-existing one: a dry run can refuse
+  a write whose repositories it did not change when a carried
+  repository is invalid, while `--live` only validates the
+  repositories when they change.
 - `request file-delete` deletes a whole project only with
   `--whole-project`: omitting `--package` and `--repository` without
   it refuses.
