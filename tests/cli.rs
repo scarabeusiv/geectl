@@ -927,13 +927,13 @@ fn debug_config_line_reports_alias_credentials() {
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.toml"),
-        "[instances]\nmyloveinstance = \"https://api.opensuse.org\"\n",
+        "[instances]\nexample = \"https://api.opensuse.org\"\n",
     )
     .unwrap();
     let out = geectl_isolated(&dir)
         .args(["--debug", "version"])
-        .env("GEECTL_OBS_USERNAME_MYLOVEINSTANCE", "target-user")
-        .env("GEECTL_OBS_PASSWORD_MYLOVEINSTANCE", "target-secret")
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "target-user")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "target-secret")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -7501,13 +7501,13 @@ fn config_show_reports_obs_auth_from_alias_credentials() {
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.toml"),
-        "[instances]\nmyloveinstance = \"https://api.opensuse.org\"\n",
+        "[instances]\nexample = \"https://api.opensuse.org\"\n",
     )
     .unwrap();
     let out = geectl_isolated(&dir)
         .args(["config", "show"])
-        .env("GEECTL_OBS_USERNAME_MYLOVEINSTANCE", "target-user")
-        .env("GEECTL_OBS_PASSWORD_MYLOVEINSTANCE", "target-secret")
+        .env("GEECTL_OBS_USERNAME_EXAMPLE", "target-user")
+        .env("GEECTL_OBS_PASSWORD_EXAMPLE", "target-secret")
         .output()
         .unwrap();
     assert!(
@@ -7519,10 +7519,7 @@ fn config_show_reports_obs_auth_from_alias_credentials() {
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(value["obs_auth"]["status"], "configured");
     assert_eq!(value["obs_auth"]["username"], "target-user");
-    assert_eq!(
-        value["instances"]["myloveinstance"],
-        "https://api.opensuse.org"
-    );
+    assert_eq!(value["instances"]["example"], "https://api.opensuse.org");
     assert!(!stdout.contains("target-secret"));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("target-secret"));
 }
@@ -7534,7 +7531,7 @@ fn config_show_reports_instances_table() {
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.toml"),
-        "[instances]\nmyloveinstance = \"https://api.opensuse.org\"\nlocal = \"http://127.0.0.1:3001\"\n",
+        "[instances]\nexample = \"https://api.opensuse.org\"\nlocal = \"http://127.0.0.1:3001\"\n",
     )
     .unwrap();
     let out = geectl_isolated(&dir)
@@ -7548,10 +7545,7 @@ fn config_show_reports_instances_table() {
     );
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
-    assert_eq!(
-        value["instances"]["myloveinstance"],
-        "https://api.opensuse.org"
-    );
+    assert_eq!(value["instances"]["example"], "https://api.opensuse.org");
     assert_eq!(value["instances"]["local"], "http://127.0.0.1:3001");
     // And in text form, as `alias -> url` pairs sorted by alias.
     let out = geectl_isolated(&dir)
@@ -7561,7 +7555,7 @@ fn config_show_reports_instances_table() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(
-            "instances: local -> http://127.0.0.1:3001, myloveinstance -> https://api.opensuse.org"
+            "instances: example -> https://api.opensuse.org, local -> http://127.0.0.1:3001"
         ),
         "{stdout}"
     );
