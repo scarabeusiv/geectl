@@ -975,6 +975,7 @@ fn remote_help_lists_every_command() {
         "upload-file",
         "create-project",
         "create-package",
+        "create-token",
         "delete-package",
         "delete-project",
         "undelete-package",
