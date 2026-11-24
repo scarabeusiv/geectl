@@ -551,13 +551,22 @@ fn as_url_string(value: &toml::Value, key: &str, path: &Path) -> Result<String, 
 }
 
 /// The `[instances]` table: alias → endpoint URL. The value must
-/// be a table of strings; each URL is validated like `obs_url`
-/// (see [`validate_endpoint_url`]) and each alias like an env-var
-/// segment (see [`validate_alias`]). Only the scheme, host and
-/// effective port identify the instance — a path in the URL is
-/// ignored by matching (see [`crate::auth::same_api_url`]); a
-/// query or fragment never reaches here, the loader rejects it
-/// (see [`validate_endpoint_url`]). The pairs come back sorted by
+/// be a table of strings and each alias like an env-var segment
+/// (see [`validate_alias`]) — those are load errors. The URL
+/// itself is not validated here, with one exception: a URL
+/// carrying userinfo (`@` in the authority — a credential in the
+/// URL) is refused at load. It can never resolve, and the raw
+/// string would otherwise echo in full through the merged
+/// results render (see [`crate::obs::InstanceBuildResults`]),
+/// leaking the credential; tolerance for genuinely malformed
+/// shapes is untouched. A malformed URL loads fine and fails
+/// only when that instance is read, so one bad entry never
+/// blocks the other instances from loading (a malformed entry
+/// matches nothing under [`crate::auth::same_api_url`], and the
+/// merged results read records the failure for that instance
+/// alone). Only the scheme, host and effective port identify the
+/// instance — a path in the URL is ignored by matching (see
+/// [`crate::auth::same_api_url`]). The pairs come back sorted by
 /// alias, so alias matching (see [`crate::auth::alias_for_url`])
 /// is deterministic regardless of the file's key order.
 fn as_instances_table(
@@ -574,43 +583,50 @@ fn as_instances_table(
     let mut instances = Vec::new();
     for (alias, url) in table {
         validate_alias(alias, &mut seen_upper, path)?;
-        let url = as_url_string(url, &format!("[instances] {alias}"), path)?;
-        // `as_url_string` checks the scheme and the host, but not
-        // the port — and with one entry there is no pair for the
-        // duplicate loop below, so a malformed port would load
-        // fine and then fail every resolution at runtime. Check
-        // the shape here, at load: `same_api_url` against itself
-        // only ever fails on the shape.
-        same_api_url(&url, &url).map_err(|e| {
+        // The value must be a string, but the URL is not
+        // validated here: a malformed URL loads fine and fails
+        // only when that instance is read, so one bad entry
+        // never blocks the other instances from loading.
+        let text = url.as_str().ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ConfigError,
-                format!(
-                    "{}: invalid URL for instance alias {alias:?}: {}",
-                    path.display(),
-                    e.context
-                ),
+                format!("{}: '[instances] {alias}' must be a string", path.display()),
             )
         })?;
-        instances.push((alias.clone(), url));
+        let text = text.trim().to_string();
+        // One shape is refused at load, not tolerated: userinfo
+        // (`@` in the authority — a credential in the URL). It
+        // can never resolve, and the loaded string would echo in
+        // full through the merged results render. The URL itself
+        // is never echoed here: the part before the `@` is a
+        // credential. The authority ends at the first `/`, `?`,
+        // or `#`, as in `validate_endpoint_url`.
+        let after_scheme = text.split("://").nth(1).unwrap_or("");
+        let authority_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        if after_scheme[..authority_end].contains('@') {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "{}: '[instances] {alias}' URL must not contain userinfo ('@')",
+                    path.display()
+                ),
+            ));
+        }
+        instances.push((alias.clone(), text));
     }
     instances.sort();
     // Two aliases for the same URL name the same instance twice:
     // resolution could only ever use the first one's variables,
     // so the duplicate is refused at load like the case
-    // collision — name each instance once.
+    // collision — name each instance once. A malformed URL
+    // matches nothing under `same_api_url`, so it never
+    // collides: the comparison failure is a non-match, not a
+    // load failure.
     for (index, (alias, url)) in instances.iter().enumerate() {
         for (other_alias, other_url) in &instances[index + 1..] {
-            // Every URL was shape-checked when its alias was
-            // read, so this cannot fail on a malformed URL any
-            // more; the mapping stays as defence, so a failure
-            // here is still a load failure naming the file, like
-            // every other load failure, not a bare `InvalidInput`.
-            if same_api_url(url, other_url).map_err(|e| {
-                GeectlError::new(
-                    ErrorKind::ConfigError,
-                    format!("{}: {}", path.display(), e.context),
-                )
-            })? {
+            if same_api_url(url, other_url).unwrap_or(false) {
                 return Err(GeectlError::new(
                     ErrorKind::ConfigError,
                     format!(
@@ -1254,40 +1270,110 @@ mod tests {
     }
 
     #[test]
-    fn instances_duplicate_url_with_bad_port_is_a_config_error() {
-        // A bad port passes `UrlBuilder` validation (it does not
-        // check the port) but fails the per-alias
-        // `same_api_url(url, url)` shape check at load, before the
-        // duplicate loop: the load failure must still be a
-        // `ConfigError` naming the file, like every other load
-        // failure.
-        let err = parse_config(
-            "[instances]\nalpha = \"https://api.example.org:notaport\"\nbeta = \"https://api.example.org\"\n",
-            &config_path(),
-        )
-        .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ConfigError);
-        assert!(err.context.contains("/x/geectl/config.toml"));
-        assert!(err.context.contains("invalid port"));
-    }
-
-    #[test]
-    fn instances_single_bad_port_is_a_config_error() {
-        // One entry has no pair for the duplicate loop, so its
-        // shape is checked at load: a bad port must fail here,
-        // not at the first resolution.
+    fn instances_malformed_url_loads_and_is_kept_trimmed() {
+        // A malformed `[instances]` URL is not a load error any
+        // more: the entry loads and is kept trimmed, and its
+        // failure surfaces only when that instance is read.
         for bad in [
+            "notaurl",
             "https://api.example.org:notaport",
             "https://api.example.org:0",
             "https://api.example.org:65536",
+            "https://",
+            "https://api.example.org?x=1",
+        ] {
+            let text = format!("[instances]\nalpha = \"{bad}\"\n");
+            let config = parse_config(&text, &config_path()).unwrap();
+            assert_eq!(
+                config.instances,
+                vec![("alpha".to_string(), bad.to_string())],
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn instances_userinfo_url_is_a_config_error() {
+        // One shape is refused at load, not tolerated like the
+        // other malformed shapes: a userinfo-bearing URL can
+        // never resolve, and the loaded string would echo in
+        // full through the merged results render, leaking the
+        // credential. The failure names the file and the alias,
+        // never the URL itself.
+        for bad in [
+            "https://user:secret@api.example.org",
+            "https://user@api.example.org",
+            "http://user:secret@127.0.0.1:3001",
         ] {
             let text = format!("[instances]\nalpha = \"{bad}\"\n");
             let err = parse_config(&text, &config_path()).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ConfigError, "{bad}");
             assert!(err.context.contains("/x/geectl/config.toml"), "{bad}");
-            assert!(err.context.contains("invalid port"), "{bad}");
             assert!(err.context.contains("alpha"), "{bad}");
+            assert!(err.context.contains("userinfo"), "{bad}");
+            assert!(!err.context.contains("secret"), "{bad}");
         }
+        // An `@` outside the authority is data, not userinfo:
+        // a path carrying one still loads.
+        let config = parse_config(
+            "[instances]\nalpha = \"https://api.example.org/path@x\"\n",
+            &config_path(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.instances,
+            vec![(
+                "alpha".to_string(),
+                "https://api.example.org/path@x".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn instances_url_value_is_trimmed() {
+        // The loader trims the value: surrounding whitespace in
+        // the file does not become part of the URL.
+        let config = parse_config(
+            "[instances]\nalpha = \"  https://api.example.org  \"\n",
+            &config_path(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.instances,
+            vec![("alpha".to_string(), "https://api.example.org".to_string())]
+        );
+    }
+
+    #[test]
+    fn instances_bad_port_entry_loads_and_matches_nothing() {
+        // A bad port no longer fails the load: the entry is kept
+        // trimmed and matches nothing, so it cannot duplicate
+        // the valid entry either — its failure surfaces when
+        // that instance is read.
+        let config = parse_config(
+            "[instances]\nalpha = \"https://api.example.org:notaport\"\nbeta = \"https://api.example.org\"\n",
+            &config_path(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.instances,
+            vec![
+                (
+                    "alpha".to_string(),
+                    "https://api.example.org:notaport".to_string()
+                ),
+                ("beta".to_string(), "https://api.example.org".to_string()),
+            ]
+        );
+        // Two aliases for the same malformed URL load too: a
+        // malformed URL matches nothing, so neither entry can
+        // shadow the other's variables at read time.
+        let config = parse_config(
+            "[instances]\nalpha = \"https://api.example.org:notaport\"\nbeta = \"https://api.example.org:notaport\"\n",
+            &config_path(),
+        )
+        .unwrap();
+        assert_eq!(config.instances.len(), 2);
     }
 
     #[test]

@@ -504,7 +504,8 @@ fn resolve_obs_bearer_with(
 /// scheme and host lowercased, the port the explicit one when the URL
 /// carries one. `http` and `https` only; a missing scheme, a missing
 /// host, userinfo (`@` in the authority — a credential in the URL),
-/// and a malformed port are `InvalidInput`. The URL itself is never
+/// a query or fragment after the authority, and a malformed port
+/// are `InvalidInput`. The URL itself is never
 /// echoed in the error: it could carry userinfo. IPv6 hosts
 /// arrive without their brackets.
 fn split_api_url(url: &str) -> Result<(String, String, Option<u16>), GeectlError> {
@@ -523,6 +524,14 @@ fn split_api_url(url: &str) -> Result<(String, String, Option<u16>), GeectlError
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() {
         return Err(invalid("must have a host"));
+    }
+    // A query or fragment after the authority would ride along
+    // verbatim into every request built from the base: the path
+    // would land inside the query. Refuse it here — this is the
+    // read boundary — so a mistyped `[instances]` URL fails at
+    // read time instead of going out as a mangled request.
+    if rest[authority.len()..].contains(['?', '#']) {
+        return Err(invalid("must not contain a query or fragment"));
     }
     if authority.contains('@') {
         // The URL is not echoed here: the authority before the `@`
@@ -1715,6 +1724,9 @@ mod tests {
             "https://api.opensuse.org:0",
             "https://api.opensuse.org:notaport",
             "https://[::1",
+            "https://api.opensuse.org?x=1",
+            "https://api.opensuse.org#frag",
+            "https://api.opensuse.org/path?x=1",
         ] {
             let err = same_api_url(bad, "https://api.opensuse.org").unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput, "{bad}");
@@ -1759,9 +1771,12 @@ mod tests {
     fn alias_for_url_skips_a_malformed_entry() {
         // One bad `[instances]` entry never poisons the lookup for
         // the others: it matches nothing, and a later entry still
-        // matches.
+        // matches. A query or fragment in the entry is refused at
+        // this read boundary too: the URL would otherwise ride
+        // along into every request built from the base.
         let table = instances(&[
             ("broken", "notaurl"),
+            ("query", "https://api.example.org?x=1"),
             ("example", "https://api.example.org"),
         ]);
         assert_eq!(
@@ -1771,6 +1786,12 @@ mod tests {
         // A malformed lookup URL is still the caller's error.
         assert_eq!(
             alias_for_url("notaurl", &table).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            alias_for_url("https://api.example.org?x=1", &table)
+                .unwrap_err()
+                .kind(),
             ErrorKind::InvalidInput
         );
     }

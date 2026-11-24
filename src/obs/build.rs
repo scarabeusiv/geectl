@@ -3667,6 +3667,7 @@ pub fn results_across_instances(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::EnvObsAuth;
     use crate::error::ErrorKind;
     use crate::obs::parse_project_meta;
     use crate::obs::test_support::{basic_credentials, FakeHttp};
@@ -4183,6 +4184,66 @@ mod tests {
         // Both endpoints were attempted: the failure did not abort
         // the run.
         assert_eq!(http.get_calls().len(), 2);
+    }
+
+    #[test]
+    fn results_across_instances_records_a_malformed_url_as_that_instances_error() {
+        // A malformed `[instances]` URL fails when that instance
+        // is read, not at load: each broken instance records its
+        // own error — naming the bad URL's shape, never echoing
+        // the URL itself — and the good instance still reads.
+        // Both headline shapes are pinned: the shapeless
+        // `notaurl` and the `?` URL the read boundary refuses.
+        let http = FakeHttp::new().with_get(
+            "https://api.one.example/build/testproject/_result",
+            RESULTS_FIXTURE,
+        );
+        let instances = vec![
+            ("broken".to_string(), "notaurl".to_string()),
+            ("one".to_string(), "https://api.one.example".to_string()),
+            (
+                "query".to_string(),
+                "https://api.one.example?x=1".to_string(),
+            ),
+        ];
+        let outcomes = results_across_instances(
+            &[
+                ("broken", "notaurl"),
+                ("one", "https://api.one.example"),
+                ("query", "https://api.one.example?x=1"),
+            ],
+            "testproject",
+            &ResultsQuery::default(),
+            |url, project, query| {
+                let credentials =
+                    EnvObsAuth::credentials_for_url(url, "https://api.one.example", &instances)?;
+                // The build-state read needs credentials; the test
+                // pins the malformed-URL failure, not credential
+                // resolution, so an unconfigured instance reads
+                // with the test pair.
+                let credentials = match credentials {
+                    Credentials::None => basic_credentials(),
+                    credentials => credentials,
+                };
+                let client = ObsClient::with_base_and_credentials(&http, url, credentials).unwrap();
+                client.results(project, query)
+            },
+        );
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(outcomes[0].alias, "broken");
+        assert_eq!(outcomes[0].api_url, "notaurl");
+        let err = outcomes[0].outcome.as_ref().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("invalid API URL"));
+        assert!(outcomes[1].outcome.is_ok());
+        assert_eq!(outcomes[2].alias, "query");
+        assert_eq!(outcomes[2].api_url, "https://api.one.example?x=1");
+        let err = outcomes[2].outcome.as_ref().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("invalid API URL"));
+        // Only the good instance was read: the broken ones failed
+        // before any request.
+        assert_eq!(http.get_calls().len(), 1);
     }
 
     #[test]
