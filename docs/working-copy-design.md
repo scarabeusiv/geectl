@@ -125,7 +125,9 @@ until the synced commit matches, bounded 60 s, then reports. The
 synthesized commit is authored with the checkout's repo-local identity
 (`geectl <geectl@localhost>`), not the user's configured git identity,
 and is pushed as such. The push authenticates with the configured Gitea
-token, scoped to the Gitea instance the same way as the clone.
+token, scoped to the Gitea instance the same way as the clone. Before
+the push, `commit` runs the pre-push sanity checks (see "Pre-push
+sanity checks"): a failed check blocks the push.
 
 ## Services before commit
 
@@ -140,6 +142,64 @@ index after the gate, so the commit sends it; new files are never staged
 by this, and unstaged changes to other files are not staged. A file the
 gate changed is staged whole, including any pre-existing unstaged edit
 to the same file, so that edit is sent with the commit.
+
+## Pre-push sanity checks
+
+The git sanity checks run as a pre-push gate for git-backed packages,
+the same way `pre_checkin` runs before commit: a failed check blocks
+the push with an actionable message. The gate runs after the
+synthesized commit exists, so it checks every commit the push would
+send, and before the push itself. It is git-backed only; the
+OBS-native commit has no push. The checks are local only (no server
+call) and cover the three states the issue names:
+
+- Hooks: an executable `pre-push` hook in the checkout's effective
+  hooks directory blocks the push. The directory is `core.hooksPath`
+  when set, else the common git directory's `hooks` (in a linked
+  worktree the hooks live in the main checkout's git directory, not
+  the worktree's). The value is read scoped — `--worktree` first
+  when `extensions.worktreeConfig` is on, then `--local`, then
+  `--global`, then `--system` — and the first scope that sets it
+  wins; a relative path resolves against the
+  checkout root, and a leading `~` expands the way git expands it
+  (`~/` from `$HOME`, `~user/` from that user's home directory;
+  on Windows git cannot expand `~user/` at all, so such a path
+  refuses the push). A
+  hooks path that is a file, not a directory, refuses the push
+  naming the path itself. Geectl never runs repository
+  hooks — the push runs with `--no-verify` and
+  `core.hooksPath=/dev/null` — so an installed hook would be silently
+  skipped, and the guard it was meant to provide would never run.
+  The push is refused until the hook is removed, not run: geectl
+  runs its own pre-push checks instead. `pre-commit` hooks are not
+  covered: the synthesized commit ignores them by design.
+- Per-commit state: every commit in the push range carries a
+  non-empty message and is not empty (its tree differs from its
+  parent's). Merge commits are exempt from the empty check: their
+  tree routinely matches one parent's.
+- Submodule state: every gitlink a pushed commit changes names a
+  URL in that commit's `.gitmodules` and points at a commit object
+  present locally, in the checkout or in the submodule's own
+  checkout. A pointer inherited unchanged from the parent is not
+  checked: it was verified when it was introduced, so a checkout
+  whose submodules were never initialized still pushes commits
+  that do not touch them. A pointer that cannot be verified fails
+  the gate: the OBS sync would fetch it, and a revision that does
+  not exist breaks the package there. A commit that moves a
+  pointer needs the submodule fetched first (`git submodule update
+  --init <path>`), before the commit.
+
+The gate and the push run under an exclusive lock on the checkout
+(a lock file in the common git directory), taken before the
+synthesized commit is created and held until the push returns, so
+a concurrent commit cannot land between the gate and the push and
+be sent ungated. A failure inside the gate itself (a git call that
+cannot run, a lock that cannot be taken) is a gate failure too: it
+refuses the push as `PrePushCheckFailed`, exit 34, instead of
+surfacing the git-classified kind.
+
+The checks are geectl's own, written against the git repository
+directly. Nothing is borrowed from osc.
 
 ## `changelog`
 
@@ -242,7 +302,8 @@ changes the call the agent makes:
   at commit), `WorkingCopyInconsistent` (checkout not in a usable state,
   or the recorded base coordinates disagree with the base commit),
   `FileConflict` (merge conflict left in the tree), `NothingToCommit`,
-  `NoGit` (the git binary is not installed).
+  `NoGit` (the git binary is not installed), `PrePushCheckFailed` (a
+  pre-push sanity check failed; the context names the failing check).
   Each with the remediation in the message; exit codes per kind, one exit
   path.
 - **Size limit / large files:** none. Files over the transport cap stream

@@ -36,6 +36,7 @@ use crate::obs::{
     ObsClient, RevisionSpec, ServiceCode,
 };
 use crate::xml::XmlDoc;
+use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -2748,6 +2749,879 @@ fn run_changelog_gate(wc: &WorkingCopy) -> Result<(), GeectlError> {
     ))
 }
 
+/// The pre-push gate: the git sanity checks for a git-backed
+/// commit, run after the synthesized commit exists and before
+/// the push, so every commit the push would send is checked.
+/// A failure refuses the push: the gate is hard, the same way a
+/// failing `pre_checkin` refuses a commit. The checks are local
+/// only — no server call — and cover what the issue names: the
+/// push-time hook state, the state of each pushed commit, and
+/// the submodule state recorded in each pushed commit. Nothing
+/// is borrowed from osc: the checks are geectl's own, written
+/// against the git repository directly.
+fn run_pre_push_gate(root: &Path, base_rev: &str, head: &str) -> Result<(), GeectlError> {
+    check_pre_push_hook(root)?;
+    check_pushed_commits(root, base_rev, head)?;
+    Ok(())
+}
+
+/// A pre-push sanity failure: the kind is the gate's, the context
+/// names the failing check and what to do about it.
+fn pre_push_failed(message: String) -> GeectlError {
+    GeectlError::new(ErrorKind::PrePushCheckFailed, message)
+}
+
+/// The first twelve hex digits of a commit SHA, for messages.
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
+/// The hooks check: an executable `pre-push` hook in the
+/// checkout's effective hooks directory blocks the push.
+/// Geectl never runs repository hooks — the push runs with
+/// `--no-verify` and `core.hooksPath=/dev/null` — so an
+/// installed pre-push hook would be silently skipped, and the
+/// guard it was meant to provide would never run. Failing
+/// loudly is the safe side; geectl runs its own pre-push
+/// checks instead, so the push is refused until the hook is
+/// removed, not run. Only `pre-push` is covered: a `pre-commit`
+/// hook is the synthesized commit's business, and the commit
+/// path pins that it is ignored.
+fn check_pre_push_hook(root: &Path) -> Result<(), GeectlError> {
+    let hooks_dir = effective_hooks_dir(root)?;
+    // A hooks directory that is a file, not a directory, blocks
+    // every commit with a misleading read error if it reaches
+    // the hook check: name the path itself instead.
+    if let Ok(metadata) = std::fs::metadata(&hooks_dir) {
+        if !metadata.is_dir() {
+            return Err(pre_push_failed(format!(
+                "refusing to push: the hooks directory {} is a file, not a directory; remove it or point core.hooksPath at a directory and retry",
+                hooks_dir.display()
+            )));
+        }
+    }
+    let hook = hooks_dir.join("pre-push");
+    if hook_is_live(&hook)? {
+        return Err(pre_push_failed(format!(
+            "refusing to push: an executable pre-push hook is installed at {}; geectl never runs repository hooks, so the guard it provides would be silently skipped — remove the hook (geectl runs its own pre-push sanity checks) and retry",
+            hook.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The checkout's common git directory, absolute: the shared
+/// directory linked worktrees hang off, so it names the same
+/// place from every worktree of the checkout.
+/// `--path-format=absolute` needs git 2.31 or later: an older
+/// git does not know the flag, so the read fails instead of
+/// returning a path.
+fn git_common_dir(root: &Path) -> Result<PathBuf, GeectlError> {
+    let common_dir = git(
+        root,
+        "rev-parse",
+        &["--path-format=absolute", "--git-common-dir"],
+        &[],
+    )?;
+    Ok(PathBuf::from(common_dir.trim()))
+}
+
+/// Run `git` inside the pre-push gate: an infrastructure
+/// failure (a spawn that cannot run, a timeout, a missing
+/// binary, a broken config) is a gate failure, not a
+/// git-classified error — the push is refused with the gate's
+/// kind, so the exit code is the gate's.
+fn gate_git(
+    root: &Path,
+    subcommand: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<String, GeectlError> {
+    git(root, subcommand, args, extra_env).map_err(|e| {
+        pre_push_failed(format!(
+            "refusing to push: the pre-push gate could not run: {e}"
+        ))
+    })
+}
+
+/// Run `git` for a status read inside the pre-push gate: a
+/// spawn or timeout failure is a gate failure, not a
+/// git-classified error, the same rule as `gate_git`.
+fn gate_status(
+    dir: &Path,
+    subcommand: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<(bool, String, String), GeectlError> {
+    git_status(dir, subcommand, args, extra_env).map_err(|e| {
+        pre_push_failed(format!(
+            "refusing to push: the pre-push gate could not run: {e}"
+        ))
+    })
+}
+
+/// The checkout's effective hooks directory: `core.hooksPath`
+/// when set, else the common git directory's `hooks`. The value
+/// is read scoped (`--worktree`, then `--local`, then
+/// `--global`, then `--system`), which reads the file's value:
+/// the wrapper's forced `core.hooksPath=/dev/null` only
+/// overrides the unscoped read. The worktree scope is first,
+/// but only when `extensions.worktreeConfig` is on: then it
+/// reads `config.worktree`, which outranks the local value.
+/// With the extension off the worktree scope is skipped:
+/// `git config --worktree` fails outright in a repository with
+/// linked worktrees, and without them it reads the local value,
+/// which the `--local` scope reads anyway. A relative path
+/// resolves against the checkout root, and a leading `~`
+/// expands the way git expands it (`--path`): `~/` from
+/// `$HOME`, `~user/` from that user's home directory. The
+/// fallback is the common directory, not the per-worktree git
+/// directory: in a linked worktree `--absolute-git-dir` names
+/// `.git/worktrees/<name>`, which holds no `hooks`.
+fn effective_hooks_dir(root: &Path) -> Result<PathBuf, GeectlError> {
+    let common_dir = git_common_dir(root).map_err(|e| {
+        pre_push_failed(format!(
+            "refusing to push: the pre-push gate could not read the git directory: {e}"
+        ))
+    })?;
+    let mut scopes: Vec<&str> = Vec::with_capacity(4);
+    if worktree_config_enabled(root)? {
+        scopes.push("--worktree");
+    }
+    scopes.extend(["--local", "--global", "--system"]);
+    for scope in scopes {
+        if let Some(value) = git_config_scoped(root, scope, "core.hooksPath")? {
+            let value = value.trim();
+            if !value.is_empty() {
+                let path = PathBuf::from(value);
+                if path.is_absolute() {
+                    return Ok(path);
+                }
+                return Ok(root.join(path));
+            }
+        }
+    }
+    Ok(common_dir.join("hooks"))
+}
+
+/// Whether `extensions.worktreeConfig` is on in the checkout's
+/// local config: only then does git read a worktree config file,
+/// so only then is the `--worktree` scope consulted. The flag is
+/// read from the local config only: git honors the extension
+/// from the repository config, not from the global or system
+/// config. A broken value fails the gate instead of passing as
+/// "off".
+fn worktree_config_enabled(root: &Path) -> Result<bool, GeectlError> {
+    let (success, stdout, stderr) = gate_status(
+        root,
+        "config",
+        &["--local", "--bool", "--get", "extensions.worktreeConfig"],
+        &[],
+    )?;
+    if success {
+        Ok(stdout.trim() == "true")
+    } else if stderr.trim().is_empty() {
+        Ok(false)
+    } else {
+        Err(pre_push_failed(format!(
+            "refusing to push: the local git config could not be read: {}",
+            stderr.trim()
+        )))
+    }
+}
+
+/// Read one config key from one scope (`--worktree`, `--local`,
+/// `--global`, `--system`). `Ok(None)` when the key is not set;
+/// a stderr on failure means the config itself is broken, and
+/// that is an error — the same rule as `git_config_get`. The
+/// read is a path read (`--path`): a leading `~` in the value
+/// expands the way git expands it, so `~user/` resolves instead
+/// of passing through as a literal path. A failure inside the
+/// gate is a gate failure, not a git-classified error.
+fn git_config_scoped(dir: &Path, scope: &str, key: &str) -> Result<Option<String>, GeectlError> {
+    let (success, stdout, stderr) =
+        gate_status(dir, "config", &[scope, "--get", "--path", key], &[])?;
+    if success {
+        Ok(Some(stdout.trim_end_matches('\n').to_string()))
+    } else if stderr.trim().is_empty() {
+        Ok(None)
+    } else {
+        Err(pre_push_failed(format!(
+            "refusing to push: the {} git config could not be read: {}",
+            scope.trim_start_matches('-'),
+            stderr.trim()
+        )))
+    }
+}
+
+/// The name of the commit lock file in the common git directory.
+const COMMIT_LOCK_FILE: &str = "geectl-commit.lock";
+
+/// The commit lock: an exclusive flock on a file in the common
+/// git directory, held from the synthesized commit through the
+/// push, so no second `commit` on the same checkout can create
+/// a commit between the gate and the push and send it ungated.
+/// The file lives in the common directory, not the worktree git
+/// directory: linked worktrees share it, so they serialize too.
+/// The lock is blocking: a concurrent commit waits for the push
+/// to land instead of failing. Released on drop.
+#[derive(Debug)]
+struct CommitLock {
+    _file: std::fs::File,
+}
+
+/// Take the checkout's commit lock. A lock file that is not a
+/// regular file (a planted symlink) is refused, not followed:
+/// the open would truncate and overwrite the link's target. A
+/// failure to take the lock refuses the push: the gate cannot
+/// be trusted without it.
+fn acquire_commit_lock(root: &Path) -> Result<CommitLock, GeectlError> {
+    let path = git_common_dir(root)
+        .map_err(|e| {
+            pre_push_failed(format!(
+                "refusing to push: the pre-push gate could not read the git directory: {e}"
+            ))
+        })?
+        .join(COMMIT_LOCK_FILE);
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if !meta.file_type().is_file() {
+            return Err(pre_push_failed(format!(
+                "refusing to push: the commit lock {} is not a regular file; remove it and retry",
+                path.display()
+            )));
+        }
+    }
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| {
+            pre_push_failed(format!(
+                "refusing to push: the commit lock {} could not be opened ({e}); fix the permissions and retry",
+                path.display()
+            ))
+        })?;
+    file.lock_exclusive().map_err(|e| {
+        pre_push_failed(format!(
+            "refusing to push: the commit lock {} could not be taken ({e})",
+            path.display()
+        ))
+    })?;
+    Ok(CommitLock { _file: file })
+}
+
+/// Whether `path` is a hook git would run: an executable file.
+/// A non-executable file is ignored by git, so it is not a
+/// guard that would be skipped. A metadata failure other than
+/// "not found" fails the gate instead of passing as "no hook":
+/// an unreadable hook state must not let the push through.
+/// On non-Unix platforms there is no executable bit, so any
+/// file counts.
+#[cfg(unix)]
+fn hook_is_live(path: &Path) -> Result<bool, GeectlError> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(pre_push_failed(format!(
+            "refusing to push: the pre-push hook state at {} could not be read ({e}); fix the permissions and retry",
+            path.display()
+        ))),
+    }
+}
+
+/// Whether `path` is a hook git would run: an executable file.
+/// A non-executable file is ignored by git, so it is not a
+/// guard that would be skipped. On non-Unix platforms there is
+/// no executable bit, so any file counts. A metadata failure
+/// other than "not found" fails the gate instead of passing as
+/// "no hook": an unreadable hook state must not let the push
+/// through, the same fail-closed read as the Unix arm.
+#[cfg(not(unix))]
+fn hook_is_live(path: &Path) -> Result<bool, GeectlError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(pre_push_failed(format!(
+            "refusing to push: the pre-push hook state at {} could not be read ({e}); fix the permissions and retry",
+            path.display()
+        ))),
+    }
+}
+
+/// The per-commit checks: every commit the push would send —
+/// `base_rev..head`, not just the head — must carry a message,
+/// must not be empty, and every submodule pointer it changes
+/// must resolve. Checking each commit, not the overall state,
+/// is the point: a submodule pointer is per-commit, so a bad
+/// pointer in an older pushed commit is missed by a head-only
+/// check. A `rev-list` that fails (the base is not in the
+/// history) fails the gate: an unverifiable push does not go.
+fn check_pushed_commits(root: &Path, base_rev: &str, head: &str) -> Result<(), GeectlError> {
+    let range = format!("{base_rev}..{head}");
+    let listed = git(root, "rev-list", &[&range], &[]).map_err(|e| {
+        pre_push_failed(format!(
+            "refusing to push: the pushed commits could not be listed ({range}): {e}"
+        ))
+    })?;
+    for sha in listed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        check_commit_message(root, sha)?;
+        check_commit_not_empty(root, sha)?;
+        check_commit_submodules(root, sha)?;
+    }
+    Ok(())
+}
+
+/// A pushed commit must carry a message: an empty message is
+/// almost always an accident (`--allow-empty-message`), and a
+/// synced commit with no message says nothing on the OBS side.
+fn check_commit_message(root: &Path, sha: &str) -> Result<(), GeectlError> {
+    let message = gate_git(root, "log", &["-1", "--format=%B", sha], &[])?;
+    if message.trim().is_empty() {
+        return Err(pre_push_failed(format!(
+            "refusing to push: commit {} has an empty commit message; give each pushed commit a message",
+            short_sha(sha)
+        )));
+    }
+    Ok(())
+}
+
+/// A pushed commit must not be empty: a commit whose tree
+/// matches its parent's syncs a new OBS revision with no
+/// content change. Merge commits are exempt: their tree
+/// routinely matches one parent's, and the merge itself is
+/// the content. A root commit in the range (a base that is not
+/// an ancestor) is checked too: `--root` compares it against
+/// the empty tree.
+fn check_commit_not_empty(root: &Path, sha: &str) -> Result<(), GeectlError> {
+    let parents = gate_git(root, "rev-list", &["--parents", "-n", "1", sha], &[])?;
+    let parent_count = parents.split_whitespace().count().saturating_sub(1);
+    if parent_count > 1 {
+        return Ok(());
+    }
+    let diff = gate_git(
+        root,
+        "diff-tree",
+        &["--root", "--no-commit-id", "--name-only", "-r", sha],
+        &[],
+    )?;
+    if diff.trim().is_empty() {
+        return Err(pre_push_failed(format!(
+            "refusing to push: commit {} is empty (its tree matches its parent's); drop it or fold the change into another commit",
+            short_sha(sha)
+        )));
+    }
+    Ok(())
+}
+
+/// The submodule check for one pushed commit: every gitlink
+/// the commit changes must name a URL in the commit's
+/// `.gitmodules` — a pointer without a URL cannot be resolved
+/// downstream — and must point at a commit object present
+/// locally, in the checkout or in the submodule's own checkout.
+/// Only the gitlinks the commit changes are checked: a pointer
+/// inherited unchanged from the parent was verified when it
+/// was introduced, and a checkout whose submodules were never
+/// initialized must still push commits that do not touch them.
+/// A pointer that cannot be verified fails the gate: the OBS
+/// sync would fetch it, and a revision that does not exist
+/// breaks the package there. The remediation names the fix:
+/// fetch the submodule so the pointer can be verified, or
+/// correct the pointer. A commit that moves a pointer needs the
+/// submodule fetched first (`git submodule update --init
+/// <path>`), before the commit.
+fn check_commit_submodules(root: &Path, sha: &str) -> Result<(), GeectlError> {
+    let gitlinks = changed_gitlinks(root, sha)?;
+    if gitlinks.is_empty() {
+        return Ok(());
+    }
+    let urls = submodule_urls_at(root, sha)?;
+    for (path, target) in &gitlinks {
+        if !urls.contains_key(path.as_str()) {
+            return Err(pre_push_failed(format!(
+                "refusing to push: commit {}: submodule {path} has no URL in .gitmodules, so the pointer cannot be resolved downstream; add the submodule URL or remove the submodule",
+                short_sha(sha)
+            )));
+        }
+        if !submodule_commit_present(root, path, target)? {
+            return Err(pre_push_failed(format!(
+                "refusing to push: commit {}: submodule {path} points at {target}, which is not present locally; fetch the submodule (git submodule update --init {path}) or fix the pointer",
+                short_sha(sha)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The gitlinks `sha` changes against its first parent: the
+/// paths whose recorded target differs, added or moved. A merge
+/// is diffed against its first parent; a root commit against
+/// the empty tree. A gitlink the commit drops is not listed:
+/// the pointer is gone, so there is nothing to resolve.
+fn changed_gitlinks(root: &Path, sha: &str) -> Result<Vec<(String, String)>, GeectlError> {
+    let parents = gate_git(root, "rev-list", &["--parents", "-n", "1", sha], &[])?;
+    let mut fields = parents.split_whitespace();
+    let _ = fields.next();
+    let diff = match fields.next() {
+        Some(parent) => gate_git(
+            root,
+            "diff-tree",
+            &["--no-commit-id", "-r", "-z", "--no-renames", parent, sha],
+            &[],
+        )?,
+        None => gate_git(
+            root,
+            "diff-tree",
+            &["--no-commit-id", "-r", "-z", "--no-renames", "--root", sha],
+            &[],
+        )?,
+    };
+    // The `-z` raw diff is NUL-separated `meta, path` pairs:
+    // the meta is `:oldmode newmode oldsha newsha status`, and
+    // only a pair whose new mode is a gitlink names a changed
+    // pointer.
+    let mut gitlinks = Vec::new();
+    let mut fields = split_nul(&diff).into_iter();
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        let mut parts = meta.split_whitespace();
+        let (Some(_old_mode), Some(new_mode), Some(_old_sha), Some(target)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if new_mode == "160000" {
+            gitlinks.push((path, target.to_string()));
+        }
+    }
+    Ok(gitlinks)
+}
+
+/// Whether a git-config section header names a submodule
+/// section: `[submodule "name"]`, or the deprecated dotted
+/// `[submodule.name]`, which git reads as the same section.
+/// Section names are case-insensitive, like the keys; the
+/// subsection name is unused here -- the map is keyed by path --
+/// so the dotted form's lowercased subsection changes nothing.
+/// Verified against git 2.56.1: a dotted-only file resolves,
+/// and when both forms are present the last one in the file
+/// wins, like any other repeated key.
+fn is_submodule_section(name: &str) -> bool {
+    name.eq_ignore_ascii_case("submodule")
+        || name
+            .split_once('.')
+            .is_some_and(|(section, _)| section.eq_ignore_ascii_case("submodule"))
+}
+
+/// The `path -> url` map from the `.gitmodules` file recorded
+/// in `sha`. An empty map when the commit carries no
+/// `.gitmodules` at all: a gitlink in such a commit has no URL
+/// by definition, and the caller reports it. A read failure is
+/// an error, not an empty map: a missing file and a broken
+/// read must not both report as "has no URL". The file is read
+/// the way git reads it: a value with an `=` inside it keeps
+/// the rest; a key may follow its section header on the same
+/// line (`[submodule "x"] path = vendor/sub`); a `\` at the
+/// end of a line continues the value onto the next; `\n`,
+/// `\t`, `\b`, `\"` and `\\` decode in quoted and unquoted
+/// values, and anything else after a backslash is a line git
+/// rejects. Section names are case-insensitive, like the keys.
+/// A dotted `[submodule.name]` section is the deprecated spelling of
+/// `[submodule "name"]` and reads the same.
+/// Comments are read the way git reads them: a `#` or `;` after
+/// a section header or after a value is stripped, and a line git
+/// rejects as a bad config line fails the read instead of being
+/// silently skipped — the gate must not pass a file git cannot
+/// parse.
+fn submodule_urls_at(
+    root: &Path,
+    sha: &str,
+) -> Result<std::collections::HashMap<String, String>, GeectlError> {
+    // List first: a missing `.gitmodules` is an empty map, but
+    // an unlistable commit (a bad SHA, a corrupt object) is a
+    // real failure, and the caller must hear about it.
+    let (listed, listing, stderr) = gate_status(root, "ls-tree", &[sha, "--", ".gitmodules"], &[])?;
+    if !listed {
+        return Err(pre_push_failed(format!(
+            "refusing to push: commit {}: .gitmodules could not be listed: {}",
+            short_sha(sha),
+            stderr.trim()
+        )));
+    }
+    let mut urls = std::collections::HashMap::new();
+    if listing.trim().is_empty() {
+        return Ok(urls);
+    }
+    let (success, stdout, stderr) =
+        gate_status(root, "show", &[&format!("{sha}:.gitmodules")], &[])?;
+    if !success {
+        return Err(pre_push_failed(format!(
+            "refusing to push: commit {}: .gitmodules could not be read: {}",
+            short_sha(sha),
+            stderr.trim()
+        )));
+    }
+    let mut in_submodule = false;
+    let mut section_path: Option<String> = None;
+    let mut section_url: Option<String> = None;
+    for (number, raw_line) in join_git_config_continuations(&stdout) {
+        // A comment after a section header (`[submodule "x"] #
+        // note`) or after a value (`path = vendor/sub # note`)
+        // is stripped the way git strips it, before the line is
+        // read: a hand-edited file with comments must parse
+        // exactly like the file git reads.
+        let mut line = strip_git_config_comment(&raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            let (name, rest) = parse_git_config_section(sha, number, &raw_line, line)?;
+            flush_gitmodules_section(&mut urls, &mut section_path, &mut section_url);
+            // The section name matches case-insensitively
+            // (`[Submodule "x"]` is a submodule section), and
+            // the subsection name (unused here) keeps its case.
+            // The deprecated dotted form (`[submodule.x]`) is
+            // the same section, so its keys belong to the
+            // submodule too.
+            in_submodule = is_submodule_section(&name);
+            // Anything after the bracket is a key line in the
+            // new section: git reads `[submodule "x"] path`
+            // as the section plus a bare `path` key, and
+            // `[submodule "x"] path = vendor/sub` as the
+            // section plus that pair.
+            line = rest.trim();
+            if line.is_empty() {
+                continue;
+            }
+        }
+        // The line is parsed (and so validated) in every
+        // section, not just submodule ones: a bad line
+        // anywhere makes git reject the whole file, so it
+        // fails the read here too.
+        let (key, value) = parse_gitmodules_key_line(sha, number, &raw_line, line)?;
+        let value = decode_config_value(sha, number, &raw_line, value.trim())?;
+        if !in_submodule {
+            continue;
+        }
+        // Config keys are case-insensitive; the subsection
+        // name (unused here) is not.
+        match key.to_ascii_lowercase().as_str() {
+            "path" => section_path = Some(value),
+            "url" => section_url = Some(value),
+            _ => {}
+        }
+    }
+    flush_gitmodules_section(&mut urls, &mut section_path, &mut section_url);
+    Ok(urls)
+}
+
+/// Join the backslash-continued lines of a git-config file the
+/// way git reads them: a `\` as the last character of a line
+/// continues the value onto the next line, the backslash itself
+/// dropped and the next line joined directly. A `\` inside a
+/// comment does not continue, and a section header line never
+/// continues — git rejects a backslash on a header line
+/// instead of joining it. Returns each logical line with the
+/// physical line it starts on, for error messages.
+fn join_git_config_continuations(content: &str) -> Vec<(usize, String)> {
+    let physical: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < physical.len() {
+        let start = index;
+        let mut logical = physical[index].to_string();
+        while git_config_line_continues(&logical) {
+            // Drop the one continuation backslash; the next line
+            // joins with no added separator. A trailing
+            // backslash on the last line joins nothing, so it is
+            // dropped the same way.
+            logical.truncate(logical.len() - 1);
+            index += 1;
+            if index >= physical.len() {
+                break;
+            }
+            logical.push_str(physical[index]);
+        }
+        out.push((start, logical));
+        index += 1;
+    }
+    out
+}
+
+/// Whether `line` continues onto the next line: it ends with an
+/// odd run of backslashes, the last of which is code, not a
+/// comment and not part of a section header. An even run is
+/// escaped backslashes, not a continuation.
+fn git_config_line_continues(line: &str) -> bool {
+    let trailing = line.bytes().rev().take_while(|b| *b == b'\\').count();
+    if trailing == 0 || trailing % 2 == 0 {
+        return false;
+    }
+    // The continuation backslash must be code: a backslash
+    // inside a trailing comment does not continue the line.
+    let code_end = git_config_comment_start(line).unwrap_or(line.len());
+    if line.len() - trailing >= code_end {
+        return false;
+    }
+    // A section header line never continues.
+    if line.trim_start().starts_with('[') {
+        return false;
+    }
+    true
+}
+
+/// The byte index where a git-config comment starts in `line`,
+/// if any: a `#` or `;` outside a double-quoted value and
+/// preceded by whitespace starts a comment, like git reads it.
+/// `None` when the line carries no comment.
+fn git_config_comment_start(line: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut previous = ' ';
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && in_quotes {
+            escaped = true;
+        } else if ch == '"' {
+            in_quotes = !in_quotes;
+        } else if (ch == '#' || ch == ';') && !in_quotes && (previous == ' ' || previous == '\t') {
+            return Some(index);
+        }
+        previous = ch;
+    }
+    None
+}
+
+/// Strip a git-config comment from `line`: a `#` or `;` outside
+/// a double-quoted value and preceded by whitespace starts a
+/// comment, like git reads it. A `#` with no whitespace before
+/// it (`sub#frag`) is part of the value, and one inside quotes
+/// (`"a # b"`) stays literal.
+fn strip_git_config_comment(line: &str) -> &str {
+    match git_config_comment_start(line) {
+        Some(index) => line[..index].trim_end(),
+        None => line,
+    }
+}
+
+/// Parse a git-config section header (`[name]` or `[name
+/// "subsection"]`) the way git reads it: the name starts right
+/// after `[` (no leading whitespace), starts with a letter and
+/// holds only letters, digits, `-` and `.` after it, and is
+/// followed by `]` directly or by whitespace and a quoted
+/// subsection and then `]` directly — no whitespace before the
+/// bracket. Returns the section name and the rest of the line
+/// after the bracket, for the one-line key form.
+fn parse_git_config_section<'a>(
+    sha: &str,
+    number: usize,
+    raw_line: &str,
+    line: &'a str,
+) -> Result<(String, &'a str), GeectlError> {
+    let bad = || bad_gitmodules_line(sha, number, raw_line);
+    let bytes = line.as_bytes();
+    let mut i = 1;
+    if i >= bytes.len() || !bytes[i].is_ascii_alphabetic() {
+        return Err(bad());
+    }
+    let name_start = i;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'.')
+    {
+        i += 1;
+    }
+    let name = &line[name_start..i];
+    if i >= bytes.len() {
+        return Err(bad());
+    }
+    if bytes[i] == b']' {
+        return Ok((name.to_string(), &line[i + 1..]));
+    }
+    if bytes[i] != b' ' && bytes[i] != b'\t' {
+        return Err(bad());
+    }
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'"' {
+        return Err(bad());
+    }
+    // The quoted subsection: the escapes decode the way value
+    // escapes decode, and anything else after a backslash is a
+    // line git rejects.
+    i += 1;
+    let mut closed = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                closed = true;
+                i += 1;
+                break;
+            }
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    return Err(bad());
+                }
+                match bytes[i + 1] {
+                    b'n' | b't' | b'b' | b'"' | b'\\' => {
+                        i += 2;
+                    }
+                    _ => return Err(bad()),
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    if !closed {
+        return Err(bad());
+    }
+    if i >= bytes.len() || bytes[i] != b']' {
+        return Err(bad());
+    }
+    Ok((name.to_string(), &line[i + 1..]))
+}
+
+/// Split a `.gitmodules` value line into its key and value, the
+/// way git reads it: `key = value`, or a bare `key` (an empty
+/// value, like git's boolean-true key). A key followed by a
+/// value with no `=` between them is a line git rejects, so it
+/// fails the gate instead of being silently skipped: a file git
+/// cannot parse must not pass the gate.
+fn parse_gitmodules_key_line(
+    sha: &str,
+    number: usize,
+    raw_line: &str,
+    line: &str,
+) -> Result<(String, String), GeectlError> {
+    let key_end = line.find([' ', '\t', '=']).unwrap_or(line.len());
+    let key = &line[..key_end];
+    let rest = line[key_end..].trim_start();
+    let value = if let Some(value) = rest.strip_prefix('=') {
+        value
+    } else if rest.is_empty() {
+        ""
+    } else {
+        return Err(bad_gitmodules_line(sha, number, raw_line));
+    };
+    if !is_git_config_key(key) {
+        return Err(bad_gitmodules_line(sha, number, raw_line));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+/// Whether `key` is a git-config variable name: it starts with
+/// a letter and holds only letters, digits, and `-`. Git rejects
+/// anything else as a bad config line.
+fn is_git_config_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+/// A `.gitmodules` line git rejects, as a gate failure: the
+/// file cannot be trusted, so the push is refused instead of
+/// the line being silently skipped.
+fn bad_gitmodules_line(sha: &str, number: usize, raw_line: &str) -> GeectlError {
+    pre_push_failed(format!(
+        "refusing to push: commit {}: .gitmodules could not be parsed: bad config line {}: {}",
+        short_sha(sha),
+        number + 1,
+        raw_line.trim()
+    ))
+}
+
+/// Record a finished `.gitmodules` section: only a section
+/// with a non-empty path and a non-empty URL names a
+/// resolvable submodule. An empty URL is a pointer nobody can
+/// resolve, not a URL.
+fn flush_gitmodules_section(
+    urls: &mut std::collections::HashMap<String, String>,
+    path: &mut Option<String>,
+    url: &mut Option<String>,
+) {
+    if let (Some(path), Some(url)) = (path.take(), url.take()) {
+        if !path.is_empty() && !url.is_empty() {
+            urls.insert(path, url);
+        }
+    }
+}
+
+/// Decode a git-config value the way git reads it: a value is
+/// a run of quoted and unquoted segments; the quotes are
+/// delimiters, and `\n`, `\t`, `\b`, `\"` and `\\` decode
+/// inside and outside the quotes. Anything else after a
+/// backslash is a line git rejects, and an unterminated quote
+/// is one too.
+fn decode_config_value(
+    sha: &str,
+    number: usize,
+    raw_line: &str,
+    value: &str,
+) -> Result<String, GeectlError> {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    let mut in_quotes = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '\\' => {
+                let Some(escaped) = chars.next() else {
+                    return Err(bad_gitmodules_line(sha, number, raw_line));
+                };
+                match escaped {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'b' => out.push('\u{8}'),
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    _ => return Err(bad_gitmodules_line(sha, number, raw_line)),
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    if in_quotes {
+        return Err(bad_gitmodules_line(sha, number, raw_line));
+    }
+    Ok(out)
+}
+
+/// Whether the commit object `sha` is present locally: in the
+/// checkout's object store, or — when the submodule is checked
+/// out — in the submodule's own object store. `cat-file -t`
+/// answers the type: only `commit` counts, a blob or tree at
+/// that SHA is a wrong-typed pointer, not a resolution. A
+/// missing object is a non-zero exit, not an error: the
+/// caller reports it as an unverifiable pointer.
+fn submodule_commit_present(root: &Path, path: &str, sha: &str) -> Result<bool, GeectlError> {
+    if object_is_commit(root, sha)? {
+        return Ok(true);
+    }
+    let worktree = root.join(path);
+    if worktree.join(".git").exists() {
+        return object_is_commit(&worktree, sha);
+    }
+    Ok(false)
+}
+
+/// Whether `sha` names a commit object in the repository at
+/// `dir`.
+fn object_is_commit(dir: &Path, sha: &str) -> Result<bool, GeectlError> {
+    let (success, stdout, _) = gate_status(dir, "cat-file", &["-t", sha], &[])?;
+    Ok(success && stdout.trim() == "commit")
+}
+
 /// The file list for an OBS-native commit: the full list derived
 /// from the base plus the staged diff — every base file with the
 /// base content's md5, overridden by the staged diff (a changed or
@@ -3215,7 +4089,9 @@ fn commit_obs(
 /// gate runs last of the checks, and its outputs are staged into
 /// the index, so the commit sends them. The changelog gate runs
 /// after the service gate's outputs are staged, on the final
-/// staged state, before the staged changes become a commit.
+/// staged state, before the staged changes become a commit. The
+/// pre-push sanity checks run after the synthesized commit, before
+/// the push: a failed check blocks the push.
 fn commit_git(
     wc: &mut WorkingCopy,
     client: &ObsClient,
@@ -3289,24 +4165,38 @@ fn commit_git(
         ],
         &[],
     )?;
-    if !split_nul(&staged).is_empty() {
-        git(
-            &wc.root,
-            "commit",
-            &["--quiet", "--no-verify", "-m", message],
-            &[],
-        )?;
-    }
-    let head = git(&wc.root, "rev-parse", &["HEAD"], &[])?
-        .trim()
-        .to_string();
-    if head == wc.base_rev {
-        return Err(GeectlError::new(
-            ErrorKind::NothingToCommit,
-            "there is nothing to commit: no local commits ahead of the base",
-        ));
-    }
-    git_network(&wc.root, "push", &["--no-verify", "origin", "HEAD"], &env)?;
+    // The commit, the gate, and the push run under the
+    // checkout's commit lock: without it a concurrent commit
+    // could land between the gate and the push and be sent
+    // ungated. The lock is released when the push returns,
+    // before the OBS poll: the poll waits on the server, not on
+    // the checkout.
+    let head = {
+        let _commit_lock = acquire_commit_lock(&wc.root)?;
+        if !split_nul(&staged).is_empty() {
+            git(
+                &wc.root,
+                "commit",
+                &["--quiet", "--no-verify", "-m", message],
+                &[],
+            )?;
+        }
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])?
+            .trim()
+            .to_string();
+        if head == wc.base_rev {
+            return Err(GeectlError::new(
+                ErrorKind::NothingToCommit,
+                "there is nothing to commit: no local commits ahead of the base",
+            ));
+        }
+        // The pre-push gate runs after the synthesized commit
+        // exists, so it checks every commit the push would send,
+        // and before the push: a failed check blocks the push.
+        run_pre_push_gate(&wc.root, &wc.base_rev, &head)?;
+        git_network(&wc.root, "push", &["--no-verify", "origin", "HEAD"], &env)?;
+        head
+    };
     // The push landed; the OBS side picks it up through scmsync.
     // Poll `_scmsync.obsinfo` until its `commit:` matches the
     // pushed head, bounded: a sync that never arrives is a timeout,
@@ -8265,6 +9155,12 @@ mod tests {
     /// the other and change its SHA.
     static GIT_DATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serializes the tests that redirect `HOME` (and
+    /// `XDG_CONFIG_HOME`): the variables are process-wide, so a
+    /// guard drop in one test would point another test's git
+    /// reads at the wrong home mid-test.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn commit_git_synthesizes_a_commit_for_staged_changes() {
         // Fixed author and committer dates: the synthesized
@@ -9540,6 +10436,7 @@ mod tests {
         // downloaded file matching the user's global excludes
         // (here `*.patch`) is committed, not dropped by the
         // excludes.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = TempDirGuard::new("fake-home");
         std::fs::write(home.path.join("excludes"), "*.patch\n").unwrap();
         // Gitconfig values treat `\` as an escape, so a Windows
@@ -10027,6 +10924,12 @@ mod tests {
         let _date_lock = GIT_DATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _author_date = RestoreVar::set("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z");
         let _committer_date = RestoreVar::set("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z");
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
         let dir = TempDirGuard::new("git-hook");
         let origin = git_origin(&dir.path);
         let http = git_checkout_http(&origin.url);
@@ -10081,6 +10984,1738 @@ mod tests {
         .unwrap();
         assert_eq!(report.pushed_head, Some(expected));
         let _ = origin;
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn commit_git_pre_push_gate_blocks_an_empty_commit_message() {
+        // A local commit with an empty message: the gate refuses
+        // the push before anything is sent, and the origin head
+        // does not move.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-empty-msg");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(
+            &wc.root,
+            &["commit", "--quiet", "--allow-empty-message", "-m", ""],
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("has an empty commit message"),
+            "message: {message}"
+        );
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, origin.head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn commit_git_pre_push_gate_blocks_an_empty_commit() {
+        // An empty local commit (no change against its parent):
+        // the gate refuses the push, and the origin head does
+        // not move.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-empty-commit");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        git_ok(
+            &wc.root,
+            &["commit", "--quiet", "--allow-empty", "-m", "empty"],
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("is empty (its tree matches its parent's)"),
+            "message: {message}"
+        );
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, origin.head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn commit_git_pre_push_gate_blocks_an_executable_pre_push_hook() {
+        // An executable pre-push hook in the checkout's own hooks
+        // directory: geectl would silently skip it (the push runs
+        // with `--no-verify` and `hooksPath=/dev/null`), so the
+        // gate refuses the push instead, naming the hook. A
+        // pre-commit hook is ignored by design (see
+        // `commit_git_ignores_a_failing_pre_commit_hook`); the
+        // gate covers the push-time hook only.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-hook");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let hooks = wc.root.join(".git").join("hooks");
+        std::fs::write(hooks.join("pre-push"), "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                hooks.join("pre-push"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("pre-push hook is installed"),
+            "message: {message}"
+        );
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, origin.head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn commit_git_pre_push_gate_blocks_a_submodule_pointer_without_a_url() {
+        // A pushed commit records a gitlink but the commit carries
+        // no `.gitmodules`: the pointer has no URL, so nobody
+        // downstream can resolve it, and the gate refuses the
+        // push.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-submodule-no-url");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        let target = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        git_ok(
+            &wc.root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{target},vendor/sub"),
+            ],
+        );
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "add submodule"]);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("has no URL in .gitmodules"),
+            "message: {message}"
+        );
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, origin.head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn commit_git_pre_push_gate_blocks_a_submodule_pointer_that_does_not_resolve() {
+        // A pushed commit records a gitlink with a URL in
+        // `.gitmodules`, but the recorded SHA is not present
+        // locally: the gate refuses the push, naming the
+        // submodule and the SHA.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-submodule-unresolved");
+        let sub = TempDirGuard::new("git-prepush-submodule-src");
+        init_repo(&sub.path);
+        write_file(&sub.path, "sub.txt", "sub\n");
+        git_ok(&sub.path, &["add", "-A"]);
+        git_ok(&sub.path, &["commit", "--quiet", "-m", "sub"]);
+        let target = git(&sub.path, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(
+            &wc.root,
+            ".gitmodules",
+            "[submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        git_ok(
+            &wc.root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{target},vendor/sub"),
+            ],
+        );
+        git_ok(&wc.root, &["add", ".gitmodules"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "add submodule"]);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("is not present locally"),
+            "message: {message}"
+        );
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, origin.head);
+        let _ = dir;
+        let _ = sub;
+        let _ = home;
+    }
+
+    #[test]
+    fn commit_git_pre_push_gate_passes_a_resolvable_submodule_pointer() {
+        // A gitlink with a URL in `.gitmodules`, pointing at a
+        // commit object present locally: the gate passes and the
+        // push lands.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-submodule-ok");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        let target = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_file(
+            &wc.root,
+            ".gitmodules",
+            "[submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        git_ok(
+            &wc.root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{target},vendor/sub"),
+            ],
+        );
+        git_ok(&wc.root, &["add", ".gitmodules"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "add submodule"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The OBS side already synced the pushed head: the poll
+        // finds it on the first read.
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.pushed_head, Some(head.clone()));
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn commit_git_pre_push_gate_ignores_a_non_executable_pre_push_hook() {
+        // A pre-push hook without the executable bit is ignored
+        // by git, so it is no guard that would be skipped: the
+        // gate passes and the push lands.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-hook-nonexec");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let hooks = wc.root.join(".git").join("hooks");
+        std::fs::write(hooks.join("pre-push"), "#!/bin/sh\nexit 1\n").unwrap();
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The OBS side already synced the pushed head: the poll
+        // finds it on the first read.
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.pushed_head, Some(head.clone()));
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn commit_git_pre_push_gate_reads_hooks_from_the_configured_hooks_path() {
+        // `core.hooksPath` points the gate at another directory:
+        // an executable pre-push hook there blocks the push, even
+        // though the checkout's own hooks directory is empty.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-hooks-path");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let hooks = dir.path.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("pre-push"), "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                hooks.join("pre-push"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        git_ok(
+            &wc.root,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                hooks.to_str().unwrap(),
+            ],
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("pre-push hook is installed"),
+            "message: {message}"
+        );
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, origin.head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn commit_git_pre_push_gate_checks_every_pushed_commit_not_just_the_head() {
+        // The bad commit is the older of two pushed commits: a
+        // head-only check would miss it, so the gate refuses the
+        // push naming the empty message.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-older-bad-commit");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(
+            &wc.root,
+            &["commit", "--quiet", "--allow-empty-message", "-m", ""],
+        );
+        write_file(&wc.root, "bar.spec", "Name: bar\n");
+        git_ok(&wc.root, &["add", "bar.spec"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "second change"]);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("has an empty commit message"),
+            "message: {message}"
+        );
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, origin.head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn commit_git_pre_push_gate_passes_an_inherited_submodule_pointer() {
+        // The base commit records a gitlink pointing at a SHA
+        // that is not present locally, with no `.gitmodules`
+        // at all: the pushed commit does not touch the
+        // submodule, so the inherited pointer is not checked,
+        // the gate passes, and the push lands. A checkout whose
+        // submodules were never initialized pushes like this.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-submodule-inherited");
+        let origin = git_origin(&dir.path);
+        // The pointer is added to the origin, so it is in the
+        // base the checkout starts from, not in a pushed commit.
+        let work = dir.path.join("work");
+        git_ok(
+            &work,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,1111111111111111111111111111111111111111,vendor/sub",
+            ],
+        );
+        git_ok(&work, &["commit", "--quiet", "-m", "add submodule pointer"]);
+        git_ok(&work, &["push", "--quiet", "origin", "main"]);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        git_ok(&wc.root, &["add", "foo.spec"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let head = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        // The OBS side already synced the pushed head: the poll
+        // finds it on the first read.
+        let http = http.with_get(
+            "https://api.opensuse.org/public/source/home:alice/foo/_scmsync.obsinfo",
+            &format!("mtime: 1\ncommit: {head}\nurl: https://example.com/foo\n"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.pushed_head, Some(head.clone()));
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn commit_git_pre_push_gate_blocks_a_moved_submodule_pointer() {
+        // The first pushed commit adds a gitlink pointing at a
+        // commit object present locally; the second moves the
+        // pointer to a SHA that is not present: the moved
+        // pointer is a changed gitlink, so the gate refuses the
+        // push naming the submodule and the SHA.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-submodule-moved");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        let target = git(&wc.root, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_file(
+            &wc.root,
+            ".gitmodules",
+            "[submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        git_ok(
+            &wc.root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{target},vendor/sub"),
+            ],
+        );
+        git_ok(&wc.root, &["add", ".gitmodules"]);
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "add submodule"]);
+        git_ok(
+            &wc.root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,1111111111111111111111111111111111111111,vendor/sub",
+            ],
+        );
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "move submodule"]);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("is not present locally"),
+            "message: {message}"
+        );
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, origin.head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn commit_git_pre_push_gate_refuses_a_hooks_path_that_is_a_file() {
+        // `core.hooksPath` points at a regular file, not a
+        // directory: the gate refuses the push naming the path
+        // itself, instead of failing the hook read with a
+        // misleading remediation.
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the gate's global config read
+        // sees an empty home, never the developer's real one.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-prepush-fake-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-prepush-hooks-path-file");
+        let origin = git_origin(&dir.path);
+        let http = git_checkout_http(&origin.url);
+        let mut wc = do_git_checkout(&http, &dir);
+        write_file(&wc.root, "foo.spec", "Name: local\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        git_ok(&wc.root, &["commit", "--quiet", "-m", "local change"]);
+        let hooks_file = dir.path.join("hooks-file");
+        std::fs::write(&hooks_file, "not a directory\n").unwrap();
+        git_ok(
+            &wc.root,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                hooks_file.to_str().unwrap(),
+            ],
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let auth = test_auth();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            Some(&auth),
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("is a file, not a directory"),
+            "message: {message}"
+        );
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let origin_head = git(&origin.path, "rev-parse", &["main"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(origin_head, origin.head);
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn commit_lock_excludes_a_second_holder() {
+        // The commit lock is exclusive while held: a second open
+        // of the same lock file cannot take it, and can once the
+        // first holder drops.
+        let dir = TempDirGuard::new("git-commit-lock");
+        init_repo(&dir.path);
+        let first = acquire_commit_lock(&dir.path).unwrap();
+        let path = git_common_dir(&dir.path).unwrap().join(COMMIT_LOCK_FILE);
+        assert!(path.is_file());
+        let second = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&second).is_err());
+        drop(first);
+        assert!(fs2::FileExt::try_lock_exclusive(&second).is_ok());
+        let _ = dir;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn commit_lock_refuses_a_lock_file_symlink() {
+        // A planted symlink at the lock path is refused, not
+        // followed: the open would truncate and overwrite the
+        // link's target.
+        let dir = TempDirGuard::new("git-commit-lock-symlink");
+        init_repo(&dir.path);
+        let path = git_common_dir(&dir.path).unwrap().join(COMMIT_LOCK_FILE);
+        let target = dir.path.join("target");
+        std::fs::write(&target, "target\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let err = acquire_commit_lock(&dir.path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(
+            message.contains("is not a regular file"),
+            "message: {message}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "target\n");
+        let _ = dir;
+    }
+
+    #[test]
+    fn pre_push_gate_maps_an_infrastructure_failure_to_its_own_kind() {
+        // A git call inside the gate that cannot run (here: the
+        // directory is not a repository at all) is a gate
+        // failure, not the git-classified kind: the push is
+        // refused as PrePushCheckFailed, exit 34.
+        let dir = TempDirGuard::new("git-prepush-infra-failure");
+        let err = check_commit_message(&dir.path, "HEAD").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(message.contains("could not run"), "message: {message}");
+        let err = check_commit_not_empty(&dir.path, "HEAD").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let err = effective_hooks_dir(&dir.path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let _ = dir;
+    }
+
+    #[test]
+    fn effective_hooks_dir_reads_the_local_hooks_path() {
+        // An absolute `core.hooksPath` in the local config is the
+        // effective hooks directory as-is.
+        let dir = TempDirGuard::new("git-hooks-local");
+        init_repo(&dir.path);
+        let hooks = dir.path.join("my-hooks");
+        git_ok(
+            &dir.path,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                hooks.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(effective_hooks_dir(&dir.path).unwrap(), hooks);
+        let _ = dir;
+    }
+
+    #[test]
+    fn effective_hooks_dir_resolves_a_relative_hooks_path_against_the_checkout() {
+        // A relative `core.hooksPath` resolves against the
+        // checkout root, not the process working directory.
+        let dir = TempDirGuard::new("git-hooks-relative");
+        init_repo(&dir.path);
+        git_ok(
+            &dir.path,
+            &["config", "--local", "core.hooksPath", "my-hooks"],
+        );
+        assert_eq!(
+            effective_hooks_dir(&dir.path).unwrap(),
+            dir.path.join("my-hooks")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn effective_hooks_dir_reads_scoped_hooks_paths() {
+        // The whole resolution chain, in one test: the global
+        // read goes through `$HOME`, which this test redirects,
+        // so the phases run sequentially here rather than as
+        // separate tests — a parallel test would see the
+        // redirected home.
+        let dir = TempDirGuard::new("git-hooks-scoped");
+        init_repo(&dir.path);
+        let home = TempDirGuard::new("git-hooks-fake-home");
+        // HOME is process-wide: hold the lock for the whole
+        // test so no other HOME-redirecting test runs mid-test.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_home_var, _xdg_var) = guard_home(&home);
+        // The global value is a rooted path with no drive, so
+        // on Windows it resolves against the checkout drive
+        // (C:/global-hooks): the expected path is built from the
+        // checkout root, not a hardcoded Unix string.
+        let global_hooks = dir.path.ancestors().last().unwrap().join("global-hooks");
+        // Global only: with no local value, the global value is
+        // the effective hooks directory.
+        write_global_hooks_path(&home.path, "/global-hooks");
+        assert_eq!(
+            effective_hooks_dir(&dir.path).unwrap(),
+            global_hooks.clone()
+        );
+        // Local wins over global: the first scope that sets the
+        // value is the one the gate reads.
+        let local_hooks = dir.path.join("local-hooks");
+        git_ok(
+            &dir.path,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                local_hooks.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(effective_hooks_dir(&dir.path).unwrap(), local_hooks);
+        // An empty local value sets nothing: the read falls
+        // through to the global value.
+        git_ok(&dir.path, &["config", "--local", "core.hooksPath", ""]);
+        assert_eq!(effective_hooks_dir(&dir.path).unwrap(), global_hooks);
+        // A `~/` prefix expands from `$HOME` — the redirected
+        // home here, so the expansion is pinned exactly.
+        git_ok(
+            &dir.path,
+            &["config", "--local", "core.hooksPath", "~/my-hooks"],
+        );
+        assert_eq!(
+            effective_hooks_dir(&dir.path).unwrap(),
+            home.path.join("my-hooks")
+        );
+        // No value anywhere: the fallback is the git
+        // directory's `hooks`. The expected path is
+        // canonicalized: git resolves the temp directory's
+        // symlinked prefix (`/var` -> `/private/var` on macOS),
+        // the test's path does not.
+        git_ok(
+            &dir.path,
+            &["config", "--local", "--unset", "core.hooksPath"],
+        );
+        std::fs::remove_file(home.path.join(".gitconfig")).unwrap();
+        assert_eq!(
+            effective_hooks_dir(&dir.path).unwrap(),
+            without_verbatim_prefix(&dir.path.canonicalize().unwrap())
+                .join(".git")
+                .join("hooks")
+        );
+        // In a linked worktree the fallback is the common
+        // directory's `hooks`, not the worktree's own git
+        // directory (`.git/worktrees/<name>`, which holds no
+        // `hooks`).
+        write_file(&dir.path, "foo.spec", "Name: foo\n");
+        git_ok(&dir.path, &["add", "-A"]);
+        git_ok(&dir.path, &["commit", "--quiet", "-m", "initial"]);
+        let wt = dir.path.join("wt");
+        git_ok(
+            &dir.path,
+            &["worktree", "add", wt.to_str().unwrap(), "HEAD"],
+        );
+        assert_eq!(
+            effective_hooks_dir(&wt).unwrap(),
+            without_verbatim_prefix(&dir.path.canonicalize().unwrap())
+                .join(".git")
+                .join("hooks")
+        );
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn effective_hooks_dir_reads_the_worktree_hooks_path() {
+        // With `extensions.worktreeConfig` on, the worktree
+        // value outranks the local one: the gate reads the
+        // worktree hooks directory. With the extension off, a
+        // value in `config.worktree` is ignored and the local
+        // value wins.
+        let dir = TempDirGuard::new("git-hooks-worktree");
+        init_repo(&dir.path);
+        let local_hooks = dir.path.join("local-hooks");
+        git_ok(
+            &dir.path,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                local_hooks.to_str().unwrap(),
+            ],
+        );
+        let wt_hooks = dir.path.join("wt-hooks");
+        git_ok(
+            &dir.path,
+            &["config", "--local", "extensions.worktreeConfig", "true"],
+        );
+        git_ok(
+            &dir.path,
+            &[
+                "config",
+                "--worktree",
+                "core.hooksPath",
+                wt_hooks.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(effective_hooks_dir(&dir.path).unwrap(), wt_hooks);
+        git_ok(
+            &dir.path,
+            &["config", "--local", "extensions.worktreeConfig", "false"],
+        );
+        assert_eq!(effective_hooks_dir(&dir.path).unwrap(), local_hooks);
+        let _ = dir;
+    }
+
+    #[test]
+    fn effective_hooks_dir_expands_a_tilde_hooks_path() {
+        // A `~/` hooks path expands from `$HOME` — the
+        // redirected home here — and a `~user/` path expands
+        // from that user's home directory, the way git expands
+        // them: the gate reads the expanded directory, never
+        // the literal `~` path. Windows git cannot expand a
+        // `~user/` path at all, so there the gate refuses it
+        // instead (see below).
+        // HOME is process-wide: hold the lock and redirect it
+        // for the whole test, so the expansion is pinned to the
+        // fake home.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-hooks-tilde-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-hooks-tilde");
+        init_repo(&dir.path);
+        git_ok(
+            &dir.path,
+            &["config", "--local", "core.hooksPath", "~/my-hooks"],
+        );
+        assert_eq!(
+            effective_hooks_dir(&dir.path).unwrap(),
+            home.path.join("my-hooks")
+        );
+        // `~user/` expands from that user's home directory, the
+        // way git expands it: the gate agrees with git's own
+        // expansion of the same value, and never reads the literal
+        // `~user/` path under the checkout. The current user
+        // exists on every platform, so their name is the portable
+        // `~user/` case: a user that does not exist makes git's
+        // own expansion fail instead (see the refusal test below).
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .or_else(|_| std::env::var("LOGNAME"))
+            .expect("current username");
+        let named = format!("~{user}/my-hooks");
+        git_ok(
+            &dir.path,
+            &["config", "--local", "core.hooksPath", named.as_str()],
+        );
+        // Unix only: git on Windows cannot expand a `~user/`
+        // path, so there the gate refuses it instead (below).
+        #[cfg(unix)]
+        {
+            let expanded = git(
+                &dir.path,
+                "config",
+                &["--local", "--get", "--path", "core.hooksPath"],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                effective_hooks_dir(&dir.path).unwrap(),
+                PathBuf::from(expanded.trim())
+            );
+            assert_ne!(
+                effective_hooks_dir(&dir.path).unwrap(),
+                dir.path.join(&named)
+            );
+        }
+        // Windows git cannot expand a `~user/` path at all: the
+        // gate refuses the current user's path the same way it
+        // refuses a user that does not exist, never reading the
+        // literal `~user/` path under the checkout.
+        #[cfg(not(unix))]
+        {
+            let err = effective_hooks_dir(&dir.path).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+            let message = err.to_string();
+            assert!(
+                message.to_lowercase().contains("failed to expand user dir"),
+                "message: {message}"
+            );
+        }
+        let _ = dir;
+        let _ = home;
+    }
+
+    #[test]
+    fn effective_hooks_dir_refuses_an_unexpandable_tilde_hooks_path() {
+        // A `~user/` hooks path for a user that does not exist
+        // cannot be expanded by git at all: the gate refuses the
+        // push as a gate failure, never surfacing git's failure
+        // as an infrastructure error.
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = TempDirGuard::new("git-hooks-tilde-nouser-home");
+        let (_home_var, _xdg_var) = guard_home(&home);
+        let dir = TempDirGuard::new("git-hooks-tilde-nouser");
+        init_repo(&dir.path);
+        git_ok(
+            &dir.path,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                "~geectl-no-such-user/my-hooks",
+            ],
+        );
+        let err = effective_hooks_dir(&dir.path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(
+            message.to_lowercase().contains("failed to expand user dir"),
+            "message: {message}"
+        );
+        let _ = dir;
+        let _ = home;
+    }
+
+    /// Write a global config with `core.hooksPath` into a fake
+    /// home directory, and point the process at it: the scoped
+    /// global read must see this file, never the real `~/.gitconfig`.
+    fn write_global_hooks_path(home: &Path, value: &str) {
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!("[core]\n\thooksPath = {value}\n"),
+        )
+        .unwrap();
+    }
+
+    /// `canonicalize` returns a verbatim (`\\?\`) path on
+    /// Windows, a spelling git's output never carries: strip
+    /// the prefix so the canonicalized path compares equal to
+    /// the path git reports.
+    fn without_verbatim_prefix(path: &Path) -> PathBuf {
+        path.to_string_lossy()
+            .strip_prefix("\\\\?\\")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// Point `HOME` (and `XDG_CONFIG_HOME`, the other global
+    /// config location) at a fake home for the rest of the test,
+    /// restoring both on drop.
+    fn guard_home(home: &TempDirGuard) -> (RestoreVar, RestoreVar) {
+        let xdg = home.path.join("xdg");
+        (
+            RestoreVar::set("HOME", home.path.to_str().unwrap()),
+            RestoreVar::set("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hook_is_live_sees_an_executable_hook() {
+        let dir = TempDirGuard::new("git-hook-live");
+        let hook = dir.path.join("pre-push");
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(hook_is_live(&hook).unwrap());
+        let _ = dir;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hook_is_live_ignores_a_non_executable_hook() {
+        let dir = TempDirGuard::new("git-hook-nonexec");
+        let hook = dir.path.join("pre-push");
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(!hook_is_live(&hook).unwrap());
+        let _ = dir;
+    }
+
+    #[test]
+    fn hook_is_live_is_false_without_a_hook() {
+        let dir = TempDirGuard::new("git-hook-missing");
+        assert!(!hook_is_live(&dir.path.join("pre-push")).unwrap());
+        let _ = dir;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hook_is_live_fails_closed_on_a_metadata_error() {
+        // A path the metadata call cannot read (here: through a
+        // regular file, so `ENOTDIR`) must not pass as "no hook":
+        // the gate refuses the push instead.
+        let dir = TempDirGuard::new("git-hook-unreadable");
+        let blocker = dir.path.join("blocker");
+        std::fs::write(&blocker, "not a directory\n").unwrap();
+        let err = hook_is_live(&blocker.join("pre-push")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(message.contains("could not be read"), "message: {message}");
+        let _ = dir;
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn hook_is_live_sees_a_plain_file_hook() {
+        // No executable bit exists on this platform, so any
+        // file is a hook git would run: a plain file counts
+        // as live, where the Unix arm needs the bit set.
+        let dir = TempDirGuard::new("git-hook-plain");
+        let hook = dir.path.join("pre-push");
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(hook_is_live(&hook).unwrap());
+        let _ = dir;
+    }
+
+    /// Commit `content` as `.gitmodules` and return the head SHA.
+    fn commit_gitmodules(dir: &Path, content: &str) -> String {
+        write_file(dir, ".gitmodules", content);
+        git_ok(dir, &["add", ".gitmodules"]);
+        git_ok(dir, &["commit", "--quiet", "-m", "gitmodules"]);
+        git(dir, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn submodule_urls_at_reads_a_mixed_case_section_header() {
+        // Section names are case-insensitive: `[Submodule "x"]`
+        // is a submodule section, the same as `[submodule "x"]`.
+        let dir = TempDirGuard::new("git-gitmodules-mixed-case");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[Submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/sub")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_reads_a_dotted_section_header() {
+        // The deprecated dotted form (`[submodule.vendor]`)
+        // is the same section as `[submodule "vendor"]`: git
+        // reads the URL from it, so the gate must too.
+        let dir = TempDirGuard::new("git-gitmodules-dotted");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule.vendor]\n\tpath = vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/sub")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_last_form_wins_when_both_forms_are_present() {
+        // The dotted and quoted forms are the same section in
+        // git, so when both are present the last one in the
+        // file wins, like any other repeated key (verified
+        // against git 2.56.1).
+        let dir = TempDirGuard::new("git-gitmodules-both-forms");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor\"]\n\tpath = vendor/sub\n\turl = https://example.com/quoted\n[submodule.vendor]\n\tpath = vendor/sub\n\turl = https://example.com/dotted\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/dotted")
+        );
+        let _ = dir;
+        let dir = TempDirGuard::new("git-gitmodules-both-forms-reversed");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule.vendor]\n\tpath = vendor/sub\n\turl = https://example.com/dotted\n[submodule \"vendor\"]\n\tpath = vendor/sub\n\turl = https://example.com/quoted\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/quoted")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_ignores_a_non_submodule_section() {
+        // `path`/`url` keys outside a submodule section name
+        // nothing: only submodule sections record a URL.
+        let dir = TempDirGuard::new("git-gitmodules-other-section");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[core]\n\tpath = vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert!(urls.is_empty());
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_ignores_a_submodules_section() {
+        // A `[submodules "x"]` section (plural, a hand-typed
+        // typo) is not a submodule section: git reads submodule
+        // URLs only from `[submodule "name"]` sections, so a
+        // path/url pair under the plural spelling names nothing.
+        let dir = TempDirGuard::new("git-gitmodules-submodules");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodules \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert!(urls.is_empty());
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_does_not_combine_path_and_url_across_sections() {
+        // A path in one section and a URL in the next name no
+        // submodule: the finished section is flushed when the
+        // header changes, so the two halves never combine into
+        // a URL for a submodule git sees as URL-less.
+        let dir = TempDirGuard::new("git-gitmodules-split-sections");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"a\"]\n\tpath = a\n[submodule \"b\"]\n\turl = https://example.com/b\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert!(urls.is_empty());
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_keeps_an_equals_sign_inside_a_value() {
+        // The value is split on the first `=` only: a URL with
+        // a query string keeps the rest.
+        let dir = TempDirGuard::new("git-gitmodules-equals");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = https://example.com/sub?a=b&c=d\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/sub?a=b&c=d")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_unquotes_a_quoted_value() {
+        let dir = TempDirGuard::new("git-gitmodules-quoted");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = \"https://example.com/sub\"\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/sub")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_drops_a_section_without_a_url() {
+        // A section with no URL, and one with an empty URL, name
+        // no resolvable submodule: neither is recorded.
+        let dir = TempDirGuard::new("git-gitmodules-no-url");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"a\"]\n\tpath = a\n[submodule \"b\"]\n\tpath = b\n\turl =\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert!(urls.is_empty());
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_matches_keys_case_insensitively() {
+        // Config keys are case-insensitive: `PATH`/`URL` record
+        // the same as `path`/`url`.
+        let dir = TempDirGuard::new("git-gitmodules-upper-keys");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"]\n\tPATH = vendor/sub\n\tURL = https://example.com/sub\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/sub")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_is_empty_without_a_gitmodules_file() {
+        let dir = TempDirGuard::new("git-gitmodules-missing");
+        init_repo(&dir.path);
+        write_file(&dir.path, "foo.spec", "Name: foo\n");
+        git_ok(&dir.path, &["add", "-A"]);
+        git_ok(&dir.path, &["commit", "--quiet", "-m", "initial"]);
+        let head = git(&dir.path, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert!(urls.is_empty());
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_reports_a_real_read_failure() {
+        // A commit that cannot be listed at all (here: a SHA
+        // that names no object) is a real failure, not an empty
+        // map: the caller must not report it as "has no URL".
+        let dir = TempDirGuard::new("git-gitmodules-bad-sha");
+        init_repo(&dir.path);
+        let err =
+            submodule_urls_at(&dir.path, "1111111111111111111111111111111111111111").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be listed"),
+            "message: {message}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_reports_a_broken_gitmodules_read() {
+        // The `.gitmodules` blob is listed in the tree but its
+        // object is gone (a corrupt object store): the listing
+        // succeeds, the read fails, and that is a real failure —
+        // not an empty map reported as "has no URL".
+        let dir = TempDirGuard::new("git-gitmodules-broken-read");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        let blob = git(
+            &dir.path,
+            "rev-parse",
+            &[&format!("{head}:.gitmodules")],
+            &[],
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let object = dir
+            .path
+            .join(".git")
+            .join("objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        std::fs::remove_file(&object).unwrap();
+        let err = submodule_urls_at(&dir.path, &head).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(message.contains("could not be read"), "message: {message}");
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_reads_a_section_header_with_a_trailing_comment() {
+        // A comment after the closing bracket (`[submodule
+        // "x"] # note`, the way a hand edit leaves it) is a
+        // submodule section: git accepts the comment, so the
+        // section's URL is recorded.
+        let dir = TempDirGuard::new("git-gitmodules-header-comment");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"] # hand note\n\tpath = vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/sub")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_strips_an_inline_comment_after_a_value() {
+        // Git strips a `#` comment preceded by whitespace
+        // (`path = vendor/sub # note` records `vendor/sub`),
+        // while a `#` with no whitespace before it stays part
+        // of the value (`sub#frag` keeps its fragment).
+        let dir = TempDirGuard::new("git-gitmodules-inline-comment");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"]\n\tpath = vendor/sub # hand note\n\turl = https://example.com/sub#frag\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/sub#frag")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_strips_a_comment_after_a_quoted_value() {
+        // A quoted value with a trailing comment unquotes
+        // cleanly: git strips the comment first, then the
+        // quotes (`"https://example.com/sub" # note` records
+        // the bare URL).
+        let dir = TempDirGuard::new("git-gitmodules-quoted-comment");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = \"https://example.com/sub\" # note\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/sub")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_fails_closed_on_a_bad_config_line() {
+        // A line git rejects (`path vendor/sub`, no `=` between
+        // the key and its value) fails the read: git rejects
+        // the whole file, so the gate must not silently skip
+        // the line and pass a file git cannot read.
+        let dir = TempDirGuard::new("git-gitmodules-bad-line");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"]\n\tpath vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        let err = submodule_urls_at(&dir.path, &head).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be parsed"),
+            "message: {message}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_joins_a_backslash_continuation() {
+        // A `\` at the end of a line continues the value onto
+        // the next line, the backslash itself dropped: git
+        // joins the two halves before reading the value.
+        let dir = TempDirGuard::new("git-gitmodules-continuation");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"]\n\tpath = vendor/su\\\nb\n\turl = https://example.com/su\\\nb\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/sub")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_decodes_tab_and_newline_escapes() {
+        // `\t` and `\n` decode to a real tab and newline in
+        // quoted and unquoted values alike, the way git reads
+        // them.
+        let dir = TempDirGuard::new("git-gitmodules-escapes");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"a\"]\n\tpath = \"x\\ty\"\n\turl = https://example.com/a\n[submodule \"b\"]\n\tpath = x\\tz\n\turl = \"https://example.com/a\\nb\"\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(
+            urls.get("x\ty").map(String::as_str),
+            Some("https://example.com/a")
+        );
+        assert_eq!(
+            urls.get("x\tz").map(String::as_str),
+            Some("https://example.com/a\nb")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_reads_a_one_line_section_header() {
+        // A key on the section header's own line
+        // (`[submodule "x"] path = vendor/sub`) is the section
+        // plus that pair, the way git reads it. A second pair
+        // on the same line is not a second pair: the value runs
+        // to the end of the line, so a section written that way
+        // names no URL.
+        let dir = TempDirGuard::new("git-gitmodules-one-line-header");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"] path = vendor/sub\n\turl = https://example.com/sub\n[submodule \"other\"] path = other url = https://example.com/other\n",
+        );
+        let urls = submodule_urls_at(&dir.path, &head).unwrap();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(
+            urls.get("vendor/sub").map(String::as_str),
+            Some("https://example.com/sub")
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_rejects_a_bad_section_header() {
+        // A space before the closing bracket (`[submodule "x"
+        // ]`) is a header git rejects, so the read fails
+        // instead of silently skipping the section.
+        let dir = TempDirGuard::new("git-gitmodules-bad-header");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\" ]\n\tpath = vendor/sub\n\turl = https://example.com/sub\n",
+        );
+        let err = submodule_urls_at(&dir.path, &head).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be parsed"),
+            "message: {message}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_urls_at_rejects_an_unknown_escape() {
+        // `\q` is not a git-config escape, in a quoted value
+        // or an unquoted one: git rejects the file, so the read
+        // fails instead of silently keeping the backslash.
+        let dir = TempDirGuard::new("git-gitmodules-bad-escape");
+        init_repo(&dir.path);
+        let head = commit_gitmodules(
+            &dir.path,
+            "[submodule \"vendor/sub\"]\n\tpath = \"a\\qb\"\n\turl = https://example.com/sub\n",
+        );
+        let err = submodule_urls_at(&dir.path, &head).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be parsed"),
+            "message: {message}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn check_commit_not_empty_exempts_a_merge_commit() {
+        // A merge whose tree matches its first parent's is the
+        // content: the merge itself is the change, so the empty
+        // check exempts it.
+        let dir = TempDirGuard::new("git-prepush-merge-exempt");
+        init_repo(&dir.path);
+        write_file(&dir.path, "foo.spec", "Name: foo\n");
+        git_ok(&dir.path, &["add", "-A"]);
+        git_ok(&dir.path, &["commit", "--quiet", "-m", "base"]);
+        git_ok(&dir.path, &["checkout", "--quiet", "-b", "side"]);
+        git_ok(
+            &dir.path,
+            &["commit", "--quiet", "--allow-empty", "-m", "side empty"],
+        );
+        git_ok(&dir.path, &["checkout", "--quiet", "-"]);
+        git_ok(
+            &dir.path,
+            &["merge", "--quiet", "--no-ff", "side", "-m", "merge side"],
+        );
+        let sha = git(&dir.path, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        check_commit_not_empty(&dir.path, &sha).unwrap();
+        let _ = dir;
+    }
+
+    #[test]
+    fn check_commit_not_empty_checks_a_root_commit() {
+        // A root commit in the range is checked too: `--root`
+        // compares it against the empty tree, so an empty root
+        // commit is refused like any other empty commit.
+        let dir = TempDirGuard::new("git-prepush-root-commit");
+        init_repo(&dir.path);
+        git_ok(
+            &dir.path,
+            &["commit", "--quiet", "--allow-empty", "-m", "root"],
+        );
+        let sha = git(&dir.path, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        let err = check_commit_not_empty(&dir.path, &sha).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(
+            message.contains("is empty (its tree matches its parent's)"),
+            "message: {message}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn check_pushed_commits_refuses_an_unlistable_range() {
+        // A base that is not in the history makes the range
+        // unlistable: an unverifiable push does not go.
+        let dir = TempDirGuard::new("git-prepush-unlistable-range");
+        init_repo(&dir.path);
+        write_file(&dir.path, "foo.spec", "Name: foo\n");
+        git_ok(&dir.path, &["add", "-A"]);
+        git_ok(&dir.path, &["commit", "--quiet", "-m", "initial"]);
+        let err = check_pushed_commits(
+            &dir.path,
+            "1111111111111111111111111111111111111111",
+            "HEAD",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PrePushCheckFailed);
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be listed"),
+            "message: {message}"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn submodule_commit_present_reads_the_submodule_checkout() {
+        // A pointer present in the checkout's own object store
+        // resolves there; otherwise the submodule's own checkout
+        // is consulted; absent from both, it does not resolve.
+        let dir = TempDirGuard::new("git-prepush-submodule-present");
+        init_repo(&dir.path);
+        write_file(&dir.path, "foo.spec", "Name: foo\n");
+        git_ok(&dir.path, &["add", "-A"]);
+        git_ok(&dir.path, &["commit", "--quiet", "-m", "base"]);
+        let head = git(&dir.path, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(submodule_commit_present(&dir.path, "vendor/none", &head).unwrap());
+        let sub = dir.path.join("vendor/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        init_repo(&sub);
+        write_file(&sub, "sub.txt", "sub\n");
+        git_ok(&sub, &["add", "-A"]);
+        git_ok(&sub, &["commit", "--quiet", "-m", "sub"]);
+        let target = git(&sub, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(submodule_commit_present(&dir.path, "vendor/sub", &target).unwrap());
+        assert!(!submodule_commit_present(
+            &dir.path,
+            "vendor/sub",
+            "1111111111111111111111111111111111111111"
+        )
+        .unwrap());
         let _ = dir;
     }
 

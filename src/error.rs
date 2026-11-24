@@ -89,6 +89,10 @@ pub enum ErrorKind {
     /// The checkout is not in a usable state, or its recorded base
     /// coordinates disagree with its base commit.
     WorkingCopyInconsistent,
+    /// A pre-push sanity check failed (a hook, a pushed commit,
+    /// or a submodule pointer). The context names the failing
+    /// check.
+    PrePushCheckFailed,
     /// A merge conflict is left in the working tree.
     FileConflict,
     /// A commit was requested with nothing to commit.
@@ -135,6 +139,7 @@ impl ErrorKind {
             ErrorKind::WorkingCopyNotFound => "working_copy_not_found",
             ErrorKind::WorkingCopyOutdated => "working_copy_outdated",
             ErrorKind::WorkingCopyInconsistent => "working_copy_inconsistent",
+            ErrorKind::PrePushCheckFailed => "pre_push_check_failed",
             ErrorKind::FileConflict => "file_conflict",
             ErrorKind::NothingToCommit => "nothing_to_commit",
             ErrorKind::NoGit => "no_git",
@@ -177,6 +182,7 @@ impl ErrorKind {
             ErrorKind::WorkingCopyNotFound => "the directory is not a geectl working copy",
             ErrorKind::WorkingCopyOutdated => "the checkout's base revision is behind the server",
             ErrorKind::WorkingCopyInconsistent => "the checkout is not in a usable state",
+            ErrorKind::PrePushCheckFailed => "a pre-push sanity check failed",
             ErrorKind::FileConflict => "a merge conflict is left in the working tree",
             ErrorKind::NothingToCommit => "there is nothing to commit",
             ErrorKind::NoGit => "the git binary is not on PATH",
@@ -259,6 +265,7 @@ impl ErrorKind {
             ErrorKind::WorkingCopyInconsistent => {
                 "check the checkout out again into a fresh directory; a fresh checkout replaces repair, and any local edits and unpushed commits in this checkout are lost"
             }
+            ErrorKind::PrePushCheckFailed => "fix the named check and retry the commit",
             ErrorKind::FileConflict => {
                 "resolve the conflicted files, then run resolve to mark them resolved"
             }
@@ -303,6 +310,7 @@ impl ErrorKind {
             ErrorKind::WorkingCopyNotFound => 25,
             ErrorKind::WorkingCopyOutdated => 26,
             ErrorKind::WorkingCopyInconsistent => 27,
+            ErrorKind::PrePushCheckFailed => 34,
             ErrorKind::FileConflict => 28,
             // Exit 29 is unused: it belonged to a removed kind and
             // is never reused.
@@ -343,6 +351,7 @@ impl ErrorKind {
             ErrorKind::WorkingCopyNotFound,
             ErrorKind::WorkingCopyOutdated,
             ErrorKind::WorkingCopyInconsistent,
+            ErrorKind::PrePushCheckFailed,
             ErrorKind::FileConflict,
             ErrorKind::NothingToCommit,
             ErrorKind::NoGit,
