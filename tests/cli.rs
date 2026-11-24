@@ -3630,7 +3630,424 @@ fn remote_set_project_meta_without_any_flag_fails() {
     assert_eq!(value["error"]["code"], "invalid_input");
     assert_eq!(
         value["error"]["context"],
-        "set-project-meta needs at least one of --title, --description, --url, --scmsync, --devel-project, --add-person, --remove-person"
+        "set-project-meta needs at least one of --from-file, --title, --description, --url, --scmsync, --devel-project, --add-person, --remove-person"
+    );
+}
+
+#[test]
+fn remote_set_package_meta_without_any_flag_fails() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "set-package-meta", "home:alice", "vim"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "set-package-meta needs at least one of --from-file, --title, --description, --url, --scmsync, --releasename, --devel-project, --devel-package, --add-person, --remove-person"
+    );
+}
+
+#[test]
+fn remote_set_project_meta_from_file_dry_run() {
+    // The whole-file write plans the file's meta: title,
+    // description, URL, devel project, person, and repository.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.xml");
+    fs::write(
+        &file,
+        "<project name=\"home:alice\">\
+         <title>Alice</title>\
+         <description>Home project</description>\
+         <url>https://example.org</url>\
+         <devel project=\"openSUSE:Factory\"/>\
+         <person userid=\"alice\" role=\"maintainer\"/>\
+         <repository name=\"standard\">\
+         <path project=\"openSUSE:Factory\" repository=\"standard\"/>\
+         <arch>x86_64</arch>\
+         </repository></project>",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["name"], "home:alice");
+    assert_eq!(value["title"], "Alice");
+    assert_eq!(value["description"], "Home project");
+    assert_eq!(value["url"], "https://example.org");
+    assert_eq!(value["devel"], "openSUSE:Factory");
+    assert_eq!(value["persons"][0]["name"], "alice");
+    assert_eq!(value["repositories"][0]["name"], "standard");
+    assert_eq!(
+        value["plan"],
+        serde_json::json!(["[dry-run] would: set project meta of home:alice"])
+    );
+    // The text result line names the file it was written from.
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "dry-run: would set project meta of home:alice (from-file: {})",
+            file.display()
+        )),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn remote_set_package_meta_from_file_dry_run() {
+    // The whole-file write plans the file's meta: title, URL,
+    // release name, devel pair, and person.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.xml");
+    fs::write(
+        &file,
+        "<package name=\"vim\" project=\"home:alice\">\
+         <title>Vim</title>\
+         <url>https://example.org/vim</url>\
+         <releasename>vim</releasename>\
+         <devel project=\"devel:languages:vim\" package=\"vim\"/>\
+         <person userid=\"alice\" role=\"maintainer\"/>\
+         </package>",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "home:alice");
+    assert_eq!(value["name"], "vim");
+    assert_eq!(value["title"], "Vim");
+    assert_eq!(value["url"], "https://example.org/vim");
+    assert_eq!(value["releasename"], "vim");
+    assert_eq!(value["devel"]["project"], "devel:languages:vim");
+    assert_eq!(value["devel"]["package"], "vim");
+    assert_eq!(value["persons"][0]["name"], "alice");
+    assert_eq!(
+        value["plan"],
+        serde_json::json!(["[dry-run] would: set package meta of home:alice/vim"])
+    );
+}
+
+#[test]
+fn remote_set_project_meta_from_file_with_field_flag_fails() {
+    // Bimodal: `--from-file` and a field flag together are a
+    // usage error, before any file is read.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            "meta.xml",
+            "--title",
+            "Alice",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be used with"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn remote_set_package_meta_from_file_with_person_flag_fails() {
+    // Bimodal: `--from-file` and a person flag together are a
+    // usage error too — the file already carries the persons.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--from-file",
+            "meta.xml",
+            "--add-person",
+            "alice:maintainer",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be used with"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn remote_set_project_meta_from_file_missing_file_fails() {
+    let dir = TempDir::new();
+    let file = dir.0.join("no-such-meta.xml");
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    let context = value["error"]["context"].as_str().unwrap();
+    assert!(context.contains("cannot read "));
+    assert!(
+        context.contains(&file.display().to_string()),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn remote_set_project_meta_from_file_malformed_fails() {
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.xml");
+    fs::write(&file, "not a meta document").unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        format!(
+            "cannot parse meta file {}: not a <project> document",
+            file.display()
+        )
+    );
+}
+
+#[test]
+fn remote_set_package_meta_from_file_wrong_project_fails() {
+    // The file's project must match the package: a file written
+    // for another project fails in dry-run, before any write.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.xml");
+    fs::write(
+        &file,
+        "<package name=\"vim\" project=\"other\"><title>Vim</title></package>",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "package meta is for \"other\"/\"vim\", not \"home:alice\"/\"vim\""
+    );
+}
+
+#[test]
+fn remote_set_project_meta_from_file_wrong_project_fails() {
+    // The file's project must match the project: a file written
+    // for another project fails in dry-run, before any write.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.xml");
+    fs::write(
+        &file,
+        "<project name=\"other\"><title>Other</title></project>",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        "project meta is for \"other\", not \"home:alice\""
+    );
+}
+
+#[test]
+fn remote_set_package_meta_from_file_missing_file_fails() {
+    let dir = TempDir::new();
+    let file = dir.0.join("no-such-meta.xml");
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    let context = value["error"]["context"].as_str().unwrap();
+    assert!(context.contains("cannot read "));
+    assert!(
+        context.contains(&file.display().to_string()),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn remote_set_package_meta_from_file_malformed_fails() {
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.xml");
+    fs::write(&file, "not a meta document").unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-package-meta",
+            "home:alice",
+            "vim",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        format!(
+            "cannot parse meta file {}: not a <package> document",
+            file.display()
+        )
+    );
+}
+
+#[test]
+fn remote_set_project_meta_from_file_package_document_fails() {
+    // The project leaf takes a `<project>` document, not a
+    // `<package>` one.
+    let dir = TempDir::new();
+    let file = dir.0.join("meta.xml");
+    fs::write(
+        &file,
+        "<package name=\"vim\" project=\"home:alice\"><title>Vim</title></package>",
+    )
+    .unwrap();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert_eq!(
+        value["error"]["context"],
+        format!(
+            "cannot parse meta file {}: not a <project> document",
+            file.display()
+        )
     );
 }
 

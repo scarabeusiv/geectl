@@ -77,7 +77,8 @@ use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
-    valid_obs_name, validate_role, AggregateOptions, CreatePackageOptions, DeletePackageOptions,
+    parse_package_meta, parse_project_meta, valid_obs_name, validate_meta_file_roles,
+    validate_role, AggregateOptions, CreatePackageOptions, DeletePackageOptions,
     DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient,
     Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch,
     ProjectMeta, ReleaseOptions, Repository, RevisionPatch, RevisionRange, RevisionSpec, RoleGrant,
@@ -209,10 +210,21 @@ pub enum RemoteCommand {
         /// The project to show.
         project: String,
     },
-    /// Set fields of a project's meta. A mutation: dry-run is the
-    /// default (only the plan is printed); `--live` performs the
-    /// write. Only the given fields change; the rest of the meta is
-    /// kept as it is. There is no flag to clear a field.
+    /// Set a project's meta, field by field or whole from a file. A
+    /// mutation: dry-run is the default (only the plan is printed);
+    /// `--live` performs the write. Field flags change only the
+    /// given fields; the rest of the meta is kept as it is. There is
+    /// no flag to clear a field. With `--from-file`, fields the file
+    /// omits are cleared.
+    ///
+    /// `--from-file FILE` writes the given meta file as the whole
+    /// meta instead: the file's title, description, URL, scmsync,
+    /// devel project, persons, groups, and repositories replace
+    /// what the server holds, and fields the file omits are cleared.
+    /// The file's project name must match the project. Settings
+    /// outside the typed meta (locks, publish and build flags)
+    /// survive, as in the field-wise write. `--from-file` conflicts
+    /// with every field and person flag.
     ///
     /// `--add-person LOGIN:ROLE` grants a role to a person;
     /// `--remove-person LOGIN` removes every role that login holds.
@@ -222,18 +234,29 @@ pub enum RemoteCommand {
     /// call keeps a maintainer. Roles: maintainer, bugowner,
     /// reviewer, reader, downloader.
     ///
-    /// The write is not atomic: the field write runs first, then
-    /// each person change is a separate read-modify-write, so a
-    /// failure part-way leaves the earlier changes applied, with no
-    /// rollback. Dry-run does not read the live meta, so a removal
-    /// is not validated there: a login holding no role, and the
-    /// last-maintainer refusal, only fail with `--live`. A dry run
+    /// The field-wise write is not atomic: the field write runs
+    /// first, then each person change is a separate
+    /// read-modify-write, so a failure part-way leaves the earlier
+    /// changes applied, with no rollback. The `--from-file` write
+    /// is a single `set_project_meta` call instead — one
+    /// read-modify-write, one GET and at most one PUT when live —
+    /// so a failure leaves either the old meta or the file's meta,
+    /// never a half-written mix. Dry-run does not read the live
+    /// meta, so a removal is not validated there: a login holding
+    /// no role, and the last-maintainer refusal, only fail with
+    /// `--live`. A dry run
     /// performs no fetch and cannot tell a changed repository from
     /// a pre-existing one, so it validates no repositories, while
     /// `--live` validates only the repositories it changes.
     SetProjectMeta {
         /// The project whose meta is written.
         project: String,
+        /// Write the given meta file as the whole meta instead of
+        /// setting fields: the file is a `<project>` document whose
+        /// name matches the project. Conflicts with every field
+        /// and person flag.
+        #[arg(long, conflicts_with_all = ["title", "description", "url", "scmsync", "devel_project", "add_person", "remove_person"])]
+        from_file: Option<PathBuf>,
         /// The new title.
         #[arg(long)]
         title: Option<String>,
@@ -263,10 +286,21 @@ pub enum RemoteCommand {
         /// The package to show.
         package: String,
     },
-    /// Set fields of a package's meta. A mutation: dry-run is the
-    /// default (only the plan is printed); `--live` performs the
-    /// write. Only the given fields change; the rest of the meta is
-    /// kept as it is. There is no flag to clear a field.
+    /// Set a package's meta, field by field or whole from a file. A
+    /// mutation: dry-run is the default (only the plan is printed);
+    /// `--live` performs the write. Field flags change only the
+    /// given fields; the rest of the meta is kept as it is. There is
+    /// no flag to clear a field. With `--from-file`, fields the file
+    /// omits are cleared.
+    ///
+    /// `--from-file FILE` writes the given meta file as the whole
+    /// meta instead: the file's title, description, URL, scmsync,
+    /// release name, devel project and package, persons, and groups
+    /// replace what the server holds, and fields the file omits are
+    /// cleared. The file's package name and project must match the
+    /// package. Settings outside the typed meta survive, as in the
+    /// field-wise write. `--from-file` conflicts with every field
+    /// and person flag.
     ///
     /// `--add-person LOGIN:ROLE` grants a role to a person;
     /// `--remove-person LOGIN` removes every role that login holds.
@@ -275,17 +309,27 @@ pub enum RemoteCommand {
     /// package: the project maintainers still cover it. Roles:
     /// maintainer, bugowner, reviewer, reader, downloader.
     ///
-    /// The write is not atomic: the field write runs first, then
-    /// each person change is a separate read-modify-write, so a
-    /// failure part-way leaves the earlier changes applied, with no
-    /// rollback. Dry-run does not read the live meta, so a removal
-    /// is not validated there: a login holding no role only fails
-    /// with `--live`.
+    /// The field-wise write is not atomic: the field write runs
+    /// first, then each person change is a separate
+    /// read-modify-write, so a failure part-way leaves the earlier
+    /// changes applied, with no rollback. The `--from-file` write
+    /// is a single `set_package_meta` call instead — one
+    /// read-modify-write, one GET and at most one PUT when live —
+    /// so a failure leaves either the old meta or the file's meta,
+    /// never a half-written mix. Dry-run does not read the live
+    /// meta, so a removal is not validated there: a login holding
+    /// no role only fails with `--live`.
     SetPackageMeta {
         /// The project the package lives in.
         project: String,
         /// The package whose meta is written.
         package: String,
+        /// Write the given meta file as the whole meta instead of
+        /// setting fields: the file is a `<package>` document whose
+        /// name and project match the package. Conflicts with every
+        /// field and person flag.
+        #[arg(long, conflicts_with_all = ["title", "description", "url", "scmsync", "releasename", "devel_project", "devel_package", "add_person", "remove_person"])]
+        from_file: Option<PathBuf>,
         /// The new title.
         #[arg(long)]
         title: Option<String>,
@@ -934,7 +978,25 @@ pub fn run_remote(
             devel_project,
             add_person,
             remove_person,
+            from_file,
         } => {
+            if let Some(path) = from_file {
+                let meta = read_project_meta_file(&path)?;
+                let fields = vec![format!("from-file: {}", path.display())];
+                let dry_run = DryRun::new(!live).with_debug(debug.clone());
+                client.set_project_meta(&project, &meta, &dry_run)?;
+                let plan = if dry_run.enabled() {
+                    Some(dry_run.plan())
+                } else {
+                    None
+                };
+                return Ok(set_project_meta_result(
+                    &meta,
+                    &fields,
+                    dry_run.enabled(),
+                    plan,
+                ));
+            }
             let flags = ProjectMetaFlags {
                 title,
                 description,
@@ -999,7 +1061,25 @@ pub fn run_remote(
             devel_package,
             add_person,
             remove_person,
+            from_file,
         } => {
+            if let Some(path) = from_file {
+                let meta = read_package_meta_file(&path)?;
+                let fields = vec![format!("from-file: {}", path.display())];
+                let dry_run = DryRun::new(!live).with_debug(debug.clone());
+                client.set_package_meta(&project, &package, &meta, &dry_run)?;
+                let plan = if dry_run.enabled() {
+                    Some(dry_run.plan())
+                } else {
+                    None
+                };
+                return Ok(set_package_meta_result(
+                    &meta,
+                    &fields,
+                    dry_run.enabled(),
+                    plan,
+                ));
+            }
             let flags = PackageMetaFlags {
                 title,
                 description,
@@ -2072,6 +2152,74 @@ fn empty_package_meta(project: &str, package: &str) -> PackageMeta {
     }
 }
 
+/// The detail of a meta parse error without the server-response
+/// prefix it was written for: a file is not a response, so the
+/// file errors name the file and keep only the detail.
+fn meta_parse_detail(context: &str) -> &str {
+    context
+        .strip_prefix("unexpected OBS project meta response: ")
+        .or_else(|| context.strip_prefix("unexpected OBS package meta response: "))
+        .or_else(|| context.strip_prefix("unexpected OBS meta response: "))
+        .or_else(|| context.strip_prefix("unexpected OBS response: "))
+        .unwrap_or(context)
+}
+
+/// Read a project meta file: the file's text parsed as a
+/// `<project>` document. A missing or unreadable file, or a file
+/// that is not a project meta document, is an input error naming
+/// the file.
+fn read_project_meta_file(path: &PathBuf) -> Result<ProjectMeta, GeectlError> {
+    let text = read_local_file_text(path)?;
+    let meta = parse_project_meta(&text).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "cannot parse meta file {}: {}",
+                path.display(),
+                meta_parse_detail(&err.context),
+            ),
+        )
+    })?;
+    // The parse reads roles leniently, as for a server response:
+    // a role-less element is skipped there, so the file check runs
+    // here, on the file text, and names the file.
+    validate_meta_file_roles(&text).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot parse meta file {}: {}", path.display(), err.context),
+        )
+    })?;
+    Ok(meta)
+}
+
+/// Read a package meta file: the file's text parsed as a
+/// `<package>` document. A missing or unreadable file, or a file
+/// that is not a package meta document, is an input error naming
+/// the file.
+fn read_package_meta_file(path: &PathBuf) -> Result<PackageMeta, GeectlError> {
+    let text = read_local_file_text(path)?;
+    let meta = parse_package_meta(&text).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "cannot parse meta file {}: {}",
+                path.display(),
+                meta_parse_detail(&err.context),
+            ),
+        )
+    })?;
+    // The parse reads roles leniently, as for a server response:
+    // a role-less element is skipped there, so the file check runs
+    // here, on the file text, and names the file.
+    validate_meta_file_roles(&text).map_err(|err| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot parse meta file {}: {}", path.display(), err.context),
+        )
+    })?;
+    Ok(meta)
+}
+
 /// The flags of a `set-project-meta` call: one optional value per
 /// writable field, plus the parsed person changes. An absent field
 /// flag keeps the current value.
@@ -2248,7 +2396,7 @@ fn project_meta_fields(flags: &ProjectMetaFlags) -> Result<Vec<String>, GeectlEr
     if fields.is_empty() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "set-project-meta needs at least one of --title, --description, --url, --scmsync, --devel-project, --add-person, --remove-person",
+            "set-project-meta needs at least one of --from-file, --title, --description, --url, --scmsync, --devel-project, --add-person, --remove-person",
         ));
     }
     Ok(fields)
@@ -2293,7 +2441,7 @@ fn package_meta_fields(flags: &PackageMetaFlags) -> Result<Vec<String>, GeectlEr
     if fields.is_empty() {
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "set-package-meta needs at least one of --title, --description, --url, --scmsync, --releasename, --devel-project, --devel-package, --add-person, --remove-person",
+            "set-package-meta needs at least one of --from-file, --title, --description, --url, --scmsync, --releasename, --devel-project, --devel-package, --add-person, --remove-person",
         ));
     }
     Ok(fields)
@@ -4574,12 +4722,69 @@ mod tests {
                 devel_project: None,
                 add_person,
                 remove_person,
+                from_file: None,
             } if project == "home:alice"
                 && title == "Alice"
                 && url == "https://example.org"
                 && add_person.is_empty()
                 && remove_person.is_empty()
         ));
+    }
+
+    #[test]
+    fn set_project_meta_parses_from_file() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            "meta.xml",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::SetProjectMeta {
+                project,
+                from_file: Some(path),
+                title: None,
+                ..
+            } if project == "home:alice" && path.as_path() == Path::new("meta.xml")
+        ));
+    }
+
+    #[test]
+    fn set_project_meta_from_file_conflicts_with_field_flags() {
+        // The leaves are bimodal: `--from-file` and the field
+        // options are mutually exclusive, so clap refuses the pair
+        // as a usage error.
+        let err = Cli::try_parse_from([
+            "geectl",
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            "meta.xml",
+            "--title",
+            "Alice",
+        ])
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn set_project_meta_from_file_conflicts_with_person_flags() {
+        let err = Cli::try_parse_from([
+            "geectl",
+            "remote",
+            "set-project-meta",
+            "home:alice",
+            "--from-file",
+            "meta.xml",
+            "--add-person",
+            "alice:maintainer",
+        ])
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
     }
 
     #[test]
@@ -4605,6 +4810,49 @@ mod tests {
                 ..
             } if project == "P" && package == "K" && releasename == "vim" && devel == "devel:languages:vim"
         ));
+    }
+
+    #[test]
+    fn set_package_meta_parses_from_file() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "set-package-meta",
+            "P",
+            "K",
+            "--from-file",
+            "meta.xml",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::SetPackageMeta {
+                project,
+                package,
+                from_file: Some(path),
+                title: None,
+                ..
+            } if project == "P" && package == "K" && path.as_path() == Path::new("meta.xml")
+        ));
+    }
+
+    #[test]
+    fn set_package_meta_from_file_conflicts_with_field_flags() {
+        // The leaves are bimodal: `--from-file` and the field
+        // options are mutually exclusive, so clap refuses the pair
+        // as a usage error.
+        let err = Cli::try_parse_from([
+            "geectl",
+            "remote",
+            "set-package-meta",
+            "P",
+            "K",
+            "--from-file",
+            "meta.xml",
+            "--devel-package",
+            "vim",
+        ])
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
     }
 
     #[test]
@@ -4939,6 +5187,283 @@ mod tests {
             ]),
             vec!["bob".to_string(), "alice".to_string()]
         );
+    }
+
+    /// Write `contents` to a fresh temp file and return its path;
+    /// the caller removes it. The name carries the process id and
+    /// a counter so parallel tests never share a file.
+    fn write_temp_meta_file(contents: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "geectl-from-file-test-{}-{n}.xml",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_project_meta_file_parses_the_whole_document() {
+        let path = write_temp_meta_file(
+            "<project name=\"home:alice\">\
+             <title>Alice</title>\
+             <description>Home project</description>\
+             <url>https://example.org</url>\
+             <devel project=\"openSUSE:Factory\"/>\
+             <person userid=\"alice\" role=\"maintainer\"/>\
+             <repository name=\"standard\">\
+             <path project=\"openSUSE:Factory\" repository=\"standard\"/>\
+             <arch>x86_64</arch>\
+             </repository></project>",
+        );
+        let meta = read_project_meta_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(meta.name, "home:alice");
+        assert_eq!(meta.title.as_deref(), Some("Alice"));
+        assert_eq!(meta.description.as_deref(), Some("Home project"));
+        assert_eq!(meta.url.as_deref(), Some("https://example.org"));
+        assert_eq!(meta.devel.as_deref(), Some("openSUSE:Factory"));
+        assert_eq!(meta.persons.len(), 1);
+        assert_eq!(meta.persons[0].name, "alice");
+        assert_eq!(meta.repositories.len(), 1);
+        assert_eq!(meta.repositories[0].name, "standard");
+        assert_eq!(meta.repositories[0].arch, vec!["x86_64".to_string()]);
+    }
+
+    #[test]
+    fn read_project_meta_file_missing_file_names_the_path() {
+        let path = std::env::temp_dir().join(format!(
+            "geectl-from-file-test-no-such-file-{}.xml",
+            std::process::id()
+        ));
+        let err = read_project_meta_file(&path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("cannot read "));
+        assert!(err.context.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn read_project_meta_file_malformed_names_the_file() {
+        let path = write_temp_meta_file("not a meta document");
+        let err = read_project_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.context,
+            format!(
+                "cannot parse meta file {}: not a <project> document",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn read_project_meta_file_rejects_a_repository_without_a_name() {
+        let path = write_temp_meta_file(
+            "<project name=\"home:alice\">\
+             <repository><arch>x86_64</arch></repository></project>",
+        );
+        let err = read_project_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.context.contains("<repository> without name"));
+    }
+
+    #[test]
+    fn read_project_meta_file_rejects_an_unterminated_element() {
+        // The element scan's error shape carries a server-response
+        // prefix; the file error keeps only the detail.
+        let path = write_temp_meta_file(
+            "<project name=\"home:alice\">\
+             <person userid=\"alice\" role=\"maintainer\"></project>",
+        );
+        let err = read_project_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.context,
+            format!(
+                "cannot parse meta file {}: malformed <person> element",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn read_project_meta_file_rejects_a_person_without_a_userid() {
+        // The parse skips a role-less element, as for a server
+        // response; the file check rejects it and names the file.
+        let path = write_temp_meta_file(
+            "<project name=\"home:alice\">\
+             <person role=\"maintainer\"/></project>",
+        );
+        let err = read_project_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.context,
+            format!(
+                "cannot parse meta file {}: <person> without userid",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn read_project_meta_file_rejects_a_person_without_a_role() {
+        let path = write_temp_meta_file(
+            "<project name=\"home:alice\">\
+             <person userid=\"alice\"/></project>",
+        );
+        let err = read_project_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.context,
+            format!(
+                "cannot parse meta file {}: <person> without role",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn read_project_meta_file_rejects_an_unknown_role() {
+        let path = write_temp_meta_file(
+            "<project name=\"home:alice\">\
+             <person userid=\"alice\" role=\"wizard\"/></project>",
+        );
+        let err = read_project_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.context,
+            format!(
+                "cannot parse meta file {}: invalid OBS role \"wizard\" for person \"alice\"; roles are maintainer, bugowner, reviewer, downloader, reader",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn read_project_meta_file_rejects_a_group_without_a_groupid() {
+        let path = write_temp_meta_file(
+            "<project name=\"home:alice\">\
+             <group role=\"maintainer\"/></project>",
+        );
+        let err = read_project_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.context,
+            format!(
+                "cannot parse meta file {}: <group> without groupid",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn read_package_meta_file_parses_the_whole_document() {
+        let path = write_temp_meta_file(
+            "<package name=\"vim\" project=\"home:alice\">\
+             <title>Vim</title>\
+             <url>https://example.org/vim</url>\
+             <releasename>vim</releasename>\
+             <devel project=\"devel:languages:vim\" package=\"vim\"/>\
+             <person userid=\"alice\" role=\"maintainer\"/>\
+             </package>",
+        );
+        let meta = read_package_meta_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(meta.name, "vim");
+        assert_eq!(meta.project, "home:alice");
+        assert_eq!(meta.title.as_deref(), Some("Vim"));
+        assert_eq!(meta.releasename.as_deref(), Some("vim"));
+        assert_eq!(
+            meta.devel,
+            Some(("devel:languages:vim".to_string(), "vim".to_string()))
+        );
+        assert_eq!(meta.persons.len(), 1);
+    }
+
+    #[test]
+    fn read_package_meta_file_rejects_a_project_document() {
+        let path = write_temp_meta_file("<project name=\"home:alice\"></project>");
+        let err = read_package_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.context,
+            format!(
+                "cannot parse meta file {}: not a <package> document",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn read_project_meta_file_rejects_a_package_document() {
+        let path = write_temp_meta_file("<package name=\"vim\" project=\"home:alice\"></package>");
+        let err = read_project_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.context,
+            format!(
+                "cannot parse meta file {}: not a <project> document",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn read_package_meta_file_rejects_a_person_without_a_role() {
+        // The file check runs on the package reader too.
+        let path = write_temp_meta_file(
+            "<package name=\"vim\" project=\"home:alice\">\
+             <person userid=\"alice\"/></package>",
+        );
+        let err = read_package_meta_file(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.context,
+            format!(
+                "cannot parse meta file {}: <person> without role",
+                path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn set_project_meta_result_names_the_file_in_the_result_line() {
+        let meta = sample_project_meta();
+        let (_, text) =
+            set_project_meta_result(&meta, &["from-file: meta.xml".to_string()], true, None);
+        assert!(text
+            .contains("dry-run: would set project meta of openSUSE:Factory (from-file: meta.xml)"));
+    }
+
+    #[test]
+    fn set_package_meta_result_names_the_file_in_the_result_line() {
+        let meta = PackageMeta {
+            name: "vim".to_string(),
+            project: "P".to_string(),
+            title: Some("Vim".to_string()),
+            description: None,
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel: None,
+            persons: vec![],
+            groups: vec![],
+        };
+        let (_, text) =
+            set_package_meta_result(&meta, &["from-file: meta.xml".to_string()], false, None);
+        assert!(text.contains("set package meta of P/vim (from-file: meta.xml)"));
     }
 
     #[test]

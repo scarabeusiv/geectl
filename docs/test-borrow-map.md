@@ -1160,6 +1160,41 @@ scheduler entries.**
   `search-projects-by-person` under batch 3; no new osc case pins
   the unified leaf itself.
 
+## Gap batch — --from-file on set-package-meta / set-project-meta (#180)
+
+**Direct adoptions: 0. Source pins: 2.**
+
+No reference test pins the whole-file meta write: `behave/features/`
+carries no `meta` scenario, and `tests/` has no `meta -F` test.
+(`tests/test_non_interactive.py` does not exist at `a83810c`, and
+its `test_meta_edit_refused` / `test_meta_edit_with_file_passes_preflight`
+names are unfindable in `tests/test_commandline.py`, so the earlier
+test pins are dropped, not re-mined.) Adopted as source pins
+instead (behaviour specs, not test cases), mined at openSUSE/osc @
+`a83810c`:
+
+- `osc/commandline.py:1873` (`do_meta` `--file` branch) — the file is
+  read (`-` reads stdin), a missing file exits with
+  `could not open file '<file>'.`, and the contents go to
+  `edit_meta` as the new meta.
+- `osc/core.py:1753` (`edit_meta`, package guard at 1753–1763) —
+  the file's `project` attribute must match the target project, or
+  the write is refused with a branch hint.
+
+Deliberate divergences, not misses:
+
+- No stdin: `--from-file -` is not supported — the flag takes a
+  file path only.
+- The file is parsed into the typed meta and written through the
+  existing in-place edit, not PUT verbatim: settings outside the
+  typed meta survive, repositories are validated, and nothing is
+  PUT when nothing changed. The name-mismatch refusal is the
+  existing `set_*_meta` input error, not the reference's
+  print-and-return.
+- The new tests are written from scratch: clap-level bimodality
+  (conflicts), file read/parse errors, dry-run payload and plan,
+  and live write-and-read-back through the binary.
+
 ## Counts (direct adoptions, de-duplicated)
 
 | Batch | Unit | Behave | Total |
@@ -1188,6 +1223,7 @@ scheduler entries.**
 | 13 mirror-first dep fetch | 1 | 0 | 1 |
 | Gap batch — periodic cache cleanup (#191) | 0 | 0 | 0 |
 | Unified person search (#300) | 1 | 0 | 1 |
+| Gap batch — --from-file on set-meta (#180) | 0 (+source pins) | 0 | 0 (+pins) |
 | **Total adopted** | **107** | **120** | **227** |
 
 Surveyed base: 272 behave scenarios + 707 unit tests = 979 items;

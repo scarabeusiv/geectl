@@ -107,6 +107,55 @@ pub fn validate_role(role: &str, what: &str) -> Result<(), GeectlError> {
     }
 }
 
+/// Validate the person/group elements of a meta *file*: every
+/// `<person>` must carry `userid` and `role`, every `<group>`
+/// `groupid` and `role`, every name must be a valid OBS name, and
+/// every role must be one of the roles the server grants. A missing
+/// attribute, an invalid name, or an unknown role is an input error
+/// naming the element. Server responses stay lenient: `parse_*_meta`
+/// reads roles through `meta_roles`, which skips a role-less element
+/// instead of failing — only a file is held to this shape.
+pub fn validate_meta_file_roles(text: &str) -> Result<(), GeectlError> {
+    for (tag, attr) in [("person", "userid"), ("group", "groupid")] {
+        // An unterminated element is a file error, not a server
+        // response error: strip the response prefix the element
+        // scan was written with.
+        let elements = elements(text, tag).map_err(|err| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                err.context
+                    .strip_prefix("unexpected OBS response: ")
+                    .unwrap_or(&err.context)
+                    .to_string(),
+            )
+        })?;
+        for (element, _) in elements {
+            let name = tag_attr(&element, attr).ok_or_else(|| {
+                GeectlError::new(ErrorKind::InvalidInput, format!("<{tag}> without {attr}"))
+            })?;
+            let role = tag_attr(&element, "role").ok_or_else(|| {
+                GeectlError::new(ErrorKind::InvalidInput, format!("<{tag}> without role"))
+            })?;
+            if !valid_obs_name(&name) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {tag} name: {name:?}"),
+                ));
+            }
+            if !LOCAL_ROLES.contains(&role.as_str()) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "invalid OBS role {role:?} for {tag} {name:?}; roles are {}",
+                        LOCAL_ROLES.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate the grantees of a role change in `grant`: at least one
 /// of `person` and `group` must name someone, and every name must be
 /// a valid OBS name. Returns the grantee phrase for the dry-run plan.
@@ -1316,6 +1365,40 @@ mod tests {
         assert!(rendered.contains("<person userid=\"alice\" role=\"maintainer\"/>"));
         assert!(rendered.contains("<repository name=\"openSUSE_Tumbleweed\">"));
         assert!(rendered.contains("<build><disable/></build>"));
+    }
+
+    #[test]
+    fn set_project_meta_clears_a_field_the_new_meta_omits() {
+        // The whole-file write: a from-file-shaped meta carries a
+        // new title and no description, so the PUT carries the new
+        // title and no description element — the omitted field is
+        // cleared, not kept.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                PROJECT_META,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+                "<status code=\"ok\" />",
+            );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META).unwrap();
+        meta.title = Some("New title".to_string());
+        meta.description = None;
+        assert!(client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .is_ok());
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        let rendered = &puts[0].1;
+        assert!(rendered.contains("<title>New title</title>"));
+        assert!(
+            !rendered.contains("<description>"),
+            "the PUT must omit the cleared description: {rendered}"
+        );
+        assert!(rendered.contains("<lock><enable/></lock>"));
+        assert!(rendered.contains("<person userid=\"alice\" role=\"maintainer\"/>"));
     }
 
     const PROJECT_META_WITH_FULL_REPOSITORY: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\" rebuild=\"local\" block=\"never\" linkedbuild=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><master url=\"https://master.example.com\" sslfingerprint=\"AB:CD\"/><pubkey>key-material</pubkey></download><download arch=\"aarch64\" url=\"https://other.example.com\" repotype=\"rpmmd\"/><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"manual\"/><releasetarget project=\"openSUSE:Leap:15.5\" repository=\"ports\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";

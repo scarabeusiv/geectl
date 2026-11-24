@@ -1296,7 +1296,7 @@ pub(crate) fn unified_diff(old_path: &str, old: &str, new_path: &str, new: &str)
 /// The body must be a `<project>` document with a `name` attribute:
 /// either is missing and the parse is an error, never a meta with
 /// no name.
-pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
+pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
     let malformed = || {
         GeectlError::new(
             ErrorKind::ServerError,
@@ -1490,7 +1490,7 @@ pub(crate) fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError>
 /// The body must be a `<package>` document with `name` and `project`
 /// attributes: either is missing and the parse is an error, never a
 /// meta with no name.
-pub(crate) fn parse_package_meta(body: &str) -> Result<PackageMeta, GeectlError> {
+pub fn parse_package_meta(body: &str) -> Result<PackageMeta, GeectlError> {
     let malformed = || {
         GeectlError::new(
             ErrorKind::ServerError,

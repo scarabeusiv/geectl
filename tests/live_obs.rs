@@ -7282,6 +7282,146 @@ fn live_set_package_meta_writes_and_reads_back() {
     );
 }
 
+/// The whole-file project meta write reads back what the file
+/// held and clears a field the file omits, driven through the CLI.
+#[test]
+fn live_set_project_meta_from_file_writes_and_reads_back() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let user = live_username();
+    // Pre-seed a URL the file then omits: the whole-file write
+    // must clear it.
+    let mut seed = client
+        .project_meta(&project)
+        .expect("read the project meta on the live instance");
+    seed.url = Some("https://example.com/pre-seeded".to_string());
+    client
+        .set_project_meta(&project, &seed, &DryRun::new(false))
+        .expect("pre-seed the project URL on the live instance");
+    let dir = LiveTempDir::new();
+    let file = dir.0.join("meta.xml");
+    std::fs::write(
+        &file,
+        format!(
+            "<project name=\"{project}\">\
+             <title>geectl live test from file</title>\
+             <description>Written from a file by the geectl live test.</description>\
+             <person userid=\"{user}\" role=\"maintainer\"/>\
+             </project>"
+        ),
+    )
+    .expect("write the meta file");
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "remote",
+            "set-project-meta",
+            &project,
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let read_back = client
+        .project_meta(&project)
+        .expect("read the project meta back from the server");
+    assert_eq!(
+        read_back.title.as_deref(),
+        Some("geectl live test from file")
+    );
+    assert_eq!(
+        read_back.description.as_deref(),
+        Some("Written from a file by the geectl live test.")
+    );
+    // The file omits the URL, so the whole-file write clears the
+    // pre-seeded URL — unlike the field-wise write, which keeps the
+    // fields it does not touch. The read-back is empty either as
+    // an absent or an empty element, so only the emptiness is
+    // pinned, not the server's rendering of a cleared field.
+    assert!(
+        read_back.url.as_deref().unwrap_or_default().is_empty(),
+        "URL reads back as {:?}",
+        read_back.url
+    );
+}
+
+/// The whole-file package meta write reads back what the file
+/// held, driven through the CLI.
+#[test]
+fn live_set_package_meta_from_file_writes_and_reads_back() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let user = live_username();
+    let dir = LiveTempDir::new();
+    let file = dir.0.join("meta.xml");
+    std::fs::write(
+        &file,
+        format!(
+            "<package name=\"{package}\" project=\"{project}\">\
+             <title>geectl live test package from file</title>\
+             <url>https://example.com/live-pkg-file</url>\
+             <person userid=\"{user}\" role=\"maintainer\"/>\
+             </package>"
+        ),
+    )
+    .expect("write the meta file");
+    let out = live_geectl(&dir.0, &base)
+        .args([
+            "--live",
+            "remote",
+            "set-package-meta",
+            &project,
+            &package,
+            "--from-file",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let read_back = client
+        .package_meta(&project, &package)
+        .expect("read the package meta back from the server");
+    assert_eq!(
+        read_back.title.as_deref(),
+        Some("geectl live test package from file")
+    );
+    assert_eq!(
+        read_back.url.as_deref(),
+        Some("https://example.com/live-pkg-file")
+    );
+    // The file omits the description, so the whole-file write
+    // clears it — unlike the field-wise write, which keeps the
+    // fields it does not touch. The read-back is empty either as
+    // an absent or an empty element, so only the emptiness is
+    // pinned, not the server's rendering of a cleared field.
+    assert!(
+        read_back
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty(),
+        "description reads back as {:?}",
+        read_back.description
+    );
+}
+
 /// Granting and removing a project role round-trips through the
 /// live server.
 #[test]
