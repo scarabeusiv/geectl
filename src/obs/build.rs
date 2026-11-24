@@ -14,6 +14,7 @@ use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::xml::find_tag_end;
 use crate::xml::skip_xml_prolog;
+use crate::xml::xml_attr_blank;
 use crate::xml::xml_child_elements;
 use crate::xml::xml_elements;
 use crate::xml::xml_escape;
@@ -965,11 +966,11 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
     let mut skipped_paths = 0usize;
     for element in xml_elements(inner, "path")? {
         let (tag, _) = xml_split_element(element, "path");
-        let Some(project) = xml_attr_non_empty(tag, "project") else {
+        let Some(project) = xml_attr_non_blank(tag, "project") else {
             skipped_paths += 1;
             continue;
         };
-        let Some(repository) = xml_attr_non_empty(tag, "repository") else {
+        let Some(repository) = xml_attr_non_blank(tag, "repository") else {
             skipped_paths += 1;
             continue;
         };
@@ -1865,7 +1866,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
     let mut repositories = Vec::new();
     for element in xml_child_elements(inner, "repository")? {
         let (tag, content) = xml_split_element(element, "repository");
-        let name = xml_attr_non_empty(tag, "name").ok_or_else(|| {
+        let name = xml_attr_non_blank(tag, "name").ok_or_else(|| {
             GeectlError::new(
                 ErrorKind::ServerError,
                 "unexpected OBS project meta response: <repository> without name",
@@ -1882,7 +1883,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
         let mut paths = Vec::new();
         for path in xml_elements(content, "path")? {
             let (path_tag, _) = xml_split_element(path, "path");
-            let project = xml_attr_non_empty(path_tag, "project").ok_or_else(|| {
+            let project = xml_attr_non_blank(path_tag, "project").ok_or_else(|| {
                 GeectlError::new(
                     ErrorKind::ServerError,
                     "unexpected OBS project meta response: <path> without project",
@@ -1892,7 +1893,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
             // (project, repository) pair, so the response is
             // malformed, not a path to keep: the server always
             // names the repository a path builds against.
-            let repository = xml_attr_non_empty(path_tag, "repository").ok_or_else(|| {
+            let repository = xml_attr_non_blank(path_tag, "repository").ok_or_else(|| {
                 GeectlError::new(
                     ErrorKind::ServerError,
                     "unexpected OBS project meta response: <path> without repository",
@@ -1936,7 +1937,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
                     match xml_attr(master_tag, "url") {
                         Some(url) if !url.is_empty() => Ok(DownloadMaster {
                             url,
-                            sslfingerprint: xml_attr_non_empty(master_tag, "sslfingerprint"),
+                            sslfingerprint: xml_attr_non_blank(master_tag, "sslfingerprint"),
                         }),
                         Some(_) => Err(GeectlError::new(
                             ErrorKind::ServerError,
@@ -1952,9 +1953,9 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
                 .into_iter()
                 .next();
             downloads.push(RepositoryDownload {
-                arch: xml_attr_non_empty(download_tag, "arch"),
+                arch: xml_attr_non_blank(download_tag, "arch"),
                 url,
-                repotype: xml_attr_non_empty(download_tag, "repotype"),
+                repotype: xml_attr_non_blank(download_tag, "repotype"),
                 archfilter: single_element_text(
                     download_inner,
                     "archfilter",
@@ -1977,7 +1978,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
         let mut release_targets = Vec::new();
         for target in xml_elements(content, "releasetarget")? {
             let (target_tag, _) = xml_split_element(target, "releasetarget");
-            let project = xml_attr_non_empty(target_tag, "project").ok_or_else(|| {
+            let project = xml_attr_non_blank(target_tag, "project").ok_or_else(|| {
                 GeectlError::new(
                     ErrorKind::ServerError,
                     "unexpected OBS project meta response: <releasetarget> without project",
@@ -1985,7 +1986,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
             })?;
             // A release target without a repository is malformed:
             // the server requires both `project` and `repository`.
-            let repository = xml_attr_non_empty(target_tag, "repository").ok_or_else(|| {
+            let repository = xml_attr_non_blank(target_tag, "repository").ok_or_else(|| {
                 GeectlError::new(
                     ErrorKind::ServerError,
                     "unexpected OBS project meta response: <releasetarget> without repository",
@@ -1994,19 +1995,19 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
             release_targets.push(ReleaseTarget {
                 project,
                 repository: Some(repository),
-                trigger: xml_attr_non_empty(target_tag, "trigger"),
+                trigger: xml_attr_non_blank(target_tag, "trigger"),
             });
         }
         let mut hostsystem = Vec::new();
         for host_element in xml_elements(content, "hostsystem")? {
             let (host_tag, _) = xml_split_element(host_element, "hostsystem");
-            let project = xml_attr_non_empty(host_tag, "project").ok_or_else(|| {
+            let project = xml_attr_non_blank(host_tag, "project").ok_or_else(|| {
                 GeectlError::new(
                     ErrorKind::ServerError,
                     "unexpected OBS project meta response: <hostsystem> without project",
                 )
             })?;
-            let repository = xml_attr_non_empty(host_tag, "repository").ok_or_else(|| {
+            let repository = xml_attr_non_blank(host_tag, "repository").ok_or_else(|| {
                 GeectlError::new(
                     ErrorKind::ServerError,
                     "unexpected OBS project meta response: <hostsystem> without repository",
@@ -2018,9 +2019,9 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
             name,
             arch,
             paths,
-            rebuild: xml_attr_non_empty(tag, "rebuild"),
-            block: xml_attr_non_empty(tag, "block"),
-            linkedbuild: xml_attr_non_empty(tag, "linkedbuild"),
+            rebuild: xml_attr_non_blank(tag, "rebuild"),
+            block: xml_attr_non_blank(tag, "block"),
+            linkedbuild: xml_attr_non_blank(tag, "linkedbuild"),
             downloads,
             release_targets,
             hostsystem,
@@ -2629,21 +2630,26 @@ fn xml_attr_raw(element: &str, name: &str) -> Option<String> {
 
 /// The attribute value, or None when the attribute is absent. An
 /// empty value reads as present: only the repository parse collapses
-/// an empty value to absent (see [`xml_attr_non_empty`]).
+/// an empty or whitespace-only value to absent (see
+/// [`xml_attr_non_blank`]).
 pub(crate) fn xml_attr(element: &str, name: &str) -> Option<String> {
     xml_attr_raw(element, name)
 }
 
-/// The attribute value, or None when the attribute is absent or
-/// empty. Repository parsing only: the modeled Repository treats a
-/// blank flag or optional value as unset, and rendering drops empty
-/// values, so the parse must read them as absent to round-trip.
+/// The attribute value, or None when the attribute is absent, empty,
+/// or whitespace-only. Repository parsing only: the modeled
+/// Repository treats a blank flag or optional value as unset, and
+/// rendering drops empty values, so the parse must read them as
+/// absent to round-trip. The exception is `<releasetarget
+/// repository>`: it is required, so a blank value errors at parse
+/// rather than reading as unset. The blank rule is the shared
+/// one, see `crate::xml::xml_attr_blank`.
 /// Every other caller reads through [`xml_attr`], where an empty
 /// value stays present. A required repository attribute whose empty
 /// value fails closed reads through [`xml_attr`] too: the empty case
 /// errors, so no empty value can round-trip.
-fn xml_attr_non_empty(element: &str, name: &str) -> Option<String> {
-    xml_attr_raw(element, name).filter(|value| !value.is_empty())
+fn xml_attr_non_blank(element: &str, name: &str) -> Option<String> {
+    xml_attr_raw(element, name).filter(|value| !xml_attr_blank(value))
 }
 
 /// The text between `<name>` and `</name>` in `body` (first
@@ -3896,13 +3902,30 @@ mod tests {
     }
 
     #[test]
-    fn xml_attr_non_empty_reads_an_empty_value_as_absent() {
-        assert_eq!(xml_attr_non_empty("code=\"\"", "code"), None);
+    fn xml_attr_non_blank_reads_an_empty_value_as_absent() {
+        assert_eq!(xml_attr_non_blank("code=\"\"", "code"), None);
         assert_eq!(
-            xml_attr_non_empty("code=\"building\"", "code"),
+            xml_attr_non_blank("code=\"building\"", "code"),
             Some("building".to_string())
         );
-        assert_eq!(xml_attr_non_empty("code=\"failed\"", "state"), None);
+        assert_eq!(xml_attr_non_blank("code=\"failed\"", "state"), None);
+    }
+
+    #[test]
+    fn xml_attr_non_blank_reads_a_whitespace_only_value_as_absent() {
+        assert_eq!(xml_attr_non_blank("code=\" \"", "code"), None);
+        assert_eq!(xml_attr_non_blank("code=\"  \t \"", "code"), None);
+        // NBSP is whitespace for attribute values: it reads as
+        // absent too.
+        assert_eq!(xml_attr_non_blank("code=\"\u{a0}\"", "code"), None);
+        // Entity-encoded whitespace is whitespace once read.
+        assert_eq!(xml_attr_non_blank("code=\"&#32;\"", "code"), None);
+        assert_eq!(xml_attr_non_blank("code=\"&#160;\"", "code"), None);
+        // A value with real content keeps its surrounding spaces.
+        assert_eq!(
+            xml_attr_non_blank("code=\" building \"", "code"),
+            Some(" building ".to_string())
+        );
     }
 
     #[test]
@@ -6618,10 +6641,13 @@ mod tests {
     fn both_repository_parsers_reject_a_release_target_without_a_repository() {
         // A release target without a repository is malformed: the
         // server requires both `project` and `repository`, as the
-        // settings check already requires on a write.
+        // settings check already requires on a write. A
+        // whitespace-only repository is the same absence: it reads
+        // as unset, so the parse refuses it too.
         for body in [
             "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" trigger=\"manual\"/></repository></project>",
             "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"\" trigger=\"manual\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" repository=\" \" trigger=\"manual\"/></repository></project>",
         ] {
             let err = parse_repositories(body).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ServerError, "{body}");
@@ -6791,6 +6817,119 @@ mod tests {
             "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><path project=\"openSUSE:Factory\"/></repository></project>",
         ] {
             assert!(parse_repositories(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn parse_repositories_rejects_whitespace_only_attribute_values() {
+        // A whitespace-only name is no name: the server always names
+        // them, and the write refuses them, so neither parser may
+        // hold one.
+        for body in [
+            "<project name=\"p\"><repository name=\" \"><arch>x86_64</arch></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><path project=\" \" repository=\"standard\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\" \"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><hostsystem project=\" \" repository=\"standard\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><hostsystem project=\"openSUSE:Factory\" repository=\" \"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\" \" repository=\"standard\"/></repository></project>",
+            // Entity-encoded whitespace is whitespace once read.
+            "<project name=\"p\"><repository name=\"&#32;\"><arch>x86_64</arch></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><path project=\"&#32;\" repository=\"standard\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"&#160;\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><hostsystem project=\"openSUSE:Factory\" repository=\"&#xA0;\"/></repository></project>",
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"&#32;\"/></repository></project>",
+        ] {
+            assert!(parse_repositories(body).is_err(), "{body}");
+            assert!(parse_project_meta(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn parse_repositories_reads_whitespace_only_optional_values_as_absent() {
+        // A whitespace-only optional value is unset, like an empty
+        // one: the model holds None and the render drops it.
+        let body = "<project name=\"p\"><repository name=\"standard\" rebuild=\" \" block=\"\t\" linkedbuild=\" \"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"/><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\" \"/></repository></project>";
+        for parsed in [
+            parse_repositories(body).unwrap(),
+            parse_project_meta(body).unwrap().repositories,
+        ] {
+            let repo = &parsed[0];
+            assert_eq!(repo.rebuild, None);
+            assert_eq!(repo.block, None);
+            assert_eq!(repo.linkedbuild, None);
+            // The release target keeps a real repository here: a
+            // blank repository is refused at parse, not read as
+            // absent (see
+            // `both_repository_parsers_reject_a_release_target_without_a_repository`).
+            assert_eq!(
+                repo.release_targets[0].repository.as_deref(),
+                Some("standard")
+            );
+            assert_eq!(repo.release_targets[0].trigger, None);
+        }
+        // The same absent rule covers entity-encoded whitespace:
+        // `&#32;` is a space once read.
+        let entity_body = "<project name=\"p\"><repository name=\"standard\" rebuild=\"&#32;\" block=\"&#160;\" linkedbuild=\"&#x20;\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"/><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\" trigger=\"&#32;\"/></repository></project>";
+        for parsed in [
+            parse_repositories(entity_body).unwrap(),
+            parse_project_meta(entity_body).unwrap().repositories,
+        ] {
+            let repo = &parsed[0];
+            assert_eq!(repo.rebuild, None);
+            assert_eq!(repo.block, None);
+            assert_eq!(repo.linkedbuild, None);
+            assert_eq!(repo.release_targets[0].trigger, None);
+        }
+        // The same absent rule covers the remote parser's optional
+        // download attributes, which read through their own
+        // whitespace-aware filter.
+        let download_body = "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\" \" url=\"https://example.com\" repotype=\" \"/></repository></project>";
+        for parsed in [
+            parse_repositories(download_body).unwrap(),
+            parse_project_meta(download_body).unwrap().repositories,
+        ] {
+            assert_eq!(parsed[0].downloads[0].arch, None);
+            assert_eq!(parsed[0].downloads[0].repotype, None);
+        }
+        let entity_download_body = "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"&#32;\" url=\"https://example.com\" repotype=\"&#160;\"/></repository></project>";
+        for parsed in [
+            parse_repositories(entity_download_body).unwrap(),
+            parse_project_meta(entity_download_body)
+                .unwrap()
+                .repositories,
+        ] {
+            assert_eq!(parsed[0].downloads[0].arch, None);
+            assert_eq!(parsed[0].downloads[0].repotype, None);
+        }
+        // Master sslfingerprint reads through the same filter in both
+        // parsers.
+        let master_body = "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://master.example.com\" sslfingerprint=\" \"/></download></repository></project>";
+        for parsed in [
+            parse_repositories(master_body).unwrap(),
+            parse_project_meta(master_body).unwrap().repositories,
+        ] {
+            assert_eq!(
+                parsed[0].downloads[0]
+                    .master
+                    .as_ref()
+                    .unwrap()
+                    .sslfingerprint,
+                None
+            );
+        }
+        let entity_master_body = "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://master.example.com\" sslfingerprint=\"&#32;\"/></download></repository></project>";
+        for parsed in [
+            parse_repositories(entity_master_body).unwrap(),
+            parse_project_meta(entity_master_body).unwrap().repositories,
+        ] {
+            assert_eq!(
+                parsed[0].downloads[0]
+                    .master
+                    .as_ref()
+                    .unwrap()
+                    .sslfingerprint,
+                None
+            );
         }
     }
 

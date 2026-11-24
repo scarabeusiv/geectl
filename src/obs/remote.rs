@@ -60,6 +60,7 @@ use crate::xml::find_attr;
 use crate::xml::find_tag_end;
 use crate::xml::scan_tag;
 use crate::xml::skip_xml_prolog;
+use crate::xml::xml_attr_blank;
 use crate::xml::xml_elements;
 use crate::xml::xml_escape;
 use crate::xml::xml_unescape;
@@ -1420,8 +1421,10 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
                     ));
                 }
             };
-            // The optional download attributes read an empty value as
-            // absent, like `xml_attr_non_empty` in build.rs: the model
+            // The optional download attributes read an empty or
+            // whitespace-only value as absent, through the shared
+            // `crate::xml::xml_attr_blank` rule like
+            // `xml_attr_non_blank` in build.rs: the model
             // treats a blank optional value as unset and rendering
             // drops empty values, so the parse must read them as
             // absent to round-trip. Only the required `url` above
@@ -1433,7 +1436,7 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
             let opt_attr = |tag: &str, name: &str| {
                 quoted_attr_value(tag, name)
                     .map(|value| xml_unescape(&value))
-                    .filter(|value| !value.is_empty())
+                    .filter(|value| !xml_attr_blank(value))
             };
             // A second `<master>` is rejected, not read as the
             // first: a single-value child with two occurrences
@@ -8648,6 +8651,9 @@ mod tests {
         // Trailing garbage after the closing tag.
         assert!(parse_directory("<directory></directory> junk").is_err());
         // An entry without a name, or with a non-numeric size/mtime.
+        // A whitespace-only name is no name: the shared `tag_attr`
+        // rule reads it as absent, so the listing is malformed.
+        assert!(parse_directory("<directory><entry name=\" \"/></directory>").is_err());
         assert!(parse_directory("<directory><entry md5=\"abc\"/></directory>").is_err());
         assert!(
             parse_directory("<directory><entry name=\"x\" size=\"big\"/></directory>").is_err()
@@ -9884,6 +9890,19 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn project_meta_rejects_a_whitespace_only_project_name() {
+        assert!(parse_project_meta(
+            "<project name=\" \"><repository name=\"standard\"><arch>x86_64</arch></repository></project>"
+        )
+        .is_err());
+        // Entity-encoded whitespace is whitespace once read.
+        assert!(parse_project_meta(
+            "<project name=\"&#32;\"><repository name=\"standard\"><arch>x86_64</arch></repository></project>"
+        )
+        .is_err());
     }
 
     #[test]

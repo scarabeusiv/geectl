@@ -11,6 +11,7 @@ use crate::url::encode_path_segment;
 use crate::url::encode_query_value;
 use crate::url::UrlBuilder;
 use crate::xml::find_tag_end;
+use crate::xml::xml_attr_blank;
 use crate::xml::xml_unescape;
 
 /// The OBS API base (production).
@@ -764,7 +765,14 @@ pub(crate) fn parse_status_invoked(body: &str) -> bool {
 /// quote-aware: a `name=` inside an earlier attribute's value must
 /// not match, and a malformed occurrence (an unquoted value) is
 /// skipped, not fatal. Whitespace around `=` is allowed: `name =
-/// "value"` is the same attribute. An empty value reads as absent.
+/// "value"` is the same attribute. An empty or whitespace-only
+/// value reads as absent. Entity-encoded whitespace counts too:
+/// `&#32;` is a space once read, so it reads as absent as well.
+/// That is the rule for every caller —
+/// directory listings, request and status parsing, project meta —
+/// a whitespace-only value is absent everywhere this is read.
+/// The blank rule is the shared one, see
+/// `crate::xml::xml_attr_blank`.
 pub(crate) fn tag_attr(element: &str, name: &str) -> Option<String> {
     if name.is_empty() {
         return None;
@@ -807,7 +815,16 @@ pub(crate) fn tag_attr(element: &str, name: &str) -> Option<String> {
                     let after = &element[j + 1..];
                     let close = after.find(quote as char)?;
                     let value = &after[..close];
-                    if value.is_empty() {
+                    // The blank rule runs on the unescaped value:
+                    // `&#32;` is a space once read, so it is absent
+                    // like a literal one. The raw slice is still
+                    // what is returned: callers unescape it.
+                    let blank = if value.contains('&') {
+                        xml_attr_blank(&xml_unescape(value))
+                    } else {
+                        xml_attr_blank(value)
+                    };
+                    if blank {
                         return None;
                     }
                     return Some(value.to_string());
@@ -1448,6 +1465,36 @@ mod tests {
         assert_eq!(tag_attr("entry myname=\"foo\"", "name"), None);
         assert_eq!(tag_attr("entry name=\"\"", "name"), None);
         assert_eq!(tag_attr("entry", "name"), None);
+    }
+
+    #[test]
+    fn tag_attr_reads_a_whitespace_only_value_as_absent() {
+        // A value of only whitespace carries no name, code, or hash:
+        // it reads as absent, like an empty value.
+        assert_eq!(tag_attr("entry name=\" \"", "name"), None);
+        assert_eq!(tag_attr("entry name=\"  \t \"", "name"), None);
+        assert_eq!(tag_attr("entry name=' '", "name"), None);
+        // NBSP is whitespace for attribute values: it reads as
+        // absent too.
+        assert_eq!(tag_attr("entry name=\"\u{a0}\"", "name"), None);
+        // Entity-encoded whitespace is whitespace once read:
+        // `&#32;` and `&#160;` are absent too.
+        assert_eq!(tag_attr("entry name=\"&#32;\"", "name"), None);
+        assert_eq!(tag_attr("entry name=\"&#x20;\"", "name"), None);
+        assert_eq!(tag_attr("entry name=\"&#160;\"", "name"), None);
+        assert_eq!(tag_attr("entry name=\"&#xA0;\"", "name"), None);
+        // A value with real content keeps its surrounding spaces:
+        // only an all-whitespace value is absent, nothing is trimmed.
+        assert_eq!(
+            tag_attr("entry name=\" foo \"", "name").as_deref(),
+            Some(" foo ")
+        );
+        // A value with real content keeps its raw form: callers
+        // unescape it, so `&#32;` before `foo` stays encoded here.
+        assert_eq!(
+            tag_attr("entry name=\"&#32;foo\"", "name").as_deref(),
+            Some("&#32;foo")
+        );
     }
 
     #[test]

@@ -211,6 +211,25 @@ pub(crate) fn find_attr(tag: &str, name: &str) -> Option<String> {
     None
 }
 
+/// XML whitespace, one definition per domain. The two domains
+/// disagree on NBSP (U+00A0) and the split is the rule, stated
+/// once here — no other helper defines XML whitespace.
+///
+/// - Attribute values: Unicode whitespace (`str::trim`). A value
+///   of only Unicode whitespace carries nothing, so it reads as
+///   absent, like an empty value. NBSP is whitespace here.
+/// - Element content: the four XML whitespace characters (space,
+///   tab, CR, LF). Anything else between children — including
+///   NBSP — is character data, not formatting, so a stray-text
+///   check sees it.
+///
+/// The attribute side is the rule for the `tag_attr`,
+/// `xml_attr_non_blank`, and remote-parser optional-attribute
+/// reads; the content side is the stray-text rule.
+pub(crate) fn xml_attr_blank(value: &str) -> bool {
+    value.trim().is_empty()
+}
+
 /// Unescape XML text or an attribute value: the five entities
 /// [`xml_escape`] produces, plus numeric character references
 /// (`&#65;`, `&#x41;`). Anything else is left verbatim: an unknown
@@ -1546,6 +1565,18 @@ mod tests {
     fn parse_skips_a_prolog() {
         let doc = XmlDoc::parse("<?xml version=\"1.0\"?><package name=\"p\"/>").unwrap();
         assert_eq!(doc.render(), "<package name=\"p\"/>");
+    }
+
+    #[test]
+    fn xml_attr_blank_reads_unicode_whitespace_only_values_as_blank() {
+        // Space, tab, and NBSP are all attribute whitespace: a
+        // value of only those carries nothing and reads as absent.
+        assert!(xml_attr_blank(" "));
+        assert!(xml_attr_blank("  \t "));
+        assert!(xml_attr_blank("\u{a0}"));
+        // A value with real content keeps its surrounding spaces:
+        // only an all-whitespace value is blank, nothing is trimmed.
+        assert!(!xml_attr_blank(" foo "));
     }
 
     #[test]
