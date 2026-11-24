@@ -4354,10 +4354,19 @@ impl<'a> LocalBuild<'a> {
         out
     }
 
+    /// Read a marker file and trust it only when it belongs to the
+    /// root it sits in (see `marker_belongs_to_root`). Missing,
+    /// unreadable, unparsable or planted markers read as `None`.
+    fn trusted_root_marker(&self, marker_path: &Path) -> Option<RootMarker> {
+        trusted_marker_at(&self.cache_dir.join("build-roots"), marker_path)
+    }
+
     /// Every build root's marker, parsed: the basis for the
     /// last-success digests and the most-recent-build digest. A
-    /// marker that does not parse is skipped — its root's key and
-    /// times are unknown, so eviction cannot reason about it.
+    /// marker is trusted only when it belongs to the root it sits
+    /// in (see `marker_belongs_to_root`): a planted marker file
+    /// anywhere else under the tree is ignored, so it cannot
+    /// protect a digest or claim a locked root.
     fn root_markers(&self) -> Vec<RootMarker> {
         let roots = self.cache_dir.join("build-roots");
         let mut markers: Vec<RootMarker> = Vec::new();
@@ -4373,10 +4382,8 @@ impl<'a> LocalBuild<'a> {
                     continue;
                 }
                 if path.file_name().is_some_and(|n| n == ROOT_MARKER) {
-                    if let Ok(text) = fs::read_to_string(&path) {
-                        if let Ok(marker) = serde_json::from_str::<RootMarker>(&text) {
-                            markers.push(marker);
-                        }
+                    if let Some(marker) = self.trusted_root_marker(&path) {
+                        markers.push(marker);
                     }
                 }
             }
@@ -4398,7 +4405,10 @@ impl<'a> LocalBuild<'a> {
     /// The pairs are the encoded directory forms (see
     /// `encode_path_segment`), matching what
     /// `store_project_package` reads from a store path — the marker
-    /// keeps the real names, so the marker side encodes here.
+    /// keeps the real names, so the marker side encodes here. Only
+    /// a marker that belongs to its root (see
+    /// `marker_belongs_to_root`) can claim a lock: a planted marker
+    /// in a locked directory attributes the lock to nobody.
     fn locked_root_keys(&self) -> std::collections::HashSet<(String, String)> {
         let mut locked = std::collections::HashSet::new();
         let roots = self.cache_dir.join("build-roots");
@@ -4414,10 +4424,7 @@ impl<'a> LocalBuild<'a> {
                     continue;
                 }
                 if path.file_name().is_some_and(|n| n == ROOT_MARKER) {
-                    let Ok(text) = fs::read_to_string(&path) else {
-                        continue;
-                    };
-                    let Ok(marker) = serde_json::from_str::<RootMarker>(&text) else {
+                    let Some(marker) = self.trusted_root_marker(&path) else {
                         continue;
                     };
                     let Some(root) = path.parent() else {
@@ -4585,8 +4592,8 @@ impl<'a> LocalBuild<'a> {
         // itself stays per 5-tuple, so that repo's next build
         // recreates its root rather than reusing the newest one.
         if remaining > report.low_water_bytes {
-            let mut roots =
-                collect_root_entries(&self.cache_dir.join("build-roots"), now, &mut protected);
+            let roots_base = self.cache_dir.join("build-roots");
+            let mut roots = collect_root_entries(&roots_base, &roots_base, now, &mut protected);
             // The most recent root per (project, package) is
             // protected, whatever its last build's outcome: a failed
             // root is still the root the next build reuses.
@@ -5221,7 +5228,9 @@ impl<'a> LocalBuild<'a> {
     /// be present and parse (never wipe an unknown directory) and
     /// the root must not be locked by another build. The package
     /// for the lock's holder line comes from the root's own marker
-    /// when it parses, else the root's own file name. A root with
+    /// when it belongs to the root (see `marker_belongs_to_root`),
+    /// else the root's own file name: a planted marker never names
+    /// the holder. A root with
     /// no file name (`/`) is refused outright.
     pub fn wipe_named_root(&self, root: &Path, dry_run: bool) -> Result<WipeOutcome, GeectlError> {
         let root = std::path::absolute(root).map_err(|e| {
@@ -5230,9 +5239,8 @@ impl<'a> LocalBuild<'a> {
                 format!("cannot resolve build root {}: {e}", root.display()),
             )
         })?;
-        let holder = fs::read_to_string(root.join(ROOT_MARKER))
-            .ok()
-            .and_then(|text| serde_json::from_str::<RootMarker>(&text).ok())
+        let holder = self
+            .trusted_root_marker(&root.join(ROOT_MARKER))
             .map(|marker| marker.package)
             .or_else(|| root.file_name().map(|n| n.to_string_lossy().to_string()))
             .ok_or_else(|| {
@@ -6583,8 +6591,9 @@ fn collect_sccache_stores(
 }
 
 /// A build root as an eviction candidate: path, last-build time,
-/// and the project/package it belongs to (from the marker, not the
-/// path — the path layout is an implementation detail). The
+/// and the project/package it belongs to (from the marker, which
+/// `marker_belongs_to_root` checked against the path, so the two
+/// agree). The
 /// repo/arch/flavor are not carried: the most-recent protection
 /// groups by (project, package), so they are not read. Whether the
 /// last build succeeded is not carried: the most-recent protection
@@ -6712,15 +6721,85 @@ fn collect_pkg_files(
     }
 }
 
+/// Whether a marker file belongs to the build root it sits in: the
+/// marker must be a regular file directly inside a
+/// `build-roots/<project>/<package>/<repo>-<arch>[-<flavor>]/`
+/// directory, and the directory must name the key the marker
+/// records. The directory spelling is the current percent-encoded
+/// one, or the legacy raw one for roots written before the encoding
+/// — a marker that matches neither spelling is planted and is
+/// ignored everywhere markers are trusted. A symlinked marker is
+/// never trusted: it would vouch for a directory with another
+/// root's identity.
+/// The location check is lexical, not canonicalized: a symlinked
+/// intermediate component can make the walked path spell a key the
+/// physical directory does not belong to. A marker at the canonical
+/// location of a never-built key is trusted by construction.
+fn marker_belongs_to_root(roots_base: &Path, marker_path: &Path, marker: &RootMarker) -> bool {
+    match fs::symlink_metadata(marker_path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        _ => return false,
+    }
+    let Some(root) = marker_path.parent() else {
+        return false;
+    };
+    let Ok(rel) = root.strip_prefix(roots_base) else {
+        return false;
+    };
+    let mut parts = rel.components();
+    let (Some(project), Some(package), Some(root_name)) = (
+        parts.next().and_then(|c| c.as_os_str().to_str()),
+        parts.next().and_then(|c| c.as_os_str().to_str()),
+        parts.next().and_then(|c| c.as_os_str().to_str()),
+    ) else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    // Current spelling: percent-encoded segments.
+    if project == LocalBuild::encode_path_segment(&marker.project)
+        && package == LocalBuild::encode_path_segment(&marker.package)
+        && root_name == LocalBuild::root_name(&marker.repo, &marker.arch, &marker.flavor)
+    {
+        return true;
+    }
+    // Legacy spelling: raw segments, for roots written before the
+    // encoding.
+    let mut legacy = format!("{}-{}", marker.repo, marker.arch);
+    if let Some(flavor) = &marker.flavor {
+        legacy.push('-');
+        legacy.push_str(flavor);
+    }
+    project == marker.project && package == marker.package && root_name == legacy
+}
+
+/// Read a marker file and trust it only when it belongs to the root
+/// it sits in (see `marker_belongs_to_root`). Missing, unreadable,
+/// unparsable or planted markers read as `None`.
+fn trusted_marker_at(roots_base: &Path, marker_path: &Path) -> Option<RootMarker> {
+    let text = fs::read_to_string(marker_path).ok()?;
+    let marker = serde_json::from_str::<RootMarker>(&text).ok()?;
+    marker_belongs_to_root(roots_base, marker_path, &marker).then_some(marker)
+}
+
 /// Collect build roots under `dir` (project/package/repo-arch
 /// layout) as eviction candidates. A locked root (another build
 /// holds it) and anything in the 24h grace period never evict; their
 /// sizes are added to `skipped` (protected bytes). A root whose
-/// marker does not parse is not a candidate at all: its key and
-/// times are unknown, so eviction cannot reason about it (it is
-/// still a geectl root for `build-wipe`). The most-recent
+/// marker does not parse, or does not belong to the root it sits in
+/// (see `marker_belongs_to_root`), is not a candidate at all: its
+/// key and times are unknown, so eviction cannot reason about it
+/// (it is still a geectl root for `build-wipe`). A planted marker
+/// is ignored, so the directory is walked like a marker-less one —
+/// a real root nested below is still found. The most-recent
 /// protection is applied by the caller, which sees the whole set.
-fn collect_root_entries(dir: &Path, now: u64, skipped: &mut u64) -> Vec<RootEntry> {
+fn collect_root_entries(
+    roots_base: &Path,
+    dir: &Path,
+    now: u64,
+    skipped: &mut u64,
+) -> Vec<RootEntry> {
     let mut out: Vec<RootEntry> = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
         return out;
@@ -6732,18 +6811,17 @@ fn collect_root_entries(dir: &Path, now: u64, skipped: &mut u64) -> Vec<RootEntr
         }
         let marker_path = path.join(ROOT_MARKER);
         if marker_path.exists() {
+            let Some(marker) = trusted_marker_at(roots_base, &marker_path) else {
+                // Unparsable or planted marker: not a candidate —
+                // walk on as if the directory carried no marker.
+                out.extend(collect_root_entries(roots_base, &path, now, skipped));
+                continue;
+            };
             // A locked root is in use: never evict it.
             if root_lock_held(&path) {
                 *skipped += dir_size(&path);
                 continue;
             }
-            let Some(marker) = fs::read_to_string(&marker_path)
-                .ok()
-                .and_then(|text| serde_json::from_str::<RootMarker>(&text).ok())
-            else {
-                // Unparsable marker: not a candidate (see above).
-                continue;
-            };
             if now.saturating_sub(marker.last_build_unix) < GRACE_PERIOD_SECS {
                 *skipped += dir_size(&path);
                 continue;
@@ -6755,7 +6833,7 @@ fn collect_root_entries(dir: &Path, now: u64, skipped: &mut u64) -> Vec<RootEntr
                 package: marker.package,
             });
         } else {
-            out.extend(collect_root_entries(&path, now, skipped));
+            out.extend(collect_root_entries(roots_base, &path, now, skipped));
         }
     }
     out
@@ -9224,6 +9302,37 @@ fi
                 )
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::NotAGeectlBuildRoot);
+        }
+
+        #[test]
+        fn wipe_named_root_ignores_a_planted_marker_for_the_holder() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root, _) = wipe_fixture(&dir);
+            // A marker for another package planted in this root:
+            // it parses, so the wipe proceeds, but it does not
+            // belong to the root, so it must not name the holder.
+            // The holder falls back to the root's own file name.
+            let mut marker = valid_marker();
+            marker.package = "bar".to_string();
+            fs::write(
+                root.join(ROOT_MARKER),
+                serde_json::to_string(&marker).unwrap(),
+            )
+            .unwrap();
+            let outcome = vertical.wipe_named_root(&root, false).unwrap();
+            assert!(outcome.existed);
+            assert!(!root.join("stale-output").exists());
+            let holder = fs::read_to_string(root.join(ROOT_LOCK)).unwrap();
+            assert!(!holder.contains("package=bar"), "holder: {holder}");
+            assert!(
+                holder.contains(&format!("package=standard-{}", host_arch())),
+                "holder: {holder}"
+            );
         }
 
         #[test]
@@ -12437,6 +12546,263 @@ exit 0
                 .unwrap();
             assert!(colon_root.is_dir());
             assert!(!colon_root.join(ROOT_MARKER).exists());
+        }
+
+        #[test]
+        fn root_markers_ignores_planted_markers() {
+            // A marker is trusted only when it belongs to the root it
+            // sits in: the directory must name the key the marker
+            // records. A planted marker anywhere else under the tree
+            // — the wrong depth, nested inside a real root, a
+            // mismatched key, a symlink borrowing another root's
+            // identity, or a symlink to an identical marker
+            // elsewhere claiming the same key — is ignored, so it
+            // cannot protect a digest
+            // or claim a locked root. A root written before the
+            // encoding keeps its raw `:` directory, and its marker
+            // is still trusted.
+            use std::os::unix::fs::symlink;
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let now = now_unix();
+            let no_flavor: Option<String> = None;
+            let marker = |project: &str,
+                          package: &str,
+                          repo: &str,
+                          last_build: u64,
+                          digest: &str|
+             -> RootMarker {
+                RootMarker {
+                    project: project.to_string(),
+                    package: package.to_string(),
+                    repo: repo.to_string(),
+                    arch: host_arch().to_string(),
+                    flavor: None,
+                    image_digest: Some(digest.to_string()),
+                    engine_version: None,
+                    created_unix: last_build,
+                    last_build_unix: last_build,
+                    last_success_digest: Some(format!("{digest}-success")),
+                }
+            };
+            let write_marker = |root: &Path, marker: &RootMarker| {
+                fs::create_dir_all(root).unwrap();
+                fs::write(
+                    root.join(ROOT_MARKER),
+                    serde_json::to_string(marker).unwrap(),
+                )
+                .unwrap();
+            };
+            // The real root: the most recent build before the
+            // plants.
+            let real_root =
+                vertical.root_path("testproject", "foo", "standard", host_arch(), &no_flavor);
+            write_marker(
+                &real_root,
+                &marker("testproject", "foo", "standard", now - 3600, "sha256:real"),
+            );
+            // A legacy root: raw `:` in the directory, written
+            // before the encoding — still trusted.
+            let legacy_root = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("home:foo")
+                .join("foo")
+                .join(format!("standard-{}", host_arch()));
+            write_marker(
+                &legacy_root,
+                &marker("home:foo", "foo", "standard", now - 7200, "sha256:legacy"),
+            );
+            // Plants, each newer than the real build, so an
+            // unguarded walk would let them win the most-recent
+            // digest.
+            // Wrong depth: directly under the tree.
+            write_marker(
+                &dir.path().join("cache").join("build-roots").join("planted"),
+                &marker(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    now,
+                    "sha256:planted-depth",
+                ),
+            );
+            // Nested inside the real root.
+            write_marker(
+                &real_root.join("nested"),
+                &marker(
+                    "testproject",
+                    "foo",
+                    "standard",
+                    now,
+                    "sha256:planted-nested",
+                ),
+            );
+            // Mismatched key: the directory names another repo.
+            write_marker(
+                &vertical.root_path("testproject", "foo", "other-repo", host_arch(), &no_flavor),
+                &marker("testproject", "foo", "standard", now, "sha256:planted-key"),
+            );
+            // A symlink borrowing the real root's marker.
+            let link_root =
+                vertical.root_path("testproject", "bar", "standard", host_arch(), &no_flavor);
+            fs::create_dir_all(&link_root).unwrap();
+            symlink(real_root.join(ROOT_MARKER), link_root.join(ROOT_MARKER)).unwrap();
+            // A symlink to an identical marker elsewhere, claiming
+            // the same key its directory names: only the symlink
+            // differs, so only the symlink check rejects it.
+            let twin_root =
+                vertical.root_path("testproject", "baz", "standard", host_arch(), &no_flavor);
+            fs::create_dir_all(&twin_root).unwrap();
+            let twin_target = dir.path().join("twin-marker");
+            fs::write(
+                &twin_target,
+                serde_json::to_string(&marker(
+                    "testproject",
+                    "baz",
+                    "standard",
+                    now,
+                    "sha256:planted-symlink",
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            symlink(&twin_target, twin_root.join(ROOT_MARKER)).unwrap();
+
+            let markers = vertical.root_markers();
+            assert_eq!(markers.len(), 2, "markers: {markers:?}");
+            assert!(
+                markers
+                    .iter()
+                    .any(|m| m.image_digest.as_deref() == Some("sha256:real")),
+                "markers: {markers:?}"
+            );
+            assert!(
+                markers
+                    .iter()
+                    .any(|m| m.image_digest.as_deref() == Some("sha256:legacy")),
+                "markers: {markers:?}"
+            );
+            assert_eq!(
+                vertical.most_recent_build_digest().as_deref(),
+                Some("sha256:real")
+            );
+            let mut digests = vertical.last_success_digests();
+            digests.sort();
+            assert_eq!(
+                digests,
+                vec![
+                    "sha256:legacy-success".to_string(),
+                    "sha256:real-success".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn locked_root_keys_ignores_a_planted_marker() {
+            // A planted marker in a directory whose lock is held
+            // must not attribute the lock to the package it claims:
+            // only a marker that belongs to its root can claim a
+            // lock.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let no_flavor: Option<String> = None;
+            let marker = |project: &str, package: &str| RootMarker {
+                project: project.to_string(),
+                package: package.to_string(),
+                repo: "standard".to_string(),
+                arch: host_arch().to_string(),
+                flavor: None,
+                image_digest: None,
+                engine_version: None,
+                created_unix: 0,
+                last_build_unix: 0,
+                last_success_digest: None,
+            };
+            let real_root =
+                vertical.root_path("testproject", "foo", "standard", host_arch(), &no_flavor);
+            fs::create_dir_all(&real_root).unwrap();
+            fs::write(
+                real_root.join(ROOT_MARKER),
+                serde_json::to_string(&marker("testproject", "foo")).unwrap(),
+            )
+            .unwrap();
+            let _lock = vertical.acquire_root_lock(&real_root, "foo").unwrap();
+            // A fake locked directory with a planted marker
+            // claiming another package.
+            let fake_root = vertical.root_path("evil", "evil", "standard", host_arch(), &no_flavor);
+            fs::create_dir_all(&fake_root).unwrap();
+            fs::write(
+                fake_root.join(ROOT_MARKER),
+                serde_json::to_string(&marker("testproject", "bar")).unwrap(),
+            )
+            .unwrap();
+            let fake_lock = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(fake_root.join(ROOT_LOCK))
+                .unwrap();
+            fake_lock.try_lock_exclusive().unwrap();
+            let keys = vertical.locked_root_keys();
+            assert!(keys.contains(&("testproject".to_string(), "foo".to_string())));
+            assert!(!keys.contains(&("testproject".to_string(), "bar".to_string())));
+            assert!(!keys.contains(&("evil".to_string(), "evil".to_string())));
+        }
+
+        #[test]
+        fn prune_ignores_a_planted_marker() {
+            // A planted marker must not make its directory an
+            // eviction candidate: it is neither protected as a root
+            // nor deleted as one — the plan reports the shortfall
+            // instead of protecting the planted bytes.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), false);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical =
+                vertical(&client, dir.path(), engine, podman).with_cache_cap_bytes(1024 * 1024);
+            let now = now_unix();
+            let fake = dir.path().join("cache").join("build-roots").join("planted");
+            fs::create_dir_all(&fake).unwrap();
+            fs::write(fake.join("blob"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+            let marker = RootMarker {
+                project: "testproject".to_string(),
+                package: "foo".to_string(),
+                repo: "standard".to_string(),
+                arch: host_arch().to_string(),
+                flavor: None,
+                image_digest: None,
+                engine_version: None,
+                created_unix: now - 3 * 86400,
+                last_build_unix: now - 3 * 86400,
+                last_success_digest: None,
+            };
+            fs::write(
+                fake.join(ROOT_MARKER),
+                serde_json::to_string(&marker).unwrap(),
+            )
+            .unwrap();
+
+            let plan = vertical.prune_plan().unwrap();
+            assert!(plan.ran);
+            assert!(plan.evicted.is_empty(), "plan: {plan:?}");
+            assert_eq!(plan.protected_bytes, 0, "plan: {plan:?}");
+            assert!(plan.shortfall_bytes > 0, "plan: {plan:?}");
+            let report = vertical.prune_apply().unwrap();
+            assert!(report.evicted.is_empty(), "report: {report:?}");
+            assert!(fake.exists());
         }
 
         #[test]
