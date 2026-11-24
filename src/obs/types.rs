@@ -3,6 +3,7 @@ use super::tag_attr;
 use crate::debug::Debug;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
+use clap::ValueEnum;
 use std::cell::RefCell;
 
 /// A CVE identifier, e.g. `CVE-2026-12345`. Stored in canonical
@@ -896,6 +897,96 @@ pub struct ReleaseOptions {
     /// Run the release immediately instead of queueing it as a job.
     /// The server's `nodelay`.
     pub no_delay: bool,
+}
+
+/// The operation a trigger token authorises: the server's
+/// `operation` on `POST /person/<login>/token`. The API accepts
+/// only these four; any other operation is refused by the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TokenOperation {
+    /// Run source services: the `runservice` trigger.
+    Runservice,
+    /// Rebuild packages: the `rebuild` trigger.
+    Rebuild,
+    /// Release packages: the `release` trigger.
+    Release,
+    /// Run SCM/CI workflows: the `workflow` trigger.
+    Workflow,
+}
+
+impl Default for TokenOperation {
+    /// The default exists only so `CreateTokenOptions` can derive
+    /// `Default` for struct-update syntax; `create_token` always
+    /// sends an operation, so the server's default for a missing
+    /// operation is never exercised.
+    fn default() -> Self {
+        TokenOperation::Runservice
+    }
+}
+
+impl TokenOperation {
+    /// The wire spelling: the server's `operation` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenOperation::Runservice => "runservice",
+            TokenOperation::Rebuild => "rebuild",
+            TokenOperation::Release => "release",
+            TokenOperation::Workflow => "workflow",
+        }
+    }
+}
+
+/// Options for [`ObsClient::create_token`]. The project and the
+/// package go together: both scope the token to a package, neither
+/// leaves it global.
+#[derive(Debug, Clone, Default)]
+pub struct CreateTokenOptions {
+    /// The operation the token authorises. The server's
+    /// `operation`.
+    pub operation: TokenOperation,
+    /// The project of the package the token is scoped to. The
+    /// server's `project`; sent only with a package.
+    pub project: Option<String>,
+    /// The package the token is scoped to. The server's `package`.
+    pub package: Option<String>,
+    /// A description identifying the token, at most 64 characters.
+    /// The server's `description`.
+    pub description: Option<String>,
+}
+
+/// A token just created by [`ObsClient::create_token`]: the id and
+/// the secret, which the server returns once, at creation — it is
+/// never shown again.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CreatedToken {
+    /// The token's id, for listing and deleting it.
+    pub id: u64,
+    /// The token secret. Shown once, at creation.
+    pub token: String,
+    /// The operation the token authorises.
+    pub operation: TokenOperation,
+    /// The project of the package the token is scoped to, if any.
+    pub project: Option<String>,
+    /// The package the token is scoped to, if any.
+    pub package: Option<String>,
+    /// The description identifying the token, if any.
+    pub description: Option<String>,
+}
+
+impl std::fmt::Debug for CreatedToken {
+    /// The secret is never shown in debug output: it is printed
+    /// once, at creation, and a `{created:?}` anywhere else must
+    /// not leak it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedToken")
+            .field("id", &self.id)
+            .field("token", &"[redacted]")
+            .field("operation", &self.operation)
+            .field("project", &self.project)
+            .field("package", &self.package)
+            .field("description", &self.description)
+            .finish()
+    }
 }
 
 /// Options for [`ObsClient::create_package_with_options`]. All

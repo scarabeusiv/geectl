@@ -1,3 +1,5 @@
+use super::build::xml_attr;
+use super::build::xml_split_element;
 use super::build_link_meta;
 use super::build_url;
 use super::element_text;
@@ -18,6 +20,8 @@ use super::CommitFileEntry;
 use super::CommitFilelistOptions;
 use super::CommitFilelistResponse;
 use super::CreatePackageOptions;
+use super::CreateTokenOptions;
+use super::CreatedToken;
 use super::DeletePackageOptions;
 use super::DeleteProjectOptions;
 use super::DirectoryListing;
@@ -55,6 +59,7 @@ use crate::xml::find_attr;
 use crate::xml::find_tag_end;
 use crate::xml::scan_tag;
 use crate::xml::skip_xml_prolog;
+use crate::xml::xml_elements;
 use crate::xml::xml_escape;
 use crate::xml::xml_unescape;
 use crate::xml::XmlDoc;
@@ -257,6 +262,57 @@ fn create_package_option_suffix(options: &CreatePackageOptions) -> String {
         String::new()
     } else {
         format!(" ({})", parts.join(", "))
+    }
+}
+
+/// The dry-run plan line for a token creation: the operation,
+/// the scoped package when there is one, and the description when
+/// there is one, so a dry-run plan reads what the creation would
+/// have done.
+fn create_token_plan(options: &CreateTokenOptions) -> String {
+    let mut plan = format!("create {} token", options.operation.as_str());
+    if let (Some(project), Some(package)) = (&options.project, &options.package) {
+        plan.push_str(&format!(" for package {project}/{package}"));
+    }
+    if let Some(description) = options.description.as_deref().filter(|d| !d.is_empty()) {
+        plan.push_str(&format!(" (description: {description})"));
+    }
+    plan
+}
+
+/// The id and secret of a token just created: the `<data
+/// name="token">` and `<data name="id">` entries of the server's
+/// `<status code="ok">` body. Any other body — a non-ok status, a
+/// missing entry, a non-numeric id — is a server error, never a
+/// partial token.
+fn parse_created_token(body: &str) -> Result<(u64, String), GeectlError> {
+    let unexpected = || {
+        GeectlError::new(
+            ErrorKind::ServerError,
+            "unexpected OBS create-token response".to_string(),
+        )
+    };
+    if !parse_status_ok(body) {
+        return Err(unexpected());
+    }
+    let mut id = None;
+    let mut token = None;
+    for element in xml_elements(body, "data")? {
+        let (tag, content) = xml_split_element(element, "data");
+        match xml_attr(tag, "name").as_deref() {
+            Some("id") => id = content.parse::<u64>().ok(),
+            Some("token") => {
+                let value = xml_unescape(content);
+                if !value.is_empty() {
+                    token = Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    match (id, token) {
+        (Some(id), Some(token)) => Ok((id, token)),
+        _ => Err(unexpected()),
     }
 }
 
@@ -4546,6 +4602,94 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// Create an operation-scoped trigger token for the
+    /// authenticated user (`POST /person/<login>/token`), and return
+    /// the id and the secret it was created with. The secret is
+    /// returned once, at creation: the server never shows it again.
+    /// Requires Basic credentials: an API token carries no username,
+    /// and the token belongs to a login, so a Bearer <redacted> fails
+    /// closed before any request. In dry-run the creation is recorded
+    /// in the plan and nothing is created — the guard runs before the
+    /// credentials check, like `create_package`.
+    ///
+    /// The project and the package go together: both scope the token
+    /// to a package, neither leaves it global. A package without a
+    /// project is refused, and a project without a package is refused
+    /// too: the server would silently drop a lone project and create
+    /// a global token. The description is at most 64 characters,
+    /// like the server's validation.
+    pub fn create_token(
+        &self,
+        options: &CreateTokenOptions,
+        dry_run: &DryRun,
+    ) -> Result<Option<CreatedToken>, GeectlError> {
+        for (label, value) in [
+            ("project", options.project.as_deref()),
+            ("package", options.package.as_deref()),
+        ] {
+            if let Some(value) = value {
+                if !valid_obs_name(value) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid OBS {label} name: {value:?}"),
+                    ));
+                }
+            }
+        }
+        if options.project.is_some() != options.package.is_some() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "a token is scoped to a package or global: project and package go together",
+            ));
+        }
+        let description = options.description.as_deref().filter(|d| !d.is_empty());
+        if let Some(description) = description {
+            if description.chars().count() > 64 {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("token description is at most 64 characters: {description:?}"),
+                ));
+            }
+        }
+        if !dry_run.allow(&create_token_plan(options)) {
+            return Ok(None);
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "cannot create a token without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let Some(login) = self.credentials.username() else {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "creating a token requires an OBS username — an API token carries no username (unset the OBS API key first, then set GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        };
+        let mut query: Vec<(&str, &str)> =
+            vec![("cmd", "create"), ("operation", options.operation.as_str())];
+        if let Some(project) = &options.project {
+            query.push(("project", project));
+        }
+        if let Some(package) = &options.package {
+            query.push(("package", package));
+        }
+        if let Some(description) = description {
+            query.push(("description", description));
+        }
+        let url = build_url(&self.base, &["person", login, "token"], &query);
+        let body = self.http.post(&url, "", &self.credentials)?;
+        let (id, token) = parse_created_token(&body)?;
+        Ok(Some(CreatedToken {
+            id,
+            token,
+            operation: options.operation,
+            project: options.project.clone(),
+            package: options.package.clone(),
+            description: description.map(str::to_string),
+        }))
+    }
+
     /// Create package `package` in project `project` on OBS (`PUT
     /// /source/<project>/<package>/_meta`) with the given title and
     /// description, optionally wiring it to a git repository through
@@ -4657,6 +4801,7 @@ mod tests {
     use crate::debug::Debug;
     use crate::error::ErrorKind;
     use crate::obs::test_support::{basic_credentials, search_without_states, FakeHttp};
+    use crate::obs::TokenOperation;
 
     #[test]
     fn devel_project_extracted() {
@@ -6300,6 +6445,364 @@ mod tests {
             )
             .is_err());
         assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_token_posts_scoped_rebuild_and_returns_id_and_secret() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=rebuild&project=test%3Afactory&package=test-pkgA&description=nightly%20rebuild",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"token\">s3cr3t-token</data><data name=\"id\">1</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CreateTokenOptions {
+            operation: TokenOperation::Rebuild,
+            project: Some("test:factory".to_string()),
+            package: Some("test-pkgA".to_string()),
+            description: Some("nightly rebuild".to_string()),
+        };
+        let created = client.create_token(&options, &DryRun::new(false)).unwrap();
+        assert_eq!(
+            created,
+            Some(CreatedToken {
+                id: 1,
+                token: "s3cr3t-token".to_string(),
+                operation: TokenOperation::Rebuild,
+                project: Some("test:factory".to_string()),
+                package: Some("test-pkgA".to_string()),
+                description: Some("nightly rebuild".to_string()),
+            })
+        );
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn create_token_global_posts_without_scope() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=runservice",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"token\">s3cr3t-token</data><data name=\"id\">7</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CreateTokenOptions {
+            operation: TokenOperation::Runservice,
+            ..CreateTokenOptions::default()
+        };
+        let created = client.create_token(&options, &DryRun::new(false)).unwrap();
+        assert_eq!(
+            created,
+            Some(CreatedToken {
+                id: 7,
+                token: "s3cr3t-token".to_string(),
+                operation: TokenOperation::Runservice,
+                project: None,
+                package: None,
+                description: None,
+            })
+        );
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn create_token_other_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=rebuild",
+            "<revision rev=\"2\" vrev=\"1\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Rebuild,
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn create_token_response_without_id_is_error_not_partial_token() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=rebuild",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"token\">s3cr3t-token</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Rebuild,
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn create_token_response_without_token_is_error_not_partial_token() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=rebuild",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"id\">1</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Rebuild,
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn create_token_response_with_non_numeric_id_is_error() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=rebuild",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"token\">s3cr3t-token</data><data name=\"id\">abc</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Rebuild,
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn create_token_response_with_empty_token_is_error() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=rebuild",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"token\"></data><data name=\"id\">1</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Rebuild,
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn create_token_response_with_non_ok_status_is_error_despite_token_and_id() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=rebuild",
+            "<status code=\"error\"><summary>Not Ok</summary><data name=\"token\">tok-fake-179</data><data name=\"id\">1</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Rebuild,
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn create_token_scope_needs_both_project_and_package() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let project_only = CreateTokenOptions {
+            operation: TokenOperation::Rebuild,
+            project: Some("test:factory".to_string()),
+            ..CreateTokenOptions::default()
+        };
+        assert!(client
+            .create_token(&project_only, &DryRun::new(false))
+            .is_err());
+        let package_only = CreateTokenOptions {
+            operation: TokenOperation::Rebuild,
+            package: Some("test-pkgA".to_string()),
+            ..CreateTokenOptions::default()
+        };
+        assert!(client
+            .create_token(&package_only, &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_token_description_over_64_characters_is_refused() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CreateTokenOptions {
+            operation: TokenOperation::Rebuild,
+            description: Some("x".repeat(65)),
+            ..CreateTokenOptions::default()
+        };
+        let err = client
+            .create_token(&options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_token_description_of_64_characters_is_accepted() {
+        let description = "x".repeat(64);
+        let url = format!(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=rebuild&description={description}"
+        );
+        let http = FakeHttp::new().with_post(
+            &url,
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"token\">tok-fake-179</data><data name=\"id\">1</data></status>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CreateTokenOptions {
+            operation: TokenOperation::Rebuild,
+            description: Some(description),
+            ..CreateTokenOptions::default()
+        };
+        let created = client.create_token(&options, &DryRun::new(false)).unwrap();
+        assert!(created.is_some());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn create_token_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = CreateTokenOptions {
+            operation: TokenOperation::Rebuild,
+            project: Some("test:factory".to_string()),
+            package: Some("test-pkgA/pkg".to_string()),
+            ..CreateTokenOptions::default()
+        };
+        assert!(client.create_token(&options, &DryRun::new(false)).is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_token_dry_run_records_plan_and_creates_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = CreateTokenOptions {
+            operation: TokenOperation::Rebuild,
+            project: Some("test:factory".to_string()),
+            package: Some("test-pkgA".to_string()),
+            description: Some("nightly rebuild".to_string()),
+        };
+        assert_eq!(client.create_token(&options, &dry_run).unwrap(), None);
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: create rebuild token for package test:factory/test-pkgA (description: nightly rebuild)".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_token_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=rebuild",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"token\">s3cr3t-token</data><data name=\"id\">1</data></status>",
+        );
+        let client = ObsClient::new(&http);
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Rebuild,
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_token_with_api_key_fails_closed_without_username() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/person/scarabeus_iv/token?cmd=create&operation=rebuild",
+            "<status code=\"ok\"><summary>Ok</summary><data name=\"token\">s3cr3t-token</data><data name=\"id\">1</data></status>",
+        );
+        let client = ObsClient::with_credentials(
+            &http,
+            Credentials::Bearer {
+                token: "api-key".to_string(),
+            },
+        )
+        .unwrap();
+        let err = client
+            .create_token(
+                &CreateTokenOptions {
+                    operation: TokenOperation::Rebuild,
+                    ..CreateTokenOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn create_token_dry_run_runs_before_credentials_checks() {
+        let options = CreateTokenOptions {
+            operation: TokenOperation::Rebuild,
+            ..CreateTokenOptions::default()
+        };
+        // No credentials at all: the dry-run guard answers before
+        // the credentials check.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client.create_token(&options, &DryRun::new(true)).unwrap(),
+            None
+        );
+        assert!(http.post_calls().is_empty());
+        // Bearer credentials carry no username: the dry-run guard
+        // answers before the username check too.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(
+            &http,
+            Credentials::Bearer {
+                token: "api-key".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            client.create_token(&options, &DryRun::new(true)).unwrap(),
+            None
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn created_token_debug_redacts_the_secret() {
+        let created = CreatedToken {
+            id: 1,
+            token: "tok-fake-179".to_string(),
+            operation: TokenOperation::Rebuild,
+            project: None,
+            package: None,
+            description: None,
+        };
+        let debug = format!("{created:?}");
+        assert!(!debug.contains("tok-fake-179"));
+        assert!(debug.contains("[redacted]"));
+        assert!(debug.contains("CreatedToken"));
     }
 
     #[test]

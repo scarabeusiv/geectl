@@ -364,11 +364,15 @@ fn assignment_value(body: &str, pos: usize, line_value: bool) -> Option<(usize, 
 }
 
 /// The text content of the credential element opening at `body[i]`
-/// (`<name>text</name>`, with an optional namespace prefix):
+/// (`<name>text</name>`, with an optional namespace prefix, or
+/// `<tag name="credential">text</tag>` where the `name` attribute
+/// carries the credential name — the shape OBS token responses use:
+/// `<data name="token">SECRET</data>`):
 /// returns the text's byte range, ending at the next `<` (or the
 /// end of the body). `None` when the tag at `i` is not a credential
-/// element — a non-credential name, a closing tag, or a tag
-/// carrying attributes.
+/// element — a non-credential name, a closing tag, a self-closing
+/// tag, or a tag carrying attributes but no credential `name`
+/// attribute.
 fn credential_element_text(body: &str, i: usize) -> Option<(usize, usize)> {
     let bytes = body.as_bytes();
     let (mut pos, mut name) = read_name(body, i + 1)?;
@@ -377,23 +381,57 @@ fn credential_element_text(body: &str, i: usize) -> Option<(usize, usize)> {
         name = local;
         pos = local_end;
     }
-    if !is_credential_name(name) {
-        return None;
-    }
-    // Whitespace may sit between the name and `>`; attributes may
-    // not — a tag carrying attributes is left alone by design.
-    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+    let tag_is_credential = is_credential_name(name);
+    // A tag carrying attributes is left alone — unless one of them
+    // is a `name` attribute whose value is a credential name: the
+    // element text is then the credential's value.
+    let mut has_attributes = false;
+    let mut named_credential = false;
+    loop {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+        if bytes[pos] == b'>' {
+            if !named_credential && !(tag_is_credential && !has_attributes) {
+                return None;
+            }
+            let text_start = pos + 1;
+            let mut text_end = text_start;
+            while text_end < bytes.len() && bytes[text_end] != b'<' {
+                text_end += 1;
+            }
+            return Some((text_start, text_end));
+        }
+        // A self-closing tag has no element text; anything else
+        // here is not an attribute, so the tag is malformed.
+        if bytes[pos] == b'/' {
+            return None;
+        }
+        let (attr_end, attr_name) = read_name(body, pos)?;
+        pos = attr_end;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() || bytes[pos] != b'=' {
+            return None;
+        }
         pos += 1;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() || (bytes[pos] != b'"' && bytes[pos] != b'\'') {
+            return None;
+        }
+        let close = scan_quoted(body, pos, bytes[pos])?;
+        has_attributes = true;
+        if attr_name.eq_ignore_ascii_case("name") && is_credential_name(&body[pos + 1..close]) {
+            named_credential = true;
+        }
+        pos = close + 1;
     }
-    if pos >= bytes.len() || bytes[pos] != b'>' {
-        return None;
-    }
-    let text_start = pos + 1;
-    let mut text_end = text_start;
-    while text_end < bytes.len() && bytes[text_end] != b'<' {
-        text_end += 1;
-    }
-    Some((text_start, text_end))
 }
 
 /// Try to redact a quoted credential name starting at `body[i]`
@@ -422,9 +460,10 @@ fn try_redact_quoted_name(body: &str, i: usize, quote: u8) -> Option<(usize, usi
 /// (`name="value"`), a JSON pair (`"name": "value"`), a bare
 /// assignment (`name: value`, `name=value`, quoted or unquoted),
 /// and element text (`<name>value</name>`, including a namespace
-/// prefix). A credential value with no name next to it — a bare
+/// prefix, or `<tag name="credential">value</tag>`). A credential value with no name next to it — a bare
 /// array item, a structured object value, a CDATA section, a
-/// nested element, an element tag carrying attributes — is left
+/// nested element, an element tag carrying attributes other than
+/// a credential `name` — is left
 /// alone: that is the design, not a gap to chase. Malformed input
 /// is left alone too: an unterminated quote or an empty value
 /// copies through verbatim, and the scan never fails.
@@ -792,6 +831,23 @@ Host: api.opensuse.org";
             redact_body("<password >hunter2-fake</password>"),
             "<password >[redacted]</password>"
         );
+    }
+
+    #[test]
+    fn redact_body_redacts_token_element_with_name_attribute() {
+        // The exact create-token response body: the secret must not
+        // reach the `--debug-body` channel, while the id stays.
+        let body = "<status code=\"ok\"><data name=\"token\">tok-fake-179</data><data name=\"id\">1</data></status>";
+        let redacted = redact_body(body);
+        assert!(!redacted.contains("tok-fake-179"));
+        assert!(redacted.contains("<data name=\"token\">[redacted]</data>"));
+        assert!(redacted.contains("<data name=\"id\">1</data>"));
+    }
+
+    #[test]
+    fn redact_body_leaves_element_text_with_non_credential_name_attribute_alone() {
+        let body = "<data name=\"id\">1</data><data name=\"project\">test:factory</data>";
+        assert_eq!(redact_body(body), body);
     }
 
     #[test]

@@ -3,9 +3,10 @@
 //! The inspection surface for what the distribution holds: file
 //! contents and downloads, listings, history, meta, search, ownership,
 //! and diffs — plus the group's mutations, which edit a project's repository
-//! list in its meta (`repo-add`, `repo-remove`) or create, upload
+//! list in its meta (`repo-add`, `repo-remove`), create, upload
 //! to, delete, restore, aggregate, and release projects and
-//! packages. Each command is a thin wrapper over one `ObsClient`
+//! packages, or create an operation-scoped trigger token
+//! (`create-token`). Each command is a thin wrapper over one `ObsClient`
 //! operation: the flags mirror the library parameters, the JSON
 //! payload carries the typed values, and the text renderer prints
 //! the same values in a human-readable form. No XML reaches the user
@@ -48,7 +49,9 @@
 //! `staging-project` echoes the workflow project and the staging
 //! name (`project:` + `staging:`). `search-projects-by-person`
 //! echoes the login (`login:`); `count-scmsync-projects` echoes the
-//! URL prefix (`url-prefix:`).
+//! URL prefix (`url-prefix:`). `create-token` echoes the operation
+//! (`operation:`), plus the project and package when the token is
+//! scoped (`project:` + `package:`).
 //!
 //! The group's mutations follow the
 //! CLI-wide rule: dry-run by default, the global `--live` performs
@@ -62,7 +65,9 @@
 //! (long free text — titles stay); `revision-patch`,
 //! `project-diff`, and `diff-packages` diffs are the server text
 //! itself, not re-rendered. `create-project` and `create-package`
-//! text carries no description (long free text); `delete-project`
+//! text carries no description (long free text); `create-token`
+//! text carries no description either (free text — the dry-run plan
+//! names it); `delete-project`
 //! text carries no comment (a message, not an identifier);
 //! `delete-package` text carries no message (long free text — the
 //! dry-run plan names a truncated message); `create-package` text
@@ -78,12 +83,12 @@ use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
     parse_package_meta, parse_project_meta, valid_obs_name, validate_meta_file_roles,
-    validate_role, AggregateOptions, CreatePackageOptions, DeletePackageOptions,
-    DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient,
-    Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch,
-    ProjectMeta, ReleaseOptions, Repository, RevisionPatch, RevisionRange, RevisionSpec, RoleGrant,
-    ScmsyncProjectList, SourceFile, StagedRequest, StagingProject, StagingReadOptions,
-    FACTORY_PROJECT, OBS_API_BASE,
+    validate_role, AggregateOptions, CreatePackageOptions, CreateTokenOptions, CreatedToken,
+    DeletePackageOptions, DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry,
+    NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person,
+    ProjectMatch, ProjectMeta, ReleaseOptions, Repository, RevisionPatch, RevisionRange,
+    RevisionSpec, RoleGrant, ScmsyncProjectList, SourceFile, StagedRequest, StagingProject,
+    StagingReadOptions, TokenOperation, FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -594,6 +599,28 @@ pub enum RemoteCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Create an operation-scoped trigger token for the
+    /// authenticated user. A mutation: dry-run is the default (only
+    /// the plan is printed); `--live` performs the creation. The
+    /// secret is printed once, at creation: it is never shown again,
+    /// so store it now. Project and package go together: give both
+    /// to scope the token to a package, or neither for a global
+    /// token.
+    CreateToken {
+        /// The operation the token authorises: runservice, rebuild,
+        /// release, or workflow.
+        #[arg(long, value_enum)]
+        operation: TokenOperation,
+        /// The project of the package the token is scoped to.
+        #[arg(long)]
+        project: Option<String>,
+        /// The package the token is scoped to.
+        #[arg(long)]
+        package: Option<String>,
+        /// A description identifying the token, at most 64 characters.
+        #[arg(long)]
+        description: Option<String>,
+    },
     /// Delete a package. A mutation: dry-run is the default (only
     /// the plan is printed); `--live` performs the deletion.
     /// Without `--force` a package with open submit requests is
@@ -786,6 +813,7 @@ pub fn run_remote(
         RemoteCommand::UploadFile { .. } if !live => Credentials::None,
         RemoteCommand::CreateProject { .. } if !live => Credentials::None,
         RemoteCommand::CreatePackage { .. } if !live => Credentials::None,
+        RemoteCommand::CreateToken { .. } if !live => Credentials::None,
         RemoteCommand::SetProjectMeta { .. } if !live => Credentials::None,
         RemoteCommand::SetPackageMeta { .. } if !live => Credentials::None,
         RemoteCommand::UpdatePackageMetaFromSpec { .. } if !live => Credentials::None,
@@ -1558,6 +1586,32 @@ pub fn run_remote(
                 plan,
             ))
         }
+        RemoteCommand::CreateToken {
+            operation,
+            project,
+            package,
+            description,
+        } => {
+            let options = CreateTokenOptions {
+                operation,
+                project,
+                package,
+                description: description.filter(|d| !d.is_empty()),
+            };
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            let created = client.create_token(&options, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(create_token_result(
+                &options,
+                created.as_ref(),
+                dry_run.enabled(),
+                plan,
+            ))
+        }
         RemoteCommand::DeletePackage {
             project,
             package,
@@ -2030,6 +2084,63 @@ fn create_package_result(
         dry_run,
         plan,
     )
+}
+
+/// The `create-token` result: the payload carries the operation,
+/// the scope, and the description, plus the id and the secret of the
+/// token just created; the text carries the id and the secret too —
+/// the secret is printed once, at creation, and never shown again.
+/// In dry-run there is no token yet, so the payload carries no id
+/// and no secret. The description rides the payload only: the text
+/// leaves it out (free text — the dry-run plan names it).
+fn create_token_result(
+    options: &CreateTokenOptions,
+    created: Option<&CreatedToken>,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let payload = json!({
+        "operation": options.operation.as_str(),
+        "project": options.project,
+        "package": options.package,
+        "description": options.description,
+        "id": created.map(|created| created.id),
+        "token": created.map(|created| created.token.as_str()),
+    });
+    let scope = match (&options.project, &options.package) {
+        (Some(project), Some(package)) => format!(" for package {package} in project {project}"),
+        _ => String::new(),
+    };
+    let (result_line, secret_line) = match created {
+        Some(created) => (
+            format!(
+                "created {} token {}{scope}",
+                options.operation.as_str(),
+                created.id,
+            ),
+            Some(format!("token: {}", created.token)),
+        ),
+        None => (
+            format!(
+                "dry-run: would create {} token{scope}",
+                options.operation.as_str(),
+            ),
+            None,
+        ),
+    };
+    let header = match (&options.project, &options.package) {
+        (Some(project), Some(package)) => format!(
+            "operation: {} project: {project} package: {package}",
+            options.operation.as_str(),
+        ),
+        _ => format!("operation: {}", options.operation.as_str()),
+    };
+    let (payload, mut text) = mutation_result(payload, header, result_line, dry_run, plan);
+    if let Some(secret_line) = secret_line {
+        text.push('\n');
+        text.push_str(&secret_line);
+    }
+    (payload, text)
 }
 
 /// The `delete-package` result: the payload carries `force` and the
@@ -4544,6 +4655,53 @@ mod tests {
     }
 
     #[test]
+    fn create_token_parses_operation_and_scope_flags() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "create-token",
+            "--operation",
+            "rebuild",
+            "--project",
+            "test:factory",
+            "--package",
+            "test-pkgA",
+            "--description",
+            "nightly rebuild",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::CreateToken {
+                operation: TokenOperation::Rebuild,
+                project: Some(project),
+                package: Some(package),
+                description: Some(description),
+            } if project == "test:factory" && package == "test-pkgA" && description == "nightly rebuild"
+        ));
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "create-token",
+            "--operation",
+            "runservice",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::CreateToken {
+                operation: TokenOperation::Runservice,
+                project: None,
+                package: None,
+                description: None,
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["geectl", "remote", "create-token", "--operation", "bogus"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["geectl", "remote", "create-token"]).is_err());
+    }
+
+    #[test]
     fn create_package_result_carries_scmsync_in_both_formats() {
         let (payload, text) = create_package_result(
             "P",
@@ -4586,6 +4744,60 @@ mod tests {
         assert_eq!(
             text,
             "project: P package: K\ndry_run: true\ndry-run: would create package K in project P (title: Vi)\n[dry-run] would: create package P/K"
+        );
+    }
+
+    #[test]
+    fn create_token_result_carries_id_and_secret_in_both_formats() {
+        let created = CreatedToken {
+            id: 1,
+            token: "s3cr3t-token".to_string(),
+            operation: TokenOperation::Rebuild,
+            project: Some("test:factory".to_string()),
+            package: Some("test-pkgA".to_string()),
+            description: Some("nightly rebuild".to_string()),
+        };
+        let options = CreateTokenOptions {
+            operation: TokenOperation::Rebuild,
+            project: Some("test:factory".to_string()),
+            package: Some("test-pkgA".to_string()),
+            description: Some("nightly rebuild".to_string()),
+        };
+        let (payload, text) = create_token_result(&options, Some(&created), false, None);
+        assert_eq!(payload["operation"], "rebuild");
+        assert_eq!(payload["project"], "test:factory");
+        assert_eq!(payload["package"], "test-pkgA");
+        assert_eq!(payload["description"], "nightly rebuild");
+        assert_eq!(payload["id"], 1);
+        assert_eq!(payload["token"], "s3cr3t-token");
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "operation: rebuild project: test:factory package: test-pkgA\ndry_run: false\ncreated rebuild token 1 for package test-pkgA in project test:factory\ntoken: s3cr3t-token"
+        );
+        let (payload, text) = create_token_result(
+            &CreateTokenOptions {
+                operation: TokenOperation::Runservice,
+                ..CreateTokenOptions::default()
+            },
+            None,
+            true,
+            Some(vec!["[dry-run] would: create runservice token".to_string()]),
+        );
+        assert_eq!(payload["operation"], "runservice");
+        assert_eq!(payload["project"], Value::Null);
+        assert_eq!(payload["package"], Value::Null);
+        assert_eq!(payload["description"], Value::Null);
+        assert_eq!(payload["id"], Value::Null);
+        assert_eq!(payload["token"], Value::Null);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: create runservice token"
+        );
+        assert_eq!(
+            text,
+            "operation: runservice\ndry_run: true\ndry-run: would create runservice token\n[dry-run] would: create runservice token"
         );
     }
 
