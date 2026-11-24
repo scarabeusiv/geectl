@@ -6746,12 +6746,22 @@ mod tests {
         }
     }
 
+    /// Serializes the tests that pin `GIT_AUTHOR_DATE` /
+    /// `GIT_COMMITTER_DATE`: the dates are process-global, so a
+    /// guard drop in one test would remove them mid-commit in
+    /// the other and change its SHA.
+    static GIT_DATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn commit_git_synthesizes_a_commit_for_staged_changes() {
         // Fixed author and committer dates: the synthesized
         // commit's SHA is deterministic, so the OBS-side sync
         // read can name it in advance. The dates are restored on
-        // drop, so no later test inherits them.
+        // drop, so no later test inherits them. The lock
+        // serializes the two date-pinning tests: the dates are
+        // process-global, so a guard drop in one test would
+        // otherwise remove them mid-commit in the other.
+        let _date_lock = GIT_DATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _author_date = RestoreVar::set("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z");
         let _committer_date = RestoreVar::set("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z");
         let dir = TempDirGuard::new("git-commit-synth");
@@ -8499,7 +8509,9 @@ mod tests {
         // directory: the synthesized commit skips it
         // (`--no-verify` plus the forced
         // `core.hooksPath=/dev/null`), so the commit still lands
-        // and pushes.
+        // and pushes. Serialized with the other date-pinning
+        // test: see GIT_DATE_LOCK.
+        let _date_lock = GIT_DATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _author_date = RestoreVar::set("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z");
         let _committer_date = RestoreVar::set("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z");
         let dir = TempDirGuard::new("git-hook");
