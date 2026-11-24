@@ -234,11 +234,19 @@ string the caller concatenates.
 | `pr_review_cancel_request(owner, repo, number, reviewer \| --all [--exclude …])` | DELETE `.../pulls/{n}/requested_reviewers` | Cancel review requests (single, all, all-but-excluded); repeat cancel is a client-side error, `--dry-run` reports the plan |
 | `pr_labels_add/remove` | POST/DELETE `.../issues/{n}/labels` | Label the review (incl. the `staging/*` labels the staging flow uses) |
 
-Defaults (osc #2222 / #2204): `pr_create` defaults the target
-branch to the target repo's default branch (resolved via
-`repo_get`) and the target repo to the fork's parent; an empty PR
-(identical source/target) is refused unless `--allow-empty`. The
-deprecated `--target-branch` form is not offered — one form only.
+Defaults (osc #2222 / #2204): `submit` defaults the target repo
+to the fork's parent (resolved via `repo_get` on the origin) and
+the target branch to the branch the checkout tracks (its scmsync
+branch), falling back to the target repo's default branch (via
+`repo_get`) only when the checkout carries no scmsync branch. The
+head is qualified with the fork owner (`owner:branch`) whenever
+the target is not the origin repo — Gitea resolves a bare head
+against the base repo. The `factory` branch does not take pull
+requests (the Factory leg is an OBS submit request, never a Gitea
+PR); a `factory` base is refused case-insensitively, and the
+target is verified before filing — the target repo is the parent
+of the origin, and the base exists on the target. The deprecated
+`--target-branch` form is not offered — one form only.
 
 ### Phase 3 — unified pull requests: the `pull-request` surface
 
@@ -450,13 +458,23 @@ The OBS arm files through `SrFiling::file` and returns
 `PullRequestRef::Gitea { owner, repo, number }`. The caller picks the
 variant for the backend it files to — the backend kind is known at
 the call site from the checkout — and never branches on backend to
-read the result. `pr_create` defaults the target branch to the
-target repo's default branch (resolved via `repo_get`) and the
-target repo to the fork's parent; an empty PR is refused unless
-`--allow-empty`. The CLI `submit` verb waits for the working-copy
+read the result. `pr_create` takes the target repo, head, base and title as given
+— the defaults live in the CLI `submit` verb, which resolves the
+target repo to the fork's parent and the base to the checkout's
+scmsync branch (else the target's default branch), refuses a
+`factory` base, and verifies the target before filing. The CLI
+`submit` verb waits for the working-copy
 layer: it reads the backend kind from the checkout, and the
 `branch` composite has the same wait — a uniform verb that needs a
 checkout does not land before the checkout exists.
+
+The Gitea-side devel rule: a pull request goes to the immediate
+parent repo — for a fork of the devel repo, the devel repo —
+never into the fork, by default on the branch the checkout tracks
+(its scmsync branch), or the target's default branch when the
+checkout tracks none, unless `--base` names another branch. The
+`factory` branch takes no pull requests; the Factory leg is an OBS
+submit request.
 
 #### The CLI surface: the `pull-request` group
 
@@ -708,7 +726,7 @@ with unique repo names per test (same rule as the OBS live suite).
 | `git-repo-list.feature` (4): `--org`, `--user`, both, `--export` JSON | Adopt the 3 list forms; `--export` is CLI rendering (the #52 renderer), not a library case. |
 | `git-ssh-key.feature` (5): add (inline + `--key-path`), invalid key refused client-side, invalid base64 → server 422, remove by id | Adopt all 5. |
 | `git-pr.feature` (15): create (default, `--source`/`--target`, `:branch` form, deprecated-options warning, mixed-options error), list (text + `--export`), search (text + `--export`), get (+ labels, + nonexistent → exit 1), checkout, checkout-as-other-user + push, rebase ff / non-ff | Adopt create/list/search/get/labels/empty (see below); SKIP checkout + rebase (local git work, git CLI); SKIP the deprecated-options warning and the mixed-options error (one form only, no deprecated form to warn about); SKIP the commented-out timeline scenario (broken upstream, gitea#35152). |
-| `git-pr-empty.feature` (2): identical commits refused; `--allow-empty` after revert | Adopt both. |
+| `git-pr-empty.feature` (2): identical commits refused; `--allow-empty` after revert | Adopt the target defaulting only (the no-target case the first scenario exercises); the identical-commits refusal and `--allow-empty` are outstanding — no identical head/base refusal exists in the submit path. |
 | `git-pr-fork-to-fork.feature` (1): Alice→Bob PR | Adopt. |
 | `git-pr-review-request.feature` (5): setup check, cancel single (+ `--dry-run`, repeat → exit 1), `--all`, `--all --exclude` (lowercase + mixed case + unknown) | Adopt all 5. |
 | `git-pr-new-package-request.feature` (4) | OUT of v1 (see below). |

@@ -1450,6 +1450,73 @@ fn serve_once_bytes(body: &[u8]) -> std::net::SocketAddr {
     addr
 }
 
+/// The origin repo of the submit fixture: a fork of pool/repo
+/// whose default branch is main.
+const SUBMIT_FORK_REPO_JSON: &str = r#"{"owner": {"login": "owner"}, "name": "repo", "full_name": "owner/repo", "parent": {"owner": {"login": "pool"}, "name": "repo", "full_name": "pool/repo"}, "default_branch": "main", "private": false, "clone_url": "http://127.0.0.1/owner/repo.git", "ssh_url": "gitea@127.0.0.1:owner/repo.git"}"#;
+
+/// The parent repo of the submit fixture: no parent, default
+/// branch devel (the fallback base).
+const SUBMIT_PARENT_REPO_JSON: &str = r#"{"owner": {"login": "pool"}, "name": "repo", "full_name": "pool/repo", "parent": null, "default_branch": "devel", "private": false, "clone_url": "http://127.0.0.1/pool/repo.git", "ssh_url": "gitea@127.0.0.1:pool/repo.git"}"#;
+
+/// A repo that is not a fork: the parent default has nothing to
+/// resolve.
+const SUBMIT_NOFORK_REPO_JSON: &str = r#"{"owner": {"login": "owner"}, "name": "repo", "full_name": "owner/repo", "parent": null, "default_branch": "main", "private": false, "clone_url": "http://127.0.0.1/owner/repo.git", "ssh_url": "gitea@127.0.0.1:owner/repo.git"}"#;
+
+/// A many-shot Gitea fixture for the submit reads: repo bodies by
+/// exact path, and a branch body built from the requested branch
+/// name (the branch parse requires the name to match the request)
+/// for the branches listed; any other branch answers 404.
+/// Anything else answers 404 too. For commands whose reads fan out
+/// (the parent resolution, then the base verification), where one
+/// canned body cannot answer every request.
+fn serve_gitea_submit(repos: &[(&str, &str)], branches: &[&str]) -> std::net::SocketAddr {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let repos: Vec<(String, String)> = repos
+        .iter()
+        .map(|(path, body)| (path.to_string(), body.to_string()))
+        .collect();
+    let branches: Vec<String> = branches.iter().map(|name| name.to_string()).collect();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let target = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            let (status, body) = match repos.iter().find(|(path, _)| path == &target) {
+                Some((_, body)) => ("200 OK".to_string(), body.clone()),
+                None => match target.split_once("/branches/") {
+                    Some((_, name)) if branches.iter().any(|branch| branch == name) => (
+                        "200 OK".to_string(),
+                        format!(
+                            r#"{{"name": "{name}", "commit": {{"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "message": "initial", "url": "http://127.0.0.1/api/v1/repos/pool/repo/git/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}, "protected": false}}"#
+                        ),
+                    ),
+                    _ => ("404 Not Found".to_string(), String::new()),
+                },
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    addr
+}
+
 /// A many-shot HTTP fixture: serves the same canned response to
 /// every connection, until the test process ends. For commands that
 /// fan out (a diff lists both sides, then reads files), where one
@@ -5808,6 +5875,18 @@ fn pull_request_submit_obs_text_dry_run_prints_plan() {
 fn pull_request_submit_gitea_dry_run_prints_plan() {
     let dir = TempDir::new();
     let checkout = git_submit_checkout(&dir);
+    // The fixture instance answers the parent resolution and the
+    // base verification: the origin is a fork of pool/repo, and
+    // main exists on the target.
+    let addr = serve_gitea_submit(
+        &[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)],
+        &["main"],
+    );
+    let origin = format!("http://{addr}/owner/repo");
+    git_in(
+        &checkout,
+        &["config", "--local", "remote.origin.url", origin.as_str()],
+    );
     let out = geectl_isolated(&dir)
         .current_dir(&checkout)
         .args([
@@ -5818,12 +5897,15 @@ fn pull_request_submit_gitea_dry_run_prints_plan() {
             "--title",
             "Update foo",
         ])
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
         .env("GEECTL_GITEA_TOKEN", "test-token")
         .output()
         .unwrap();
     // A dry-run submit on Gitea prints with a token configured
-    // (the client needs one to build); the token is never sent —
-    // the dry-run plan does not fetch, and pr_create posts nothing.
+    // (the client needs one to build); the plan reads the parent
+    // and the base but files nothing — the token is sent only on
+    // those reads, never on a filing POST. The dry-run plan does
+    // not fetch, and pr_create posts nothing.
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -5836,7 +5918,7 @@ fn pull_request_submit_gitea_dry_run_prints_plan() {
     assert_eq!(value["dry_run"], true);
     assert_eq!(
         value["plan"][0],
-        "[dry-run] would: create pull request in owner/repo from main to main"
+        "[dry-run] would: create pull request in pool/repo from owner:main to main"
     );
 }
 
@@ -5844,6 +5926,15 @@ fn pull_request_submit_gitea_dry_run_prints_plan() {
 fn pull_request_submit_gitea_text_dry_run_prints_plan() {
     let dir = TempDir::new();
     let checkout = git_submit_checkout(&dir);
+    let addr = serve_gitea_submit(
+        &[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)],
+        &["main"],
+    );
+    let origin = format!("http://{addr}/owner/repo");
+    git_in(
+        &checkout,
+        &["config", "--local", "remote.origin.url", origin.as_str()],
+    );
     let out = geectl_isolated(&dir)
         .current_dir(&checkout)
         .args([
@@ -5856,6 +5947,7 @@ fn pull_request_submit_gitea_text_dry_run_prints_plan() {
             "--title",
             "Update foo",
         ])
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
         .env("GEECTL_GITEA_TOKEN", "test-token")
         .output()
         .unwrap();
@@ -5866,7 +5958,7 @@ fn pull_request_submit_gitea_text_dry_run_prints_plan() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would open a pull request for owner/repo from main to main"
+        "dry-run: would open a pull request for pool/repo from owner:main to main"
     );
 }
 
@@ -5998,7 +6090,8 @@ fn pull_request_submit_obs_missing_required_flags_are_invalid_input() {
 fn pull_request_submit_gitea_missing_required_flags_are_invalid_input() {
     let dir = TempDir::new();
     let checkout = git_submit_checkout(&dir);
-    assert_submit_invalid_input(&dir, &checkout, &["--title", "Update foo"], "--base");
+    // --base now defaults (the scmsync branch, else the target's
+    // default branch); only --title stays required.
     assert_submit_invalid_input(&dir, &checkout, &["--base", "main"], "--title");
 }
 
@@ -6099,24 +6192,25 @@ fn pull_request_submit_gitea_foreign_host_is_invalid_input() {
 fn pull_request_submit_gitea_alias_token_dry_run_prints_plan() {
     let dir = TempDir::new();
     // A custom instance under an alias: the token lives only in
-    // the alias variable, never in the plain one. The origin host
-    // matches the alias instance.
+    // the alias variable, never in the plain one. The instance is
+    // a loopback fixture, so the parent resolution and the base
+    // verification answer.
+    let addr = serve_gitea_submit(
+        &[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)],
+        &["main"],
+    );
     let config_dir = dir.0.join("geectl");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("config.toml"),
-        "[instances]\ncustom = \"https://gitea.example.org\"\n",
+        format!("[instances]\ncustom = \"http://{addr}\"\n"),
     )
     .unwrap();
     let checkout = git_submit_checkout(&dir);
+    let origin = format!("http://{addr}/owner/repo");
     git_in(
         &checkout,
-        &[
-            "config",
-            "--local",
-            "remote.origin.url",
-            "https://gitea.example.org/owner/repo",
-        ],
+        &["config", "--local", "remote.origin.url", origin.as_str()],
     );
     let out = geectl_isolated(&dir)
         .current_dir(&checkout)
@@ -6128,13 +6222,13 @@ fn pull_request_submit_gitea_alias_token_dry_run_prints_plan() {
             "--title",
             "Update foo",
         ])
-        .env("GEECTL_GITEA_URL", "https://gitea.example.org")
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
         .env("GEECTL_GITEA_TOKEN_CUSTOM", "alias-token")
         .output()
         .unwrap();
     // The alias token resolves for the client and the fetch alike:
-    // one resolution, shared. The dry-run plan prints; nothing is
-    // sent to the instance.
+    // one resolution, shared. The dry-run plan prints; the reads
+    // resolve the parent and the base, nothing is filed.
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -6146,7 +6240,7 @@ fn pull_request_submit_gitea_alias_token_dry_run_prints_plan() {
     assert_eq!(value["dry_run"], true);
     assert_eq!(
         value["plan"][0],
-        "[dry-run] would: create pull request in owner/repo from main to main"
+        "[dry-run] would: create pull request in pool/repo from owner:main to main"
     );
 }
 
@@ -6187,6 +6281,191 @@ fn pull_request_submit_gitea_base_with_path_reports_the_base() {
     assert!(stderr.contains("Gitea base URL"), "stderr: {stderr}");
     assert!(
         !stderr.contains("no Gitea token configured"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn pull_request_submit_gitea_factory_base_is_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    // The refusal precedes credential resolution and any network
+    // read: the factory branch takes no pull requests.
+    assert_submit_invalid_input(
+        &dir,
+        &checkout,
+        &["--base", "factory", "--title", "Update foo"],
+        "the factory branch does not take pull requests",
+    );
+}
+
+#[test]
+fn pull_request_submit_gitea_base_defaults_from_the_scmsync_branch() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    git_in(
+        &checkout,
+        &["config", "--local", "geectl.scmsync-branch", "devel"],
+    );
+    let addr = serve_gitea_submit(
+        &[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)],
+        &["devel"],
+    );
+    let origin = format!("http://{addr}/owner/repo");
+    git_in(
+        &checkout,
+        &["config", "--local", "remote.origin.url", origin.as_str()],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args(["pull-request", "submit", "--title", "Update foo"])
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: create pull request in pool/repo from owner:main to devel"
+    );
+}
+
+#[test]
+fn pull_request_submit_gitea_base_defaults_from_the_target_default_branch() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    // No scmsync branch on this checkout: the base falls back to
+    // the target repo's default branch (devel on pool/repo).
+    let addr = serve_gitea_submit(
+        &[
+            ("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON),
+            ("/api/v1/repos/pool/repo", SUBMIT_PARENT_REPO_JSON),
+        ],
+        &["devel"],
+    );
+    let origin = format!("http://{addr}/owner/repo");
+    git_in(
+        &checkout,
+        &["config", "--local", "remote.origin.url", origin.as_str()],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args(["pull-request", "submit", "--title", "Update foo"])
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: create pull request in pool/repo from owner:main to devel"
+    );
+}
+
+#[test]
+fn pull_request_submit_gitea_origin_not_a_fork_is_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    let addr = serve_gitea_submit(
+        &[("/api/v1/repos/owner/repo", SUBMIT_NOFORK_REPO_JSON)],
+        &[],
+    );
+    let origin = format!("http://{addr}/owner/repo");
+    git_in(
+        &checkout,
+        &["config", "--local", "remote.origin.url", origin.as_str()],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args(["pull-request", "submit", "--title", "Update foo"])
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("not a fork"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_submit_gitea_target_not_parent_is_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    let addr = serve_gitea_submit(&[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)], &[]);
+    let origin = format!("http://{addr}/owner/repo");
+    git_in(
+        &checkout,
+        &["config", "--local", "remote.origin.url", origin.as_str()],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--repo",
+            "other/repo",
+            "--base",
+            "main",
+            "--title",
+            "Update foo",
+        ])
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("not the parent"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_submit_gitea_missing_base_is_invalid_input() {
+    let dir = TempDir::new();
+    let checkout = git_submit_checkout(&dir);
+    // The fixture answers the parent resolution only: the base
+    // branch read answers 404.
+    let addr = serve_gitea_submit(&[("/api/v1/repos/owner/repo", SUBMIT_FORK_REPO_JSON)], &[]);
+    let origin = format!("http://{addr}/owner/repo");
+    git_in(
+        &checkout,
+        &["config", "--local", "remote.origin.url", origin.as_str()],
+    );
+    let out = geectl_isolated(&dir)
+        .current_dir(&checkout)
+        .args([
+            "pull-request",
+            "submit",
+            "--base",
+            "nope",
+            "--title",
+            "Update foo",
+        ])
+        .env("GEECTL_GITEA_URL", format!("http://{addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("does not exist on pool/repo"),
         "stderr: {stderr}"
     );
 }

@@ -29,7 +29,7 @@ use crate::changelog::changes::normalize_changes_content;
 use crate::changelog::validate::{validate, PackageSnapshot, ValidateOptions};
 use crate::config::Config;
 use crate::error::{ErrorKind, GeectlError};
-use crate::gitea::validate_gitea_name;
+use crate::gitea::{validate_gitea_name, GiteaClient};
 use crate::local_build::LocalBuild;
 use crate::obs::{
     valid_obs_filename, CommitFileEntry, CommitFilelistOptions, DirectoryListing, DryRun,
@@ -145,6 +145,15 @@ pub struct WorkingCopy {
     pub base_rev: String,
     /// The base source md5. Empty for a git-backed checkout.
     pub base_srcmd5: String,
+    /// The scmsync URL the git-backed checkout was cloned from, as
+    /// recorded at checkout (with the `#branch` fragment when the
+    /// server named one). None for an OBS-native checkout, and for
+    /// a git-backed checkout recorded before this field existed.
+    pub scmsync_url: Option<String>,
+    /// The branch the scmsync URL's fragment names, when one is
+    /// present and non-empty: the branch the checkout tracks, and
+    /// the pull-request base it defaults to. None otherwise.
+    pub scmsync_branch: Option<String>,
 }
 
 impl WorkingCopy {
@@ -1320,6 +1329,9 @@ fn open_inner(dir: &Path, heal: bool) -> Result<WorkingCopy, GeectlError> {
             format!("the working copy backend is not obs or git: {backend:?}"),
         )
     })?;
+    // The scmsync keys are optional: a checkout recorded
+    // before they existed opens with neither, and the submit
+    // defaults fall back to the target's default branch.
     let mut working_copy = WorkingCopy {
         root: dir.to_path_buf(),
         project,
@@ -1328,6 +1340,8 @@ fn open_inner(dir: &Path, heal: bool) -> Result<WorkingCopy, GeectlError> {
         backend,
         base_rev,
         base_srcmd5,
+        scmsync_url: git_config_get(dir, "scmsync-url")?,
+        scmsync_branch: git_config_get(dir, "scmsync-branch")?.filter(|branch| !branch.is_empty()),
     };
     if backend == Backend::Obs {
         let root = root_commit(dir)?;
@@ -1807,6 +1821,8 @@ fn checkout_obs(
         Backend::Obs,
         &rev_number,
         &srcmd5,
+        None,
+        None,
     )?;
     // Forced: `git add -A` honours the user's global excludes, so
     // a `*.patch` in `core.excludesFile` would leave server files
@@ -1835,6 +1851,8 @@ fn checkout_obs(
         backend: Backend::Obs,
         base_rev: rev_number,
         base_srcmd5: srcmd5,
+        scmsync_url: None,
+        scmsync_branch: None,
     })
 }
 
@@ -1848,7 +1866,9 @@ fn split_scmsync_url(url: &str) -> (&str, Option<&str>) {
 }
 
 /// The git-backed checkout: clone the scmsync repository. The
-/// clone's HEAD is the base.
+/// clone's HEAD is the base. The scmsync URL and the branch its
+/// fragment names are recorded, so the checkout remembers which
+/// branch it tracks.
 fn checkout_git(
     client: &ObsClient,
     project: &str,
@@ -1921,6 +1941,8 @@ fn checkout_git(
         Backend::Git,
         &head,
         "",
+        Some(url),
+        branch.filter(|branch| !branch.is_empty()),
     )?;
     Ok(WorkingCopy {
         root: target,
@@ -1930,11 +1952,18 @@ fn checkout_git(
         backend: Backend::Git,
         base_rev: head,
         base_srcmd5: String::new(),
+        scmsync_url: Some(url.to_string()),
+        scmsync_branch: branch
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_string),
     })
 }
 
 /// Write the checkout record: the repo-local identity for
-/// synthesized commits, then the `geectl.*` keys.
+/// synthesized commits, then the `geectl.*` keys — including the
+/// scmsync URL and branch for a git-backed checkout, so the
+/// checkout remembers which branch it tracks.
+#[allow(clippy::too_many_arguments)]
 fn write_record(
     dir: &Path,
     apiurl: &str,
@@ -1943,6 +1972,8 @@ fn write_record(
     backend: Backend,
     base_rev: &str,
     base_srcmd5: &str,
+    scmsync_url: Option<&str>,
+    scmsync_branch: Option<&str>,
 ) -> Result<(), GeectlError> {
     git(dir, "config", &["--local", "user.name", "geectl"], &[])?;
     git(
@@ -1957,6 +1988,12 @@ fn write_record(
     git_config_set(dir, "backend", backend.as_str())?;
     git_config_set(dir, "base-rev", base_rev)?;
     git_config_set(dir, "base-srcmd5", base_srcmd5)?;
+    if let Some(url) = scmsync_url {
+        git_config_set(dir, "scmsync-url", url)?;
+    }
+    if let Some(branch) = scmsync_branch {
+        git_config_set(dir, "scmsync-branch", branch)?;
+    }
     Ok(())
 }
 
@@ -4721,21 +4758,140 @@ pub fn refuse_not_submittable_obs(wc: &WorkingCopy, obs: &ObsClient) -> Result<(
     Ok(())
 }
 
+/// The filed target a git-backed refusal verifies against the
+/// configured instance: the client, the instance URL, and the
+/// target repo and branch. `None` at the call site skips the
+/// verification (callers that do not file).
+pub struct GitTargetVerification<'a> {
+    /// The Gitea client for the configured instance.
+    pub client: &'a GiteaClient<'a>,
+    /// The configured Gitea instance URL, for the origin-host
+    /// check.
+    pub instance_url: &'a str,
+    /// The target repo's owner.
+    pub owner: &'a str,
+    /// The target repo's name.
+    pub repo: &'a str,
+    /// The target branch.
+    pub base: &'a str,
+    /// Whether `--repo` named the target explicitly: with an
+    /// explicit target the "pass --repo" remedy cannot apply, so
+    /// verification errors name the parent rule — and, for a
+    /// parentless origin, the branch-first remedy — instead.
+    pub repo_explicit: bool,
+}
+
+/// Reword an `origin_repo` failure for an explicit `--repo`
+/// target: the "pass --repo" remedy cannot apply — the user
+/// already passed it — so the parent rule takes its place. Only
+/// `InvalidInput` failures carry that remedy; a broken configured
+/// URL (`ConfigError`) or a git failure passes through untouched.
+/// The remedy takes two shapes in `origin_repo` — the long form
+/// for a foreign host, the short form for the rest — and both are
+/// reworded, the long form first.
+fn explicit_origin_error(err: GeectlError) -> GeectlError {
+    if err.kind() != ErrorKind::InvalidInput {
+        return err;
+    }
+    let kind = err.kind();
+    let reworded = err
+        .context
+        .replace(
+            ": pass --repo to name the repo on the configured instance",
+            ": the pull request target must be the parent of the checkout's origin, so the origin must name the fork on the configured instance",
+        )
+        .replace(
+            ": pass --repo",
+            ": the pull request target must be the parent of the checkout's origin",
+        );
+    GeectlError::new(kind, reworded)
+}
+
+/// Verify the filed target before filing: the target repo is the
+/// parent of the checkout's origin — a pull request goes to the
+/// parent repo, never to the fork — and the base branch exists on
+/// the target. A target that is not the parent, and a base the
+/// target does not carry, are `InvalidInput`: the remedy is a
+/// `--repo`/`--base` the target actually names — except when the
+/// target was explicit: `--repo` was already passed, so the remedy
+/// there names the parent rule instead, and a parentless origin
+/// names branching first.
+fn verify_git_submit_target(
+    wc: &WorkingCopy,
+    target: &GitTargetVerification,
+) -> Result<(), GeectlError> {
+    let (origin_owner, origin_repo) = origin_repo(wc, target.instance_url).map_err(|err| {
+        if target.repo_explicit {
+            explicit_origin_error(err)
+        } else {
+            err
+        }
+    })?;
+    let origin = target.client.repo_get(&origin_owner, &origin_repo)?;
+    let expected = format!("{}/{}", target.owner, target.repo);
+    let parent = origin.parent.as_ref().ok_or_else(|| {
+        if target.repo_explicit {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "the checkout's origin {origin_owner}/{origin_repo} is not a fork on this instance: it has no parent to file into — branch the checkout from the target repo first"
+                ),
+            )
+        } else {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "the checkout's origin {origin_owner}/{origin_repo} is not a fork on this instance: pass --repo to name the repo the pull request goes to"
+                ),
+            )
+        }
+    })?;
+    if !parent.full_name.eq_ignore_ascii_case(&expected) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to file into {expected}: it is not the parent of the checkout's origin {origin_owner}/{origin_repo} — a pull request goes to the parent repo, never the fork"
+            ),
+        ));
+    }
+    match target
+        .client
+        .branch_get(target.owner, target.repo, target.base)
+    {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "the base branch {} does not exist on {expected}: pass --base with a branch that exists on the target",
+                target.base
+            ),
+        )),
+        Err(err) => Err(err),
+    }
+}
+
 /// Refuse to file from a git-backed checkout that is not ready:
-/// a remote ahead of the checkout, conflicts, or changes against
-/// the base. The order mirrors `commit_git`: the remote check
-/// first, then conflicts, then the uncommitted check. Live, the
-/// remote is fetched first, so the check judges the current
-/// remote; the dry-run plan does not fetch, so it refuses only
-/// when the checkout is behind what was last fetched — like the
-/// commit plan. The fetch only refreshes remote-tracking refs —
-/// never HEAD, the index, or the working tree — so a filing that
-/// then fails leaves the checkout itself untouched.
+/// the filed target is verified first (when one is given) — the
+/// target repo is the parent of the checkout's origin and the base
+/// exists on the target — then a remote ahead of the checkout,
+/// conflicts, or changes against the base. The order after the
+/// verification mirrors `commit_git`: the remote check first, then
+/// conflicts, then the uncommitted check. Live, the remote is fetched first, so the
+/// check judges the current remote; the dry-run plan does not
+/// fetch, so it refuses only when the checkout is behind what was
+/// last fetched — like the commit plan. The fetch only refreshes
+/// remote-tracking refs — never HEAD, the index, or the working
+/// tree — so a filing that then fails leaves the checkout itself
+/// untouched.
 pub fn refuse_not_submittable_git(
     wc: &WorkingCopy,
     gitea_auth: Option<&GiteaAuth<'_>>,
+    target: Option<&GitTargetVerification<'_>>,
     dry_run: &DryRun,
 ) -> Result<(), GeectlError> {
+    if let Some(target) = target {
+        verify_git_submit_target(wc, target)?;
+    }
     if !dry_run.enabled() {
         let auth = gitea_auth.ok_or_else(|| {
             GeectlError::new(
@@ -5681,6 +5837,7 @@ pub fn resolve(wc: &mut WorkingCopy, dry_run: &DryRun) -> Result<Option<Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Credentials;
     use crate::obs::test_support::{basic_credentials, FakeHttp};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5742,6 +5899,8 @@ mod tests {
             Backend::Obs,
             rev,
             srcmd5,
+            None,
+            None,
         )
         .unwrap();
     }
@@ -8988,6 +9147,11 @@ mod tests {
         assert_eq!(wc.backend, Backend::Git);
         assert_eq!(wc.base_rev, main_head);
         assert_eq!(read_file(&wc.root, "foo.spec"), "Name: foo\n");
+        // The scmsync URL and its branch are recorded, so the
+        // checkout remembers which branch it tracks.
+        let expected_url = format!("{}#main", origin.url);
+        assert_eq!(wc.scmsync_url.as_deref(), Some(expected_url.as_str()));
+        assert_eq!(wc.scmsync_branch.as_deref(), Some("main"));
         let reopened = open(&wc.root).unwrap();
         assert_eq!(reopened, wc);
     }
@@ -9010,6 +9174,11 @@ mod tests {
         assert_eq!(wc.backend, Backend::Git);
         assert_eq!(wc.base_rev, main_head);
         assert_eq!(read_file(&wc.root, "foo.spec"), "Name: foo\n");
+        // An empty fragment names no branch: the URL is recorded,
+        // the branch stays unset.
+        let expected_url = format!("{}#", origin.url);
+        assert_eq!(wc.scmsync_url.as_deref(), Some(expected_url.as_str()));
+        assert_eq!(wc.scmsync_branch, None);
         let _ = origin;
     }
 
@@ -12943,7 +13112,7 @@ mod tests {
         let origin = git_origin(&dir.path);
         let http = git_checkout_http(&origin.url);
         let wc = do_git_checkout(&http, &dir);
-        assert!(refuse_not_submittable_git(&wc, None, &DryRun::new(true)).is_ok());
+        assert!(refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).is_ok());
         let _ = origin;
     }
 
@@ -12961,7 +13130,7 @@ mod tests {
         // The dry-run plan does not fetch: judge against the
         // last fetch, so fetch here first.
         git(&wc.root, "fetch", &["origin"], &[]).unwrap();
-        let err = refuse_not_submittable_git(&wc, None, &DryRun::new(true)).unwrap_err();
+        let err = refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::WorkingCopyOutdated);
         assert!(err.to_string().contains("run update first"));
         let _ = origin;
@@ -12974,7 +13143,7 @@ mod tests {
         let http = git_checkout_http(&origin.url);
         let wc = do_git_checkout(&http, &dir);
         write_file(&wc.root, "foo.spec", "Name: edited\n");
-        let err = refuse_not_submittable_git(&wc, None, &DryRun::new(true)).unwrap_err();
+        let err = refuse_not_submittable_git(&wc, None, None, &DryRun::new(true)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("commit them first"));
         let _ = origin;
@@ -12995,10 +13164,293 @@ mod tests {
         git_ok(&work, &["add", "-A"]);
         git_ok(&work, &["commit", "--quiet", "-m", "server"]);
         git_ok(&work, &["push", "--quiet", "origin", "main"]);
-        let err =
-            refuse_not_submittable_git(&wc, Some(&test_auth()), &DryRun::new(false)).unwrap_err();
+        let err = refuse_not_submittable_git(&wc, Some(&test_auth()), None, &DryRun::new(false))
+            .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::WorkingCopyOutdated);
         let _ = origin;
+    }
+
+    /// A Gitea client against the default instance, answering from
+    /// the fixture HTTP layer.
+    fn gitea_client(http: &FakeHttp) -> GiteaClient<'_> {
+        GiteaClient::with_base(
+            http,
+            "https://src.opensuse.org",
+            Credentials::Bearer {
+                token: "token".to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// A repo JSON body, shaped like Gitea answers: the fork's
+    /// parent when one is given, else none.
+    fn submit_repo_json(owner: &str, name: &str, parent: Option<(&str, &str)>) -> String {
+        let parent_json = match parent {
+            Some((parent_owner, parent_name)) => format!(
+                r#"{{"owner": {{"login": "{parent_owner}"}}, "name": "{parent_name}", "full_name": "{parent_owner}/{parent_name}"}}"#
+            ),
+            None => "null".to_string(),
+        };
+        format!(
+            r#"{{"owner": {{"login": "{owner}"}}, "name": "{name}", "full_name": "{owner}/{name}", "parent": {parent_json}, "default_branch": "main", "private": false, "clone_url": "https://src.opensuse.org/{owner}/{name}.git", "ssh_url": "gitea@src.opensuse.org:{owner}/{name}.git"}}"#
+        )
+    }
+
+    /// A branch JSON body, shaped like Gitea answers.
+    fn submit_branch_json(name: &str) -> String {
+        format!(
+            r#"{{"name": "{name}", "commit": {{"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "message": "initial", "url": "https://src.opensuse.org/api/v1/repos/pool/foo/git/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}, "protected": false}}"#
+        )
+    }
+
+    /// A git-backed checkout whose origin is a fork on the
+    /// configured instance, with a clean tree at its base: the
+    /// record is written by hand, like the `origin_repo` tests.
+    /// The live fetch never runs in these tests — the dry-run plan
+    /// skips it — so the origin need not be reachable.
+    fn git_submit_checkout(dir: &TempDirGuard) -> WorkingCopy {
+        init_repo(&dir.path);
+        write_file(&dir.path, "foo.spec", "Name: foo\n");
+        git_ok(&dir.path, &["add", "-A"]);
+        git_ok(&dir.path, &["commit", "--quiet", "-m", "initial"]);
+        let head = git(&dir.path, "rev-parse", &["HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string();
+        git_ok(
+            &dir.path,
+            &[
+                "config",
+                "--local",
+                "remote.origin.url",
+                "https://src.opensuse.org/scarabeus_iv/foo",
+            ],
+        );
+        write_record(
+            &dir.path,
+            "https://api.opensuse.org",
+            "home:alice",
+            "foo",
+            Backend::Git,
+            &head,
+            "",
+            None,
+            None,
+        )
+        .unwrap();
+        open(&dir.path).unwrap()
+    }
+
+    /// A checkout recorded without scmsync keys opens with
+    /// neither: the record stays backward compatible.
+    #[test]
+    fn open_reads_a_checkout_recorded_without_scmsync_keys() {
+        let dir = TempDirGuard::new("submit-git-no-scmsync");
+        let wc = git_submit_checkout(&dir);
+        assert_eq!(wc.scmsync_url, None);
+        assert_eq!(wc.scmsync_branch, None);
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_verifies_the_target_is_the_parent() {
+        let dir = TempDirGuard::new("submit-git-verify");
+        let wc = git_submit_checkout(&dir);
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/scarabeus_iv/foo",
+                &submit_repo_json("scarabeus_iv", "foo", Some(("pool", "foo"))),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/pool/foo/branches/main",
+                &submit_branch_json("main"),
+            );
+        let gitea = gitea_client(&http);
+        let target = GitTargetVerification {
+            client: &gitea,
+            instance_url: "https://src.opensuse.org",
+            owner: "pool",
+            repo: "foo",
+            base: "main",
+            repo_explicit: false,
+        };
+        assert!(refuse_not_submittable_git(&wc, None, Some(&target), &DryRun::new(true)).is_ok());
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_a_target_that_is_not_the_parent() {
+        let dir = TempDirGuard::new("submit-git-wrong-parent");
+        let wc = git_submit_checkout(&dir);
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/scarabeus_iv/foo",
+            &submit_repo_json("scarabeus_iv", "foo", Some(("pool", "foo"))),
+        );
+        let gitea = gitea_client(&http);
+        let target = GitTargetVerification {
+            client: &gitea,
+            instance_url: "https://src.opensuse.org",
+            owner: "other",
+            repo: "foo",
+            base: "main",
+            repo_explicit: false,
+        };
+        let err =
+            refuse_not_submittable_git(&wc, None, Some(&target), &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not the parent"), "err: {err}");
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_an_origin_that_is_not_a_fork() {
+        let dir = TempDirGuard::new("submit-git-no-parent");
+        let wc = git_submit_checkout(&dir);
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/scarabeus_iv/foo",
+            &submit_repo_json("scarabeus_iv", "foo", None),
+        );
+        let gitea = gitea_client(&http);
+        let target = GitTargetVerification {
+            client: &gitea,
+            instance_url: "https://src.opensuse.org",
+            owner: "pool",
+            repo: "foo",
+            base: "main",
+            repo_explicit: false,
+        };
+        let err =
+            refuse_not_submittable_git(&wc, None, Some(&target), &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a fork"), "err: {err}");
+        assert!(err.to_string().contains("pass --repo"), "err: {err}");
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_explicit_repo_names_branching_first_for_a_parentless_origin() {
+        let dir = TempDirGuard::new("submit-git-no-parent-explicit");
+        let wc = git_submit_checkout(&dir);
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/scarabeus_iv/foo",
+            &submit_repo_json("scarabeus_iv", "foo", None),
+        );
+        let gitea = gitea_client(&http);
+        let target = GitTargetVerification {
+            client: &gitea,
+            instance_url: "https://src.opensuse.org",
+            owner: "pool",
+            repo: "foo",
+            base: "main",
+            repo_explicit: true,
+        };
+        let err =
+            refuse_not_submittable_git(&wc, None, Some(&target), &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a fork"), "err: {err}");
+        assert!(
+            err.to_string()
+                .contains("branch the checkout from the target repo first"),
+            "err: {err}"
+        );
+        assert!(!err.to_string().contains("pass --repo"), "err: {err}");
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_explicit_repo_rewords_an_unreadable_origin() {
+        let dir = TempDirGuard::new("submit-git-foreign-origin-explicit");
+        let wc = git_submit_checkout(&dir);
+        git_ok(
+            &dir.path,
+            &[
+                "config",
+                "--local",
+                "remote.origin.url",
+                "https://example.com/scarabeus_iv/foo",
+            ],
+        );
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let target = GitTargetVerification {
+            client: &gitea,
+            instance_url: "https://src.opensuse.org",
+            owner: "pool",
+            repo: "foo",
+            base: "main",
+            repo_explicit: true,
+        };
+        let err =
+            refuse_not_submittable_git(&wc, None, Some(&target), &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .contains("must be the parent of the checkout's origin"),
+            "err: {err}"
+        );
+        assert!(!err.to_string().contains("pass --repo"), "err: {err}");
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_explicit_repo_rewords_an_unparsable_origin() {
+        let dir = TempDirGuard::new("submit-git-unparsable-origin-explicit");
+        let wc = git_submit_checkout(&dir);
+        git_ok(
+            &dir.path,
+            &[
+                "config",
+                "--local",
+                "remote.origin.url",
+                "/tmp/no-such-origin",
+            ],
+        );
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let target = GitTargetVerification {
+            client: &gitea,
+            instance_url: "https://src.opensuse.org",
+            owner: "pool",
+            repo: "foo",
+            base: "main",
+            repo_explicit: true,
+        };
+        let err =
+            refuse_not_submittable_git(&wc, None, Some(&target), &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("cannot read a host"), "err: {err}");
+        assert!(
+            err.to_string()
+                .contains("must be the parent of the checkout's origin"),
+            "err: {err}"
+        );
+        assert!(!err.to_string().contains("pass --repo"), "err: {err}");
+    }
+
+    #[test]
+    fn refuse_not_submittable_git_refuses_a_base_missing_on_the_target() {
+        let dir = TempDirGuard::new("submit-git-no-base");
+        let wc = git_submit_checkout(&dir);
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/scarabeus_iv/foo",
+                &submit_repo_json("scarabeus_iv", "foo", Some(("pool", "foo"))),
+            )
+            .with_get_error(
+                "https://src.opensuse.org/api/v1/repos/pool/foo/branches/main",
+                ErrorKind::NotFound,
+            );
+        let gitea = gitea_client(&http);
+        let target = GitTargetVerification {
+            client: &gitea,
+            instance_url: "https://src.opensuse.org",
+            owner: "pool",
+            repo: "foo",
+            base: "main",
+            repo_explicit: false,
+        };
+        let err =
+            refuse_not_submittable_git(&wc, None, Some(&target), &DryRun::new(true)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("does not exist on pool/foo"),
+            "err: {err}"
+        );
     }
 
     /// A bare origin at `<dir>/owner/repo`, served over smart
@@ -13108,6 +13560,8 @@ mod tests {
             Backend::Git,
             &head,
             "",
+            None,
+            None,
         )
         .unwrap();
         let wc = open(&dir.path).unwrap();

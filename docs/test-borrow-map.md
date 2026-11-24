@@ -709,7 +709,7 @@ natively — there is no adoptable comment case. Counts unchanged.
 
 ## Batch 9 — Gitea operations
 
-**Direct adoptions: 15 (2 unit + 13 behave). Surveyed in full
+**Direct adoptions: 18 (2 unit + 16 behave). Surveyed in full
 (sweep 2): all 15 `git-*.feature` files (56 scenarios) and all 338
 unsurveyed unit tests.**
 
@@ -719,8 +719,19 @@ unsurveyed unit tests.**
   scenarios adopted in #140, 1 read scenario adopted in sweep 2
   (`:170` "Get a pull request that doesn't exist" →
   `pr_get_missing_pr_is_not_found`, a 404 mapping to `NotFound`),
-  8 checkout/rebase/create scenarios out of scope for the read
-  surface (working-copy ops / `pr create`, not implemented).
+  2 create scenarios adopted in #298 (`:355` explicit
+  `--source`/`--target` → explicit `--repo`/`--base` files to that
+  target; `:365` `:branch` form → the target repo defaults to the
+  origin's parent), 6 checkout/rebase/deprecated-form scenarios
+  out of scope (working-copy ops / one form only, no deprecated
+  form to warn about).
+- `git-pr-empty.feature` (2): 1 adopted — the no-target defaulting
+  the first scenario exercises (target repo = the origin's parent,
+  base = the scmsync branch else the target's default branch, pinned
+  by `resolve_git_submit_target_refuses_a_defaulted_target_whose_default_is_factory`,
+  which resolves the parent before refusing the factory default);
+  the identical-commits refusal and `--allow-empty` are recorded
+  under gaps for the create op.
 - `git-pr-review-request.feature` (5): 5 adopted in #154 (step 4).
 - `git-repo-fork.feature` (3): 1 adopted in sweep 2 (`:72`
   fork-of-fork → `fork_repo_fork_of_a_fork_verifies_the_immediate_parent`,
@@ -811,11 +822,17 @@ unsurveyed unit tests.**
   checkout/rebase (`git-pr.feature` lines 190, 217, 231, 259):
   working-copy layer (#17, blocked on Gitea ops).
 - PR create (`git-pr.feature` create scenarios, `git-pr-empty.feature`
-  2, `git-pr-fork-to-fork.feature` 1): not implemented; the empty-PR
+  2, `git-pr-fork-to-fork.feature` 1): the target defaults are
+  implemented in #298 (target repo = the fork's parent, base = the
+  scmsync branch else the target's default branch, head =
+  `fork-owner:branch` when the target is not the origin repo; a
+  `factory` base is refused per the devel rule) — the no-target
+  defaulting the
+  `git-pr-empty.feature` first scenario exercises. The empty-PR
   rule ("Source and target are identical" refused) and the
-  fork-to-fork target form are validation rules for the create op.
-  `Branch.split_id` (`test_gitea_api_branch.py`) is the target-spec
-  parser for it.
+  fork-to-fork target form are still validation rules for the create
+  op. `Branch.split_id` (`test_gitea_api_branch.py`) is the
+  target-spec parser for it.
 - Git helpers for the working-copy layer: `Git.urlparse`/`urljoin`/
   `detect_git` (`test_gitea_api_git.py`), `GitDiffGenerator`
   (`test_gitea_api_git_diff_generator.py`, incl. the `.gitmodules`
