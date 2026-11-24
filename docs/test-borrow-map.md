@@ -977,6 +977,24 @@ table in this tree still records #40 as 231 (125 + 106) — that gap
 predates this PR (the #217/#232/#207 adoptions are recorded in #40
 but not in this tree's map) and is not changed by it.
 
+## Gap batch 3 — project-meta full-shape write test (#266)
+
+**Direct adoptions: 0. No reference test pins a full-shape project
+meta write; same mining as the #157 section above.**
+
+- The only behave scenario that PUTs project meta
+  (`behave/features/linkpac.feature:48`) carries no `<repository>`
+  at all, and no scenario mentions `download` or `releasetarget`;
+  the `repo add` scenario (`behave/features/repo.feature:24`)
+  covers arch + path only. No unit test mentions `releasetarget`
+  or a download model.
+- The new live test
+  `live_set_project_meta_writes_full_shape_and_reads_back` writes
+  the full shape through `set_project_meta` and reads it back,
+  reusing the `full_shape_repository` shape the
+  `live_full_repository_shape_round_trips` test already pins
+  through `add_repository`.
+
 ## Batch 11 — prjconf
 
 **Direct adoptions: 0. osc has no prjconf tests.**

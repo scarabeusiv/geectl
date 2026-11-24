@@ -6298,22 +6298,14 @@ fn live_add_repository_round_trips() {
     assert_eq!(err.kind(), ErrorKind::AlreadyExists);
 }
 
-/// Add a repository carrying the full shape through the library,
-/// verified by re-listing and by reading the project meta: the
-/// download, release target and host system read back unchanged.
-#[test]
-fn live_full_repository_shape_round_trips() {
-    let Some(base) = live_url() else {
-        return;
-    };
-    let authed = live_client_authed(&base);
-    let package = live_package();
-    let source_project = create_source_branch(&authed, &package);
-    let path_target = create_path_target(&authed, &base);
-    let repository = Repository {
+/// A repository carrying the full shape: a download with master,
+/// archfilter and pubkey, a release target and a host system, over
+/// two architectures and one path.
+fn full_shape_repository(path_target: &str) -> Repository {
+    Repository {
         name: "full".to_string(),
         arch: vec!["x86_64".to_string(), "aarch64".to_string()],
-        paths: vec![(path_target.clone(), "standard".to_string())],
+        paths: vec![(path_target.to_string(), "standard".to_string())],
         rebuild: Some("local".to_string()),
         block: Some("never".to_string()),
         linkedbuild: Some("all".to_string()),
@@ -6329,12 +6321,27 @@ fn live_full_repository_shape_round_trips() {
             }),
         }],
         release_targets: vec![ReleaseTarget {
-            project: path_target.clone(),
+            project: path_target.to_string(),
             repository: Some("standard".to_string()),
             trigger: Some("manual".to_string()),
         }],
-        hostsystem: vec![(path_target.clone(), "standard".to_string())],
+        hostsystem: vec![(path_target.to_string(), "standard".to_string())],
+    }
+}
+
+/// Add a repository carrying the full shape through the library,
+/// verified by re-listing and by reading the project meta: the
+/// download, release target and host system read back unchanged.
+#[test]
+fn live_full_repository_shape_round_trips() {
+    let Some(base) = live_url() else {
+        return;
     };
+    let authed = live_client_authed(&base);
+    let package = live_package();
+    let source_project = create_source_branch(&authed, &package);
+    let path_target = create_path_target(&authed, &base);
+    let repository = full_shape_repository(&path_target);
     assert!(
         authed
             .add_repository(&source_project, &repository, false, &DryRun::new(false))
@@ -7091,6 +7098,45 @@ fn live_set_project_meta_writes_and_reads_back() {
         Some("Retitled by the geectl live test.")
     );
     assert_eq!(read_back.url.as_deref(), Some("https://example.com/live"));
+}
+
+/// The project meta write carries a full-shape repository and reads
+/// it back: the download (with master, archfilter and pubkey),
+/// release target and host system survive the `set_project_meta`
+/// round trip, alongside the retitled fields.
+#[test]
+fn live_set_project_meta_writes_full_shape_and_reads_back() {
+    let Some(base) = live_url() else {
+        return;
+    };
+    let client = live_client_authed(&base);
+    let package = live_package();
+    let project = create_source_branch(&client, &package);
+    let path_target = create_path_target(&client, &base);
+    let mut meta = client
+        .project_meta(&project)
+        .expect("read the project meta on the live instance");
+    meta.title = Some("geectl live test retitled".to_string());
+    meta.description = Some("Retitled by the geectl live test.".to_string());
+    meta.url = Some("https://example.com/live".to_string());
+    let repository = full_shape_repository(&path_target);
+    meta.repositories = vec![repository.clone()];
+    client
+        .set_project_meta(&project, &meta, &DryRun::new(false))
+        .expect("write the full-shape project meta on the live instance");
+    let read_back = client
+        .project_meta(&project)
+        .expect("read the project meta back from the server");
+    assert_eq!(
+        read_back.title.as_deref(),
+        Some("geectl live test retitled")
+    );
+    assert_eq!(
+        read_back.description.as_deref(),
+        Some("Retitled by the geectl live test.")
+    );
+    assert_eq!(read_back.url.as_deref(), Some("https://example.com/live"));
+    assert_eq!(read_back.repositories, vec![repository]);
 }
 
 /// The package meta write reads back what was written, and leaves
