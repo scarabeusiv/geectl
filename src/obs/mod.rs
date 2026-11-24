@@ -13,9 +13,9 @@
 //! `references/request-text.md` "SR and PR messages",
 //! `references/git-workflow.md` "Submitting changes", and
 //! `references/changelog-rules.md"):
-//! - A submit request targets the DEVEL project, never Factory
-//!   directly. A payload naming `openSUSE:Factory` as its target is
-//!   refused at build time.
+//! - A submit request targets the DEVEL project, or Factory from
+//!   the recorded devel project and package: a Factory target is
+//!   verified live at filing against the target package meta.
 //! - Filing supersedes every open submit request for the package from
 //!   the authenticated user. [`SrFiling::file`] files the new request
 //!   first, then supersedes each open one with it; the supersede is

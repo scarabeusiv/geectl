@@ -429,8 +429,9 @@ pub struct FileArgs {
     /// The package in the source project.
     #[arg(long)]
     source_package: String,
-    /// The project the request targets (the devel project, never
-    /// openSUSE:Factory directly).
+    /// The project the request targets: the devel project, or
+    /// openSUSE:Factory when the source is the recorded devel
+    /// project and package.
     #[arg(long)]
     target_project: String,
     /// The package in the target project.

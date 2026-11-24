@@ -3250,6 +3250,33 @@ impl<'a> ObsClient<'a> {
         parse_package_meta(&body)
     }
 
+    /// Read the meta of package `package` in project `project` with the client's
+    /// credentials (`GET /source/<project>/<package>/_meta`). The
+    /// authenticated twin of [`ObsClient::package_meta`]: the public
+    /// read answers 404 for a package that exists but is hidden
+    /// (access-disabled), so a filing-path caller that trusted the
+    /// public read alone would treat a hidden target as "no record
+    /// yet" and skip the recorded-devel verification. A 404 here
+    /// means the package really is missing for this caller; any
+    /// other failure fails loudly, like the public read.
+    pub fn package_meta_authenticated(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<PackageMeta, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let url = build_url(&self.base, &["source", project, package, "_meta"], &[]);
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_package_meta(&body)
+    }
+
     /// Search packages by substring (`GET
     /// /search/package?match=...`): the match is
     /// `contains(@name,'term') or contains(title,'term') or
@@ -10195,6 +10222,31 @@ mod tests {
         assert_eq!(meta.name, "foo");
         assert_eq!(meta.project, "openSUSE:Factory");
         assert_eq!(meta.persons.len(), 2);
+    }
+
+    #[test]
+    fn package_meta_authenticated_reads_the_authenticated_endpoint() {
+        // The authenticated package-meta read hits the plain
+        // `/source/…/_meta` endpoint with the client's credentials
+        // — the read a filing-path caller uses to tell a hidden
+        // package apart from a missing one.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            PACKAGE_META_FIXTURE,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let meta = client
+            .package_meta_authenticated("openSUSE:Factory", "foo")
+            .unwrap();
+        assert_eq!(meta.name, "foo");
+        assert_eq!(meta.project, "openSUSE:Factory");
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta".to_string(),
+                true
+            )]
+        );
     }
 
     #[test]

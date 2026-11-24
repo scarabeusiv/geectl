@@ -81,9 +81,10 @@ pub struct SrPayload {
     source_project: String,
     /// The package in the source project.
     source_package: String,
-    /// The project the SR targets (the devel project). Never
-    /// `openSUSE:Factory` — a submit request targets the devel
-    /// project; Factory comes via a forward.
+    /// The project the SR targets: the devel project, or
+    /// `openSUSE:Factory` when the source is the recorded devel
+    /// project and package — the filing path verifies the Factory
+    /// case live against the target package meta.
     target_project: String,
     /// The package in the target project.
     target_package: String,
@@ -103,14 +104,16 @@ pub struct SrPayload {
 
 impl SrPayload {
     /// Build and validate a payload. Every name must be a valid OBS
-    /// project/package name, the target must not be
-    /// `openSUSE:Factory`, the description and `.changes` entry must
+    /// project/package name, the description and `.changes` entry must
     /// be non-empty, and the `.changes` entry must name every CVE in
-    /// `cves`. The payload carries `opt_sourceupdate="cleanup"` by
-    /// default, so OBS deletes the source branch on accept; use
-    /// [`SrPayload::without_cleanup`] when the branch must survive.
-    /// Returns Err instead of building a payload that could not be
-    /// filed.
+    /// `cves`. A Factory target is allowed here; the filing path
+    /// verifies live that the source is the recorded devel project
+    /// and package of the target. The payload carries
+    /// `opt_sourceupdate="cleanup"` by default, so OBS deletes the
+    /// source branch on accept; use [`SrPayload::without_cleanup`]
+    /// when the branch must survive. Returns Err instead of building
+    /// a payload that could not be filed, except a Factory target
+    /// whose devel check runs at filing.
     pub fn new(
         source_project: &str,
         source_package: &str,
@@ -138,12 +141,15 @@ impl SrPayload {
     }
 
     /// The semantic checks [`SrPayload::new`] runs: every name must
-    /// be a valid OBS project/package name, the target must not be
-    /// `openSUSE:Factory`, the description and `.changes` entry must
-    /// be non-empty, and the `.changes` entry must name every CVE in
-    /// `cves`. [`SrFiling::file`] runs the same checks again on the
-    /// filing path, so a payload that reaches filing is validated
-    /// there too, not only at construction.
+    /// be a valid OBS project/package name, the description and
+    /// `.changes` entry must be non-empty, and the `.changes` entry
+    /// must name every CVE in `cves`. A Factory target passes here:
+    /// the rule is that Factory takes submissions only from the
+    /// recorded devel project and package, and that needs a live
+    /// read of the target package meta, so the filing path checks
+    /// it ([`SrFiling::file`]). [`SrFiling::file`] runs the same
+    /// checks again on the filing path, so a payload that reaches
+    /// filing is validated there too, not only at construction.
     pub fn validate_semantics(&self) -> Result<(), GeectlError> {
         for (label, value) in [
             ("source project", self.source_project.as_str()),
@@ -166,15 +172,6 @@ impl SrPayload {
                     format!("invalid OBS package name for {label}: {value:?}"),
                 ));
             }
-        }
-        // A submit request targets the devel project, never Factory
-        // directly: the Factory step is a forward after the devel
-        // request lands.
-        if self.target_project == FACTORY_PROJECT {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                "submit requests target the devel project, never openSUSE:Factory directly",
-            ));
         }
         if self.description.trim().is_empty() {
             return Err(GeectlError::new(
@@ -211,7 +208,9 @@ impl SrPayload {
         &self.source_package
     }
 
-    /// The project the SR targets (the devel project).
+    /// The project the SR targets: the devel project, or
+    /// openSUSE:Factory when the source is the recorded devel
+    /// project and package.
     pub fn target_project(&self) -> &str {
         &self.target_project
     }
@@ -1664,10 +1663,27 @@ impl<'a> SrFiling<'a> {
             // line in the plan.) The detail lines go through `note`,
             // not `eprintln`, so the plan carries them too.
             self.log_would_be_submit_request(payload);
+            if payload.target_project == FACTORY_PROJECT {
+                self.dry_run.note(&format!(
+                    "would: verify {}/{} is the recorded devel project and package of {}/{} before filing",
+                    payload.source_project,
+                    payload.source_package,
+                    payload.target_project,
+                    payload.target_package
+                ));
+            }
             for note in dry_run_supersede {
                 self.dry_run.note(note);
             }
             return Ok(None);
+        }
+        // A Factory target files only from the recorded devel
+        // project and package: the source must be what the target
+        // package meta records as its devel, project and package
+        // both. The read runs here, on the filing path, where the
+        // client is available.
+        if payload.target_project == FACTORY_PROJECT {
+            self.check_factory_target(payload)?;
         }
         let open = self
             .obs
@@ -1693,6 +1709,56 @@ impl<'a> SrFiling<'a> {
         let id = self.obs.create_request(payload)?;
         let superseded = self.supersede_all(&supersede, &id)?;
         Ok(Some(FiledRequest { id, superseded }))
+    }
+
+    /// Verify a Factory target: the source must be the recorded
+    /// devel project and package of the target package, as the
+    /// target package meta records them. The read is the
+    /// authenticated package-meta read: the public endpoint answers
+    /// 404 for a target that exists but is hidden, and a caller
+    /// that trusted that 404 as "no record yet" would file without
+    /// verifying the recorded devel — exactly what this rule exists
+    /// to prevent. A 404 on the authenticated read means the package
+    /// really is missing for this caller, so the first submission
+    /// from devel proceeds. A recorded devel that names another
+    /// project or package, or no devel at all, refuses the filing
+    /// with the rule named. The same 100% rule the forward applies
+    /// on its coordinates.
+    ///
+    /// The check runs on the live path only: dry-run reads nothing,
+    /// so a dry-run plan prints "would file" for a Factory
+    /// submission the live check would refuse; the plan records the
+    /// would-be verification instead.
+    fn check_factory_target(&self, payload: &SrPayload) -> Result<(), GeectlError> {
+        let source = format!("{}/{}", payload.source_project, payload.source_package);
+        let target = format!("{}/{}", payload.target_project, payload.target_package);
+        match self
+            .obs
+            .package_meta_authenticated(&payload.target_project, &payload.target_package)
+        {
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+            Ok(meta) => match meta.devel {
+                Some((recorded_project, recorded_package))
+                    if recorded_project == payload.source_project
+                        && recorded_package == payload.source_package =>
+                {
+                    Ok(())
+                }
+                Some((recorded_project, recorded_package)) => Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to submit {source} to openSUSE:Factory: {target} records devel {recorded_project}/{recorded_package}, not {source}"
+                    ),
+                )),
+                None => Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to submit {source} to openSUSE:Factory: {target} records no devel project"
+                    ),
+                )),
+            },
+        }
     }
 
     /// Log the would-be submit request in full, for the dry-run
@@ -2275,11 +2341,13 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_factory_as_target() {
-        // A submit request targets the devel project, never Factory
-        // directly.
+    fn new_accepts_factory_as_target() {
+        // Construction does not refuse a Factory target: the rule
+        // is that Factory takes submissions only from the recorded
+        // devel project and package, and that needs a live read of
+        // the target package meta, so the filing path checks it.
         assert!(SrPayload::new(
-            "home:scarabeus_iv",
+            "devel:languages:python",
             "foo",
             "openSUSE:Factory",
             "foo",
@@ -2287,7 +2355,7 @@ mod tests {
             "- Update to version 2.0.\n",
             &[],
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]
@@ -2709,6 +2777,340 @@ mod tests {
         // The open-request search ran first, then the filing POST.
         assert_eq!(http.get_calls().len(), 1);
         assert_eq!(http.post_calls().len(), 1);
+    }
+
+    fn factory_payload() -> SrPayload {
+        SrPayload::new(
+            "devel:languages:python",
+            "foo",
+            "openSUSE:Factory",
+            "foo",
+            "Update foo to 2.0",
+            "- Update to version 2.0.\n",
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn factory_search_url() -> String {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        obs.search_url("foo").unwrap()
+    }
+
+    #[test]
+    fn file_live_factory_target_from_recorded_devel_files() {
+        // The source is the recorded devel project and package of
+        // the target: the Factory submission files.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
+            )
+            .with_get(&factory_search_url(), "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing.file(&factory_payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
+        );
+        // The devel check read the target meta first, then the
+        // open-request search ran, then the filing POST.
+        assert_eq!(http.get_calls().len(), 2);
+        assert_eq!(
+            http.get_calls()[0],
+            (
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta".to_string(),
+                true
+            )
+        );
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_live_factory_target_new_package_files() {
+        // No Factory record yet: the first submission from devel
+        // proceeds.
+        let http = FakeHttp::new()
+            .with_get_error(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_get(
+                &factory_search_url(),
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing.file(&factory_payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
+        );
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_live_factory_target_from_other_project_refuses() {
+        // The recorded devel names another project: the filing is
+        // refused before anything is filed.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:other\" package=\"foo\"/></package>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.file(&factory_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains(
+                "refusing to submit devel:languages:python/foo to openSUSE:Factory: openSUSE:Factory/foo records devel devel:other/foo, not devel:languages:python/foo"
+            ),
+            "{}",
+            err.context
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_live_factory_target_hidden_target_refuses() {
+        // The target exists but is hidden from the public endpoint:
+        // the public read 404s while the authenticated read answers
+        // with a devel naming another project. The check must run on
+        // the authenticated read and refuse — a public read would
+        // have treated the 404 as "no record yet" and filed.
+        let http = FakeHttp::new()
+            .with_get_error(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:other\" package=\"foo\"/></package>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.file(&factory_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains(
+                "refusing to submit devel:languages:python/foo to openSUSE:Factory: openSUSE:Factory/foo records devel devel:other/foo, not devel:languages:python/foo"
+            ),
+            "{}",
+            err.context
+        );
+        // Only the authenticated endpoint was read, with
+        // credentials; the public 404 never decided anything.
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta".to_string(),
+                true
+            )]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_live_factory_target_rename_refuses() {
+        // The recorded devel project matches but the package does
+        // not: a rename case must fail the 100% match.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.file(&factory_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains(
+                "refusing to submit devel:languages:python/foo to openSUSE:Factory: openSUSE:Factory/foo records devel devel:languages:python/bar, not devel:languages:python/foo"
+            ),
+            "{}",
+            err.context
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_live_factory_target_without_recorded_devel_refuses() {
+        // The target records no devel project at all: the source
+        // cannot be its devel, so the filing is refused.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><title>Foo package</title></package>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.file(&factory_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains(
+                "refusing to submit devel:languages:python/foo to openSUSE:Factory: openSUSE:Factory/foo records no devel project"
+            ),
+            "{}",
+            err.context
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_dry_run_factory_target_makes_no_requests() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        let filing = SrFiling::new(&obs, &dry);
+        let payload = factory_payload();
+        assert_eq!(filing.file(&payload).unwrap(), None);
+        // Nothing was read or filed: no meta GET, no search, no POST.
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec![
+                "[dry-run] would: file submit request for foo to openSUSE:Factory".to_string(),
+                "[dry-run] --- would-be submit request (dry-run) ---".to_string(),
+                "[dry-run] source: devel:languages:python/foo".to_string(),
+                "[dry-run] target: openSUSE:Factory/foo".to_string(),
+                "[dry-run] description: Update foo to 2.0".to_string(),
+                format!("[dry-run] changes entry: {}", payload.changes_entry()),
+                format!("[dry-run] {}", payload.to_xml()),
+                "[dry-run] --- end of would-be submit request ---".to_string(),
+                "[dry-run] would: verify devel:languages:python/foo is the recorded devel project and package of openSUSE:Factory/foo before filing".to_string(),
+                "[dry-run] would: supersede all open submit requests targeting foo with the new request".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_live_factory_target_rename_allow_files() {
+        // The recorded devel names a different package than the
+        // target, and the source is that package: the 100% match
+        // holds on the source coordinates, so the filing proceeds.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
+            )
+            .with_get(&factory_search_url(), "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let payload = SrPayload::new(
+            "devel:languages:python",
+            "bar",
+            "openSUSE:Factory",
+            "foo",
+            "Update foo to 2.0",
+            "- Update to version 2.0.\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            filing.file(&payload).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
+        );
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_live_factory_target_meta_error_fails_closed() {
+        // A non-NotFound error reading the target meta fails the
+        // filing: nothing is filed on an unreadable record.
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            ErrorKind::ServerError,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.file(&factory_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn refile_live_factory_target_from_other_project_refuses() {
+        // The refile path shares the filing path, so a Factory
+        // refile from a non-devel source is refused before
+        // anything is filed or superseded.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:other\" package=\"foo\"/></package>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.refile(&factory_payload(), "1398492").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context
+                .contains("records devel devel:other/foo, not devel:languages:python/foo"),
+            "{}",
+            err.context
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn refile_dry_run_factory_target_makes_no_requests() {
+        // The refile dry-run plan carries the would-verify note
+        // and reads nothing.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        let filing = SrFiling::new(&obs, &dry);
+        let payload = factory_payload();
+        assert_eq!(filing.refile(&payload, "1398492").unwrap(), None);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec![
+                "[dry-run] would: file submit request for foo to openSUSE:Factory".to_string(),
+                "[dry-run] --- would-be submit request (dry-run) ---".to_string(),
+                "[dry-run] source: devel:languages:python/foo".to_string(),
+                "[dry-run] target: openSUSE:Factory/foo".to_string(),
+                "[dry-run] description: Update foo to 2.0".to_string(),
+                format!("[dry-run] changes entry: {}", payload.changes_entry()),
+                format!("[dry-run] {}", payload.to_xml()),
+                "[dry-run] --- end of would-be submit request ---".to_string(),
+                "[dry-run] would: verify devel:languages:python/foo is the recorded devel project and package of openSUSE:Factory/foo before filing".to_string(),
+                "[dry-run] would: supersede submit request 1398492 with the new request".to_string(),
+                "[dry-run] would: supersede all other open submit requests targeting foo with the new request".to_string(),
+            ]
+        );
     }
 
     #[test]

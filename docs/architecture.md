@@ -120,7 +120,7 @@ expression), and `ReviewTarget` (who a review is asked of).
 
 Behaviour rules (from the openSUSE packaging guide):
 
-A submit request targets the DEVEL project. A payload naming `openSUSE:Factory` as its target fails at build time.
+A submit request targets the DEVEL project, or Factory from the recorded devel project and package: a Factory target is verified live at filing against the target package meta.
 Regular flow: Home -> devel -> Factory -> updates. Devel projects have maintainers and owners, and they are allowed to skip the home step: Devel -> Factory -> updates. That is the legitimate path — the devel project's maintainers and owners work in devel directly and submit straight to Factory. The develprj check exists because only the devel project may submit to Factory.
 Filing supersedes every open submit request for the package from the authenticated user. `SrFiling::file` files the new request first, then supersedes each open one with it; the supersede is unconditional — a second filing at the same head files and supersedes again. The open-request check is also available on its own as `ObsClient::has_open_sr`.
 The SR description follows the guide's message format: one headline of at most 160 characters of prose, then `- ` lines for staging, needs, and rebuilds. The library validates the description is non-empty; the headline shape is the caller's responsibility.

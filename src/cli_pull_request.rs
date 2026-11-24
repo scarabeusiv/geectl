@@ -138,8 +138,9 @@ pub enum PullRequestCommand {
 /// `--changes-entry` on OBS; `--base` and `--title` on Gitea.
 #[derive(Debug, Args)]
 pub struct SubmitArgs {
-    /// The project the request targets (the devel project, never
-    /// openSUSE:Factory directly). OBS only; required there.
+    /// The project the request targets: the devel project, or
+    /// openSUSE:Factory when the source is the recorded devel
+    /// project and package. OBS only; required there.
     #[arg(long)]
     target_project: Option<String>,
     /// The package in the target project. OBS only; the checkout
