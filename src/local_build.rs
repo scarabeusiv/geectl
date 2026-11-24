@@ -10531,7 +10531,7 @@ exit 0
             let err = vertical
                 .resolve_image(req.refresh_image, req.timeout_secs, deadline)
                 .unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::BuildTimeout);
+            assert_eq!(err.kind(), ErrorKind::BuildTimeout, "got: {err}");
             assert!(err.context.contains("timed out"), "got: {}", err.context);
         }
 
