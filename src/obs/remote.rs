@@ -11,6 +11,7 @@ use super::parse_search_matches;
 use super::parse_status_invoked;
 use super::parse_status_ok;
 use super::quoted_attr_value;
+use super::single_element_text;
 use super::tag_attr;
 use super::valid_obs_filename;
 use super::valid_obs_filename_for_delete;
@@ -1434,12 +1435,17 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
                     .map(|value| xml_unescape(&value))
                     .filter(|value| !value.is_empty())
             };
+            // A second `<master>` is rejected, not read as the
+            // first: a single-value child with two occurrences
+            // has no defined kept value, and the meta write
+            // path refuses the duplicate too.
             let master_elements = elements(&download_inner, "master")?;
-            // `<master>`, `<archfilter>` and `<pubkey>` are singular
-            // in the typed model, which keeps the first of each: a
-            // second one is server-accepted state the parse keeps
-            // readable, and the rewrite refuses it instead of
-            // dropping it (see `unmodeled_repository_content`).
+            if master_elements.len() > 1 {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS project meta response: duplicate <master> in <download>",
+                ));
+            }
             let master = master_elements
                 .into_iter()
                 .map(
@@ -1465,12 +1471,22 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
                 arch: opt_attr(&download_tag, "arch"),
                 url: xml_unescape(&url),
                 repotype: opt_attr(&download_tag, "repotype"),
-                archfilter: element_text(&download_inner, "archfilter")
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty()),
-                pubkey: element_text(&download_inner, "pubkey")
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty()),
+                archfilter: single_element_text(
+                    &download_inner,
+                    "archfilter",
+                    "download",
+                    "OBS project meta response",
+                )?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+                pubkey: single_element_text(
+                    &download_inner,
+                    "pubkey",
+                    "download",
+                    "OBS project meta response",
+                )?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
                 master,
             });
         }
@@ -9960,6 +9976,94 @@ mod tests {
             .unwrap_err()
             .context
             .contains("<master> with empty url"));
+    }
+
+    #[test]
+    fn project_meta_rejects_duplicate_single_value_download_children() {
+        // A second single-value child has no defined kept value, so
+        // the response is rejected instead of read as the first
+        // occurrence — the same refusal the meta write path makes, and
+        // the same rejection as `parse_repositories`.
+        let prefix = "<project name=\"home:scarabeus_iv\"><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\">";
+        let suffix = "</download></repository></project>";
+        for (children, child) in [
+            (
+                "<master url=\"https://a.example.com\"/><master url=\"https://b.example.com\"/>",
+                "master",
+            ),
+            (
+                "<archfilter>x86_64</archfilter><archfilter>i586</archfilter>",
+                "archfilter",
+            ),
+            ("<pubkey>aaa</pubkey><pubkey>bbb</pubkey>", "pubkey"),
+        ] {
+            let body = format!("{prefix}{children}{suffix}");
+            let err = parse_project_meta(&body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.context.contains("unexpected OBS project meta response"),
+                "{body}: {}",
+                err.context
+            );
+            assert!(
+                err.context
+                    .contains(&format!("duplicate <{child}> in <download>")),
+                "{body}"
+            );
+        }
+        // A duplicate is a duplicate even when the values agree, and
+        // even when both are empty: the count, not the value, is what
+        // has no defined reading.
+        for children in [
+            "<master url=\"https://a.example.com\"/><master url=\"https://a.example.com\"/>",
+            "<archfilter>x86_64</archfilter><archfilter>x86_64</archfilter>",
+            "<archfilter/><archfilter/>",
+            "<pubkey>aaa</pubkey><pubkey>aaa</pubkey>",
+            "<pubkey/><pubkey/>",
+        ] {
+            let body = format!("{prefix}{children}{suffix}");
+            assert!(parse_project_meta(&body).is_err(), "{body}");
+        }
+        // An unterminated single-value child is an error, not an
+        // absent value: the old readers returned None here, the
+        // strict readers reject the malformed response instead.
+        for (children, child) in [
+            ("<archfilter>x86_64", "archfilter"),
+            ("<pubkey>aaa", "pubkey"),
+        ] {
+            let body = format!("{prefix}{children}{suffix}");
+            let err = parse_project_meta(&body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.context
+                    .contains(&format!("malformed <{child}> element")),
+                "{body}: {}",
+                err.context
+            );
+        }
+        // One single-value child per download is still fine: the
+        // duplicate check is per `<download>`, not per repository.
+        let meta = parse_project_meta(
+            "<project name=\"home:scarabeus_iv\"><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://a.example.com\" repotype=\"rpmmd\"><master url=\"https://m-a.example.com\"/></download><download arch=\"x86_64\" url=\"https://b.example.com\" repotype=\"rpmmd\"><master url=\"https://m-b.example.com\"/></download></repository></project>",
+        )
+        .unwrap();
+        assert_eq!(meta.repositories[0].downloads.len(), 2);
+        assert_eq!(
+            meta.repositories[0].downloads[0]
+                .master
+                .as_ref()
+                .unwrap()
+                .url,
+            "https://m-a.example.com"
+        );
+        assert_eq!(
+            meta.repositories[0].downloads[1]
+                .master
+                .as_ref()
+                .unwrap()
+                .url,
+            "https://m-b.example.com"
+        );
     }
 
     #[test]

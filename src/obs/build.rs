@@ -1,5 +1,6 @@
 use super::build_url;
 use super::parse_status_ok;
+use super::single_element_text;
 use super::valid_obs_filename;
 use super::valid_obs_name;
 use super::DownloadMaster;
@@ -1917,12 +1918,17 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
                     ));
                 }
             };
+            // A second `<master>` is rejected, not read as the
+            // first: a single-value child with two occurrences
+            // has no defined kept value, and the meta write
+            // path refuses the duplicate too.
             let master_elements = xml_elements(download_inner, "master")?;
-            // `<master>`, `<archfilter>` and `<pubkey>` are singular
-            // in the typed model, which keeps the first of each: a
-            // second one is server-accepted state the parse keeps
-            // readable, and the rewrite refuses it instead of
-            // dropping it (see `unmodeled_repository_content`).
+            if master_elements.len() > 1 {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS repositories response: duplicate <master> in <download>",
+                ));
+            }
             let master = master_elements
                 .into_iter()
                 .map(|master_element| {
@@ -1949,10 +1955,22 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
                 arch: xml_attr_non_empty(download_tag, "arch"),
                 url,
                 repotype: xml_attr_non_empty(download_tag, "repotype"),
-                archfilter: xml_element_text(download_inner, "archfilter")
-                    .filter(|value| !value.is_empty()),
-                pubkey: xml_element_text(download_inner, "pubkey")
-                    .filter(|value| !value.is_empty()),
+                archfilter: single_element_text(
+                    download_inner,
+                    "archfilter",
+                    "download",
+                    "OBS repositories response",
+                )?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+                pubkey: single_element_text(
+                    download_inner,
+                    "pubkey",
+                    "download",
+                    "OBS repositories response",
+                )?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
                 master,
             });
         }
@@ -6739,36 +6757,82 @@ mod tests {
             .contains("<master> with empty url"));
     }
     #[test]
-    fn parse_repositories_keep_the_first_duplicate_download_child() {
-        // `<master>`, `<archfilter>` and `<pubkey>` are singular in
-        // the typed model: the parse keeps the first of each, so a
-        // read never fails on server-accepted state — only a rewrite
-        // refuses the duplicate (see the meta write tests).
-        for (body, child) in [
-            ("<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://a.example.com\"/><master url=\"https://b.example.com\"/></download></repository></project>", "master"),
-            ("<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><archfilter>aarch64</archfilter></download></repository></project>", "archfilter"),
-            ("<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><pubkey>key-one</pubkey><pubkey>key-two</pubkey></download></repository></project>", "pubkey"),
+    fn parse_repositories_rejects_duplicate_single_value_download_children() {
+        // A second single-value child has no defined kept value, so
+        // the response is rejected instead of read as the first
+        // occurrence — the same refusal the meta write path makes.
+        let prefix = "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\">";
+        let suffix = "</download></repository></project>";
+        for (children, child) in [
+            (
+                "<master url=\"https://a.example.com\"/><master url=\"https://b.example.com\"/>",
+                "master",
+            ),
+            (
+                "<archfilter>x86_64</archfilter><archfilter>i586</archfilter>",
+                "archfilter",
+            ),
+            ("<pubkey>aaa</pubkey><pubkey>bbb</pubkey>", "pubkey"),
         ] {
-            for parsed in [
-                parse_repositories(body).unwrap(),
-                parse_project_meta(body).unwrap().repositories,
-            ] {
-                let download = &parsed[0].downloads[0];
-                match child {
-                    "master" => assert_eq!(
-                        download.master.as_ref().unwrap().url,
-                        "https://a.example.com"
-                    ),
-                    "archfilter" => {
-                        assert_eq!(download.archfilter.as_deref(), Some("x86_64"))
-                    }
-                    "pubkey" => {
-                        assert_eq!(download.pubkey.as_deref(), Some("key-one"))
-                    }
-                    _ => unreachable!(),
-                }
-            }
+            let body = format!("{prefix}{children}{suffix}");
+            let err = parse_repositories(&body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.context.contains("unexpected OBS repositories response"),
+                "{body}: {}",
+                err.context
+            );
+            assert!(
+                err.context
+                    .contains(&format!("duplicate <{child}> in <download>")),
+                "{body}"
+            );
         }
+        // A duplicate is a duplicate even when the values agree, and
+        // even when both are empty: the count, not the value, is what
+        // has no defined reading.
+        for children in [
+            "<master url=\"https://a.example.com\"/><master url=\"https://a.example.com\"/>",
+            "<archfilter>x86_64</archfilter><archfilter>x86_64</archfilter>",
+            "<archfilter/><archfilter/>",
+            "<pubkey>aaa</pubkey><pubkey>aaa</pubkey>",
+            "<pubkey/><pubkey/>",
+        ] {
+            let body = format!("{prefix}{children}{suffix}");
+            assert!(parse_repositories(&body).is_err(), "{body}");
+        }
+        // An unterminated single-value child is an error, not an
+        // absent value: the old readers returned None here, the
+        // strict readers reject the malformed response instead.
+        for (children, child) in [
+            ("<archfilter>x86_64", "archfilter"),
+            ("<pubkey>aaa", "pubkey"),
+        ] {
+            let body = format!("{prefix}{children}{suffix}");
+            let err = parse_repositories(&body).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError);
+            assert!(
+                err.context
+                    .contains(&format!("malformed <{child}> element")),
+                "{body}: {}",
+                err.context
+            );
+        }
+        // One single-value child per download is still fine: the
+        // duplicate check is per `<download>`, not per repository.
+        let parsed = parse_repositories(
+            "<project name=\"p\"><repository name=\"standard\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://a.example.com\" repotype=\"rpmmd\"><master url=\"https://m-a.example.com\"/></download><download arch=\"x86_64\" url=\"https://b.example.com\" repotype=\"rpmmd\"><master url=\"https://m-b.example.com\"/></download></repository></project>",
+        )
+        .unwrap();
+        assert_eq!(parsed[0].downloads.len(), 2);
+        assert_eq!(
+            parsed[0].downloads[0].master.as_ref().unwrap().url,
+            "https://m-a.example.com"
+        );
+        assert_eq!(
+            parsed[0].downloads[1].master.as_ref().unwrap().url,
+            "https://m-b.example.com"
+        );
     }
 
     #[test]

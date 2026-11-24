@@ -898,6 +898,34 @@ pub(crate) fn element_text(block: &str, tag: &str) -> Option<String> {
     None
 }
 
+/// The text of the single `<tag>...</tag>` element in `block`, or
+/// None when there is none. The text is XML-unescaped. A second
+/// `<tag>` is a server error: a single-value child with two
+/// occurrences has no defined kept value, so the response is
+/// rejected instead of read as the first occurrence. The parent
+/// element names the duplicate in the error, and `subject` names
+/// the response being parsed, so a repositories read does not blame
+/// the project meta response. Unlike [`element_text`], an
+/// unterminated `<tag>` is an error, not an absent value.
+pub(crate) fn single_element_text(
+    block: &str,
+    tag: &str,
+    parent: &str,
+    subject: &str,
+) -> Result<Option<String>, GeectlError> {
+    let found = elements(block, tag)?;
+    if found.len() > 1 {
+        return Err(GeectlError::new(
+            ErrorKind::ServerError,
+            format!("unexpected {subject}: duplicate <{tag}> in <{parent}>"),
+        ));
+    }
+    Ok(found
+        .into_iter()
+        .next()
+        .map(|(_, inner)| xml_unescape(&inner)))
+}
+
 /// Each `<tag ...>...</tag>` (or self-closing `<tag .../>`) element
 /// in `block`, as `(opening-tag text, inner text)`. The tag name must
 /// stand on its own. An unterminated element is an error, never a

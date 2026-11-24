@@ -371,8 +371,7 @@ fn validate_changed_repositories(
 /// attributes only. A child missing a required value is malformed,
 /// not unmodeled: the parser errors on it before this check runs.
 /// A duplicate `<master>`, `<archfilter>` or `<pubkey>` in one
-/// `<download>` is unmodeled instead: the parse keeps the first,
-/// so the rewrite refuses the duplicate rather than dropping it.
+/// `<download>` is rejected by the parse before this check runs.
 fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<String>, GeectlError> {
     let mut found = Vec::new();
     for attr in tag_attr_names(open_tag) {
@@ -437,14 +436,6 @@ fn unmodeled_repository_content(open_tag: &str, inner: &str) -> Result<Vec<Strin
         for child in download_doc.child_names() {
             if !matches!(child, "archfilter" | "master" | "pubkey") {
                 push_finding(&mut found, format!("<{child}> elements in <download>"));
-            }
-        }
-        // A second `<master>`, `<archfilter>` or `<pubkey>` is
-        // content the render drops: the typed model holds at most
-        // one of each, so the rewrite refuses the duplicate.
-        for child in ["master", "archfilter", "pubkey"] {
-            if elements(&download_inner, child)?.len() > 1 {
-                push_finding(&mut found, format!("duplicate <{child}> in <download>"));
             }
         }
         for (master_tag, master_inner) in elements(&download_inner, "master")? {
@@ -1334,6 +1325,30 @@ mod tests {
         assert!(http.put_calls().is_empty());
     }
 
+    fn set_project_meta_fails_closed_on_a_duplicate_download_child(fetched: &str, child: &str) {
+        // The fetched meta never reaches the rewrite refusal: the
+        // parse rejects the duplicate first, so the write fails
+        // closed with a server error and no PUT happens.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
+            fetched,
+        );
+        let client = project_client(&http);
+        let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
+        meta.repositories = vec![replacement_repository()];
+        let err = client
+            .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.context
+                .contains(&format!("duplicate <{child}> in <download>")),
+            "{}",
+            err.context
+        );
+        assert!(http.put_calls().is_empty());
+    }
+
     #[test]
     fn set_project_meta_puts_only_the_changed_title_and_keeps_the_rest() {
         let http = FakeHttp::new()
@@ -1581,37 +1596,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_project_meta_keeps_the_first_duplicate_master() {
+    fn set_project_meta_fails_closed_on_a_duplicate_master() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://a.example.com\"/><master url=\"https://b.example.com\"/></download></repository></project>";
-        let meta = parse_project_meta(META).unwrap();
-        assert_eq!(
-            meta.repositories[0].downloads[0]
-                .master
-                .as_ref()
-                .unwrap()
-                .url,
-            "https://a.example.com"
-        );
+        set_project_meta_fails_closed_on_a_duplicate_download_child(META, "master");
     }
 
     #[test]
-    fn parse_project_meta_keeps_the_first_duplicate_archfilter() {
+    fn set_project_meta_fails_closed_on_a_duplicate_archfilter() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><archfilter>aarch64</archfilter></download></repository></project>";
-        let meta = parse_project_meta(META).unwrap();
-        assert_eq!(
-            meta.repositories[0].downloads[0].archfilter.as_deref(),
-            Some("x86_64")
-        );
+        set_project_meta_fails_closed_on_a_duplicate_download_child(META, "archfilter");
     }
 
     #[test]
-    fn parse_project_meta_keeps_the_first_duplicate_pubkey() {
+    fn set_project_meta_fails_closed_on_a_duplicate_pubkey() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><pubkey>key-one</pubkey><pubkey>key-two</pubkey></download></repository></project>";
-        let meta = parse_project_meta(META).unwrap();
-        assert_eq!(
-            meta.repositories[0].downloads[0].pubkey.as_deref(),
-            Some("key-one")
-        );
+        set_project_meta_fails_closed_on_a_duplicate_download_child(META, "pubkey");
     }
 
     #[test]
@@ -1734,34 +1733,6 @@ mod tests {
     fn set_project_meta_refuses_a_repository_rewrite_with_a_comment_inside_a_download() {
         const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><!-- a note --></download></repository></project>";
         set_project_meta_replacing_repositories_is_refused(META);
-    }
-
-    #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_duplicate_master_in_a_download() {
-        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://a.example.com\"/><master url=\"https://b.example.com\"/></download><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
-    }
-
-    #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_duplicate_archfilter_in_a_download() {
-        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><archfilter>x86_64</archfilter><archfilter>aarch64</archfilter></download><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
-    }
-
-    #[test]
-    fn set_project_meta_refuses_a_repository_rewrite_with_a_duplicate_pubkey_in_a_download() {
-        const META: &str = "<project name=\"home:scarabeus_iv\"><title>Old title</title><repository name=\"openSUSE_Tumbleweed\"><arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><pubkey>key-one</pubkey><pubkey>key-two</pubkey></download><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>";
-        set_project_meta_replacing_repositories_is_refused(META);
-    }
-
-    #[test]
-    fn unmodeled_repository_content_names_a_duplicate_download_child() {
-        let found = unmodeled_repository_content(
-            " name=\"standard\"",
-            "<arch>x86_64</arch><download arch=\"x86_64\" url=\"https://example.com\" repotype=\"rpmmd\"><master url=\"https://a.example.com\"/><master url=\"https://b.example.com\"/></download>",
-        )
-        .unwrap();
-        assert_eq!(found, vec!["duplicate <master> in <download>".to_string()]);
     }
 
     #[test]
