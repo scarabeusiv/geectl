@@ -885,6 +885,12 @@ fn parse_commitfilelist_response(body: &str) -> Result<CommitFilelistResponse, G
     })
 }
 
+/// A 32-hex-digit md5, the shape a checksum attribute must have:
+/// anything else is malformed server data, not a checksum.
+fn is_md5(value: &str) -> bool {
+    value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Parse an OBS source directory listing (`<directory>...</directory>`
 /// with `<entry name md5 size mtime .../>` children and an optional
 /// `<linkinfo project package/>`). The body must be a `<directory>`
@@ -892,7 +898,9 @@ fn parse_commitfilelist_response(body: &str) -> Result<CommitFilelistResponse, G
 /// document) is an error, never an empty listing — a truncated 200
 /// body must not read as "no files". An `<entry>` without a `name`
 /// attribute, or with a `size`/`mtime` that is not a number, is a
-/// malformed listing, not a skippable entry. Other children (`<devel
+/// malformed listing, not a skippable entry. A `<serviceinfo>` whose
+/// `xsrcmd5`/`lsrcmd5` is not exactly 32 hex digits is a malformed
+/// listing too. Other children (`<devel
 /// .../>` and the like) are ignored: this parser reads files and the
 /// link target only.
 pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlError> {
@@ -1035,7 +1043,8 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
     }
     // The service run state, when the listing carries one: the
     // first `<serviceinfo>` wins (a listing carries at most one). An
-    // unknown `code` is a malformed listing, not a state to guess at.
+    // unknown `code`, or an `xsrcmd5`/`lsrcmd5` that is not exactly
+    // 32 hex digits, is a malformed listing, not a state to guess at.
     let mut serviceinfo = None;
     let mut rest = inner;
     while let Some(pos) = rest.find("<serviceinfo") {
@@ -1063,8 +1072,20 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
             Some("succeeded") => ServiceCode::Succeeded,
             _ => return Err(malformed()),
         };
-        let xsrcmd5 = tag_attr(element, "xsrcmd5").map(|value| xml_unescape(&value));
-        let lsrcmd5 = tag_attr(element, "lsrcmd5").map(|value| xml_unescape(&value));
+        // The md5s are checksums, not free text: a value that is
+        // not exactly 32 hex digits would reach the terminal
+        // verbatim through the state render and be presented as a
+        // checksum, so it is malformed, not a value to carry.
+        let xsrcmd5 = match tag_attr(element, "xsrcmd5").map(|value| xml_unescape(&value)) {
+            Some(value) if is_md5(&value) => Some(value),
+            Some(_) => return Err(malformed()),
+            None => None,
+        };
+        let lsrcmd5 = match tag_attr(element, "lsrcmd5").map(|value| xml_unescape(&value)) {
+            Some(value) if is_md5(&value) => Some(value),
+            Some(_) => return Err(malformed()),
+            None => None,
+        };
         let error = if element.trim_end().ends_with('/') {
             None
         } else {
@@ -9953,6 +9974,72 @@ mod tests {
     fn directory_listing_without_linkinfo_is_none() {
         let listing = parse_directory("<directory><entry name=\"foo.spec\"/></directory>").unwrap();
         assert_eq!(listing.linkinfo, None);
+    }
+
+    #[test]
+    fn directory_listing_rejects_non_hex_serviceinfo_md5() {
+        // The md5s are checksums, not free text: a non-hex value is
+        // a malformed listing, never a state to carry — it would
+        // reach the terminal verbatim through the state render and
+        // be presented as a checksum.
+        assert_eq!(
+            parse_directory(
+                "<directory><serviceinfo code=\"running\" xsrcmd5=\"aaa\"/></directory>"
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ServerError
+        );
+        assert_eq!(
+            parse_directory(
+                "<directory><serviceinfo code=\"running\" lsrcmd5=\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"/></directory>"
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ServerError
+        );
+    }
+
+    #[test]
+    fn directory_listing_rejects_wrong_length_serviceinfo_md5() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        assert!(parse_directory(
+            "<directory><serviceinfo code=\"running\" xsrcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/></directory>"
+        )
+        .is_err());
+        assert!(parse_directory(
+            "<directory><serviceinfo code=\"running\" lsrcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/></directory>"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn directory_listing_accepts_32_hex_serviceinfo_md5() {
+        // Lowercase and uppercase hex both read, carried verbatim.
+        let listing = parse_directory(
+            "<directory><serviceinfo code=\"succeeded\" xsrcmd5=\"0123456789abcdef0123456789abcdef\" lsrcmd5=\"0123456789ABCDEF0123456789ABCDEF\"/></directory>",
+        )
+        .unwrap();
+        let state = listing.serviceinfo.unwrap();
+        assert_eq!(
+            state.xsrcmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            state.lsrcmd5.as_deref(),
+            Some("0123456789ABCDEF0123456789ABCDEF")
+        );
+    }
+
+    #[test]
+    fn directory_listing_rejects_control_characters_in_serviceinfo_md5() {
+        // An escape sequence smuggled into the md5 would reach the
+        // terminal through the state render: it is not 32 hex
+        // digits, so the listing is malformed.
+        assert!(parse_directory(
+            "<directory><serviceinfo code=\"running\" xsrcmd5=\"\u{1b}[31maaaaaaaaaaaaaaaaaaaaaaaaaa\"/></directory>"
+        )
+        .is_err());
     }
 
     #[test]

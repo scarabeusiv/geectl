@@ -410,9 +410,13 @@ impl std::fmt::Display for ServiceCode {
 pub struct ServiceState {
     /// The run's code.
     pub code: ServiceCode,
-    /// The expanded source md5, when the listing carries it.
+    /// The expanded source md5, when the listing carries it:
+    /// exactly 32 hex digits, validated at parse — a listing
+    /// carrying anything else is malformed, never a state.
     pub xsrcmd5: Option<String>,
-    /// The linked source md5, when the listing carries it.
+    /// The linked source md5, when the listing carries it:
+    /// exactly 32 hex digits, validated at parse — a listing
+    /// carrying anything else is malformed, never a state.
     pub lsrcmd5: Option<String>,
     /// The `<error>` text, on failure. Multi-line; terminal control
     /// characters are stripped at parse, the rest verbatim from the

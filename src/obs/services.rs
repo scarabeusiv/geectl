@@ -1193,7 +1193,7 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
     fn service_state_running() {
         let http = fake_with(
             &dir_with_serviceinfo(
-                "<serviceinfo code=\"running\" xsrcmd5=\"aaa\" lsrcmd5=\"bbb\"/>",
+                "<serviceinfo code=\"running\" xsrcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" lsrcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/>",
             ),
             None,
         );
@@ -1202,8 +1202,8 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
             client.service_state("openSUSE:Factory", "foo").unwrap(),
             Some(ServiceState {
                 code: ServiceCode::Running,
-                xsrcmd5: Some("aaa".to_string()),
-                lsrcmd5: Some("bbb".to_string()),
+                xsrcmd5: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                lsrcmd5: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
                 error: None,
             })
         );
@@ -1213,7 +1213,7 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
     fn service_state_failed_carries_error() {
         let http = fake_with(
             &dir_with_serviceinfo(
-                "<serviceinfo code=\"failed\" xsrcmd5=\"aaa\" lsrcmd5=\"bbb\"><error>service run failed: download_url: 404 Not Found\nsecond line</error></serviceinfo>",
+                "<serviceinfo code=\"failed\" xsrcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" lsrcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"><error>service run failed: download_url: 404 Not Found\nsecond line</error></serviceinfo>",
             ),
             None,
         );
@@ -1222,8 +1222,8 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
             client.service_state("openSUSE:Factory", "foo").unwrap(),
             Some(ServiceState {
                 code: ServiceCode::Failed,
-                xsrcmd5: Some("aaa".to_string()),
-                lsrcmd5: Some("bbb".to_string()),
+                xsrcmd5: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                lsrcmd5: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
                 error: Some(
                     "service run failed: download_url: 404 Not Found\nsecond line".to_string()
                 ),
@@ -1241,7 +1241,7 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
         // (`&#27;`) is stripped too: the strip runs after unescape.
         let http = fake_with(
             &dir_with_serviceinfo(
-                "<serviceinfo code=\"failed\" xsrcmd5=\"aaa\" lsrcmd5=\"bbb\"><error>bad\u{1b}[2Jline\rwith\u{7}bell\nand\u{202e}bidi</error></serviceinfo>",
+                "<serviceinfo code=\"failed\" xsrcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" lsrcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"><error>bad\u{1b}[2Jline\rwith\u{7}bell\nand\u{202e}bidi</error></serviceinfo>",
             ),
             None,
         );
@@ -1250,8 +1250,8 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
             client.service_state("openSUSE:Factory", "foo").unwrap(),
             Some(ServiceState {
                 code: ServiceCode::Failed,
-                xsrcmd5: Some("aaa".to_string()),
-                lsrcmd5: Some("bbb".to_string()),
+                xsrcmd5: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                lsrcmd5: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
                 error: Some("bad[2Jlinewithbell\nandbidi".to_string()),
             })
         );
@@ -1275,7 +1275,7 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
     fn service_state_succeeded() {
         let http = fake_with(
             &dir_with_serviceinfo(
-                "<serviceinfo code=\"succeeded\" xsrcmd5=\"aaa\" lsrcmd5=\"bbb\"/>",
+                "<serviceinfo code=\"succeeded\" xsrcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" lsrcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/>",
             ),
             None,
         );
@@ -1284,8 +1284,8 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
             client.service_state("openSUSE:Factory", "foo").unwrap(),
             Some(ServiceState {
                 code: ServiceCode::Succeeded,
-                xsrcmd5: Some("aaa".to_string()),
-                lsrcmd5: Some("bbb".to_string()),
+                xsrcmd5: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                lsrcmd5: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
                 error: None,
             })
         );

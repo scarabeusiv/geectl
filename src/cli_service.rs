@@ -276,7 +276,9 @@ fn render_comment(name: &str, comment: &str) -> String {
 
 /// The service state as `key: value` lines: the run code, the two
 /// md5s when the listing carries them, and the error when the run
-/// failed, terminal control characters stripped. `None` means the
+/// failed, terminal control characters stripped. The md5s are
+/// exactly 32 hex digits, validated at parse, so what renders here
+/// is a checksum, never verbatim server text. `None` means the
 /// listing carries no service state at all.
 fn render_service_state(state: &Option<ServiceState>) -> String {
     match state {

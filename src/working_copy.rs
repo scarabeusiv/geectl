@@ -8578,7 +8578,7 @@ mod tests {
             "<directory name=\"foo\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
             <entry md5=\"9444ad22a238286bca9bf649b2aef01d\" mtime=\"1282047302\" name=\"foo.spec\" size=\"10\" />\
             <entry md5=\"d41d8cd98f00b204e9800998ecf8427e\" mtime=\"1282047302\" name=\"foo.tar.gz\" size=\"0\" />\
-            <serviceinfo code=\"failed\" xsrcmd5=\"aaa\" lsrcmd5=\"bbb\"><error>service run failed: download_url: 404 Not Found</error></serviceinfo></directory>"
+            <serviceinfo code=\"failed\" xsrcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" lsrcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"><error>service run failed: download_url: 404 Not Found</error></serviceinfo></directory>"
         );
         let http = FakeHttp::new()
             .with_get(
