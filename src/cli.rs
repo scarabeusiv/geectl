@@ -90,7 +90,7 @@ pub enum Command {
     /// Branch, copy, and link packages.
     Branch {
         #[command(subcommand)]
-        // Boxed: the ten branch subcommands make BranchCommand far
+        // Boxed: the eleven branch subcommands make BranchCommand far
         // larger than the other variants (clippy::large_enum_variant).
         command: Box<cli_branch::BranchCommand>,
     },

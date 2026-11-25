@@ -94,6 +94,9 @@ _geectl() {
             geectl,version)
                 cmd="geectl__subcmd__version"
                 ;;
+            geectl__subcmd__branch,branch)
+                cmd="geectl__subcmd__branch__subcmd__branch"
+                ;;
             geectl__subcmd__branch,branch-package)
                 cmd="geectl__subcmd__branch__subcmd__branch__subcmd__package"
                 ;;
@@ -126,6 +129,9 @@ _geectl() {
                 ;;
             geectl__subcmd__branch,set-link-rev-project)
                 cmd="geectl__subcmd__branch__subcmd__set__subcmd__link__subcmd__rev__subcmd__project"
+                ;;
+            geectl__subcmd__branch__subcmd__help,branch)
+                cmd="geectl__subcmd__branch__subcmd__help__subcmd__branch"
                 ;;
             geectl__subcmd__branch__subcmd__help,branch-package)
                 cmd="geectl__subcmd__branch__subcmd__help__subcmd__branch__subcmd__package"
@@ -465,6 +471,9 @@ _geectl() {
                 ;;
             geectl__subcmd__help,version)
                 cmd="geectl__subcmd__help__subcmd__version"
+                ;;
+            geectl__subcmd__help__subcmd__branch,branch)
+                cmd="geectl__subcmd__help__subcmd__branch__subcmd__branch"
                 ;;
             geectl__subcmd__help__subcmd__branch,branch-package)
                 cmd="geectl__subcmd__help__subcmd__branch__subcmd__branch__subcmd__package"
@@ -1640,12 +1649,62 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__branch)
-            opts="-h --format --debug --debug-body --live --help branch-package copy-package copy-project set-devel-project link-package repair-link set-link-rev set-link-rev-project link-to-branch detach-branch help"
+            opts="-h --format --debug --debug-body --live --help branch branch-package copy-package copy-project set-devel-project link-package repair-link set-link-rev set-link-rev-project link-to-branch detach-branch help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "json text" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__branch__subcmd__branch)
+            opts="-h --project --package --new-repo-name --organization --git-branch --no-devel-project --target-project --target-package --first-build-deadline-secs --format --debug --debug-body --live --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --project)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --package)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --new-repo-name)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --organization)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --git-branch)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --target-project)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --target-package)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --first-build-deadline-secs)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --format)
                     COMPREPLY=($(compgen -W "json text" -- "${cur}"))
                     return 0
@@ -1814,8 +1873,22 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__branch__subcmd__help)
-            opts="branch-package copy-package copy-project set-devel-project link-package repair-link set-link-rev set-link-rev-project link-to-branch detach-branch help"
+            opts="branch branch-package copy-package copy-project set-devel-project link-package repair-link set-link-rev set-link-rev-project link-to-branch detach-branch help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__branch__subcmd__help__subcmd__branch)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -3702,8 +3775,22 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help__subcmd__branch)
-            opts="branch-package copy-package copy-project set-devel-project link-package repair-link set-link-rev set-link-rev-project link-to-branch detach-branch"
+            opts="branch branch-package copy-package copy-project set-devel-project link-package repair-link set-link-rev set-link-rev-project link-to-branch detach-branch"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__help__subcmd__branch__subcmd__branch)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

@@ -15,9 +15,10 @@
 //! takes the single configured instance.
 //!
 //! The `branch` composite (Gitea fork + OBS `cmd=fork`, library
-//! `GiteaClient::branch`) has no CLI command: it composes the
-//! two backends behind the uniform flow, and its CLI shape is a
-//! separate decision.
+//! `GiteaClient::branch`) is exposed as `branch branch`: the
+//! `branch` group's composite leaf, which also copies the source
+//! project's repositories into the test project. The Gitea half
+//! stays `repo-fork` here.
 //!
 //! Coordinate header (design rule 1):
 //! every text rendering opens with one header line echoing the query

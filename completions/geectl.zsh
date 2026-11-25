@@ -1468,7 +1468,26 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:geectl-branch-command-$line[1]:"
         case $line[1] in
-            (branch-package)
+            (branch)
+_arguments "${_arguments_options[@]}" : \
+'--project=[The project to branch from]:PROJECT:_default' \
+'--package=[The package to branch]:PACKAGE:_default' \
+'--new-repo-name=[Name for the fork; defaults to the source repo name]:NEW_REPO_NAME:_default' \
+'--organization=[Organization to fork into; defaults to the token owner'\''s account]:ORGANIZATION:_default' \
+'--git-branch=[Branch to fork from and name in the fork'\''s scmsync URL; defaults to the source branch]:GIT_BRANCH:_default' \
+'--target-project=[The branch project. Without it, the server picks the default (usually \`home\:<user>\:branches\:<source project>\`)]:TARGET_PROJECT:_default' \
+'--target-package=[The branch package name. Without it, the source package name]:TARGET_PACKAGE:_default' \
+'--first-build-deadline-secs=[Seconds to wait for the first build of the forked package in the fork'\''s test project; 0 skips the wait and reports the branch without a build]:FIRST_BUILD_DEADLINE_SECS:_default' \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--no-devel-project[Ignore the devel project when resolving the fork source]' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(branch-package)
 _arguments "${_arguments_options[@]}" : \
 '--project=[The project to branch from]:PROJECT:_default' \
 '--package=[The package to branch]:PACKAGE:_default' \
@@ -1644,7 +1663,11 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:geectl-branch-help-command-$line[1]:"
         case $line[1] in
-            (branch-package)
+            (branch)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(branch-package)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -3763,7 +3786,11 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:geectl-help-branch-command-$line[1]:"
         case $line[1] in
-            (branch-package)
+            (branch)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(branch-package)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -4325,6 +4352,7 @@ _geectl__subcmd__addremove_commands() {
 (( $+functions[_geectl__subcmd__branch_commands] )) ||
 _geectl__subcmd__branch_commands() {
     local commands; commands=(
+'branch:Branch a git-backed package\: Gitea fork + OBS fork into a test project with the source project'\''s repositories. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
 'branch-package:Branch a package\: create a linked copy under a branch project. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
 'copy-package:Copy a package to another project (or another OBS instance with \`--to-apiurl\`). A mutation\: dry-run is the default' \
 'copy-project:Copy a whole project. A mutation\: dry-run is the default' \
@@ -4338,6 +4366,11 @@ _geectl__subcmd__branch_commands() {
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl branch commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__branch__subcmd__branch_commands] )) ||
+_geectl__subcmd__branch__subcmd__branch_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl branch branch commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__branch__subcmd__branch-package_commands] )) ||
 _geectl__subcmd__branch__subcmd__branch-package_commands() {
@@ -4362,6 +4395,7 @@ _geectl__subcmd__branch__subcmd__detach-branch_commands() {
 (( $+functions[_geectl__subcmd__branch__subcmd__help_commands] )) ||
 _geectl__subcmd__branch__subcmd__help_commands() {
     local commands; commands=(
+'branch:Branch a git-backed package\: Gitea fork + OBS fork into a test project with the source project'\''s repositories. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
 'branch-package:Branch a package\: create a linked copy under a branch project. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
 'copy-package:Copy a package to another project (or another OBS instance with \`--to-apiurl\`). A mutation\: dry-run is the default' \
 'copy-project:Copy a whole project. A mutation\: dry-run is the default' \
@@ -4375,6 +4409,11 @@ _geectl__subcmd__branch__subcmd__help_commands() {
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl branch help commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__branch__subcmd__help__subcmd__branch_commands] )) ||
+_geectl__subcmd__branch__subcmd__help__subcmd__branch_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl branch help branch commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__branch__subcmd__help__subcmd__branch-package_commands] )) ||
 _geectl__subcmd__branch__subcmd__help__subcmd__branch-package_commands() {
@@ -5005,6 +5044,7 @@ _geectl__subcmd__help__subcmd__addremove_commands() {
 (( $+functions[_geectl__subcmd__help__subcmd__branch_commands] )) ||
 _geectl__subcmd__help__subcmd__branch_commands() {
     local commands; commands=(
+'branch:Branch a git-backed package\: Gitea fork + OBS fork into a test project with the source project'\''s repositories. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
 'branch-package:Branch a package\: create a linked copy under a branch project. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the branch' \
 'copy-package:Copy a package to another project (or another OBS instance with \`--to-apiurl\`). A mutation\: dry-run is the default' \
 'copy-project:Copy a whole project. A mutation\: dry-run is the default' \
@@ -5017,6 +5057,11 @@ _geectl__subcmd__help__subcmd__branch_commands() {
 'detach-branch:Detach a branch\: replace the branch link with a copy of the branched files. A mutation\: dry-run is the default' \
     )
     _describe -t commands 'geectl help branch commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__branch__subcmd__branch_commands] )) ||
+_geectl__subcmd__help__subcmd__branch__subcmd__branch_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help branch branch commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__branch__subcmd__branch-package_commands] )) ||
 _geectl__subcmd__help__subcmd__branch__subcmd__branch-package_commands() {

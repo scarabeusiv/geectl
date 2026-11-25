@@ -1,0 +1,42 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-branch-branch 1  "geectl-branch-branch 0.2.2" 
+.SH NAME
+geectl\-branch\-branch \- Branch a git\-backed package: Gitea fork + OBS fork into a test project with the source project\*(Aqs repositories. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the branch
+.SH SYNOPSIS
+\fBgeectl branch branch\fR [\fB\-\-new\-repo\-name\fR] [\fB\-\-organization\fR] [\fB\-\-git\-branch\fR] [\fB\-\-no\-devel\-project\fR] [\fB\-\-target\-project\fR] [\fB\-\-target\-package\fR] [\fB\-\-first\-build\-deadline\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> 
+.SH DESCRIPTION
+Branch a git\-backed package: Gitea fork + OBS fork into a test project with the source project\*(Aqs repositories. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the branch
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The project to branch from
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package to branch
+.TP
+\fB\-\-new\-repo\-name\fR \fI<NEW_REPO_NAME>\fR
+Name for the fork; defaults to the source repo name
+.TP
+\fB\-\-organization\fR \fI<ORGANIZATION>\fR
+Organization to fork into; defaults to the token owner\*(Aqs account
+.TP
+\fB\-\-git\-branch\fR \fI<GIT_BRANCH>\fR
+Branch to fork from and name in the fork\*(Aqs scmsync URL; defaults to the source branch
+.TP
+\fB\-\-no\-devel\-project\fR
+Ignore the devel project when resolving the fork source
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The branch project. Without it, the server picks the default (usually `home:<user>:branches:<source project>`)
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+The branch package name. Without it, the source package name
+.TP
+\fB\-\-first\-build\-deadline\-secs\fR \fI<FIRST_BUILD_DEADLINE_SECS>\fR [default: 600]
+Seconds to wait for the first build of the forked package in the fork\*(Aqs test project; 0 skips the wait and reports the branch without a build
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

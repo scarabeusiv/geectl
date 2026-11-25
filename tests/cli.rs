@@ -1372,6 +1372,89 @@ fn serve_once_status(status: u16, reason: &str, body: &str) -> std::net::SocketA
     addr
 }
 
+/// A routing HTTP fixture: serves canned responses by (method,
+/// path), each route answering from a queue of (status, body) in
+/// order and reusing its last answer once the queue is empty; the
+/// query string is ignored when matching, so a POST with query
+/// parameters matches its path. Every request's method, target,
+/// and body is recorded on the returned channel. For commands
+/// that fan out across endpoints, where one canned body cannot
+/// answer every request. The thread is not joined, like
+/// `serve_once`.
+/// One canned route: (method, path, answers in order).
+type Route<'a> = (&'a str, &'a str, &'a [(u16, &'a str)]);
+/// A route's remaining answers: (status, body), in order.
+type AnswerQueue = std::collections::VecDeque<(u16, String)>;
+
+fn serve_routes_queued(
+    content_type: &str,
+    routes: &[Route<'_>],
+) -> (
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<(String, String, String)>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let content_type = content_type.to_string();
+    let mut table: Vec<(String, String, AnswerQueue)> = routes
+        .iter()
+        .map(|(method, path, answers)| {
+            (
+                method.to_string(),
+                path.to_string(),
+                answers
+                    .iter()
+                    .map(|(status, body)| (*status, body.to_string()))
+                    .collect(),
+            )
+        })
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            let mut lines = text.lines();
+            let first = lines.next().unwrap_or("");
+            let mut parts = first.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let target = parts.next().unwrap_or("").to_string();
+            let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            let _ = tx.send((method.clone(), target.clone(), body));
+            let path = target.split('?').next().unwrap_or("").to_string();
+            let (status, resp_body) = table
+                .iter_mut()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, answers)| {
+                    if answers.len() > 1 {
+                        answers.pop_front().unwrap()
+                    } else {
+                        answers.front().unwrap().clone()
+                    }
+                })
+                .unwrap_or((404, String::new()));
+            let reason = match status {
+                200 => "OK",
+                202 => "Accepted",
+                _ => "Not Found",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, rx)
+}
+
 fn serve_once(body: &str) -> std::net::SocketAddr {
     serve_once_status(200, "OK", body)
 }
@@ -5115,11 +5198,13 @@ fn branch_help_exits_zero() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("branch-package"), "{stdout}");
     assert!(stdout.contains("copy-package"), "{stdout}");
+    assert!(stdout.contains("Branch a git-backed package"), "{stdout}");
 }
 
 #[test]
 fn branch_commands_reject_missing_required_flags() {
     for args in [
+        ["branch"],
         ["branch-package"],
         ["copy-package"],
         ["copy-project"],
@@ -5154,6 +5239,201 @@ fn branch_package_dry_run() {
     // null: the server resolves it only when live.
     assert_eq!(value["target_project"], serde_json::Value::Null);
     assert_eq!(value["target_package"], serde_json::Value::Null);
+}
+
+#[test]
+fn branch_branch_dry_run() {
+    // The composite leaf's dry-run needs a Gitea token to construct
+    // the client (the library's rule: the token is required even
+    // in dry-run), but touches no server: the guard records the
+    // plan before any read.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "branch",
+            "branch",
+            "--project",
+            "games",
+            "--package",
+            "descent3",
+        ])
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true, "payload: {value}");
+    assert_eq!(value["source_project"], "games");
+    assert_eq!(value["source_package"], "descent3");
+    assert_eq!(value["target_project"], serde_json::Value::Null);
+    assert_eq!(value["target_package"], serde_json::Value::Null);
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert_eq!(plan.len(), 1);
+    assert!(
+        plan[0]
+            .as_str()
+            .unwrap()
+            .contains("fork git-backed package games/descent3"),
+        "plan: {plan:?}"
+    );
+}
+
+#[test]
+fn branch_branch_live_copies_the_source_repositories() {
+    // The leaf end to end, against routing fake servers for both
+    // backends: the Gitea fork lands, the test project is reused,
+    // the OBS fork lands in it, and the source project's
+    // repositories are copied into it — the PUT bodies carry the
+    // Factory repo (its build blocks) and the second repo verbatim.
+    let fork_body = r#"{"id": 7, "owner": {"login": "fbui"}, "name": "descent3", "full_name": "fbui/descent3", "parent": {"owner": {"login": "jengelh"}, "name": "descent3", "full_name": "jengelh/descent3"}, "default_branch": "master", "private": false, "clone_url": "http://127.0.0.1/fbui/descent3.git", "ssh_url": "gitea@127.0.0.1:fbui/descent3.git"}"#;
+    let (gitea_addr, _gitea_rx) = serve_routes_queued(
+        "application/json",
+        &[
+            ("GET", "/api/v1/user", &[(200, r#"{"login": "fbui"}"#)]),
+            (
+                "GET",
+                "/api/v1/repos/fbui/descent3",
+                &[(404, ""), (200, fork_body)],
+            ),
+            (
+                "POST",
+                "/api/v1/repos/jengelh/descent3/forks",
+                &[(202, fork_body)],
+            ),
+        ],
+    );
+    let scmsync = format!("http://{gitea_addr}/jengelh/descent3#master");
+    let package_meta = format!(
+        "<package name=\"descent3\" project=\"games\"><title>t</title><scmsync>{scmsync}</scmsync></package>"
+    );
+    let target_meta = "<project name=\"home:fbui:test:descent3\"></project>";
+    let source_meta = "<project name=\"games\"><repository name=\"openSUSE_Factory\" rebuild=\"local\" block=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository><repository name=\"openSUSE_Tumbleweed\" block=\"never\"><arch>x86_64</arch><path project=\"openSUSE:Tumbleweed\" repository=\"standard\"/></repository></project>";
+    let fork_status = "<status code=\"ok\"><summary>Ok</summary><data name=\"targetproject\">home:fbui:test:descent3</data><data name=\"targetpackage\">descent3</data><data name=\"sourceproject\">games</data><data name=\"sourcepackage\">descent3</data></status>";
+    let (obs_addr, obs_rx) = serve_routes_queued(
+        "application/xml",
+        &[
+            (
+                "GET",
+                "/public/source/games/descent3/_meta",
+                &[(200, package_meta.as_str())],
+            ),
+            (
+                "GET",
+                "/public/source/home:fbui:test:descent3/_meta",
+                &[(200, target_meta)],
+            ),
+            ("POST", "/source/games/descent3", &[(200, fork_status)]),
+            ("GET", "/public/source/games/_meta", &[(200, source_meta)]),
+            (
+                "GET",
+                "/source/home:fbui:test:descent3/_meta",
+                &[(200, target_meta)],
+            ),
+            (
+                "PUT",
+                "/source/home:fbui:test:descent3/_meta",
+                &[(200, "<status code=\"ok\" />")],
+            ),
+        ],
+    );
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "branch",
+            "branch",
+            "--project",
+            "games",
+            "--package",
+            "descent3",
+            "--target-project",
+            "home:fbui:test:descent3",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], false, "payload: {value}");
+    assert_eq!(value["source_project"], "games");
+    assert_eq!(value["source_package"], "descent3");
+    assert_eq!(value["owner"], "fbui");
+    assert_eq!(value["repo"], "descent3");
+    assert_eq!(value["branch"], "master");
+    assert_eq!(
+        value["scmsync"],
+        format!("http://{gitea_addr}/fbui/descent3#master")
+    );
+    assert_eq!(value["target_project"], "home:fbui:test:descent3");
+    assert_eq!(value["target_package"], "descent3");
+    // The copies: one PUT per source repository, each carrying
+    // the repository verbatim — Factory first (its build blocks),
+    // then the second repo.
+    let puts: Vec<String> = obs_rx
+        .try_iter()
+        .filter(|(method, _, _)| method == "PUT")
+        .map(|(_, _, body)| body)
+        .collect();
+    assert_eq!(puts.len(), 2, "PUT bodies: {puts:?}");
+    assert!(
+        puts[0].contains("<repository name=\"openSUSE_Factory\" rebuild=\"local\" block=\"all\">"),
+        "PUT 0: {}",
+        puts[0]
+    );
+    assert!(
+        puts[1].contains("<repository name=\"openSUSE_Tumbleweed\" block=\"never\">"),
+        "PUT 1: {}",
+        puts[1]
+    );
+    // The text rendering names the fork and its scmsync URL; the
+    // second run reuses the fork and re-copies the same
+    // repositories, so the text run needs no fresh server.
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "--format",
+            "text",
+            "branch",
+            "branch",
+            "--project",
+            "games",
+            "--package",
+            "descent3",
+            "--target-project",
+            "home:fbui:test:descent3",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("branch games/descent3 -> home:fbui:test:descent3"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("fork: fbui/descent3#master"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "scmsync: http://{gitea_addr}/fbui/descent3#master"
+        )),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]

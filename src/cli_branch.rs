@@ -6,7 +6,7 @@
 //! opt-in via `--format text`, stdout carries only the result payload,
 //! and nothing here touches raw XML (typed values only).
 //!
-//! All ten commands take explicit `--project`/`--package` (etc.)
+//! All eleven commands take explicit `--project`/`--package` (etc.)
 //! flags, always required: no positionals, no working-copy defaults
 //! (the branch leaves take explicit coordinates; the working-copy
 //! leaves are the ones that use the checkout). Mutations are dry-run by
@@ -29,9 +29,11 @@
 //! pair is stated in `docs/cli.md`.
 
 use crate::auth::{same_api_url, EnvObsAuth};
+use crate::cli_gitea::gitea_client;
 use crate::config;
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
+use crate::gitea::{ForkOptions, ForkResult};
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
     BranchOptions, BranchResult, CopyOptions, CopyProjectOptions, DryRun, LinkOptions,
@@ -44,6 +46,11 @@ use serde_json::{json, Value};
 /// in kebab-case, grouped under the top-level noun.
 #[derive(Debug, Subcommand)]
 pub enum BranchCommand {
+    /// Branch a git-backed package: Gitea fork + OBS fork into a
+    /// test project with the source project's repositories.
+    /// A mutation: dry-run is the default (only the plan is printed);
+    /// `--live` performs the branch.
+    Branch(BranchArgs),
     /// Branch a package: create a linked copy under a branch project.
     /// A mutation: dry-run is the default (only the plan is printed);
     /// `--live` performs the branch.
@@ -75,6 +82,38 @@ pub enum BranchCommand {
     /// Detach a branch: replace the branch link with a copy of the
     /// branched files. A mutation: dry-run is the default.
     DetachBranch(DetachBranchArgs),
+}
+
+/// Arguments for `branch branch`.
+#[derive(Debug, Args)]
+pub struct BranchArgs {
+    /// The project to branch from.
+    #[arg(long)]
+    project: String,
+    /// The package to branch.
+    #[arg(long)]
+    package: String,
+    /// Name for the fork; defaults to the source repo name.
+    #[arg(long)]
+    new_repo_name: Option<String>,
+    /// Organization to fork into; defaults to the token owner's
+    /// account.
+    #[arg(long)]
+    organization: Option<String>,
+    /// Branch to fork from and name in the fork's scmsync URL;
+    /// defaults to the source branch.
+    #[arg(long)]
+    git_branch: Option<String>,
+    /// Ignore the devel project when resolving the fork source.
+    #[arg(long)]
+    no_devel_project: bool,
+    /// The branch project. Without it, the server picks the default
+    /// (usually `home:<user>:branches:<source project>`).
+    #[arg(long)]
+    target_project: Option<String>,
+    /// The branch package name. Without it, the source package name.
+    #[arg(long)]
+    target_package: Option<String>,
 }
 
 /// Arguments for `branch branch-package`.
@@ -348,6 +387,7 @@ pub fn run_branch(
     live: bool,
 ) -> Result<(Value, String), GeectlError> {
     match command {
+        BranchCommand::Branch(args) => branch(args, debug, live),
         BranchCommand::BranchPackage(args) => branch_package(args, debug, live),
         BranchCommand::CopyPackage(args) => copy_package(args, debug, live),
         BranchCommand::CopyProject(args) => copy_project(args, debug, live),
@@ -548,6 +588,87 @@ fn render_row<const N: usize>(cells: &[String; N], widths: &[usize; N]) -> Strin
         .collect::<Vec<_>>()
         .join(" ");
     joined.trim_end().to_string()
+}
+
+fn branch(args: BranchArgs, debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
+    let options = ForkOptions {
+        new_repo_name: args.new_repo_name.clone(),
+        organization: args.organization.clone(),
+        fork_branch: args.git_branch.clone(),
+        no_devel_project: args.no_devel_project,
+        target_project: args.target_project.clone(),
+        target_package: args.target_package.clone(),
+    };
+    let dry_run = dry_run_for(live, debug);
+    let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+    let obs = obs_client(&http, debug)?;
+    let gitea = gitea_client(&http, debug)?;
+    match gitea.branch(&obs, &args.project, &args.package, &options, &dry_run)? {
+        // Dry-run: the guard returned None and recorded the plan.
+        // The target is the requested one when the flags named it,
+        // else null: the server resolves it only when live.
+        None => {
+            let plan = dry_run.plan();
+            let payload = json!({
+                "source_project": args.project,
+                "source_package": args.package,
+                "target_project": args.target_project,
+                "target_package": args.target_package,
+            });
+            // Text omission: the target when the flags
+            // did not name it — null in the payload, the server
+            // resolves it only when live. The header echoes only
+            // the requested coordinates.
+            let lines = vec![header(
+                "branch",
+                coords(&args.project, &args.package),
+                coords_opt(
+                    args.target_project.as_deref(),
+                    args.target_package.as_deref(),
+                ),
+            )];
+            Ok(finish(payload, lines, true, Some(plan)))
+        }
+        Some(result) => Ok(finish(
+            fork_result_json(&args, &result),
+            render_fork_result_text(&args, &result),
+            false,
+            None,
+        )),
+    }
+}
+
+/// A live branch-composite result as JSON: the requested source
+/// plus the fork and the server-resolved target.
+fn fork_result_json(args: &BranchArgs, result: &ForkResult) -> Value {
+    json!({
+        "source_project": args.project,
+        "source_package": args.package,
+        "owner": result.owner,
+        "repo": result.repo,
+        "branch": result.branch,
+        "scmsync": result.scmsync,
+        "target_project": result.target_project,
+        "target_package": result.target_package,
+        "clone_url": result.clone_url,
+        "ssh_url": result.ssh_url,
+    })
+}
+
+/// Render a live branch-composite result: the header carries the
+/// source and the server-resolved target, then the fork and its
+/// scmsync URL. Text omission: the clone URLs are JSON-only — the
+/// agent clones from the payload, the text names the fork.
+fn render_fork_result_text(args: &BranchArgs, result: &ForkResult) -> Vec<String> {
+    vec![
+        header(
+            "branch",
+            coords(&args.project, &args.package),
+            Some(coords(&result.target_project, &result.target_package)),
+        ),
+        format!("fork: {}/{}#{}", result.owner, result.repo, result.branch),
+        format!("scmsync: {}", result.scmsync),
+    ]
 }
 
 fn branch_package(
@@ -1065,6 +1186,49 @@ mod tests {
 
     fn parse_fails(argv: &[&str]) {
         assert!(TestCli::try_parse_from(argv).is_err(), "argv: {argv:?}");
+    }
+
+    #[test]
+    fn branch_parses_all_flags() {
+        let BranchCommand::Branch(args) = parse(&[
+            "geectl",
+            "branch",
+            "branch",
+            "--project",
+            "games",
+            "--package",
+            "descent3",
+            "--new-repo-name",
+            "descent3-fork",
+            "--organization",
+            "factory-team",
+            "--git-branch",
+            "factory",
+            "--no-devel-project",
+            "--target-project",
+            "home:fbui:test:descent3",
+            "--target-package",
+            "descent3",
+        ]) else {
+            panic!("wrong variant");
+        };
+        assert_eq!(args.project, "games");
+        assert_eq!(args.package, "descent3");
+        assert_eq!(args.new_repo_name.as_deref(), Some("descent3-fork"));
+        assert_eq!(args.organization.as_deref(), Some("factory-team"));
+        assert_eq!(args.git_branch.as_deref(), Some("factory"));
+        assert!(args.no_devel_project);
+        assert_eq!(
+            args.target_project.as_deref(),
+            Some("home:fbui:test:descent3")
+        );
+        assert_eq!(args.target_package.as_deref(), Some("descent3"));
+    }
+
+    #[test]
+    fn branch_requires_project_and_package() {
+        parse_fails(&["geectl", "branch", "branch", "--package", "foo"]);
+        parse_fails(&["geectl", "branch", "branch", "--project", "p"]);
     }
 
     #[test]
