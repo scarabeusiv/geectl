@@ -200,7 +200,7 @@ layout. Incident filing lives with the other filings under `geectl request`
 | — | `geectl gitea repo-get` / `geectl gitea repo-list` / `geectl gitea branch-list` / `geectl gitea branch-get` / `geectl gitea branch-head` | New surface: Gitea reads on the configured instance |
 | — | `geectl gitea repo-create` | New surface: create a repository on the configured instance; mutations take the global `--live` |
 | `osc api -X DELETE /repos/...` | `geectl gitea repo-delete` | The delete op under the `geectl gitea` noun; mutations take the global `--live`; the library requires `--force` |
-| `osc fork` | `geectl gitea repo-fork` (Gitea half only) | `osc fork` is a composite: Gitea fork + OBS branch. `geectl gitea repo-fork` is the Gitea half; the OBS half is `branch branch-package`. `osc fork` is scmsync-only; it clones the fork locally and inits `.osc` |
+| `osc fork` | `geectl branch branch` | `osc fork` is a composite: Gitea fork + OBS branch. `geectl branch branch` is the composite: repo fork, OBS fork into a test project with the source project's repositories, and the first-build report. `geectl gitea repo-fork` is the Gitea half only. `osc fork` is scmsync-only; it clones the fork locally and inits `.osc` |
 
 Scope note: the sibling `git-obs` entry point carries its own `repo list` and `repo fork` commands; `git-obs repo list` requires `--org`/`--user`.
 

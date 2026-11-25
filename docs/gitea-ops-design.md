@@ -313,6 +313,19 @@ project and package, and the `clone_url` and `ssh_url` for the agent's own
 `git clone`. The fork result returns the URLs; the clone runs through the
 git CLI.
 
+The composite waits for the first build of the forked package in the
+fork's test project and reports it on the result: settled once the
+build matrix settles, still running with the latest matrix when the
+deadline passes, not waited at deadline zero, no repositories when
+the source project carries none, and project fork for a project fork.
+The wait is bounded by `--first-build-deadline-secs` (600 seconds by
+default); a slow build is not a branch failure — the branch stands
+and the caller sees the latest state. Tracking is the scmsync link:
+a push to the fork branch syncs into the test project and OBS
+rebuilds, with no re-run of the leaf. A second branch reuses the
+existing fork, target project, and repositories, and still reports
+the first build.
+
 An existing fork under the requested name is reused. A same-name repo
 whose parent differs from the source answers `AlreadyExists`.
 Forking someone else's fork answers 202; the composite verifies the created
