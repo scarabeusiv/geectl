@@ -6131,19 +6131,22 @@ fn top_help_lists_the_service_group() {
 }
 
 #[test]
-fn gitea_help_lists_all_nine_subcommands() {
+fn gitea_help_lists_all_twelve_subcommands() {
     let out = geectl().args(["gitea", "--help"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     for name in [
         "repo-get",
         "repo-list",
+        "repo-search",
         "repo-create",
         "repo-delete",
         "repo-fork",
         "branch-list",
         "branch-get",
         "branch-head",
+        "raw-file",
+        "commit-statuses",
         "maintainers",
     ] {
         assert!(text.contains(name), "gitea --help misses {name}");

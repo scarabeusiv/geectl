@@ -2715,6 +2715,33 @@ _arguments "${_arguments_options[@]}" : \
 ':branch -- The branch name:_default' \
 && ret=0
 ;;
+(raw-file)
+_arguments "${_arguments_options[@]}" : \
+'--ref=[The branch, tag, or commit to read from; the default branch when omitted]:GIT_REF:_default' \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':owner -- The repository owner:_default' \
+':repo -- The repository name:_default' \
+':path -- The file path inside the repository:_default' \
+&& ret=0
+;;
+(commit-statuses)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':owner -- The repository owner:_default' \
+':repo -- The repository name:_default' \
+':sha -- The commit SHA:_default' \
+&& ret=0
+;;
 (maintainers)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
@@ -2783,6 +2810,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (branch-head)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(raw-file)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(commit-statuses)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -4134,6 +4169,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(raw-file)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(commit-statuses)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (maintainers)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -4923,7 +4966,7 @@ _geectl__subcmd__diff_commands() {
 (( $+functions[_geectl__subcmd__gitea_commands] )) ||
 _geectl__subcmd__gitea_commands() {
     local commands; commands=(
-'repo-get:Show a repository\: owner, default branch, privacy, clone URLs' \
+'repo-get:Show a repository\: owner, default branch, privacy, clone URLs, and the token owner'\''s permissions' \
 'repo-list:List repositories\: the token owner'\''s own repos, one user'\''s repos with \`--owner\`, one organization'\''s with \`--org\`, or both (the user'\''s first, then the organization'\''s)' \
 'repo-search:Search repositories across the instance by keyword\: the keyword matches the name and the description. The Gitea counterpart of \`remote search-packages\` / \`remote search-projects\`' \
 'repo-create:Create a repository under the token owner'\''s account. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
@@ -4932,6 +4975,8 @@ _geectl__subcmd__gitea_commands() {
 'branch-list:List the branches of a repository' \
 'branch-get:Show one branch\: name, head commit, protection' \
 'branch-head:Print the head commit SHA of a branch. Content command\: the text IS the SHA, with no header' \
+'raw-file:Print one file from a repository verbatim. Content command\: the text IS the file content, with no header. \`--ref\` reads from a branch, tag, or commit instead of the default branch. A missing file is \`NotFound\`, never empty content — the 404 is the existence answer' \
+'commit-statuses:List a commit'\''s statuses\: the CI states reported for that commit' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
 'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -4958,10 +5003,15 @@ _geectl__subcmd__gitea__subcmd__cleanup-forks_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea cleanup-forks commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__gitea__subcmd__commit-statuses_commands] )) ||
+_geectl__subcmd__gitea__subcmd__commit-statuses_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea commit-statuses commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__gitea__subcmd__help_commands] )) ||
 _geectl__subcmd__gitea__subcmd__help_commands() {
     local commands; commands=(
-'repo-get:Show a repository\: owner, default branch, privacy, clone URLs' \
+'repo-get:Show a repository\: owner, default branch, privacy, clone URLs, and the token owner'\''s permissions' \
 'repo-list:List repositories\: the token owner'\''s own repos, one user'\''s repos with \`--owner\`, one organization'\''s with \`--org\`, or both (the user'\''s first, then the organization'\''s)' \
 'repo-search:Search repositories across the instance by keyword\: the keyword matches the name and the description. The Gitea counterpart of \`remote search-packages\` / \`remote search-projects\`' \
 'repo-create:Create a repository under the token owner'\''s account. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
@@ -4970,6 +5020,8 @@ _geectl__subcmd__gitea__subcmd__help_commands() {
 'branch-list:List the branches of a repository' \
 'branch-get:Show one branch\: name, head commit, protection' \
 'branch-head:Print the head commit SHA of a branch. Content command\: the text IS the SHA, with no header' \
+'raw-file:Print one file from a repository verbatim. Content command\: the text IS the file content, with no header. \`--ref\` reads from a branch, tag, or commit instead of the default branch. A missing file is \`NotFound\`, never empty content — the 404 is the existence answer' \
+'commit-statuses:List a commit'\''s statuses\: the CI states reported for that commit' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
 'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -4996,6 +5048,11 @@ _geectl__subcmd__gitea__subcmd__help__subcmd__cleanup-forks_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea help cleanup-forks commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__commit-statuses_commands] )) ||
+_geectl__subcmd__gitea__subcmd__help__subcmd__commit-statuses_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea help commit-statuses commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__help_commands] )) ||
 _geectl__subcmd__gitea__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
@@ -5005,6 +5062,11 @@ _geectl__subcmd__gitea__subcmd__help__subcmd__help_commands() {
 _geectl__subcmd__gitea__subcmd__help__subcmd__maintainers_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea help maintainers commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__raw-file_commands] )) ||
+_geectl__subcmd__gitea__subcmd__help__subcmd__raw-file_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea help raw-file commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__repo-create_commands] )) ||
 _geectl__subcmd__gitea__subcmd__help__subcmd__repo-create_commands() {
@@ -5040,6 +5102,11 @@ _geectl__subcmd__gitea__subcmd__help__subcmd__repo-search_commands() {
 _geectl__subcmd__gitea__subcmd__maintainers_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea maintainers commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__gitea__subcmd__raw-file_commands] )) ||
+_geectl__subcmd__gitea__subcmd__raw-file_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea raw-file commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__gitea__subcmd__repo-create_commands] )) ||
 _geectl__subcmd__gitea__subcmd__repo-create_commands() {
@@ -5371,7 +5438,7 @@ _geectl__subcmd__help__subcmd__diff_commands() {
 (( $+functions[_geectl__subcmd__help__subcmd__gitea_commands] )) ||
 _geectl__subcmd__help__subcmd__gitea_commands() {
     local commands; commands=(
-'repo-get:Show a repository\: owner, default branch, privacy, clone URLs' \
+'repo-get:Show a repository\: owner, default branch, privacy, clone URLs, and the token owner'\''s permissions' \
 'repo-list:List repositories\: the token owner'\''s own repos, one user'\''s repos with \`--owner\`, one organization'\''s with \`--org\`, or both (the user'\''s first, then the organization'\''s)' \
 'repo-search:Search repositories across the instance by keyword\: the keyword matches the name and the description. The Gitea counterpart of \`remote search-packages\` / \`remote search-projects\`' \
 'repo-create:Create a repository under the token owner'\''s account. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the creation' \
@@ -5380,6 +5447,8 @@ _geectl__subcmd__help__subcmd__gitea_commands() {
 'branch-list:List the branches of a repository' \
 'branch-get:Show one branch\: name, head commit, protection' \
 'branch-head:Print the head commit SHA of a branch. Content command\: the text IS the SHA, with no header' \
+'raw-file:Print one file from a repository verbatim. Content command\: the text IS the file content, with no header. \`--ref\` reads from a branch, tag, or commit instead of the default branch. A missing file is \`NotFound\`, never empty content — the 404 is the existence answer' \
+'commit-statuses:List a commit'\''s statuses\: the CI states reported for that commit' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
 'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
     )
@@ -5405,10 +5474,20 @@ _geectl__subcmd__help__subcmd__gitea__subcmd__cleanup-forks_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help gitea cleanup-forks commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__commit-statuses_commands] )) ||
+_geectl__subcmd__help__subcmd__gitea__subcmd__commit-statuses_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help gitea commit-statuses commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__maintainers_commands] )) ||
 _geectl__subcmd__help__subcmd__gitea__subcmd__maintainers_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help gitea maintainers commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__raw-file_commands] )) ||
+_geectl__subcmd__help__subcmd__gitea__subcmd__raw-file_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help gitea raw-file commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__repo-create_commands] )) ||
 _geectl__subcmd__help__subcmd__gitea__subcmd__repo-create_commands() {

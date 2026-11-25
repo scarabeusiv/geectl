@@ -31,7 +31,7 @@ Mutations are dry-run by default: without `--live` only the plan is printed (on 
 
 Errors go to stderr in the selected format (JSON payload, or `error:` + `remediation:` lines in text mode) with the error kind's exit code. A parse error stays JSON.
 
-Text renderings open with one header line echoing the query coordinates (`project: … package: … …`); tables follow as designed. Content commands (`remote cat`, `remote revision-patch`, `remote project-diff`, `remote diff-packages`, `build build-log`, `request diff`, `gitea branch-head`) render verbatim, opening with the content — the coordinates live in the JSON payload. Two renderings open with the content directly too: `remote list-projects` (the query names the instance only) and the request action texts (one-line outcome summaries; the plan is on stderr and in the payload).
+Text renderings open with one header line echoing the query coordinates (`project: … package: … …`); tables follow as designed. Content commands (`remote cat`, `remote revision-patch`, `remote project-diff`, `remote diff-packages`, `build build-log`, `request diff`, `gitea branch-head`, `gitea raw-file`) render verbatim, opening with the content — the coordinates live in the JSON payload. Two renderings open with the content directly too: `remote list-projects` (the query names the instance only) and the request action texts (one-line outcome summaries; the plan is on stderr and in the payload).
 
 ### Credentials in dry-run
 
@@ -294,7 +294,7 @@ without evaluating trust.
 
 ## `gitea` — Gitea operations
 
-- `geectl gitea repo-get <OWNER> <REPO>` — Show a repository: owner, default branch, privacy, clone URLs.
+- `geectl gitea repo-get <OWNER> <REPO>` — Show a repository: owner, default branch, privacy, clone URLs, and the token owner's permissions.
 - `geectl gitea repo-list` — List repositories: the token owner's own repos, one user's repos with `--owner`, one organization's with `--org`, or both (the user's first, then the organization's); key flags: --owner <OWNER>, --org <ORG>
 - `geectl gitea repo-search <QUERY>` — Search repositories across the instance by keyword: the keyword matches the name and the description. The Gitea counterpart of `remote search-packages` / `remote search-projects`.
 - `geectl gitea repo-create <NAME>` — Create a repository under the token owner's account; key flags: --private, --description <DESCRIPTION>, --default-branch <DEFAULT_BRANCH>
@@ -303,6 +303,8 @@ without evaluating trust.
 - `geectl gitea branch-list <OWNER> <REPO>` — List the branches of a repository.
 - `geectl gitea branch-get <OWNER> <REPO> <BRANCH>` — Show one branch: name, head commit, protection.
 - `geectl gitea branch-head <OWNER> <REPO> <BRANCH>` — Print the head commit SHA of a branch.
+- `geectl gitea raw-file <OWNER> <REPO> <PATH>` — Print one file from a repository verbatim; key flags: --ref <REF>
+- `geectl gitea commit-statuses <OWNER> <REPO> <SHA>` — List a commit's statuses: the CI states reported for that commit.
 - `geectl gitea maintainers <OWNER> <REPO>` — Show the maintainers recorded in a git project's `_maintainership.json`: the project maintainers and the per-package maintainers.
 - `geectl gitea cleanup-forks` — List obsolete Gitea forks and their OBS home test projects, and delete them; key flags: --user <USER>
 
@@ -402,6 +404,8 @@ geectl --live service trigger openSUSE:Factory vim
 geectl gitea repo-get pool systemd
 geectl gitea repo-search geectl
 geectl gitea branch-head pool systemd factory
+geectl gitea raw-file pool systemd .obs
+geectl gitea commit-statuses pool systemd 0123456789abcdef0123456789abcdef01234567
 geectl gitea maintainers pool systemd
 geectl gitea repo-create vim --private
 

@@ -109,7 +109,8 @@ pub struct GiteaParent {
 
 /// A Gitea repository: only the fields the operations need are modelled — identity, parent, default
 /// branch, privacy, description and website (the repo edit reads
-/// them back), and the clone URLs the fork result returns. A
+/// them back), the clone URLs the fork result returns, and the
+/// token owner's permissions (the push check reads them). A
 /// field the operation does not need is not parsed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GiteaRepository {
@@ -136,6 +137,28 @@ pub struct GiteaRepository {
     pub clone_url: String,
     /// The SSH clone URL.
     pub ssh_url: String,
+    /// The token owner's permissions on the repo, when the server
+    /// sent them. Absent on reads that do not answer them.
+    #[serde(default)]
+    pub permissions: Option<GiteaPermissions>,
+}
+
+/// The token owner's permissions on a repository, as the repo
+/// read answers them: whether the token owner administers the
+/// repo, can push to it, and can pull it. The booleans default
+/// when the server omits one, so a permissions object that names
+/// only push still parses.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaPermissions {
+    /// Whether the token owner administers the repo.
+    #[serde(default)]
+    pub admin: bool,
+    /// Whether the token owner can push to the repo.
+    #[serde(default)]
+    pub push: bool,
+    /// Whether the token owner can pull the repo.
+    #[serde(default)]
+    pub pull: bool,
 }
 
 /// Options for the Gitea-side fork step (`fork_repo`).
@@ -329,6 +352,36 @@ pub struct GiteaBranch {
     /// that omits it must fail the parse rather than read the
     /// branch as unprotected.
     pub protected: bool,
+}
+
+/// One commit status: the state one CI reported for a commit,
+/// the context that reported it, and where to read the run.
+/// Only the fields the read needs are modelled — the id, the
+/// state, and the context are required; the rest defaults when
+/// the server omits it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GiteaCommitStatus {
+    /// The status id.
+    pub id: i64,
+    /// The state: `pending`, `success`, `error`, `failure`, or `warning`.
+    pub state: String,
+    /// The URL of the run that reported the status, when the server sent one.
+    #[serde(default)]
+    pub target_url: String,
+    /// The human-readable description, when the server sent one.
+    #[serde(default)]
+    pub description: String,
+    /// The context that reported the status (the CI name).
+    pub context: String,
+    /// The user that reported the status, when the server sent one.
+    #[serde(default)]
+    pub creator: Option<GiteaUser>,
+    /// When the status was created, when the server sent it.
+    #[serde(default)]
+    pub created_at: String,
+    /// When the status was last updated, when the server sent it.
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 /// The maintainers of one scope in a git project's
@@ -2640,6 +2693,69 @@ impl<'a> GiteaClient<'a> {
         parse_maintainership(&body, owner, repo)
     }
 
+    /// Read one file from a repository (`GET
+    /// /api/v1/repos/{owner}/{repo}/raw/{path}?ref={ref}`): the
+    /// file's content verbatim, from the given ref (a branch, a
+    /// tag, or a commit) or the default branch when no ref is
+    /// given. A missing file (or a missing ref) is `NotFound`,
+    /// never an empty string — the caller asked for that file, so
+    /// a 404 is the existence answer the scmsync-integration
+    /// probe reads. The path is split on `/`: each part travels
+    /// as one segment, so a nested path reads as nested segments.
+    pub fn raw_file(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: Option<&str>,
+    ) -> Result<String, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        validate_raw_file_path(path)?;
+        if let Some(git_ref) = git_ref {
+            validate_git_branch_name(git_ref)?;
+        }
+        let mut segments: Vec<&str> = vec!["api", "v1", "repos", owner, repo, "raw"];
+        segments.extend(path.split('/'));
+        let query: Vec<(&str, &str)> = match git_ref {
+            Some(git_ref) => vec![("ref", git_ref)],
+            None => vec![],
+        };
+        let url = build_url(&self.base, &segments, &query);
+        self.http.get_with(&url, &self.credentials)
+    }
+
+    /// List a commit's statuses (`GET
+    /// /api/v1/repos/{owner}/{repo}/commits/{sha}/statuses`): the
+    /// CI states reported for that commit, paginated internally
+    /// and bounded like `branch_list`. A commit with no statuses
+    /// reads as an empty list, never an error — statuses are
+    /// additive, so absence is a state, not a missing commit. A
+    /// commit that does not exist is `NotFound`.
+    pub fn commit_statuses(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<GiteaCommitStatus>, GeectlError> {
+        validate_gitea_name(owner, "owner")?;
+        validate_gitea_name(repo, "repo")?;
+        if !looks_like_commit_sha(sha) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid Gitea commit SHA: {sha:?} (expected a 40- or 64-hex-digit SHA)"),
+            ));
+        }
+        self.list_paged::<GiteaCommitStatus>(
+            &[
+                "api", "v1", "repos", owner, repo, "commits", sha, "statuses",
+            ],
+            &[],
+            &format!("commit statuses of {owner}/{repo}@{sha}"),
+            "the list is bounded at 500 entries",
+        )
+    }
+
     /// Read one pull request (`GET
     /// /api/v1/repos/{owner}/{repo}/pulls/{number}`): the title and
     /// body, state and merge flags, author, labels, and the
@@ -4466,6 +4582,25 @@ fn validate_git_branch_name(branch: &str) -> Result<(), GeectlError> {
     Ok(())
 }
 
+/// A raw-file path: slash-separated parts, none empty, no `.`
+/// or `..` part, no leading or trailing slash. The path travels
+/// as segments, so a part that escapes the repo (`..`) or an
+/// empty part must fail here, before any call.
+fn validate_raw_file_path(path: &str) -> Result<(), GeectlError> {
+    let valid = !path.is_empty()
+        && !path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.contains("//")
+        && path.split('/').all(|part| part != "." && part != "..");
+    if !valid {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid Gitea raw-file path: {path:?}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Parse a Gitea repository out of a response body. A body that is
 /// not a repository is a server error naming the repo, never a
 /// silent empty value — the caller asked for this repo. A body
@@ -5655,6 +5790,34 @@ mod tests {
                 full_name: "pool/systemd".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn repo_get_parses_permissions() {
+        let body = r#"{"owner": {"login": "pool"}, "name": "systemd", "full_name": "pool/systemd", "parent": null, "default_branch": "factory", "private": false, "clone_url": "x", "ssh_url": "y", "permissions": {"admin": true, "push": true, "pull": true}}"#;
+        let http =
+            FakeHttp::new().with_get("https://src.opensuse.org/api/v1/repos/pool/systemd", body);
+        let repo = client(&http).repo_get("pool", "systemd").unwrap();
+        assert_eq!(
+            repo.permissions,
+            Some(GiteaPermissions {
+                admin: true,
+                push: true,
+                pull: true,
+            })
+        );
+    }
+
+    #[test]
+    fn repo_get_without_permissions_parses_as_none() {
+        // The fixture answers no permissions object: reads that
+        // do not answer permissions still parse.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd",
+            &repo_json("pool", "systemd", None),
+        );
+        let repo = client(&http).repo_get("pool", "systemd").unwrap();
+        assert_eq!(repo.permissions, None);
     }
 
     #[test]
@@ -8187,6 +8350,128 @@ mod tests {
             ErrorKind::NotFound,
         );
         let err = client(&http).maintainership("pool", "systemd").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn raw_file_reads_the_file_verbatim() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/raw/.obs",
+            "scmsync content\nsecond line\n",
+        );
+        let content = client(&http)
+            .raw_file("pool", "systemd", ".obs", None)
+            .unwrap();
+        assert_eq!(content, "scmsync content\nsecond line\n");
+    }
+
+    #[test]
+    fn raw_file_reads_a_nested_path_from_a_ref() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/raw/sub/dir/_service?ref=factory",
+            "service content",
+        );
+        let content = client(&http)
+            .raw_file("pool", "systemd", "sub/dir/_service", Some("factory"))
+            .unwrap();
+        assert_eq!(content, "service content");
+    }
+
+    #[test]
+    fn raw_file_missing_file_is_not_found() {
+        // The 404 is the existence answer: the scmsync-integration
+        // probe reads a missing `.obs` as no integration.
+        let http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/raw/.obs",
+            ErrorKind::NotFound,
+        );
+        let err = client(&http)
+            .raw_file("pool", "systemd", ".obs", None)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn raw_file_validates_path_and_ref_before_any_call() {
+        let http = FakeHttp::new();
+        for path in ["", "/.obs", ".obs/", "a//b", "../.obs", "a/../b", "./.obs"] {
+            let err = client(&http)
+                .raw_file("pool", "systemd", path, None)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "path {path:?}");
+        }
+        for git_ref in ["", "bad ref", "bad#ref"] {
+            let err = client(&http)
+                .raw_file("pool", "systemd", ".obs", Some(git_ref))
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "ref {git_ref:?}");
+        }
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn commit_statuses_lists_statuses() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/commits/{sha}/statuses?page=1&limit=50"
+            ),
+            r#"[{"id": 1, "state": "success", "target_url": "https://ci.example.org/1", "description": "Build succeeded", "context": "obs", "creator": {"login": "ci"}, "created_at": "2026-11-25T00:00:00Z", "updated_at": "2026-11-25T00:01:00Z"}, {"id": 2, "state": "pending", "target_url": "", "description": "", "context": "other-ci", "creator": null, "created_at": "", "updated_at": ""}]"#,
+        );
+        let statuses = client(&http)
+            .commit_statuses("pool", "systemd", sha)
+            .unwrap();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].state, "success");
+        assert_eq!(statuses[0].context, "obs");
+        assert_eq!(statuses[0].creator.as_ref().unwrap().login, "ci");
+        assert_eq!(statuses[1].state, "pending");
+        assert_eq!(statuses[1].creator, None);
+    }
+
+    #[test]
+    fn commit_statuses_empty_is_no_statuses() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let http = FakeHttp::new().with_get(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/commits/{sha}/statuses?page=1&limit=50"
+            ),
+            "[]",
+        );
+        let statuses = client(&http)
+            .commit_statuses("pool", "systemd", sha)
+            .unwrap();
+        assert!(statuses.is_empty());
+    }
+
+    #[test]
+    fn commit_statuses_rejects_a_non_sha_without_http() {
+        let http = FakeHttp::new();
+        for sha in [
+            "factory",
+            "0123",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            let err = client(&http)
+                .commit_statuses("pool", "systemd", sha)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "sha {sha:?}");
+        }
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn commit_statuses_missing_commit_is_not_found() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let http = FakeHttp::new().with_get_error(
+            &format!(
+                "https://src.opensuse.org/api/v1/repos/pool/systemd/commits/{sha}/statuses?page=1&limit=50"
+            ),
+            ErrorKind::NotFound,
+        );
+        let err = client(&http)
+            .commit_statuses("pool", "systemd", sha)
+            .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 

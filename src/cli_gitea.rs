@@ -23,7 +23,8 @@
 //! Coordinate header (design rule 1):
 //! every text rendering opens with one header line echoing the query
 //! coordinates (`owner: … repo: …`, `repo: owner/name`), except the
-//! content command `branch-head`, whose text IS the bare SHA.
+//! content commands `branch-head`, whose text IS the bare SHA, and
+//! `raw-file`, whose text IS the file content.
 //! Tables stay as designed.
 //!
 //! Documented omissions (not gaps): `repo-list` and `repo-search`
@@ -34,7 +35,9 @@
 //! sync-verification primitive) but no commit message (long free
 //! text); `repo-get` text carries no description or website (long
 //! free text) and `repo-create` text carries no description (long
-//! free text). The JSON payload remains the complete record in every case.
+//! free text); `repo-get` text carries the push permission when the
+//! server sent permissions, while admin and pull stay JSON-only.
+//! The JSON payload remains the complete record in every case.
 
 use crate::auth::EnvGiteaAuth;
 use crate::config::{self, DEFAULT_GITEA_URL};
@@ -42,8 +45,8 @@ use crate::debug::Debug;
 use crate::error::GeectlError;
 use crate::gitea::{
     require_credentials_for_url, CleanupForkEntry, CleanupForkOutcome, CleanupForksResult,
-    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaRepository, MaintainerInfo, Maintainership,
-    RepoCreateOptions,
+    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaCommitStatus, GiteaRepository, MaintainerInfo,
+    Maintainership, RepoCreateOptions,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::DryRun;
@@ -54,7 +57,8 @@ use serde_json::{json, Value};
 /// in kebab-case, grouped under the top-level noun.
 #[derive(Debug, Subcommand)]
 pub enum GiteaCommand {
-    /// Show a repository: owner, default branch, privacy, clone URLs.
+    /// Show a repository: owner, default branch, privacy, clone URLs,
+    /// and the token owner's permissions.
     RepoGet {
         /// The repository owner.
         owner: String,
@@ -119,6 +123,31 @@ pub enum GiteaCommand {
         repo: String,
         /// The branch name.
         branch: String,
+    },
+    /// Print one file from a repository verbatim. Content
+    /// command: the text IS the file content, with no header.
+    /// `--ref` reads from a branch, tag, or commit instead of
+    /// the default branch. A missing file is `NotFound`, never
+    /// empty content — the 404 is the existence answer.
+    RawFile {
+        /// The repository owner.
+        owner: String,
+        /// The repository name.
+        repo: String,
+        /// The file path inside the repository.
+        path: String,
+        /// The branch, tag, or commit to read from; the default branch when omitted.
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+    },
+    /// List a commit's statuses: the CI states reported for that commit.
+    CommitStatuses {
+        /// The repository owner.
+        owner: String,
+        /// The repository name.
+        repo: String,
+        /// The commit SHA.
+        sha: String,
     },
     /// Show the maintainers recorded in a git project's
     /// `_maintainership.json`: the project maintainers and the
@@ -356,6 +385,39 @@ pub fn run_gitea(
             });
             // Content command: the text IS the SHA.
             Ok((payload, head))
+        }
+        GiteaCommand::RawFile {
+            owner,
+            repo,
+            path,
+            git_ref,
+        } => {
+            let content = client.raw_file(&owner, &repo, &path, git_ref.as_deref())?;
+            let payload = json!({
+                "owner": owner,
+                "repo": repo,
+                "path": path,
+                "ref": git_ref,
+                "content": content,
+            });
+            // Content command: the text IS the file content.
+            Ok((payload, content))
+        }
+        GiteaCommand::CommitStatuses { owner, repo, sha } => {
+            let statuses = client.commit_statuses(&owner, &repo, &sha)?;
+            let payload = json!({
+                "owner": owner,
+                "repo": repo,
+                "sha": sha,
+                "statuses": statuses.iter().map(commit_status_json).collect::<Vec<_>>(),
+            });
+            Ok((
+                payload,
+                with_header(
+                    &format!("owner: {owner} repo: {repo} commit: {sha}"),
+                    render_commit_statuses(&statuses),
+                ),
+            ))
         }
         GiteaCommand::Maintainers { owner, repo } => {
             let maintainership = client.maintainership(&owner, &repo)?;
@@ -665,6 +727,13 @@ fn gitea_repository_json(repository: &GiteaRepository) -> Value {
         "website": repository.website,
         "clone_url": repository.clone_url,
         "ssh_url": repository.ssh_url,
+        "permissions": repository.permissions.as_ref().map(|permissions| {
+            json!({
+                "admin": permissions.admin,
+                "push": permissions.push,
+                "pull": permissions.pull,
+            })
+        }),
     })
 }
 
@@ -691,6 +760,12 @@ fn render_repository(repository: &GiteaRepository) -> String {
         "private: {}",
         if repository.private { "yes" } else { "no" }
     ));
+    if let Some(permissions) = &repository.permissions {
+        lines.push(format!(
+            "push: {}",
+            if permissions.push { "yes" } else { "no" }
+        ));
+    }
     lines.push(format!("clone: {}", repository.clone_url));
     lines.push(format!("ssh: {}", repository.ssh_url));
     lines.join("\n")
@@ -752,6 +827,41 @@ fn render_branch(branch: &GiteaBranch) -> String {
         if branch.protected { "yes" } else { "no" }
     ));
     lines.join("\n")
+}
+
+/// One commit status as JSON: the id, state, target URL,
+/// description, context, reporting user, and timestamps.
+fn commit_status_json(status: &GiteaCommitStatus) -> Value {
+    json!({
+        "id": status.id,
+        "state": status.state,
+        "target_url": status.target_url,
+        "description": status.description,
+        "context": status.context,
+        "creator": status.creator.as_ref().map(|creator| creator.login.clone()),
+        "created_at": status.created_at,
+        "updated_at": status.updated_at,
+    })
+}
+
+/// Commit statuses as a table: context, state, description, and
+/// target URL. An empty list reads `no statuses`.
+fn render_commit_statuses(statuses: &[GiteaCommitStatus]) -> String {
+    if statuses.is_empty() {
+        return "no statuses".to_string();
+    }
+    let rows: Vec<Vec<String>> = statuses
+        .iter()
+        .map(|status| {
+            vec![
+                status.context.clone(),
+                status.state.clone(),
+                status.description.clone(),
+                status.target_url.clone(),
+            ]
+        })
+        .collect();
+    render_table(&["CONTEXT", "STATE", "DESCRIPTION", "TARGET"], &rows)
 }
 
 /// The maintainership read as its JSON payload and its text
@@ -863,7 +973,7 @@ fn join_row(cells: &[&str], widths: &[usize]) -> String {
 mod tests {
     use super::*;
     use crate::cli::{Cli, Command};
-    use crate::gitea::{GiteaBranchCommit, GiteaOwner, GiteaParent};
+    use crate::gitea::{GiteaBranchCommit, GiteaOwner, GiteaParent, GiteaPermissions};
     use clap::Parser;
 
     fn parse(args: &[&str]) -> GiteaCommand {
@@ -938,6 +1048,88 @@ mod tests {
         let (payload, text) = maintainers_result("pool", "systemd", &empty);
         assert_eq!(payload["packages"], json!({}));
         assert_eq!(text, "owner: pool repo: systemd\nno maintainers");
+    }
+
+    #[test]
+    fn render_repository_shows_push_when_permissions_present() {
+        let mut repo = sample_repository();
+        repo.permissions = Some(GiteaPermissions {
+            admin: false,
+            push: true,
+            pull: true,
+        });
+        let text = render_repository(&repo);
+        assert!(
+            text.contains("push: yes"),
+            "text misses the push line: {text}"
+        );
+    }
+
+    #[test]
+    fn render_repository_without_permissions_has_no_push_line() {
+        let text = render_repository(&sample_repository());
+        assert!(
+            !text.contains("push:"),
+            "text names push without permissions: {text}"
+        );
+    }
+
+    #[test]
+    fn repository_json_carries_permissions_when_present() {
+        let mut repo = sample_repository();
+        repo.permissions = Some(GiteaPermissions {
+            admin: true,
+            push: false,
+            pull: true,
+        });
+        let payload = gitea_repository_json(&repo);
+        assert_eq!(payload["permissions"]["admin"], json!(true));
+        assert_eq!(payload["permissions"]["push"], json!(false));
+        assert_eq!(payload["permissions"]["pull"], json!(true));
+    }
+
+    #[test]
+    fn repository_json_permissions_is_null_when_absent() {
+        let payload = gitea_repository_json(&sample_repository());
+        assert_eq!(payload["permissions"], json!(null));
+    }
+
+    fn sample_status() -> GiteaCommitStatus {
+        GiteaCommitStatus {
+            id: 1,
+            state: "success".to_string(),
+            target_url: "https://ci.example.org/1".to_string(),
+            description: "Build succeeded".to_string(),
+            context: "obs".to_string(),
+            creator: None,
+            created_at: "2026-11-25T00:00:00Z".to_string(),
+            updated_at: "2026-11-25T00:01:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn commit_status_json_carries_the_status_fields() {
+        let payload = commit_status_json(&sample_status());
+        assert_eq!(payload["id"], json!(1));
+        assert_eq!(payload["state"], json!("success"));
+        assert_eq!(payload["context"], json!("obs"));
+        assert_eq!(payload["target_url"], json!("https://ci.example.org/1"));
+        assert_eq!(payload["description"], json!("Build succeeded"));
+        assert_eq!(payload["creator"], json!(null));
+    }
+
+    #[test]
+    fn render_commit_statuses_renders_a_table() {
+        let text = render_commit_statuses(&[sample_status()]);
+        assert_eq!(
+            text,
+            "CONTEXT STATE   DESCRIPTION     TARGET\nobs     success Build succeeded https://ci.example.org/1"
+        );
+    }
+
+    #[test]
+    fn render_commit_statuses_empty_is_no_statuses() {
+        assert_eq!(render_commit_statuses(&[]), "no statuses");
     }
 
     #[test]
@@ -1035,6 +1227,31 @@ mod tests {
             ]),
             GiteaCommand::BranchHead { .. }
         ));
+        let parsed = parse(&[
+            "geectl", "gitea", "raw-file", "pool", "systemd", ".obs", "--ref", "factory",
+        ]);
+        assert!(matches!(
+            parsed,
+            GiteaCommand::RawFile {
+                git_ref: Some(git_ref),
+                ..
+            } if git_ref == "factory"
+        ));
+        assert!(matches!(
+            parse(&["geectl", "gitea", "raw-file", "pool", "systemd", ".obs"]),
+            GiteaCommand::RawFile { git_ref: None, .. }
+        ));
+        assert!(matches!(
+            parse(&[
+                "geectl",
+                "gitea",
+                "commit-statuses",
+                "pool",
+                "systemd",
+                "0123456789abcdef0123456789abcdef01234567"
+            ]),
+            GiteaCommand::CommitStatuses { .. }
+        ));
     }
 
     #[test]
@@ -1071,6 +1288,7 @@ mod tests {
             website: None,
             clone_url: "https://src.opensuse.org/pool/systemd.git".to_string(),
             ssh_url: "git@src.opensuse.org:pool/systemd.git".to_string(),
+            permissions: None,
         }
     }
 
