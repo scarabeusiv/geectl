@@ -16,6 +16,7 @@ use super::tag_attr;
 use super::valid_obs_filename;
 use super::valid_obs_filename_for_delete;
 use super::valid_obs_name;
+use super::AddChannelsOptions;
 use super::AggregateOptions;
 use super::CommitFileEntry;
 use super::CommitFilelistOptions;
@@ -117,6 +118,30 @@ fn aggregate_option_suffix(options: &AggregateOptions) -> String {
         String::new()
     } else {
         format!(" ({})", flags.join(", "))
+    }
+}
+
+/// Refuse mutually exclusive channel modes client-side instead
+/// of failing on the server: osc raises the same combination.
+fn validate_add_channels_options(options: &AddChannelsOptions) -> Result<(), GeectlError> {
+    if options.enable_all && options.skip_disabled {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "channel modes enable-all and skip-disabled are mutually exclusive",
+        ));
+    }
+    Ok(())
+}
+
+/// The option suffix for an add-channels plan line: the set mode,
+/// so a dry-run plan reads what the addition would have done.
+fn add_channels_option_suffix(options: &AddChannelsOptions) -> String {
+    if options.enable_all {
+        " (enable all)".to_string()
+    } else if options.skip_disabled {
+        " (skip disabled)".to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -4871,6 +4896,75 @@ impl<'a> ObsClient<'a> {
         self.source_command(&path, &query, "unlock", &what)
     }
 
+    /// Add the channels defined for a project, or for one package
+    /// in it, on OBS (`POST
+    /// /source/<project>[<package>]?cmd=addchannels`, with
+    /// `&mode=enable_all` or `&mode=skip_disabled` when set).
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. In dry-run the addition is recorded in
+    /// the plan and nothing is added — the guard runs before the
+    /// credentials check, like `create_package`.
+    ///
+    /// An agent adds channels to pull a linked project's channel
+    /// packages into the project, with the repositories that build
+    /// them. The source link target is what the server looks the
+    /// channels up from; a project or package with no channels
+    /// defined is a no-op that still answers ok. `enable_all` and
+    /// `skip_disabled` are mutually exclusive, like osc.
+    pub fn add_channels(
+        &self,
+        project: &str,
+        package: Option<&str>,
+        options: &AddChannelsOptions,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        if let Some(package) = package {
+            if !valid_obs_name(package) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name: {package:?}"),
+                ));
+            }
+        }
+        validate_add_channels_options(options)?;
+        let what = match package {
+            Some(package) => format!("package {project}/{package}"),
+            None => format!("project {project}"),
+        };
+        if !dry_run.allow(&format!(
+            "add channels to {what}{}",
+            add_channels_option_suffix(options)
+        )) {
+            return Ok(());
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "cannot add channels to {what} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
+                ),
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("cmd", "addchannels")];
+        if options.enable_all {
+            query.push(("mode", "enable_all"));
+        }
+        if options.skip_disabled {
+            query.push(("mode", "skip_disabled"));
+        }
+        let path: Vec<&str> = match package {
+            Some(package) => vec![project, package],
+            None => vec![project],
+        };
+        self.source_command(&path, &query, "addchannels", &what)
+    }
+
     /// Create an operation-scoped trigger token for the
     /// authenticated user (`POST /person/<login>/token`), and return
     /// the id and the secret it was created with. The secret is
@@ -7506,6 +7600,158 @@ mod tests {
                 "test:factory",
                 Some("test-pkgA/pkg"),
                 "release done",
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_channels_project_posts_without_mode_and_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=addchannels",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .add_channels(
+                "test:factory",
+                None,
+                &AddChannelsOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn add_channels_package_with_enable_all_posts_mode() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=addchannels&mode=enable_all",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = AddChannelsOptions {
+            enable_all: true,
+            ..AddChannelsOptions::default()
+        };
+        assert!(client
+            .add_channels(
+                "test:factory",
+                Some("test-pkgA"),
+                &options,
+                &DryRun::new(false)
+            )
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn add_channels_with_skip_disabled_posts_mode() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=addchannels&mode=skip_disabled",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = AddChannelsOptions {
+            skip_disabled: true,
+            ..AddChannelsOptions::default()
+        };
+        assert!(client
+            .add_channels("test:factory", None, &options, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn add_channels_other_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=addchannels",
+            "<status code=\"error\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .add_channels(
+                "test:factory",
+                None,
+                &AddChannelsOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn add_channels_dry_run_records_plan_and_adds_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = AddChannelsOptions {
+            enable_all: true,
+            ..AddChannelsOptions::default()
+        };
+        assert!(client
+            .add_channels("test:factory", None, &options, &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: add channels to project test:factory (enable all)".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_channels_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=addchannels",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .add_channels(
+                "test:factory",
+                None,
+                &AddChannelsOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_channels_exclusive_modes_are_refused_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = AddChannelsOptions {
+            enable_all: true,
+            skip_disabled: true,
+        };
+        assert!(client
+            .add_channels("test:factory", None, &options, &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_channels_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .add_channels(
+                "test:factory/pkg",
+                None,
+                &AddChannelsOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(client
+            .add_channels(
+                "test:factory",
+                Some("test-pkgA/pkg"),
+                &AddChannelsOptions::default(),
                 &DryRun::new(false),
             )
             .is_err());

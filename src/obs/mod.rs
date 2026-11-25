@@ -235,6 +235,7 @@ pub use self::staging::StagingReadOptions;
 pub use self::types::changelog_names_cve;
 pub(crate) use self::types::ActionShape;
 pub(crate) use self::types::ActionTarget;
+pub use self::types::AddChannelsOptions;
 pub use self::types::AggregateOptions;
 pub use self::types::BranchOptions;
 pub use self::types::BranchResult;

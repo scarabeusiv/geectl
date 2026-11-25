@@ -4511,6 +4511,62 @@ fn remote_unlock_empty_message_fails_with_invalid_input() {
 }
 
 #[test]
+fn remote_add_channels_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "add-channels",
+            "openSUSE:Factory",
+            "vim",
+            "--enable-all",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "openSUSE:Factory");
+    assert_eq!(value["package"], "vim");
+    assert_eq!(value["enable_all"], true);
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: add channels to package openSUSE:Factory/vim (enable all)"
+    );
+}
+
+#[test]
+fn remote_add_channels_both_modes_fails_with_invalid_input() {
+    // `--enable-all` and `--skip-disabled` conflict at parse time:
+    // clap refuses the combination through the single JSON error path.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "add-channels",
+            "openSUSE:Factory",
+            "--enable-all",
+            "--skip-disabled",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
 fn remote_repo_add_live_with_half_set_credentials_fails_with_config_error() {
     // A live mutation does need credentials, so it fails fast.
     let dir = TempDir::new();

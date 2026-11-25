@@ -1043,6 +1043,21 @@ pub struct WipeBinariesOptions {
     pub codes: Vec<WipeCode>,
 }
 
+/// Options for [`ObsClient::add_channels`]. Both fields are off
+/// by default: the channels are added disabled, as the server's
+/// default `add_disabled` mode.
+#[derive(Debug, Clone, Default)]
+pub struct AddChannelsOptions {
+    /// Enable all added channels, including the ones disabled by
+    /// default. The server's `mode=enable_all`. Mutually exclusive
+    /// with `skip_disabled`.
+    pub enable_all: bool,
+    /// Skip disabled channels: add the channel packages but not
+    /// their repositories. The server's `mode=skip_disabled`.
+    /// Mutually exclusive with `enable_all`.
+    pub skip_disabled: bool,
+}
+
 /// Options for [`ObsClient::create_package_with_options`]. All
 /// fields are optional: no scmsync means an OBS-native package, no
 /// force means an existing package is refused rather than

@@ -4,8 +4,9 @@
 //! contents and downloads, listings, history, meta, search, ownership,
 //! and diffs — plus the group's mutations, which edit a project's repository
 //! list in its meta (`repo-add`, `repo-remove`), create, upload
-//! to, delete, restore, aggregate, release, lock, and unlock
-//! projects and packages, or create an operation-scoped trigger token
+//! to, delete, restore, aggregate, release, lock, unlock, and
+//! add channels to projects and packages, or create an
+//! operation-scoped trigger token
 //! (`create-token`). Each command is a thin wrapper over one `ObsClient`
 //! operation: the flags mirror the library parameters, the JSON
 //! payload carries the typed values, and the text renderer prints
@@ -85,12 +86,12 @@ use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
     parse_package_meta, parse_project_meta, valid_obs_name, validate_meta_file_roles,
-    validate_role, AggregateOptions, CreatePackageOptions, CreateTokenOptions, CreatedToken,
-    DeletePackageOptions, DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry,
-    NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person,
-    ProjectMatch, ProjectMeta, ReleaseOptions, Repository, RevisionPatch, RevisionRange,
-    RevisionSpec, RoleGrant, ScmsyncProjectList, SourceFile, StagedRequest, StagingProject,
-    StagingReadOptions, TokenOperation, FACTORY_PROJECT, OBS_API_BASE,
+    validate_role, AddChannelsOptions, AggregateOptions, CreatePackageOptions, CreateTokenOptions,
+    CreatedToken, DeletePackageOptions, DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus,
+    HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus, PackageMatch,
+    PackageMeta, Person, ProjectMatch, ProjectMeta, ReleaseOptions, Repository, RevisionPatch,
+    RevisionRange, RevisionSpec, RoleGrant, ScmsyncProjectList, SourceFile, StagedRequest,
+    StagingProject, StagingReadOptions, TokenOperation, FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -802,6 +803,24 @@ pub enum RemoteCommand {
         #[arg(long)]
         message: String,
     },
+    /// Add the channels defined for a project or a package. A
+    /// mutation: dry-run is the default (only the plan is printed);
+    /// `--live` performs the addition. A project or package with
+    /// no channels defined is a no-op.
+    AddChannels {
+        /// The project to add channels to.
+        project: String,
+        /// The package to add channels to. Omit for the whole project.
+        package: Option<String>,
+        /// Enable all added channels including the ones disabled by
+        /// default. Cannot combine with `--skip-disabled`.
+        #[arg(long, conflicts_with = "skip_disabled")]
+        enable_all: bool,
+        /// Skip disabled channels: add the channel packages but not
+        /// their repositories. Cannot combine with `--enable-all`.
+        #[arg(long, conflicts_with = "enable_all")]
+        skip_disabled: bool,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
@@ -854,6 +873,7 @@ pub fn run_remote(
         RemoteCommand::ReleaseProject { .. } if !live => Credentials::None,
         RemoteCommand::Lock { .. } if !live => Credentials::None,
         RemoteCommand::Unlock { .. } if !live => Credentials::None,
+        RemoteCommand::AddChannels { .. } if !live => Credentials::None,
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -1889,6 +1909,31 @@ pub fn run_remote(
                 &project,
                 package.as_deref(),
                 &message,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
+        RemoteCommand::AddChannels {
+            project,
+            package,
+            enable_all,
+            skip_disabled,
+        } => {
+            let options = AddChannelsOptions {
+                enable_all,
+                skip_disabled,
+            };
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.add_channels(&project, package.as_deref(), &options, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(add_channels_result(
+                &project,
+                package.as_deref(),
+                &options,
                 dry_run.enabled(),
                 plan,
             ))
@@ -3099,6 +3144,53 @@ fn unlock_result(
         dry_run,
         plan,
     )
+}
+
+/// The `add-channels` result: the payload carries the scope and
+/// the mode; the text carries them too, in the result line.
+fn add_channels_result(
+    project: &str,
+    package: Option<&str>,
+    options: &AddChannelsOptions,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let (header, scope) = match package {
+        Some(package) => (
+            format!("project: {project} package: {package}"),
+            format!("package {package} in project {project}"),
+        ),
+        None => (format!("project: {project}"), format!("project {project}")),
+    };
+    let suffix = add_channels_options_suffix(options);
+    let result_line = if dry_run {
+        format!("dry-run: would add channels to {scope}{suffix}")
+    } else {
+        format!("added channels to {scope}{suffix}")
+    };
+    mutation_result(
+        json!({
+            "project": project,
+            "package": package,
+            "enable_all": options.enable_all,
+            "skip_disabled": options.skip_disabled,
+        }),
+        header,
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The option suffix for an add-channels result line: the set mode.
+fn add_channels_options_suffix(options: &AddChannelsOptions) -> String {
+    if options.enable_all {
+        " (enable all)".to_string()
+    } else if options.skip_disabled {
+        " (skip disabled)".to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn list_packages_result(project: &str, packages: Vec<String>) -> (Value, String) {
@@ -6638,6 +6730,80 @@ mod tests {
         assert_eq!(
             text,
             "project: P\ndry_run: true\ndry-run: would unlock project P\n[dry-run] would: unlock project P"
+        );
+    }
+
+    #[test]
+    fn add_channels_parses_project_package_and_modes() {
+        let parsed = parse(&["geectl", "remote", "add-channels", "P", "K", "--enable-all"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::AddChannels {
+                project,
+                package: Some(package),
+                enable_all: true,
+                skip_disabled: false,
+                ..
+            } if project == "P" && package == "K"
+        ));
+        let parsed = parse(&["geectl", "remote", "add-channels", "P"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::AddChannels {
+                package: None,
+                enable_all: false,
+                skip_disabled: false,
+                ..
+            }
+        ));
+        // The modes exclude each other at parse time, like the
+        // library refuses them at the call.
+        assert!(Cli::try_parse_from([
+            "geectl",
+            "remote",
+            "add-channels",
+            "P",
+            "--enable-all",
+            "--skip-disabled",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn add_channels_result_carries_scope_and_mode_in_both_formats() {
+        let options = AddChannelsOptions {
+            enable_all: true,
+            ..AddChannelsOptions::default()
+        };
+        let (payload, text) = add_channels_result("P", Some("K"), &options, false, None);
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["package"], "K");
+        assert_eq!(payload["enable_all"], true);
+        assert_eq!(payload["skip_disabled"], false);
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: false\nadded channels to package K in project P (enable all)"
+        );
+        let (payload, text) = add_channels_result(
+            "P",
+            None,
+            &AddChannelsOptions::default(),
+            true,
+            Some(vec![
+                "[dry-run] would: add channels to project P".to_string()
+            ]),
+        );
+        assert_eq!(payload["package"], Value::Null);
+        assert_eq!(payload["enable_all"], false);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: add channels to project P"
+        );
+        assert_eq!(
+            text,
+            "project: P\ndry_run: true\ndry-run: would add channels to project P\n[dry-run] would: add channels to project P"
         );
     }
 

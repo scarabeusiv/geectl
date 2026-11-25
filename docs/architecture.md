@@ -208,7 +208,9 @@ under a new name; and `ObsClient::release_package` /
 release target as built; `ObsClient::lock` locks a project with
 the server's `cmd=lock`, which records the message, or a package
 by setting its `lock` flag — the message is sent but not recorded;
-`ObsClient::unlock` unlocks one with a required comment. Every one of these is
+`ObsClient::unlock` unlocks one with a required comment;
+`ObsClient::add_channels` adds the channels defined for a project
+or a package. Every one of these is
 DryRun-guarded and credentialed like the create and upload calls
 above.
 
