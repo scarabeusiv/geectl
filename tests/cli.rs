@@ -3590,9 +3590,82 @@ fn remote_set_package_meta_live_with_half_set_credentials_fails_with_config_erro
     assert_eq!(value["error"]["code"], "config_error");
 }
 
+
 #[test]
-fn remote_set_project_meta_add_person_dry_run_ignores_half_set_credentials() {
-    // A person-only change writes no meta itself — the meta write
+fn remote_lock_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "remote", "lock", "openSUSE:Factory"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_unlock_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "unlock",
+            "openSUSE:Factory",
+            "--message",
+            "unlocking",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_add_channels_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "remote", "add-channels", "openSUSE:Factory"])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_add_containers_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "remote",
+            "add-containers",
+            "openSUSE:Factory",
+            "vim",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn remote_set_project_meta_add_person_dry_run_ignores_half_set_credentials() {    // A person-only change writes no meta itself — the meta write
     // runs only when a field flag is set — so the plan carries only
     // the role entry, and the payload carries the granted person.
     let dir = TempDir::new();
@@ -8988,6 +9061,29 @@ fn build_abort_build_live_with_half_set_credentials_fails_with_config_error() {
             "vim",
             "standard",
             "x86_64",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+}
+
+#[test]
+fn build_wipe_binaries_live_with_half_set_credentials_fails_with_config_error() {
+    // A live mutation does need credentials, so it fails fast. The
+    // `--all` scope carries the wipe past the scope refusal to the
+    // credentials check.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "build",
+            "wipe-binaries",
+            "openSUSE:Factory",
+            "--all",
         ])
         .env("GEECTL_OBS_USERNAME", "alice")
         .output()
