@@ -2521,12 +2521,17 @@ fn markdown_to_plaintext(markdown: &str) -> String {
     // One line per line, no trailing whitespace, no leading or
     // trailing blank lines: a single-paragraph body renders as one
     // line, multi-paragraph bodies as separated lines.
-    out.lines()
+    let text = out
+        .lines()
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
-        .to_string()
+        .to_string();
+    // Terminal control characters are stripped from the converted
+    // text: comment bodies are free text from another user, and the
+    // Markdown parser passes escape sequences through as text.
+    strip_terminal_controls(&text)
 }
 
 fn render_comments_text(id: &str, comments: &[RequestComment]) -> String {
@@ -2907,6 +2912,24 @@ mod tests {
             .contains("comment 3 by user3 at 2010-12-29T12:00:00: Please fix <foo> and see note"));
         assert!(!text.contains("**"));
         assert!(!text.contains("https://example.com"));
+    }
+
+    #[test]
+    fn comments_text_strips_terminal_controls_from_bodies() {
+        // Comment bodies are free text from another user, and the
+        // Markdown parser passes escape sequences through as text:
+        // the converted plaintext is stripped at the render, while
+        // the JSON payload keeps the raw Markdown.
+        let xml = "<comments request=\"42\">\n  <comment who=\"user1\" when=\"2010-12-29T10:00:00\" id=\"1\">fix\u{1b}[2Jit\u{7}now\nline\u{202e}two</comment>\n</comments>";
+        let comments = parse_comments(xml).expect("comments parse");
+        let text = render_comments_text("42", &comments);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(
+            text.contains("comment 1 by user1 at 2010-12-29T10:00:00: fix[2Jitnow linetwo"),
+            "text: {text}"
+        );
     }
 
     #[test]
