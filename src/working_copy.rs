@@ -11911,7 +11911,23 @@ mod tests {
             .unwrap();
         assert!(fs2::FileExt::try_lock_exclusive(&second).is_err());
         drop(first);
-        assert!(fs2::FileExt::try_lock_exclusive(&second).is_ok());
+        // The release is not instantaneously observable: a
+        // subprocess forked by another test thread while the
+        // lock was held inherits the lock file descriptor, and
+        // the flock only releases once that child execs or
+        // exits. Poll briefly for the release instead of
+        // asserting it at once; a lock that never releases
+        // still fails the test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&second) {
+                Ok(()) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("commit lock did not release after drop: {e}"),
+            }
+        }
         let _ = dir;
     }
 
