@@ -1690,32 +1690,40 @@ pub fn checkout_target(dir: &Path, project: &str, package: &str) -> Result<PathB
 /// (`Foo.spec` vs `foo.spec`) are refused too: a case-insensitive
 /// checkout cannot hold both.
 fn check_listing_names(listing: &DirectoryListing) -> Result<(), GeectlError> {
+    let names: Vec<&str> = listing
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    check_file_names(&names)
+}
+
+/// Refuse file names that are not plain file names, or that
+/// collide case-insensitively: the names a checkout downloads,
+/// whether from one listing or resolved across link levels.
+fn check_file_names(names: &[&str]) -> Result<(), GeectlError> {
     let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
-    for entry in &listing.entries {
-        if !valid_obs_filename(&entry.name) || entry.name.contains('\\') {
+    for &name in names {
+        if !valid_obs_filename(name) || name.contains('\\') {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
-                format!(
-                    "invalid file name in the directory listing: {:?}",
-                    entry.name
-                ),
+                format!("invalid file name in the directory listing: {name:?}"),
             ));
         }
         // A case-insensitive checkout (macOS, Windows) cannot hold
         // both `Foo.spec` and `foo.spec`: the second download
         // overwrites the first. The fold is Unicode-aware, not
         // ASCII-only, so it holds for non-ASCII names too.
-        let folded = entry.name.to_lowercase();
+        let folded = name.to_lowercase();
         if let Some(first) = seen.get(&folded) {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
                 format!(
-                    "file names in the directory listing collide case-insensitively: {first:?} and {:?}",
-                    entry.name
+                    "file names in the directory listing collide case-insensitively: {first:?} and {name:?}"
                 ),
             ));
         }
-        seen.insert(folded, entry.name.as_str());
+        seen.insert(folded, name);
     }
     Ok(())
 }
@@ -1777,11 +1785,11 @@ pub fn checkout(
                 dry_run.note(&format!("would clone {url} into {}", target.display()));
             }
             None => {
-                let (listing, _) = client.directory_listing_rev(project, package, rev)?;
-                for entry in &listing.entries {
+                let (_, _, files) = checkout_file_plan(client, project, package, rev)?;
+                for file in &files {
                     dry_run.note(&format!(
                         "would download {} into {}",
-                        entry.name,
+                        file.name,
                         target.display()
                     ));
                 }
@@ -1842,16 +1850,46 @@ fn download_verified(
     Ok(())
 }
 
-/// The OBS-native checkout: download every file at the base
-/// revision, then commit the tree as the root commit.
-fn checkout_obs(
+/// How deep a revisioned checkout follows `_link` chains: a
+/// chain deeper than this is a cycle (or a pathological package),
+/// and the checkout refuses instead of fetching forever.
+const LINK_CHAIN_DEPTH: usize = 8;
+
+/// One file a revisioned checkout downloads: the project and
+/// package it belongs to (the link target, for resolved files),
+/// its name, the listing md5 when the listing carries one, and
+/// the revision pin the download is verified against.
+struct CheckoutFile {
+    project: String,
+    package: String,
+    name: String,
+    md5: Option<String>,
+    pin: RevisionSpec,
+}
+
+/// The files a checkout downloads, and the link package's own
+/// revision and srcmd5 (the recorded base). An unrevisioned
+/// checkout, or a package that is not a link at the pinned
+/// revision, resolves to its own listing unchanged: the link's
+/// own files, downloaded at the listing's revision. A revisioned
+/// checkout of a link resolves through the link history instead:
+/// each `_link` is read at its pin, and the target's listing at
+/// the link's baserev (or the target's latest srcmd5, for a
+/// baserev-less link) supplies the content. The target's files
+/// come first; each link level's own files overlay them, the
+/// outermost level last, so a link-local file wins over the
+/// target's version of the same name. The outermost `_link` is a
+/// checkout file; inner links' `_link` files are the mechanism,
+/// never content. The base stays the link package's own revision
+/// and srcmd5, as `pull` already records it for the expanded
+/// tree: the expanded srcmd5 would make every later commit
+/// refuse as outdated.
+fn checkout_file_plan(
     client: &ObsClient,
     project: &str,
     package: &str,
     rev: Option<&RevisionSpec>,
-    dir: &Path,
-) -> Result<WorkingCopy, GeectlError> {
-    let target = checkout_target(dir, project, package)?;
+) -> Result<(String, String, Vec<CheckoutFile>), GeectlError> {
     let (listing, (rev_number, _, srcmd5)) = client.directory_listing_rev(project, package, rev)?;
     let rev_number = rev_number.ok_or_else(|| {
         GeectlError::new(
@@ -1865,32 +1903,145 @@ fn checkout_obs(
             format!("the server did not return a source md5 for {project}/{package}"),
         )
     })?;
-    // The downloads are pinned to the listing's revision: a
-    // revision landing between the listing and the download is
-    // recorded under the older rev otherwise.
-    let pinned_rev = rev_number.parse::<u64>().map_err(|_| {
+    let own_pin = RevisionSpec::Rev(rev_number.parse::<u64>().map_err(|_| {
         GeectlError::new(
             ErrorKind::ServerError,
             format!("the server returned a non-numeric revision for {project}/{package}"),
         )
-    })?;
-    let pinned = RevisionSpec::Rev(pinned_rev);
-    check_listing_names(&listing)?;
+    })?);
+    // The levels, outermost first: the own listing, then each
+    // link target's listing in turn.
+    let mut levels: Vec<(String, String, DirectoryListing, RevisionSpec)> =
+        vec![(project.to_string(), package.to_string(), listing, own_pin)];
+    let mut depth = 0;
+    while rev.is_some() {
+        let (cur_project, cur_package, cur_pin, linkinfo) = {
+            let (project, package, listing, pin) = levels.last().unwrap();
+            (
+                project.clone(),
+                package.clone(),
+                pin.clone(),
+                listing.linkinfo.clone(),
+            )
+        };
+        let Some((target_project, target_package)) = linkinfo else {
+            break;
+        };
+        depth += 1;
+        if depth > LINK_CHAIN_DEPTH {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "the link chain for {project}/{package} is deeper than {LINK_CHAIN_DEPTH} levels: the links likely form a cycle; check the _link files"
+                ),
+            ));
+        }
+        // The `_link` at the pin names the target and its
+        // baserev: the listing's linkinfo names the target too,
+        // and the two must agree — a disagreement means the
+        // server moved under the read.
+        let link_text = client.cat(&cur_project, &cur_package, "_link", Some(cur_pin))?;
+        let doc = XmlDoc::parse(&link_text)?;
+        let (link_project, link_package) = link_target(&doc, &cur_project)?;
+        if link_project != target_project || link_package != target_package {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "the _link of {cur_project}/{cur_package} points at {link_project}/{link_package}, but its directory listing names {target_project}/{target_package}: the server moved under the checkout; retry the operation"
+                ),
+            ));
+        }
+        let (target_listing, pin) = match doc.root_attr("baserev") {
+            Some(baserev) => {
+                let pin = RevisionSpec::parse(&baserev)?;
+                let (listing, _) =
+                    client.directory_listing_rev(&link_project, &link_package, Some(&pin))?;
+                (listing, pin)
+            }
+            None => {
+                // A baserev-less link tracks the target's latest:
+                // the listing just read pins the downloads that
+                // follow, so no second read is needed.
+                let (listing, (_, _, target_srcmd5)) =
+                    client.directory_listing_rev(&link_project, &link_package, None)?;
+                let target_srcmd5 = target_srcmd5.ok_or_else(|| {
+                    GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!(
+                            "the server did not return a source md5 for {link_project}/{link_package}"
+                        ),
+                    )
+                })?;
+                (listing, RevisionSpec::parse(&target_srcmd5)?)
+            }
+        };
+        levels.push((link_project, link_package, target_listing, pin));
+    }
+    // The download list: the deepest content first, each link
+    // level's own files over it, the outermost level last. A
+    // later file with the same name replaces the earlier one, so
+    // a link-local file wins over the target's version.
+    let mut files: Vec<CheckoutFile> = Vec::new();
+    let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let outermost = levels.len() - 1;
+    for (rev_index, (level_project, level_package, level_listing, level_pin)) in
+        levels.iter().rev().enumerate()
+    {
+        let is_outermost = rev_index == outermost;
+        for entry in &level_listing.entries {
+            if entry.name == "_link" && !is_outermost {
+                continue;
+            }
+            let file = CheckoutFile {
+                project: level_project.clone(),
+                package: level_package.clone(),
+                name: entry.name.clone(),
+                md5: entry.md5.clone(),
+                pin: level_pin.clone(),
+            };
+            match positions.get(&entry.name) {
+                Some(&at) => files[at] = file,
+                None => {
+                    positions.insert(entry.name.clone(), files.len());
+                    files.push(file);
+                }
+            }
+        }
+    }
+    Ok((rev_number, srcmd5, files))
+}
+
+/// The OBS-native checkout: download every file at the base
+/// revision, then commit the tree as the root commit.
+fn checkout_obs(
+    client: &ObsClient,
+    project: &str,
+    package: &str,
+    rev: Option<&RevisionSpec>,
+    dir: &Path,
+) -> Result<WorkingCopy, GeectlError> {
+    let target = checkout_target(dir, project, package)?;
+    let (rev_number, srcmd5, files) = checkout_file_plan(client, project, package, rev)?;
+    // The downloads are pinned per file: a revision landing
+    // between the listing and a download is recorded under the
+    // older rev otherwise.
+    let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
+    check_file_names(&names)?;
     std::fs::create_dir_all(&target).map_err(|e| {
         GeectlError::new(
             ErrorKind::InternalError,
             format!("failed to create {}: {e}", target.display()),
         )
     })?;
-    for entry in &listing.entries {
+    for file in &files {
         download_verified(
             client,
-            project,
-            package,
-            &entry.name,
-            Some(&pinned),
-            &target.join(&entry.name),
-            entry.md5.as_deref(),
+            &file.project,
+            &file.package,
+            &file.name,
+            Some(&file.pin),
+            &target.join(&file.name),
+            file.md5.as_deref(),
             false,
         )?;
     }
@@ -2557,7 +2708,7 @@ fn link_target_listing(
     let link_content = index_content(wc, "_link")?;
     let link_text = String::from_utf8_lossy(&link_content);
     let doc = XmlDoc::parse(&link_text)?;
-    let (link_project, link_package) = link_target(&doc)?;
+    let (link_project, link_package) = link_target(&doc, &wc.project)?;
     match doc.root_attr("baserev") {
         Some(baserev) => {
             let pin = RevisionSpec::parse(&baserev)?;
@@ -5462,7 +5613,7 @@ fn read_link(wc: &WorkingCopy) -> Result<(String, String, String), GeectlError> 
     let link_content = index_content(wc, "_link")?;
     let link_text = String::from_utf8_lossy(&link_content);
     let doc = XmlDoc::parse(&link_text)?;
-    let (link_project, link_package) = link_target(&doc)?;
+    let (link_project, link_package) = link_target(&doc, &wc.project)?;
     let old_baserev = doc.root_attr("baserev").ok_or_else(|| {
         GeectlError::new(
             ErrorKind::InvalidInput,
@@ -5480,17 +5631,19 @@ fn read_link_target(wc: &WorkingCopy) -> Result<(String, String), GeectlError> {
     let link_content = index_content(wc, "_link")?;
     let link_text = String::from_utf8_lossy(&link_content);
     let doc = XmlDoc::parse(&link_text)?;
-    link_target(&doc)
+    link_target(&doc, &wc.project)
 }
 
 /// The project and package a parsed `_link` document points at.
-fn link_target(doc: &XmlDoc) -> Result<(String, String), GeectlError> {
-    let link_project = doc.root_attr("project").ok_or_else(|| {
-        GeectlError::new(
-            ErrorKind::InvalidInput,
-            "the _link file has no project attribute",
-        )
-    })?;
+/// A link with no `project` attribute points at a package in the
+/// link's own project (`link_package` omits `project` when source
+/// and target share it), so the caller passes that project as the
+/// default.
+fn link_target(doc: &XmlDoc, default_project: &str) -> Result<(String, String), GeectlError> {
+    let link_project = match doc.root_attr("project") {
+        Some(project) => project,
+        None => default_project.to_string(),
+    };
     let link_package = doc.root_attr("package").ok_or_else(|| {
         GeectlError::new(
             ErrorKind::InvalidInput,
@@ -7356,6 +7509,301 @@ mod tests {
         let _ = dir;
     }
 
+    /// A linked package's checkout fixture: `foo-link` rev 1 is a
+    /// link to `foo` at baserev 7, with a local patch. The target
+    /// rev 7 holds `bar.spec`.
+    fn linked_checkout_http() -> FakeHttp {
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
+                "<package name=\"foo-link\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link?rev=1",
+                &format!(
+                    "<directory name=\"foo-link\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+                    <linkinfo project=\"home:alice\" package=\"foo\" baserev=\"7\" xsrcmd5=\"cccccccccccccccccccccccccccccccc\" />\
+                    <entry md5=\"85a0a7eb3eff93b00f71fa802d182254\" mtime=\"1282047302\" name=\"_link\" size=\"54\" />\
+                    <entry md5=\"8151f31f450ddc9a0288454a4732e2a3\" mtime=\"1282047302\" name=\"local.patch\" size=\"11\" />\
+                    </directory>"
+                ),
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_link?rev=1",
+                "<link project=\"home:alice\" package=\"foo\" baserev=\"7\"/>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo?rev=7",
+                "<directory name=\"foo\" rev=\"7\" srcmd5=\"dddddddddddddddddddddddddddddddd\" vrev=\"7\">\
+                <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047302\" name=\"bar.spec\" size=\"10\" />\
+                </directory>",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_link?rev=1",
+                b"<link project=\"home:alice\" package=\"foo\" baserev=\"7\"/>",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/local.patch?rev=1",
+                b"--- patch\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/bar.spec?rev=7",
+                b"Name: bar\n",
+            )
+    }
+
+    /// A chained link's checkout fixture: `foo-link` rev 1 links
+    /// to `bar-link` at baserev 3, which links to `baz` at
+    /// baserev 5. Each link level carries a local patch.
+    fn chained_checkout_http() -> FakeHttp {
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
+                "<package name=\"foo-link\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link?rev=1",
+                &format!(
+                    "<directory name=\"foo-link\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+                    <linkinfo project=\"home:alice\" package=\"bar-link\" baserev=\"3\" xsrcmd5=\"cccccccccccccccccccccccccccccccc\" />\
+                    <entry md5=\"e3e658a8633fff863170bc28baa394c3\" mtime=\"1282047302\" name=\"_link\" size=\"59\" />\
+                    <entry md5=\"32a5c17ffc56b6db7275373e5fd3f084\" mtime=\"1282047302\" name=\"foo-local.patch\" size=\"9\" />\
+                    </directory>"
+                ),
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_link?rev=1",
+                "<link project=\"home:alice\" package=\"bar-link\" baserev=\"3\"/>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/bar-link?rev=3",
+                "<directory name=\"bar-link\" rev=\"3\" srcmd5=\"dddddddddddddddddddddddddddddddd\" vrev=\"3\">\
+                <linkinfo project=\"home:alice\" package=\"baz\" baserev=\"5\" xsrcmd5=\"cccccccccccccccccccccccccccccccc\" />\
+                <entry md5=\"810ec5390ba17964ae481b157bd57b1e\" mtime=\"1282047302\" name=\"_link\" size=\"54\" />\
+                <entry md5=\"e60b01655ca778961b5887604f5b4955\" mtime=\"1282047302\" name=\"bar-local.patch\" size=\"9\" />\
+                </directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/bar-link/_link?rev=3",
+                "<link project=\"home:alice\" package=\"baz\" baserev=\"5\"/>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/baz?rev=5",
+                "<directory name=\"baz\" rev=\"5\" srcmd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" vrev=\"5\">\
+                <entry md5=\"98524327364f070f58eb12ab152fb033\" mtime=\"1282047302\" name=\"qux.spec\" size=\"10\" />\
+                </directory>",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_link?rev=1",
+                b"<link project=\"home:alice\" package=\"bar-link\" baserev=\"3\"/>",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/foo-local.patch?rev=1",
+                b"--- foo\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/bar-link/bar-local.patch?rev=3",
+                b"--- bar\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/baz/qux.spec?rev=5",
+                b"Name: baz\n",
+            )
+    }
+
+    /// A baserev-less link's checkout fixture: `foo-link` rev 1
+    /// links to `foo` with no baserev, so the target's latest
+    /// revision supplies the content.
+    fn baserevless_checkout_http() -> FakeHttp {
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
+                "<package name=\"foo-link\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link?rev=1",
+                &format!(
+                    "<directory name=\"foo-link\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+                    <linkinfo project=\"home:alice\" package=\"foo\" />\
+                    <entry md5=\"b1de528edc8454e7bc9ad7aa18bace32\" mtime=\"1282047302\" name=\"_link\" size=\"41\" />\
+                    <entry md5=\"8151f31f450ddc9a0288454a4732e2a3\" mtime=\"1282047302\" name=\"local.patch\" size=\"11\" />\
+                    </directory>"
+                ),
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_link?rev=1",
+                "<link project=\"home:alice\" package=\"foo\"/>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo",
+                "<directory name=\"foo\" rev=\"9\" srcmd5=\"cccccccccccccccccccccccccccccccc\" vrev=\"9\">\
+                <entry md5=\"cf0d04a286833ebd00a5f5b2d54474a9\" mtime=\"1282047302\" name=\"bar.spec\" size=\"10\" />\
+                </directory>",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_link?rev=1",
+                b"<link project=\"home:alice\" package=\"foo\"/>",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/local.patch?rev=1",
+                b"--- patch\n",
+            )
+            .with_get_to_file(
+                "https://api.opensuse.org/public/source/home:alice/foo/bar.spec?rev=cccccccccccccccccccccccccccccccc",
+                b"Name: bar\n",
+            )
+    }
+
+    /// A self-link's checkout fixture: `foo-link` rev 1 links to
+    /// itself, so the walk never reaches a non-link listing.
+    fn cyclic_checkout_http() -> FakeHttp {
+        FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_meta",
+                "<package name=\"foo-link\" project=\"home:alice\"></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link?rev=1",
+                &format!(
+                    "<directory name=\"foo-link\" rev=\"1\" srcmd5=\"{SRCMD5_1}\" vrev=\"1\">\
+                    <linkinfo project=\"home:alice\" package=\"foo-link\" baserev=\"1\" xsrcmd5=\"cccccccccccccccccccccccccccccccc\" />\
+                    <entry md5=\"15a544b00aa23903b91033e5537da492\" mtime=\"1282047302\" name=\"_link\" size=\"59\" />\
+                    </directory>"
+                ),
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:alice/foo-link/_link?rev=1",
+                "<link project=\"home:alice\" package=\"foo-link\" baserev=\"1\"/>",
+            )
+    }
+
+    fn checkout_linked(
+        http: &FakeHttp,
+        package: &str,
+        rev: RevisionSpec,
+    ) -> (TempDirGuard, WorkingCopy) {
+        let dir = TempDirGuard::new("checkout-link");
+        let client = ObsClient::with_credentials(http, basic_credentials()).unwrap();
+        let wc = checkout(
+            &client,
+            "home:alice",
+            package,
+            Some(&rev),
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        (dir, wc)
+    }
+
+    #[test]
+    fn checkout_rev_resolves_a_link_through_its_baserev() {
+        let http = linked_checkout_http();
+        let (dir, wc) = checkout_linked(&http, "foo-link", RevisionSpec::Rev(1));
+        // The resolved content: the target at the link's baserev,
+        // overlaid with the link's local files.
+        assert_eq!(read_file(&wc.root, "bar.spec"), "Name: bar\n");
+        assert_eq!(read_file(&wc.root, "local.patch"), "--- patch\n");
+        assert_eq!(
+            read_file(&wc.root, "_link"),
+            "<link project=\"home:alice\" package=\"foo\" baserev=\"7\"/>"
+        );
+        // The base stays the link package's own coordinates.
+        assert_eq!(wc.base_rev, "1");
+        assert_eq!(wc.base_srcmd5, SRCMD5_1);
+        // The target listing at the baserev pin was actually read.
+        assert!(http
+            .get_calls()
+            .iter()
+            .any(|(url, _)| url == "https://api.opensuse.org/public/source/home:alice/foo?rev=7"));
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_rev_resolves_a_chained_link_level_by_level() {
+        let http = chained_checkout_http();
+        let (dir, wc) = checkout_linked(&http, "foo-link", RevisionSpec::Rev(1));
+        assert_eq!(read_file(&wc.root, "qux.spec"), "Name: baz\n");
+        assert_eq!(read_file(&wc.root, "foo-local.patch"), "--- foo\n");
+        assert_eq!(read_file(&wc.root, "bar-local.patch"), "--- bar\n");
+        // The checked-out `_link` is the outermost one: the inner
+        // link's `_link` is the mechanism, never content.
+        assert_eq!(
+            read_file(&wc.root, "_link"),
+            "<link project=\"home:alice\" package=\"bar-link\" baserev=\"3\"/>"
+        );
+        assert_eq!(wc.base_rev, "1");
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_rev_resolves_a_baserev_less_link_at_the_targets_latest() {
+        let http = baserevless_checkout_http();
+        let (dir, wc) = checkout_linked(&http, "foo-link", RevisionSpec::Rev(1));
+        assert_eq!(read_file(&wc.root, "bar.spec"), "Name: bar\n");
+        assert_eq!(wc.base_rev, "1");
+        assert!(http
+            .get_calls()
+            .iter()
+            .any(|(url, _)| url == "https://api.opensuse.org/public/source/home:alice/foo"));
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_rev_refuses_a_cyclic_link_chain() {
+        let http = cyclic_checkout_http();
+        let dir = TempDirGuard::new("checkout-link-cycle");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = checkout(
+            &client,
+            "home:alice",
+            "foo-link",
+            Some(&RevisionSpec::Rev(1)),
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(message.contains("deeper than"), "{message}");
+        assert!(message.contains("cycle"), "{message}");
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_dry_run_plans_the_resolved_files() {
+        let http = linked_checkout_http();
+        let dir = TempDirGuard::new("checkout-link-dry");
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let wc = checkout(
+            &client,
+            "home:alice",
+            "foo-link",
+            Some(&RevisionSpec::Rev(1)),
+            &dir.path,
+            None,
+            &dry_run,
+        )
+        .unwrap();
+        assert!(wc.is_none());
+        let plan = dry_run.plan();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("would download bar.spec")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("would download _link")),
+            "{plan:?}"
+        );
+        let _ = dir;
+    }
+
     #[test]
     fn checkout_refuses_a_traversal_listing_name() {
         // A listing entry that escapes the checkout (`../evil`)
@@ -7660,6 +8108,22 @@ mod tests {
         assert!(!wc.mtimes.is_empty());
         assert_eq!(open(&wc.root).unwrap().mtimes, wc.mtimes);
         let _ = dir;
+    }
+
+    #[test]
+    fn link_target_defaults_a_missing_project_to_the_links_own() {
+        let doc = XmlDoc::parse("<link package=\"foo\"/>").unwrap();
+        assert_eq!(
+            link_target(&doc, "home:alice").unwrap(),
+            ("home:alice".to_string(), "foo".to_string())
+        );
+        let doc = XmlDoc::parse("<link project=\"home:bob\" package=\"foo\"/>").unwrap();
+        assert_eq!(
+            link_target(&doc, "home:alice").unwrap(),
+            ("home:bob".to_string(), "foo".to_string())
+        );
+        let doc = XmlDoc::parse("<link project=\"home:bob\"/>").unwrap();
+        assert!(link_target(&doc, "home:alice").is_err());
     }
 
     #[test]
