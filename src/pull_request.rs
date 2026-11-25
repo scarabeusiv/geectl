@@ -6,7 +6,7 @@
 //! backends, with a unified status ([`PullRequestStatus`]). This module
 //! carries the handle, the shapes, and the status mappings.
 
-use crate::debug::Debug;
+use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
     validate_gitea_name, GiteaClient, GiteaComment, GiteaIssue, GiteaMergeMethod, GiteaPullRequest,
@@ -476,8 +476,12 @@ impl PullRequest {
                 repo: repo.to_string(),
                 number: pr.number,
             },
-            title: pr.title.clone(),
-            description: pr.body.clone().unwrap_or_default(),
+            // Terminal control characters are stripped from the
+            // title, body, and label names: they are author text
+            // from the server, and the unified PR reaches the
+            // terminal through the show render.
+            title: strip_terminal_controls(&pr.title),
+            description: strip_terminal_controls(pr.body.as_deref().unwrap_or_default()),
             author: pr.user.login.clone(),
             status: PullRequestStatus::from_gitea(&pr.state, pr.merged)?,
             draft: pr.draft,
@@ -487,7 +491,11 @@ impl PullRequest {
             target: gitea_endpoint(&pr.base),
             reviews: opinions,
             reviews_error: None,
-            labels: pr.labels.iter().map(|label| label.name.clone()).collect(),
+            labels: pr
+                .labels
+                .iter()
+                .map(|label| strip_terminal_controls(&label.name))
+                .collect(),
         })
     }
 }
@@ -957,7 +965,10 @@ impl<'a> PullRequestClient<'a> {
                         id: comment.id,
                         author: comment.who.clone(),
                         created: comment.when.clone(),
-                        body: comment.body.clone(),
+                        // Terminal control characters are stripped
+                        // from the body: commenter text, rendered
+                        // to the terminal.
+                        body: strip_terminal_controls(&comment.body),
                         parent_id: comment.parent_id,
                     })
                     .ok_or_else(|| {
@@ -994,7 +1005,10 @@ impl<'a> PullRequestClient<'a> {
                     id: comment.id,
                     author: comment.user.map(|user| user.login).unwrap_or_default(),
                     created: comment.created_at.unwrap_or_default(),
-                    body: comment.body,
+                    // Terminal control characters are stripped from
+                    // the body: commenter text, rendered to the
+                    // terminal.
+                    body: strip_terminal_controls(&comment.body),
                     parent_id: None,
                 }))
             }
@@ -1013,7 +1027,10 @@ impl<'a> PullRequestClient<'a> {
                         id: comment.id,
                         author: comment.who.clone(),
                         created: comment.when.clone(),
-                        body: comment.body.clone(),
+                        // Terminal control characters are stripped
+                        // from the body: commenter text, rendered
+                        // to the terminal.
+                        body: strip_terminal_controls(&comment.body),
                         parent_id: comment.parent_id,
                     })
                     .collect())
@@ -1035,7 +1052,10 @@ impl<'a> PullRequestClient<'a> {
                             .map(|user| user.login.clone())
                             .unwrap_or_default(),
                         created: comment.created_at.clone().unwrap_or_default(),
-                        body: comment.body.clone(),
+                        // Terminal control characters are stripped
+                        // from the body: commenter text, rendered
+                        // to the terminal.
+                        body: strip_terminal_controls(&comment.body),
                         parent_id: None,
                     })
                     .collect())
@@ -1461,7 +1481,9 @@ fn opinion_from_gitea_review(review: &GiteaReview) -> Result<ReviewOpinion, Geec
     Ok(ReviewOpinion {
         reviewer,
         state: OpinionState::from_gitea(&review.state, review.dismissed)?,
-        comment: review.body.clone().unwrap_or_default(),
+        // Terminal control characters are stripped from the
+        // review comment: reviewer text, rendered to the terminal.
+        comment: strip_terminal_controls(review.body.as_deref().unwrap_or_default()),
         when: review.submitted_at.clone(),
     })
 }

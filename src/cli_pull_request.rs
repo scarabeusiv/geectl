@@ -47,7 +47,7 @@
 
 use crate::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
 use crate::config::{self, DEFAULT_GITEA_URL};
-use crate::debug::Debug;
+use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{
     parse_gitea_repo, parse_scmsync_url, validate_gitea_base, GiteaClient, GiteaMergeMethod,
@@ -1953,7 +1953,7 @@ fn comments_text(reference: &PullRequestRef, comments: &[ReviewComment]) -> Stri
         if !comment.created.is_empty() {
             line.push_str(&format!(" at {}", comment.created));
         }
-        line.push_str(&format!(": {}", comment.body));
+        line.push_str(&format!(": {}", strip_terminal_controls(&comment.body)));
         if let Some(parent) = comment.parent_id {
             line.push_str(&format!(" (reply to {parent})"));
         }
@@ -2080,12 +2080,15 @@ fn payload_json<T: Serialize>(value: &T) -> Result<Value, GeectlError> {
 fn render_pull_request_text(pr: &PullRequest) -> String {
     let mut lines = vec![format!("reference: {}", pr.reference)];
     if !pr.title.is_empty() {
-        lines.push(format!("title: {}", pr.title));
+        lines.push(format!("title: {}", strip_terminal_controls(&pr.title)));
     }
     lines.push(format!("author: {}", pr.author));
     lines.push(format!("state: {}", pr.status.as_str()));
     if !pr.description.is_empty() {
-        lines.push(format!("description: {}", pr.description));
+        lines.push(format!(
+            "description: {}",
+            strip_terminal_controls(&pr.description)
+        ));
     }
     if pr.draft {
         lines.push("draft: true".to_string());
@@ -2110,7 +2113,11 @@ fn render_pull_request_text(pr: &PullRequest) -> String {
             review.state.as_str()
         ));
         if !review.comment.is_empty() {
-            lines.push(format!("review {} comment: {}", index + 1, review.comment));
+            lines.push(format!(
+                "review {} comment: {}",
+                index + 1,
+                strip_terminal_controls(&review.comment)
+            ));
         }
         if let Some(when) = &review.when {
             lines.push(format!("review {} at: {}", index + 1, when));
@@ -2120,7 +2127,14 @@ fn render_pull_request_text(pr: &PullRequest) -> String {
         lines.push(format!("reviews unavailable: {error}"));
     }
     if !pr.labels.is_empty() {
-        lines.push(format!("labels: {}", pr.labels.join(", ")));
+        lines.push(format!(
+            "labels: {}",
+            pr.labels
+                .iter()
+                .map(|label| strip_terminal_controls(label))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     lines.join("\n")
 }
@@ -2377,6 +2391,47 @@ mod tests {
                 "text missing {expected:?}:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn gitea_mapping_strips_terminal_controls_from_free_text_fields() {
+        // The Gitea arm maps server text into the unified PR: title,
+        // body, review comments, and label names are stripped at the
+        // mapping, so no downstream surface can print them.
+        let mut pr: GiteaPullRequest = serde_json::from_str(PR_JSON).expect("fixture PR parses");
+        pr.title = "ti\u{1b}[2Jtle".to_string();
+        pr.body = Some("bo\u{7}dy\nline".to_string());
+        pr.labels[0].name = "la\u{202e}bel".to_string();
+        let mut reviews: Vec<GiteaReview> =
+            serde_json::from_str(REVIEWS_JSON).expect("fixture reviews parse");
+        reviews[0].body = Some("re\u{1b}]8;;http://x\u{7}view".to_string());
+        let pr =
+            PullRequest::from_gitea("openSUSE", "geectl", &pr, &reviews).expect("fixture PR maps");
+        assert_eq!(pr.title, "ti[2Jtle");
+        assert_eq!(pr.description, "body\nline");
+        assert_eq!(pr.labels, vec!["label".to_string()]);
+        assert_eq!(pr.reviews[0].comment, "re]8;;http://xview");
+    }
+
+    #[test]
+    fn pull_request_text_strips_terminal_controls_from_free_text_fields() {
+        // Free text from the server reaches the terminal through the
+        // PR render: escape sequences, carriage returns, bells, and
+        // bidirectional marks are stripped, while newlines survive.
+        let mut pr = fixture_gitea_pull_request();
+        pr.title = "ti\u{1b}[2Jtle".to_string();
+        pr.description = "de\u{7}sc\nription".to_string();
+        pr.reviews[0].comment = "re\u{202e}view".to_string();
+        pr.labels = vec!["la\rbel".to_string()];
+        let text = render_pull_request_text(&pr);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(!text.contains('\r'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(text.contains("title: ti[2Jtle"), "text: {text}");
+        assert!(text.contains("description: desc\nription"), "text: {text}");
+        assert!(text.contains("review 1 comment: review"), "text: {text}");
+        assert!(text.contains("labels: label"), "text: {text}");
     }
 
     #[test]
@@ -2640,6 +2695,24 @@ mod tests {
         assert_eq!(
             comments_text(&reference, &[]),
             "comments for gitea:openSUSE/geectl#122 (0 comments)\nno comments"
+        );
+    }
+
+    #[test]
+    fn comments_text_strips_terminal_controls_from_bodies() {
+        // Comment bodies are free text from another user: escape
+        // sequences, bells, and bidirectional marks are stripped at
+        // the render.
+        let reference = gitea_reference();
+        let mut comment = fixture_comment();
+        comment.body = "fi\u{1b}[2Jx\u{7}ed\nline\u{202e}two".to_string();
+        let text = comments_text(&reference, &[comment]);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(
+            text.contains("comment 7 by plusky at 2026-11-22T19:52:58Z: fi[2Jxed\nlinetwo"),
+            "text: {text}"
         );
     }
 
