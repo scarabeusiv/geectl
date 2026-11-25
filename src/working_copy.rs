@@ -8316,6 +8316,45 @@ mod tests {
     }
 
     #[test]
+    fn commit_obs_refuses_a_meego_style_old_header() {
+        // The #993 case end to end: a canonical entry prepended
+        // over a Meego-style old entry. The prepend succeeds, but
+        // the changelog gate refuses the commit with V5 on the old
+        // header line — the strictness is correct (the source
+        // validator reads every header the same way), so the
+        // refusal names the repair.
+        let http = checkout_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        let sep = "-".repeat(67);
+        let text = format!(
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nSat Apr 14 2007 Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+        );
+        write_file(&wc.root, "foo.changes", &text);
+        add(&wc, &["foo.changes".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            false,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValidationFailed);
+        let message = err.to_string();
+        assert!(
+            message.contains("foo.changes:7: V5") && message.contains("source validator"),
+            "message: {message}"
+        );
+        assert!(http.post_calls().is_empty());
+        let _ = dir;
+    }
+
+    #[test]
     fn commit_obs_accepts_a_valid_changes_entry() {
         // A validate pass with nothing missing commits: the
         // server commits whenever the file list is complete.

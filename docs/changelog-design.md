@@ -34,7 +34,9 @@ skipped. Any other fetch failure is a hard error.
   a `+`/`-` line of the `.changes` diff (LCS diff). Exempt when the
   filename matches a `Source:` value in either spec (glob;
   `%{...}` is a wildcard, over the value's basename).
-- V5 — `.changes` headers parse and run strictly descending; a
+- V5 — `.changes` headers parse and run strictly descending, old
+  entries included (the source validator checks every header, so a
+  foreign-style old header is repaired, not tolerated); a
   duplicated header (a short `* Day Mon DD YYYY Name` line matching
   the entry's own header, same date and author) is a finding; the
   newest local entry is newer than the target's newest (target

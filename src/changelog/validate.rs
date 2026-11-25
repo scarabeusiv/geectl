@@ -581,6 +581,13 @@ pub fn validate(
 /// same entry, same date and author) is an invalid date the source
 /// validator rejects. A body line that merely quotes a date is not
 /// the pair: the date and the author must match the entry's header.
+/// An unparsable header is a finding wherever it sits, newest or
+/// old: the source validator reads the line after every separator
+/// the same way, so tolerating an old foreign-style header here
+/// would only move the refusal to the Factory submission. The
+/// repair is the minimal edit to the old header (adding a missing
+/// ` - ` separator, and a time where the header carries none) — a
+/// sanctioned exception to leaving old entries alone.
 fn check_sequence(changes_name: &str, file: &ChangesFile, report: &mut ValidationReport) {
     let mut last_timestamp: Option<(i64, usize)> = None;
     for entry in &file.entries {
@@ -590,7 +597,7 @@ fn check_sequence(changes_name: &str, file: &ChangesFile, report: &mut Validatio
                 file: changes_name.to_string(),
                 line: entry.header_line,
                 message: format!(
-                    "header does not parse as 'Day Mon DD HH:MM:SS UTC YYYY - Name <email>': {}",
+                    "header does not parse as 'Day Mon DD HH:MM:SS UTC YYYY - Name <email>': {} — the source validator rejects an unparsable header anywhere in the file, so repair this header instead of deleting the entry",
                     entry.header_raw.trim()
                 ),
             }),
@@ -1862,6 +1869,120 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.rule == Rule::V5 && f.message.contains("duplicated-header")));
+    }
+
+    #[test]
+    fn v5_flags_a_meego_style_old_header() {
+        // The #993 case: a canonical entry prepended over a
+        // Meego-style old entry (separator, but a header with no
+        // ` - ` separator and no time). The prepend succeeds, but
+        // the gate's local-only validate run refuses the file: V5
+        // fires on the old header line, and nothing else fires —
+        // the new entry is clean. The strictness is correct: the
+        // source validator reads the line after every separator
+        // the same way, so tolerating the old header here would
+        // only move the refusal to the Factory submission.
+        let sep = "-".repeat(67);
+        let text = format!(
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nSat Apr 14 2007 Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+        );
+        let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &text)]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        let v5: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == Rule::V5)
+            .collect();
+        assert_eq!(v5.len(), 1, "findings: {:?}", report.findings);
+        assert_eq!(v5[0].file, "foo.changes");
+        assert_eq!(v5[0].line, 7);
+        assert!(v5[0].message.contains("Sat Apr 14 2007 Tobias Blomberg"));
+        // The refusal names the remedy: repair the header, do not
+        // delete the entry.
+        assert!(
+            v5[0].message.contains("source validator")
+                && v5[0].message.contains("repair this header"),
+            "message: {}",
+            v5[0].message
+        );
+        assert!(
+            !report.findings.iter().any(|f| f.rule == Rule::V11),
+            "findings: {:?}",
+            report.findings
+        );
+        assert!(!report.passed());
+    }
+
+    #[test]
+    fn repairing_a_meego_style_old_header_clears_v5() {
+        // The svxlink remedy: the old header carries a time but no
+        // ` - ` separator; adding the separator alone makes it
+        // parse, and the whole file passes.
+        let sep = "-".repeat(67);
+        let text = format!(
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nSat Apr 14 10:00:00 UTC 2007 - Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+        );
+        let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &text)]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(report.passed(), "findings: {:?}", report.findings);
+    }
+
+    #[test]
+    fn a_dateless_meego_header_needs_a_time_as_well() {
+        // The dateless Meego header cannot be repaired by the
+        // separator alone: with ` - ` added but no time it still
+        // does not parse, so V5 still fires. Supplying midnight UTC
+        // with the separator clears it.
+        let sep = "-".repeat(67);
+        let unrepaired = format!(
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nSat Apr 14 2007 - Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+        );
+        let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &unrepaired)]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(
+            report.findings.iter().any(|f| f.rule == Rule::V5),
+            "findings: {:?}",
+            report.findings
+        );
+        let repaired = unrepaired.replace(
+            "Sat Apr 14 2007 - Tobias Blomberg",
+            "Sat Apr 14 00:00:00 UTC 2007 - Tobias Blomberg",
+        );
+        let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &repaired)]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(report.passed(), "findings: {:?}", report.findings);
+    }
+
+    #[test]
+    fn separator_less_meego_history_is_refused_by_v11_not_v5() {
+        // The pure Meego shape prepended over: the parser sees a
+        // single entry (the new one) whose body is the whole old
+        // file, so no old header exists for V5 to fire on — but V11
+        // lints the newest entry's body, and the old
+        // `* Day Mon DD YYYY Name` lines are top-level `*` bullets
+        // with no `-` above them. The gate still refuses; the remedy
+        // is converting the old history to separated entries.
+        let sep = "-".repeat(67);
+        let old = "* Sat Apr 14 2007 Tobias Blomberg <t@example.com>\n- Old Meego change\n\n* Fri Apr 13 2007 Tobias Blomberg <t@example.com>\n- Older change\n\n";
+        let text = format!(
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{old}"
+        );
+        let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &text)]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        assert!(
+            !report.findings.iter().any(|f| f.rule == Rule::V5),
+            "findings: {:?}",
+            report.findings
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == Rule::V11 && f.message.contains("'*' bullet at the top level")),
+            "findings: {:?}",
+            report.findings
+        );
+        assert!(!report.passed());
     }
 
     #[test]

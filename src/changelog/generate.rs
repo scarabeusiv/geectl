@@ -676,6 +676,40 @@ mod tests {
     }
 
     #[test]
+    fn prepend_entry_keeps_a_meego_style_old_entry() {
+        // A Meego-style old entry: separator plus a header with no
+        // ` - ` separator and no time. Prepend never parses old
+        // entries, so the foreign style survives as a suffix — the
+        // commit gate is what judges it (V5), not the prepend.
+        let sep = "-".repeat(67);
+        let old = format!(
+            "{sep}\nSat Apr 14 2007 Tobias Blomberg <t@example.com>\n\n- Old Meego change\n\n"
+        );
+        let entry =
+            format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
+        let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
+        assert!(new.content.starts_with(&entry));
+        assert!(new.content.ends_with(&old));
+        assert_eq!(new.source_encoding, None);
+    }
+
+    #[test]
+    fn prepend_entry_keeps_a_separator_less_meego_file() {
+        // The pure Meego shape: no separators at all, entries start
+        // with a short `* Day Mon DD YYYY Name` line. The new entry
+        // supplies the only separator, so the count rises from zero
+        // to one and the whole old file survives as the suffix.
+        let sep = "-".repeat(67);
+        let old = "* Sat Apr 14 2007 Tobias Blomberg <t@example.com>\n- Old Meego change\n\n* Fri Apr 13 2007 Tobias Blomberg <t@example.com>\n- Older change\n\n";
+        let entry =
+            format!("{sep}\nThu May 28 10:00:00 UTC 2026 - Jane <jane@example.com>\n\n- New\n\n");
+        let new = prepend_entry(old.as_bytes(), &entry).expect("prepend succeeds");
+        assert!(new.content.starts_with(&entry));
+        assert!(new.content.ends_with(old));
+        assert_eq!(new.source_encoding, None);
+    }
+
+    #[test]
     fn wrap_bullet_wraps_at_67() {
         let lines = wrap_bullet(
             "Fix a very long crash in the parser that runs past sixty-seven characters for sure",
