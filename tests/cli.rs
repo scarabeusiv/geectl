@@ -4459,6 +4459,58 @@ fn remote_lock_dry_run_ignores_half_set_credentials() {
 }
 
 #[test]
+fn remote_unlock_dry_run_ignores_half_set_credentials() {
+    // A dry-run mutation preview needs no credentials — the
+    // library's dry-run guard runs before its credentials check —
+    // so it runs with a half-set env and no server at all.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "remote",
+            "unlock",
+            "openSUSE:Factory",
+            "vim",
+            "--message",
+            "release done",
+        ])
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["project"], "openSUSE:Factory");
+    assert_eq!(value["package"], "vim");
+    assert_eq!(value["message"], "release done");
+    assert_eq!(
+        value["plan"][0],
+        "[dry-run] would: unlock package openSUSE:Factory/vim (message release done)"
+    );
+}
+
+#[test]
+fn remote_unlock_empty_message_fails_with_invalid_input() {
+    // The server requires a comment, so an empty message is refused
+    // before the dry-run guard — a dry-run preview must never
+    // promise an unlock the server would refuse.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["remote", "unlock", "openSUSE:Factory", "--message", ""])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+}
+
+#[test]
 fn remote_repo_add_live_with_half_set_credentials_fails_with_config_error() {
     // A live mutation does need credentials, so it fails fast.
     let dir = TempDir::new();

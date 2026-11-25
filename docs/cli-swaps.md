@@ -45,6 +45,7 @@ the per-group sections list only what is specific to that group.
 | `osc release [SOURCEPROJECT SOURCEPACKAGE]` | `geectl remote release-package` | One command per library operation. `-r` is `--repository`, `-a` is `--arch`; `--target-project` / `--target-repository` / `--set-release` / `--no-delay` keep their names |
 | `osc release [SOURCEPROJECT]` | `geectl remote release-project` | One command per library operation; same flag mapping as `release-package` |
 | `osc lock PROJECT [PACKAGE]` | `geectl remote lock PROJECT [PACKAGE] [--message TEXT]` | One command per library operation; osc's `-m` stays `--message`, sent as the server's `comment`; a project lock records it (`cmd=lock`), a package lock sends it but the server does not record it (`set_flag` is the only package path) |
+| `osc unlock PROJECT [PACKAGE]` | `geectl remote unlock PROJECT [PACKAGE] --message TEXT` | One command per library operation; the message is a required flag — osc prompts for it in an editor when `-m` is absent, geectl has no editor |
 | `osc ls /` | `geectl remote list-projects` | Same listing, named as a leaf under `geectl remote` |
 | — | `geectl remote list-staging-projects PROJECT` | New surface: the library reads `/staging/<workflow>/staging_projects` |
 | — | `geectl remote staging-project PROJECT NAME` | Same; the one-project read |

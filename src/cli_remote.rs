@@ -4,8 +4,8 @@
 //! contents and downloads, listings, history, meta, search, ownership,
 //! and diffs — plus the group's mutations, which edit a project's repository
 //! list in its meta (`repo-add`, `repo-remove`), create, upload
-//! to, delete, restore, aggregate, release, and lock projects
-//! and packages, or create an operation-scoped trigger token
+//! to, delete, restore, aggregate, release, lock, and unlock
+//! projects and packages, or create an operation-scoped trigger token
 //! (`create-token`). Each command is a thin wrapper over one `ObsClient`
 //! operation: the flags mirror the library parameters, the JSON
 //! payload carries the typed values, and the text renderer prints
@@ -788,6 +788,20 @@ pub enum RemoteCommand {
         #[arg(long)]
         message: Option<String>,
     },
+    /// Unlock a project or a package. A mutation: dry-run is the
+    /// default (only the plan is printed); `--live` performs the
+    /// unlock. The message is required: the server refuses an
+    /// unlock without a comment.
+    Unlock {
+        /// The project to unlock.
+        project: String,
+        /// The package to unlock. Omit to unlock the whole project.
+        package: Option<String>,
+        /// A message recorded on the unlock, sent as the server's
+        /// `comment` query parameter.
+        #[arg(long)]
+        message: String,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
@@ -839,6 +853,7 @@ pub fn run_remote(
         RemoteCommand::ReleasePackage { .. } if !live => Credentials::None,
         RemoteCommand::ReleaseProject { .. } if !live => Credentials::None,
         RemoteCommand::Lock { .. } if !live => Credentials::None,
+        RemoteCommand::Unlock { .. } if !live => Credentials::None,
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -1854,6 +1869,26 @@ pub fn run_remote(
                 &project,
                 package.as_deref(),
                 message.as_deref(),
+                dry_run.enabled(),
+                plan,
+            ))
+        }
+        RemoteCommand::Unlock {
+            project,
+            package,
+            message,
+        } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.unlock(&project, package.as_deref(), &message, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(unlock_result(
+                &project,
+                package.as_deref(),
+                &message,
                 dry_run.enabled(),
                 plan,
             ))
@@ -3017,6 +3052,41 @@ fn lock_result(
         format!("dry-run: would lock {scope}")
     } else {
         format!("locked {scope}")
+    };
+    mutation_result(
+        json!({
+            "project": project,
+            "package": package,
+            "message": message,
+        }),
+        header,
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The `unlock` result: the payload carries the scope and
+/// the message; the text carries the scope and leaves the message
+/// to the payload (a message, not an identifier).
+fn unlock_result(
+    project: &str,
+    package: Option<&str>,
+    message: &str,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let (header, scope) = match package {
+        Some(package) => (
+            format!("project: {project} package: {package}"),
+            format!("package {package} in project {project}"),
+        ),
+        None => (format!("project: {project}"), format!("project {project}")),
+    };
+    let result_line = if dry_run {
+        format!("dry-run: would unlock {scope}")
+    } else {
+        format!("unlocked {scope}")
     };
     mutation_result(
         json!({
@@ -6515,6 +6585,59 @@ mod tests {
         assert_eq!(
             text,
             "project: P\ndry_run: true\ndry-run: would lock project P\n[dry-run] would: lock project P"
+        );
+    }
+
+    #[test]
+    fn unlock_parses_project_package_and_message() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "unlock",
+            "P",
+            "K",
+            "--message",
+            "release done",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::Unlock {
+                project,
+                package: Some(package),
+                message,
+                ..
+            } if project == "P" && package == "K" && message == "release done"
+        ));
+        // The message is required: without `--message` the parse
+        // fails, so no unlock is ever filed comment-free.
+        assert!(Cli::try_parse_from(["geectl", "remote", "unlock", "P", "K"]).is_err());
+    }
+
+    #[test]
+    fn unlock_result_carries_scope_and_message_in_both_formats() {
+        let (payload, text) = unlock_result("P", Some("K"), "release done", false, None);
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["package"], "K");
+        assert_eq!(payload["message"], "release done");
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: false\nunlocked package K in project P"
+        );
+        let (payload, text) = unlock_result(
+            "P",
+            None,
+            "release done",
+            true,
+            Some(vec!["[dry-run] would: unlock project P".to_string()]),
+        );
+        assert_eq!(payload["package"], Value::Null);
+        assert_eq!(payload["message"], "release done");
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(payload["plan"][0], "[dry-run] would: unlock project P");
+        assert_eq!(
+            text,
+            "project: P\ndry_run: true\ndry-run: would unlock project P\n[dry-run] would: unlock project P"
         );
     }
 

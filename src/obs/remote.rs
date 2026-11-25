@@ -4803,6 +4803,74 @@ impl<'a> ObsClient<'a> {
         self.source_command(&path, &query, "lock", &what)
     }
 
+    /// Unlock a project, or a package in it, on OBS (`POST
+    /// /source/<project>[<package>]?cmd=unlock&comment=<message>`).
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. In dry-run the unlock is recorded in
+    /// the plan and nothing is unlocked — the guard runs before
+    /// the credentials check, like `create_package`. The plan
+    /// names a truncated message, like the delete message.
+    ///
+    /// An agent unlocks a project or package it locked, to let
+    /// changes flow again. The comment is required: the server
+    /// refuses an unlock without one (`params.require(:comment)`),
+    /// and osc prompts for it in an editor when `-m` is absent —
+    /// geectl has no editor, so the caller supplies the message.
+    /// Unlocking a package that is not locked fails on the server
+    /// (`NotLocked`); the library does not pre-check the flag.
+    pub fn unlock(
+        &self,
+        project: &str,
+        package: Option<&str>,
+        message: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        if let Some(package) = package {
+            if !valid_obs_name(package) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name: {package:?}"),
+                ));
+            }
+        }
+        if message.trim().is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "unlock needs a message: the server requires a comment",
+            ));
+        }
+        let what = match package {
+            Some(package) => format!("package {project}/{package}"),
+            None => format!("project {project}"),
+        };
+        if !dry_run.allow(&format!(
+            "unlock {what}{}",
+            plan_message_suffix(Some(message))
+        )) {
+            return Ok(());
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "cannot unlock {what} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
+                ),
+            ));
+        }
+        let query: Vec<(&str, &str)> = vec![("cmd", "unlock"), ("comment", message)];
+        let path: Vec<&str> = match package {
+            Some(package) => vec![project, package],
+            None => vec![project],
+        };
+        self.source_command(&path, &query, "unlock", &what)
+    }
+
     /// Create an operation-scoped trigger token for the
     /// authenticated user (`POST /person/<login>/token`), and return
     /// the id and the secret it was created with. The secret is
@@ -7296,6 +7364,149 @@ mod tests {
                 Some("test-pkgA/pkg"),
                 None,
                 &DryRun::new(false)
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn unlock_package_posts_unlock_with_message() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=unlock&comment=release%20done",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .unlock(
+                "test:factory",
+                Some("test-pkgA"),
+                "release done",
+                &DryRun::new(false)
+            )
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn unlock_project_posts_unlock_with_message() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=unlock&comment=release%20done",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .unlock("test:factory", None, "release done", &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn unlock_other_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=unlock&comment=release%20done",
+            "<status code=\"error\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .unlock("test:factory", None, "release done", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn unlock_dry_run_records_plan_and_unlocks_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .unlock("test:factory", None, "release done", &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: unlock project test:factory (message release done)".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn unlock_dry_run_plan_names_truncated_message() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        // A message longer than 80 characters is truncated, with an
+        // ellipsis marking the cut — the plan is one line.
+        let dry_run = DryRun::new(true);
+        let long = "x".repeat(81);
+        assert!(client.unlock("test:factory", None, &long, &dry_run).is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![format!(
+                "[dry-run] would: unlock project test:factory (message {}…)",
+                "x".repeat(80)
+            )]
+        );
+        // A message of exactly 80 characters is shown whole.
+        let dry_run = DryRun::new(true);
+        let exact = "x".repeat(80);
+        assert!(client
+            .unlock("test:factory", None, &exact, &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![format!(
+                "[dry-run] would: unlock project test:factory (message {})",
+                "x".repeat(80)
+            )]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn unlock_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=unlock&comment=release%20done",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .unlock("test:factory", None, "release done", &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn unlock_rejects_empty_message_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .unlock("test:factory", None, "", &DryRun::new(false))
+            .is_err());
+        assert!(client
+            .unlock("test:factory", None, "   ", &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn unlock_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .unlock(
+                "test:factory/pkg",
+                None,
+                "release done",
+                &DryRun::new(false)
+            )
+            .is_err());
+        assert!(client
+            .unlock(
+                "test:factory",
+                Some("test-pkgA/pkg"),
+                "release done",
+                &DryRun::new(false),
             )
             .is_err());
         assert!(http.post_calls().is_empty());

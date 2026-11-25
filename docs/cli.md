@@ -182,6 +182,7 @@ directory's `.env` only.
 - `geectl remote release-package <PROJECT> <PACKAGE>` — Release a package's sources and binaries; key flags: --repository <REPOSITORY>, --arch <ARCH>, --target-project <TARGET_PROJECT>, --target-repository <TARGET_REPOSITORY>, --set-release <SET_RELEASE>, --no-delay
 - `geectl remote release-project <PROJECT>` — Release a whole project's sources and binaries; key flags: --repository <REPOSITORY>, --arch <ARCH>, --target-project <TARGET_PROJECT>, --target-repository <TARGET_REPOSITORY>, --set-release <SET_RELEASE>, --no-delay
 - `geectl remote lock <PROJECT> [PACKAGE]` — Lock a project or a package; key flags: --message <MESSAGE>
+- `geectl remote unlock <PROJECT> [PACKAGE] --message <MESSAGE>` — Unlock a project or a package
 
 ## `request` — submit requests
 
