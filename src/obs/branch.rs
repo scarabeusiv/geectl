@@ -1385,11 +1385,15 @@ impl<'a> ObsClient<'a> {
         // about the source only: the target keeps its own scmsync
         // on the edit-in-place path below. The element carries the
         // URL as text content or as a url attribute; either shape
-        // refuses.
+        // refuses. A blank url attribute is not a URL: the first
+        // non-empty of the two shapes is reported.
         let source_doc = XmlDoc::parse(&source_meta)?;
         if let Some(scmsync) = source_doc.child("scmsync") {
             let url = find_attr(&scmsync, "url")
-                .or_else(|| element_text(&scmsync, "scmsync"))
+                .filter(|url| !url.trim().is_empty())
+                .or_else(|| {
+                    element_text(&scmsync, "scmsync").filter(|url| !url.trim().is_empty())
+                })
                 .unwrap_or_default();
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
@@ -3927,6 +3931,10 @@ mod tests {
             (
                 "attribute",
                 "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><scmsync url=\"https://example.com#main\"/></package>",
+            ),
+            (
+                "blank attribute falls back to the text",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><scmsync url=\"\">https://example.com#main</scmsync></package>",
             ),
         ] {
             let http = FakeHttp::new().with_get(
