@@ -220,6 +220,21 @@ fn validate_delete_message(message: &str) -> Result<(), GeectlError> {
     Ok(())
 }
 
+/// Truncate `text` to its first 80 characters for a one-line plan
+/// suffix, marking the cut with `…`. The value is validated
+/// single-line before the plan is built, so truncation cuts length
+/// only, never a line. The full value rides the payload.
+fn truncate_plan_text(text: &str) -> String {
+    const PLAN_TEXT_LEN: usize = 80;
+    let shown: String = text.chars().take(PLAN_TEXT_LEN).collect();
+    let more = if text.chars().count() > PLAN_TEXT_LEN {
+        "…"
+    } else {
+        ""
+    };
+    format!("{shown}{more}")
+}
+
 /// The option suffix for a package-delete plan line: the set
 /// options, so a dry-run plan reads what the delete would have
 /// done. The message is truncated to its first 80 characters: the
@@ -230,16 +245,7 @@ fn delete_package_option_suffix(options: &DeletePackageOptions) -> String {
         parts.push("force".to_string());
     }
     if let Some(message) = &options.message {
-        // Messages are validated single-line before the plan is
-        // built, so truncation cuts length only, never a line.
-        const PLAN_MESSAGE_LEN: usize = 80;
-        let shown: String = message.chars().take(PLAN_MESSAGE_LEN).collect();
-        let more = if message.chars().count() > PLAN_MESSAGE_LEN {
-            "…"
-        } else {
-            ""
-        };
-        parts.push(format!("message {shown}{more}"));
+        parts.push(format!("message {}", truncate_plan_text(message)));
     }
     if parts.is_empty() {
         String::new()
@@ -259,16 +265,7 @@ fn delete_project_option_suffix(options: &DeleteProjectOptions) -> String {
         parts.push("force".to_string());
     }
     if let Some(comment) = &options.comment {
-        // Comments are validated single-line before the plan is
-        // built, so truncation cuts length only, never a line.
-        const PLAN_COMMENT_LEN: usize = 80;
-        let shown: String = comment.chars().take(PLAN_COMMENT_LEN).collect();
-        let more = if comment.chars().count() > PLAN_COMMENT_LEN {
-            "…"
-        } else {
-            ""
-        };
-        parts.push(format!("comment {shown}{more}"));
+        parts.push(format!("comment {}", truncate_plan_text(comment)));
     }
     if parts.is_empty() {
         String::new()
@@ -283,16 +280,7 @@ fn delete_project_option_suffix(options: &DeleteProjectOptions) -> String {
 /// No message — none given, or an empty one — adds no suffix.
 fn plan_message_suffix(message: Option<&str>) -> String {
     match message.filter(|message| !message.is_empty()) {
-        Some(message) => {
-            const PLAN_MESSAGE_LEN: usize = 80;
-            let shown: String = message.chars().take(PLAN_MESSAGE_LEN).collect();
-            let more = if message.chars().count() > PLAN_MESSAGE_LEN {
-                "…"
-            } else {
-                ""
-            };
-            format!(" (message {shown}{more})")
-        }
+        Some(message) => format!(" (message {})", truncate_plan_text(message)),
         None => String::new(),
     }
 }
