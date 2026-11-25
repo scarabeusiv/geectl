@@ -127,6 +127,22 @@ impl Backend {
     }
 }
 
+/// One file's mtime in the working-copy state: the file name,
+/// relative to the checkout root, and its modification time as
+/// seconds and nanoseconds since the epoch. The record is the
+/// worktree's mtimes as of the last base move (checkout, commit,
+/// update, pull, resolve), so a later read can tell files the
+/// checkout itself wrote from ones edited since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMtime {
+    /// The file name, relative to the checkout root.
+    pub name: String,
+    /// Modification time, seconds since the epoch.
+    pub secs: u64,
+    /// Modification time, nanoseconds past `secs`.
+    pub nanos: u32,
+}
+
 /// One checked-out package: its root, its coordinates, and its base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkingCopy {
@@ -145,6 +161,9 @@ pub struct WorkingCopy {
     pub base_rev: String,
     /// The base source md5. Empty for a git-backed checkout.
     pub base_srcmd5: String,
+    /// The files' mtimes as of the last base move, sorted by
+    /// name. Empty for a checkout recorded before mtimes existed.
+    pub mtimes: Vec<FileMtime>,
     /// The scmsync URL the git-backed checkout was cloned from, as
     /// recorded at checkout (with the `#branch` fragment when the
     /// server named one). None for an OBS-native checkout, and for
@@ -1339,6 +1358,13 @@ fn open_inner(dir: &Path, heal: bool) -> Result<WorkingCopy, GeectlError> {
     // The scmsync keys are optional: a checkout recorded
     // before they existed opens with neither, and the submit
     // defaults fall back to the target's default branch.
+    // The mtimes key is optional: a checkout recorded before
+    // mtimes existed opens with an empty record, and a malformed
+    // value is an inconsistent checkout, not a silent skip.
+    let mtimes = match git_config_get(dir, "mtimes")? {
+        None => Vec::new(),
+        Some(encoded) => decode_mtimes(&encoded)?,
+    };
     let mut working_copy = WorkingCopy {
         root: dir.to_path_buf(),
         project,
@@ -1347,6 +1373,7 @@ fn open_inner(dir: &Path, heal: bool) -> Result<WorkingCopy, GeectlError> {
         backend,
         base_rev,
         base_srcmd5,
+        mtimes,
         scmsync_url: git_config_get(dir, "scmsync-url")?,
         scmsync_branch: git_config_get(dir, "scmsync-branch")?.filter(|branch| !branch.is_empty()),
     };
@@ -1820,7 +1847,7 @@ fn checkout_obs(
         )?;
     }
     git(&target, "init", &["--quiet"], &[])?;
-    write_record(
+    let mtimes = write_record(
         &target,
         &client.base,
         project,
@@ -1858,6 +1885,7 @@ fn checkout_obs(
         backend: Backend::Obs,
         base_rev: rev_number,
         base_srcmd5: srcmd5,
+        mtimes,
         scmsync_url: None,
         scmsync_branch: None,
     })
@@ -1940,7 +1968,7 @@ fn checkout_git(
     let head = git(&target, "rev-parse", &["HEAD"], &[])?
         .trim()
         .to_string();
-    write_record(
+    let mtimes = write_record(
         &target,
         &client.base,
         project,
@@ -1959,6 +1987,7 @@ fn checkout_git(
         backend: Backend::Git,
         base_rev: head,
         base_srcmd5: String::new(),
+        mtimes,
         scmsync_url: Some(url.to_string()),
         scmsync_branch: branch
             .filter(|branch| !branch.is_empty())
@@ -1981,7 +2010,7 @@ fn write_record(
     base_srcmd5: &str,
     scmsync_url: Option<&str>,
     scmsync_branch: Option<&str>,
-) -> Result<(), GeectlError> {
+) -> Result<Vec<FileMtime>, GeectlError> {
     git(dir, "config", &["--local", "user.name", "geectl"], &[])?;
     git(
         dir,
@@ -2001,6 +2030,174 @@ fn write_record(
     if let Some(branch) = scmsync_branch {
         git_config_set(dir, "scmsync-branch", branch)?;
     }
+    // The mtimes are snapshotted last: the files are all in
+    // place by now (downloaded, or cloned), so the record names
+    // the worktree the checkout actually holds.
+    let mtimes = snapshot_mtimes(dir)?;
+    git_config_set(dir, "mtimes", &encode_mtimes(&mtimes))?;
+    Ok(mtimes)
+}
+
+/// Snapshot the worktree's mtimes: every regular file and symlink
+/// under `dir`, relative names, sorted. `.git` is skipped: the
+/// record names the checkout's files, not its repository. A file
+/// that cannot be statted is an error, never a skipped entry — a
+/// partial record would read as a complete one.
+fn snapshot_mtimes(dir: &Path) -> Result<Vec<FileMtime>, GeectlError> {
+    let mut mtimes = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = std::fs::read_dir(&current).map_err(|e| {
+            GeectlError::new(
+                ErrorKind::InternalError,
+                format!("failed to read {}: {e}", current.display()),
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("failed to read an entry of {}: {e}", current.display()),
+                )
+            })?;
+            let path = entry.path();
+            if current.as_path() == dir && entry.file_name().to_string_lossy() == ".git" {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("failed to read {}: {e}", path.display()),
+                )
+            })?;
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() && !meta.file_type().is_symlink() {
+                continue;
+            }
+            let mtime = meta.modified().map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("failed to read the mtime of {}: {e}", path.display()),
+                )
+            })?;
+            let since = mtime.duration_since(std::time::UNIX_EPOCH).map_err(|e| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("the mtime of {} is before the epoch: {e}", path.display()),
+                )
+            })?;
+            let rel = path.strip_prefix(dir).map_err(|_| {
+                GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("{} is not under {}", path.display(), dir.display()),
+                )
+            })?;
+            mtimes.push(FileMtime {
+                name: rel.to_string_lossy().replace('\\', "/"),
+                secs: since.as_secs(),
+                nanos: since.subsec_nanos(),
+            });
+        }
+    }
+    mtimes.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(mtimes)
+}
+
+/// Encode mtimes as one record line: `name=secs.nanos` entries
+/// joined by `,`. The record stays one line per key
+/// (`git_config_set` refuses newlines), so the name escapes the
+/// structural characters: `%` → `%25`, `,` → `%2C`, `=` →
+/// `%3D`, and any control character → `%XX`. Anything else —
+/// including `/` for files in subdirectories — is verbatim.
+fn encode_mtimes(mtimes: &[FileMtime]) -> String {
+    mtimes
+        .iter()
+        .map(|mtime| {
+            format!(
+                "{}={}.{}",
+                escape_mtime_name(&mtime.name),
+                mtime.secs,
+                mtime.nanos
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn escape_mtime_name(name: &str) -> String {
+    let mut escaped = String::new();
+    for ch in name.chars() {
+        match ch {
+            '%' => escaped.push_str("%25"),
+            ',' => escaped.push_str("%2C"),
+            '=' => escaped.push_str("%3D"),
+            c if c.is_control() => escaped.push_str(&format!("%{:02X}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// Decode a record line written by `encode_mtimes`. A value that
+/// does not parse is an inconsistent checkout: the record is
+/// corrupt, and a guessed record would be worse than a refusal.
+fn decode_mtimes(encoded: &str) -> Result<Vec<FileMtime>, GeectlError> {
+    let malformed = || {
+        GeectlError::new(
+            ErrorKind::WorkingCopyInconsistent,
+            "the working copy mtimes record is malformed",
+        )
+    };
+    if encoded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut mtimes = Vec::new();
+    for entry in encoded.split(',') {
+        let (name, stamp) = entry.split_once('=').ok_or_else(malformed)?;
+        let (secs, nanos) = stamp.split_once('.').ok_or_else(malformed)?;
+        let secs: u64 = secs.parse().map_err(|_| malformed())?;
+        let nanos: u32 = nanos.parse().map_err(|_| malformed())?;
+        mtimes.push(FileMtime {
+            name: unescape_mtime_name(name).ok_or_else(malformed)?,
+            secs,
+            nanos,
+        });
+    }
+    Ok(mtimes)
+}
+
+fn unescape_mtime_name(escaped: &str) -> Option<String> {
+    let bytes = escaped.as_bytes();
+    let mut name = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = escaped.get(i + 1..i + 3)?;
+            let byte = u8::from_str_radix(hex, 16).ok()?;
+            // The escape only ever encodes ASCII, so a decoded
+            // byte is a char by construction.
+            name.push(byte as char);
+            i += 3;
+        } else {
+            // `name` is UTF-8: advance one char, not one byte.
+            let ch = escaped[i..].chars().next()?;
+            name.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    Some(name)
+}
+
+/// Re-record the worktree's mtimes, on disk and in the struct:
+/// the base just moved, so the record names the new base's
+/// worktree.
+fn refresh_mtimes(wc: &mut WorkingCopy) -> Result<(), GeectlError> {
+    let mtimes = snapshot_mtimes(&wc.root)?;
+    git_config_set(&wc.root, "mtimes", &encode_mtimes(&mtimes))?;
+    wc.mtimes = mtimes;
     Ok(())
 }
 
@@ -3723,6 +3920,7 @@ fn refresh_base(wc: &mut WorkingCopy, rev: &str, srcmd5: &str) -> Result<(), Gee
     git_config_set(&wc.root, "base-srcmd5", srcmd5)?;
     wc.base_rev = rev.to_string();
     wc.base_srcmd5 = srcmd5.to_string();
+    refresh_mtimes(wc)?;
     Ok(())
 }
 
@@ -4290,6 +4488,7 @@ fn commit_git(
         )
     })?;
     wc.base_rev = head.clone();
+    refresh_mtimes(wc)?;
     let changed = git(
         &wc.root,
         "diff",
@@ -5102,6 +5301,7 @@ fn update_obs(
         None => {
             git_config_set(&wc.root, "base-rev", &rev_number)?;
             git_config_set(&wc.root, "base-srcmd5", &srcmd5)?;
+            refresh_mtimes(wc)?;
             let report = UpdateReport {
                 updated: true,
                 old_base_rev: wc.base_rev.clone(),
@@ -5173,6 +5373,7 @@ fn update_git(
     match outcome.conflicts {
         None => {
             git_config_set(&wc.root, "base-rev", &target)?;
+            refresh_mtimes(wc)?;
             let report = UpdateReport {
                 updated: true,
                 old_base_rev: wc.base_rev.clone(),
@@ -5495,6 +5696,7 @@ pub fn pull(
         None => {
             git_config_set(&wc.root, "base-rev", &own_rev)?;
             git_config_set(&wc.root, "base-srcmd5", &own_srcmd5)?;
+            refresh_mtimes(wc)?;
             let report = PullReport {
                 updated: true,
                 old_baserev,
@@ -5838,6 +6040,13 @@ pub fn resolve(wc: &mut WorkingCopy, dry_run: &DryRun) -> Result<Option<Vec<Stri
     // changes in the `geectl autostash` entry: restore them now
     // that the rebase is done (or was never in progress).
     restore_autostash(wc)?;
+    // A finished rebase moved the base: the worktree files are
+    // rewritten (and the stashed changes restored), so the
+    // recorded mtimes are re-snapshotted. A resolve that only
+    // staged files moved no base and records nothing new.
+    if in_progress {
+        refresh_mtimes(wc)?;
+    }
     Ok(Some(before))
 }
 
@@ -6912,6 +7121,72 @@ mod tests {
     }
 
     #[test]
+    fn mtimes_encode_decode_round_trips() {
+        let mtimes = vec![
+            FileMtime {
+                name: "a,b".to_string(),
+                secs: 1,
+                nanos: 2,
+            },
+            FileMtime {
+                name: "a=b".to_string(),
+                secs: 3,
+                nanos: 4,
+            },
+            FileMtime {
+                name: "a%b".to_string(),
+                secs: 5,
+                nanos: 6,
+            },
+            FileMtime {
+                name: "sub/dir/file".to_string(),
+                secs: 7,
+                nanos: 8,
+            },
+            FileMtime {
+                name: "plain".to_string(),
+                secs: 9,
+                nanos: 0,
+            },
+        ];
+        assert_eq!(decode_mtimes(&encode_mtimes(&mtimes)).unwrap(), mtimes);
+        assert_eq!(decode_mtimes("").unwrap(), Vec::<FileMtime>::new());
+        assert_eq!(encode_mtimes(&[]), "");
+        assert!(decode_mtimes("bogus").is_err());
+        assert!(decode_mtimes("a=1").is_err());
+        assert!(decode_mtimes("a=1.x").is_err());
+    }
+
+    #[test]
+    fn checkout_records_mtimes_and_reads_them_back() {
+        let http = checkout_http();
+        let (dir, wc) = do_checkout(&http);
+        assert_eq!(
+            wc.mtimes
+                .iter()
+                .map(|mtime| mtime.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["foo.spec", "foo.tar.gz"]
+        );
+        assert!(wc.mtimes.iter().all(|mtime| mtime.secs > 0));
+        // The record round-trips through open, `.git` excluded.
+        let reopened = open(&wc.root).unwrap();
+        assert_eq!(reopened.mtimes, wc.mtimes);
+        assert_eq!(reopened, wc);
+        let _ = dir;
+    }
+
+    #[test]
+    fn open_refuses_a_malformed_mtimes_record() {
+        let http = checkout_http();
+        let (dir, wc) = do_checkout(&http);
+        git_config_set(&wc.root, "mtimes", "bogus").unwrap();
+        let err = open(&wc.root).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WorkingCopyInconsistent);
+        let _ = dir;
+    }
+
+    #[test]
     fn checkout_refuses_a_traversal_listing_name() {
         // A listing entry that escapes the checkout (`../evil`)
         // is refused before anything is downloaded: the file
@@ -7179,6 +7454,41 @@ mod tests {
         );
         assert_eq!(puts[0].1, b"new file\n".to_vec());
         assert!(puts[0].2);
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_refreshes_the_mtimes_record() {
+        // The validate pass commits outright: the sent list is
+        // complete, so no file is staged and no final pass runs.
+        let validate_url = "https://api.opensuse.org/source/home:alice/foo?cmd=commitfilelist&comment=test&user=scarabeus_iv&withvalidate=1&noservice=1";
+        let http = checkout_http().with_post(
+            validate_url,
+            &format!("<directory name=\"foo\" rev=\"2\" srcmd5=\"{SRCMD5_2}\" vrev=\"2\" />"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (dir, mut wc) = do_checkout(&http);
+        write_file(&wc.root, "foo.spec", "Name: bar\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let report = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.rev, Some(2));
+        // The base moved, so the mtimes were re-recorded: the
+        // record still names the committed worktree.
+        assert_eq!(wc.mtimes, snapshot_mtimes(&wc.root).unwrap());
+        assert!(!wc.mtimes.is_empty());
+        assert_eq!(open(&wc.root).unwrap().mtimes, wc.mtimes);
         let _ = dir;
     }
 

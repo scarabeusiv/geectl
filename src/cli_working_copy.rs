@@ -800,6 +800,7 @@ mod tests {
             backend: Backend::Obs,
             base_rev: "1".to_string(),
             base_srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            mtimes: Vec::new(),
             scmsync_url: None,
             scmsync_branch: None,
         }
