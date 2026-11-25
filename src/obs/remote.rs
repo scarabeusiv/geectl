@@ -4046,7 +4046,11 @@ impl<'a> ObsClient<'a> {
     /// bookkeeping beside a git-backed package's sources, not package
     /// content. `_scmsync.obsinfo` records the synced commit;
     /// `build.specials.obscpio` is the synced tree. See
-    /// https://github.com/openSUSE/osc/issues/2240.
+    /// https://github.com/openSUSE/osc/issues/2240. The match is by
+    /// filename only, in every package: a native package carrying a
+    /// file of the same name has it hidden from diffs too. Scoping
+    /// the skip to git-backed packages would cost a meta read per
+    /// diff, so the by-name skip stands.
     fn is_scmsync_internal_file(name: &str) -> bool {
         matches!(name, "_scmsync.obsinfo" | "build.specials.obscpio")
     }
@@ -4057,7 +4061,8 @@ impl<'a> ObsClient<'a> {
     /// internal scmsync files (`_scmsync.obsinfo`,
     /// `build.specials.obscpio`) are skipped on both sides: they are
     /// server bookkeeping for a git-backed package, not package
-    /// content, so their churn is not a diff.
+    /// content, so their churn is not a diff. The skip is by filename
+    /// in every package, not only in git-backed ones.
     fn diff_files(
         &self,
         old_project: &str,
@@ -13679,6 +13684,20 @@ mod tests {
             ]
         );
         assert!(patches[1].diff.contains("-Version: 1.0\n+Version: 1.1\n"));
+    }
+
+    #[test]
+    fn scmsync_internal_files_match_by_name_only() {
+        // The skip consults no package state: a native package
+        // carrying a file of the same name has it skipped too.
+        assert!(ObsClient::is_scmsync_internal_file("_scmsync.obsinfo"));
+        assert!(ObsClient::is_scmsync_internal_file(
+            "build.specials.obscpio"
+        ));
+        assert!(!ObsClient::is_scmsync_internal_file("foo.spec"));
+        assert!(!ObsClient::is_scmsync_internal_file(
+            "_scmsync.obsinfo.bak"
+        ));
     }
 
     #[test]
