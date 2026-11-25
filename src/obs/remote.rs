@@ -826,7 +826,13 @@ fn parse_commitfilelist_response(body: &str) -> Result<CommitFilelistResponse, G
         Some(value) => Some(value.parse::<u64>().map_err(|_| malformed())?),
         None => None,
     };
-    let srcmd5 = tag_attr(open_tag, "srcmd5").map(|value| xml_unescape(&value));
+    // The srcmd5 is the commit's new base: a value that is not
+    // exactly 32 hex digits is malformed, not a base to record.
+    let srcmd5 = match tag_attr(open_tag, "srcmd5").map(|value| xml_unescape(&value)) {
+        Some(value) if is_md5(&value) => Some(value),
+        Some(_) => return Err(malformed()),
+        None => None,
+    };
     if open_tag.trim_end().ends_with('/') {
         // Self-closing `<directory .../>`: no children, so no missing
         // files and no service state.
@@ -9315,6 +9321,71 @@ mod tests {
         let answer = parse_commitfilelist_response(body).unwrap();
         assert_eq!(answer.missing, vec!["bar.txt".to_string()]);
         assert!(answer.rev.is_none());
+    }
+
+    #[test]
+    fn commitfilelist_response_rejects_non_hex_srcmd5() {
+        // The srcmd5 is the commit's new base: a non-hex value
+        // is a malformed answer, never a base to record.
+        assert_eq!(
+            parse_commitfilelist_response(
+                "<directory name=\"foo\" rev=\"2\" srcmd5=\"aaa\"></directory>"
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ServerError
+        );
+        assert_eq!(
+            parse_commitfilelist_response("<directory name=\"foo\" rev=\"2\" srcmd5=\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"></directory>")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ServerError
+        );
+    }
+
+    #[test]
+    fn commitfilelist_response_rejects_wrong_length_srcmd5() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        assert!(
+            parse_commitfilelist_response("<directory name=\"foo\" rev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"></directory>")
+                .is_err()
+        );
+        assert!(
+            parse_commitfilelist_response("<directory name=\"foo\" rev=\"2\" srcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"></directory>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn commitfilelist_response_accepts_32_hex_srcmd5() {
+        // Lowercase and uppercase hex both read, carried verbatim.
+        let answer = parse_commitfilelist_response(
+            "<directory name=\"foo\" rev=\"2\" srcmd5=\"0123456789abcdef0123456789abcdef\"></directory>",
+        )
+        .unwrap();
+        assert_eq!(
+            answer.srcmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let answer = parse_commitfilelist_response(
+            "<directory name=\"foo\" rev=\"2\" srcmd5=\"0123456789ABCDEF0123456789ABCDEF\"></directory>",
+        )
+        .unwrap();
+        assert_eq!(
+            answer.srcmd5.as_deref(),
+            Some("0123456789ABCDEF0123456789ABCDEF")
+        );
+    }
+
+    #[test]
+    fn commitfilelist_response_rejects_escape_sequence_in_srcmd5() {
+        // An escape sequence smuggled into the md5 unescapes to a
+        // value that is not 32 hex digits, so the answer is
+        // malformed.
+        assert!(
+            parse_commitfilelist_response("<directory name=\"foo\" rev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;\"></directory>")
+                .is_err()
+        );
     }
 
     #[test]
