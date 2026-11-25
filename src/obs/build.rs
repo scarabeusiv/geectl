@@ -471,11 +471,12 @@ pub struct JobStatus {
 
 /// Parse a `<jobstatus ...>...</jobstatus>` document. An element
 /// with no `code` means no job is running (None); a document with no
-/// jobstatus element at all — or a non-numeric numeric child — is a
-/// server error, never "no job". Only `code`, `result`, and `details`
-/// are attributes; the rest (`starttime`, `endtime`, `lastduration`,
-/// `workerid`, `hostarch`, `uri`, `arch`, `job`, `jobid`, `attempt`)
-/// are child elements.
+/// jobstatus element at all — or a non-numeric numeric child, or a
+/// `<jobid>` that is not exactly 32 hex digits — is a server error,
+/// never "no job". Only `code`, `result`, and `details` are attributes;
+/// the rest (`starttime`, `endtime`, `lastduration`, `workerid`,
+/// `hostarch`, `uri`, `arch`, `job`, `jobid`, `attempt`) are child
+/// elements.
 pub(crate) fn parse_job_status(body: &str) -> Result<Option<JobStatus>, GeectlError> {
     let body = body.trim();
     // A malformed job status response still fails closed, but the error
@@ -558,6 +559,14 @@ pub(crate) fn parse_job_status(body: &str) -> Result<Option<JobStatus>, GeectlEr
             }),
         }
     };
+    // The jobid is the md5 of the job info file: a value that is
+    // not exactly 32 hex digits is malformed, not a job to report.
+    // It may be absent.
+    let jobid = match xml_element_text(inner, "jobid") {
+        Some(value) if is_md5(&value) => Some(value),
+        Some(_) => return Err(malformed()),
+        None => None,
+    };
     Ok(Some(JobStatus {
         code,
         result: xml_attr(tag, "result"),
@@ -570,7 +579,7 @@ pub(crate) fn parse_job_status(body: &str) -> Result<Option<JobStatus>, GeectlEr
         uri: xml_element_text(inner, "uri"),
         arch: xml_element_text(inner, "arch"),
         job: xml_element_text(inner, "job"),
-        jobid: xml_element_text(inner, "jobid"),
+        jobid,
         attempt: number("attempt")?,
     }))
 }
@@ -4804,6 +4813,74 @@ mod tests {
                 jobid: Some("17c8d25b92da67f6ec428ea51a9b5342".to_string()),
                 attempt: Some(1),
             })
+        );
+    }
+
+    #[test]
+    fn parse_job_status_rejects_non_hex_jobid() {
+        // The jobid is the md5 of the job info file: a non-hex
+        // value is a malformed status, never a job to report.
+        assert_eq!(
+            parse_job_status("<jobstatus code=\"building\"><jobid>aaa</jobid></jobstatus>")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ServerError
+        );
+        assert!(
+            parse_job_status("<jobstatus code=\"building\"><jobid>zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz</jobid></jobstatus>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_job_status_rejects_wrong_length_jobid() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        assert!(
+            parse_job_status("<jobstatus code=\"building\"><jobid>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</jobid></jobstatus>")
+                .is_err()
+        );
+        assert!(
+            parse_job_status("<jobstatus code=\"building\"><jobid>bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</jobid></jobstatus>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_job_status_accepts_32_hex_jobid() {
+        // Lowercase and uppercase hex both read, carried verbatim.
+        let parsed = parse_job_status(
+            "<jobstatus code=\"building\"><jobid>0123456789abcdef0123456789abcdef</jobid></jobstatus>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parsed.jobid.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let parsed = parse_job_status(
+            "<jobstatus code=\"building\"><jobid>0123456789ABCDEF0123456789ABCDEF</jobid></jobstatus>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parsed.jobid.as_deref(),
+            Some("0123456789ABCDEF0123456789ABCDEF")
+        );
+        // A status without one still parses: the jobid is None.
+        let parsed = parse_job_status("<jobstatus code=\"building\"></jobstatus>")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.jobid, None);
+    }
+
+    #[test]
+    fn parse_job_status_rejects_escape_sequence_in_jobid() {
+        // An escape sequence smuggled into the md5 unescapes to a
+        // value that is not 32 hex digits, so the status is
+        // malformed.
+        assert!(
+            parse_job_status("<jobstatus code=\"building\"><jobid>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;</jobid></jobstatus>")
+                .is_err()
         );
     }
 
