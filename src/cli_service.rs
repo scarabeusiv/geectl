@@ -61,8 +61,8 @@ pub enum ServiceCommand {
     /// dry-run is the default (only the plan is printed); `--live`
     /// performs the trigger. The trigger only queues the run: the
     /// server runs the services asynchronously, so a successful
-    /// trigger says the run was queued, not that it finished. Check
-    /// the outcome with `service state`.
+    /// trigger says the run was queued. Check the outcome with
+    /// `service state`.
     Trigger {
         /// The project the package lives in.
         project: String,

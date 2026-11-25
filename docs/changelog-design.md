@@ -12,7 +12,7 @@ geectl changelog generate <dir> [--target-project P --target-package PKG] [--aut
 ```
 
 `dir` defaults to `.`. The target flags pass as a pair.
-`--author` is required for `generate` (geectl reads the identity from the flag only). `--live` is a no-op: `changelog` runs locally only; `--write` is the explicit local-write flag.
+`--author` is required for `generate` (geectl reads the identity from the flag only). `changelog` accepts `--live` and runs locally regardless; `--write` is the explicit local-write flag.
 
 ## Rules (V1–V12)
 
@@ -65,8 +65,8 @@ skipped. Any other fetch failure is a hard error.
   entries match the target's up to the whole-file normalization
   `generate --write` applies (sanctioned exceptions are named in
   the message for the human to judge).
-- V12 — bug references: a `bnc#` reference (the old abbreviation —
-  use `boo#`/`bsc#`), incomplete CVE ids, a bare `CVE(s)` or
+- V12 — bug references: a `bnc#` reference (use `boo#`/`bsc#`),
+  incomplete CVE ids, a bare `CVE(s)` or
   security claim with no full id, and a CVE named as not fixed /
   not affected with no fix statement elsewhere in the entry.
 
@@ -117,15 +117,6 @@ under `## 2.0`) stay inside the section. A file with no version
 headings yields an empty section. A lookup failure is
 an error value.
 
-## Out of scope
+## Scope
 
-Filing, OBS mutation, and commit wiring are outside this layer. V1–V8 and V10–V12 are exact; V9 is a deterministic heuristic gated on the NEWS section existing. Old entries are rewritten only by the whole-file normalization: `--write` normalizes the whole file (trailing whitespace, CRLF→LF, legacy encodings to UTF-8, BOM stripped) and V11 compares older entries after that normalization, so a difference normalization alone explains stays out of the findings.
-
-## Rule provenance
-
-V11's format lint and V12's bug-reference checks are ports of the
-packaging skill's `changes-lint.sh`; V4's patch-naming rule is a port
-of its `changes-patches.sh`; V9's needs-detail condition and the
-entry-count rule follow its `changelog-rules.md`. V12 is a
-simplification of the skill's full attribution logic, which stays in
-the skill.
+This layer validates and generates `.changes` entries; filing, OBS mutation, and commit wiring live in their own layers. V1–V8 and V10–V12 are exact; V9 is a deterministic heuristic gated on the NEWS section existing. Old entries change through the whole-file normalization: `--write` normalizes the whole file (trailing whitespace, CRLF→LF, legacy encodings to UTF-8, BOM stripped) and V11 compares older entries after that normalization, so a difference normalization alone explains counts as no finding.

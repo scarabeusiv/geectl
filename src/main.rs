@@ -215,7 +215,7 @@ enum Command {
         /// The commit message.
         #[arg(long, short)]
         message: String,
-        /// Skip the service gate (no source services, no
+        /// Skip the service gate (source services and
         /// `pre_checkin.sh`).
         #[arg(long)]
         noservice: bool,

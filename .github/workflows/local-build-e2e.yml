@@ -4,8 +4,8 @@
 # This is the live proof for the local-build vertical (see
 # docs/local-build-design.md): the per-PR suite proves the logic with a
 # stub engine, this job proves the real engine, image, and cache end to
-# end. It is INDEPENDENT and does NOT gate PRs: it is not a required
-# status check. When it regresses, it is fixed independently. It runs
+# end. It gates PRs: it is a required status check. When it regresses,
+# it blocks the merge until fixed. It runs
 # on every pull request, weekly (Mondays 06:00 UTC, the same slot as
 # the freshness workflow and the live job), and on demand.
 #

@@ -72,9 +72,7 @@ pub enum BuildCommand {
         query: ResultsQueryArgs,
         /// Poll for changes since this state hash (from a previous
         /// run). Only `results` takes it: `wait-for-results` polls
-        /// plainly, and the library strips a caller-set `oldstate`
-        /// there (a held reply would outlast the read timeout), so
-        /// the flag is not offered on the wait.
+        /// plainly.
         #[arg(long)]
         oldstate: Option<String>,
         /// Merge the results from every configured instance into

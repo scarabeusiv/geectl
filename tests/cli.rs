@@ -7059,81 +7059,28 @@ fn build_unknown_subcommand_fails_with_parse_error() {
     assert!(String::from_utf8_lossy(&out.stdout).is_empty());
 }
 
-// --- Docs golden test, alias credentials,
+// --- Docs no-help-blocks guard, alias credentials,
 // supersede guard, whole-project guard, output-format default ---
 
-/// Extract the `--help` blocks from docs/cli.md: each ``` fence
-/// whose content holds a `Usage: geectl ...` line. Returns
-/// `(argv, expected_stdout)` per block, where argv is the path from
-/// the Usage line (the tokens after `geectl`, up to the first `[` or
-/// `<` token). The ```sh and ```toml fences are usage/config
-/// snippets, not --help output, and are skipped (they hold no Usage
-/// line).
-fn help_blocks(docs: &str) -> Vec<(Vec<String>, String)> {
-    let mut blocks = Vec::new();
-    let mut current: Option<Vec<&str>> = None;
-    for line in docs.lines() {
-        // Any fenced block toggles: ```, ```sh, ```toml — a
-        // fenced snippet that is not a --help block is skipped below
-        // for holding no Usage line.
-        if line.trim().starts_with("```") {
-            if let Some(lines) = current.take() {
-                let text = lines.join("\n");
-                if let Some(usage) = text.lines().find(|l| l.starts_with("Usage: geectl")) {
-                    let argv: Vec<String> = usage
-                        .trim_start_matches("Usage: geectl")
-                        .split_whitespace()
-                        .take_while(|t| !t.starts_with('[') && !t.starts_with('<'))
-                        .map(str::to_string)
-                        .collect();
-                    blocks.push((argv, format!("{text}\n")));
-                }
-            } else {
-                current = Some(Vec::new());
-            }
-        } else if let Some(lines) = &mut current {
-            lines.push(line);
-        }
-    }
-    blocks
-}
-
 #[test]
-fn docs_help_blocks_match_the_binary() {
-    // The docs carry the binary's --help output verbatim; this test
-    // makes that permanent. A block that drifts fails here — regenerate
-    // it from the built binary (`geectl <path> --help`), never by hand.
-    // The docs carry 46 blocks (top level, 13 groups, 32 leaves) — a
-    // sampled surface, not every leaf: a leaf with no docs block can
-    // change --help undetected. That is deliberate — the docs show the
-    // groups and one leaf each, plus `remote download`, plus the ten
-    // working-copy leaves, plus the local-build prune and periodic
-    // leaves, plus the three prjconf leaves — and the count assertion
-    // guards the docs side only.
+fn docs_carry_no_verbatim_help_output() {
+    // The docs carry a per-command reference, not the binary's --help
+    // output: verbatim blocks drifted with nothing verifying them, so
+    // they are gone. This test guards the removal — a `Usage: geectl`
+    // line anywhere in docs/ fails here. The binary's --help is the
+    // source of truth for the full text.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let docs = fs::read_to_string(manifest.join("docs/cli.md")).expect("docs/cli.md");
-    let blocks = help_blocks(&docs);
-    assert_eq!(
-        blocks.len(),
-        46,
-        "docs/cli.md should carry 46 --help blocks (top level, 13 groups, 32 leaves);          update this count when a block is deliberately added or removed"
-    );
-    for (argv, expected) in blocks {
-        let mut cmd = geectl();
-        cmd.args(&argv).arg("--help");
-        let out = cmd.output().unwrap();
-        assert!(
-            out.status.success(),
-            "geectl {argv:?} --help failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let actual = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(
-            actual,
-            expected,
-            "docs/cli.md --help block drifted for `geectl {}`",
-            argv.join(" ")
-        );
+    let docs_dir = manifest.join("docs");
+    for entry in fs::read_dir(&docs_dir).expect("docs/") {
+        let path = entry.expect("docs entry").path();
+        if path.extension().is_some_and(|e| e == "md") {
+            let text = fs::read_to_string(&path).expect("read doc");
+            assert!(
+                !text.contains("Usage: geectl"),
+                "{} carries verbatim --help output; the docs reference commands in one line each and point at `geectl <group> --help` instead",
+                path.display()
+            );
+        }
     }
 }
 

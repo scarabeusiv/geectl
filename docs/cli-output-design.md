@@ -2,8 +2,6 @@
 
 State: the debug channel exists; text rendering exists for every command.
 
-Divergence between this doc and the code is caught by review passes. The docs-conformance CI check was removed deliberately: it caught only literal examples, missed semantic claims, and its pins were the rebase-conflict engine.
-
 `src/main.rs` is a thin CLI over the library. Global `--format` flag (JSON default, text alternative) plus the debug flags (`--debug`, `--debug-body`). Errors go to stderr in the selected format (JSON payload by default, `error:`/`remediation:` lines in text mode). The debug channel is the `log` crate facade with a bespoke backend in `src/debug.rs`, fed by the global flags and `GEECTL_DEBUG=1`. One command tree covers both backends (git and OBS).
 
 ## The decision, up front
@@ -25,13 +23,13 @@ Stdout carries the result payload and nothing else. Everything a human reads whi
 ### What it prints: the event catalog
 
 One line per event, on stderr, in time order. The catalog is closed:
-only the listed event kinds print.
+the listed event kinds print.
 
 **HTTP attempt** (the bulk of the channel): method, URL path, status or error kind, duration, attempt number against the retry budget. Example shape: `http: GET /source/openSUSE:Factory/geectl -> 200 in 123ms (attempt 1/4)` On a retryable failure the line carries the reason and the backoff: `http: GET /source/... -> 500 in 210ms (attempt 2/4, retry in 2s: transient status 500)` (test `debug_on_records_exhaustion_after_retries`). On exhaustion: `http: GET /source/... failed after 4 attempts (last: 500)`. (test `debug_on_records_exhaustion_after_retries`). A body that fails mid-read retries the same way, and emits a second line for the same attempt: the status line when the headers arrive, then the failure — two events for one attempt: `http: GET /source/... -> network error in 210ms (attempt 1/4, retry in 1s: body read failed)` (test `debug_on_records_body_failure_line_for_severed_read`).
 **Read-after-write retries** (the library's bounded retries): each probe plus the remaining budget, e.g. `retry: create_package registration probe 1/30s: still not found`. (test `debug_create_package_probe_reports_each_retry`). A retried `change_state` consuming its 60 s budget leaves its trace in this channel.
-**Library decision points** (the ones that change what happens next): the supersede-all filing decision (`decision: filing for foo; superseding open submit request(s) 1398492 with the new request`; test `debug_file_reports_the_supersede_decision`), dedup checks (`decision: open maintenance_incident request(s) 1399001 already target openSUSE:Maintenance for foo; refusing to file`; test `debug_maintenance_incident_reports_the_dedup_refusal`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `debug_dry_run_refusal_reports_the_guard`), endpoint selection (`decision: read via /public/source (no credentials)`; test `debug_on_records_attempt_lines_for_500_then_200` vs `decision: read via /source (authenticated)`; test `debug_endpoint_reports_authenticated_reads`), and the accept-state check before a retried `change_state` (`decision: request 1398977 still new, re-issuing accepted`; test `debug_change_state_retry_reports_probe_and_decision`).
+**Library decision points** (the ones that change what happens next): the supersede-all filing decision (`decision: filing for foo; superseding open submit request(s) 1234567 with the new request`; test `debug_file_reports_the_supersede_decision`), dedup checks (`decision: open maintenance_incident request(s) 1234567 already target openSUSE:Maintenance for foo; refusing to file`; test `debug_maintenance_incident_reports_the_dedup_refusal`), the DryRun guard (`decision: dry-run: mutation refused, plan only: <action>`; test `debug_dry_run_refusal_reports_the_guard`), endpoint selection (`decision: read via /public/source (no credentials)`; test `debug_on_records_attempt_lines_for_500_then_200` vs `decision: read via /source (authenticated)`; test `debug_endpoint_reports_authenticated_reads`), and the accept-state check before a retried `change_state` (`decision: request 1234567 still new, re-issuing accepted`; test `debug_change_state_retry_reports_probe_and_decision`).
 **Service status lines**: `service_state <project>/<package>: <code>` and `list_services <project>/<package>: <n> service(s)` — emitted by the services reads, unprefixed (the verb names the operation, as with the startup line; emit sites `src/obs/services.rs:parse_services,service_directory_listing`).
-**Startup line**: `geectl <version> request show 1398977` — the invoked command line, so a pasted debug transcript is self-describing. Secret-valued flags are masked here by construction.
+**Startup line**: `geectl <version> request show 1234567` — the invoked command line, so a pasted debug transcript is self-describing. Secret-valued flags are masked here by construction.
 **Config line at startup**: the effective OBS/Gitea base *hosts* and the auth *kind* (`basic`/`bearer`/`ssh`/`none`/`error`) only. (`config show` reports the username as data.)
 
 ### Channel boundaries
@@ -69,7 +67,7 @@ One level that prints everything the channel carries.
 ### Where it lives: the `log` facade with a bespoke backend
 
 A small `Debug` sink type in the library (`src/debug.rs`): an `enabled: bool` plus pre-formed lines. The library's `UreqClient` and `ObsClient` take it at construction (builder or constructor parameter); the binary constructs it from the flag/env and passes it in. The sink is public in the library so other consumers (freshcrab) can wire it to their own log.
-**The `log` crate (decision 4).** The emit path goes through the `log` facade to a minimal bespoke `log::Log` backend installed by `install`, writing the plain human line to stderr. The backend accepts only records from this module.
+**The `log` crate (decision 4).** The emit path goes through the `log` facade to a minimal bespoke `log::Log` backend installed by `install`, writing the plain human line to stderr. The backend accepts records from this module.
 **Near-zero cost when off.** The HTTP transport checks `enabled()` before formatting; the library decision-point sites format one small string each, dropped inside `emit()` when the channel is off. The sink takes pre-formed lines, so the check is one bool per event.
 **The two existing prints.** `try_change_state` emits a `decision:` line on the channel when it declines an accept (`post_changestate_with_retry` in `src/obs/request.rs`): the refused-change path propagates the error, so the reason reaches the JSON error payload, while the already-in-target-state path returns `Ok(false)`, and the boolean outcome is in the payload. The re-issue `decision:` lines emit live in `post_changestate_with_retry`. The `[dry-run]` plan echo (`src/obs/types.rs`, `DryRun::note`) is unconditional stderr narration: it is the dry-run feature's output — a dry run shows what would happen — and the plan is data (`DryRun::plan`).
 
@@ -102,7 +100,7 @@ Consequences:
    description, a comment body); every id, name, revision, and state in the payload appears in the text.
 **Coordinate header:** text starts with one header line echoing the query coordinates — the required positionals, in the order project, package, repository, arch (as applicable), plus `package:` when the query is package-scoped. Tables stay as the worked examples pin them; the header is the only addition.
 **Documented omissions:** anything else the text leaves out is listed per renderer in the module docs, with the reason. The JSON payload remains the complete record.
-**Content commands (rule 4) are exempt from the header:** their text *is* the content, verbatim; the coordinates live in the JSON payload. The exemption covers the content itself; a synthetic empty-content line (e.g. `no log`) still carries the header. Every text rendering opens with one header line echoing the query coordinates (project/package/repository/arch as applicable), except content commands (rule 4), whose text is the content verbatim; tables stay as designed; every other omission stands as a DOCUMENTED per-renderer omission — recorded at the renderer (comment + module docs).
+**Content commands (rule 4) are exempt from the header:** their text *is* the content, verbatim; the coordinates live in the JSON payload. The exemption covers the content itself; a synthetic empty-content line (e.g. `no log`) still carries the header.
 2. **Single objects render as `key: value` lines**, one fact per
    line — the `config show` precedent. Nested objects flatten with a
    prefix (`action 1: submit ...`); nested lists get one line per
@@ -136,7 +134,7 @@ Consequences:
 Per-command fields are the command author's decision, following the
 shape rules above. Six examples pin the shape:
 
-**`request show <id>`** (single object, `key: value`): `id: 1398977`, `state: new`, `creator: ...`, `created: ...`, then one line per action (`action 1: submit openSUSE:Factory/foo rev 42 -> openSUSE:Factory`), one line per review (`review 1: by group:factory-staging state accepted`).
+**`request show <id>`** (single object, `key: value`): `id: 1234567`, `state: new`, `creator: ...`, `created: ...`, then one line per action (`action 1: submit openSUSE:Factory/foo rev 42 -> openSUSE:Factory`), one line per review (`review 1: by group:factory-staging state accepted`).
 **`request search` / `search_requests`** (list, table): header `ID STATE CREATOR ACTIONS`, one row per request, the actions column a compact inline form (`submit foo`). `request list` renders the same table under a `list` header; `--since` bounds by history or last-update date, `--limit` caps the rows.
 **`list_files`** (list, table): header `NAME SIZE MTIME`, one row per file. The md5 is JSON-only: it is a verification value.
 **`cat <package> <file>`** (content): the file verbatim.
@@ -159,14 +157,13 @@ shape rules above. Six examples pin the shape:
 environment variable**, under the existing precedence (flag > env >
 config file > built-in default). (Decision 2.)
 
-`config.rs` gains a `format` field, validated (`json`|`text`, anything else is `ConfigError` naming the value), and `config show` reports the effective format and its source, like the endpoint URLs.
+`config.rs` carries a `format` field, validated (`json`|`text`, anything else is `ConfigError` naming the value), and `config show` reports the effective format and its source, like the endpoint URLs.
 A human's config that sets `text` changes an agent's stdout. **Agent invocations pass `--format json` explicitly** (the skill's invocations do), and the flag beats the config. `config show` reports the format source.
 `--format text` per invocation is the whole mechanism, and the alias is the persistent form.
 
 ### Errors in text mode
 
-Errors go to stderr as a JSON payload, in both formats.
-**Render the error in the selected format too** — text
+**Render the error in the selected format** — text
 mode prints `error: <message>` plus `remediation: <...>` lines on
 stderr; JSON mode keeps the JSON payload. The error kind and the
 exit code are unchanged; only the rendering varies, in one place
@@ -201,24 +198,14 @@ Redaction: a fixture run with a fake credential asserts every debug line is cred
 Flag/env precedence: `--debug` enables with `GEECTL_DEBUG` unset; `GEECTL_DEBUG=1` enables alone; `GEECTL_DEBUG=0` (and empty, and `yes`) disables alone.
 Text: every command renders its fixture payload in both formats; the identifying-fields agreement test (every id/name/ revision in the JSON appears in the text); empty-list renders the explicit `no <things>` line; `cat` renders verbatim.
 Error rendering (decision 3): text mode renders `error:` + `remediation:` lines; JSON mode keeps the payload; exit code identical in both.
-**Live (non-gating):** the live suite proves the operations against a real server. A red live run re-runs with `--debug` to produce the transcript.
-Debug and text are PR-level features; the live suite is unchanged.
+**Live (gating):** the live suite proves the operations against a real server. A red live run re-runs with `--debug` to produce the transcript.
 
 ## Risks
 
 **Debug lines pasted with secrets.** The sink takes pre-formed lines, and the redaction test asserts every debug line is credential-free. A URL carrying a credential as a query parameter is a bug: the transport guard forbids credentials over cleartext, and credentials travel in headers. A debug line printing such a URL surfaces the bug.
 **Debug noise drowning the signal.** One level prints everything; a chatty command (a search fanning out per-file GETs, the `revision_patch` / `project_diff` fan-outs) produces many lines. One line per event, and the channel is off by default.
-**Text renderers drifting from JSON.** The identifying-fields agreement test and by the pair return type pin the two together — the renderer sits in the same function as the payload. Free-text fields omitted from text by design (rule 1) are documented per renderer.
-**Config `format` breaking agent parsing.** A human's config setting `text` changes an agent's stdout. Agent invocations pass `--format json` explicitly; `config show` reports the format source.
+**Text renderers drifting from JSON.** The identifying-fields agreement test and the pair return type pin the two together — the renderer sits in the same function as the payload. Free-text fields omitted from text by design (rule 1) are documented per renderer.
 **Scope creep into a logging framework.** The channel is one level on stderr, through the `log` facade to the minimal bespoke backend.
-
-## What stays out
-
-Leveled verbosity (`-v`/`-vv`), `RUST_LOG`, timestamps, JSON debug lines, request/response headers in debug output, and request/response bodies in default debug output (bodies are behind `--debug-body` only, decision 5).
-Color, paging, progress spinners, interactive prompts (the binary stays non-interactive).
-`env_logger` / `RUST_LOG` semantics.
-Terminal sniffing for the default format.
-Any change to the library's operations: the debug sink observes calls; the text renderers present payloads.
 
 ## Decisions
 
@@ -232,7 +219,7 @@ Any change to the library's operations: the debug sink observes calls; the text 
 4. The `log` crate. The channel contract holds: stderr, human
    lines, one level, off by default.
 5. Bodies behind a separate flag (`--debug-body`), size-capped
-   and redacted. Bodies print behind `--debug-body` only.
+   and redacted.
 
 ### Human-readable output
 

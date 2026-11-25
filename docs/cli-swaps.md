@@ -2,7 +2,7 @@
 
 Deliberate deviations from osc's command/flag shape, with the
 consistency reason. Rows cover deviations only. The
-scheme-level rows apply across all nine groups and are listed once;
+scheme-level rows apply across all twelve groups and are listed once;
 the per-group sections list only what is specific to that group.
 
 ## Scheme-level (all groups)
@@ -10,7 +10,7 @@ the per-group sections list only what is specific to that group.
 | osc | geectl | Why |
 |---|---|---|
 | Positional `PROJECT`/`PACKAGE` args, often defaulting to the working copy | Explicit `--project`/`--package` (etc.) flags, always required; required coordinates that stay positional are the query itself | Options use flags; the grouped commands name their coordinates explicitly. The working-copy leaves are the exception: they operate on the checkout in the current directory |
-| Short flags (`-f`, `-r`, `-m`, `-e`, `-k`, `-d`, `-N`, `-M`, `-c`, `-R`, `-u`, `-t`, `-a`, `-l`, `-w`, `-s`, `-b`, `-V`, `-F`, `-o`) | Long forms only, except `geectl commit -m` | Agents type full names; one flag name per concept. `geectl commit -m` is the one short flag |
+| Short flags (`-f`, `-r`, `-m`, `-e`, `-k`, `-d`, `-N`, `-M`, `-c`, `-R`, `-u`, `-t`, `-a`, `-l`, `-w`, `-s`, `-b`, `-V`, `-F`, `-o`) | Long forms only, apart from clap's built-in `-h`/`-V`, `geectl commit -m`, and `geectl local-build build -k`/`-p` | Agents type full names; one flag name per concept. `geectl commit -m` and `local-build build -k`/`-p` are the short flags |
 | Command aliases (`r`, `bl`, `blt`, `buildhist`, `jobhist`, `rpmlint`, `lint`, `bco`, `branchco`, `getpac`, …) | Full names only | Commands have a single full name |
 | Working-copy inference (project/package from the `.osc` checkout) | Explicit coordinates always, except the working-copy leaves, which read project/package from the checkout in the current directory | The grouped commands name their coordinates; the working-copy leaves are the ones that use the checkout |
 | Per-command output formats (`--xml`, `--csv`, `--format` with named-field interpolation) and human text only | One global `--format json\|text` | One output switch for the whole CLI; every command returns `(payload, text)` |
@@ -31,7 +31,7 @@ the per-group sections list only what is specific to that group.
 | `osc get` single file / `osc cat` (streamed read) | `geectl remote download` | Streams the file to `--output` instead of printing it; the rev passes verbatim (a number or a srcmd5), like `cat` — osc resolves the expanded srcmd5 by default. osc writes to a temp file and renames; geectl streams to the destination with exclusive create, so a failure mid-stream leaves a partial file for the caller to delete |
 | — | `geectl remote create-project` | New surface: projects are created through `meta -e` in osc; the library creates the server meta directly |
 | `osc rmkpac [--scmsync SCMSYNC] [--force] PROJECT PACKAGE` | `geectl remote create-package` | One command per library operation. `--scmsync` / `--force` select the options form of the creation |
-| `osc token --create --operation OPERATION [PROJECT PACKAGE]` | `geectl remote create-token --operation OPERATION [--project PROJECT] [--package PACKAGE] [--description TEXT]` | One command per library operation; the operation is a required flag; project and package go together (both scope the token to a package, neither leaves it global); `--description` names the token, at most 64 characters. The secret prints once, at creation |
+| `osc token --create --operation OPERATION [PROJECT PACKAGE]` | `geectl remote create-token --operation OPERATION [--project PROJECT] [--package PACKAGE] [--description TEXT]` | One command per library operation; the operation is a required flag; project and package go together: both scope the token to a package; `--description` names the token, at most 64 characters. The secret prints once, at creation |
 | `osc rdelete [-m TEXT] PROJECT PACKAGE` | `geectl remote delete-package` | One command per library operation; osc's `-m` is `--message`, sent as the server's `comment` |
 | — | `geectl remote delete-link PROJECT PACKAGE` | Working-copy or API delete: a working copy deletes the `_link` file and commits it, or `osc api -X DELETE /source/PROJECT/PACKAGE/_link` deletes it directly; the library guards the delete behind dry-run |
 | — | `geectl remote delete-file PROJECT PACKAGE FILE` | Working-copy or API delete: a working copy deletes the file and commits it, or `osc api -X DELETE /source/PROJECT/PACKAGE/FILE` deletes it directly; the library guards the delete behind dry-run |
@@ -88,11 +88,9 @@ Only deliberate deviations; the table lists deviations only.
 | `osc branch` | `geectl branch branch-package` | Grouped + spelled-out operation name (kebab-case library name) |
 | `osc branch --nodevelproject` | `--no-devel-project` | Kebab-case flag names everywhere (osc concatenates) |
 | `osc branch -c/--checkout` | `geectl branch branch-package` then `geectl checkout PROJECT PACKAGE` | Branches AND checks out a working copy; geectl does the two steps as two commands — the branch, then a checkout of the new package |
-| `osc branch --disable-build` | — | Branch meta build flags are outside the branch op's scope |
 | `osc copypac` | `geectl branch copy-package` | Grouped + spelled-out (osc abbreviates to `copypac`) |
 | `osc copypac -c/--client-side-copy` | — (same-instance form) | Client-side download/upload copy of a single package; the cross-instance form exists as `--to-apiurl`; the same-instance copy stays server-side |
 | `osc copypac -k/--keep-maintainers` | — | The server builds the target meta from the source meta |
-| `osc copypac -d/--keep-develproject` | — | — |
 | `osc copypac -t/--to-apiurl` | `geectl branch copy-package --to-apiurl <URL>` | Cross-instance copy, client-side download+upload; the target instance's credentials resolve from the instance alias matching the target URL (`GEECTL_OBS_USERNAME_<ALIAS>` / `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>`) and the copy fails clearly for an unconfigured target; the source credentials stay with the source instance |
 | `osc linkpac` | `geectl branch link-package` | Grouped + spelled-out |
 | `osc linkpac -c/--current` | — | Pins the link at the source's current expanded revision, which needs a directory read first; the library op takes an explicit revision |
@@ -108,7 +106,6 @@ Only deliberate deviations; the table lists deviations only.
 | `osc setdevelproject` | `geectl branch set-devel-project` | Grouped + kebab-case |
 | `osc linktobranch` | `geectl branch link-to-branch` | Grouped + kebab-case |
 | `osc detachbranch` | `geectl branch detach-branch` | Grouped + kebab-case |
-| `osc detachbranch -m/--message` | — | Passed as the copy comment in osc |
 
 Additions beyond osc: `geectl branch copy-project`;
 `geectl branch set-link-rev-project`;
@@ -132,7 +129,7 @@ beyond osc.
 | `prjresults [PROJECT]` | Use `geectl build results PROJECT` | The same matrix for the whole project; one matrix command |
 | `buildlog` | `geectl build build-log` | Kebab-case library name under the `geectl build` group; the mapping stays mechanical (group + kebab(library op)) |
 | `buildlog [REPOSITORY ARCH \| BUILDLOGURL]` | `geectl build build-log PROJECT PACKAGE REPOSITORY ARCH`, or `geectl build build-log BUILDLOGURL` | Explicit coordinates, or a single build-log URL (API or web-UI form) |
-| `buildlog` tail via `blt` alias | — | The library reads whole logs only |
+| `buildlog` tail via `blt` alias | — | The library reads whole logs |
 | `buildlog --lastsucceeded` / `--last-succeeded` (two spellings) | `--lastsucceeded` | One spelling, the library field name |
 | `buildlog -M/--multibuild-package FLAVOR` | `geectl build build-log --multibuild FLAVOR` | The flavor appends `:FLAVOR` to the package |
 | `buildlog -o/--offset` | `geectl build build-log --start` | Flag named after the library query field |
@@ -141,7 +138,7 @@ beyond osc.
 | `buildconfig REPOSITORY (in pkg or prj dir) \| buildconfig PROJECT REPOSITORY` | `geectl build buildconfig PROJECT REPOSITORY` | Explicit coordinates; project is always required; the config text renders verbatim, coordinates in the payload |
 | `buildhistory` | `geectl build build-history` | Kebab-case library name, same mechanical mapping as `geectl build build-log` |
 | `jobhistory [PROJECT [PACKAGE] REPOSITORY ARCH]` | `geectl build job-history PROJECT REPOSITORY ARCH` + `--package` flag | Positionals are required coordinates only |
-| `repos [PROJECT] [PACKAGE]` | `geectl build list-repositories PROJECT` | Verb-noun `list-*` scheme for listings; the library reads project meta; per-package disabled-repo filtering is outside the library read |
+| `repos [PROJECT] [PACKAGE]` | `geectl build list-repositories PROJECT` | Verb-noun `list-*` scheme for listings; the library reads project meta |
 | `getbinaries …` | `geectl build list-binaries` + `geectl build download-binary` | One osc command split into list vs download, mirroring the library split |
 | `getbinaries` implicit cwd/subdir writes | `geectl build download-binary --output PATH` (required) | Explicit destination |
 | `getbinaries PROJECT PACKAGE REPOSITORY ARCH` (whole package) | `geectl build download-binary --all --output DIR PROJECT PACKAGE REPOSITORY ARCH` | One list call plus one streaming download per file, into the named directory; downloads every listed file, including the `.src.rpm` and `-debuginfo` files; one invocation covers one architecture |
@@ -159,16 +156,12 @@ via `osc api`.
 
 | osc | geectl | Why |
 |---|---|---|
-| `build` | `geectl local-build build DIRECTORY --project PROJECT --repo REPOSITORY` | One operation: the run-mode service run, the precommit gate, then the engine build in one invocation; project and repo are explicit coordinates, arch defaults to the host arch; the v1 options are `--arch`, `--clean`, `--flavor`, `--release`, `--trust-all-projects`, `--refresh-image`, `--timeout-secs`, `--alternative-project`, `--root`, `--noinit`, `--preinstall-image`, `--keep-rpms`, `--prefer-packages` |
+| `build` | `geectl local-build build DIRECTORY --project PROJECT --repo REPOSITORY` | One operation: the run-mode service run, the precommit gate, then the engine build in one invocation; project and repo are explicit coordinates, arch defaults to the host arch; the options are `--arch`, `--clean`, `--flavor`, `--release`, `--trust-all-projects`, `--refresh-image`, `--timeout-secs`, `--alternative-project`, `--root`, `--noinit`, `--preinstall-image`, `--keep-rpms`, `--prefer-packages` |
 | `osc wipe [REPOSITORY ARCH]` (alias of `build`, sets `--wipe`) | `geectl local-build wipe REPOSITORY ARCH SPEC --project PROJECT` | Wipes the root the build's own coordinates name; the package comes from the spec file in the source directory, like the build; `--root` names the root directly; the marker check and the in-use lock are safety invariants |
 | `chroot [REPOSITORY [ARCH]]` (alias of `build`, in-directory form) | `geectl local-build chroot DIRECTORY --project PROJECT --repo REPOSITORY` | Enters the preserved root of the last build for the package; the package comes from the spec file in the directory, like the build; arch defaults to the host arch; the directory, project, and repo are explicit coordinates. Repro commands come from stdin, one per line, joined with `&&` into one shell command; a failing repro exits 0, with the exit code in `exit:` / `record.result.exit_code`; the shell is non-interactive |
 | `osc lbl [REPOSITORY [ARCH]]` | `geectl local-build log REPOSITORY ARCH SPEC --project PROJECT` | Reads the `<root>/.build.log` the build's coordinates name; the package comes from the spec file in the source directory, like the wipe; the text is the log verbatim, the verdict and truncation flag ride in the JSON payload; `--tail N` prints only the last N lines, `--full` reads the whole log; the default read caps at 4 MiB |
 
-`--trust-all-projects` lifts the foreign-`home:` refusal for the
-dep set the buildinfo enumerates; non-`home:` projects and the caller's
-own `home:` are trusted. Unlike osc's `trusted_prj` globs, which name
-trusted projects, trust in geectl is flag-wide; the flag alone decides
-trust for the run. The accepted foreign
+`--trust-all-projects` trusts the dep set the buildinfo enumerates as a whole: foreign `home:` projects in the set are accepted for the run; non-`home:` projects and the caller's own `home:` are trusted already. Trust in geectl is flag-wide; the flag alone decides trust for the run. The accepted foreign
 `home:` projects are recorded in the build record
 (`trusted_foreign_projects`); a dry run records the flag in the plan.
 
@@ -179,7 +172,6 @@ trust for the run. The accepted foreign
 | `osc mbranch [SOURCEPACKAGE [TARGETPROJECT]]` (flat top-level command, positionals) | `geectl maintenance maintenance-branch --package … [--target-project …]` | Grouped under the maintenance noun; package and target are named flags |
 | `osc maintained` / `osc sm` (aliases of `mbranch`, list-only) | `geectl maintenance maintained-instances --package …` | The list form is its own leaf. Semantics match for `sm`: both are the dry-run branch call. The `[git] org/package:branch` lines from the Gitea cache are Gitea scope. |
 | `osc mbranch -c/--checkout` | `geectl maintenance maintenance-branch` then `geectl checkout PROJECT PACKAGE` | Branches AND checks out a working copy; geectl does the two steps as two commands — the branch, then a checkout of the new package |
-| `osc mbranch --noaccess`, `--nodevelproject` | — | — |
 | `osc mbranch --version` (print version of the maintained package) | — | The top-level `geectl version` command reports geectl itself |
 
 Unchanged: `--attribute` and
@@ -203,9 +195,9 @@ layout. Incident filing lives with the other filings under `geectl request`
 | — | `geectl gitea repo-get` / `geectl gitea repo-list` / `geectl gitea branch-list` / `geectl gitea branch-get` / `geectl gitea branch-head` | New surface: Gitea reads on the configured instance |
 | — | `geectl gitea repo-create` | New surface: create a repository on the configured instance; mutations take the global `--live` |
 | `osc api -X DELETE /repos/...` | `geectl gitea repo-delete` | The delete op under the `geectl gitea` noun; mutations take the global `--live`; the library requires `--force` |
-| `osc fork` | `geectl gitea repo-fork` (Gitea half only) | `osc fork` is a composite: Gitea fork + OBS branch. `geectl gitea repo-fork` is the Gitea half; the combined fork-and-branch composite is outside the CLI. `osc fork` is scmsync-only; it clones the fork locally and inits `.osc` |
+| `osc fork` | `geectl gitea repo-fork` (Gitea half only) | `osc fork` is a composite: Gitea fork + OBS branch. `geectl gitea repo-fork` is the Gitea half; the OBS half is `branch branch-package`. `osc fork` is scmsync-only; it clones the fork locally and inits `.osc` |
 
-Scope note: the sibling `git-obs` entry point has `repo list` and `repo fork`; they are `git-obs` commands, outside this table's scope; `git-obs repo list` requires `--org`/`--user`.
+Scope note: the sibling `git-obs` entry point carries its own `repo list` and `repo fork` commands; `git-obs repo list` requires `--org`/`--user`.
 
 ## Working copy — git working copy
 

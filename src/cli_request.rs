@@ -85,8 +85,7 @@ pub enum RequestCommand {
         /// The request id.
         id: String,
     },
-    /// List the submit requests matching the filters: a typed search,
-    /// not a plain listing.
+    /// List the submit requests matching the filters: a typed search.
     Search {
         /// Only requests with these ids.
         #[arg(long = "request-id")]
@@ -229,8 +228,7 @@ pub enum RequestCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Best-effort state change: try it, and report whether it
-    /// happened instead of failing when the request cannot move.
+    /// Best-effort state change: try it, and report whether it happened.
     TryChangeState {
         /// The request id.
         id: String,
@@ -315,9 +313,8 @@ pub enum RequestCommand {
         supersede: String,
     },
     /// Supersede one request with another existing one. A mutation
-    /// that needs `--live`: the library's raw supersede has no
-    /// dry-run, so without `--live` this command refuses — use
-    /// `request refile --supersede` for the dry-runnable flow.
+    /// that needs `--live`; the dry-runnable supersede flow is
+    /// `request refile --supersede`.
     Supersede {
         /// The open request being superseded.
         old_id: String,

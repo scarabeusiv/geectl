@@ -9,8 +9,7 @@ rationale states the failure it prevents.
 ### Non-interactive is the only mode
 
 All input arrives via flags. Missing required input fails fast with a structured error
-naming the missing flag. A lint/grep check in CI fails the build when a
-prompt primitive appears.
+naming the missing flag.
 
 Rationale: a prompt hangs an agent with silence as the failure mode.
 
@@ -24,17 +23,6 @@ input from stdin and files, and leaves `/dev/tty` untouched.
 Rationale: a terminal read bypasses stdin redirection, so the same
 command behaves differently depending on whether a controlling
 terminal is present.
-
-### Trust is a configuration decision
-
-Certificate trust and project trust are decided explicitly in a config
-file or a dedicated `trust` subcommand. When a trust store is
-supported, its files are created 0600 from the first byte. A
-certificate that fails verification fails the request with a
-structured error naming the host and the failure.
-
-Rationale: a persisted trust decision changes the security posture of
-every later run, so it belongs in configuration, made deliberately.
 
 ## HTTP and API
 
@@ -137,9 +125,7 @@ a misconfiguration into a diagnosis.
 ### Keyring backend
 
 Credential providers are environment variables and mounted secret
-files. A keyring needs a platform secret service (and a daemon on
-Linux), and it serves interactive human use. Agents run headless. The
-`AuthProvider` trait is the seam a keyring provider plugs into
+files. The `AuthProvider` trait is the seam a keyring provider plugs into
 when a human-facing use case needs it.
 
 ## Output and errors
@@ -185,8 +171,8 @@ on, and the error path works on unexpected input.
 
 ### Shared resources are locked or unique per invocation
 
-Builds are outside geectl's scope. Any shared mutable resource it
-owns (state files, caches, the queue) is either locked with `flock`
+Any shared mutable resource it owns (state files, caches, the
+queue) is either locked with `flock`
 for the duration of the operation or unique per invocation. A
 destructive operation (`clean`, `wipe`, `reset`) on an in-use resource
 fails with a structured error.

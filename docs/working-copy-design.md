@@ -124,9 +124,7 @@ The git sanity checks run as a pre-push gate for git-backed packages,
 the same way `pre_checkin` runs before commit: a failed check blocks
 the push with an actionable message. The gate runs after the
 synthesized commit exists, so it checks every commit the push would
-send, and before the push itself. It is git-backed only; the
-OBS-native commit has no push. The checks are local only (no server
-call) and cover the three states the issue names:
+send, and before the push itself. The gate covers git-backed pushes; OBS-native commits take the `commitfilelist` path. The checks are local only and cover the three states the issue names:
 
 - Hooks: an executable `pre-push` hook in the checkout's effective
   hooks directory blocks the push. The directory is `core.hooksPath`
@@ -141,13 +139,10 @@ call) and cover the three states the issue names:
   on Windows git cannot expand `~user/` at all, so such a path
   refuses the push). A
   hooks path that is a file, not a directory, refuses the push
-  naming the path itself. Geectl never runs repository
-  hooks — the push runs with `--no-verify` and
-  `core.hooksPath=/dev/null` — so an installed hook would be silently
-  skipped, and the guard it was meant to provide would never run.
-  The push is refused until the hook is removed, not run: geectl
-  runs its own pre-push checks instead. `pre-commit` hooks are not
-  covered: the synthesized commit ignores them by design.
+  naming the path itself. The push runs with `--no-verify` and
+  `core.hooksPath=/dev/null`; geectl runs its own pre-push checks
+  instead of repository hooks. The push is refused until the hook is
+  removed. The synthesized commit skips `pre-commit` hooks.
 - Per-commit state: every commit in the push range carries a
   non-empty message and is not empty (its tree differs from its
   parent's). Merge commits are exempt from the empty check: their
@@ -155,10 +150,9 @@ call) and cover the three states the issue names:
 - Submodule state: every gitlink a pushed commit changes names a
   URL in that commit's `.gitmodules` and points at a commit object
   present locally, in the checkout or in the submodule's own
-  checkout. A pointer inherited unchanged from the parent is not
-  checked: it was verified when it was introduced, so a checkout
-  whose submodules were never initialized still pushes commits
-  that do not touch them. A pointer that cannot be verified fails
+  checkout. The gate covers pointers a pushed commit changes; a
+  checkout whose submodules were never initialized still pushes
+  commits that do not touch them. A pointer that cannot be verified fails
   the gate: the OBS sync would fetch it, and a revision that does
   not exist breaks the package there. A commit that moves a
   pointer needs the submodule fetched first (`git submodule update
@@ -170,11 +164,10 @@ synthesized commit is created and held until the push returns, so
 a concurrent commit cannot land between the gate and the push and
 be sent ungated. A failure inside the gate itself (a git call that
 cannot run, a lock that cannot be taken) is a gate failure too: it
-refuses the push as `PrePushCheckFailed`, exit 34, instead of
-surfacing the git-classified kind.
+refuses the push as `PrePushCheckFailed`, exit 34.
 
 The checks are geectl's own, written against the git repository
-directly. Nothing is borrowed from osc.
+directly.
 
 ## `changelog`
 
@@ -217,27 +210,7 @@ be downloaded. `update`/`commit` print the plan (files
 
 ## Test story
 
-The layer's tests: `test_commit.py` — the commit
-protocol sequence (validate → final `commitfilelist`, per-file staged PUT,
-open-request check, refuse on conflict, refuse with nothing to do, partial
-commit by file list, added-file-missing refusal, remote-exists idempotence,
-`keeplink=1`, SHA256 digest variants); `test_update.py` — file-list
-diff semantics (no changes, new file, new-file/local collision, upstream
-delete/modify, both-modified conflict, local deletions, restore,
-`_service:*` handling, brand-new package with a root commit over the empty
-tree). The both-modified case is a git merge conflict left in the
-tree; an in-progress rebase conflict blocks `update`. Interrupted update
-leaves a valid old base. Vocabulary reference: `test_package_status.py` /
-`test_project_status.py`.
+The layer's tests live in `src/working_copy.rs` and `src/obs/remote.rs`: `commit_obs_validate_pass_that_commits_skips_the_final_pass` and `commit_filelist_final_pass_returns_rev_srcmd5_and_service_state` cover the commit protocol sequence (validate → final `commitfilelist`); `commit_obs_sends_the_index_state` covers the per-file staged PUT; `commit_filelist_validate_pass_returns_the_missing_list` covers the missing list; `commit_obs_sends_keeplink_when_the_link_is_staged` covers `keeplink=1`; `commit_obs_answers_a_sha256_challenge` covers the SHA256 digest challenge. `commit_obs_refuses_an_outdated_base`, `commit_obs_refuses_nothing_to_commit`, and `commit_refuses_with_conflicts` cover the refusals. `update_obs_rebases_local_commits_onto_the_new_base` covers the update rebase; `update_git_stops_on_a_conflict` covers the both-modified case, a git merge conflict left in the tree. An in-progress rebase conflict blocks `update`. Vocabulary reference: `status_maps_porcelain_codes`.
 
-Live tests assert on server state per test: checkout lands the files,
-commit creates exactly one revision, update moves the base rev, a refused
-`commit` (conflicted, outdated, or nothing to do) leaves the server
-untouched.
+Live tests assert on server state per test (`live_working_copy_checkout_edit_commit_update`, `live_working_copy_pull_pulls_a_linked_package`): checkout lands the files, commit creates exactly one revision, update moves the base rev, a refused `commit` (conflicted, outdated, or nothing to do) leaves the server untouched.
 
-## Open points
-
-1. **Filing** (unified pull-request surface, issue #112, step 6:
-   labels) builds on the working copy; the working copy is implemented.
-2. **Pre-commit changelog validation**: pending; the service gate is
-   the commit gate.

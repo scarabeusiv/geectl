@@ -172,9 +172,9 @@ pub enum LocalBuildCommand {
     },
     /// Wipe a build root: delete its contents (the lock file
     /// stays). A mutation: dry-run is the default (only the
-    /// plan is printed); `--live` performs the wipe. There is
-    /// no force flag: the marker check and the in-use lock are
-    /// safety invariants, never bypassed.
+    /// plan is printed); `--live` performs the wipe. The marker
+    /// check and the in-use lock are safety invariants, never
+    /// bypassed.
     Wipe {
         /// The repository the root was built for. Required
         /// unless `--root` names the root directly.
@@ -204,8 +204,8 @@ pub enum LocalBuildCommand {
     },
     /// Print the eviction plan (what would be evicted, in order,
     /// with bytes); delete only with `--apply`. The plan is the
-    /// default: the global `--live` does not gate this leaf, the
-    /// leaf's own `--apply` is the confirmation, so the scheduled
+    /// default: the leaf's own `--apply` is the confirmation, so
+    /// the scheduled
     /// task runs exactly `prune --apply`.
     Prune {
         /// Delete what the plan lists.
@@ -229,9 +229,9 @@ pub enum LocalBuildCommand {
     /// package and run repro commands there, read from stdin, one
     /// per line, joined with `&&` into one shell command. A
     /// mutation: dry-run is the default (only the plan is printed);
-    /// `--live` runs the commands in the root. There is no
-    /// interactive shell: a terminal on stdin is refused instead of
-    /// blocking on a read that never arrives. A failing repro still
+    /// `--live` runs the commands in the root. A terminal on stdin
+    /// is refused instead of blocking on a read that never arrives.
+    /// A failing repro still
     /// exits 0: the exit code is data, in `exit:` and in
     /// `record.result.exit_code`.
     Chroot {
@@ -256,8 +256,8 @@ pub enum LocalBuildCommand {
         timeout_secs: u64,
     },
     /// Read the log of the last local build: the `<root>/.build.log`
-    /// the build's coordinates name. A read, not a mutation: no
-    /// `--live` needed. The text is the log verbatim (design rule 4);
+    /// the build's coordinates name. A read: no `--live` needed. The
+    /// text is the log verbatim (design rule 4);
     /// the verdict, exit code, log path, and truncation flag ride in
     /// the JSON payload.
     Log {

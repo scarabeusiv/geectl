@@ -100,8 +100,7 @@ pub enum PullRequestCommand {
     },
     /// Cancel pending review requests on a pull request. Dry-run
     /// by default; mutates only with `--live`. On OBS the cancel
-    /// fails closed: OBS has no request call that removes a
-    /// reviewer.
+    /// fails closed.
     CancelReviewRequest(CancelArgs),
     /// Merge a pull request. On OBS this accepts the submit
     /// request; on Gitea it merges the pull request. Dry-run by

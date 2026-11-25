@@ -15,7 +15,7 @@ The library modules:
 | `url` | The single URL builder (one encoder per context). |
 | `http` | The HTTP client trait with a bounded timeout, plus a ureq implementation. |
 | `auth` | The credential types and resolution (see below). |
-| `config` | The XDG config file (URLs only) and the secure-write primitive. |
+| `config` | The XDG config file (endpoint URLs, output-format default, named instances, local-build tunables) and the secure-write primitive. |
 | `gitea` | The Gitea operations (repo/branch reads and mutations, fork, repo create/delete). |
 | `obs` | The OBS operations (devel lookup, open-SR check, SR filing, superseding, branch cleanup, request read/act — see below). |
 | `debug` | The debug channel (one coherent `--debug` stream on stderr). |
@@ -64,7 +64,7 @@ instance alias's variables (`GEECTL_OBS_APIKEY[_FILE]_<ALIAS>` or
 `GEECTL_OBS_PASSWORD_FILE` when the URL is the configured default.
 OBS login takes a username and password; a token
 login fails with a 401 (upstream
-https://github.com/openSUSE/open-build-service/issues/20322). Gitea Bearer <redacted> credentials come from
+https://github.com/openSUSE/open-build-service/issues/20322). Gitea Bearer token credentials come from
 `EnvGiteaAuth` the same way (per-URL, via `credentials_for_url`):
 the matching alias's variables (`GEECTL_GITEA_TOKEN_<ALIAS>`),
 else the plain `GEECTL_GITEA_TOKEN` or
@@ -134,7 +134,7 @@ request is accepted. `SrFiling::refile` files the new request first
 and only then supersedes the old one with it, so `superseded_by`
 always names a request that exists. Branch deletion
 (`ObsClient::delete_package`) is a separate explicit call for the
-old branch — a superseded request stays out of accept, so
+old branch — accept skips a superseded request, so
 server-side cleanup skips it — and the delete runs only when no
 request in `new`, `review`, or `declined` state involves the
 package as a submit source or target.
@@ -216,11 +216,7 @@ implementations: a mistaken assumption fails before the first write
 handed to a plain create, a pinned revision for a whole
 project), leaving state untouched (an existing `_aggregate`, an
 existing link). The repository mapping of an aggregate is validated
-by the server at build time: a bad map builds as broken. Server
-behaviour that looks like a bug is documented as a candidate fix for
-the server itself.
-
-Consumers see typed values only. The XML document editor
+by the server at build time: a bad map builds as broken. Consumers see typed values only. The XML document editor
 (`src/xml.rs`) and the response parsers are `pub(crate)` — the
 boundary the typed surface is built on.
 
@@ -273,7 +269,7 @@ request's comments, with replies threaded under their parent. State
 changes, reviews, and comment creation take the `DryRun` guard, like
 deleting; the reads run unguarded. Accepting is a maintainer action,
 and the boundary is the packaging guide's: an agent accepts its own
-requests only when explicitly authorised. The server enforces who may
+requests with explicit authorisation. The server enforces who may
 move a request; the library surfaces its refusal as-is. The operations
 are backend-agnostic server calls: a request is a server object
 whether the package is OBS-native or git-backed.
@@ -388,13 +384,12 @@ Three layers:
    is provisioned in the `test` job, and `tests/gitea.rs` authenticates
    against it with geectl's own `EnvGiteaAuth` and does real API calls
    (read the user, create a repository, read it back, list it),
-   asserting on server state. They gate because they are fast (~20s end
-   to end: a single prebuilt image).
-3. **Live tests against a live OBS instance (independent CI job).**
+   asserting on server state. They gate because they are fast (a single prebuilt image).
+3. **Live tests against a live OBS instance (separate CI job).**
    A temporary OBS instance is spun up and the CLI's changes are
-   asserted on **server state**. This runs on every pull request and on
-   a schedule. It is an independent CI job, outside the PR gate. It
-   exists to catch drift as the server changes underneath us. The OBS
+   asserted on **server state**. This runs on every pull request, on every push to main, and on
+   a schedule. It is a required status check. It exists to catch drift
+   as the server changes underneath us. The OBS
    instance is slow (source checkout + frontend build, minutes); the
    frontend build reuses a BuildKit cache in CI.
 
@@ -414,9 +409,9 @@ the API answers, and probes the backend source server until it
 answers. `teardown.sh` removes the containers and volumes. The
 instance tracks OBS master.
 
-**Schedule.** The `live` workflow runs on every pull request,
+**Schedule.** The `live` workflow runs on every pull request, on every push to main,
 weekly (Mondays 06:00 UTC) and on demand
-(`workflow_dispatch`), on a GitHub-hosted runner. It is an optional
+(`workflow_dispatch`), on a GitHub-hosted runner. It is a required
 status check. It is slow (source checkout, frontend build,
 bootstrap); the timeout is 60 minutes. The frontend image build reuses
 BuildKit's GitHub Actions cache (`tests/live/docker-compose.cache.yml`,

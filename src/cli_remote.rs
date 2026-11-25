@@ -200,8 +200,8 @@ pub enum RemoteCommand {
     },
     /// Show the per-file diff of one revision against the previous one.
     /// Computed client-side from per-file reads (the library lists both
-    /// revisions and cats each changed file), not a server-side diff;
-    /// a differing binary file fails the call.
+    /// revisions and cats each changed file); a differing binary file
+    /// fails the call.
     RevisionPatch {
         /// The project the package lives in.
         project: String,
@@ -218,9 +218,8 @@ pub enum RemoteCommand {
     /// Set a project's meta, field by field or whole from a file. A
     /// mutation: dry-run is the default (only the plan is printed);
     /// `--live` performs the write. Field flags change only the
-    /// given fields; the rest of the meta is kept as it is. There is
-    /// no flag to clear a field. With `--from-file`, fields the file
-    /// omits are cleared.
+    /// given fields; the rest of the meta is kept as it is. Clear a
+    /// field with `--from-file`: fields the file omits are cleared.
     ///
     /// `--from-file FILE` writes the given meta file as the whole
     /// meta instead: the file's title, description, URL, scmsync,
@@ -294,9 +293,8 @@ pub enum RemoteCommand {
     /// Set a package's meta, field by field or whole from a file. A
     /// mutation: dry-run is the default (only the plan is printed);
     /// `--live` performs the write. Field flags change only the
-    /// given fields; the rest of the meta is kept as it is. There is
-    /// no flag to clear a field. With `--from-file`, fields the file
-    /// omits are cleared.
+    /// given fields; the rest of the meta is kept as it is. Clear a
+    /// field with `--from-file`: fields the file omits are cleared.
     ///
     /// `--from-file FILE` writes the given meta file as the whole
     /// meta instead: the file's title, description, URL, scmsync,
@@ -380,8 +378,7 @@ pub enum RemoteCommand {
     },
     /// Search packages by name. Substring matches on name, title, and
     /// description by default; `--exact` keeps only exact-name matches
-    /// (exact matching is not provided server-side, so the filter runs
-    /// client-side). With `--devel-project`, only packages developed
+    /// (the filter runs client-side). With `--devel-project`, only packages developed
     /// in that project; without a term, every package the devel
     /// project develops.
     SearchPackages {
@@ -397,8 +394,7 @@ pub enum RemoteCommand {
     },
     /// Search projects by name. Substring matches on name, title, and
     /// description by default; `--exact` keeps only exact-name matches
-    /// (exact matching is not provided server-side, so the filter runs
-    /// client-side).
+    /// (the filter runs client-side).
     SearchProjects {
         /// The search term.
         term: String,
@@ -536,7 +532,7 @@ pub enum RemoteCommand {
     },
     /// Remove a repository from a project. A mutation: dry-run is
     /// the default (only the plan is printed); `--live` performs
-    /// the removal. A repository that is not there is not an error.
+    /// the removal. Removing a repository that is not there succeeds.
     RepoRemove {
         /// The project to remove the repository from.
         project: String,
@@ -602,8 +598,8 @@ pub enum RemoteCommand {
     /// Create an operation-scoped trigger token for the
     /// authenticated user. A mutation: dry-run is the default (only
     /// the plan is printed); `--live` performs the creation. The
-    /// secret is printed once, at creation: it is never shown again,
-    /// so store it now. Project and package go together: give both
+    /// secret prints once, at creation: store it now. Project and
+    /// package go together: give both
     /// to scope the token to a package, or neither for a global
     /// token.
     CreateToken {
@@ -651,12 +647,10 @@ pub enum RemoteCommand {
     /// Delete a file from a package. A mutation: dry-run is the
     /// default (only the plan is printed); `--live` performs the
     /// deletion. The general form of `delete-link`: deleting `_link`
-    /// here issues the same delete as `delete-link`. The delete is
-    /// not idempotent: deleting a file that is already gone is
-    /// refused by the server (NotFound). The server records the
-    /// delete with the fixed comment `removed <file>`; there is no
-    /// `--message` option, unlike `delete-package` — the asymmetry
-    /// is intentional.
+    /// here issues the same delete as `delete-link`. Deleting a file
+    /// that is already gone is refused by the server (NotFound). The
+    /// server records the delete with the fixed comment
+    /// `removed <file>`.
     DeleteFile {
         /// The project the package lives in.
         project: String,

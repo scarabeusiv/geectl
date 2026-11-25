@@ -111,7 +111,7 @@ pub struct BranchPackageArgs {
     /// A comment recorded on the branch.
     #[arg(long)]
     comment: Option<String>,
-    /// Do not give the branch read access to the source package's project.
+    /// Withhold the branch's read access to the source package's project.
     #[arg(long)]
     noaccess: bool,
     /// Add the source project's repositories to the branch project.

@@ -8,8 +8,8 @@
 # is what catches drift as OBS changes underneath us. Fixtures alone
 # cannot do that.
 #
-# This job is INDEPENDENT and does NOT gate PRs: it is not a required
-# status check. When it regresses, it is fixed independently. It runs
+# This job gates PRs: it is a required status check. When it regresses,
+# it blocks the merge until fixed. It runs
 # on every pull request, on every push to main, weekly
 # (Mondays 06:00 UTC, the same slot as the freshness workflow),
 # and on demand.

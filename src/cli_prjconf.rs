@@ -62,15 +62,14 @@ pub enum PrjconfCommand {
         project: String,
     },
     /// Validate a project's prjconf across its repositories.
-    /// Exits 24 when error findings exist; warnings alone do not
-    /// fail the run.
+    /// Exits 24 when error findings exist.
     ///
     /// The config is evaluated once per repository and
     /// architecture, with one buildconfig fetch per repository;
     /// package and owner lookups are cached across evaluations.
     /// At most 32 repositories are evaluated; a project with more
-    /// is refused. Requires OBS credentials; without them the
-    /// command fails closed before any request. A `%if` branch is
+    /// is refused. Requires OBS credentials, checked before any
+    /// request. A `%if` branch is
     /// reported dead only when it is dead in every evaluation.
     Validate {
         /// The project to validate the prjconf of.
