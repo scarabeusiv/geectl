@@ -2919,6 +2919,60 @@ mod tests {
     }
 
     #[test]
+    fn fork_package_to_an_existing_target_package_succeeds() {
+        // A fork to a target package that already exists succeeds:
+        // the server answers the same ok-status as the first fork,
+        // naming the same targets, and re-wires the target to the
+        // supplied scmsync URL — so a second branch of the same
+        // source is a plain re-fork, not an error. The answer is
+        // the server's pretty-printed status document, newlines
+        // included.
+        let body = "<status code=\"ok\">\n\
+  <summary>Ok</summary>\n\
+  <data name=\"targetproject\">home:scarabeus_iv:geectl-refork-probe-20261125</data>\n\
+  <data name=\"targetpackage\">kvm-client-container</data>\n\
+  <data name=\"sourceproject\">Virtualization</data>\n\
+  <data name=\"sourcepackage\">kvm-client-container</data>\n\
+</status>\n";
+        let url = "https://api.opensuse.org/source/Virtualization/kvm-client-container?cmd=fork&scmsync=https%3A%2F%2Fgithub.com%2FopenSUSE%2Fkvm-client-container%23main&target_project=home%3Ascarabeus_iv%3Ageectl-refork-probe-20261125";
+        let http = FakeHttp::new().with_post(url, body);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let expected = BranchResult {
+            source_project: "Virtualization".to_string(),
+            source_package: "kvm-client-container".to_string(),
+            target_project: "home:scarabeus_iv:geectl-refork-probe-20261125".to_string(),
+            target_package: "kvm-client-container".to_string(),
+        };
+        assert_eq!(
+            client
+                .fork_package(
+                    "Virtualization",
+                    "kvm-client-container",
+                    "https://github.com/openSUSE/kvm-client-container#main",
+                    Some("home:scarabeus_iv:geectl-refork-probe-20261125"),
+                    None,
+                )
+                .unwrap(),
+            expected
+        );
+        // The identical re-fork answers the same ok-status again.
+        assert_eq!(
+            client
+                .fork_package(
+                    "Virtualization",
+                    "kvm-client-container",
+                    "https://github.com/openSUSE/kvm-client-container#main",
+                    Some("home:scarabeus_iv:geectl-refork-probe-20261125"),
+                    None,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(http.post_calls().len(), 2);
+        assert!(http.post_calls().iter().all(|call| call.0 == url));
+    }
+
+    #[test]
     fn parse_fork_result_defaults_a_project_fork_to_project() {
         // A project fork answers only targetproject /
         // sourceproject — no package names at all. The shape
