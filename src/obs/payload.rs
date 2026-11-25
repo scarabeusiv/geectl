@@ -1594,6 +1594,16 @@ pub struct FiledRequest {
     pub superseded: Vec<String>,
 }
 
+/// The outcome of the Factory devel-record check: the target
+/// package records the source as its devel, or the target package
+/// does not exist yet and the first submission proceeds.
+enum FactoryDevelCheck {
+    /// The target package records the source as its devel project and package.
+    RecordedDevelMatches,
+    /// The target package does not exist yet.
+    NoTargetPackage,
+}
+
 impl<'a> SrFiling<'a> {
     pub fn new(obs: &'a ObsClient<'a>, dry_run: &'a DryRun) -> Self {
         SrFiling {
@@ -1697,9 +1707,12 @@ impl<'a> SrFiling<'a> {
     /// earlier forward for the same hop, never an open request
     /// for the same package aimed elsewhere.
     /// Returns the filed request in live mode, or None in dry-run.
-    /// In dry-run nothing is read or filed: the plan records the
-    /// supersede as `dry_run_supersede` lines against the package,
-    /// not as ids. In live mode the order is the guarantee: the new
+    /// In dry-run nothing is filed: the plan records the supersede
+    /// as `dry_run_supersede` lines against the package, not as ids.
+    /// A Factory target's devel record is verified on the dry-run
+    /// path too: the authenticated read runs before the plan prints,
+    /// a refusal errors out, and the plan records the outcome.
+    /// In live mode the order is the guarantee: the new
     /// request is filed FIRST, and only then is each open one
     /// superseded pointing at it, so `superseded_by` always names a
     /// request that exists. (The API does not verify the replacement
@@ -1727,6 +1740,17 @@ impl<'a> SrFiling<'a> {
         // payload by both measures.
         payload.validate_semantics()?;
         payload.validate_xml()?;
+        // A Factory target files only from the recorded devel
+        // project and package: the source must be what the target
+        // package meta records as its devel, project and package
+        // both. The check runs here, before the dry-run branch, so
+        // a dry-run plan never prints "would file" for a submission
+        // the check refuses; the outcome is recorded in the plan.
+        let factory_check = if payload.target_project == FACTORY_PROJECT {
+            Some(self.check_factory_target(payload)?)
+        } else {
+            None
+        };
         if !self.dry_run.allow(&format!(
             "file submit request for {} to {}",
             payload.target_package, payload.target_project
@@ -1737,27 +1761,31 @@ impl<'a> SrFiling<'a> {
             // line in the plan.) The detail lines go through `note`,
             // not `eprintln`, so the plan carries them too.
             self.log_would_be_submit_request(payload);
-            if payload.target_project == FACTORY_PROJECT {
-                self.dry_run.note(&format!(
-                    "would: verify {}/{} is the recorded devel project and package of {}/{} before filing",
-                    payload.source_project,
-                    payload.source_package,
-                    payload.target_project,
-                    payload.target_package
-                ));
+            match factory_check {
+                Some(FactoryDevelCheck::RecordedDevelMatches) => {
+                    self.dry_run.note(&format!(
+                        "verified {}/{} is the recorded devel project and package of {}/{}",
+                        payload.source_project,
+                        payload.source_package,
+                        payload.target_project,
+                        payload.target_package
+                    ));
+                }
+                Some(FactoryDevelCheck::NoTargetPackage) => {
+                    self.dry_run.note(&format!(
+                        "{}/{} has no package yet: first submission from {}/{} proceeds",
+                        payload.target_project,
+                        payload.target_package,
+                        payload.source_project,
+                        payload.source_package
+                    ));
+                }
+                None => {}
             }
             for note in dry_run_supersede {
                 self.dry_run.note(note);
             }
             return Ok(None);
-        }
-        // A Factory target files only from the recorded devel
-        // project and package: the source must be what the target
-        // package meta records as its devel, project and package
-        // both. The read runs here, on the filing path, where the
-        // client is available.
-        if payload.target_project == FACTORY_PROJECT {
-            self.check_factory_target(payload)?;
         }
         let open = match forward_source {
             Some((source_project, source_package)) => {
@@ -1809,25 +1837,35 @@ impl<'a> SrFiling<'a> {
     /// with the rule named. The same 100% rule the forward applies
     /// on its coordinates.
     ///
-    /// The check runs on the live path only: dry-run reads nothing,
-    /// so a dry-run plan prints "would file" for a Factory
-    /// submission the live check would refuse; the plan records the
-    /// would-be verification instead.
-    fn check_factory_target(&self, payload: &SrPayload) -> Result<(), GeectlError> {
+    /// The check runs on the filing path, live and dry-run alike:
+    /// a dry-run plan never prints "would file" for a submission
+    /// the check refuses, and the plan records the check outcome.
+    /// Without OBS credentials the check fails closed with a
+    /// ConfigError before any request: the read is only meaningful
+    /// authenticated, and an anonymous 404 reads as "no record yet".
+    fn check_factory_target(&self, payload: &SrPayload) -> Result<FactoryDevelCheck, GeectlError> {
+        if !self.obs.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "verifying the Factory devel record requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
         let source = format!("{}/{}", payload.source_project, payload.source_package);
         let target = format!("{}/{}", payload.target_project, payload.target_package);
         match self
             .obs
             .package_meta_authenticated(&payload.target_project, &payload.target_package)
         {
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                Ok(FactoryDevelCheck::NoTargetPackage)
+            }
             Err(err) => Err(err),
             Ok(meta) => match meta.devel {
                 Some((recorded_project, recorded_package))
                     if recorded_project == payload.source_project
                         && recorded_package == payload.source_package =>
                 {
-                    Ok(())
+                    Ok(FactoryDevelCheck::RecordedDevelMatches)
                 }
                 Some((recorded_project, recorded_package)) => Err(GeectlError::new(
                     ErrorKind::InvalidInput,
@@ -3104,15 +3142,27 @@ mod tests {
     }
 
     #[test]
-    fn file_dry_run_factory_target_makes_no_requests() {
-        let http = FakeHttp::new();
+    fn file_dry_run_factory_target_verifies_recorded_devel() {
+        // The dry-run verifies the Factory devel record before
+        // printing the plan: the authenticated meta read runs, and
+        // the plan records the verification.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
+        );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dry = DryRun::default();
         let filing = SrFiling::new(&obs, &dry);
         let payload = factory_payload();
         assert_eq!(filing.file(&payload).unwrap(), None);
-        // Nothing was read or filed: no meta GET, no search, no POST.
-        assert!(http.get_calls().is_empty());
+        // Only the authenticated meta read ran: no search, no POST.
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta".to_string(),
+                true
+            )]
+        );
         assert!(http.post_calls().is_empty());
         assert_eq!(
             dry.plan(),
@@ -3125,10 +3175,126 @@ mod tests {
                 format!("[dry-run] changes entry: {}", payload.changes_entry()),
                 format!("[dry-run] {}", payload.to_xml()),
                 "[dry-run] --- end of would-be submit request ---".to_string(),
-                "[dry-run] would: verify devel:languages:python/foo is the recorded devel project and package of openSUSE:Factory/foo before filing".to_string(),
+                "[dry-run] verified devel:languages:python/foo is the recorded devel project and package of openSUSE:Factory/foo".to_string(),
                 "[dry-run] would: supersede all open submit requests targeting foo with the new request".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn file_dry_run_factory_target_from_other_project_refuses() {
+        // A dry-run refuses a Factory submission from a non-devel
+        // source like the live path: the error surfaces before the
+        // plan prints "would file", so the plan stays empty.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:other\" package=\"foo\"/></package>",
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.file(&factory_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains(
+                "refusing to submit devel:languages:python/foo to openSUSE:Factory: openSUSE:Factory/foo records devel devel:other/foo, not devel:languages:python/foo"
+            ),
+            "{}",
+            err.context
+        );
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta".to_string(),
+                true
+            )]
+        );
+        assert!(http.post_calls().is_empty());
+        assert!(dry.plan().is_empty());
+    }
+
+    #[test]
+    fn file_dry_run_factory_target_without_target_package_proceeds() {
+        // No target package yet: the authenticated read 404s and
+        // the dry-run proceeds, recording that the first submission
+        // has no recorded devel to check against.
+        let http = FakeHttp::new().with_get_error(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            ErrorKind::NotFound,
+        );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        let filing = SrFiling::new(&obs, &dry);
+        let payload = factory_payload();
+        assert_eq!(filing.file(&payload).unwrap(), None);
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta".to_string(),
+                true
+            )]
+        );
+        assert!(http.post_calls().is_empty());
+        assert_eq!(
+            dry.plan(),
+            vec![
+                "[dry-run] would: file submit request for foo to openSUSE:Factory".to_string(),
+                "[dry-run] --- would-be submit request (dry-run) ---".to_string(),
+                "[dry-run] source: devel:languages:python/foo".to_string(),
+                "[dry-run] target: openSUSE:Factory/foo".to_string(),
+                "[dry-run] description: Update foo to 2.0".to_string(),
+                format!("[dry-run] changes entry: {}", payload.changes_entry()),
+                format!("[dry-run] {}", payload.to_xml()),
+                "[dry-run] --- end of would-be submit request ---".to_string(),
+                "[dry-run] openSUSE:Factory/foo has no package yet: first submission from devel:languages:python/foo proceeds".to_string(),
+                "[dry-run] would: supersede all open submit requests targeting foo with the new request".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_dry_run_factory_target_without_credentials_fails_closed() {
+        // No OBS credentials: the dry-run fails closed before any
+        // request. An anonymous read would 404 on a hidden target
+        // and read as "no record yet", so the check refuses to run
+        // unauthenticated.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let dry = DryRun::default();
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.file(&factory_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains(
+                "verifying the Factory devel record requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
+            ),
+            "{}",
+            err.context
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+        assert!(dry.plan().is_empty());
+    }
+
+    #[test]
+    fn file_live_factory_target_without_credentials_fails_closed() {
+        // The same guard covers the live path: no credentials, no
+        // request, a ConfigError naming the credential env vars.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, Credentials::None).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing.file(&factory_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains(
+                "verifying the Factory devel record requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
+            ),
+            "{}",
+            err.context
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]
@@ -3210,16 +3376,25 @@ mod tests {
     }
 
     #[test]
-    fn refile_dry_run_factory_target_makes_no_requests() {
-        // The refile dry-run plan carries the would-verify note
-        // and reads nothing.
-        let http = FakeHttp::new();
+    fn refile_dry_run_factory_target_verifies_recorded_devel() {
+        // The refile dry-run verifies the Factory devel record
+        // before printing the plan, like the file dry-run.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
+        );
         let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let dry = DryRun::default();
         let filing = SrFiling::new(&obs, &dry);
         let payload = factory_payload();
         assert_eq!(filing.refile(&payload, "1398492").unwrap(), None);
-        assert!(http.get_calls().is_empty());
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta".to_string(),
+                true
+            )]
+        );
         assert!(http.post_calls().is_empty());
         assert_eq!(
             dry.plan(),
@@ -3232,7 +3407,7 @@ mod tests {
                 format!("[dry-run] changes entry: {}", payload.changes_entry()),
                 format!("[dry-run] {}", payload.to_xml()),
                 "[dry-run] --- end of would-be submit request ---".to_string(),
-                "[dry-run] would: verify devel:languages:python/foo is the recorded devel project and package of openSUSE:Factory/foo before filing".to_string(),
+                "[dry-run] verified devel:languages:python/foo is the recorded devel project and package of openSUSE:Factory/foo".to_string(),
                 "[dry-run] would: supersede submit request 1398492 with the new request".to_string(),
                 "[dry-run] would: supersede all other open submit requests targeting foo with the new request".to_string(),
             ]
