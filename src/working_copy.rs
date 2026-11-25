@@ -2616,17 +2616,22 @@ pub fn diff(
     // whole diff: the plain halves are already computed and stand
     // on their own, and `diff` on a linked checkout used to be
     // purely local git. The note carries the failure for the
-    // caller's stderr. A linked checkout with no client is a
+    // caller's stderr. A local git failure inside the section is a
+    // working-copy problem, not a skipped optional section, so it
+    // carries its own wording. A linked checkout with no client is a
     // caller error, not a read failure, so it still errors.
     let mut note = None;
     match link_diff_section(wc, client) {
-        Ok(Some(link)) => out.push_str(&link),
-        Ok(None) => {}
+        Ok(LinkSection::Present(link)) => out.push_str(&link),
+        Ok(LinkSection::Absent) => {}
+        Ok(LinkSection::TargetUnreadable(err)) => {
+            note = Some(format!("warning: skipping the link diff: {err}"));
+        }
         Err(err) => {
             if client.is_none() {
                 return Err(err);
             }
-            note = Some(format!("warning: skipping the link diff: {err}"));
+            note = Some(format!("warning: the link diff failed: {err}"));
         }
     }
     let untracked = git(
@@ -2655,22 +2660,27 @@ pub fn is_linked(wc: &WorkingCopy) -> Result<bool, GeectlError> {
 
 /// The link diff section for a linked checkout: the staged index
 /// overlaid on the link target's content, diffed against that
-/// content. `None` when the checkout is not linked, or when the
-/// link adds nothing over its target. A linked checkout needs the
+/// content. `Absent` when the checkout is not linked, when the link
+/// adds nothing over its target, or when a conflicted `_link` has
+/// no single staged version to read. A linked checkout needs the
 /// client for the target read: without one the section is an
-/// error, not a silent skip.
+/// error, not a silent skip. A link-target read failure is
+/// `TargetUnreadable` and degrades to a note at the call site; a
+/// local git failure inside the section is an error, so the diff
+/// fails instead of mislabeling a working-copy problem as a
+/// skipped optional section.
 fn link_diff_section(
     wc: &WorkingCopy,
     client: Option<&ObsClient>,
-) -> Result<Option<String>, GeectlError> {
+) -> Result<LinkSection, GeectlError> {
     if !is_linked(wc)? {
-        return Ok(None);
+        return Ok(LinkSection::Absent);
     }
     // A conflicted `_link` has no single staged version to read:
     // the link section is skipped and the plain halves (which show
     // the conflict) still stand.
     if unmerged_files(wc)?.iter().any(|path| path == "_link") {
-        return Ok(None);
+        return Ok(LinkSection::Absent);
     }
     let Some(client) = client else {
         return Err(GeectlError::new(
@@ -2678,12 +2688,42 @@ fn link_diff_section(
             "diff on a linked checkout needs an OBS client for the link target read",
         ));
     };
-    let (link_project, link_package, pin, mut listing) = link_target_listing(wc, client)?;
+    let (link_project, link_package, baserev_pin) = link_target_coords(wc)?;
+    // The target read proper: the listing, at the baserev pin when
+    // the link carries one, else the target's latest (a baserev-less
+    // link has no recorded base; the listing's srcmd5 pins the
+    // downloads that follow). A failure here is the target's, not
+    // the checkout's, so it degrades to a note at the call site
+    // instead of failing the diff.
+    let (mut listing, pin) = match baserev_pin {
+        Some(pin) => match client.directory_listing_rev(&link_project, &link_package, Some(&pin)) {
+            Ok((listing, _)) => (listing, pin),
+            Err(err) => return Ok(LinkSection::TargetUnreadable(err)),
+        },
+        None => match client.directory_listing_rev(&link_project, &link_package, None) {
+            Ok((listing, (_, _, srcmd5))) => {
+                let Some(srcmd5) = srcmd5 else {
+                    return Ok(LinkSection::TargetUnreadable(GeectlError::new(
+                        ErrorKind::ServerError,
+                        format!(
+                            "the server did not return a source md5 for {link_project}/{link_package}"
+                        ),
+                    )));
+                };
+                (listing, RevisionSpec::parse(&srcmd5)?)
+            }
+            Err(err) => return Ok(LinkSection::TargetUnreadable(err)),
+        },
+    };
     // `_link` is the link itself, not linked content: the target
     // tree never carries it, so a chained link's own `_link` does
     // not read as a deletion either.
     listing.entries.retain(|entry| entry.name != "_link");
-    let target_tree = build_base_tree(
+    // The target-tree build is the target read too: its failures
+    // here are the target download (the local git steps run against
+    // the temp index and objects the plain halves above already
+    // validated).
+    let target_tree = match build_base_tree(
         client,
         wc,
         &listing,
@@ -2693,7 +2733,10 @@ fn link_diff_section(
         None,
         None,
         false,
-    )?;
+    ) {
+        Ok(tree) => tree,
+        Err(err) => return Ok(LinkSection::TargetUnreadable(err)),
+    };
     let staged_tree = build_staged_link_tree(wc, &target_tree)?;
     let diff = git(
         &wc.root,
@@ -2708,54 +2751,40 @@ fn link_diff_section(
         &[],
     )?;
     if diff.trim().is_empty() {
-        return Ok(None);
+        return Ok(LinkSection::Absent);
     }
-    Ok(Some(format!(
+    Ok(LinkSection::Present(format!(
         "\nLink diff ({link_project}/{link_package} at {pin}):\n{diff}"
     )))
 }
 
-/// The link target and its listing at the pinned revision: the
-/// `_link` baserev when the link carries one, else the target's
-/// latest srcmd5 from its own listing (a baserev-less link has no
-/// recorded base; the listing's srcmd5 pins the downloads that
-/// follow). The listing is the target's own files: a chained link
-/// resolves one level — the immediate target's files, not its
-/// target's.
-fn link_target_listing(
+/// The link section outcome: the section text, its absence, or a
+/// link-target read failure. Only the target failure degrades to a
+/// note at the call site; every other failure inside the section is
+/// a local working-copy failure and fails the diff.
+enum LinkSection {
+    Present(String),
+    Absent,
+    TargetUnreadable(GeectlError),
+}
+
+/// The link target coordinates from the staged `_link`: the target
+/// project and package, and the pinned revision when the link
+/// carries a baserev. A local read and parse only — no server
+/// contact — so a failure here is a working-copy failure, not a
+/// link-target read failure.
+fn link_target_coords(
     wc: &WorkingCopy,
-    client: &ObsClient,
-) -> Result<(String, String, RevisionSpec, DirectoryListing), GeectlError> {
+) -> Result<(String, String, Option<RevisionSpec>), GeectlError> {
     let link_content = index_content(wc, "_link")?;
     let link_text = String::from_utf8_lossy(&link_content);
     let doc = XmlDoc::parse(&link_text)?;
     let (link_project, link_package) = link_target(&doc, &wc.project)?;
-    match doc.root_attr("baserev") {
-        Some(baserev) => {
-            let pin = RevisionSpec::parse(&baserev)?;
-            let (listing, _) =
-                client.directory_listing_rev(&link_project, &link_package, Some(&pin))?;
-            Ok((link_project, link_package, pin, listing))
-        }
-        None => {
-            let (listing, (_, _, srcmd5)) =
-                client.directory_listing_rev(&link_project, &link_package, None)?;
-            let srcmd5 = srcmd5.ok_or_else(|| {
-                GeectlError::new(
-                    ErrorKind::ServerError,
-                    format!(
-                        "the server did not return a source md5 for {link_project}/{link_package}"
-                    ),
-                )
-            })?;
-            Ok((
-                link_project,
-                link_package,
-                RevisionSpec::parse(&srcmd5)?,
-                listing,
-            ))
-        }
-    }
+    let pin = match doc.root_attr("baserev") {
+        Some(baserev) => Some(RevisionSpec::parse(&baserev)?),
+        None => None,
+    };
+    Ok((link_project, link_package, pin))
 }
 
 /// The staged link tree: the target tree overlaid with the staged
@@ -7285,6 +7314,42 @@ mod tests {
         assert!(!out.contains("Link diff"), "diff: {out}");
         let note = note.expect("the skipped link section is noted");
         assert!(note.contains("home:alice/bar"), "note: {note}");
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_with_an_unparsable_link_names_the_local_failure() {
+        let http = link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        // A staged `_link` that is not XML: the failure is local —
+        // the checkout's own file cannot be read — so the note names
+        // the failure instead of mislabeling it as a skipped
+        // optional section.
+        write_file(&wc.root, "_link", "this is not xml\n");
+        git_ok(&wc.root, &["add", "_link"]);
+        let (out, note) = diff(&wc, Some(&client)).unwrap();
+        assert!(out.contains("_link"), "diff: {out}");
+        let note = note.expect("the failed link section is noted");
+        assert!(
+            note.starts_with("warning: the link diff failed:"),
+            "note: {note}"
+        );
+        assert!(!note.contains("skipping the link diff"), "note: {note}");
+    }
+
+    #[test]
+    fn diff_on_a_linked_checkout_with_a_deleted_target_keeps_the_skip_wording() {
+        let http = deleted_target_link_diff_http();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let (_dir, wc) = link_diff_checkout(&http);
+        let (_, note) = diff(&wc, Some(&client)).unwrap();
+        // A target read failure degrades with the skipping wording:
+        // the target is gone, the checkout is fine.
+        let note = note.expect("the skipped link section is noted");
+        assert!(
+            note.starts_with("warning: skipping the link diff:"),
+            "note: {note}"
+        );
     }
 
     #[test]
