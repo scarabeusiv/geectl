@@ -5254,7 +5254,7 @@ fn rpm_hdrmd5_reader<R: std::io::Read + std::io::Seek>(
             Err(e) => return Err(format!("cannot read {what}: {e}")),
         }
     }
-    Ok(format!("{:x}", ctx.compute()))
+    Ok(format!("{:x}", ctx.finalize()))
 }
 
 /// The offset of the main header in an RPM file, from the lead

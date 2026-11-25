@@ -906,7 +906,7 @@ fn md5_of_file(path: &Path) -> Result<String, GeectlError> {
         }
         context.consume(&buf[..n]);
     }
-    Ok(format!("{:x}", context.compute()))
+    Ok(format!("{:x}", context.finalize()))
 }
 
 /// The sha256 of a worktree file, streamed: `None` when the file
@@ -1031,7 +1031,7 @@ impl BlobBatch {
                         format!("git cat-file returned a malformed blob trailer for {sha}"),
                     ));
                 }
-                Ok(format!("{:x}", context.compute()))
+                Ok(format!("{:x}", context.finalize()))
             }
             _ => Err(GeectlError::new(
                 ErrorKind::InternalError,
