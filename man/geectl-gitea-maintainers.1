@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-gitea-maintainers 1  "geectl-gitea-maintainers 0.2.2" 
+.SH NAME
+geectl\-gitea\-maintainers \- Show the maintainers recorded in a git project\*(Aqs `_maintainership.json`: the project maintainers and the per\-package maintainers. The git\-side counterpart of `remote maintainers`, read from the repo\*(Aqs default branch
+.SH SYNOPSIS
+\fBgeectl gitea maintainers\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIOWNER\fR> <\fIREPO\fR> 
+.SH DESCRIPTION
+Show the maintainers recorded in a git project\*(Aqs `_maintainership.json`: the project maintainers and the per\-package maintainers. The git\-side counterpart of `remote maintainers`, read from the repo\*(Aqs default branch
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIOWNER\fR>
+The repository owner
+.TP
+<\fIREPO\fR>
+The repository name
+.SH VERSION
+v0.2.2

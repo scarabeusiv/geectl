@@ -1,0 +1,23 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-local-build-precommit 1  "geectl-local-build-precommit 0.2.2" 
+.SH NAME
+geectl\-local\-build\-precommit \- The precommit gate: the `precommit`\-mode service run, then `pre_checkin.sh` when the source directory carries one
+.SH SYNOPSIS
+\fBgeectl local\-build precommit\fR [\fB\-\-timeout\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIRECTORY\fR> 
+.SH DESCRIPTION
+The precommit gate: the `precommit`\-mode service run, then `pre_checkin.sh` when the source directory carries one.
+.PP
+The script step is part of the gate, not of the service mode: the mode filter alone runs services only.
+.SH OPTIONS
+.TP
+\fB\-\-timeout\-secs\fR \fI<TIMEOUT_SECS>\fR [default: 3600]
+Timeout in seconds for the whole gate
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIDIRECTORY\fR>
+The source directory carrying the `_service` file and optionally `pre_checkin.sh`
+.SH VERSION
+v0.2.2

@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-dependson 1  "geectl-build-dependson 0.2.2" 
+.SH NAME
+geectl\-build\-dependson \- List which packages each package depends on for its build
+.SH SYNOPSIS
+\fBgeectl build dependson\fR [\fB\-\-package\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIREPOSITORY\fR> <\fIARCH\fR> 
+.SH DESCRIPTION
+List which packages each package depends on for its build
+.SH OPTIONS
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+Only this package\*(Aqs dependencies
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the repository is in
+.TP
+<\fIREPOSITORY\fR>
+The repository to read
+.TP
+<\fIARCH\fR>
+The architecture to read
+.SH VERSION
+v0.2.2

@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-list-scmsync-projects 1  "geectl-remote-list-scmsync-projects 0.2.2" 
+.SH NAME
+geectl\-remote\-list\-scmsync\-projects \- List the projects syncing from a git URL prefix
+.SH SYNOPSIS
+\fBgeectl remote list\-scmsync\-projects\fR [\fB\-\-limit\fR] [\fB\-\-offset\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIURL_PREFIX\fR> 
+.SH DESCRIPTION
+List the projects syncing from a git URL prefix
+.SH OPTIONS
+.TP
+\fB\-\-limit\fR \fI<LIMIT>\fR
+At most this many projects (default 100)
+.TP
+\fB\-\-offset\fR \fI<OFFSET>\fR
+Skip this many matching projects (default 0)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIURL_PREFIX\fR>
+The git URL prefix to list projects for
+.SH VERSION
+v0.2.2

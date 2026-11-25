@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-local-build-spec-cleaner 1  "geectl-local-build-spec-cleaner 0.2.2" 
+.SH NAME
+geectl\-local\-build\-spec\-cleaner \- Run `spec\-cleaner` on a spec in the container
+.SH SYNOPSIS
+\fBgeectl local\-build spec\-cleaner\fR [\fB\-\-timeout\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIRECTORY\fR> <\fISPEC\fR> [\fIARGS\fR] 
+.SH DESCRIPTION
+Run `spec\-cleaner` on a spec in the container
+.SH OPTIONS
+.TP
+\fB\-\-timeout\-secs\fR \fI<TIMEOUT_SECS>\fR [default: 3600]
+Timeout in seconds for the run
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIDIRECTORY\fR>
+The source directory carrying the spec
+.TP
+<\fISPEC\fR>
+The spec file, inside the source directory
+.TP
+[\fIARGS\fR]
+Extra arguments for `spec\-cleaner`, after `\-\-`
+.SH VERSION
+v0.2.2

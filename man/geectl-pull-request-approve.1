@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-approve 1  "geectl-pull-request-approve 0.2.2" 
+.SH NAME
+geectl\-pull\-request\-approve \- Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry\-run by default; mutates only with `\-\-live`
+.SH SYNOPSIS
+\fBgeectl pull\-request approve\fR [\fB\-\-message\fR] [\fB\-\-user\fR] [\fB\-\-group\fR] [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+.SH DESCRIPTION
+Approve a pull request as the review asked of the target: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry\-run by default; mutates only with `\-\-live`
+.SH OPTIONS
+.TP
+\fB\-\-message\fR \fI<MESSAGE>\fR
+The message left with the review. Values starting with `\-` are taken literally: a message may open with a `\- ` bullet
+.TP
+\fB\-\-user\fR \fI<USER>\fR
+Act on the review asked of this user (OBS only)
+.TP
+\fB\-\-group\fR \fI<GROUP>\fR
+Act on the review asked of this group (OBS only)
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+Act on the review asked of this project (OBS only)
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+Act on the review asked of this package (OBS only; needs its project)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREFERENCE\fR>
+The pull\-request handle: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+.SH VERSION
+v0.2.2

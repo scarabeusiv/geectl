@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-delete-project 1  "geectl-remote-delete-project 0.2.2" 
+.SH NAME
+geectl\-remote\-delete\-project \- Delete a project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the deletion. Without `\-\-recursive` a project holding packages is refused
+.SH SYNOPSIS
+\fBgeectl remote delete\-project\fR [\fB\-\-recursive\fR] [\fB\-\-force\fR] [\fB\-\-comment\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
+.SH DESCRIPTION
+Delete a project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the deletion. Without `\-\-recursive` a project holding packages is refused
+.SH OPTIONS
+.TP
+\fB\-\-recursive\fR
+Delete the project with all its packages
+.TP
+\fB\-\-force\fR
+Ignore other projects depending on this one
+.TP
+\fB\-\-comment\fR \fI<COMMENT>\fR
+A comment recorded on the delete
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to delete
+.SH VERSION
+v0.2.2

@@ -1,0 +1,30 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-repo-add 1  "geectl-remote-repo-add 0.2.2" 
+.SH NAME
+geectl\-remote\-repo\-add \- Add a repository to a project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the addition
+.SH SYNOPSIS
+\fBgeectl remote repo\-add\fR [\fB\-\-disable\-publish\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-arch\fR> <\fB\-\-path\fR> <\fIPROJECT\fR> <\fINAME\fR> 
+.SH DESCRIPTION
+Add a repository to a project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the addition
+.SH OPTIONS
+.TP
+\fB\-\-arch\fR \fI<ARCH>\fR
+An architecture the repository builds for (repeatable; at least one is required)
+.TP
+\fB\-\-path\fR \fI<PATH>\fR
+A rebuild source as `PROJECT/REPOSITORY` (repeatable; at least one is required)
+.TP
+\fB\-\-disable\-publish\fR
+Disable publishing for the added repository
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to add the repository to
+.TP
+<\fINAME\fR>
+The repository name
+.SH VERSION
+v0.2.2

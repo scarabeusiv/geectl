@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-changelog-validate 1  "geectl-changelog-validate 0.2.2" 
+.SH NAME
+geectl\-changelog\-validate \- Validate the `.changes` entries in a package directory against the V1–V12 rules. Local\-only by default; with `\-\-target\-project`/`\-\-target\-package` the target\-relative rules (V2, V4, V5 newest\-vs\-target, V11 older entries) run against the target\*(Aqs current files. Exits non\-zero naming the failing rule
+.SH SYNOPSIS
+\fBgeectl changelog validate\fR [\fB\-\-target\-project\fR] [\fB\-\-target\-package\fR] [\fB\-\-entries\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIDIR\fR] 
+.SH DESCRIPTION
+Validate the `.changes` entries in a package directory against the V1–V12 rules. Local\-only by default; with `\-\-target\-project`/`\-\-target\-package` the target\-relative rules (V2, V4, V5 newest\-vs\-target, V11 older entries) run against the target\*(Aqs current files. Exits non\-zero naming the failing rule
+.SH OPTIONS
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The target project to compare against
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+The target package to compare against
+.TP
+\fB\-\-entries\fR \fI<ENTRIES>\fR [default: 1]
+Newest N entries to lint for format, and the number of new entries the submission may carry vs the target (default 1: one entry per SR)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+[\fIDIR\fR] [default: .]
+The package directory (default: the current directory)
+.SH VERSION
+v0.2.2

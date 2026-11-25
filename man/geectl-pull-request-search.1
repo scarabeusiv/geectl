@@ -1,0 +1,57 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-search 1  "geectl-pull-request-search 0.2.2" 
+.SH NAME
+geectl\-pull\-request\-search \- Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no `\-\-backend` both arms run; `\-\-backend` scopes to one
+.SH SYNOPSIS
+\fBgeectl pull\-request search\fR [\fB\-\-backend\fR] [\fB\-\-state\fR] [\fB\-\-creator\fR] [\fB\-\-repo\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Search pull requests: OBS submit requests and Gitea pull requests as one list, OBS first then Gitea. With no `\-\-backend` both arms run; `\-\-backend` scopes to one
+.SH OPTIONS
+.TP
+\fB\-\-backend\fR \fI<BACKEND>\fR
+Only this backend (`obs` or `gitea`). With no backend both arms run, OBS first then Gitea
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+obs
+.IP \(bu 2
+gitea
+.RE
+.TP
+\fB\-\-state\fR \fI<STATE>\fR
+Only pull requests in these unified states. With none given each arm applies its own default (new/review/declined on OBS, open on Gitea). OBS has no closed state: `\-\-state closed` reads OBS declined requests, which report as `declined`
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+open
+.IP \(bu 2
+merged
+.IP \(bu 2
+declined
+.IP \(bu 2
+withdrawn
+.IP \(bu 2
+closed
+.IP \(bu 2
+superseded
+.IP \(bu 2
+deleted
+.RE
+.TP
+\fB\-\-creator\fR \fI<CREATOR>\fR
+Only pull requests by this author
+.TP
+\fB\-\-repo\fR \fI<REPO>\fR
+Only pull requests in this Gitea repo (`owner/repo`). Requires `\-\-backend gitea`
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

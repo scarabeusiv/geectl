@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-gitea-repo-list 1  "geectl-gitea-repo-list 0.2.2" 
+.SH NAME
+geectl\-gitea\-repo\-list \- List repositories: the token owner\*(Aqs own repos, one user\*(Aqs repos with `\-\-owner`, one organization\*(Aqs with `\-\-org`, or both (the user\*(Aqs first, then the organization\*(Aqs)
+.SH SYNOPSIS
+\fBgeectl gitea repo\-list\fR [\fB\-\-owner\fR] [\fB\-\-org\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+List repositories: the token owner\*(Aqs own repos, one user\*(Aqs repos with `\-\-owner`, one organization\*(Aqs with `\-\-org`, or both (the user\*(Aqs first, then the organization\*(Aqs)
+.SH OPTIONS
+.TP
+\fB\-\-owner\fR \fI<OWNER>\fR
+List this user\*(Aqs repositories instead of the token owner\*(Aqs
+.TP
+\fB\-\-org\fR \fI<ORG>\fR
+List this organization\*(Aqs repositories instead of (or, with `\-\-owner`, after) the user\*(Aqs
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

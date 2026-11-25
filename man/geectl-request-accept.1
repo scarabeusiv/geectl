@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-accept 1  "geectl-request-accept 0.2.2" 
+.SH NAME
+geectl\-request\-accept \- Accept a submit request, with a comment as the message left with the accept
+.SH SYNOPSIS
+\fBgeectl request accept\fR [\fB\-\-comment\fR] [\fB\-\-force\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR> 
+.SH DESCRIPTION
+Accept a submit request, with a comment as the message left with the accept
+.SH OPTIONS
+.TP
+\fB\-\-comment\fR \fI<COMMENT>\fR [default: ]
+The message left with the accept. Values starting with `\-` are taken literally: a comment may open with a `\- ` bullet
+.TP
+\fB\-\-force\fR
+Accept a request still in `review` state, overriding its open reviews
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIID\fR>
+The request id
+.SH VERSION
+v0.2.2

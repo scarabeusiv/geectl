@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-delete-package 1  "geectl-remote-delete-package 0.2.2" 
+.SH NAME
+geectl\-remote\-delete\-package \- Delete a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the deletion. Without `\-\-force` a package with open submit requests is refused
+.SH SYNOPSIS
+\fBgeectl remote delete\-package\fR [\fB\-\-force\fR] [\fB\-\-message\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+Delete a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the deletion. Without `\-\-force` a package with open submit requests is refused
+.SH OPTIONS
+.TP
+\fB\-\-force\fR
+Delete even when open submit requests involve the package
+.TP
+\fB\-\-message\fR \fI<MESSAGE>\fR
+A message recorded on the delete, sent as the server\*(Aqs `comment` query parameter
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package to delete
+.SH VERSION
+v0.2.2

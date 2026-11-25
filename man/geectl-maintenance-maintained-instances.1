@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-maintenance-maintained-instances 1  "geectl-maintenance-maintained-instances 0.2.2" 
+.SH NAME
+geectl\-maintenance\-maintained\-instances \- List the maintained instances of a package: the projects carrying the OBS:Maintained attribute that the package exists in, with where a branch would land. Read\-only; requires OBS credentials
+.SH SYNOPSIS
+\fBgeectl maintenance maintained\-instances\fR [\fB\-\-attribute\fR] [\fB\-\-update\-project\-attribute\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-package\fR> 
+.SH DESCRIPTION
+List the maintained instances of a package: the projects carrying the OBS:Maintained attribute that the package exists in, with where a branch would land. Read\-only; requires OBS credentials
+.SH OPTIONS
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package whose maintained instances to list
+.TP
+\fB\-\-attribute\fR \fI<ATTRIBUTE>\fR
+The attribute marking a project as maintaining the package (`NAMESPACE:NAME`, default `OBS:Maintained`)
+.TP
+\fB\-\-update\-project\-attribute\fR \fI<UPDATE_PROJECT_ATTRIBUTE>\fR
+The attribute pointing a project at its update project (`NAMESPACE:NAME`, default `OBS:UpdateProject`)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

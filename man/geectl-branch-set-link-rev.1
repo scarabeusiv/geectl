@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-branch-set-link-rev 1  "geectl-branch-set-link-rev 0.2.2" 
+.SH NAME
+geectl\-branch\-set\-link\-rev \- Set the revision a link expands at. A mutation: dry\-run is the default
+.SH SYNOPSIS
+\fBgeectl branch set\-link\-rev\fR [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> <\fB\-\-revision\fR> 
+.SH DESCRIPTION
+Set the revision a link expands at. A mutation: dry\-run is the default
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The project holding the package
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package whose link revision to set
+.TP
+\fB\-\-revision\fR \fI<REVISION>\fR
+The revision: `latest`, `expanded`, `unset`, a bare revision (a number or an md5, expanded), or `pinned:<rev>` / `expanded:<rev>`
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

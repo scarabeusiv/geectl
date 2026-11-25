@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-branch-link-to-branch 1  "geectl-branch-link-to-branch 0.2.2" 
+.SH NAME
+geectl\-branch\-link\-to\-branch \- Turn a link into a branch: replace the link with a copy of the linked files. A mutation: dry\-run is the default
+.SH SYNOPSIS
+\fBgeectl branch link\-to\-branch\fR [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> 
+.SH DESCRIPTION
+Turn a link into a branch: replace the link with a copy of the linked files. A mutation: dry\-run is the default
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The project holding the package
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package whose link to turn into a branch
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

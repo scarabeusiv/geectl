@@ -1,0 +1,30 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-build-history 1  "geectl-build-build-history 0.2.2" 
+.SH NAME
+geectl\-build\-build\-history \- List the completed builds for a package, newest first
+.SH SYNOPSIS
+\fBgeectl build build\-history\fR [\fB\-\-limit\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> <\fIREPOSITORY\fR> <\fIARCH\fR> 
+.SH DESCRIPTION
+List the completed builds for a package, newest first
+.SH OPTIONS
+.TP
+\fB\-\-limit\fR \fI<LIMIT>\fR
+At most this many entries
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package is in
+.TP
+<\fIPACKAGE\fR>
+The package to list the history for
+.TP
+<\fIREPOSITORY\fR>
+The repository the package builds in
+.TP
+<\fIARCH\fR>
+The architecture the package builds for
+.SH VERSION
+v0.2.2

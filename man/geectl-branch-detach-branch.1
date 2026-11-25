@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-branch-detach-branch 1  "geectl-branch-detach-branch 0.2.2" 
+.SH NAME
+geectl\-branch\-detach\-branch \- Detach a branch: replace the branch link with a copy of the branched files. A mutation: dry\-run is the default
+.SH SYNOPSIS
+\fBgeectl branch detach\-branch\fR [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> 
+.SH DESCRIPTION
+Detach a branch: replace the branch link with a copy of the branched files. A mutation: dry\-run is the default
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The project holding the package
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The branch package to detach
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

@@ -1,0 +1,30 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-file-change-devel 1  "geectl-request-file-change-devel 0.2.2" 
+.SH NAME
+geectl\-request\-file\-change\-devel \- File a change\-devel request: change a package\*(Aqs devel project
+.SH SYNOPSIS
+\fBgeectl request file\-change\-devel\fR [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-source\-project\fR> <\fB\-\-source\-package\fR> <\fB\-\-target\-project\fR> <\fB\-\-target\-package\fR> <\fB\-\-description\fR> 
+.SH DESCRIPTION
+File a change\-devel request: change a package\*(Aqs devel project
+.SH OPTIONS
+.TP
+\fB\-\-source\-project\fR \fI<SOURCE_PROJECT>\fR
+The project the package lives in
+.TP
+\fB\-\-source\-package\fR \fI<SOURCE_PACKAGE>\fR
+The package whose devel project changes
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The project that becomes the devel project
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+The package in the devel project
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+The request description. Values starting with `\-` are taken literally: a description may open with a `\- ` bullet
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

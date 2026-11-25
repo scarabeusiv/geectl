@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-undelete-package 1  "geectl-remote-undelete-package 0.2.2" 
+.SH NAME
+geectl\-remote\-undelete\-package \- Restore a deleted package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the restore
+.SH SYNOPSIS
+\fBgeectl remote undelete\-package\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+Restore a deleted package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the restore
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package to restore
+.SH VERSION
+v0.2.2

@@ -30,15 +30,15 @@
 //! carries no description (long free text — titles stay). The
 //! JSON payload remains the complete record in every case.
 
+use crate::auth::{EnvGiteaAuth, EnvObsAuth};
+use crate::config::{self, DEFAULT_GITEA_URL};
+use crate::debug::Debug;
+use crate::error::{ErrorKind, GeectlError};
+use crate::gitea::{GiteaClient, GiteaUser};
+use crate::http::{HttpClient, Timeout, UreqClient};
+use crate::obs::{ObsClient, ProjectMatch, OBS_API_BASE};
+use crate::person::{PersonBackend, PersonClient, PersonSearch, PersonSearchResult};
 use clap::{Args, Subcommand};
-use geectl::auth::{EnvGiteaAuth, EnvObsAuth};
-use geectl::config::{self, DEFAULT_GITEA_URL};
-use geectl::debug::Debug;
-use geectl::error::{ErrorKind, GeectlError};
-use geectl::gitea::{GiteaClient, GiteaUser};
-use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{ObsClient, ProjectMatch, OBS_API_BASE};
-use geectl::person::{PersonBackend, PersonClient, PersonSearch, PersonSearchResult};
 use serde_json::{json, Value};
 
 /// The `person` command group: the unified person search over
@@ -321,8 +321,8 @@ fn join_row(cells: &[&str], widths: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obs::ProjectMatch;
     use clap::Parser;
-    use geectl::obs::ProjectMatch;
 
     /// A minimal CLI for parsing `person` subcommands in tests.
     #[derive(Debug, Parser)]

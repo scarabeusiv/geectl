@@ -1,0 +1,36 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-aggregate-package 1  "geectl-remote-aggregate-package 0.2.2" 
+.SH NAME
+geectl\-remote\-aggregate\-package \- Aggregate a package\*(Aqs binaries into another package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the aggregation. The target package is created from the source package\*(Aqs meta when it does not exist yet; an `_aggregate` file that already exists is refused
+.SH SYNOPSIS
+\fBgeectl remote aggregate\-package\fR [\fB\-\-repository\-map\fR] [\fB\-\-no\-sources\fR] [\fB\-\-disable\-publish\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fISOURCE_PROJECT\fR> <\fISOURCE_PACKAGE\fR> <\fITARGET_PROJECT\fR> <\fITARGET_PACKAGE\fR> 
+.SH DESCRIPTION
+Aggregate a package\*(Aqs binaries into another package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the aggregation. The target package is created from the source package\*(Aqs meta when it does not exist yet; an `_aggregate` file that already exists is refused
+.SH OPTIONS
+.TP
+\fB\-\-repository\-map\fR \fI<REPOSITORY_MAP>\fR
+Map a source repository to a target repository, as `SOURCE=TARGET` (repeatable)
+.TP
+\fB\-\-no\-sources\fR
+Aggregate binaries only, not the sources
+.TP
+\fB\-\-disable\-publish\fR
+Disable publishing of the aggregate package
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fISOURCE_PROJECT\fR>
+The project the source package lives in
+.TP
+<\fISOURCE_PACKAGE\fR>
+The source package
+.TP
+<\fITARGET_PROJECT\fR>
+The project the target package lives in
+.TP
+<\fITARGET_PACKAGE\fR>
+The target package
+.SH VERSION
+v0.2.2

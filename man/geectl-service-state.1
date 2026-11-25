@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-service-state 1  "geectl-service-state 0.2.2" 
+.SH NAME
+geectl\-service\-state \- Show the last service run state of a package
+.SH SYNOPSIS
+\fBgeectl service state\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+Show the last service run state of a package
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package to show the service state of
+.SH VERSION
+v0.2.2

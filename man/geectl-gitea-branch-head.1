@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-gitea-branch-head 1  "geectl-gitea-branch-head 0.2.2" 
+.SH NAME
+geectl\-gitea\-branch\-head \- Print the head commit SHA of a branch. Content command: the text IS the SHA, with no header
+.SH SYNOPSIS
+\fBgeectl gitea branch\-head\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIOWNER\fR> <\fIREPO\fR> <\fIBRANCH\fR> 
+.SH DESCRIPTION
+Print the head commit SHA of a branch. Content command: the text IS the SHA, with no header
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIOWNER\fR>
+The repository owner
+.TP
+<\fIREPO\fR>
+The repository name
+.TP
+<\fIBRANCH\fR>
+The branch name
+.SH VERSION
+v0.2.2

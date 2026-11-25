@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-add-review 1  "geectl-request-add-review 0.2.2" 
+.SH NAME
+geectl\-request\-add\-review \- Ask a user, group, project, or package to review a submit request
+.SH SYNOPSIS
+\fBgeectl request add\-review\fR [\fB\-\-user\fR] [\fB\-\-group\fR] [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-comment\fR> <\fIID\fR> 
+.SH DESCRIPTION
+Ask a user, group, project, or package to review a submit request
+.SH OPTIONS
+.TP
+\fB\-\-user\fR \fI<USER>\fR
+The user the review is asked of
+.TP
+\fB\-\-group\fR \fI<GROUP>\fR
+The group the review is asked of
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The project the review is asked of
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package the review is asked of (needs its project)
+.TP
+\fB\-\-comment\fR \fI<COMMENT>\fR
+The reason the review is asked for. Values starting with `\-` are taken literally: a comment may open with a `\- ` bullet
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIID\fR>
+The request id
+.SH VERSION
+v0.2.2

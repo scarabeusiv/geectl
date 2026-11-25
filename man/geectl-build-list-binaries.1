@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-list-binaries 1  "geectl-build-list-binaries 0.2.2" 
+.SH NAME
+geectl\-build\-list\-binaries \- List the built files for a package (or the whole repository)
+.SH SYNOPSIS
+\fBgeectl build list\-binaries\fR [\fB\-\-package\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIREPOSITORY\fR> <\fIARCH\fR> 
+.SH DESCRIPTION
+List the built files for a package (or the whole repository)
+.SH OPTIONS
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+Only this package\*(Aqs files; without it, the whole repository\*(Aqs files
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package is in
+.TP
+<\fIREPOSITORY\fR>
+The repository the files were built in
+.TP
+<\fIARCH\fR>
+The architecture the files were built for
+.SH VERSION
+v0.2.2

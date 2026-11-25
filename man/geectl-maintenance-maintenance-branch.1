@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-maintenance-maintenance-branch 1  "geectl-maintenance-maintenance-branch 0.2.2" 
+.SH NAME
+geectl\-maintenance\-maintenance\-branch \- Branch a maintained package into its maintenance branch project and report where it landed. A mutation: dry\-run is the default (only the plan is printed); the global `\-\-live` performs the branch
+.SH SYNOPSIS
+\fBgeectl maintenance maintenance\-branch\fR [\fB\-\-attribute\fR] [\fB\-\-update\-project\-attribute\fR] [\fB\-\-target\-project\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-package\fR> 
+.SH DESCRIPTION
+Branch a maintained package into its maintenance branch project and report where it landed. A mutation: dry\-run is the default (only the plan is printed); the global `\-\-live` performs the branch
+.SH OPTIONS
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package to branch into its maintenance branch project
+.TP
+\fB\-\-attribute\fR \fI<ATTRIBUTE>\fR
+The attribute marking a project as maintaining the package (`NAMESPACE:NAME`, default `OBS:Maintained`)
+.TP
+\fB\-\-update\-project\-attribute\fR \fI<UPDATE_PROJECT_ATTRIBUTE>\fR
+The attribute pointing a project at its update project (`NAMESPACE:NAME`, default `OBS:UpdateProject`)
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+Override the server\-derived branch project (`home:<user>:branches:OBS_Maintained:<package>`)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

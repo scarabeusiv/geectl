@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-branch-repair-link 1  "geectl-branch-repair-link 0.2.2" 
+.SH NAME
+geectl\-branch\-repair\-link \- Repair a broken link: strip the failing patches from `_link` server\-side and pin it at a revision where it expands. A mutation: dry\-run is the default
+.SH SYNOPSIS
+\fBgeectl branch repair\-link\fR [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> 
+.SH DESCRIPTION
+Repair a broken link: strip the failing patches from `_link` server\-side and pin it at a revision where it expands. A mutation: dry\-run is the default
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The project holding the package
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package whose link to repair
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

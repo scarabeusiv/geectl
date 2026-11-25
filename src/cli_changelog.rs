@@ -17,16 +17,16 @@
 //! `file:line: V#: message` line per finding, plus the skipped
 //! rules — the same shape the skill's `changes-lint.sh` prints.
 
+use crate::changelog::changes::normalize_changes_content;
+use crate::changelog::generate::{generate, prepend_entry};
+use crate::changelog::news::{extract_news_section, find_tarball, NewsSection};
+use crate::changelog::spec::parse_spec;
+use crate::changelog::validate::{validate, PackageSnapshot, ValidateOptions};
+use crate::debug::Debug;
+use crate::error::{ErrorKind, GeectlError};
+use crate::http::{Timeout, UreqClient};
+use crate::obs::ObsClient;
 use clap::Subcommand;
-use geectl::changelog::changes::normalize_changes_content;
-use geectl::changelog::generate::{generate, prepend_entry};
-use geectl::changelog::news::{extract_news_section, find_tarball, NewsSection};
-use geectl::changelog::spec::parse_spec;
-use geectl::changelog::validate::{validate, PackageSnapshot, ValidateOptions};
-use geectl::debug::Debug;
-use geectl::error::{ErrorKind, GeectlError};
-use geectl::http::{Timeout, UreqClient};
-use geectl::obs::ObsClient;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -163,7 +163,7 @@ fn fetch_target(
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
     let (base, _instances) = crate::cli_remote::obs_endpoint()?;
     let client =
-        ObsClient::with_base_and_credentials(&http, &base, geectl::auth::Credentials::None)?
+        ObsClient::with_base_and_credentials(&http, &base, crate::auth::Credentials::None)?
             .with_debug(debug.clone());
     let files = match client.list_files(project, package, None, false) {
         Ok(files) => files,
@@ -236,8 +236,8 @@ fn run_validate(
     let report = validate(&local, target_snapshot.as_ref(), &options);
     let mut skipped = report.skipped.clone();
     if let Some(reason) = news_error {
-        skipped.push(geectl::changelog::Skipped {
-            rule: geectl::changelog::Rule::V9,
+        skipped.push(crate::changelog::Skipped {
+            rule: crate::changelog::Rule::V9,
             reason: format!("upstream NEWS lookup failed ({reason}) — V9 did not run"),
         });
     }

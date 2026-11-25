@@ -1,0 +1,39 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-release-package 1  "geectl-remote-release-package 0.2.2" 
+.SH NAME
+geectl\-remote\-release\-package \- Release a package\*(Aqs sources and binaries. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the release. A release to a target project needs a repository and a target repository
+.SH SYNOPSIS
+\fBgeectl remote release\-package\fR [\fB\-\-repository\fR] [\fB\-\-arch\fR] [\fB\-\-target\-project\fR] [\fB\-\-target\-repository\fR] [\fB\-\-set\-release\fR] [\fB\-\-no\-delay\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+Release a package\*(Aqs sources and binaries. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the release. A release to a target project needs a repository and a target repository
+.SH OPTIONS
+.TP
+\fB\-\-repository\fR \fI<REPOSITORY>\fR
+Release only binaries from this repository
+.TP
+\fB\-\-arch\fR \fI<ARCH>\fR
+Release only binaries for this architecture
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+Release only to this project
+.TP
+\fB\-\-target\-repository\fR \fI<TARGET_REPOSITORY>\fR
+Release only to this repository in the target project
+.TP
+\fB\-\-set\-release\fR \fI<SET_RELEASE>\fR
+Rename binaries during the release using this release tag
+.TP
+\fB\-\-no\-delay\fR
+Run the release immediately instead of queueing it as a job
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package to release
+.SH VERSION
+v0.2.2

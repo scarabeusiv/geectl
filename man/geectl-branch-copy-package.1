@@ -1,0 +1,51 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-branch-copy-package 1  "geectl-branch-copy-package 0.2.2" 
+.SH NAME
+geectl\-branch\-copy\-package \- Copy a package to another project (or another OBS instance with `\-\-to\-apiurl`). A mutation: dry\-run is the default
+.SH SYNOPSIS
+\fBgeectl branch copy\-package\fR [\fB\-\-revision\fR] [\fB\-\-keep\-link\fR] [\fB\-\-expand\fR] [\fB\-\-comment\fR] [\fB\-\-noservice\fR] [\fB\-\-dont\-update\-source\fR] [\fB\-\-with\-vrev\fR] [\fB\-\-to\-apiurl\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-source\-project\fR> <\fB\-\-source\-package\fR> <\fB\-\-target\-project\fR> <\fB\-\-target\-package\fR> 
+.SH DESCRIPTION
+Copy a package to another project (or another OBS instance with `\-\-to\-apiurl`). A mutation: dry\-run is the default
+.SH OPTIONS
+.TP
+\fB\-\-source\-project\fR \fI<SOURCE_PROJECT>\fR
+The project to copy from
+.TP
+\fB\-\-source\-package\fR \fI<SOURCE_PACKAGE>\fR
+The package to copy
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The project to copy to
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+The package to copy to
+.TP
+\fB\-\-revision\fR \fI<REVISION>\fR
+Copy this source revision instead of the latest
+.TP
+\fB\-\-keep\-link\fR
+Keep the source package\*(Aqs link when copying a link package
+.TP
+\fB\-\-expand\fR
+Copy the expanded source (the link resolved) instead of the link itself
+.TP
+\fB\-\-comment\fR \fI<COMMENT>\fR
+A comment recorded on the copy
+.TP
+\fB\-\-noservice\fR
+Do not run source services on the copied files
+.TP
+\fB\-\-dont\-update\-source\fR
+Do not update the source package when copying a link onto its target
+.TP
+\fB\-\-with\-vrev\fR
+Carry the source revision\*(Aqs vrev over to the copy
+.TP
+\fB\-\-to\-apiurl\fR \fI<TO_APIURL>\fR
+Copy to another OBS instance at this API URL instead of the configured one. The target\*(Aqs credentials come from the instance alias matching that URL in the config file\*(Aqs `[instances]` table (`GEECTL_OBS_APIKEY[_FILE]_<ALIAS>` or `GEECTL_OBS_USERNAME_<ALIAS>` / `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>`; see `auth::resolve_obs_for_url`) and the copy fails clearly when none are configured — the source instance\*(Aqs credentials are never forwarded to the target. The copy is client\-side and always expanded; `\-\-keep\-link` and the server\-side copy options are refused with it
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

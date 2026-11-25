@@ -1,0 +1,51 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-submit 1  "geectl-pull-request-submit 0.2.2" 
+.SH NAME
+geectl\-pull\-request\-submit \- File a submission from the working copy in the current directory: an OBS submit request from an OBS\-native checkout, a Gitea pull request from a git\-backed one. The checkout\*(Aqs backend decides; the other arm\*(Aqs flags are refused. Dry\-run by default; mutates only with `\-\-live`
+.SH SYNOPSIS
+\fBgeectl pull\-request submit\fR [\fB\-\-target\-project\fR] [\fB\-\-target\-package\fR] [\fB\-\-description\fR] [\fB\-\-changes\-entry\fR] [\fB\-\-cve\fR] [\fB\-\-without\-cleanup\fR] [\fB\-\-repo\fR] [\fB\-\-head\fR] [\fB\-\-base\fR] [\fB\-\-title\fR] [\fB\-\-body\fR] [\fB\-\-draft\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+File a submission from the working copy in the current directory: an OBS submit request from an OBS\-native checkout, a Gitea pull request from a git\-backed one. The checkout\*(Aqs backend decides; the other arm\*(Aqs flags are refused. Dry\-run by default; mutates only with `\-\-live`
+.SH OPTIONS
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The project the request targets: the devel project, or openSUSE:Factory when the source is the recorded devel project and package. OBS only; required there
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+The package in the target project. OBS only; the checkout package when unset
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+The request description: one headline, then `\- ` lines for staging, needs, and rebuilds. OBS only; required there. Values starting with `\-` are taken literally: a description may open with a `\- ` bullet
+.TP
+\fB\-\-changes\-entry\fR \fI<CHANGES_ENTRY>\fR
+The one `.changes` entry for this submission. It must name every CVE passed with `\-\-cve`. OBS only; required there. Values starting with `\-` are taken literally: a `.changes` entry starts with `\- `
+.TP
+\fB\-\-cve\fR \fI<CVE>\fR
+A CVE this submission claims to fix. Repeatable; each one must be named in `\-\-changes\-entry`. OBS only
+.TP
+\fB\-\-without\-cleanup\fR
+Keep the source branch on accept instead of deleting it (cleanup is the default). OBS only
+.TP
+\fB\-\-repo\fR \fI<REPO>\fR
+The repo to open the pull request in (`owner/repo`). Gitea only; the parent of the checkout\*(Aqs origin remote (the fork\*(Aqs parent, never the fork) when unset
+.TP
+\fB\-\-head\fR \fI<HEAD>\fR
+The branch the change comes from. Gitea only; the checkout\*(Aqs current branch when unset
+.TP
+\fB\-\-base\fR \fI<BASE>\fR
+The branch the pull request targets. Gitea only; the branch the checkout tracks (its scmsync branch) when unset, else the target repo\*(Aqs default branch. The `factory` branch does not take pull requests
+.TP
+\fB\-\-title\fR \fI<TITLE>\fR
+The pull request title. Gitea only; required there. Values starting with `\-` are taken literally
+.TP
+\fB\-\-body\fR \fI<BODY>\fR
+The pull request body. Gitea only. Values starting with `\-` are taken literally: the body may open with a `\- ` bullet
+.TP
+\fB\-\-draft\fR
+Open the pull request as a draft. Gitea only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2
