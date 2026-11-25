@@ -407,7 +407,8 @@ pub(crate) struct LinkInfo {
 /// Read the `<linkinfo>` element from an OBS directory listing.
 /// None when the listing carries no linkinfo (the package is not a
 /// link). An error when the body is not a `<directory>` document at
-/// all — a truncated 200 body must not read as "not a link". The
+/// all — a truncated 200 body must not read as "not a link". An
+/// `xsrcmd5` that is not exactly 32 hex digits is malformed too. The
 /// attributes are read from the open tag only, so a linkinfo with
 /// `<linked>` children still parses.
 pub(crate) fn parse_linkinfo(body: &str) -> Result<Option<LinkInfo>, GeectlError> {
@@ -494,6 +495,12 @@ pub(crate) fn parse_linkinfo(body: &str) -> Result<Option<LinkInfo>, GeectlError
             info.baserev = Some(value);
         }
         if let Some(value) = find_attr(tag, "xsrcmd5") {
+            // The md5 is a checksum, not free text: a value that
+            // is not exactly 32 hex digits is malformed, not a
+            // value to carry.
+            if !is_md5(&value) {
+                return Err(malformed());
+            }
             info.xsrcmd5 = Some(value);
         }
         if let Some(value) = find_attr(tag, "lastworking") {
@@ -883,6 +890,12 @@ fn parse_commitfilelist_response(body: &str) -> Result<CommitFilelistResponse, G
         hash_challenge,
         service_running,
     })
+}
+
+/// A 32-hex-digit md5, the shape a checksum attribute must have:
+/// anything else is malformed server data, not a checksum.
+fn is_md5(value: &str) -> bool {
+    value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Parse an OBS source directory listing (`<directory>...</directory>`
@@ -5725,6 +5738,66 @@ mod tests {
         assert_eq!(
             info.error.as_deref(),
             Some("patch bad.patch failed to apply")
+        );
+    }
+
+    #[test]
+    fn parse_linkinfo_rejects_non_hex_xsrcmd5() {
+        // The md5 is a checksum, not free text: a non-hex value
+        // is a malformed listing, never a value to carry.
+        assert_eq!(
+            parse_linkinfo("<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" xsrcmd5=\"aaa\"/></directory>").unwrap_err().kind(),
+            ErrorKind::ServerError
+        );
+        assert_eq!(
+            parse_linkinfo("<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" xsrcmd5=\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"/></directory>").unwrap_err().kind(),
+            ErrorKind::ServerError
+        );
+    }
+
+    #[test]
+    fn parse_linkinfo_rejects_wrong_length_xsrcmd5() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        assert!(
+            parse_linkinfo("<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" xsrcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/></directory>").is_err()
+        );
+        assert!(
+            parse_linkinfo("<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" xsrcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/></directory>").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_linkinfo_accepts_32_hex_xsrcmd5() {
+        // Lowercase and uppercase hex both read, carried verbatim.
+        let info = parse_linkinfo(
+            "<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" xsrcmd5=\"0123456789abcdef0123456789abcdef\"/></directory>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            info.xsrcmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let info = parse_linkinfo(
+            "<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" xsrcmd5=\"0123456789ABCDEF0123456789ABCDEF\"/></directory>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            info.xsrcmd5.as_deref(),
+            Some("0123456789ABCDEF0123456789ABCDEF")
+        );
+    }
+
+    #[test]
+    fn parse_linkinfo_rejects_escape_sequence_in_xsrcmd5() {
+        // An escape sequence smuggled into the md5 is not 32
+        // hex digits, so the listing is malformed.
+        assert!(
+            parse_linkinfo(
+                "<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" xsrcmd5=\"\u{1b}[31maaaaaaaaaaaaaaaaaaaaaaaaaa\"/></directory>",
+            )
+            .is_err()
         );
     }
 
