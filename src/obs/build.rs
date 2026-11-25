@@ -1671,8 +1671,13 @@ pub(crate) fn parse_fileinfo(body: &str) -> Result<FileInfo, GeectlError> {
         release: xml_element_text(inner, "release"),
         arch: xml_element_text(inner, "arch"),
         source: xml_element_text(inner, "source"),
-        summary: xml_element_text(inner, "summary"),
-        description: xml_element_text(inner, "description"),
+        // Terminal control characters are stripped from the
+        // summary and description: they are RPM author text, and
+        // both reach the terminal through the fileinfo render.
+        summary: xml_element_text(inner, "summary")
+            .map(|text| crate::debug::strip_terminal_controls(&text)),
+        description: xml_element_text(inner, "description")
+            .map(|text| crate::debug::strip_terminal_controls(&text)),
         disturl: xml_element_text(inner, "disturl"),
         size: number_text("size")?,
         mtime: number_text("mtime")?,
@@ -6085,6 +6090,19 @@ mod tests {
         assert!(parsed.requires_ext.is_empty());
         assert!(parsed.recommends_ext.is_empty());
         assert!(parsed.supplements_ext.is_empty());
+    }
+
+    #[test]
+    fn parse_fileinfo_strips_terminal_controls_from_summary_and_description() {
+        // The summary and description are RPM author text: escape
+        // sequences, bells, and bidirectional marks are stripped at
+        // the parse, so no downstream surface can print them.
+        let parsed = parse_fileinfo(
+            "<fileinfo filename=\"foo-1.0-1.x86_64.rpm\"><summary>Fo\u{1b}[2Jo tool</summary><description>Does\u{7} foo.\nMore\u{202e} text</description></fileinfo>",
+        )
+        .unwrap();
+        assert_eq!(parsed.summary.as_deref(), Some("Fo[2Jo tool"));
+        assert_eq!(parsed.description.as_deref(), Some("Does foo.\nMore text"));
     }
 
     #[test]

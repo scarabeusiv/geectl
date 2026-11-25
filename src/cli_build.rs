@@ -45,7 +45,7 @@
 
 use crate::auth::{alias_for_url, same_api_url, Credentials, EnvObsAuth};
 use crate::config;
-use crate::debug::Debug;
+use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{Timeout, UreqClient};
 use crate::obs::{
@@ -2350,8 +2350,14 @@ fn render_fileinfo_text(info: &FileInfo) -> String {
     lines.extend(opt_line("release", &info.release));
     lines.extend(opt_line("arch", &info.arch));
     lines.extend(opt_line("source", &info.source));
-    lines.extend(opt_line("summary", &info.summary));
-    lines.extend(opt_line("description", &info.description));
+    lines.extend(opt_line(
+        "summary",
+        &info.summary.as_deref().map(strip_terminal_controls),
+    ));
+    lines.extend(opt_line(
+        "description",
+        &info.description.as_deref().map(strip_terminal_controls),
+    ));
     lines.extend(opt_line("disturl", &info.disturl));
     lines.extend(opt_num_line("size", &info.size));
     lines.extend(opt_num_line("mtime", &info.mtime));
@@ -4035,6 +4041,27 @@ mod tests {
         assert_eq!(
             payload["supplements_ext"][0]["required_by"][0]["release"],
             "1"
+        );
+    }
+
+    #[test]
+    fn fileinfo_text_strips_terminal_controls_from_summary_and_description() {
+        // The summary and description are RPM author text and reach
+        // the terminal through the fileinfo render: escape sequences,
+        // carriage returns, bells, and bidirectional marks are
+        // stripped, while newlines survive.
+        let mut info = fileinfo_fixture();
+        info.summary = Some("A\u{1b}[2J foo".to_string());
+        info.description = Some("Does\rfoo\u{7}.\nMore\u{202e} text".to_string());
+        let text = render_fileinfo_text(&info);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\r'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(text.contains("summary: A[2J foo"), "text: {text}");
+        assert!(
+            text.contains("description: Doesfoo.\nMore text"),
+            "text: {text}"
         );
     }
 
