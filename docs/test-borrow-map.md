@@ -6,37 +6,6 @@ osc source: openSUSE/osc @ `89f6bdc`.
 
 Surveyed: osc's Behave suite (77 feature files, 272 scenarios) and unit suite (58 files, 707 test methods) — 979 items. Adopted as written: 227 (120 behave scenarios, 107 unit tests), plus protocol specs. The rest is SKIP (osc-internal), stdout-only, covered by geectl's existing tests, or a gap with no implementation yet.
 
-## Counts (direct adoptions, de-duplicated)
-
-| Batch | Unit | Behave | Total |
-|---|---|---|---|
-| 1 file upload | 0 (+1 protocol spec) | 0 | 0 (+spec) |
-| 2 request read/act | 54 | 5 | 59 |
-| 3 remote read | 36 | 17 | 53 (+1 protocol spec) |
-| 4 branch/copy/link | 9 | 42 | 51 |
-| 5 build status | 4 | 42 | 46 |
-| 5b build-log selectors (#206) | 0 (+3 source pins) | 0 | 0 (+pins) |
-| 5c single-review state change (#209) | 0 (+1 source pin) | 0 | 0 (+pin) |
-| 6 working-copy layer | 0 (+36 spec ref) | 0 | 0 (+spec) |
-| 7 maintenance requests | 0 (counted in 2/4) | 0 (counted in 2/4) | 0 (+gaps) |
-| 8 services | 0 | 1 | 1 |
-| 9 Gitea ops | 2 | 13 | 15 |
-| 10 local-build flag parity | 0 (+spec ref) | 0 | 0 (+spec) |
-| 11 list-scmsync-projects | 0 | 0 | 0 |
-| Gap batch 2, wave 3 (#175, #176) | 0 | 0 | 0 |
-| Gap batch 3 — buildconfig --alternative-project (#252) | 0 (+spec ref) | 0 | 0 (+spec) |
-| Gap batch 3 — local-build log (#178) | 0 | 0 | 0 |
-| Gap batch 3 — Repository shape in the meta write (#157 OCR follow-ups) | 0 (+source pins) | 0 | 0 (+pins) |
-| Gap batch 3 — project-meta full-shape write test (#266) | 0 | 0 | 0 |
-| Gap batch — releasetarget repository required (#265) | 0 | 0 | 0 |
-| 11 prjconf | 0 | 0 | 0 |
-| 12 buildinfo bdep projects (#194) | 0 (+spec ref) | 0 | 0 (+spec) |
-| 13 mirror-first dep fetch | 1 | 0 | 1 |
-| Gap batch — periodic cache cleanup (#191) | 0 | 0 | 0 |
-| Unified person search (#300) | 1 | 0 | 1 |
-| Gap batch — --from-file on set-meta (#180) | 0 (+source pins) | 0 | 0 (+pins) |
-| **Total adopted** | **107** | **120** | **227** |
-
 ## Operations written from scratch
 
 - `rq show`, `rq log`, accept, decline, revoke, `review add`, comment
@@ -53,7 +22,7 @@ Surveyed: osc's Behave suite (77 feature files, 272 scenarios) and unit suite (5
   `run NAME`, `format_spec_file`, `localrun`, `disabledrun`.
 - Upload revision-response body (`<revision rev="N"/>` as PUT success).
 - `remote delete-file`: a working copy deletes the file and commits it; `test_deletefiles.py` pins working-copy delete semantics only (see "Adoption exclusions").
-- `remote list-scmsync-projects`: the scmsync-prefix project list. No osc test pins it; the count's own endpoint and validation are the spec reference.
+- `remote list-scmsync-projects`: the scmsync-prefix project list. No osc test pins it; the command's own endpoint and validation are the spec reference.
 
 ## Adoption exclusions (and why)
 
