@@ -435,6 +435,43 @@ pub fn parse_build_log_url(url: &str, api_base: &str) -> Result<BuildLogCoordina
     Ok(coords)
 }
 
+/// The web-UI package page for `project`/`package`: the link the
+/// build-link comment carries, so the reviewer reads the build
+/// results on OBS. Only mapped for the public instance — the
+/// configured API host must be `api.opensuse.org`, the same
+/// host-mapping discipline as [`parse_build_log_url`]: any other
+/// host fails closed naming it, never a guessed web host.
+pub fn package_show_url(
+    project: &str,
+    package: &str,
+    api_base: &str,
+) -> Result<String, GeectlError> {
+    if !valid_obs_name(project) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OBS project name: {project:?}"),
+        ));
+    }
+    if !valid_obs_name(package) {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid OBS package name: {package:?}"),
+        ));
+    }
+    let api_host = url_host(api_base.trim_end_matches('/')).unwrap_or("");
+    if api_host != "api.opensuse.org" {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "the package page is only mapped for build.opensuse.org against api.opensuse.org; the configured API host is {api_host}"
+            ),
+        ));
+    }
+    Ok(format!(
+        "https://build.opensuse.org/package/show/{project}/{package}"
+    ))
+}
+
 /// Strip the leading `[timestamp] ` from each log line: the
 /// client-side strip-time behaviour. A line is stripped only when
 /// it starts with `[` and the first `]` is followed by a space —
@@ -5425,6 +5462,51 @@ mod tests {
             .package,
             "multibuild-pkg:flavor1"
         );
+    }
+
+    #[test]
+    fn package_show_url_forms_the_production_link() {
+        assert_eq!(
+            package_show_url(
+                "home:test:branches:openSUSE:Factory",
+                "vim",
+                "https://api.opensuse.org"
+            )
+            .unwrap(),
+            "https://build.opensuse.org/package/show/home:test:branches:openSUSE:Factory/vim"
+        );
+        // A trailing slash on the API base changes nothing.
+        assert_eq!(
+            package_show_url("openSUSE:Factory", "vim", "https://api.opensuse.org/").unwrap(),
+            "https://build.opensuse.org/package/show/openSUSE:Factory/vim"
+        );
+    }
+
+    #[test]
+    fn package_show_url_refuses_a_non_production_host() {
+        for (base, host) in [
+            ("http://127.0.0.1:3000", "127.0.0.1:3000"),
+            ("https://obs.example.com", "obs.example.com"),
+            ("https://build.opensuse.org", "build.opensuse.org"),
+        ] {
+            let err = package_show_url("openSUSE:Factory", "vim", base).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains(host), "{}", err);
+            assert!(err.to_string().contains("api.opensuse.org"), "{}", err);
+        }
+    }
+
+    #[test]
+    fn package_show_url_refuses_an_invalid_name() {
+        let err = package_show_url("not a project", "vim", "https://api.opensuse.org").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let err = package_show_url(
+            "openSUSE:Factory",
+            "not a package!",
+            "https://api.opensuse.org",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]

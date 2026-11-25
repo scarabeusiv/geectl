@@ -17,7 +17,7 @@ use crate::obs::request::{
     validate_request_id, Request, RequestAction, RequestSearch, RequestState, ReviewState,
     ReviewTarget,
 };
-use crate::obs::{DryRun, ObsClient, SrFiling, SrPayload};
+use crate::obs::{DryRun, InstanceBuildResults, ObsClient, SrFiling, SrPayload};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -1015,6 +1015,40 @@ impl<'a> PullRequestClient<'a> {
         }
     }
 
+    /// Post the build-link comment on a pull request: one comment
+    /// carrying the OBS package page for the test project and
+    /// package, plus a one-line per-instance status summary from
+    /// the read, so the comment is useful before the reviewer
+    /// opens the link. The comment is posted once, on PR opening;
+    /// there is no polling, no live update, and no edit. The link
+    /// comes from [`crate::obs::package_show_url`], formed by the
+    /// caller before the results read so a non-production host
+    /// fails before any network. Refuses an OBS ref: the build
+    /// link belongs on the Gitea pull request. Returns the created
+    /// comment, or `None` in dry-run.
+    pub fn build_comment(
+        &self,
+        reference: &PullRequestRef,
+        project: &str,
+        package: &str,
+        link: &str,
+        outcomes: &[InstanceBuildResults],
+        dry_run: &DryRun,
+    ) -> Result<Option<ReviewComment>, GeectlError> {
+        match reference {
+            PullRequestRef::Obs(id) => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "build-comment posts the build link on a Gitea pull request; {id} is an OBS submit request"
+                ),
+            )),
+            PullRequestRef::Gitea { .. } => {
+                let body = build_comment_body(project, package, link, outcomes);
+                self.comment(reference, &body, None, dry_run)
+            }
+        }
+    }
+
     /// List the comments on a pull request, oldest first.
     pub fn comments(&self, reference: &PullRequestRef) -> Result<Vec<ReviewComment>, GeectlError> {
         match reference {
@@ -1663,6 +1697,55 @@ fn matches_query(summary: &PullRequestSummary, query: &PullRequestSearch) -> boo
     true
 }
 
+/// The build-link comment body: the package page link first,
+/// then one line per configured instance carrying that
+/// instance's summary for `package` — the
+/// repository/architecture cells with a status for the package,
+/// `repository/arch: code`, or `no results for <package>` when
+/// no cell carries one, or the read failure when the instance
+/// could not be read. A cell marked dirty carries ` (dirty)` on
+/// its code: its state may already be stale.
+pub fn build_comment_body(
+    project: &str,
+    package: &str,
+    link: &str,
+    outcomes: &[InstanceBuildResults],
+) -> String {
+    let mut lines = vec![
+        format!("Build results for {project}/{package}: {link}"),
+        String::new(),
+    ];
+    for outcome in outcomes {
+        let summary = match &outcome.outcome {
+            Ok(results) => {
+                let mut cells = Vec::new();
+                for cell in &results.results {
+                    for status in &cell.statuses {
+                        if status.package == package {
+                            let dirty = if cell.dirty { " (dirty)" } else { "" };
+                            cells.push(format!(
+                                "{}/{}: {}{dirty}",
+                                cell.repository, cell.arch, status.code
+                            ));
+                        }
+                    }
+                }
+                if cells.is_empty() {
+                    format!("no results for {package}")
+                } else {
+                    cells.join(", ")
+                }
+            }
+            Err(err) => format!("error: {err}"),
+        };
+        lines.push(format!(
+            "instance: {} ({}): {summary}",
+            outcome.alias, outcome.api_url
+        ));
+    }
+    lines.join("\n")
+}
+
 /// The missing-OBS-arm error: the read needs OBS credentials.
 fn missing_obs_arm() -> GeectlError {
     GeectlError::new(
@@ -1685,6 +1768,7 @@ mod tests {
     use crate::auth::Credentials;
     use crate::http::{HttpClient, Timeout, UreqClient};
     use crate::obs::test_support::{basic_credentials, FakeHttp};
+    use crate::obs::{BuildResult, BuildResults, PackageBuildStatus};
 
     fn endpoint(repository: &str) -> PullRequestEndpoint {
         PullRequestEndpoint {
@@ -2853,6 +2937,179 @@ mod tests {
             .expect_err("a parent on a Gitea ref must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(err.to_string().contains("--parent 7"));
+    }
+
+    fn build_outcomes() -> Vec<InstanceBuildResults> {
+        vec![
+            InstanceBuildResults {
+                alias: "default".to_string(),
+                api_url: "https://api.opensuse.org".to_string(),
+                outcome: Ok(BuildResults {
+                    state: Some("aaa".to_string()),
+                    results: vec![
+                        BuildResult {
+                            project: "home:test".to_string(),
+                            repository: "standard".to_string(),
+                            arch: "x86_64".to_string(),
+                            code: "published".to_string(),
+                            state: "published".to_string(),
+                            dirty: false,
+                            details: None,
+                            statuses: vec![PackageBuildStatus {
+                                package: "foo".to_string(),
+                                code: "succeeded".to_string(),
+                                details: None,
+                            }],
+                        },
+                        BuildResult {
+                            project: "home:test".to_string(),
+                            repository: "standard".to_string(),
+                            arch: "aarch64".to_string(),
+                            code: "published".to_string(),
+                            state: "published".to_string(),
+                            dirty: false,
+                            details: None,
+                            statuses: vec![PackageBuildStatus {
+                                package: "foo".to_string(),
+                                code: "failed".to_string(),
+                                details: None,
+                            }],
+                        },
+                    ],
+                }),
+            },
+            InstanceBuildResults {
+                alias: "local".to_string(),
+                api_url: "http://127.0.0.1:3000".to_string(),
+                outcome: Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    "the local instance refused the connection".to_string(),
+                )),
+            },
+        ]
+    }
+
+    #[test]
+    fn build_comment_body_renders_the_link_and_one_line_per_instance() {
+        let link = "https://build.opensuse.org/package/show/home:test/foo";
+        assert_eq!(
+            build_comment_body("home:test", "foo", link, &build_outcomes()),
+            "Build results for home:test/foo: https://build.opensuse.org/package/show/home:test/foo\n\ninstance: default (https://api.opensuse.org): standard/x86_64: succeeded, standard/aarch64: failed\ninstance: local (http://127.0.0.1:3000): error: server_error: the server returned an error (the local instance refused the connection)"
+        );
+    }
+
+    #[test]
+    fn build_comment_body_marks_dirty_and_reports_no_results() {
+        let link = "https://build.opensuse.org/package/show/home:test/foo";
+        let outcomes = vec![InstanceBuildResults {
+            alias: "default".to_string(),
+            api_url: "https://api.opensuse.org".to_string(),
+            outcome: Ok(BuildResults {
+                state: None,
+                results: vec![
+                    BuildResult {
+                        project: "home:test".to_string(),
+                        repository: "standard".to_string(),
+                        arch: "x86_64".to_string(),
+                        code: "published".to_string(),
+                        state: "published".to_string(),
+                        dirty: true,
+                        details: None,
+                        statuses: vec![PackageBuildStatus {
+                            package: "foo".to_string(),
+                            code: "succeeded".to_string(),
+                            details: None,
+                        }],
+                    },
+                    BuildResult {
+                        project: "home:test".to_string(),
+                        repository: "standard".to_string(),
+                        arch: "ppc64le".to_string(),
+                        code: "published".to_string(),
+                        state: "published".to_string(),
+                        dirty: false,
+                        details: None,
+                        statuses: vec![PackageBuildStatus {
+                            package: "other".to_string(),
+                            code: "succeeded".to_string(),
+                            details: None,
+                        }],
+                    },
+                ],
+            }),
+        }];
+        assert_eq!(
+            build_comment_body("home:test", "foo", link, &outcomes),
+            "Build results for home:test/foo: https://build.opensuse.org/package/show/home:test/foo\n\ninstance: default (https://api.opensuse.org): standard/x86_64: succeeded (dirty)"
+        );
+        assert_eq!(
+            build_comment_body("home:test", "bar", link, &outcomes),
+            "Build results for home:test/bar: https://build.opensuse.org/package/show/home:test/foo\n\ninstance: default (https://api.opensuse.org): no results for bar"
+        );
+    }
+
+    #[test]
+    fn build_comment_refuses_an_obs_reference() {
+        let err = act_client(None, None)
+            .build_comment(
+                &obs_ref(),
+                "home:test",
+                "foo",
+                "https://build.opensuse.org/package/show/home:test/foo",
+                &build_outcomes(),
+                &DryRun::new(false),
+            )
+            .expect_err("an OBS ref takes no build-link comment");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("OBS submit request"));
+    }
+
+    #[test]
+    fn build_comment_gitea_posts_once_with_the_rendered_body() {
+        let outcomes = build_outcomes();
+        let link = "https://build.opensuse.org/package/show/home:test/foo";
+        let body = build_comment_body("home:test", "foo", link, &outcomes);
+        let http = FakeHttp::new().with_post(
+            "https://src.opensuse.org/api/v1/repos/openSUSE/geectl/issues/122/comments",
+            r#"{"id": 7, "user": {"login": "plusky"}, "body": "One nit.", "created_at": "2026-11-22T19:52:58Z"}"#,
+        );
+        let gitea = gitea_client(&http);
+        let comment = act_client(None, Some(&gitea))
+            .build_comment(
+                &gitea_ref(),
+                "home:test",
+                "foo",
+                link,
+                &outcomes,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(comment.id, 7);
+        assert_eq!(comment.author, "plusky");
+        assert_eq!(http.post_calls().len(), 1);
+        assert_eq!(
+            http.post_calls()[0].1,
+            serde_json::to_string(&serde_json::json!({ "body": body })).unwrap()
+        );
+    }
+
+    #[test]
+    fn build_comment_dry_run_posts_nothing() {
+        let http = FakeHttp::new();
+        let gitea = gitea_client(&http);
+        let comment = act_client(None, Some(&gitea))
+            .build_comment(
+                &gitea_ref(),
+                "home:test",
+                "foo",
+                "https://build.opensuse.org/package/show/home:test/foo",
+                &build_outcomes(),
+                &DryRun::new(true),
+            )
+            .unwrap();
+        assert!(comment.is_none());
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]

@@ -124,6 +124,7 @@ pub(crate) mod test_support;
 pub(crate) mod types;
 
 pub(crate) use self::branch::build_link_meta;
+pub use self::build::package_show_url;
 pub use self::build::parse_build_log_url;
 pub(crate) use self::build::repository_element;
 pub use self::build::results_across_instances;
