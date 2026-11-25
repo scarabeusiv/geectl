@@ -909,6 +909,13 @@ fn md5_of_file(path: &Path) -> Result<String, GeectlError> {
     Ok(format!("{:x}", context.compute()))
 }
 
+/// Hex-encode `bytes`: sha2 0.11 returns its digest as a
+/// `hybrid_array::Array`, which does not implement `LowerHex`,
+/// so the `{:x}` formatting the md5 sites use cannot apply here.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// The sha256 of a worktree file, streamed: `None` when the file
 /// is missing, a symlink, or not a regular file. A tracked
 /// symlink to `/dev/zero` or a FIFO must not hang the gate or
@@ -931,7 +938,7 @@ fn hash_worktree_file(root: &Path, path: &str) -> Option<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Some(format!("{:x}", hasher.finalize()))
+    Some(hex_encode(&hasher.finalize()))
 }
 
 /// One `git cat-file --batch` process serving blob md5s for a
@@ -3857,7 +3864,7 @@ fn record_commit_plan(
 /// Attach the sha256 of `content` to the file-list entry for `name`:
 /// the server verifies it against the staged bytes.
 fn attach_sha256(entries: &mut [CommitFileEntry], name: &str, content: &[u8]) {
-    let sha256 = format!("{:x}", Sha256::digest(content));
+    let sha256 = hex_encode(&Sha256::digest(content));
     if let Some(entry) = entries.iter_mut().find(|entry| entry.name == name) {
         entry.sha256 = Some(sha256);
     }
