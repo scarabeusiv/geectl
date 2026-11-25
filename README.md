@@ -149,6 +149,11 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo deny check
 ```
 
+The man pages and shell completions live in `man/` and `completions/`,
+generated from the CLI definition by `cargo run --features gen --bin geectl-gen`
+and checked in. The `assets-drift` CI job regenerates them and fails on any
+difference, so a CLI change regenerates the assets in the same PR.
+
 Requires any recent stable Rust toolchain. The binary is `geectl`; the library is also `geectl`,
 so tools can link the same logic instead of shelling out.
 

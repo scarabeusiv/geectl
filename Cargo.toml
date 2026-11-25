@@ -15,10 +15,19 @@ path = "src/lib.rs"
 name = "geectl"
 path = "src/main.rs"
 
+[[bin]]
+# Feature-gated generator for man pages and shell completions; never linked
+# into the shipped binary.
+name = "geectl-gen"
+path = "src/bin/geectl-gen.rs"
+required-features = ["gen"]
+
 [dependencies]
 base64 = "0.23"
 chardetng = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "string"] }
+clap_complete = { version = "4", optional = true }
+clap_mangen = { version = "0.3", optional = true }
 encoding_rs = "0.8"
 fs2 = "0.4"
 # Renders `_service` comments as plain text: the stored file's
@@ -48,3 +57,6 @@ all = { level = "warn", priority = -1 }
 # (do not enable pedantic as warn-as-error — it blocks scaffolding with style
 # nits).
 pedantic = { level = "allow", priority = -1 }
+
+[features]
+gen = ["dep:clap_complete", "dep:clap_mangen"]

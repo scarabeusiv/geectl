@@ -1,11 +1,12 @@
 # Architecture
 
-## Crate shape: lib + bin
+## Crate shape: lib + bins
 
-geectl is one crate with a library and a binary:
+geectl is one crate with a library and two binaries:
 
 `src/lib.rs` — the library. The binary is a thin CLI over it, so tools can link the same logic instead of shelling out to the binary. The library is the core; the binary is one consumer of it.
 `src/main.rs` — the binary. Argument parsing (clap), one exit path, stdout carries only the result payload.
+`src/bin/geectl-gen.rs` — the feature-gated generator for the checked-in man pages and shell completions (`man/`, `completions/`); built only with `--features gen`, never linked into the shipped binary. Regenerate with `cargo run --features gen --bin geectl-gen`; the `assets-drift` CI job fails when the committed assets differ from a fresh regeneration.
 
 The library modules:
 
