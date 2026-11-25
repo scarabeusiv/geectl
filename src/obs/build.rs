@@ -1170,12 +1170,25 @@ pub(crate) fn parse_job_history(body: &str) -> Result<Vec<JobHistoryEntry>, Geec
                 "unexpected OBS job history response: <jobhist> without code",
             )
         })?;
+        // The srcmd5 and verifymd5 are checksums, not free text:
+        // a value that is not exactly 32 hex digits is malformed,
+        // not a history entry to record. Either may be absent.
+        let srcmd5 = match xml_attr(tag, "srcmd5") {
+            Some(value) if is_md5(&value) => Some(value),
+            Some(_) => return Err(malformed()),
+            None => None,
+        };
+        let verifymd5 = match xml_attr(tag, "verifymd5") {
+            Some(value) if is_md5(&value) => Some(value),
+            Some(_) => return Err(malformed()),
+            None => None,
+        };
         entries.push(JobHistoryEntry {
             repository: xml_attr(tag, "repository"),
             arch: xml_attr(tag, "arch"),
             package,
             rev: xml_attr(tag, "rev"),
-            srcmd5: xml_attr(tag, "srcmd5"),
+            srcmd5,
             versrel: xml_attr(tag, "versrel"),
             bcnt: xml_attr_number(tag, "bcnt")?,
             readytime: xml_attr_number(tag, "readytime")?,
@@ -1186,7 +1199,7 @@ pub(crate) fn parse_job_history(body: &str) -> Result<Vec<JobHistoryEntry>, Geec
             workerid: xml_attr(tag, "workerid"),
             hostarch: xml_attr(tag, "hostarch"),
             reason: xml_attr(tag, "reason"),
-            verifymd5: xml_attr(tag, "verifymd5"),
+            verifymd5,
         });
     }
     // The wire order is oldest-first, like the build history, so the
@@ -5764,7 +5777,7 @@ mod tests {
     #[test]
     fn parse_job_history_reads_entries() {
         let parsed = parse_job_history(
-            "<jobhistlist><jobhist repository=\"standard\" arch=\"x86_64\" package=\"foo\" rev=\"3\" srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"2\" readytime=\"1700000000\" starttime=\"1700000060\" endtime=\"1700000120\" code=\"succeeded\" uri=\"http://worker:3000\" workerid=\"w1\" hostarch=\"x86_64\" reason=\"source change\" verifymd5=\"abc\"/></jobhistlist>",
+            "<jobhistlist><jobhist repository=\"standard\" arch=\"x86_64\" package=\"foo\" rev=\"3\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" versrel=\"1.0-1\" bcnt=\"2\" readytime=\"1700000000\" starttime=\"1700000060\" endtime=\"1700000120\" code=\"succeeded\" uri=\"http://worker:3000\" workerid=\"w1\" hostarch=\"x86_64\" reason=\"source change\" verifymd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/></jobhistlist>",
         )
         .unwrap();
         assert_eq!(parsed.len(), 1);
@@ -5777,6 +5790,95 @@ mod tests {
         assert_eq!(entry.starttime, Some(1_700_000_060));
         assert_eq!(entry.endtime, Some(1_700_000_120));
         assert_eq!(entry.reason.as_deref(), Some("source change"));
+        assert_eq!(
+            entry.srcmd5.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            entry.verifymd5.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn parse_job_history_rejects_non_hex_srcmd5_and_verifymd5() {
+        // The srcmd5 and verifymd5 are checksums, not free text:
+        // a non-hex value in either is a malformed history, never
+        // an entry to record.
+        assert_eq!(
+            parse_job_history("<jobhistlist><jobhist package=\"foo\" code=\"succeeded\" srcmd5=\"aaa\"/></jobhistlist>")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ServerError
+        );
+        assert!(
+            parse_job_history("<jobhistlist><jobhist package=\"foo\" code=\"succeeded\" verifymd5=\"aaa\"/></jobhistlist>")
+                .is_err()
+        );
+        assert!(
+            parse_job_history("<jobhistlist><jobhist package=\"foo\" code=\"succeeded\" srcmd5=\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"/></jobhistlist>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_job_history_rejects_wrong_length_srcmd5_and_verifymd5() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        assert!(
+            parse_job_history("<jobhistlist><jobhist package=\"foo\" code=\"succeeded\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"/></jobhistlist>")
+                .is_err()
+        );
+        assert!(
+            parse_job_history("<jobhistlist><jobhist package=\"foo\" code=\"succeeded\" srcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"/></jobhistlist>")
+                .is_err()
+        );
+        assert!(
+            parse_job_history("<jobhistlist><jobhist package=\"foo\" code=\"succeeded\" verifymd5=\"ccccccccccccccccccccccccccccccc\"/></jobhistlist>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_job_history_accepts_32_hex_srcmd5_and_verifymd5() {
+        // Lowercase and uppercase hex both read, carried verbatim.
+        let parsed = parse_job_history(
+            "<jobhistlist><jobhist package=\"foo\" code=\"succeeded\" srcmd5=\"0123456789abcdef0123456789abcdef\" verifymd5=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"/></jobhistlist>",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed[0].srcmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            parsed[0].verifymd5.as_deref(),
+            Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+        );
+        let parsed = parse_job_history(
+            "<jobhistlist><jobhist package=\"foo\" code=\"succeeded\" srcmd5=\"0123456789ABCDEF0123456789ABCDEF\"/></jobhistlist>",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed[0].srcmd5.as_deref(),
+            Some("0123456789ABCDEF0123456789ABCDEF")
+        );
+        // Either may be absent: a minimal entry is still enough.
+        let parsed = parse_job_history(
+            "<jobhistlist><jobhist package=\"foo\" code=\"succeeded\"/></jobhistlist>",
+        )
+        .unwrap();
+        assert_eq!(parsed[0].srcmd5, None);
+        assert_eq!(parsed[0].verifymd5, None);
+    }
+
+    #[test]
+    fn parse_job_history_rejects_escape_sequence_in_srcmd5() {
+        // An escape sequence smuggled into the md5 unescapes to a
+        // value that is not 32 hex digits, so the history is
+        // malformed.
+        assert!(
+            parse_job_history("<jobhistlist><jobhist package=\"foo\" code=\"succeeded\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;\"/></jobhistlist>")
+                .is_err()
+        );
     }
 
     #[test]
