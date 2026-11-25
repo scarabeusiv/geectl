@@ -1771,7 +1771,7 @@ _arguments "${_arguments_options[@]}" : \
 '--multibuild[Expand multibuild flavors into their own statuses]' \
 '--locallink[Follow local links when expanding multibuild flavors]' \
 '--lastbuild[The last build'\''s results instead of the current state]' \
-'(--oldstate)--all-instances[Merge the results from every configured instance into one view, instead of only the instance currently pointed at. Cannot combine with \`--oldstate\`\: a state hash is per instance]' \
+'(--oldstate)--all-instances[Merge the results from every configured instance into one view, instead of only the instance currently pointed at. Cannot combine with \`--oldstate\`\: a state hash is per instance. A partially-failing read still exits 0\: per-instance errors render in the view and payload, and only an every-instance failure is an error]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \

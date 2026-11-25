@@ -34,7 +34,7 @@ The last build\*(Aqs results instead of the current state
 Poll for changes since this state hash (from a previous run). Only `results` takes it: `wait\-for\-results` polls plainly
 .TP
 \fB\-\-all\-instances\fR
-Merge the results from every configured instance into one view, instead of only the instance currently pointed at. Cannot combine with `\-\-oldstate`: a state hash is per instance
+Merge the results from every configured instance into one view, instead of only the instance currently pointed at. Cannot combine with `\-\-oldstate`: a state hash is per instance. A partially\-failing read still exits 0: per\-instance errors render in the view and payload, and only an every\-instance failure is an error
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
