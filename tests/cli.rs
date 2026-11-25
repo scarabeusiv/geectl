@@ -5280,13 +5280,22 @@ fn branch_branch_dry_run() {
     );
 }
 
-#[test]
-fn branch_branch_live_copies_the_source_repositories() {
-    // The leaf end to end, against routing fake servers for both
-    // backends: the Gitea fork lands, the test project is reused,
-    // the OBS fork lands in it, and the source project's
-    // repositories are copied into it — the PUT bodies carry the
-    // Factory repo (its build blocks) and the second repo verbatim.
+/// Fresh routing fake servers for the `branch branch` live test,
+/// one pair per run: the Gitea fork lands, the test project is
+/// reused, the OBS fork lands in it, and the source project's
+/// repositories are copied into it. The build-results route
+/// answers from a two-answer queue - the baseline read takes the
+/// previous build's matrix and the wait's first poll takes the
+/// settled one - so a run exhausts the queue: the settled answer
+/// is sticky once the queue is empty, and a second run against
+/// the same servers would read the settled matrix as its baseline
+/// and poll it until the deadline, the state never moving past
+/// the baseline. Each run therefore gets its own servers.
+fn branch_live_servers() -> (
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<(String, String, String)>,
+) {
     let fork_body = r#"{"id": 7, "owner": {"login": "fbui"}, "name": "descent3", "full_name": "fbui/descent3", "parent": {"owner": {"login": "jengelh"}, "name": "descent3", "full_name": "jengelh/descent3"}, "default_branch": "master", "private": false, "clone_url": "http://127.0.0.1/fbui/descent3.git", "ssh_url": "gitea@127.0.0.1:fbui/descent3.git"}"#;
     let (gitea_addr, _gitea_rx) = serve_routes_queued(
         "application/json",
@@ -5338,6 +5347,19 @@ fn branch_branch_live_copies_the_source_repositories() {
             ),
         ],
     );
+    (gitea_addr, obs_addr, obs_rx)
+}
+
+#[test]
+fn branch_branch_live_copies_the_source_repositories() {
+    // The leaf end to end, against routing fake servers for both
+    // backends: the Gitea fork lands, the test project is reused,
+    // the OBS fork lands in it, and the source project's
+    // repositories are copied into it — the PUT bodies carry the
+    // Factory repo (its build blocks) and the second repo verbatim.
+    // Each run gets fresh servers: the first run exhausts the
+    // build-results queue (see `branch_live_servers`).
+    let (gitea_addr, obs_addr, obs_rx) = branch_live_servers();
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args([
@@ -5394,8 +5416,9 @@ fn branch_branch_live_copies_the_source_repositories() {
         puts[1]
     );
     // The text rendering names the fork and its scmsync URL; the
-    // second run reuses the fork and re-copies the same
-    // repositories, so the text run needs no fresh server.
+    // second run re-forks and re-copies the same repositories
+    // against fresh servers, so its wait settles the same way.
+    let (gitea_addr, obs_addr, _obs_rx) = branch_live_servers();
     let out = geectl_isolated(&dir)
         .args([
             "--live",

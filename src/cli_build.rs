@@ -615,8 +615,13 @@ pub fn run_build(
             deadline_secs,
         } => {
             let query = query.into_query(None);
-            let results =
-                client.wait_for_results(&project, &query, Duration::from_secs(deadline_secs))?;
+            let results = client.wait_for_results(
+                &project,
+                &query,
+                Duration::from_secs(deadline_secs),
+                None,
+                &[],
+            )?;
             Ok((
                 results_payload(&results),
                 with_header(&header, render_results_text(&results)),

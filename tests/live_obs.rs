@@ -6109,6 +6109,8 @@ fn live_build_results_empty_then_scheduler_reports_the_repo() {
             &source_project,
             &ResultsQuery::default(),
             std::time::Duration::from_secs(30),
+            None,
+            &[],
         )
         .expect("wait on a fresh project");
     assert!(waited.results.is_empty());

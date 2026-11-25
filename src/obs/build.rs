@@ -129,8 +129,20 @@ const WAITING_BUILD_CODES: [&str; 6] = [
 /// never-scheduled package instead of reporting it `unknown`, so
 /// absence is not settled — the wait keeps polling until the package
 /// appears or the deadline passes. Without a filter, an empty matrix
-/// (a project with no repositories) is settled.
-fn results_settled(results: &BuildResults, package: Option<&str>) -> bool {
+/// (a project with no repositories) is settled. A `baseline_state`
+/// additionally requires the matrix state hash to have moved past
+/// it: a reused project still shows the previous build settled, and
+/// that stale matrix is not the new build settling. `expected_repositories`
+/// additionally requires a status for the package in every named
+/// repository: the wait judges only cells that are present, so a
+/// repository whose build has not scheduled yet would otherwise be
+/// invisible and the wait would settle early.
+fn results_settled(
+    results: &BuildResults,
+    package: Option<&str>,
+    baseline_state: Option<&str>,
+    expected_repositories: &[String],
+) -> bool {
     if let Some(package) = package {
         if !results
             .results
@@ -138,6 +150,22 @@ fn results_settled(results: &BuildResults, package: Option<&str>) -> bool {
             .flat_map(|result| result.statuses.iter())
             .any(|status| status.package == package)
         {
+            return false;
+        }
+        if !expected_repositories.iter().all(|repository| {
+            results.results.iter().any(|result| {
+                result.repository == *repository
+                    && result
+                        .statuses
+                        .iter()
+                        .any(|status| status.package == package)
+            })
+        }) {
+            return false;
+        }
+    }
+    if let Some(baseline) = baseline_state {
+        if results.state.as_deref() == Some(baseline) {
             return false;
         }
     }
@@ -2914,7 +2942,12 @@ impl<'a> ObsClient<'a> {
     /// must also appear in the matrix: a never-scheduled package drops
     /// out of a filtered read, and that absence is not settled, so the
     /// poll keeps going until the package appears or the deadline
-    /// passes. The poll reads the matrix every two seconds (less when
+    /// passes. A `baseline_state` additionally requires the matrix
+    /// state hash to have moved past it, and `expected_repositories`
+    /// additionally requires a status for the package in every named
+    /// repository — both are the first-build wait's guards against
+    /// settling on a reused project's stale matrix or before every
+    /// copied repository has scheduled its build. The poll reads the matrix every two seconds (less when
     /// the deadline is nearer, so a sleep never overshoots it); it
     /// deliberately does not send `oldstate`, even though
     /// the server holds an unchanged `oldstate` reply for up to five
@@ -2930,6 +2963,8 @@ impl<'a> ObsClient<'a> {
         project: &str,
         query: &ResultsQuery,
         deadline: std::time::Duration,
+        baseline_state: Option<&str>,
+        expected_repositories: &[String],
     ) -> Result<BuildResults, GeectlError> {
         // Plain polling only: a caller-set `oldstate` would make the
         // server hold an unchanged reply for up to five minutes, past
@@ -2941,7 +2976,12 @@ impl<'a> ObsClient<'a> {
         let start = std::time::Instant::now();
         loop {
             let fetched = self.results(project, &query)?;
-            if results_settled(&fetched, query.package.as_deref()) {
+            if results_settled(
+                &fetched,
+                query.package.as_deref(),
+                baseline_state,
+                expected_repositories,
+            ) {
                 return Ok(fetched);
             }
             if start.elapsed() >= deadline {
@@ -4165,7 +4205,7 @@ mod tests {
         assert_eq!(first.statuses[0].package, "python-MarkupSafe");
         assert_eq!(first.statuses[0].code, "disabled");
         assert_eq!(first.statuses[0].details, None);
-        assert!(results_settled(&parsed, None));
+        assert!(results_settled(&parsed, None, None, &[]));
     }
 
     #[test]
@@ -4183,7 +4223,7 @@ mod tests {
         assert_eq!(blocked.code, "blocked");
         assert_eq!(blocked.details.as_deref(), Some("suspendproject"));
         assert!(blocked.dirty);
-        assert!(!results_settled(&parsed, None));
+        assert!(!results_settled(&parsed, None, None, &[]));
     }
 
     #[test]
@@ -4191,7 +4231,7 @@ mod tests {
         let parsed = parse_build_results("<resultlist state=\"abc\"/>").unwrap();
         assert_eq!(parsed.state.as_deref(), Some("abc"));
         assert!(parsed.results.is_empty());
-        assert!(results_settled(&parsed, None));
+        assert!(results_settled(&parsed, None, None, &[]));
     }
 
     #[test]
@@ -4278,16 +4318,16 @@ mod tests {
                 }],
             }],
         };
-        assert!(results_settled(&settled, None));
+        assert!(results_settled(&settled, None, None, &[]));
         let mut dirty = settled.clone();
         dirty.results[0].dirty = true;
-        assert!(!results_settled(&dirty, None));
+        assert!(!results_settled(&dirty, None, None, &[]));
         let mut building = settled.clone();
         building.results[0].statuses[0].code = "building".to_string();
-        assert!(!results_settled(&building, None));
+        assert!(!results_settled(&building, None, None, &[]));
         let mut scheduled = settled.clone();
         scheduled.results[0].code = "scheduled".to_string();
-        assert!(!results_settled(&scheduled, None));
+        assert!(!results_settled(&scheduled, None, None, &[]));
     }
 
     #[test]
@@ -4310,19 +4350,127 @@ mod tests {
             }],
         };
         // The package is present and settled.
-        assert!(results_settled(&settled, Some("pkg")));
+        assert!(results_settled(&settled, Some("pkg"), None, &[]));
         // A never-scheduled package drops out of a filtered read:
         // absence is not settled, even when every present cell is.
-        assert!(!results_settled(&settled, Some("other")));
+        assert!(!results_settled(&settled, Some("other"), None, &[]));
         // Without a filter the same matrix is settled.
-        assert!(results_settled(&settled, None));
+        assert!(results_settled(&settled, None, None, &[]));
+
         // An empty matrix is settled without a filter, not with one.
         let empty = BuildResults {
             state: None,
             results: Vec::new(),
         };
-        assert!(results_settled(&empty, None));
-        assert!(!results_settled(&empty, Some("pkg")));
+        assert!(results_settled(&empty, None, None, &[]));
+        assert!(!results_settled(&empty, Some("pkg"), None, &[]));
+    }
+
+    #[test]
+    fn results_settled_requires_the_state_to_move_past_the_baseline() {
+        // A reused project still shows the previous build settled:
+        // the matrix must move past the pre-fork state hash before
+        // it counts as the new build settling.
+        let settled = BuildResults {
+            state: Some("abc".to_string()),
+            results: vec![BuildResult {
+                project: "p".to_string(),
+                repository: "r".to_string(),
+                arch: "x86_64".to_string(),
+                code: "published".to_string(),
+                state: "published".to_string(),
+                dirty: false,
+                details: None,
+                statuses: vec![PackageBuildStatus {
+                    package: "pkg".to_string(),
+                    code: "succeeded".to_string(),
+                    details: None,
+                }],
+            }],
+        };
+        // Same state hash as the baseline: stale, not settled.
+        assert!(!results_settled(&settled, Some("pkg"), Some("abc"), &[]));
+        // A moved state hash settles.
+        let mut moved = settled.clone();
+        moved.state = Some("def".to_string());
+        assert!(results_settled(&moved, Some("pkg"), Some("abc"), &[]));
+        // No baseline: the old behaviour, settled.
+        assert!(results_settled(&settled, Some("pkg"), None, &[]));
+        // No state hash on the read: nothing to compare against, so
+        // the baseline cannot block it.
+        let mut no_state = settled.clone();
+        no_state.state = None;
+        assert!(results_settled(&no_state, Some("pkg"), Some("abc"), &[]));
+    }
+
+    #[test]
+    fn results_settled_requires_a_status_in_every_expected_repository() {
+        // Repositories are copied one at a time: a repository whose
+        // build has not scheduled yet has no cell for the package,
+        // and the wait must not settle on the repositories that do.
+        let one_repo = BuildResults {
+            state: None,
+            results: vec![BuildResult {
+                project: "p".to_string(),
+                repository: "Factory".to_string(),
+                arch: "x86_64".to_string(),
+                code: "published".to_string(),
+                state: "published".to_string(),
+                dirty: false,
+                details: None,
+                statuses: vec![PackageBuildStatus {
+                    package: "pkg".to_string(),
+                    code: "succeeded".to_string(),
+                    details: None,
+                }],
+            }],
+        };
+        let repos = vec!["Factory".to_string(), "Tumbleweed".to_string()];
+        // The package is settled in Factory only: not settled while
+        // Tumbleweed has no status for it.
+        assert!(!results_settled(&one_repo, Some("pkg"), None, &repos));
+        // The single copied repository is enough when only it was copied.
+        assert!(results_settled(
+            &one_repo,
+            Some("pkg"),
+            None,
+            &["Factory".to_string()]
+        ));
+        let mut both = one_repo.clone();
+        both.results.push(BuildResult {
+            project: "p".to_string(),
+            repository: "Tumbleweed".to_string(),
+            arch: "x86_64".to_string(),
+            code: "published".to_string(),
+            state: "published".to_string(),
+            dirty: false,
+            details: None,
+            statuses: vec![PackageBuildStatus {
+                package: "pkg".to_string(),
+                code: "succeeded".to_string(),
+                details: None,
+            }],
+        });
+        assert!(results_settled(&both, Some("pkg"), None, &repos));
+        // A cell for the repository without the package's status
+        // does not count as the repository being represented.
+        let mut cell_without_package = one_repo.clone();
+        cell_without_package.results.push(BuildResult {
+            project: "p".to_string(),
+            repository: "Tumbleweed".to_string(),
+            arch: "x86_64".to_string(),
+            code: "published".to_string(),
+            state: "published".to_string(),
+            dirty: false,
+            details: None,
+            statuses: vec![],
+        });
+        assert!(!results_settled(
+            &cell_without_package,
+            Some("pkg"),
+            None,
+            &repos
+        ));
     }
 
     #[test]
@@ -4606,10 +4754,12 @@ mod tests {
                 "testproject",
                 &ResultsQuery::default(),
                 std::time::Duration::from_secs(30),
+                None,
+                &[],
             )
             .unwrap();
         assert_eq!(parsed.results.len(), 4);
-        assert!(results_settled(&parsed, None));
+        assert!(results_settled(&parsed, None, None, &[]));
         assert_eq!(
             http.get_calls(),
             vec![
@@ -4637,9 +4787,15 @@ mod tests {
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let parsed = client
-            .wait_for_results("testproject", &query, std::time::Duration::from_secs(30))
+            .wait_for_results(
+                "testproject",
+                &query,
+                std::time::Duration::from_secs(30),
+                None,
+                &[],
+            )
             .unwrap();
-        assert!(results_settled(&parsed, None));
+        assert!(results_settled(&parsed, None, None, &[]));
         assert_eq!(
             http.get_calls(),
             vec![
@@ -4667,9 +4823,11 @@ mod tests {
                 "testproject",
                 &ResultsQuery::default(),
                 std::time::Duration::from_secs(30),
+                None,
+                &[],
             )
             .unwrap();
-        assert!(results_settled(&parsed, None));
+        assert!(results_settled(&parsed, None, None, &[]));
         assert_eq!(http.get_calls().len(), 1);
     }
 
@@ -4685,6 +4843,8 @@ mod tests {
                 "testproject",
                 &ResultsQuery::default(),
                 std::time::Duration::ZERO,
+                None,
+                &[],
             )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Timeout);
@@ -4708,6 +4868,8 @@ mod tests {
                 "testproject",
                 &ResultsQuery::default(),
                 std::time::Duration::from_millis(150),
+                None,
+                &[],
             )
             .unwrap_err();
         let elapsed = start.elapsed();
@@ -4734,7 +4896,13 @@ mod tests {
             ..ResultsQuery::default()
         };
         let parsed = client
-            .wait_for_results("testproject", &query, std::time::Duration::from_secs(30))
+            .wait_for_results(
+                "testproject",
+                &query,
+                std::time::Duration::from_secs(30),
+                None,
+                &[],
+            )
             .unwrap();
         assert_eq!(parsed.results.len(), 1);
         assert_eq!(parsed.results[0].statuses.len(), 1);
@@ -4754,7 +4922,7 @@ mod tests {
             ..ResultsQuery::default()
         };
         let err = client
-            .wait_for_results("testproject", &query, std::time::Duration::ZERO)
+            .wait_for_results("testproject", &query, std::time::Duration::ZERO, None, &[])
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Timeout);
         assert_eq!(http.get_calls().len(), 1);
