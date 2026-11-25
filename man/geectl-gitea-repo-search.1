@@ -1,0 +1,18 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-gitea-repo-search 1  "geectl-gitea-repo-search 0.2.2" 
+.SH NAME
+geectl\-gitea\-repo\-search \- Search repositories across the instance by keyword: the keyword matches the name and the description. The Gitea counterpart of `remote search\-packages` / `remote search\-projects`
+.SH SYNOPSIS
+\fBgeectl gitea repo\-search\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIQUERY\fR> 
+.SH DESCRIPTION
+Search repositories across the instance by keyword: the keyword matches the name and the description. The Gitea counterpart of `remote search\-packages` / `remote search\-projects`
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIQUERY\fR>
+The search keyword
+.SH VERSION
+v0.2.2

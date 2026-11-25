@@ -352,6 +352,9 @@ _geectl() {
             geectl__subcmd__gitea,repo-list)
                 cmd="geectl__subcmd__gitea__subcmd__repo__subcmd__list"
                 ;;
+            geectl__subcmd__gitea,repo-search)
+                cmd="geectl__subcmd__gitea__subcmd__repo__subcmd__search"
+                ;;
             geectl__subcmd__gitea__subcmd__help,branch-get)
                 cmd="geectl__subcmd__gitea__subcmd__help__subcmd__branch__subcmd__get"
                 ;;
@@ -381,6 +384,9 @@ _geectl() {
                 ;;
             geectl__subcmd__gitea__subcmd__help,repo-list)
                 cmd="geectl__subcmd__gitea__subcmd__help__subcmd__repo__subcmd__list"
+                ;;
+            geectl__subcmd__gitea__subcmd__help,repo-search)
+                cmd="geectl__subcmd__gitea__subcmd__help__subcmd__repo__subcmd__search"
                 ;;
             geectl__subcmd__help,add)
                 cmd="geectl__subcmd__help__subcmd__add"
@@ -588,6 +594,9 @@ _geectl() {
                 ;;
             geectl__subcmd__help__subcmd__gitea,repo-list)
                 cmd="geectl__subcmd__help__subcmd__gitea__subcmd__repo__subcmd__list"
+                ;;
+            geectl__subcmd__help__subcmd__gitea,repo-search)
+                cmd="geectl__subcmd__help__subcmd__gitea__subcmd__repo__subcmd__search"
                 ;;
             geectl__subcmd__help__subcmd__local__subcmd__build,build)
                 cmd="geectl__subcmd__help__subcmd__local__subcmd__build__subcmd__build"
@@ -3253,7 +3262,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__gitea)
-            opts="-h --format --debug --debug-body --live --help repo-get repo-list repo-create repo-delete repo-fork branch-list branch-get branch-head maintainers help"
+            opts="-h --format --debug --debug-body --live --help repo-get repo-list repo-search repo-create repo-delete repo-fork branch-list branch-get branch-head maintainers help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3325,7 +3334,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__gitea__subcmd__help)
-            opts="repo-get repo-list repo-create repo-delete repo-fork branch-list branch-get branch-head maintainers help"
+            opts="repo-get repo-list repo-search repo-create repo-delete repo-fork branch-list branch-get branch-head maintainers help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3478,6 +3487,20 @@ _geectl() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        geectl__subcmd__gitea__subcmd__help__subcmd__repo__subcmd__search)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         geectl__subcmd__gitea__subcmd__maintainers)
             opts="-h --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -3599,6 +3622,24 @@ _geectl() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --format)
+                    COMPREPLY=($(compgen -W "json text" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__gitea__subcmd__repo__subcmd__search)
+            opts="-h --format --debug --debug-body --live --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 --format)
                     COMPREPLY=($(compgen -W "json text" -- "${cur}"))
                     return 0
@@ -4227,7 +4268,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help__subcmd__gitea)
-            opts="repo-get repo-list repo-create repo-delete repo-fork branch-list branch-get branch-head maintainers"
+            opts="repo-get repo-list repo-search repo-create repo-delete repo-fork branch-list branch-get branch-head maintainers"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4353,6 +4394,20 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help__subcmd__gitea__subcmd__repo__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__help__subcmd__gitea__subcmd__repo__subcmd__search)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -7365,7 +7420,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__pull__subcmd__request__subcmd__merge)
-            opts="-h --message --method --force --format --debug --debug-body --live --help"
+            opts="-h --message --method --force --no-forward --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -9411,7 +9466,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__request__subcmd__accept)
-            opts="-h --comment --force --format --debug --debug-body --live --help"
+            opts="-h --comment --force --no-forward --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

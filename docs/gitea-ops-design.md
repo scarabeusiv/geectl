@@ -86,6 +86,7 @@ bare SHA.
 |---|---|
 | `gitea repo-get <OWNER/REPO>` | Read one repo: default branch, parent, clone URLs |
 | `gitea repo-list [--owner …] [--org …]` | List repos: a user's, an org's, or the token owner's |
+| `gitea repo-search <QUERY>` | Search repos by keyword: the keyword matches the name and the description |
 | `gitea repo-create <NAME> [--private] [--description …] [--default-branch …]` | Create a repo |
 | `gitea repo-delete <OWNER/REPO>` | Delete a repo; a dry run reports the plan, a live delete needs `--force` to confirm and then reads the repo to confirm owner and name |
 | `gitea repo-fork <OWNER/REPO> [--organization …] [--new-name …]` | Fork a repo |
@@ -280,6 +281,7 @@ the devel branch. The CLI `submit` verb is `pull-request submit`.
 |---|---|---|
 | `repo_get(owner, repo)` | `GET /api/v1/repos/{owner}/{repo}` | Resolve the default branch; verify a fork's parent by re-reading; the read every later operation builds on |
 | `repo_list(owner?, org?)` | `GET /api/v1/orgs/{org}/repos`, `/api/v1/users/{user}/repos`, `/api/v1/user/repos` | Find the agent's forks or an org's repos before acting on one |
+| `repo_search(query)` | `GET /api/v1/repos/search?q=...&includeDesc=true` | Find a repo by keyword (name and description) before acting on one — the Gitea counterpart of the OBS keyword search |
 | `repo_create(name, options)` | `POST /api/v1/user/repos` | Create the repo a new git-backed package's sources live in |
 | `repo_delete(owner, repo)` | `DELETE /api/v1/repos/{owner}/{repo}` | Delete a fork after the OBS branch is gone, or for cleanup |
 | `branch_get(owner, repo, branch)` / `branch_list(owner, repo)` | `GET /api/v1/repos/{owner}/{repo}/branches[/{branch}]` | Verify a branch exists before naming it in a scmsync URL; list what a fork carries |

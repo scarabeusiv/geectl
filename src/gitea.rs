@@ -2542,6 +2542,32 @@ impl<'a> GiteaClient<'a> {
         )
     }
 
+    /// Search repositories across the instance (`GET
+    /// /api/v1/repos/search?q=...`): the keyword matches the name
+    /// and, with `includeDesc`, the description — the same match
+    /// surface as the OBS `search_packages` substring match over
+    /// name, title, and description (a repo has no separate title).
+    /// The search answers a wrapped page (`{"ok": true, "data":
+    /// [...]}`) of the same Repository objects the list endpoints
+    /// answer, paginated internally and bounded like `repo_list`;
+    /// past the bound the call fails naming the list, never a
+    /// silent truncation — narrow the query instead. An empty query
+    /// is an error before any call.
+    pub fn repo_search(&self, query: &str) -> Result<Vec<GiteaRepository>, GeectlError> {
+        if query.is_empty() {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "repo search query must not be empty",
+            ));
+        }
+        self.search_paged::<GiteaRepository>(
+            &["api", "v1", "repos", "search"],
+            &[("q", query), ("includeDesc", "true")],
+            &format!("repositories matching {query:?}"),
+            "narrow the search query",
+        )
+    }
+
     /// List the reviews on a pull request (`GET
     /// /api/v1/repos/{owner}/{repo}/pulls/{number}/reviews`): one
     /// entry per review, in order. Paginates internally and is
@@ -6106,6 +6132,129 @@ mod tests {
         );
         let users = client(&http).user_search("user").unwrap();
         assert_eq!(users.len(), 500);
+    }
+
+    /// A repo-search JSON body, shaped like Gitea 1.24.7 answers
+    /// for `GET /api/v1/repos/search`: the `ok` flag plus the
+    /// `data` page of repository objects.
+    fn repo_search_json(repos: &[String]) -> String {
+        format!(r#"{{"ok": true, "data": [{}]}}"#, repos.join(","))
+    }
+
+    #[test]
+    fn repo_search_parses_repositories_and_ignores_unknown_fields() {
+        // The repo JSON carries the unknown `future_field` the
+        // list tests already pin; the search answers the same
+        // Repository objects as the list endpoints.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/search?q=geectl&includeDesc=true&page=1&limit=50",
+            &repo_search_json(&[
+                repo_json("openSUSE", "geectl", None),
+                repo_json("pool", "systemd", None),
+            ]),
+        );
+        let repos = client(&http).repo_search("geectl").unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].full_name, "openSUSE/geectl");
+        assert_eq!(repos[0].default_branch, "factory");
+        assert!(!repos[0].private);
+        assert_eq!(repos[0].description.as_deref(), Some(""));
+        assert_eq!(
+            repos[0].clone_url,
+            "https://src.opensuse.org/openSUSE/geectl.git"
+        );
+        assert_eq!(repos[1].full_name, "pool/systemd");
+    }
+
+    #[test]
+    fn repo_search_empty_data_is_an_empty_list() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/search?q=nobody&includeDesc=true&page=1&limit=50",
+            r#"{"ok": true, "data": []}"#,
+        );
+        let repos = client(&http).repo_search("nobody").unwrap();
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn repo_search_not_ok_fails() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/search?q=geectl&includeDesc=true&page=1&limit=50",
+            r#"{"ok": false, "data": []}"#,
+        );
+        let err = client(&http)
+            .repo_search("geectl")
+            .expect_err("an ok:false search must fail");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.to_string().contains("repositories matching \"geectl\""),
+            "the search failure must name the search; got {err}"
+        );
+    }
+
+    #[test]
+    fn repo_search_unexpected_shape_fails() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/search?q=geectl&includeDesc=true&page=1&limit=50",
+            "[{\"full_name\": \"openSUSE/geectl\"}]",
+        );
+        let err = client(&http)
+            .repo_search("geectl")
+            .expect_err("a bare array is not a search response");
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn repo_search_rejects_an_empty_query_without_http() {
+        let http = FakeHttp::new();
+        assert!(client(&http).repo_search("").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn repo_search_paginates() {
+        let page1 = fifty_repos("openSUSE");
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/search?q=repo&includeDesc=true&page=1&limit=50",
+                &repo_search_json(&page1),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/search?q=repo&includeDesc=true&page=2&limit=50",
+                &repo_search_json(&[repo_json("openSUSE", "repo-50", None)]),
+            );
+        let repos = client(&http).repo_search("repo").unwrap();
+        assert_eq!(repos.len(), 51);
+        assert_eq!(repos[50].full_name, "openSUSE/repo-50");
+    }
+
+    #[test]
+    fn repo_search_bound_fails_instead_of_truncating() {
+        // Ten full pages (500 repos) and page 11 still has one
+        // more: the call fails naming the query and the remedy,
+        // instead of silently returning the first 500.
+        let page = repo_search_json(&fifty_repos("openSUSE"));
+        let mut http = FakeHttp::new();
+        for n in 1..=10 {
+            http = http.with_get(
+                &format!("https://src.opensuse.org/api/v1/repos/search?q=repo&includeDesc=true&page={n}&limit=50"),
+                &page,
+            );
+        }
+        http = http.with_get(
+            "https://src.opensuse.org/api/v1/repos/search?q=repo&includeDesc=true&page=11&limit=50",
+            &repo_search_json(&[repo_json("openSUSE", "repo-500", None)]),
+        );
+        let err = client(&http).repo_search("repo").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("repositories matching \"repo\""),
+            "the bound error must name the query; got {err}"
+        );
+        assert!(
+            err.to_string().contains("narrow the search query"),
+            "a search can be narrowed, so the error must name the remedy; got {err}"
+        );
     }
 
     #[test]

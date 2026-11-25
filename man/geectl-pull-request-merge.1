@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH geectl-pull-request-merge 1  "geectl-pull-request-merge 0.2.2" 
 .SH NAME
-geectl\-pull\-request\-merge \- Merge a pull request. On OBS this accepts the submit request; on Gitea it merges the pull request. Dry\-run by default; mutates only with `\-\-live`
+geectl\-pull\-request\-merge \- Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless `\-\-no\-forward` is given. Dry\-run by default; mutates only with `\-\-live`
 .SH SYNOPSIS
-\fBgeectl pull\-request merge\fR [\fB\-\-message\fR] [\fB\-\-method\fR] [\fB\-\-force\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+\fBgeectl pull\-request merge\fR [\fB\-\-message\fR] [\fB\-\-method\fR] [\fB\-\-force\fR] [\fB\-\-no\-forward\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
 .SH DESCRIPTION
-Merge a pull request. On OBS this accepts the submit request; on Gitea it merges the pull request. Dry\-run by default; mutates only with `\-\-live`
+Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless `\-\-no\-forward` is given. Dry\-run by default; mutates only with `\-\-live`
 .SH OPTIONS
 .TP
 \fB\-\-message\fR \fI<MESSAGE>\fR
@@ -33,6 +33,9 @@ fast\-forward\-only
 .TP
 \fB\-\-force\fR
 Accept past open reviews (OBS only; refused on a Gitea ref)
+.TP
+\fB\-\-no\-forward\fR
+Do not forward the pull request after merging it: by default a merged Gitea pull request is forwarded to its link parent. (Gitea only; refused on an OBS ref.)
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

@@ -292,6 +292,7 @@ without evaluating trust.
 
 - `geectl gitea repo-get <OWNER> <REPO>` — Show a repository: owner, default branch, privacy, clone URLs.
 - `geectl gitea repo-list` — List repositories: the token owner's own repos, one user's repos with `--owner`, one organization's with `--org`, or both (the user's first, then the organization's); key flags: --owner <OWNER>, --org <ORG>
+- `geectl gitea repo-search <QUERY>` — Search repositories across the instance by keyword: the keyword matches the name and the description. The Gitea counterpart of `remote search-packages` / `remote search-projects`.
 - `geectl gitea repo-create <NAME>` — Create a repository under the token owner's account; key flags: --private, --description <DESCRIPTION>, --default-branch <DEFAULT_BRANCH>
 - `geectl gitea repo-delete <OWNER> <REPO>` — Delete a repository; key flags: --force
 - `geectl gitea repo-fork <OWNER> <REPO>` — Fork a repository into the token owner's account (or an organization with `--organization`); key flags: --new-name <NEW_NAME>, --organization <ORGANIZATION>
@@ -395,6 +396,7 @@ geectl --live service trigger openSUSE:Factory vim
 
 # Gitea (needs GEECTL_GITEA_TOKEN, or GEECTL_GITEA_TOKEN_<ALIAS> for an aliased instance, even in dry-run)
 geectl gitea repo-get pool systemd
+geectl gitea repo-search geectl
 geectl gitea branch-head pool systemd factory
 geectl gitea maintainers pool systemd
 geectl gitea repo-create vim --private

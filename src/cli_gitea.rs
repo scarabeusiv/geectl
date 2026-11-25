@@ -25,9 +25,10 @@
 //! content command `branch-head`, whose text IS the bare SHA.
 //! Tables stay as designed.
 //!
-//! Documented omissions (not gaps): `repo-list` text
-//! carries no clone URLs (identifiers stay; the URLs are in the
-//! JSON payload) and no fork parent (the parent is in the JSON
+//! Documented omissions (not gaps): `repo-list` and `repo-search`
+//! text carry no clone URLs (identifiers stay; the URLs are in the
+//! JSON payload), no fork parent (the parent is in the JSON
+//! payload), and no description (long free text, in the JSON
 //! payload); `branch-list` text carries the full head SHA (the
 //! sync-verification primitive) but no commit message (long free
 //! text); `repo-get` text carries no description or website (long
@@ -62,6 +63,14 @@ pub enum GiteaCommand {
     /// repos with `--owner`, one organization's with `--org`, or both
     /// (the user's first, then the organization's).
     RepoList(RepoListArgs),
+    /// Search repositories across the instance by keyword: the
+    /// keyword matches the name and the description. The Gitea
+    /// counterpart of `remote search-packages` / `remote
+    /// search-projects`.
+    RepoSearch {
+        /// The search keyword.
+        query: String,
+    },
     /// Create a repository under the token owner's account. A
     /// mutation: dry-run is the default (only the plan is printed);
     /// `--live` performs the creation.
@@ -191,6 +200,17 @@ pub fn run_gitea(
             Ok((
                 payload,
                 with_header(&repo_list_header(&args), render_repositories(&repos)),
+            ))
+        }
+        GiteaCommand::RepoSearch { query } => {
+            let repos = client.repo_search(&query)?;
+            let payload = json!({
+                "query": query,
+                "repositories": repos.iter().map(gitea_repository_json).collect::<Vec<_>>(),
+            });
+            Ok((
+                payload,
+                with_header(&repo_search_header(&query), render_repositories(&repos)),
             ))
         }
         GiteaCommand::RepoCreate(args) => {
@@ -450,6 +470,11 @@ fn repo_list_header(args: &RepoListArgs) -> String {
         parts.push(format!("org: {org}"));
     }
     parts.join(" ")
+}
+
+/// The `repo-search` coordinate header: the keyword searched for.
+fn repo_search_header(query: &str) -> String {
+    format!("query: {query}")
 }
 
 fn gitea_repository_json(repository: &GiteaRepository) -> Value {
@@ -765,6 +790,10 @@ mod tests {
                 org: Some(org),
             }) if owner == "alice" && org == "pool"
         ));
+        assert!(matches!(
+            parse(&["geectl", "gitea", "repo-search", "geectl"]),
+            GiteaCommand::RepoSearch { query } if query == "geectl"
+        ));
         let parsed = parse(&[
             "geectl",
             "gitea",
@@ -953,6 +982,20 @@ mod tests {
             .find(|line| line.contains("alice/systemd"))
             .expect("fork row present");
         assert!(row.ends_with("no"), "{row}");
+    }
+
+    #[test]
+    fn repo_search_text_carries_the_query_header() {
+        assert_eq!(repo_search_header("geectl"), "query: geectl");
+        let text = with_header(
+            &repo_search_header("geectl"),
+            render_repositories(&[sample_repository(), sample_fork()]),
+        );
+        assert!(text.starts_with("query: geectl\n"));
+        assert!(text.contains("pool/systemd"));
+        assert!(text.contains("alice/systemd"));
+        let empty = with_header(&repo_search_header("nobody"), render_repositories(&[]));
+        assert_eq!(empty, "query: nobody\nno repositories");
     }
 
     #[test]
