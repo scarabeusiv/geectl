@@ -29,11 +29,12 @@
 //! pair is stated in `docs/cli.md`.
 
 use crate::auth::{same_api_url, EnvObsAuth};
+use crate::cli_build::{render_results_text, results_payload};
 use crate::cli_gitea::gitea_client;
 use crate::config;
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
-use crate::gitea::{ForkOptions, ForkResult};
+use crate::gitea::{FirstBuild, ForkOptions, ForkResult};
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
     BranchOptions, BranchResult, CopyOptions, CopyProjectOptions, DryRun, LinkOptions,
@@ -114,6 +115,11 @@ pub struct BranchArgs {
     /// The branch package name. Without it, the source package name.
     #[arg(long)]
     target_package: Option<String>,
+    /// Seconds to wait for the first build of the forked package in
+    /// the fork's test project; 0 skips the wait and reports the
+    /// branch without a build.
+    #[arg(long, default_value_t = 600)]
+    first_build_deadline_secs: u64,
 }
 
 /// Arguments for `branch branch-package`.
@@ -598,6 +604,7 @@ fn branch(args: BranchArgs, debug: &Debug, live: bool) -> Result<(Value, String)
         no_devel_project: args.no_devel_project,
         target_project: args.target_project.clone(),
         target_package: args.target_package.clone(),
+        first_build_deadline_secs: Some(args.first_build_deadline_secs),
     };
     let dry_run = dry_run_for(live, debug);
     let http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
@@ -639,7 +646,8 @@ fn branch(args: BranchArgs, debug: &Debug, live: bool) -> Result<(Value, String)
 }
 
 /// A live branch-composite result as JSON: the requested source
-/// plus the fork and the server-resolved target.
+/// plus the fork, the server-resolved target, and the first-build
+/// report.
 fn fork_result_json(args: &BranchArgs, result: &ForkResult) -> Value {
     json!({
         "source_project": args.project,
@@ -652,15 +660,36 @@ fn fork_result_json(args: &BranchArgs, result: &ForkResult) -> Value {
         "target_package": result.target_package,
         "clone_url": result.clone_url,
         "ssh_url": result.ssh_url,
+        "first_build": first_build_json(&result.first_build),
+    })
+}
+
+/// The first-build report as JSON: its state plus the results matrix
+/// when one was read.
+fn first_build_json(first_build: &FirstBuild) -> Value {
+    let (state, results, error) = match first_build {
+        FirstBuild::Settled(results) => ("settled", Some(results), None),
+        FirstBuild::StillRunning(results) => ("still_running", Some(results), None),
+        FirstBuild::NotWaited => ("not_waited", None, None),
+        FirstBuild::NoRepositories => ("no_repositories", None, None),
+        FirstBuild::ProjectFork => ("project_fork", None, None),
+        FirstBuild::Unreadable(error) => ("unreadable", None, Some(error)),
+    };
+    json!({
+        "state": state,
+        "results": results.map(results_payload),
+        "error": error,
     })
 }
 
 /// Render a live branch-composite result: the header carries the
 /// source and the server-resolved target, then the fork and its
-/// scmsync URL. Text omission: the clone URLs are JSON-only — the
-/// agent clones from the payload, the text names the fork.
+/// scmsync URL, then the first-build report: its state, and the
+/// results matrix when one was read. Text omission: the clone URLs
+/// are JSON-only — the agent clones from the payload, the text names
+/// the fork.
 fn render_fork_result_text(args: &BranchArgs, result: &ForkResult) -> Vec<String> {
-    vec![
+    let mut lines = vec![
         header(
             "branch",
             coords(&args.project, &args.package),
@@ -668,7 +697,22 @@ fn render_fork_result_text(args: &BranchArgs, result: &ForkResult) -> Vec<String
         ),
         format!("fork: {}/{}#{}", result.owner, result.repo, result.branch),
         format!("scmsync: {}", result.scmsync),
-    ]
+    ];
+    match &result.first_build {
+        FirstBuild::Settled(results) => {
+            lines.push("first build: settled".to_string());
+            lines.extend(render_results_text(results).lines().map(str::to_string));
+        }
+        FirstBuild::StillRunning(results) => {
+            lines.push("first build: still running".to_string());
+            lines.extend(render_results_text(results).lines().map(str::to_string));
+        }
+        FirstBuild::NotWaited => lines.push("first build: not waited".to_string()),
+        FirstBuild::NoRepositories => lines.push("first build: no repositories".to_string()),
+        FirstBuild::ProjectFork => lines.push("first build: project fork".to_string()),
+        FirstBuild::Unreadable(error) => lines.push(format!("first build: unreadable: {error}")),
+    }
+    lines
 }
 
 fn branch_package(
@@ -1209,6 +1253,8 @@ mod tests {
             "home:fbui:test:descent3",
             "--target-package",
             "descent3",
+            "--first-build-deadline-secs",
+            "30",
         ]) else {
             panic!("wrong variant");
         };
@@ -1223,6 +1269,7 @@ mod tests {
             Some("home:fbui:test:descent3")
         );
         assert_eq!(args.target_package.as_deref(), Some("descent3"));
+        assert_eq!(args.first_build_deadline_secs, 30);
     }
 
     #[test]

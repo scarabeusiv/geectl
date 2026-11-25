@@ -1714,7 +1714,7 @@ fn opt_num_line(label: &str, value: &Option<u64>) -> Option<String> {
 
 /// The results matrix as JSON: the state hash plus one object per
 /// repository/architecture cell, each with its per-package codes.
-fn results_payload(results: &BuildResults) -> Value {
+pub(crate) fn results_payload(results: &BuildResults) -> Value {
     json!({
         "state": results.state,
         "results": results.results.iter().map(|cell| json!({
@@ -1743,7 +1743,7 @@ fn results_payload(results: &BuildResults) -> Value {
 /// row for the cell-level code/state — the per-package rows carry the
 /// codes, and the cell detail rides a note line. The cell-level
 /// code/state stay in the JSON payload.
-fn render_results_text(results: &BuildResults) -> String {
+pub(crate) fn render_results_text(results: &BuildResults) -> String {
     if results.results.is_empty() {
         return "no results".to_string();
     }

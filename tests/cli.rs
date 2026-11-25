@@ -5345,6 +5345,25 @@ fn branch_live_servers() -> (
                 "/source/home:fbui:test:descent3/_meta",
                 &[(200, "<status code=\"ok\" />")],
             ),
+            // The build-results route answers in order: the
+            // baseline read takes the previous build's matrix,
+            // and the wait's first poll takes the new build's
+            // settled matrix — a different state, with the package
+            // in both copied repositories.
+            (
+                "GET",
+                "/build/home:fbui:test:descent3/_result",
+                &[
+                    (
+                        200,
+                        "<resultlist state=\"9f2c8e41\"><result project=\"home:fbui:test:descent3\" repository=\"openSUSE_Tumbleweed\" arch=\"x86_64\" code=\"published\" state=\"published\"><status package=\"descent3\" code=\"succeeded\" /></result></resultlist>",
+                    ),
+                    (
+                        200,
+                        "<resultlist state=\"a1b2c3d4\"><result project=\"home:fbui:test:descent3\" repository=\"openSUSE_Factory\" arch=\"x86_64\" code=\"published\" state=\"published\"><status package=\"descent3\" code=\"succeeded\" /></result><result project=\"home:fbui:test:descent3\" repository=\"openSUSE_Tumbleweed\" arch=\"x86_64\" code=\"published\" state=\"published\"><status package=\"descent3\" code=\"succeeded\" /></result></resultlist>",
+                    ),
+                ],
+            ),
         ],
     );
     (gitea_addr, obs_addr, obs_rx)
@@ -5396,6 +5415,13 @@ fn branch_branch_live_copies_the_source_repositories() {
     );
     assert_eq!(value["target_project"], "home:fbui:test:descent3");
     assert_eq!(value["target_package"], "descent3");
+    // The first build settled: the wait read the matrix once and
+    // reported it.
+    assert_eq!(value["first_build"]["state"], "settled");
+    assert_eq!(
+        value["first_build"]["results"]["results"][0]["statuses"][0]["code"],
+        "succeeded"
+    );
     // The copies: one PUT per source repository, each carrying
     // the repository verbatim — Factory first (its build blocks),
     // then the second repo.
@@ -5457,6 +5483,7 @@ fn branch_branch_live_copies_the_source_repositories() {
         )),
         "stdout: {stdout}"
     );
+    assert!(stdout.contains("first build: settled"), "stdout: {stdout}");
 }
 
 #[test]
