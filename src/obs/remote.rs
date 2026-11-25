@@ -3832,9 +3832,22 @@ impl<'a> ObsClient<'a> {
         Ok(self.public_directory(&[project, package], &[])?.linkinfo)
     }
 
+    /// Whether `name` is an internal scmsync file: the server's
+    /// bookkeeping beside a git-backed package's sources, not package
+    /// content. `_scmsync.obsinfo` records the synced commit;
+    /// `build.specials.obscpio` is the synced tree. See
+    /// https://github.com/openSUSE/osc/issues/2240.
+    fn is_scmsync_internal_file(name: &str) -> bool {
+        matches!(name, "_scmsync.obsinfo" | "build.specials.obscpio")
+    }
+
     /// The per-file diff between two listings, one per package:
     /// files added, modified (contents differ), or deleted, each
-    /// with a unified diff. Unchanged files do not appear.
+    /// with a unified diff. Unchanged files do not appear. The
+    /// internal scmsync files (`_scmsync.obsinfo`,
+    /// `build.specials.obscpio`) are skipped on both sides: they are
+    /// server bookkeeping for a git-backed package, not package
+    /// content, so their churn is not a diff.
     fn diff_files(
         &self,
         old_project: &str,
@@ -3846,6 +3859,9 @@ impl<'a> ObsClient<'a> {
     ) -> Result<Vec<FilePatch>, GeectlError> {
         let mut patches = Vec::new();
         for new in new_files {
+            if Self::is_scmsync_internal_file(&new.name) {
+                continue;
+            }
             match old_files.iter().find(|old| old.name == new.name) {
                 None => {
                     // Added: the whole file is new.
@@ -3880,6 +3896,9 @@ impl<'a> ObsClient<'a> {
             }
         }
         for old in old_files {
+            if Self::is_scmsync_internal_file(&old.name) {
+                continue;
+            }
             if !new_files.iter().any(|new| new.name == old.name) {
                 let content = self.cat(old_project, old_package, &old.name, None)?;
                 patches.push(FilePatch {
@@ -3906,6 +3925,7 @@ impl<'a> ObsClient<'a> {
     /// file and two per changed file: a public read, no credentials.
     /// A failed read aborts the whole diff with its error, never a
     /// partial list — including a missing package on either side.
+    /// The internal scmsync files are skipped (see `diff_files`).
     pub fn diff_packages(
         &self,
         old_project: &str,
@@ -12524,6 +12544,44 @@ mod tests {
             ]
         );
         assert!(patches[1].diff.contains("-Version: 1.0\n+Version: 1.1\n"));
+    }
+
+    #[test]
+    fn diff_packages_skips_scmsync_internal_files() {
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/public/source/old/pkg",
+                "<directory><entry name=\"_scmsync.obsinfo\" md5=\"aaa\"/><entry name=\"foo.spec\" md5=\"aaa\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/new/pkg",
+                "<directory><entry name=\"_scmsync.obsinfo\" md5=\"bbb\"/><entry name=\"build.specials.obscpio\" md5=\"ccc\"/><entry name=\"foo.spec\" md5=\"bbb\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/old/pkg/foo.spec",
+                "Version: 1.0\n",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/new/pkg/foo.spec",
+                "Version: 1.1\n",
+            );
+        let client = ObsClient::new(&http);
+        let patches = client.diff_packages("old", "pkg", "new", "pkg").unwrap();
+        assert_eq!(
+            patches
+                .iter()
+                .map(|file| file.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["foo.spec"]
+        );
+        assert!(
+            http.get_calls()
+                .iter()
+                .all(|(url, _)| !url.contains("_scmsync.obsinfo")
+                    && !url.contains("build.specials.obscpio")),
+            "scmsync files must not be fetched: {:?}",
+            http.get_calls()
+        );
     }
 
     #[test]
