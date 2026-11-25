@@ -2,7 +2,7 @@
 
 osc source: openSUSE/osc @ `89f6bdc`.
 
-**Scope: adopt the pinning cases**. Adopt the osc test cases that pin behaviour geectl is building, as unit tests or as live tests; write the rest from scratch. The point is to cover every case osc covers.
+**Scope: adopt the pinning cases**. Adopt the osc test cases that pin behaviour geectl is building, as unit tests or as live tests; write the rest from scratch. The point is to cover every in-scope case osc covers.
 
 Surveyed: osc's Behave suite (77 feature files, 272 scenarios) and unit suite (58 files, 707 test methods) — 979 items. Adopted as written: 227 (120 behave scenarios, 107 unit tests), plus protocol specs. The rest is SKIP (osc-internal), stdout-only, covered by geectl's existing tests, or a gap with no implementation yet.
 
