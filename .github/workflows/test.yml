@@ -76,13 +76,17 @@ jobs:
           # the live tests quietly.
           GEECTL_GITEA_EXPECTED: "1"
         run: cargo test --locked
+      # The generator binary is feature-gated, so the default test
+      # run never builds it: its tests run here, with the feature on.
+      - name: Run the generator tests
+        run: cargo test --locked --features gen --bin geectl-gen
       - name: Tear down disposable Gitea instance
         if: always()
         run: bash tests/gitea/teardown.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --features gen --locked -- -D warnings
 
   # Devel (beta) compiler, non-failing: an early-warning leg for upcoming
   # toolchain breaks. rust-toolchain.toml outranks the dtolnay default, so

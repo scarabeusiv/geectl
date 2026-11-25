@@ -1,0 +1,57 @@
+name: assets-drift
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel a superseded run of the same workflow on the same ref, but only
+# for pull requests: a push to main must never cancel a running main
+# build. Matches test.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The man pages and shell completions are checked in under
+  # {man,completions}; regenerate them from the clap Command and fail if
+  # the committed assets drifted. Matches rpmcrab's assets-drift job.
+  assets-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Pinned to the v4 tag's commit so the action cannot move under us;
+      # Dependabot tracks SHA pins and proposes updates.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The toolchain is derived from Cargo.toml `rust-version` (the single
+      # source of truth) by the shared read-rust-version step; see test.yml.
+      - uses: ./.github/actions/read-rust-version
+        id: toolchain
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.value }}
+      # Pinned to the v2 tag's commit; Dependabot tracks SHA pins and
+      # proposes updates. Plain cache (no OS-release scoping): geectl
+      # is pure Rust with no bindgen or system libraries, so the cache
+      # is not tied to a distro release the way rpmcrab's is.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          workspaces: . -> target
+      # Regenerate into a scratch directory and fail if the committed
+      # assets differ: a clap change must regenerate man/ and
+      # completions/ in the same PR. Regenerate locally with
+      # `cargo run --features gen --bin geectl-gen` and commit the result.
+      - name: Regenerate man pages and completions
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo run --locked --features gen --bin geectl-gen -- /tmp/geectl-gen-assets
+      - name: Fail on drift
+        run: |
+          diff -r man /tmp/geectl-gen-assets/man
+          diff -r completions /tmp/geectl-gen-assets/completions
