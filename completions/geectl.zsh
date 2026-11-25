@@ -1101,6 +1101,7 @@ _arguments "${_arguments_options[@]}" : \
 '--comment=[The message left with the accept. Values starting with \`-\` are taken literally\: a comment may open with a \`- \` bullet]:COMMENT:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--force[Accept a request still in \`review\` state, overriding its open reviews]' \
+'--no-forward[Do not forward the request after accepting it\: by default an accepted request is forwarded to its link parent]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
@@ -2848,6 +2849,7 @@ _arguments "${_arguments_options[@]}" : \
 '--method=[The Gitea merge style (Gitea only; refused on an OBS ref)]:METHOD:(merge rebase rebase-merge squash fast-forward-only)' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--force[Accept past open reviews (OBS only; refused on a Gitea ref)]' \
+'--no-forward[Do not forward the pull request after merging it\: by default a merged Gitea pull request is forwarded to its link parent. (Gitea only; refused on an OBS ref.)]' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
 '--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
 '--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
@@ -5428,7 +5430,7 @@ _geectl__subcmd__help__subcmd__pull-request_commands() {
 'comment:Comment on a pull request. Dry-run by default; mutates only with \`--live\`' \
 'comments:List the comments on a pull request, oldest first. A read, always live' \
 'cancel-review-request:Cancel pending review requests on a pull request. Dry-run by default; mutates only with \`--live\`. On OBS the cancel fails closed' \
-'merge:Merge a pull request. On OBS this accepts the submit request; on Gitea it merges the pull request. Dry-run by default; mutates only with \`--live\`' \
+'merge:Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless \`--no-forward\` is given. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a pull request. On OBS this changes the request state to declined; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'withdraw:Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'reopen:Reopen a pull request. On OBS this changes a declined request back to \`new\`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with \`--live\`' \
@@ -5799,7 +5801,7 @@ _geectl__subcmd__help__subcmd__request_commands() {
 'list:List submit requests\: the same search, with the states still awaiting action (new, review) as the default. A thin wrapper over the search operation\: the flags select the same server-side search' \
 'diff:Show the diff of a submit request\: the unified diff, or the request XML with the diff injected with \`--xml\`' \
 'list-comments:List the comments on a submit request, in id order' \
-'accept:Accept a submit request, with a comment as the message left with the accept' \
+'accept:Accept a submit request, with a comment as the message left with the accept. An accepted request is forwarded to its link parent unless \`--no-forward\` is given; a refused forward is reported and the accepted request stands, with the work staying queued in the devel project. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a submit request, with a comment as the reason' \
 'revoke:Revoke (withdraw) a submit request, with a comment as the reason' \
 'change-state:Change a submit request'\''s state to one of new/review/accepted/declined/revoked' \
@@ -6303,7 +6305,7 @@ _geectl__subcmd__pull-request_commands() {
 'comment:Comment on a pull request. Dry-run by default; mutates only with \`--live\`' \
 'comments:List the comments on a pull request, oldest first. A read, always live' \
 'cancel-review-request:Cancel pending review requests on a pull request. Dry-run by default; mutates only with \`--live\`. On OBS the cancel fails closed' \
-'merge:Merge a pull request. On OBS this accepts the submit request; on Gitea it merges the pull request. Dry-run by default; mutates only with \`--live\`' \
+'merge:Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless \`--no-forward\` is given. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a pull request. On OBS this changes the request state to declined; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'withdraw:Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'reopen:Reopen a pull request. On OBS this changes a declined request back to \`new\`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with \`--live\`' \
@@ -6347,7 +6349,7 @@ _geectl__subcmd__pull-request__subcmd__help_commands() {
 'comment:Comment on a pull request. Dry-run by default; mutates only with \`--live\`' \
 'comments:List the comments on a pull request, oldest first. A read, always live' \
 'cancel-review-request:Cancel pending review requests on a pull request. Dry-run by default; mutates only with \`--live\`. On OBS the cancel fails closed' \
-'merge:Merge a pull request. On OBS this accepts the submit request; on Gitea it merges the pull request. Dry-run by default; mutates only with \`--live\`' \
+'merge:Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless \`--no-forward\` is given. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a pull request. On OBS this changes the request state to declined; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'withdraw:Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'reopen:Reopen a pull request. On OBS this changes a declined request back to \`new\`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with \`--live\`' \
@@ -7060,7 +7062,7 @@ _geectl__subcmd__request_commands() {
 'list:List submit requests\: the same search, with the states still awaiting action (new, review) as the default. A thin wrapper over the search operation\: the flags select the same server-side search' \
 'diff:Show the diff of a submit request\: the unified diff, or the request XML with the diff injected with \`--xml\`' \
 'list-comments:List the comments on a submit request, in id order' \
-'accept:Accept a submit request, with a comment as the message left with the accept' \
+'accept:Accept a submit request, with a comment as the message left with the accept. An accepted request is forwarded to its link parent unless \`--no-forward\` is given; a refused forward is reported and the accepted request stands, with the work staying queued in the devel project. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a submit request, with a comment as the reason' \
 'revoke:Revoke (withdraw) a submit request, with a comment as the reason' \
 'change-state:Change a submit request'\''s state to one of new/review/accepted/declined/revoked' \
@@ -7149,7 +7151,7 @@ _geectl__subcmd__request__subcmd__help_commands() {
 'list:List submit requests\: the same search, with the states still awaiting action (new, review) as the default. A thin wrapper over the search operation\: the flags select the same server-side search' \
 'diff:Show the diff of a submit request\: the unified diff, or the request XML with the diff injected with \`--xml\`' \
 'list-comments:List the comments on a submit request, in id order' \
-'accept:Accept a submit request, with a comment as the message left with the accept' \
+'accept:Accept a submit request, with a comment as the message left with the accept. An accepted request is forwarded to its link parent unless \`--no-forward\` is given; a refused forward is reported and the accepted request stands, with the work staying queued in the devel project. Dry-run by default; mutates only with \`--live\`' \
 'decline:Decline a submit request, with a comment as the reason' \
 'revoke:Revoke (withdraw) a submit request, with a comment as the reason' \
 'change-state:Change a submit request'\''s state to one of new/review/accepted/declined/revoked' \

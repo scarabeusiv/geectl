@@ -7365,7 +7365,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__pull__subcmd__request__subcmd__merge)
-            opts="-h --message --method --force --format --debug --debug-body --live --help"
+            opts="-h --message --method --force --no-forward --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -9411,7 +9411,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__request__subcmd__accept)
-            opts="-h --comment --force --format --debug --debug-body --live --help"
+            opts="-h --comment --force --no-forward --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
