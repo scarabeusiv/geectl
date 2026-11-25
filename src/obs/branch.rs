@@ -771,11 +771,14 @@ impl<'a> ObsClient<'a> {
     /// parameters). `expand` is accepted and ignored: the copy is
     /// always expanded. `revision` pins the source revision copied.
     ///
-    /// A scmsync-managed source is refused: the source's files are
-    /// generated from git, and copying them would freeze a snapshot
-    /// the target can never refresh. The source must be publicly
-    /// readable: its meta, listing, and files are read on the
-    /// public route, so a private source fails closed here.
+    /// A scmsync-managed source copies like any other: the copy is
+    /// a one-shot snapshot of the source's expanded files, and the
+    /// target carries no scmsync marker, so it is never refreshed
+    /// from git — which is true of every cross-instance copy, the
+    /// transfer being client-side, one-shot, and always expanded.
+    /// The source must be publicly readable: its meta, listing,
+    /// and files are read on the public route, so a private source
+    /// fails closed here.
     ///
     /// Files already identical on the target (same name and md5)
     /// are skipped without a download, so a retry after a partial
@@ -798,7 +801,11 @@ impl<'a> ObsClient<'a> {
     /// other binary download.
     ///
     /// Returns the target revision after the copy, and how many
-    /// files were copied and skipped. The revision is None when
+    /// files were copied and skipped — a one-shot snapshot: the
+    /// target holds the copied files as they were and is never
+    /// refreshed from the source, and an scmsync-managed source
+    /// copies as its expanded files with no scmsync marker carried
+    /// over. The revision is None when
     /// nothing was uploaded: in dry-run, or when every file was
     /// already identical on the target. The target package is
     /// created (with the source's title and description) only when
@@ -895,20 +902,7 @@ impl<'a> ObsClient<'a> {
                 ),
             ));
         }
-        // A scmsync-managed source is generated from git: copying
-        // its files would freeze a snapshot the target can never
-        // refresh. Refuse it with the reason, like osc's note-and-
-        // skip — but fail-closed, not silent.
         let source_meta = self.package_meta(source_project, source_package)?;
-        if source_meta.scmsync.is_some() {
-            return Err(GeectlError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "cannot copy {source_project}/{source_package} across instances: it is scmsync-managed (syncs from {})",
-                    source_meta.scmsync.as_deref().unwrap_or(""),
-                ),
-            ));
-        }
         let listing =
             self.expanded_source_listing(source_project, source_package, &options.revision)?;
         // The expanded listing must carry the resolved files: a
@@ -3071,10 +3065,16 @@ mod tests {
     }
 
     fn cross_instance_source_http() -> FakeHttp {
+        cross_instance_source_http_with_meta(
+            "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>",
+        )
+    }
+
+    fn cross_instance_source_http_with_meta(meta: &str) -> FakeHttp {
         FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/public/source/test:factory/test-pkgA/_meta",
-                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description></package>",
+                meta,
             )
             .with_get(
                 "https://api.opensuse.org/public/source/test:factory/test-pkgA?expand=1",
@@ -3405,13 +3405,12 @@ mod tests {
     }
 
     #[test]
-    fn copy_package_to_instance_refuses_scmsync_source() {
-        let http = FakeHttp::new().with_get(
-            "https://api.opensuse.org/public/source/test:factory/test-pkgA/_meta",
-            "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><scmsync>https://example.com#main</scmsync></package>",
-        );
+    fn copy_package_to_instance_copies_scmsync_source() {
+        let http = cross_instance_target_missing(cross_instance_source_http_with_meta(
+            "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><scmsync>https://example.com#main</scmsync></package>",
+        ));
         let (source, target) = cross_instance_clients(&http);
-        let err = source
+        let result = source
             .copy_package_to_instance(
                 &target,
                 "test:factory",
@@ -3421,10 +3420,28 @@ mod tests {
                 &CopyOptions::default(),
                 &DryRun::new(false),
             )
-            .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        // Only the meta read happens: the listing is never read.
-        assert_eq!(http.get_calls().len(), 1);
+            .unwrap();
+        assert_eq!(
+            result,
+            CrossInstanceCopyResult {
+                revision: Some(5),
+                copied_files: 2,
+                skipped_files: 0,
+            }
+        );
+        // The expanded listing is read and both files copy: the
+        // scmsync marker changes nothing about the transfer.
+        assert_eq!(http.get_calls().len(), 3);
+        assert_eq!(http.get_bytes_calls().len(), 2);
+        // The target package is created with title and description
+        // only: no scmsync marker is carried over, so the target
+        // never syncs from git.
+        let puts = http.put_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].1,
+            "<package name=\"test-pkgA\" project=\"test:target\"><title>Test</title><description>A test package</description></package>"
+        );
     }
 
     #[test]
