@@ -15,7 +15,7 @@
 //! takes the single configured instance.
 //!
 //! The `branch` composite (Gitea fork + OBS `cmd=fork`, library
-//! `GiteaClient::branch`) is exposed as `branch branch`: the
+//! `GiteaClient::branch`) is exposed as `branch create`: the
 //! `branch` group's composite leaf, which also copies the source
 //! project's repositories into the test project. The Gitea half
 //! stays `repo-fork` here.

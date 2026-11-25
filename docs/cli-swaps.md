@@ -89,16 +89,16 @@ Only deliberate deviations; the table lists deviations only.
 | osc | geectl | Why (consistency reason) |
 |---|---|---|
 | Flat top-level commands (`branch`, `copypac`, `linkpac`, …) | `geectl branch <subcommand>` group | Uniform grouping: one top-level noun per library module across all CLI groups |
-| `osc branch` | `geectl branch branch-package` | Grouped + spelled-out operation name (kebab-case library name) |
+| `osc branch` | `geectl branch create-package` | Grouped + spelled-out operation name (kebab-case library name) |
 | `osc branch --nodevelproject` | `--no-devel-project` | Kebab-case flag names everywhere (osc concatenates) |
-| `osc branch -c/--checkout` | `geectl branch branch-package` then `geectl checkout PROJECT PACKAGE` | Branches AND checks out a working copy; geectl does the two steps as two commands — the branch, then a checkout of the new package |
+| `osc branch -c/--checkout` | `geectl branch create-package` then `geectl checkout PROJECT PACKAGE` | Branches AND checks out a working copy; geectl does the two steps as two commands — the branch, then a checkout of the new package |
 | `osc copypac` | `geectl branch copy-package` | Grouped + spelled-out (osc abbreviates to `copypac`) |
 | `osc copypac -c/--client-side-copy` | — (same-instance form) | Client-side download/upload copy of a single package; the cross-instance form exists as `--to-apiurl`; the same-instance copy stays server-side |
 | `osc copypac -k/--keep-maintainers` | — | The server builds the target meta from the source meta |
 | `osc copypac -t/--to-apiurl` | `geectl branch copy-package --to-apiurl <URL>` | Cross-instance copy, client-side download+upload; the target instance's credentials resolve from the instance alias matching the target URL (`GEECTL_OBS_USERNAME_<ALIAS>` / `GEECTL_OBS_PASSWORD[_FILE]_<ALIAS>`) and the copy fails clearly for an unconfigured target; the source credentials stay with the source instance |
 | `osc linkpac` | `geectl branch link-package` | Grouped + spelled-out |
 | `osc linkpac -c/--current` | — | Pins the link at the source's current expanded revision, which needs a directory read first; the library op takes an explicit revision |
-| `osc linkpac -N/--new-package` | `--missing-target` | `--new-package` already means "branch a package missing from the target" in `geectl branch branch-package`; the library field is `missing_target` |
+| `osc linkpac -N/--new-package` | `--missing-target` | `--new-package` already means "branch a package missing from the target" in `geectl branch create-package`; the library field is `missing_target` |
 | `osc repairlink` | `geectl branch repair-link` | Same name, different operation: osc does a working-copy 3-way merge (checkout, merge, `resolved`, `ci`); geectl strips the failing patches from `_link` server-side and pins it at a revision where it expands. The cross-project form repairs the link in place. |
 | `osc setlinkrev` | `geectl branch set-link-rev` | Grouped + kebab-case |
 | `osc setlinkrev -r REV` (default: expanded) | `--revision <rev>` (bare = expanded) | Bare value keeps osc's default (expand); `pinned:<rev>` selects the plain form |
@@ -200,7 +200,7 @@ layout. Incident filing lives with the other filings under `geectl request`
 | — | `geectl gitea repo-get` / `geectl gitea repo-list` / `geectl gitea branch-list` / `geectl gitea branch-get` / `geectl gitea branch-head` | New surface: Gitea reads on the configured instance |
 | — | `geectl gitea repo-create` | New surface: create a repository on the configured instance; mutations take the global `--live` |
 | `osc api -X DELETE /repos/...` | `geectl gitea repo-delete` | The delete op under the `geectl gitea` noun; mutations take the global `--live`; the library requires `--force` |
-| `osc fork` | `geectl branch branch` | `osc fork` is a composite: Gitea fork + OBS branch. `geectl branch branch` is the composite: repo fork, OBS fork into a test project with the source project's repositories, and the first-build report. `geectl gitea repo-fork` is the Gitea half only. `osc fork` is scmsync-only; it clones the fork locally and inits `.osc` |
+| `osc fork` | `geectl branch create` | `osc fork` is a composite: Gitea fork + OBS branch. `geectl branch create` is the composite: repo fork, OBS fork into a test project with the source project's repositories, and the first-build report. `geectl gitea repo-fork` is the Gitea half only. `osc fork` is scmsync-only; it clones the fork locally and inits `.osc` |
 
 Scope note: the sibling `git-obs` entry point carries its own `repo list` and `repo fork` commands; `git-obs repo list` requires `--org`/`--user`.
 

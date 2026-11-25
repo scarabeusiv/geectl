@@ -108,7 +108,7 @@ under a branch project, with `--target-project`, `--target-package`,
 `--linkrev`. The group also carries the link operations
 `repair-link`, `set-link-rev`, `set-link-rev-project`,
 `link-to-branch`, and `detach-branch`. The git-backed fork composite is a
-library operation, exposed as `branch branch`.
+library operation, exposed as `branch create`.
 
 ## The pull-request handle
 

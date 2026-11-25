@@ -5242,7 +5242,7 @@ fn branch_package_dry_run() {
 }
 
 #[test]
-fn branch_branch_dry_run() {
+fn branch_create_dry_run() {
     // The composite leaf's dry-run needs a Gitea token to construct
     // the client (the library's rule: the token is required even
     // in dry-run), but touches no server: the guard records the
@@ -5251,7 +5251,7 @@ fn branch_branch_dry_run() {
     let out = geectl_isolated(&dir)
         .args([
             "branch",
-            "branch",
+            "create",
             "--project",
             "games",
             "--package",
@@ -5280,7 +5280,7 @@ fn branch_branch_dry_run() {
     );
 }
 
-/// Fresh routing fake servers for the `branch branch` live test,
+/// Fresh routing fake servers for the `branch create` live test,
 /// one pair per run: the Gitea fork lands, the test project is
 /// reused, the OBS fork lands in it, and the source project's
 /// repositories are copied into it. The build-results route
@@ -5370,7 +5370,7 @@ fn branch_live_servers() -> (
 }
 
 #[test]
-fn branch_branch_live_copies_the_source_repositories() {
+fn branch_create_live_copies_the_source_repositories() {
     // The leaf end to end, against routing fake servers for both
     // backends: the Gitea fork lands, the test project is reused,
     // the OBS fork lands in it, and the source project's
@@ -5384,7 +5384,7 @@ fn branch_branch_live_copies_the_source_repositories() {
         .args([
             "--live",
             "branch",
-            "branch",
+            "create",
             "--project",
             "games",
             "--package",
@@ -5453,7 +5453,7 @@ fn branch_branch_live_copies_the_source_repositories() {
             "--format",
             "text",
             "branch",
-            "branch",
+            "create",
             "--project",
             "games",
             "--package",

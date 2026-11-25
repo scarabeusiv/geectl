@@ -44,14 +44,15 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
 /// The `branch` subcommands. Names are the library operation names
-/// in kebab-case, grouped under the top-level noun.
+/// in kebab-case, grouped under the top-level noun; the git-backed
+/// composite leaf is `create`.
 #[derive(Debug, Subcommand)]
 pub enum BranchCommand {
     /// Branch a git-backed package: Gitea fork + OBS fork into a
     /// test project with the source project's repositories.
     /// A mutation: dry-run is the default (only the plan is printed);
     /// `--live` performs the branch.
-    Branch(BranchArgs),
+    Create(BranchArgs),
     /// Branch a package: create a linked copy under a branch project.
     /// A mutation: dry-run is the default (only the plan is printed);
     /// `--live` performs the branch.
@@ -85,7 +86,7 @@ pub enum BranchCommand {
     DetachBranch(DetachBranchArgs),
 }
 
-/// Arguments for `branch branch`.
+/// Arguments for `branch create`.
 #[derive(Debug, Args)]
 pub struct BranchArgs {
     /// The project to branch from.
@@ -393,7 +394,7 @@ pub fn run_branch(
     live: bool,
 ) -> Result<(Value, String), GeectlError> {
     match command {
-        BranchCommand::Branch(args) => branch(args, debug, live),
+        BranchCommand::Create(args) => branch(args, debug, live),
         BranchCommand::BranchPackage(args) => branch_package(args, debug, live),
         BranchCommand::CopyPackage(args) => copy_package(args, debug, live),
         BranchCommand::CopyProject(args) => copy_project(args, debug, live),
@@ -1233,11 +1234,11 @@ mod tests {
     }
 
     #[test]
-    fn branch_parses_all_flags() {
-        let BranchCommand::Branch(args) = parse(&[
+    fn create_parses_all_flags() {
+        let BranchCommand::Create(args) = parse(&[
             "geectl",
             "branch",
-            "branch",
+            "create",
             "--project",
             "games",
             "--package",
@@ -1273,9 +1274,9 @@ mod tests {
     }
 
     #[test]
-    fn branch_requires_project_and_package() {
-        parse_fails(&["geectl", "branch", "branch", "--package", "foo"]);
-        parse_fails(&["geectl", "branch", "branch", "--project", "p"]);
+    fn create_requires_project_and_package() {
+        parse_fails(&["geectl", "branch", "create", "--package", "foo"]);
+        parse_fails(&["geectl", "branch", "create", "--project", "p"]);
     }
 
     #[test]

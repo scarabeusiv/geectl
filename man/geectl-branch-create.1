@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH geectl-branch-branch 1  "geectl-branch-branch 0.2.2" 
+.TH geectl-branch-create 1  "geectl-branch-create 0.2.2" 
 .SH NAME
-geectl\-branch\-branch \- Branch a git\-backed package: Gitea fork + OBS fork into a test project with the source project\*(Aqs repositories. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the branch
+geectl\-branch\-create \- Branch a git\-backed package: Gitea fork + OBS fork into a test project with the source project\*(Aqs repositories. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the branch
 .SH SYNOPSIS
-\fBgeectl branch branch\fR [\fB\-\-new\-repo\-name\fR] [\fB\-\-organization\fR] [\fB\-\-git\-branch\fR] [\fB\-\-no\-devel\-project\fR] [\fB\-\-target\-project\fR] [\fB\-\-target\-package\fR] [\fB\-\-first\-build\-deadline\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> 
+\fBgeectl branch create\fR [\fB\-\-new\-repo\-name\fR] [\fB\-\-organization\fR] [\fB\-\-git\-branch\fR] [\fB\-\-no\-devel\-project\fR] [\fB\-\-target\-project\fR] [\fB\-\-target\-package\fR] [\fB\-\-first\-build\-deadline\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> 
 .SH DESCRIPTION
 Branch a git\-backed package: Gitea fork + OBS fork into a test project with the source project\*(Aqs repositories. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the branch
 .SH OPTIONS
@@ -33,8 +33,8 @@ The branch project. Without it, the server picks the default (usually `home:<use
 \fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
 The branch package name. Without it, the source package name
 .TP
-\fB\-\-first\-build\-deadline\-secs\fR \fI<FIRST_BUILD_DEADLINE_SECS>\fR [default: 600]
-Seconds to wait for the first build of the forked package in the fork\*(Aqs test project; 0 skips the wait and reports the branch without a build
+\fB\-\-first\-build\-deadline\-secs\fR \fI<FIRST_BUILD_DEADLINE_SECS>\fR [default: 0]
+Seconds to wait for the first build of the forked package in the fork\*(Aqs test project; 0 skips the wait and reports the branch without a build. No wait by default
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
