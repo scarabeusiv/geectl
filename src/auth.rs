@@ -1287,11 +1287,13 @@ fn parse_dotenv(content: &str, path: &Path) -> Result<HashMap<String, String>, G
             rest[..end].to_string()
         } else {
             // Unquoted: to the end of the line, minus a comment
-            // starting at a `#` preceded by whitespace.
+            // starting at a `#` preceded by whitespace — or at the
+            // start of the value, where there is no value before it.
             let comment = raw_value
                 .char_indices()
                 .find(|(i, c)| {
-                    *c == '#' && *i > 0 && raw_value.as_bytes()[i - 1].is_ascii_whitespace()
+                    *c == '#'
+                        && (*i == 0 || raw_value.as_bytes()[i - 1].is_ascii_whitespace())
                 })
                 .map(|(i, _)| i);
             match comment {
@@ -2923,6 +2925,17 @@ mod tests {
     fn dotenv_tab_before_hash_starts_a_comment() {
         let map = parse_dotenv("GEECTL_A=value\t# comment\n", Path::new(".env")).unwrap();
         assert_eq!(map["GEECTL_A"], "value");
+    }
+
+    #[test]
+    fn dotenv_hash_after_equals_is_empty() {
+        let map = parse_dotenv(
+            "GEECTL_A=# comment\nGEECTL_B=#comment\n",
+            Path::new(".env"),
+        )
+        .unwrap();
+        assert_eq!(map["GEECTL_A"], "");
+        assert_eq!(map["GEECTL_B"], "");
     }
 
     #[test]
