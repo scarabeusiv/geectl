@@ -5,7 +5,7 @@
 # limit is set high enough that no update is ever suppressed. The one
 # exception is github/codeql-action below: its init and analyze steps
 # must move together. Each PR
-# goes through the same branch protection as any other change (green CI
+# goes through the same ruleset enforcement as any other change (green CI
 # + at least 1 approving review); Dependabot PRs are NOT auto-merged.
 # The repo is kept green by merging Dependabot PRs promptly, not by
 # relaxing the checks.
