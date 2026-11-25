@@ -8944,6 +8944,23 @@ mod tests {
     }
 
     #[test]
+    fn wipe_binaries_package_without_a_scope_is_refused_without_http() {
+        // The positional package selects which package's binaries
+        // are wiped; it is not a scope, so a package with no scope
+        // flag is refused like a bare project wipe.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = WipeBinariesOptions {
+            package: Some("pkg".to_string()),
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
     fn wipe_binaries_all_with_codes_is_refused_without_http() {
         let http = FakeHttp::new();
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
