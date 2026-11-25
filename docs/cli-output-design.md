@@ -99,7 +99,7 @@ Consequences:
    omissions below. A summary may omit long free text (a
    description, a comment body); every id, name, revision, and state in the payload appears in the text.
 **Coordinate header:** text starts with one header line echoing the query coordinates — the required positionals, in the order project, package, repository, arch (as applicable), plus `package:` when the query is package-scoped. Tables stay as the worked examples pin them; the header is the only addition.
-**Documented omissions:** anything else the text leaves out is listed per renderer in the module docs, with the reason. The JSON payload remains the complete record.
+**Documented omissions:** anything else the text leaves out is listed per renderer in the module docs, with the reason. The JSON payload remains the complete record of the typed state, not of the server's raw bytes (terminal control characters are stripped at parse, per the `ServiceState` error field docs).
 **Content commands (rule 4) are exempt from the header:** their text *is* the content, verbatim; the coordinates live in the JSON payload. The exemption covers the content itself; a synthetic empty-content line (e.g. `no log`) still carries the header.
 2. **Single objects render as `key: value` lines**, one fact per
    line — the `config show` precedent. Nested objects flatten with a
