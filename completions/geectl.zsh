@@ -2191,7 +2191,7 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (service-run)
 _arguments "${_arguments_options[@]}" : \
-'--mode=[The run mode\: run, manualrun, precommit, localrun, disabledrun]:MODE:_default' \
+'--mode=[The run mode\: run, manualrun, precommit, localrun, disabledrun]:MODE:(run manualrun precommit localrun disabledrun)' \
 '--service=[Run only this service, with the run mode forced as its mode]:SERVICE:_default' \
 '--timeout-secs=[Timeout in seconds for the whole run]:TIMEOUT_SECS:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \

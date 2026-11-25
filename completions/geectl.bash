@@ -6685,7 +6685,7 @@ _geectl() {
             fi
             case "${prev}" in
                 --mode)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    COMPREPLY=($(compgen -W "run manualrun precommit localrun disabledrun" -- "${cur}"))
                     return 0
                     ;;
                 --service)

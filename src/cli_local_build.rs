@@ -65,7 +65,11 @@ pub enum LocalBuildCommand {
         directory: PathBuf,
         /// The run mode: run, manualrun, precommit, localrun,
         /// disabledrun.
-        #[arg(long, default_value = "run")]
+        #[arg(
+            long,
+            default_value = "run",
+            value_parser = ["run", "manualrun", "precommit", "localrun", "disabledrun"]
+        )]
         mode: String,
         /// Run only this service, with the run mode forced as its
         /// mode.
@@ -1225,6 +1229,24 @@ mod tests {
                 assert_eq!(timeout_secs, 3600);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn service_run_mode_rejects_runall_at_parse_time() {
+        let err = Cli::try_parse_from([
+            "geectl",
+            "local-build",
+            "service-run",
+            "/tmp/pkg",
+            "--mode",
+            "runall",
+        ])
+        .expect_err("runall is not a service-run mode");
+        let message = err.to_string();
+        assert!(message.contains("invalid value 'runall'"), "{message}");
+        for value in ["run", "manualrun", "precommit", "localrun", "disabledrun"] {
+            assert!(message.contains(value), "{message}");
         }
     }
 
