@@ -4541,6 +4541,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_link_rev_rejects_garbage_expanded_srcmd5() {
+        // A garbage expanded srcmd5 must never become the link's
+        // rev: the directory read fails closed instead.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?rev=latest&expand=1",
+            "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"1\" srcmd5=\"abc\" />",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .resolve_link_rev("test:factory", "test-pkgA", None, true)
+            .is_err());
+    }
+
+    #[test]
     fn repair_link_repairs_via_previous_revision_without_lastworking() {
         let broken = "<directory name=\"test:factory/test-pkgA\" rev=\"2\" vrev=\"2\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"><entry name=\"_link\" md5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" size=\"120\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"dddddddddddddddddddddddddddddddd\" xsrcmd5=\"ffffffffffffffffffffffffffffffff\" error=\"patch bad.patch failed to apply\"/></directory>";
         let prior = "<directory name=\"test:factory/test-pkgA\" rev=\"1\" vrev=\"1\" srcmd5=\"33333333333333333333333333333333\"><entry name=\"_link\" md5=\"44444444444444444444444444444444\" size=\"100\" mtime=\"1700000000\"/><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"55555555555555555555555555555555\" xsrcmd5=\"33333333333333333333333333333333\"/></directory>";

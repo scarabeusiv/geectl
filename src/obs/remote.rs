@@ -579,7 +579,14 @@ pub(crate) fn parse_directory_rev(body: &str) -> Result<DirectoryRev, GeectlErro
     let self_closing = tag.ends_with('/');
     let rev = find_attr(tag, "rev");
     let vrev = find_attr(tag, "vrev");
-    let srcmd5 = find_attr(tag, "srcmd5");
+    // The srcmd5 is a checksum, not free text: a value that is
+    // not exactly 32 hex digits is malformed, not a revision to
+    // pin the working-copy base at.
+    let srcmd5 = match find_attr(tag, "srcmd5") {
+        Some(value) if is_md5(&value) => Some(value),
+        Some(_) => return Err(malformed()),
+        None => None,
+    };
     let rest = &after_open[end + 1..];
     if self_closing {
         if !rest.trim().is_empty() {
@@ -5922,6 +5929,65 @@ mod tests {
                 None,
                 Some("ffffffffffffffffffffffffffffffff".to_string()),
             )
+        );
+    }
+
+    #[test]
+    fn parse_directory_rev_rejects_non_hex_srcmd5() {
+        // The srcmd5 pins the working-copy base: a non-hex value
+        // is a malformed listing, never a base to record.
+        assert_eq!(
+            parse_directory_rev(
+                "<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"aaa\" vrev=\"1\"/>"
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ServerError
+        );
+        assert_eq!(
+            parse_directory_rev("<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\" vrev=\"1\"/>").unwrap_err().kind(),
+            ErrorKind::ServerError
+        );
+    }
+
+    #[test]
+    fn parse_directory_rev_rejects_wrong_length_srcmd5() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        assert!(
+            parse_directory_rev("<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" vrev=\"1\"/>").is_err()
+        );
+        assert!(
+            parse_directory_rev("<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" vrev=\"1\"/>").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_directory_rev_accepts_32_hex_srcmd5() {
+        // Lowercase and uppercase hex both read, carried verbatim.
+        assert_eq!(
+            parse_directory_rev("<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"0123456789abcdef0123456789abcdef\" vrev=\"1\"/>").unwrap(),
+            (
+                Some("42".to_string()),
+                Some("1".to_string()),
+                Some("0123456789abcdef0123456789abcdef".to_string()),
+            )
+        );
+        assert_eq!(
+            parse_directory_rev("<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"0123456789ABCDEF0123456789ABCDEF\" vrev=\"1\"/>").unwrap(),
+            (
+                Some("42".to_string()),
+                Some("1".to_string()),
+                Some("0123456789ABCDEF0123456789ABCDEF".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_directory_rev_rejects_escape_sequence_in_srcmd5() {
+        // An escape sequence smuggled into the md5 is not 32
+        // hex digits, so the listing is malformed.
+        assert!(
+            parse_directory_rev("<directory name=\"srcpkg\" rev=\"42\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;\" vrev=\"1\"/>").is_err()
         );
     }
 
