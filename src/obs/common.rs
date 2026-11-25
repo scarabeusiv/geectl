@@ -1037,6 +1037,7 @@ pub(crate) fn meta_roles(block: &str) -> Result<(Vec<NamedRole>, Vec<NamedRole>)
                 name: xml_unescape(&name),
                 role: xml_unescape(&role),
                 email: None,
+                realname: None,
             });
         }
     }
@@ -1049,6 +1050,7 @@ pub(crate) fn meta_roles(block: &str) -> Result<(Vec<NamedRole>, Vec<NamedRole>)
                 name: xml_unescape(&name),
                 role: xml_unescape(&role),
                 email: None,
+                realname: None,
             });
         }
     }

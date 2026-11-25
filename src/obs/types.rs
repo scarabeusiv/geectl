@@ -489,6 +489,11 @@ pub struct NamedRole {
     /// from `whois()`. `None` for groups and for roles read from
     /// package meta, which carry no email.
     pub email: Option<String>,
+    /// Real name, when the role came from an owner search: filled
+    /// in from `whois()` alongside the email. `None` for groups,
+    /// for roles read from package meta, and for persons whose
+    /// `whois()` carries no realname.
+    pub realname: Option<String>,
 }
 
 /// A role grant or removal: a person and/or a group with a role.

@@ -299,18 +299,21 @@ complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_su
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from list-scmsync-projects" -s h -l help -d 'Print help'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners" -l format -d 'Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json`' -r -f -a "json\t''
 text\t''"
+complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners" -l verbose -d 'Show each person as `login (realname <email>)`'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners" -l debug -d 'Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners" -l debug-body -d 'Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners" -l live -d 'Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners" -s h -l help -d 'Print help'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-binary" -l format -d 'Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json`' -r -f -a "json\t''
 text\t''"
+complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-binary" -l verbose -d 'Show each person as `login (realname <email>)`'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-binary" -l debug -d 'Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-binary" -l debug-body -d 'Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-binary" -l live -d 'Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-binary" -s h -l help -d 'Print help'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-package" -l format -d 'Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json`' -r -f -a "json\t''
 text\t''"
+complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-package" -l verbose -d 'Show each person as `login (realname <email>)`'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-package" -l debug -d 'Enable the debug channel: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-package" -l debug-body -d 'Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `--debug`'
 complete -c geectl -n "__fish_geectl_using_subcommand remote; and __fish_seen_subcommand_from owners-for-package" -l live -d 'Actually perform mutations. Without it, only the plan is printed: dry-run is the default for mutations'

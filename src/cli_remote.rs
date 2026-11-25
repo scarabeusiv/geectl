@@ -440,16 +440,25 @@ pub enum RemoteCommand {
         project: String,
         /// The package to show the owners of.
         package: String,
+        /// Show each person as `login (realname <email>)`.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Show the owners of a binary package.
     OwnersForBinary {
         /// The binary package name.
         binary: String,
+        /// Show each person as `login (realname <email>)`.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Show the owners of a package by name alone, in the owner root projects.
     OwnersForPackage {
         /// The package name.
         package: String,
+        /// Show each person as `login (realname <email>)`.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Show the maintainers of a package.
     Maintainers {
@@ -1364,7 +1373,11 @@ pub fn run_remote(
                 ),
             ))
         }
-        RemoteCommand::Owners { project, package } => {
+        RemoteCommand::Owners {
+            project,
+            package,
+            verbose,
+        } => {
             let owners = client.owners(&project, &package)?;
             let payload = json!({
                 "project": project,
@@ -1375,11 +1388,11 @@ pub fn run_remote(
                 payload,
                 with_header(
                     &format!("project: {project} package: {package}"),
-                    render_owners(&owners),
+                    render_owners(&owners, verbose),
                 ),
             ))
         }
-        RemoteCommand::OwnersForBinary { binary } => {
+        RemoteCommand::OwnersForBinary { binary, verbose } => {
             let owners = client.owners_for_binary(&binary)?;
             let payload = json!({
                 "binary": binary,
@@ -1387,10 +1400,13 @@ pub fn run_remote(
             });
             Ok((
                 payload,
-                with_header(&format!("binary: {binary}"), render_owners(&owners)),
+                with_header(
+                    &format!("binary: {binary}"),
+                    render_owners(&owners, verbose),
+                ),
             ))
         }
-        RemoteCommand::OwnersForPackage { package } => {
+        RemoteCommand::OwnersForPackage { package, verbose } => {
             let owners = client.owners_for_package(&package)?;
             let payload = json!({
                 "package": package,
@@ -1398,7 +1414,10 @@ pub fn run_remote(
             });
             Ok((
                 payload,
-                with_header(&format!("package: {package}"), render_owners(&owners)),
+                with_header(
+                    &format!("package: {package}"),
+                    render_owners(&owners, verbose),
+                ),
             ))
         }
         RemoteCommand::Maintainers { project, package } => {
@@ -3442,6 +3461,7 @@ fn apply_person_adds(persons: &mut Vec<NamedRole>, grants: &[RoleGrant]) {
                 name: name.to_string(),
                 role: grant.role.clone(),
                 email: None,
+                realname: None,
             });
         }
     }
@@ -3798,13 +3818,34 @@ fn package_diff_json(diff: &PackageDiff) -> Value {
     })
 }
 
+/// A role in an owner payload: the shared role fields plus the
+/// realname `whois()` filled in, so the payload carries what the
+/// verbose text renders (`realname` is null for groups and for
+/// persons whose `whois()` carries none).
+fn owner_named_role_json(role: &NamedRole) -> Value {
+    json!({
+        "name": role.name,
+        "role": role.role,
+        "email": role.email,
+        "realname": role.realname,
+    })
+}
+
 fn owner_json(owner: &Owner) -> Value {
     json!({
         "root_project": owner.root_project,
         "project": owner.project,
         "package": owner.package,
-        "persons": owner.persons.iter().map(named_role_json).collect::<Vec<_>>(),
-        "groups": owner.groups.iter().map(named_role_json).collect::<Vec<_>>(),
+        "persons": owner
+            .persons
+            .iter()
+            .map(owner_named_role_json)
+            .collect::<Vec<_>>(),
+        "groups": owner
+            .groups
+            .iter()
+            .map(owner_named_role_json)
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -4283,7 +4324,7 @@ fn render_staged_requests(
     }
 }
 
-fn render_owners(owners: &[Owner]) -> String {
+fn render_owners(owners: &[Owner], verbose: bool) -> String {
     if owners.is_empty() {
         return "no owners".to_string();
     }
@@ -4293,10 +4334,17 @@ fn render_owners(owners: &[Owner]) -> String {
             let persons = if owner.persons.is_empty() {
                 "-".to_string()
             } else {
+                // Verbose persons render as `login (realname
+                // <email>)`; groups keep the role form either way.
+                let render_person = if verbose {
+                    render_named_role_verbose
+                } else {
+                    render_named_role
+                };
                 owner
                     .persons
                     .iter()
-                    .map(render_named_role)
+                    .map(render_person)
                     .collect::<Vec<_>>()
                     .join(", ")
             };
@@ -4336,6 +4384,20 @@ fn render_named_role(role: &NamedRole) -> String {
     match &role.email {
         Some(email) => format!("{} ({}) <{}>", role.name, role.role, email),
         None => format!("{} ({})", role.name, role.role),
+    }
+}
+
+/// A person as `login (realname <email>)` for `--verbose`: the role
+/// drops out, and a person with no realname renders without it
+/// (`login (<email>)`), never a blank. Without an email there is
+/// nothing verbose to show, so the role form stands.
+fn render_named_role_verbose(role: &NamedRole) -> String {
+    match (&role.realname, &role.email) {
+        (Some(realname), Some(email)) => {
+            format!("{} ({realname} <{email}>)", role.name)
+        }
+        (None, Some(email)) => format!("{} (<{email}>)", role.name),
+        (_, None) => render_named_role(role),
     }
 }
 
@@ -4642,6 +4704,18 @@ mod tests {
         assert!(matches!(
             parse(&["geectl", "remote", "owners-for-package", "vim"]),
             RemoteCommand::OwnersForPackage { .. }
+        ));
+        assert!(matches!(
+            parse(&["geectl", "remote", "owners", "P", "K", "--verbose"]),
+            RemoteCommand::Owners { verbose: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["geectl", "remote", "owners-for-binary", "vim", "--verbose"]),
+            RemoteCommand::OwnersForBinary { verbose: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["geectl", "remote", "owners-for-package", "vim", "--verbose"]),
+            RemoteCommand::OwnersForPackage { verbose: true, .. }
         ));
         assert!(matches!(
             parse(&["geectl", "remote", "maintainers", "P", "K"]),
@@ -5613,21 +5687,25 @@ mod tests {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
                 email: None,
+                realname: None,
             },
             NamedRole {
                 name: "bob".to_string(),
                 role: "reviewer".to_string(),
                 email: None,
+                realname: None,
             },
             NamedRole {
                 name: "alice".to_string(),
                 role: "reviewer".to_string(),
                 email: None,
+                realname: None,
             },
             NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
                 email: None,
+                realname: None,
             },
         ];
         assert_eq!(
@@ -5667,6 +5745,7 @@ mod tests {
             name: "bob".to_string(),
             role: "maintainer".to_string(),
             email: None,
+            realname: None,
         });
         assert_eq!(
             plan_project_removals("openSUSE:Factory", &meta, &["alice".to_string()], &[]).unwrap(),
@@ -5689,6 +5768,7 @@ mod tests {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
                 email: None,
+                realname: None,
             }],
             groups: vec![],
         };
@@ -6012,6 +6092,7 @@ mod tests {
             name: "bob".to_string(),
             role: "maintainer".to_string(),
             email: None,
+            realname: None,
         });
         assert_eq!(
             plan_project_removals(
@@ -6045,6 +6126,7 @@ mod tests {
             name: "bob".to_string(),
             role: "maintainer".to_string(),
             email: None,
+            realname: None,
         });
         // Removing both maintainers leaves none, even though each
         // removal alone looks fine against the current meta.
@@ -6107,6 +6189,7 @@ mod tests {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
                 email: None,
+                realname: None,
             }],
             groups: vec![],
         };
@@ -7425,6 +7508,7 @@ mod tests {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
                 email: None,
+                realname: None,
             }],
             groups: vec![],
             repositories: vec![Repository {
@@ -7519,11 +7603,13 @@ mod tests {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
                 email: Some("alice@example.com".to_string()),
+                realname: Some("Alice Example".to_string()),
             }],
             groups: vec![NamedRole {
                 name: "editors".to_string(),
                 role: "bugowner".to_string(),
                 email: None,
+                realname: None,
             }],
         }];
         let payload = json!({
@@ -7534,11 +7620,60 @@ mod tests {
             payload["owners"][0]["persons"][0]["email"],
             "alice@example.com"
         );
-        let text = render_owners(&owners);
+        assert_eq!(
+            payload["owners"][0]["persons"][0]["realname"],
+            "Alice Example"
+        );
+        let text = render_owners(&owners, false);
         assert!(text.contains("openSUSE:Factory openSUSE:Factory vim:"));
         assert!(text.contains("persons: alice (maintainer) <alice@example.com>"));
         assert!(text.contains("groups: editors (bugowner)"));
-        assert_eq!(render_owners(&[]), "no owners");
+        assert_eq!(render_owners(&[], false), "no owners");
+        let verbose = render_owners(&owners, true);
+        assert!(verbose.contains("persons: alice (Alice Example <alice@example.com>)"));
+        assert!(verbose.contains("groups: editors (bugowner)"));
+    }
+
+    #[test]
+    fn owners_render_verbose_renders_realname_and_omits_it_when_absent() {
+        let owners = vec![Owner {
+            root_project: "openSUSE:Factory".to_string(),
+            project: "openSUSE:Factory".to_string(),
+            package: Some("vim".to_string()),
+            persons: vec![
+                NamedRole {
+                    name: "alice".to_string(),
+                    role: "maintainer".to_string(),
+                    email: Some("alice@example.com".to_string()),
+                    realname: Some("Alice Example".to_string()),
+                },
+                NamedRole {
+                    name: "bob".to_string(),
+                    role: "bugowner".to_string(),
+                    email: Some("bob@example.com".to_string()),
+                    realname: None,
+                },
+            ],
+            groups: vec![NamedRole {
+                name: "editors".to_string(),
+                role: "bugowner".to_string(),
+                email: None,
+                realname: None,
+            }],
+        }];
+        let verbose = render_owners(&owners, true);
+        assert!(
+            verbose.contains(
+                "persons: alice (Alice Example <alice@example.com>), bob (<bob@example.com>)"
+            ),
+            "verbose owners text misses the verbose persons:\n{verbose}"
+        );
+        assert!(verbose.contains("groups: editors (bugowner)"));
+        // The default rendering is unchanged by the flag's existence.
+        let text = render_owners(&owners, false);
+        assert!(text.contains(
+            "persons: alice (maintainer) <alice@example.com>, bob (bugowner) <bob@example.com>"
+        ));
     }
 
     #[test]
@@ -7554,10 +7689,11 @@ mod tests {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
                 email: None,
+                realname: None,
             }],
             groups: vec![],
         }];
-        let text = render_owners(&owners);
+        let text = render_owners(&owners, false);
         assert!(text.starts_with("openSUSE:Factory vim:"));
         assert!(text.contains("persons: alice (maintainer)"));
     }
@@ -7746,6 +7882,7 @@ mod tests {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
                 email: Some("alice@example.com".to_string()),
+                realname: None,
             }],
         );
         assert_eq!(payload["maintainers"][0]["name"], "alice");
@@ -7873,7 +8010,7 @@ mod tests {
             "owners": owners.iter().map(owner_json).collect::<Vec<_>>(),
         });
         assert_eq!(payload["owners"][0]["package"], Value::Null);
-        let text = render_owners(&owners);
+        let text = render_owners(&owners, false);
         assert!(text.contains("openSUSE:Factory openSUSE:Factory -:"));
         assert!(text.contains("persons: -"));
         assert!(text.contains("groups: -"));
@@ -8051,6 +8188,7 @@ mod tests {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
                 email: None,
+                realname: None,
             }],
             groups: vec![],
         };
@@ -8078,14 +8216,16 @@ mod tests {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
                 email: None,
+                realname: None,
             }],
             groups: vec![NamedRole {
                 name: "editors".to_string(),
                 role: "bugowner".to_string(),
                 email: None,
+                realname: None,
             }],
         }];
-        let text = render_owners(&owners);
+        let text = render_owners(&owners, false);
         for field in [
             "openSUSE:Factory",
             "vim",

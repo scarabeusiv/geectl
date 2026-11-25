@@ -1271,7 +1271,7 @@ fn remote_owners_for_package_rejects_an_invalid_name() {
 
 const OWNER_SEARCH_BODY: &str = "<collection matches=\"2\"><owner rootproject=\"openSUSE:Factory\" project=\"devel:languages:python\" package=\"foo\"><person name=\"Admin\" role=\"maintainer\"/><person name=\"scarabeus_iv\" role=\"bugowner\"/><group name=\"factory-maintainers\" role=\"maintainer\"/></owner><owner rootproject=\"openSUSE:Factory\" project=\"openSUSE:Factory\"><person name=\"Admin\" role=\"maintainer\"/></owner></collection>";
 const ADMIN_PERSON_BODY: &str =
-    "<person><login>Admin</login><email>admin@example.com</email><state>confirmed</state></person>";
+    "<person><login>Admin</login><email>admin@example.com</email><realname>Admin User</realname><state>confirmed</state></person>";
 const SCARABEUS_PERSON_BODY: &str = "<person><login>scarabeus_iv</login><email>scarabeus@example.com</email><state>confirmed</state></person>";
 
 #[test]
@@ -1311,6 +1311,8 @@ fn remote_owners_for_package_json_reports_package_and_owners() {
         value["owners"][0]["persons"][1]["email"],
         "scarabeus@example.com"
     );
+    assert_eq!(value["owners"][0]["persons"][0]["realname"], "Admin User");
+    assert!(value["owners"][0]["persons"][1]["realname"].is_null());
 }
 
 #[test]
@@ -1337,6 +1339,41 @@ fn remote_owners_for_package_text_mode_opens_with_the_package_header() {
     assert!(stdout.starts_with("package: foo\n"), "{stdout}");
     assert!(
         stdout.contains("openSUSE:Factory devel:languages:python foo: persons: Admin (maintainer) <admin@example.com>, scarabeus_iv (bugowner) <scarabeus@example.com>; groups: factory-maintainers (maintainer)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn remote_owners_for_package_verbose_text_renders_realname() {
+    let addr = serve_routes(&[
+        ("/search/owner", OWNER_SEARCH_BODY),
+        ("/person/Admin", ADMIN_PERSON_BODY),
+        ("/person/scarabeus_iv", SCARABEUS_PERSON_BODY),
+    ]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "remote",
+            "owners-for-package",
+            "foo",
+            "--verbose",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "secret")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("package: foo\n"), "{stdout}");
+    assert!(
+        stdout.contains("persons: Admin (Admin User <admin@example.com>), scarabeus_iv (<scarabeus@example.com>); groups: factory-maintainers (maintainer)"),
         "{stdout}"
     );
 }
