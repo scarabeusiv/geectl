@@ -327,6 +327,53 @@ impl<'a> ObsClient<'a> {
         query
     }
 
+    /// The scmsync-managed source a branch of `package` in `project`
+    /// would resolve to, if it is one: the source package itself, or
+    /// its devel package when one is registered and
+    /// `no_devel_project` is false. The scmsync URL is the resolved
+    /// source meta's `<scmsync>` text; a blank value counts as none.
+    /// Both metas are read authenticated: a package that exists but
+    /// is hidden from the public read is still refused here, where a
+    /// public read would have answered NotFound and let the branch
+    /// freeze a snapshot. None when neither meta carries one, and
+    /// None when an authenticated read answers NotFound — a genuinely
+    /// missing source is not refused here; the branch POST produces
+    /// the authoritative error. Any other meta-read error propagates.
+    /// A project-level scmsync with no per-package `<scmsync>` marker
+    /// is deliberately not detected: only the resolved source's own
+    /// meta decides.
+    fn scmsync_managed_branch_source(
+        &self,
+        project: &str,
+        package: &str,
+        no_devel_project: bool,
+    ) -> Result<Option<(String, String, String)>, GeectlError> {
+        let meta = match self.package_meta_authenticated(project, package) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let (source_project, source_package) = match (&meta.devel, no_devel_project) {
+            (Some((devel_project, devel_package)), false) => {
+                (devel_project.clone(), devel_package.clone())
+            }
+            _ => (project.to_string(), package.to_string()),
+        };
+        let scmsync = if source_project == project && source_package == package {
+            meta.scmsync
+        } else {
+            match self.package_meta_authenticated(&source_project, &source_package) {
+                Ok(devel_meta) => devel_meta.scmsync,
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(err) => return Err(err),
+            }
+        };
+        match scmsync {
+            Some(url) if !url.trim().is_empty() => Ok(Some((source_project, source_package, url))),
+            _ => Ok(None),
+        }
+    }
+
     /// Branch package `package` in project `project` on OBS
     /// (`POST /source/<project>/<package>?cmd=branch`) and return
     /// where the branch landed. Requires credentials; without them the
@@ -351,9 +398,17 @@ impl<'a> ObsClient<'a> {
     /// source has a devel project. The two cases are told
     /// apart by reading the source first, because the transport
     /// reports a failed call by status only and the server's
-    /// `not_missing` error code does not survive it. The read runs
-    /// only on the `new_package` path; a plain branch makes a single
-    /// POST.
+    /// `not_missing` error code does not survive it.
+    ///
+    /// A scmsync-managed source is refused before any POST: the
+    /// source meta is read authenticated first (and the devel source's
+    /// meta when a devel project is registered and `no_devel_project`
+    /// is not set), and a non-empty `<scmsync>` on the resolved source
+    /// fails with `InvalidInput` naming the source, the scmsync URL,
+    /// and the fork route. A source whose authenticated meta read
+    /// answers NotFound proceeds to the branch POST, which produces
+    /// the authoritative error. A plain branch of a non-SCM source is
+    /// one meta GET plus one POST.
     ///
     /// Success is the server's `<status code="ok"/>` carrying the
     /// branch target as `<data>` elements; any other body is a server
@@ -427,6 +482,30 @@ impl<'a> ObsClient<'a> {
             return Err(GeectlError::new(
                 ErrorKind::ConfigError,
                 "cannot branch a package without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        // An scmsync-managed source cannot be branched: its sources
+        // live in git, so a plain branch would freeze a snapshot the
+        // target can never refresh — osc refuses the same case
+        // (`branch_pkg` in osc/core.py). The resolved source is the
+        // devel package when one is registered and `no_devel_project`
+        // is not set, mirroring the link source the branch itself
+        // resolves through. The refusal names that source and its
+        // scmsync URL, and the route: fork the git repository
+        // (gitea repo-fork) and create the branch package from the
+        // fork (remote create-package --scmsync <fork-url>#<branch>).
+        // A source whose authenticated meta read answers NotFound
+        // proceeds to the branch below: the POST produces the
+        // authoritative error, as before. The check runs only live —
+        // the dry-run guard above already returned.
+        if let Some((source_project, source_package, scmsync)) =
+            self.scmsync_managed_branch_source(project, package, options.no_devel_project)?
+        {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot branch {source_project}/{source_package}: it is scmsync-managed (syncs from {scmsync}); branch the git repository instead: fork it with gitea repo-fork and create the branch package from the fork with remote create-package --scmsync <fork-url>#<branch>"
+                ),
             ));
         }
         let mut query: Vec<(&str, &str)> = vec![("cmd", "branch")];
@@ -2212,10 +2291,15 @@ mod tests {
             <data name=\"target_package\">test-pkgA</data>\
             <data name=\"project\">test:factory</data>\
             <data name=\"package\">test-pkgA</data></status>";
-        let http = FakeHttp::new().with_post(
-            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
-            body,
-        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
+            )
+            .with_post(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
+                body,
+            );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let result = client
             .branch_package(
@@ -2246,8 +2330,9 @@ mod tests {
         // query) and the credentials.
         assert_eq!(posts[0].1, "");
         assert!(posts[0].2);
-        // A plain branch makes a single POST: no target pre-check.
-        assert!(http.get_calls().is_empty());
+        // A plain branch reads the source meta first (the scmsync
+        // check), then makes a single POST.
+        assert_eq!(http.get_calls().len(), 1);
     }
 
     #[test]
@@ -2258,6 +2343,10 @@ mod tests {
             <data name=\"project\">test:factory</data>\
             <data name=\"package\">test-pkgA</data></status>";
         let http = FakeHttp::new()
+            .with_get_error(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                ErrorKind::NotFound,
+            )
             .with_get_error(
                 "https://api.opensuse.org/source/test:factory/test-pkgA",
                 ErrorKind::NotFound,
@@ -2275,8 +2364,9 @@ mod tests {
             .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
             .unwrap();
         assert!(result.is_some());
-        // The source was read first, then branched with missingok.
-        assert_eq!(http.get_calls().len(), 1);
+        // The source meta and the source itself were read first,
+        // then branched with missingok.
+        assert_eq!(http.get_calls().len(), 2);
         assert_eq!(http.post_calls().len(), 1);
     }
 
@@ -2288,6 +2378,10 @@ mod tests {
             <data name=\"project\">test:factory</data>\
             <data name=\"package\">test-pkgA</data></status>";
         let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
+            )
             .with_get(
                 "https://api.opensuse.org/source/test:factory/test-pkgA",
                 "<directory name=\"test-pkgA\" />",
@@ -2305,7 +2399,7 @@ mod tests {
             .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
             .unwrap();
         assert!(result.is_some());
-        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.get_calls().len(), 2);
         assert_eq!(http.post_calls().len(), 1);
     }
 
@@ -2316,10 +2410,15 @@ mod tests {
             <data name=\"target_package\">test-pkgA</data>\
             <data name=\"project\">test:factory</data>\
             <data name=\"package\">test-pkgA</data></status>";
-        let http = FakeHttp::new().with_post(
-            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&ignoredevel=1",
-            body,
-        );
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
+            )
+            .with_post(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&ignoredevel=1",
+                body,
+            );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         let options = BranchOptions {
             no_devel_project: true,
@@ -2337,7 +2436,12 @@ mod tests {
             <data name=\"target_package\">renamed</data>\
             <data name=\"project\">test:factory</data>\
             <data name=\"package\">test-pkgA</data></status>";
-        let http = FakeHttp::new().with_post(
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
+            )
+            .with_post(
             "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&target_project=home%3Aalice%3Abranches%3Atest%3Afactory&target_package=renamed&ignoredevel=1&force=1&rev=42&linkrev=abc123&comment=test-branch&noaccess=1&add_repositories=1&add_repositories_block=standard&add_repositories_rebuild=standard&extend_package_names=1&maintenance=1",
             body,
         );
@@ -2489,7 +2593,12 @@ mod tests {
 
     #[test]
     fn branch_package_non_ok_body_is_error_not_success() {
-        let http = FakeHttp::new().with_post(
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
+            )
+            .with_post(
             "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
             "<status code=\"error\"><summary>nope</summary></status>",
         );
@@ -2503,6 +2612,220 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn branch_package_refuses_scmsync_managed_source() {
+        let scmsync = "https://src.opensuse.org/test/test-pkgA#main";
+        let meta = format!(
+            "<package name=\"test-pkgA\" project=\"test:factory\"><scmsync>{scmsync}</scmsync></package>"
+        );
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"target_project\">home:scarabeus_iv:branches:test:factory</data>\
+            <data name=\"target_package\">test-pkgA</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                &meta,
+            )
+            .with_post(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
+                body,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(scmsync),
+            "refusal names the scmsync URL: {err}"
+        );
+        assert!(
+            err.to_string().contains("repo-fork"),
+            "refusal names the fork route: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_package_refuses_scmsync_managed_devel_source() {
+        let scmsync = "https://src.opensuse.org/test/test-pkgA#main";
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><devel project=\"test:devel\" package=\"test-pkgA\"/></package>";
+        let devel_meta = format!(
+            "<package name=\"test-pkgA\" project=\"test:devel\"><scmsync>{scmsync}</scmsync></package>"
+        );
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"target_project\">home:scarabeus_iv:branches:test:factory</data>\
+            <data name=\"target_package\">test-pkgA</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:devel/test-pkgA/_meta",
+                &devel_meta,
+            )
+            .with_post(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
+                body,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("test:devel/test-pkgA"),
+            "refusal names the devel source: {err}"
+        );
+        assert!(
+            err.to_string().contains(scmsync),
+            "refusal names the scmsync URL: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn branch_package_refuses_scmsync_managed_source_hidden_from_public_read() {
+        // A package hidden from the public read answers NotFound
+        // there but carries <scmsync> on the authenticated read: the
+        // guard reads authenticated, so the branch is still refused
+        // instead of freezing a snapshot. The public stub is the
+        // regression pin — a guard that read the public route would
+        // take the NotFound as "not managed" and POST the branch.
+        let scmsync = "https://src.opensuse.org/test/test-pkgA#main";
+        let meta = format!(
+            "<package name=\"test-pkgA\" project=\"test:factory\"><scmsync>{scmsync}</scmsync></package>"
+        );
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"target_project\">home:scarabeus_iv:branches:test:factory</data>\
+            <data name=\"target_package\">test-pkgA</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new()
+            .with_get_error(
+                "https://api.opensuse.org/public/source/test:factory/test-pkgA/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                &meta,
+            )
+            .with_post(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
+                body,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(scmsync),
+            "refusal names the scmsync URL: {err}"
+        );
+        assert!(
+            err.to_string().contains("repo-fork"),
+            "refusal names the fork route: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+        // Only the authenticated meta read ran; the public route was
+        // never consulted.
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn branch_package_no_devel_project_branches_scmsync_devel_source() {
+        // `no_devel_project` skips the devel follow: the source itself
+        // is not scmsync-managed, so the branch proceeds from it.
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><devel project=\"test:devel\" package=\"test-pkgA\"/></package>";
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"target_project\">home:scarabeus_iv:branches:test:factory</data>\
+            <data name=\"target_package\">test-pkgA</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            )
+            .with_post(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&ignoredevel=1",
+                body,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = BranchOptions {
+            no_devel_project: true,
+            ..BranchOptions::default()
+        };
+        let result = client
+            .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn branch_package_missing_source_meta_proceeds_to_branch() {
+        // An authenticated meta read that answers NotFound is not a
+        // refusal: the source is genuinely missing, and the branch
+        // POST produces the authoritative error, as before. A package
+        // hidden from the public read but visible to the credentials
+        // is refused instead (see the test below).
+        let body = "<status code=\"ok\"><summary>Ok</summary>\
+            <data name=\"target_project\">home:scarabeus_iv:branches:test:factory</data>\
+            <data name=\"target_package\">test-pkgA</data>\
+            <data name=\"project\">test:factory</data>\
+            <data name=\"package\">test-pkgA</data></status>";
+        let http = FakeHttp::new()
+            .with_get_error(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_post(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
+                body,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let result = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
     }
 
     #[test]
