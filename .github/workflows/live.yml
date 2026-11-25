@@ -88,9 +88,9 @@ jobs:
       # build can export its layers to the GitHub Actions cache (the
       # gha cache exporter needs a builder that supports it, and this
       # also guarantees a current Buildx/BuildKit — the v2 cache API
-      # needs Buildx >= 0.21 / BuildKit >= 0.20). Pinned to the v3
+      # needs Buildx >= 0.21 / BuildKit >= 0.20). Pinned to the v4
       # tag's commit; Dependabot tracks SHA pins and proposes updates.
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Expose the GitHub Actions runtime (ACTIONS_CACHE_URL /
       # ACTIONS_RUNTIME_TOKEN) to the following steps: BuildKit's
       # `type=gha` cache backend reads them from the environment, and
