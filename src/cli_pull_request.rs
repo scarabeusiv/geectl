@@ -638,9 +638,20 @@ fn submit(args: SubmitArgs, debug: &Debug, live: bool) -> Result<(Value, String)
     match wc.backend {
         Backend::Obs => {
             let target = obs_submit_target(&args, &wc)?;
+            // The freshness check's Gitea client, best-effort and
+            // live-only: a dry-run plan reads nothing, so no client
+            // is built there; live, a missing token means no client
+            // and the check stays off.
+            let gitea_http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+            let gitea = if live {
+                crate::cli_gitea::try_gitea_client(&gitea_http, debug)?
+            } else {
+                None
+            };
             with_obs(debug, live, |obs| {
                 working_copy::refuse_not_submittable_obs(&wc, obs)?;
-                let client = PullRequestClient::new(Some(obs), None).with_debug(debug.clone());
+                let client =
+                    PullRequestClient::new(Some(obs), gitea.as_ref()).with_debug(debug.clone());
                 let submitted = client.submit(&target, &dry_run)?;
                 Ok((
                     submit_payload(&submitted, &dry_run)?,

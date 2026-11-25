@@ -1242,7 +1242,9 @@ impl<'a> PullRequestClient<'a> {
         match target {
             SubmitTarget::Obs(payload) => {
                 let obs = self.obs.ok_or_else(missing_obs_arm)?;
-                let filing = SrFiling::new(obs, dry_run).with_debug(self.debug.clone());
+                let filing = SrFiling::new(obs, dry_run)
+                    .with_debug(self.debug.clone())
+                    .with_gitea(self.gitea);
                 let filed = filing.file(payload)?;
                 let Some(filed) = filed else {
                     return Ok(None);

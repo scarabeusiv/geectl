@@ -57,6 +57,7 @@
 //! These omissions are decided, not gaps: do not expand the tables
 //! to echo the full payload.
 
+use crate::cli_gitea::try_gitea_client;
 use clap::{Args, Subcommand};
 use geectl::auth::{Credentials, EnvObsAuth};
 use geectl::config;
@@ -1203,8 +1204,20 @@ fn file_request(
         payload = payload.without_cleanup();
     }
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    // The freshness check's Gitea client, best-effort and
+    // live-only: a dry-run plan reads nothing, so no client is
+    // built there; live, a missing token means no client and the
+    // check stays off.
+    let gitea_http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+    let gitea = if live {
+        try_gitea_client(&gitea_http, debug)?
+    } else {
+        None
+    };
     with_client(debug, live, |client| {
-        let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
+        let filing = SrFiling::new(client, &dry_run)
+            .with_debug(debug.clone())
+            .with_gitea(gitea.as_ref());
         let filed_request = match supersede {
             Some(old_id) => filing.refile(&payload, old_id)?,
             None => filing.file(&payload)?,

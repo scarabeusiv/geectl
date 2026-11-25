@@ -35,7 +35,7 @@
 //! free text). The JSON payload remains the complete record in every case.
 
 use clap::{Args, Subcommand};
-use geectl::auth::EnvGiteaAuth;
+use geectl::auth::{Credentials, EnvGiteaAuth};
 use geectl::config::{self, DEFAULT_GITEA_URL};
 use geectl::debug::Debug;
 use geectl::error::GeectlError;
@@ -367,6 +367,44 @@ pub(crate) fn gitea_client<'a>(
         &file_config.instances,
     )?;
     GiteaClient::with_base(http, base, credentials).map(|client| client.with_debug(debug.clone()))
+}
+
+/// A `GiteaClient` for the configured Gitea instance when a token
+/// is configured, `None` when none is: the best-effort twin of
+/// [`gitea_client`] for callers that can proceed without one. A
+/// missing token is not an error here — the caller records the gap
+/// on the debug channel and carries on (the filing-path freshness
+/// check is off without a client) — but a misconfigured credential
+/// set still fails closed, like `gitea_client`. The caller builds
+/// the client only when it will be used: a dry-run plan reads
+/// nothing, so no client is built there.
+pub(crate) fn try_gitea_client<'a>(
+    http: &'a dyn HttpClient,
+    debug: &Debug,
+) -> Result<Option<GiteaClient<'a>>, GeectlError> {
+    let path = config::config_path()?;
+    let file_config = config::load_config_at(&path)?;
+    let effective = config::effective_config(&file_config)?;
+    // Unreachable by construction — effective_config always yields
+    // Some(gitea_url) — but kept as a defensive default rather than
+    // an unwrap: a config change must not turn into a panic here.
+    let base = effective
+        .config
+        .gitea_url
+        .as_deref()
+        .unwrap_or(DEFAULT_GITEA_URL);
+    // Both arguments are `base`: it is the effective URL
+    // (environment, then config file, then default), so the plain
+    // variables belong to it — the same resolution `gitea_client`
+    // performs.
+    let credentials = EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?;
+    if matches!(credentials, Credentials::None) {
+        debug.emit("decision: no Gitea token configured; the filing-path freshness check is off");
+        return Ok(None);
+    }
+    GiteaClient::with_base(http, base, credentials)
+        .map(|client| client.with_debug(debug.clone()))
+        .map(Some)
 }
 
 /// The `repo-create` result line: the created repository's full
