@@ -39,15 +39,15 @@
 //! as `name: value` entries, like the `remote` set-meta leaves;
 //! the JSON payload remains the complete record in every case.
 
+use crate::auth::{Credentials, EnvObsAuth};
+use crate::config;
+use crate::debug::Debug;
+use crate::error::{ErrorKind, GeectlError};
+use crate::gitea::{parse_gitea_repo, GiteaClient};
+use crate::http::{Timeout, UreqClient};
+use crate::meta::{MetaClient, MetaFields, MetaTarget, SetMeta};
+use crate::obs::{DryRun, ObsClient, OBS_API_BASE};
 use clap::{Args, Subcommand};
-use geectl::auth::{Credentials, EnvObsAuth};
-use geectl::config;
-use geectl::debug::Debug;
-use geectl::error::{ErrorKind, GeectlError};
-use geectl::gitea::{parse_gitea_repo, GiteaClient};
-use geectl::http::{Timeout, UreqClient};
-use geectl::meta::{MetaClient, MetaFields, MetaTarget, SetMeta};
-use geectl::obs::{DryRun, ObsClient, OBS_API_BASE};
 use serde_json::{json, Value};
 
 /// The `meta` subcommands. One operation for both backends: the
