@@ -713,8 +713,8 @@ pub struct Owner {
 pub struct Person {
     /// Login name.
     pub login: String,
-    /// Email address.
-    pub email: String,
+    /// Email address, when the person carries one.
+    pub email: Option<String>,
     /// Real name, when the person carries one.
     pub realname: Option<String>,
     /// Account state (`confirmed`, `locked`, ...).

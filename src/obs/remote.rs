@@ -1926,11 +1926,12 @@ pub(crate) fn parse_owners(body: &str) -> Option<Vec<Owner>> {
     Some(owners)
 }
 
-/// Parse a person document (`<person>` with `<login>`, `<email>`,
+/// Parse a person document (`<person>` with `<login>`, `<email?>`,
 /// `<realname?>`, `<state>`, and `<globalrole>*` children). None
 /// when the body is not a `<person>` document, or when it carries no
-/// login, email, or state: a person without an identity is an
-/// unexpected response, never a person with empty fields.
+/// login or state: a person without an identity is an unexpected
+/// response, never a person with empty fields. Email is optional —
+/// a person without one parses with `email: None`.
 pub(crate) fn parse_person(body: &str) -> Option<Person> {
     let (_, inner) = meta_envelope(body, "person").ok()?;
     let token = |tag: &str| -> Option<String> {
@@ -1944,7 +1945,7 @@ pub(crate) fn parse_person(body: &str) -> Option<Person> {
         // and real name: they are account-holder free text, and
         // both reach the terminal through the person render (and
         // the email through owner role lines).
-        email: token("email").map(|value| strip_terminal_controls(&value))?,
+        email: token("email").map(|value| strip_terminal_controls(&value)),
         realname: token("realname").map(|value| strip_terminal_controls(&value)),
         state: token("state")?,
     })
@@ -3759,26 +3760,32 @@ impl<'a> ObsClient<'a> {
         // itself returns name and role only, so each distinct login
         // costs one `whois` (`GET /person/<login>`), deduplicated
         // across owner entries: a person named twice is looked up
-        // once. Groups are not persons and carry neither. A failed
-        // lookup fails the search: a login the server just returned
-        // should resolve, and a half-enriched result would lie about
-        // which persons have no email.
-        let mut enriched: std::collections::HashMap<String, (String, Option<String>)> =
+        // once. Groups are not persons and carry neither. A lookup
+        // that 404s reads as no email and no realname — the person
+        // is gone since the search returned them — while any other
+        // failure still fails the search.
+        let mut enriched: std::collections::HashMap<String, (Option<String>, Option<String>)> =
             std::collections::HashMap::new();
         for owner in &mut owners {
             for person in &mut owner.persons {
                 let (email, realname) = match enriched.get(&person.name) {
                     Some((email, realname)) => (email.clone(), realname.clone()),
                     None => {
-                        let whois = self.whois(&person.name)?;
-                        let enriched_person = (whois.email, whois.realname);
+                        let enriched_person = match self.whois(&person.name) {
+                            Ok(found) => (found.email, found.realname),
+                            Err(err) if err.kind() == ErrorKind::NotFound => (None, None),
+                            Err(err) => return Err(err),
+                        };
                         enriched.insert(person.name.clone(), enriched_person.clone());
                         enriched_person
                     }
                 };
-                person.email = Some(email);
+                person.email = email;
                 person.realname = realname;
             }
+        }
+        Ok(owners)
+    }            }
         }
         Ok(owners)
     }
@@ -12971,7 +12978,7 @@ mod tests {
             person,
             Person {
                 login: "Admin".to_string(),
-                email: "admin@example.com".to_string(),
+                email: Some("admin@example.com".to_string()),
                 realname: Some("Admin User".to_string()),
                 state: "confirmed".to_string(),
             }
@@ -12999,15 +13006,20 @@ mod tests {
     }
 
     #[test]
+    fn person_without_email_parses_with_no_email() {
+        let person = parse_person(
+            "<person><login>Admin</login><state>confirmed</state></person>",
+        )
+        .unwrap();
+        assert_eq!(person.email, None);
+    }
+
+    #[test]
     fn person_rejects_malformed_bodies() {
         assert_eq!(parse_person(""), None);
         assert_eq!(parse_person("<collection></collection>"), None);
         assert_eq!(
             parse_person("<person><email>a@b.c</email><state>confirmed</state></person>"),
-            None
-        );
-        assert_eq!(
-            parse_person("<person><login>Admin</login><state>confirmed</state></person>"),
             None
         );
         assert_eq!(
@@ -13140,6 +13152,57 @@ mod tests {
         );
         let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
         assert!(client.owners("openSUSE:Factory", "foo").is_err());
+    }
+
+    #[test]
+    fn owners_whois_not_found_reads_as_no_email() {
+        // A person the search returned but whois 404s is gone since
+        // the search: the owner still lists them, with no email.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/search/owner?project=openSUSE%3AFactory&package=foo",
+                OWNER_SEARCH_FIXTURE,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/person/Admin",
+                ErrorKind::NotFound,
+            )
+            .with_get(
+                "https://api.opensuse.org/person/scarabeus_iv",
+                PERSON_SCARABEUS_FIXTURE,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let owners = client.owners("openSUSE:Factory", "foo").unwrap();
+        assert_eq!(owners[0].persons[0].email, None);
+        assert_eq!(
+            owners[0].persons[1].email.as_deref(),
+            Some("scarabeus@example.com")
+        );
+    }
+
+    #[test]
+    fn owners_blank_whois_email_reads_as_no_email() {
+        // A whois body with a blank email element carries no email.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/search/owner?project=openSUSE%3AFactory&package=foo",
+                OWNER_SEARCH_FIXTURE,
+            )
+            .with_get(
+                "https://api.opensuse.org/person/Admin",
+                "<person><login>Admin</login><email></email><state>confirmed</state></person>",
+            )
+            .with_get(
+                "https://api.opensuse.org/person/scarabeus_iv",
+                PERSON_SCARABEUS_FIXTURE,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let owners = client.owners("openSUSE:Factory", "foo").unwrap();
+        assert_eq!(owners[0].persons[0].email, None);
+        assert_eq!(
+            owners[0].persons[1].email.as_deref(),
+            Some("scarabeus@example.com")
+        );
     }
 
     #[test]

@@ -4427,10 +4427,10 @@ fn render_named_role_verbose(role: &NamedRole) -> String {
 }
 
 fn render_person(person: &Person) -> String {
-    let mut lines = vec![
-        format!("login: {}", person.login),
-        format!("email: {}", strip_terminal_controls(&person.email)),
-    ];
+    let mut lines = vec![format!("login: {}", person.login)];
+    if let Some(email) = &person.email {
+        lines.push(format!("email: {}", strip_terminal_controls(email)));
+    }
     if let Some(realname) = &person.realname {
         lines.push(format!("realname: {}", strip_terminal_controls(realname)));
     }
@@ -7806,7 +7806,7 @@ mod tests {
     fn whois_renders_realname_when_present() {
         let person = Person {
             login: "alice".to_string(),
-            email: "alice@example.com".to_string(),
+            email: Some("alice@example.com".to_string()),
             realname: Some("Alice Example".to_string()),
             state: "confirmed".to_string(),
         };
@@ -8122,7 +8122,7 @@ mod tests {
     fn whois_renders_without_realname() {
         let person = Person {
             login: "alice".to_string(),
-            email: "alice@example.com".to_string(),
+            email: Some("alice@example.com".to_string()),
             realname: None,
             state: "confirmed".to_string(),
         };
