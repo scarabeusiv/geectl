@@ -6103,6 +6103,19 @@ fn pull_request_merge_gitea_dry_run_with_no_forward_prints_no_forward_plan() {
     );
 }
 
+/// The reason phrase matching a stub status code, so a routing
+/// stub's status line reads like a real server's (`HTTP/1.1 500
+/// Internal Server Error`, never `HTTP/1.1 500 OK`). Covers the
+/// codes the merge-forward stubs answer with.
+fn http_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Unknown",
+    }
+}
+
 /// A routing stub Gitea server for the live merge-then-forward:
 /// the merge POST, the pull-request read, the reviews read, and
 /// the repo read each get their canned answer, by method and
@@ -6147,8 +6160,9 @@ fn serve_gitea_merge_forward() -> (
             } else {
                 (404, "{}".to_string())
             };
+            let reason = http_reason(status);
             let response = format!(
-                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -6218,8 +6232,9 @@ fn serve_obs_gitea_merge_forward(
             } else {
                 (404, "<status code=\"not_found\" />".to_string())
             };
+            let reason = http_reason(status);
             let response = format!(
-                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -6288,8 +6303,9 @@ fn serve_obs_gitea_merge_forward_ambiguous(
             } else {
                 (404, "<status code=\"not_found\" />".to_string())
             };
+            let reason = http_reason(status);
             let response = format!(
-                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -6600,8 +6616,9 @@ fn serve_obs_gitea_merge_forward_outcomes(
             } else {
                 (404, "<status code=\"not_found\" />".to_string())
             };
+            let reason = http_reason(status);
             let response = format!(
-                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
