@@ -925,7 +925,7 @@ fn parse_commitfilelist_response(body: &str) -> Result<CommitFilelistResponse, G
 
 /// A 32-hex-digit md5, the shape a checksum attribute must have:
 /// anything else is malformed server data, not a checksum.
-fn is_md5(value: &str) -> bool {
+pub(crate) fn is_md5(value: &str) -> bool {
     value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 

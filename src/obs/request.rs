@@ -7,6 +7,7 @@ use super::parse_status_ok;
 use super::parse_submit_request_ids;
 use super::parse_submit_request_ids_for_creator;
 use super::parse_submit_request_ids_for_forward_hop;
+use super::remote::is_md5;
 use super::remote::parse_linkinfo;
 use super::valid_obs_name;
 use super::ActionShape;
@@ -978,8 +979,9 @@ fn action_target(element: &Element<'_>) -> Option<Option<TargetRef>> {
 }
 
 /// Parse an `<acceptinfo>` element: `rev` and `srcmd5` are required
-/// and non-empty; the origin attributes are optional. The element
-/// carries no text.
+/// and non-empty; the origin attributes are optional. Each hash it
+/// carries (srcmd5 and the optional osrcmd5, xsrcmd5, oxsrcmd5) is
+/// exactly 32 hex digits. The element carries no text.
 fn parse_acceptinfo(element: &Element<'_>) -> Option<AcceptInfo> {
     if !element.inner.trim().is_empty() {
         return None;
@@ -989,14 +991,28 @@ fn parse_acceptinfo(element: &Element<'_>) -> Option<AcceptInfo> {
     if rev.is_empty() || srcmd5.is_empty() {
         return None;
     }
+    // The hashes are checksums, not free text: a value that is
+    // not exactly 32 hex digits is malformed, not a hash to carry
+    // into the forward round-trip.
+    if !is_md5(srcmd5) {
+        return None;
+    }
+    let osrcmd5 = attr_value(element.attrs, "osrcmd5").map(str::to_string);
+    let xsrcmd5 = attr_value(element.attrs, "xsrcmd5").map(str::to_string);
+    let oxsrcmd5 = attr_value(element.attrs, "oxsrcmd5").map(str::to_string);
+    for value in [&osrcmd5, &xsrcmd5, &oxsrcmd5].into_iter().flatten() {
+        if !is_md5(value) {
+            return None;
+        }
+    }
     Some(AcceptInfo {
         rev: rev.to_string(),
         srcmd5: srcmd5.to_string(),
         oproject: attr_value(element.attrs, "oproject").map(str::to_string),
         opackage: attr_value(element.attrs, "opackage").map(str::to_string),
-        osrcmd5: attr_value(element.attrs, "osrcmd5").map(str::to_string),
-        xsrcmd5: attr_value(element.attrs, "xsrcmd5").map(str::to_string),
-        oxsrcmd5: attr_value(element.attrs, "oxsrcmd5").map(str::to_string),
+        osrcmd5,
+        xsrcmd5,
+        oxsrcmd5,
     })
 }
 
@@ -6250,6 +6266,74 @@ description</description>
                     osrcmd5: None,
                     xsrcmd5: Some("ffffffffffffffffffffffffffffffff".to_string()),
                     oxsrcmd5: None,
+                }),
+            }
+        );
+        assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn request_parse_rejects_non_hex_acceptinfo_hashes() {
+        // The acceptinfo hashes are checksums, not free text: a
+        // non-hex value in any of the four positions is a
+        // malformed request, never a hash to forward.
+        let base = "<action type=\"submit\">\n  <source package=\"bar\" project=\"testprj\" />\n  <target package=\"baz\" project=\"foobar\" />\n  <acceptinfo rev=\"5\"";
+        for acceptinfo in [
+            " srcmd5=\"aaa\"",
+            " srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" osrcmd5=\"aaa\"",
+            " srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" xsrcmd5=\"aaa\"",
+            " srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" oxsrcmd5=\"aaa\"",
+            " srcmd5=\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"",
+        ] {
+            let xml = request_document_with_action(&format!("{base}{acceptinfo} />\n</action>"));
+            assert!(
+                parse_request(&xml).is_none(),
+                "{acceptinfo} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn request_parse_rejects_wrong_length_acceptinfo_hashes() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        let base = "<action type=\"submit\">\n  <source package=\"bar\" project=\"testprj\" />\n  <target package=\"baz\" project=\"foobar\" />\n  <acceptinfo rev=\"5\"";
+        for acceptinfo in [
+            " srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            " srcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+            " srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" xsrcmd5=\"ccccccccccccccccccccccccccccccc\"",
+        ] {
+            let xml = request_document_with_action(&format!("{base}{acceptinfo} />\n</action>"));
+            assert!(parse_request(&xml).is_none(), "{acceptinfo} must be refused");
+        }
+    }
+
+    #[test]
+    fn request_action_from_xml_submit_with_all_acceptinfo_hashes_round_trips() {
+        // All four hashes valid 32-hex read, carried verbatim,
+        // and re-emitted by the forward round-trip.
+        let xml = request_document_with_action(
+            "<action type=\"submit\">\n  <source package=\"bar\" project=\"testprj\" />\n  <target package=\"baz\" project=\"foobar\" />\n  <acceptinfo rev=\"5\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" osrcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" xsrcmd5=\"cccccccccccccccccccccccccccccccc\" oxsrcmd5=\"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\" />\n</action>",
+        );
+        let request = parse_request(&xml).expect("submit with all acceptinfo hashes parses");
+        assert_eq!(
+            request.actions[0],
+            RequestAction::Submit {
+                source_project: "testprj".to_string(),
+                source_package: "bar".to_string(),
+                source_rev: None,
+                target_project: Some("foobar".to_string()),
+                target_package: Some("baz".to_string()),
+                sourceupdate: None,
+                updatelink: false,
+                makeoriginolder: false,
+                acceptinfo: Some(AcceptInfo {
+                    rev: "5".to_string(),
+                    srcmd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    oproject: None,
+                    opackage: None,
+                    osrcmd5: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+                    xsrcmd5: Some("cccccccccccccccccccccccccccccccc".to_string()),
+                    oxsrcmd5: Some("DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD".to_string()),
                 }),
             }
         );
