@@ -211,7 +211,8 @@ pub(crate) fn find_attr(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-/// XML whitespace, one definition per domain. Attribute values use
+/// XML whitespace, one definition per domain. Stated once here — no
+/// other helper defines XML whitespace. Attribute values use
 /// Unicode whitespace (`str::trim`): a whitespace-only value is
 /// blank, and NBSP counts as whitespace. Element content uses only
 /// the four XML whitespace characters (space, tab, CR, LF), so NBSP
