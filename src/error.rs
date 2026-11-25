@@ -97,6 +97,10 @@ pub enum ErrorKind {
     FileConflict,
     /// A commit was requested with nothing to commit.
     NothingToCommit,
+    /// Files the commit was sending changed while the commit was
+    /// running (edited in the worktree, or re-staged). The context
+    /// names the files.
+    CommitInputsChanged,
     /// The git binary is not on PATH. The working copy operates
     /// through git; without the binary there is no checkout.
     NoGit,
@@ -142,6 +146,7 @@ impl ErrorKind {
             ErrorKind::PrePushCheckFailed => "pre_push_check_failed",
             ErrorKind::FileConflict => "file_conflict",
             ErrorKind::NothingToCommit => "nothing_to_commit",
+            ErrorKind::CommitInputsChanged => "commit_inputs_changed",
             ErrorKind::NoGit => "no_git",
             ErrorKind::TooManyRepositories => "too_many_repositories",
         }
@@ -185,6 +190,7 @@ impl ErrorKind {
             ErrorKind::PrePushCheckFailed => "a pre-push sanity check failed",
             ErrorKind::FileConflict => "a merge conflict is left in the working tree",
             ErrorKind::NothingToCommit => "there is nothing to commit",
+            ErrorKind::CommitInputsChanged => "files changed during the commit",
             ErrorKind::NoGit => "the git binary is not on PATH",
             ErrorKind::TooManyRepositories => {
                 "the project has more repositories than the operation supports"
@@ -272,6 +278,9 @@ impl ErrorKind {
             ErrorKind::NothingToCommit => {
                 "stage a change with add first, or check status for what is staged"
             }
+            ErrorKind::CommitInputsChanged => {
+                "run the commit again; no revision landed"
+            }
             ErrorKind::NoGit => "install git and retry",
             ErrorKind::TooManyRepositories => {
                 "split the repositories across smaller projects"
@@ -315,6 +324,7 @@ impl ErrorKind {
             // Exit 29 is unused: it belonged to a removed kind and
             // is never reused.
             ErrorKind::NothingToCommit => 30,
+            ErrorKind::CommitInputsChanged => 35,
             ErrorKind::NoGit => 31,
             ErrorKind::TooManyRepositories => 32,
             ErrorKind::UnsupportedOs => 33,
@@ -354,6 +364,7 @@ impl ErrorKind {
             ErrorKind::PrePushCheckFailed,
             ErrorKind::FileConflict,
             ErrorKind::NothingToCommit,
+            ErrorKind::CommitInputsChanged,
             ErrorKind::NoGit,
             ErrorKind::TooManyRepositories,
             ErrorKind::UnsupportedOs,

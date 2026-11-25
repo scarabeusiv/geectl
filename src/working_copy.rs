@@ -955,14 +955,23 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// The sha256 of a worktree file, streamed: `None` when the file
-/// is missing, a symlink, or not a regular file. A tracked
-/// symlink to `/dev/zero` or a FIFO must not hang the gate or
-/// exhaust memory: symlinks are never followed here, and a FIFO
-/// is never opened.
+/// is missing or not a regular file. A symlink hashes its target
+/// bytes, so a retargeted symlink is a change; the target is never
+/// followed, so a tracked symlink to `/dev/zero` or a FIFO cannot
+/// hang the gate or exhaust memory, and a FIFO is never opened.
+/// The `symlink\0` domain prefix keeps a symlink's hash distinct
+/// from a regular file holding the same bytes.
 fn hash_worktree_file(root: &Path, path: &str) -> Option<String> {
     let full = root.join(path);
     let meta = std::fs::symlink_metadata(&full).ok()?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(&full).ok()?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"symlink\0");
+        hasher.update(target.as_os_str().as_encoded_bytes());
+        return Some(hex_encode(&hasher.finalize()));
+    }
+    if !meta.is_file() {
         return None;
     }
     let file = std::fs::File::open(&full).ok()?;
@@ -3053,8 +3062,8 @@ fn snapshot_gate_inputs(wc: &WorkingCopy) -> Result<GateSnapshot, GeectlError> {
     for path in split_nul(&tracked) {
         // Streamed, and never through a symlink: a tracked
         // symlink to `/dev/zero` or a FIFO would hang or exhaust
-        // memory on `fs::read`, and a symlink's target bytes are
-        // not the file's content.
+        // memory on `fs::read`. A symlink hashes its target
+        // bytes instead, so a retarget is a change.
         hashes.push((path.clone(), hash_worktree_file(&wc.root, &path)));
     }
     Ok(GateSnapshot { hashes })
@@ -3083,6 +3092,77 @@ fn stage_gate_changes(wc: &WorkingCopy, before: &GateSnapshot) -> Result<Vec<Str
         git_literal(&wc.root, "add", &args, &[])?;
     }
     Ok(changed)
+}
+
+/// A snapshot of the commit's inputs after staging: the full
+/// index (blob SHA per staged file) plus the worktree content
+/// hash of each file the commit sends. The commit sends index
+/// content, but an edit in another tab — worktree, or re-staged
+/// — must not slip into the sends unnoticed: the snapshot is
+/// re-verified before each send, and a file whose hash moved
+/// refuses loudly instead of landing stale.
+struct CommitSnapshot {
+    index: std::collections::HashMap<String, String>,
+    worktree: Vec<(String, Option<String>)>,
+}
+
+fn snapshot_commit_inputs(
+    wc: &WorkingCopy,
+    files: &[String],
+) -> Result<CommitSnapshot, GeectlError> {
+    let index = ls_files_entries(wc)?;
+    let mut worktree = Vec::new();
+    for path in files {
+        worktree.push((path.clone(), hash_worktree_file(&wc.root, path)));
+    }
+    Ok(CommitSnapshot { index, worktree })
+}
+
+/// Refuse when the commit's inputs moved since the snapshot: an
+/// index change (staged, unstaged, or added), or a worktree edit
+/// to a file the commit sends. The refusal names the files (at
+/// most ten, then a count) and the commit is run again. A worktree
+/// edit to a file the commit does not send is not in the snapshot
+/// and never refuses.
+fn refuse_when_commit_inputs_moved(
+    wc: &WorkingCopy,
+    before: &CommitSnapshot,
+) -> Result<(), GeectlError> {
+    let mut moved: Vec<String> = Vec::new();
+    let now_index = ls_files_entries(wc)?;
+    if now_index != before.index {
+        // Name what changed: files in the snapshot whose blob
+        // moved or vanished, plus files staged since.
+        for name in before.index.keys() {
+            if now_index.get(name) != before.index.get(name) {
+                moved.push(name.clone());
+            }
+        }
+        for name in now_index.keys() {
+            if !before.index.contains_key(name) {
+                moved.push(name.clone());
+            }
+        }
+    }
+    for (path, hash) in &before.worktree {
+        if hash_worktree_file(&wc.root, path).as_deref() != hash.as_deref() && !moved.contains(path)
+        {
+            moved.push(path.clone());
+        }
+    }
+    if moved.is_empty() {
+        return Ok(());
+    }
+    moved.sort();
+    let named = if moved.len() > 10 {
+        format!("{} and {} more", moved[..10].join(", "), moved.len() - 10)
+    } else {
+        moved.join(", ")
+    };
+    Err(GeectlError::new(
+        ErrorKind::CommitInputsChanged,
+        format!("files were modified during the commit: {named}; run the commit again"),
+    ))
 }
 
 /// The service gate: run the source services and `pre_checkin.sh`
@@ -4314,6 +4394,11 @@ fn commit_obs(
     // the service gate staged its outputs — and before anything
     // is filed.
     run_changelog_gate(wc)?;
+    // The commit's inputs are snapshotted after staging, on the
+    // final staged state: any edit past this point — worktree, or
+    // re-staged — refuses before the next send instead of landing
+    // stale.
+    let snapshot = snapshot_commit_inputs(wc, &committed_files)?;
     let keeplink = index_has(wc, "_link")?;
     // One validate pass: learn what the server lacks and any sha256
     // challenges. A validate pass with a complete file list commits
@@ -4323,6 +4408,9 @@ fn commit_obs(
     // a revision, the commit already landed: no staging, no final
     // pass. Otherwise, after staging, the final pass runs, and it
     // reports anything still missing itself instead of committing.
+    // The validate pass is the first send: the inputs must still
+    // be the snapshotted ones.
+    refuse_when_commit_inputs_moved(wc, &snapshot)?;
     let mut options = CommitFilelistOptions::new(message);
     options.validate = true;
     options.keeplink = keeplink;
@@ -4346,6 +4434,9 @@ fn commit_obs(
             (rev, srcmd5, answer.service_running)
         }
         None => {
+            // The staged PUTs send index content: the inputs must
+            // still be the snapshotted ones before any byte goes out.
+            refuse_when_commit_inputs_moved(wc, &snapshot)?;
             for name in &answer.hash_challenge {
                 let content = index_content(wc, name)?;
                 attach_sha256(&mut entries, name, &content);
@@ -4363,6 +4454,10 @@ fn commit_obs(
             // stage that raced is retried (three final passes at most).
             let mut attempts = 0;
             loop {
+                // Each final pass sends the staged files: a file
+                // that moved since the snapshot refuses here,
+                // before the server sees it.
+                refuse_when_commit_inputs_moved(wc, &snapshot)?;
                 attempts += 1;
                 let mut options = CommitFilelistOptions::new(message);
                 options.keeplink = keeplink;
@@ -4612,6 +4707,10 @@ fn commit_git(
         ],
         &[],
     )?;
+    // The commit's inputs are snapshotted after staging, on the
+    // final staged state: any edit past this point refuses before
+    // the synthesized commit instead of landing in it.
+    let snapshot = snapshot_commit_inputs(wc, &split_nul(&staged))?;
     // The commit, the gate, and the push run under the
     // checkout's commit lock: without it a concurrent commit
     // could land between the gate and the push and be sent
@@ -4620,6 +4719,10 @@ fn commit_git(
     // the checkout.
     let head = {
         let _commit_lock = acquire_commit_lock(&wc.root)?;
+        // The synthesized commit sends the index: verify the
+        // inputs are still the snapshotted ones, under the lock,
+        // before the commit exists.
+        refuse_when_commit_inputs_moved(wc, &snapshot)?;
         if !split_nul(&staged).is_empty() {
             git(
                 &wc.root,
@@ -8107,6 +8210,119 @@ mod tests {
         assert_eq!(wc.mtimes, snapshot_mtimes(&wc.root).unwrap());
         assert!(!wc.mtimes.is_empty());
         assert_eq!(open(&wc.root).unwrap().mtimes, wc.mtimes);
+        let _ = dir;
+    }
+
+    /// A working copy with one staged change (`foo.spec` edited):
+    /// the fixture the commit-snapshot tests move under.
+    fn staged_spec_checkout(http: &FakeHttp) -> (TempDirGuard, WorkingCopy, Vec<String>) {
+        let (dir, wc) = do_checkout(http);
+        write_file(&wc.root, "foo.spec", "Name: bar\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let (_, committed_files) = build_commit_entries(&wc).unwrap();
+        (dir, wc, committed_files)
+    }
+
+    #[test]
+    fn commit_snapshot_detects_a_worktree_edit() {
+        let http = checkout_http();
+        let (dir, wc, committed_files) = staged_spec_checkout(&http);
+        let snapshot = snapshot_commit_inputs(&wc, &committed_files).unwrap();
+        write_file(&wc.root, "foo.spec", "Name: baz\n");
+        let err = refuse_when_commit_inputs_moved(&wc, &snapshot).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::CommitInputsChanged);
+        let message = err.to_string();
+        assert!(message.contains("foo.spec"), "{message}");
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_snapshot_detects_a_restaged_file() {
+        let http = checkout_http();
+        let (dir, wc, committed_files) = staged_spec_checkout(&http);
+        let snapshot = snapshot_commit_inputs(&wc, &committed_files).unwrap();
+        write_file(&wc.root, "foo.spec", "Name: baz\n");
+        add(&wc, &["foo.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let err = refuse_when_commit_inputs_moved(&wc, &snapshot).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::CommitInputsChanged);
+        let message = err.to_string();
+        assert!(message.contains("foo.spec"), "{message}");
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_snapshot_detects_a_newly_staged_file() {
+        let http = checkout_http();
+        let (dir, wc, committed_files) = staged_spec_checkout(&http);
+        let snapshot = snapshot_commit_inputs(&wc, &committed_files).unwrap();
+        write_file(&wc.root, "bar.txt", "new file\n");
+        add(&wc, &["bar.txt".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let err = refuse_when_commit_inputs_moved(&wc, &snapshot).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::CommitInputsChanged);
+        let message = err.to_string();
+        assert!(message.contains("bar.txt"), "{message}");
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_snapshot_ignores_an_unrelated_worktree_edit() {
+        let http = checkout_http();
+        let (dir, wc, committed_files) = staged_spec_checkout(&http);
+        let snapshot = snapshot_commit_inputs(&wc, &committed_files).unwrap();
+        // `foo.tar.gz` is in the index but not in the commit: a
+        // worktree edit to it is not a mid-commit change.
+        write_file(&wc.root, "foo.tar.gz", "changed\n");
+        refuse_when_commit_inputs_moved(&wc, &snapshot).unwrap();
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_snapshot_passes_when_nothing_moved() {
+        let http = checkout_http();
+        let (dir, wc, committed_files) = staged_spec_checkout(&http);
+        let snapshot = snapshot_commit_inputs(&wc, &committed_files).unwrap();
+        refuse_when_commit_inputs_moved(&wc, &snapshot).unwrap();
+        let _ = dir;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hash_worktree_file_hashes_a_symlinks_target() {
+        let dir = TempDirGuard::new("hash-symlink");
+        std::os::unix::fs::symlink("target-a", dir.path.join("link")).unwrap();
+        let first = hash_worktree_file(&dir.path, "link").unwrap();
+        std::fs::remove_file(dir.path.join("link")).unwrap();
+        std::os::unix::fs::symlink("target-b", dir.path.join("link")).unwrap();
+        let second = hash_worktree_file(&dir.path, "link").unwrap();
+        assert_ne!(first, second);
+        // A regular file holding the target bytes hashes differently.
+        write_file(&dir.path, "plain", "target-a");
+        assert_ne!(first, hash_worktree_file(&dir.path, "plain").unwrap());
+        let _ = dir;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn commit_snapshot_detects_a_retargeted_symlink() {
+        let http = checkout_http();
+        let (dir, wc, _) = staged_spec_checkout(&http);
+        std::os::unix::fs::symlink("foo.spec", wc.root.join("link.spec")).unwrap();
+        add(&wc, &["link.spec".to_string()], &DryRun::new(false))
+            .unwrap()
+            .unwrap();
+        let (_, committed_files) = build_commit_entries(&wc).unwrap();
+        assert!(committed_files.contains(&"link.spec".to_string()));
+        let snapshot = snapshot_commit_inputs(&wc, &committed_files).unwrap();
+        std::fs::remove_file(wc.root.join("link.spec")).unwrap();
+        std::os::unix::fs::symlink("foo.tar.gz", wc.root.join("link.spec")).unwrap();
+        let err = refuse_when_commit_inputs_moved(&wc, &snapshot).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::CommitInputsChanged);
         let _ = dir;
     }
 
@@ -13890,10 +14106,10 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn tracked_symlink_is_not_followed_by_the_service_gate() {
+    fn tracked_symlink_hashes_its_target_without_following_it() {
         // A tracked symlink to `/dev/zero`: the gate snapshot
-        // records no hash for it (it hashes file content, never
-        // a link target) instead of reading through the link.
+        // records the hash of the target bytes, never the target's
+        // content — following the link would read forever.
         let (dir, wc) = do_checkout(&checkout_http());
         std::os::unix::fs::symlink("/dev/zero", wc.root.join("zero-link")).unwrap();
         add(&wc, &["zero-link".to_string()], &DryRun::new(false))
@@ -13905,7 +14121,8 @@ mod tests {
             .iter()
             .find(|(name, _)| name == "zero-link")
             .unwrap();
-        assert_eq!(entry.1, None);
+        assert!(entry.1.is_some());
+        assert_eq!(entry.1, hash_worktree_file(&wc.root, "zero-link"));
         let _ = dir;
     }
 
