@@ -37,7 +37,8 @@
 //! per-package rows carry the codes, the cell detail rides a note
 //! line).
 //!
-//! Mutations (`rebuild-package`, `restart-build`, `abort-build`)
+//! Mutations (`rebuild-package`, `restart-build`, `abort-build`,
+//! `wipe-binaries`)
 //! follow the CLI-wide rule: dry-run by default, the global `--live`
 //! performs them, and the text opens with the coordinate header, then
 //! `dry_run:`, then the result line and the plan.
@@ -53,7 +54,7 @@ use geectl::obs::{
     parse_build_log_url, results_across_instances, valid_obs_filename, valid_obs_name, BinaryFile,
     BuildHistoryEntry, BuildInfo, BuildLogQuery, BuildResults, DryRun, ExtDependency, FileInfo,
     InstanceBuildResults, JobHistoryEntry, JobStatus, ObsClient, PackageDeps, ProvidedBy,
-    Repository, ResultsQuery, OBS_API_BASE,
+    Repository, ResultsQuery, WipeBinariesOptions, WipeCode, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -188,6 +189,40 @@ pub enum BuildCommand {
         repository: String,
         /// The architecture the package builds for.
         arch: String,
+    },
+    /// Wipe the binary packages of a project or a package. A
+    /// mutation: dry-run is the default (only the plan is printed);
+    /// `--live` performs the wipe. At least one scope selector is
+    /// required: `--all`, `--arch`, `--repository`, or a status
+    /// filter.
+    WipeBinaries {
+        /// The project to wipe binaries in.
+        project: String,
+        /// The package to wipe binaries for. Omit to wipe the whole
+        /// project.
+        package: Option<String>,
+        /// Wipe only binaries for this architecture.
+        #[arg(long)]
+        arch: Option<String>,
+        /// Wipe only binaries for this repository.
+        #[arg(long)]
+        repository: Option<String>,
+        /// Wipe all binaries regardless of package status. Combines
+        /// with no status filter.
+        #[arg(long)]
+        all: bool,
+        /// Wipe only binaries of packages whose build is disabled.
+        #[arg(long)]
+        build_disabled: bool,
+        /// Wipe only binaries of packages whose build failed.
+        #[arg(long)]
+        build_failed: bool,
+        /// Wipe only binaries of packages whose sources are bad.
+        #[arg(long)]
+        broken: bool,
+        /// Wipe only binaries of packages with dependency errors.
+        #[arg(long)]
+        unresolvable: bool,
     },
     /// Read the buildinfo for a package: the blocking error, if any,
     /// and the dependencies the build pulls in.
@@ -534,6 +569,7 @@ pub fn run_build(
         BuildCommand::RebuildPackage { .. }
         | BuildCommand::RestartBuild { .. }
         | BuildCommand::AbortBuild { .. }
+        | BuildCommand::WipeBinaries { .. }
             if !live =>
         {
             Credentials::None
@@ -717,6 +753,51 @@ pub fn run_build(
                 &package,
                 &repository,
                 &arch,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
+        BuildCommand::WipeBinaries {
+            project,
+            package,
+            arch,
+            repository,
+            all,
+            build_disabled,
+            build_failed,
+            broken,
+            unresolvable,
+        } => {
+            let mut codes = Vec::new();
+            if build_disabled {
+                codes.push(WipeCode::Disabled);
+            }
+            if build_failed {
+                codes.push(WipeCode::Failed);
+            }
+            if broken {
+                codes.push(WipeCode::Broken);
+            }
+            if unresolvable {
+                codes.push(WipeCode::Unresolvable);
+            }
+            let options = WipeBinariesOptions {
+                package,
+                arch,
+                repository,
+                all,
+                codes,
+            };
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.wipe_binaries(&project, &options, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(wipe_binaries_result(
+                &project,
+                &options,
                 dry_run.enabled(),
                 plan,
             ))
@@ -1168,6 +1249,24 @@ fn coordinates_header(command: &BuildCommand) -> String {
                 coords.push(format!("alternative-project: {alt}"));
             }
         }
+        BuildCommand::WipeBinaries {
+            project,
+            package,
+            repository,
+            arch,
+            ..
+        } => {
+            coords.push(format!("project: {project}"));
+            if let Some(package) = package {
+                coords.push(format!("package: {package}"));
+            }
+            if let Some(repository) = repository {
+                coords.push(format!("repository: {repository}"));
+            }
+            if let Some(arch) = arch {
+                coords.push(format!("arch: {arch}"));
+            }
+        }
         BuildCommand::ListRepositories { project } => {
             coords.push(format!("project: {project}"));
         }
@@ -1242,6 +1341,75 @@ fn build_control_result(
         dry_run,
         plan,
     )
+}
+
+/// The `wipe-binaries` result: the payload carries the scope;
+/// the text states the wipe, or the dry-run plan.
+fn wipe_binaries_result(
+    project: &str,
+    options: &WipeBinariesOptions,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let mut header_parts = vec![format!("project: {project}")];
+    if let Some(package) = &options.package {
+        header_parts.push(format!("package: {package}"));
+    }
+    if let Some(repository) = &options.repository {
+        header_parts.push(format!("repository: {repository}"));
+    }
+    if let Some(arch) = &options.arch {
+        header_parts.push(format!("arch: {arch}"));
+    }
+    let header = header_parts.join(" ");
+    let scope = match &options.package {
+        Some(package) => format!("package {package} in project {project}"),
+        None => format!("project {project}"),
+    };
+    let suffix = wipe_binaries_options_suffix(options);
+    let result_line = if dry_run {
+        format!("dry-run: would wipe binaries in {scope}{suffix}")
+    } else {
+        format!("wiped binaries in {scope}{suffix}")
+    };
+    mutation_result(
+        json!({
+            "project": project,
+            "package": options.package,
+            "arch": options.arch,
+            "repository": options.repository,
+            "all": options.all,
+            "codes": options.codes.iter().map(|code| code.as_str()).collect::<Vec<_>>(),
+        }),
+        header,
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The option suffix for a wipe-binaries plan/result line: the set
+/// scope selectors, so a dry-run plan reads what the wipe would do.
+fn wipe_binaries_options_suffix(options: &WipeBinariesOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(arch) = &options.arch {
+        parts.push(format!("arch {arch}"));
+    }
+    if let Some(repository) = &options.repository {
+        parts.push(format!("repository {repository}"));
+    }
+    if options.all {
+        parts.push("all".to_string());
+    }
+    if !options.codes.is_empty() {
+        let codes: Vec<&str> = options.codes.iter().map(|code| code.as_str()).collect();
+        parts.push(format!("codes {}", codes.join(", ")));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
 }
 
 /// The mutation result: the payload gains `dry_run` (and the plan
@@ -2443,6 +2611,101 @@ mod tests {
     }
 
     #[test]
+    fn clap_wipe_binaries_with_filters() {
+        match parse_build(&[
+            "wipe-binaries",
+            "openSUSE:Factory",
+            "foo",
+            "--arch",
+            "x86_64",
+            "--repository",
+            "standard",
+            "--build-failed",
+            "--broken",
+        ]) {
+            BuildCommand::WipeBinaries {
+                project,
+                package,
+                arch,
+                repository,
+                all,
+                build_disabled,
+                build_failed,
+                broken,
+                unresolvable,
+            } => {
+                assert_eq!(project, "openSUSE:Factory");
+                assert_eq!(package.as_deref(), Some("foo"));
+                assert_eq!(arch.as_deref(), Some("x86_64"));
+                assert_eq!(repository.as_deref(), Some("standard"));
+                assert!(!all);
+                assert!(!build_disabled);
+                assert!(build_failed);
+                assert!(broken);
+                assert!(!unresolvable);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // The project alone parses: the scope check is the
+        // library's, so the leaf refuses an unscoped wipe at the
+        // call, not at parse time.
+        match parse_build(&["wipe-binaries", "openSUSE:Factory"]) {
+            BuildCommand::WipeBinaries {
+                package: None,
+                all: false,
+                ..
+            } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wipe_binaries_result_carries_scope_in_both_formats() {
+        let options = WipeBinariesOptions {
+            package: Some("k".to_string()),
+            arch: Some("x86_64".to_string()),
+            repository: Some("standard".to_string()),
+            codes: vec![WipeCode::Failed, WipeCode::Broken],
+            ..WipeBinariesOptions::default()
+        };
+        let (payload, text) = wipe_binaries_result("P", &options, false, None);
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["package"], "k");
+        assert_eq!(payload["arch"], "x86_64");
+        assert_eq!(payload["repository"], "standard");
+        assert_eq!(payload["all"], false);
+        assert_eq!(payload["codes"][0], "failed");
+        assert_eq!(payload["codes"][1], "broken");
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "project: P package: k repository: standard arch: x86_64\ndry_run: false\nwiped binaries in package k in project P (arch x86_64, repository standard, codes failed, broken)"
+        );
+        let (payload, text) = wipe_binaries_result(
+            "P",
+            &WipeBinariesOptions {
+                all: true,
+                ..WipeBinariesOptions::default()
+            },
+            true,
+            Some(vec![
+                "[dry-run] would: wipe binaries in project P (all)".to_string()
+            ]),
+        );
+        assert_eq!(payload["package"], Value::Null);
+        assert_eq!(payload["all"], true);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: wipe binaries in project P (all)"
+        );
+        assert_eq!(
+            text,
+            "project: P\ndry_run: true\ndry-run: would wipe binaries in project P (all)\n[dry-run] would: wipe binaries in project P (all)"
+        );
+    }
+
+    #[test]
     fn table_measures_widths_in_characters() {
         // Widths are characters, not bytes: a two-byte `é` is one
         // column wide, so the second column still aligns.
@@ -2612,6 +2875,22 @@ mod tests {
         );
         assert_eq!(
             coordinates_header(&parse_build(&["check-constraints", "p", "k", "r", "a"])),
+            "project: p package: k repository: r arch: a"
+        );
+        assert_eq!(
+            coordinates_header(&parse_build(&["wipe-binaries", "p"])),
+            "project: p"
+        );
+        assert_eq!(
+            coordinates_header(&parse_build(&[
+                "wipe-binaries",
+                "p",
+                "k",
+                "--repository",
+                "r",
+                "--arch",
+                "a",
+            ])),
             "project: p package: k repository: r arch: a"
         );
     }

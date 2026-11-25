@@ -9,6 +9,8 @@ use super::ObsClient;
 use super::ReleaseTarget;
 use super::Repository;
 use super::RepositoryDownload;
+use super::WipeBinariesOptions;
+use super::WipeCode;
 use crate::auth::Credentials;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
@@ -2742,6 +2744,56 @@ where
     })
 }
 
+/// A wipe needs a scope: at least one of `all`, `arch`,
+/// `repository`, or a non-empty `codes` — an unscoped wipe would
+/// delete every binary in the project, so osc refuses it too.
+/// `all` combines with no status filter: osc silently drops
+/// `--all` when a filter is given, geectl refuses the combination
+/// instead.
+fn validate_wipe_binaries_options(options: &WipeBinariesOptions) -> Result<(), GeectlError> {
+    if options.all && !options.codes.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "an all-binaries wipe takes no status filter",
+        ));
+    }
+    if !options.all
+        && options.arch.is_none()
+        && options.repository.is_none()
+        && options.codes.is_empty()
+    {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "a wipe needs a scope: all binaries, an architecture, a repository, or a status filter",
+        ));
+    }
+    Ok(())
+}
+
+/// The scope suffix for a wipe-binaries plan line: the set scope
+/// selectors, so a dry-run plan reads what the wipe would do.
+fn wipe_binaries_scope_suffix(options: &WipeBinariesOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(arch) = &options.arch {
+        parts.push(format!("arch {arch}"));
+    }
+    if let Some(repository) = &options.repository {
+        parts.push(format!("repository {repository}"));
+    }
+    if options.all {
+        parts.push("all".to_string());
+    }
+    if !options.codes.is_empty() {
+        let codes: Vec<&str> = options.codes.iter().map(|code| code.as_str()).collect();
+        parts.push(format!("codes {}", codes.join(", ")));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 impl<'a> ObsClient<'a> {
     /// Refuse a credentialed build read without OBS Basic
     /// credentials, before any request: every `/build` endpoint
@@ -3227,6 +3279,111 @@ impl<'a> ObsClient<'a> {
                 format!("unexpected OBS {cmd} response for package {project}/{package}"),
             ))
         }
+    }
+
+    /// Wipe the binary packages of a project, or of one package in
+    /// it, on OBS (`POST /build/<project>?cmd=wipe`, with
+    /// `&package=`, `&arch=`, `&repository=` when set, and one
+    /// request per `code` when status filters are set). Requires
+    /// credentials; without them the call fails loudly before any
+    /// request. In dry-run the wipe is recorded in the plan and
+    /// nothing is wiped — the guard runs before the credentials
+    /// check, like `create_package`.
+    ///
+    /// An agent wipes binaries to force a clean rebuild surface,
+    /// or to drop the binaries of packages in a given build state.
+    /// At least one scope selector is required — `all`, `arch`,
+    /// `repository`, or a status filter — because an unscoped wipe
+    /// deletes every binary in the project; osc refuses that too.
+    /// `all` combines with no status filter: osc silently drops
+    /// `--all` when a filter is given, geectl refuses the
+    /// combination instead. Each status filter is its own request,
+    /// in the order given, like osc.
+    ///
+    /// Success is the `<status code="ok"/>` body; any other body
+    /// is a server error, never success.
+    pub fn wipe_binaries(
+        &self,
+        project: &str,
+        options: &WipeBinariesOptions,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        for (label, value) in [
+            ("package", options.package.as_deref()),
+            ("architecture", options.arch.as_deref()),
+            ("repository", options.repository.as_deref()),
+        ] {
+            if let Some(value) = value {
+                if !valid_obs_name(value) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid OBS {label} name: {value:?}"),
+                    ));
+                }
+            }
+        }
+        validate_wipe_binaries_options(options)?;
+        let what = match &options.package {
+            Some(package) => format!("package {project}/{package}"),
+            None => format!("project {project}"),
+        };
+        if !dry_run.allow(&format!(
+            "wipe binaries in {what}{}",
+            wipe_binaries_scope_suffix(options)
+        )) {
+            return Ok(());
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "cannot wipe binaries in {what} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
+                ),
+            ));
+        }
+        let mut codes: Vec<Option<WipeCode>> = Vec::new();
+        for code in &options.codes {
+            if !codes.contains(&Some(*code)) {
+                codes.push(Some(*code));
+            }
+        }
+        if codes.is_empty() {
+            codes.push(None);
+        }
+        for code in codes {
+            let mut query: Vec<(&str, &str)> = vec![("cmd", "wipe")];
+            if let Some(package) = &options.package {
+                query.push(("package", package));
+            }
+            if let Some(arch) = &options.arch {
+                query.push(("arch", arch));
+            }
+            if let Some(repository) = &options.repository {
+                query.push(("repository", repository));
+            }
+            if let Some(code) = code {
+                query.push(("code", code.as_str()));
+            }
+            let url = build_url(&self.base, &["build", project], &query);
+            let body = self.http.post(&url, "", &self.credentials)?;
+            if !parse_status_ok(&body) {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected OBS wipe response for {what}{}",
+                        code.map(|code| format!(" (code {})", code.as_str()))
+                            .unwrap_or_default()
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The build configuration for `project`/`repository`: the
@@ -8088,6 +8245,269 @@ mod tests {
             )
             .is_ok());
         assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn wipe_binaries_project_all_posts_wipe_and_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory?cmd=wipe",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = WipeBinariesOptions {
+            all: true,
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn wipe_binaries_package_with_codes_posts_one_request_per_code() {
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/build/test:factory?cmd=wipe&package=test-pkgA&arch=x86_64&repository=standard&code=failed",
+                "<status code=\"ok\"/>",
+            )
+            .with_post(
+                "https://api.opensuse.org/build/test:factory?cmd=wipe&package=test-pkgA&arch=x86_64&repository=standard&code=broken",
+                "<status code=\"ok\"/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = WipeBinariesOptions {
+            package: Some("test-pkgA".to_string()),
+            arch: Some("x86_64".to_string()),
+            repository: Some("standard".to_string()),
+            codes: vec![WipeCode::Failed, WipeCode::Broken],
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 2);
+    }
+
+    #[test]
+    fn wipe_binaries_repeated_codes_post_once() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory?cmd=wipe&arch=x86_64&code=failed",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = WipeBinariesOptions {
+            arch: Some("x86_64".to_string()),
+            codes: vec![WipeCode::Failed, WipeCode::Failed],
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn wipe_binaries_all_with_arch_posts_wipe_with_arch() {
+        // `all` combines with an architecture filter: one request,
+        // no `code`.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory?cmd=wipe&arch=x86_64",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = WipeBinariesOptions {
+            all: true,
+            arch: Some("x86_64".to_string()),
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn wipe_binaries_all_with_repository_posts_wipe_with_repository() {
+        // `all` combines with a repository filter: one request,
+        // no `code`.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory?cmd=wipe&repository=standard",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = WipeBinariesOptions {
+            all: true,
+            repository: Some("standard".to_string()),
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn wipe_binaries_package_with_all_posts_wipe_with_package() {
+        // A package scope with `all`: one request carrying the
+        // package, no `code`.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory?cmd=wipe&package=test-pkgA",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = WipeBinariesOptions {
+            package: Some("test-pkgA".to_string()),
+            all: true,
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn wipe_binaries_second_code_failure_names_the_failing_code() {
+        // The requests run in order and stop at the first failure:
+        // the error names the code that failed, not the first code.
+        let http = FakeHttp::new()
+            .with_post(
+                "https://api.opensuse.org/build/test:factory?cmd=wipe&code=failed",
+                "<status code=\"ok\"/>",
+            )
+            .with_post(
+                "https://api.opensuse.org/build/test:factory?cmd=wipe&code=broken",
+                "<status code=\"error\"/>",
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = WipeBinariesOptions {
+            codes: vec![WipeCode::Failed, WipeCode::Broken],
+            ..WipeBinariesOptions::default()
+        };
+        let err = client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(
+            err.to_string().contains("(code broken)"),
+            "error names the failing code: {err}"
+        );
+        assert_eq!(http.post_calls().len(), 2);
+    }
+
+    #[test]
+    fn wipe_binaries_other_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory?cmd=wipe",
+            "<status code=\"error\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = WipeBinariesOptions {
+            all: true,
+            ..WipeBinariesOptions::default()
+        };
+        let err = client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn wipe_binaries_dry_run_records_plan_and_wipes_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = WipeBinariesOptions {
+            package: Some("test-pkgA".to_string()),
+            codes: vec![WipeCode::Disabled, WipeCode::Failed],
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: wipe binaries in package test:factory/test-pkgA (codes disabled, failed)"
+                    .to_string()
+            ]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn wipe_binaries_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/build/test:factory?cmd=wipe",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        let options = WipeBinariesOptions {
+            all: true,
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn wipe_binaries_needs_a_scope_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .wipe_binaries(
+                "test:factory",
+                &WipeBinariesOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn wipe_binaries_all_with_codes_is_refused_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = WipeBinariesOptions {
+            all: true,
+            codes: vec![WipeCode::Failed],
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn wipe_binaries_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .wipe_binaries(
+                "test:factory/pkg",
+                &WipeBinariesOptions {
+                    all: true,
+                    ..WipeBinariesOptions::default()
+                },
+                &DryRun::new(false),
+            )
+            .is_err());
+        let options = WipeBinariesOptions {
+            package: Some("test-pkgA/pkg".to_string()),
+            all: true,
+            ..WipeBinariesOptions::default()
+        };
+        assert!(client
+            .wipe_binaries("test:factory", &options, &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
     }
 
     #[test]

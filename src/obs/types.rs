@@ -990,6 +990,59 @@ impl std::fmt::Debug for CreatedToken {
     }
 }
 
+/// The status filter for [`ObsClient::wipe_binaries`]: wipe only
+/// the binaries of packages in this build state. The server's
+/// `code` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WipeCode {
+    /// Packages whose build is disabled. The server's
+    /// `code=disabled`.
+    Disabled,
+    /// Packages whose build failed. The server's `code=failed`.
+    Failed,
+    /// Packages whose sources are bad. The server's `code=broken`.
+    Broken,
+    /// Packages with dependency errors. The server's
+    /// `code=unresolvable`.
+    Unresolvable,
+}
+
+impl WipeCode {
+    /// The wire spelling: the server's `code` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WipeCode::Disabled => "disabled",
+            WipeCode::Failed => "failed",
+            WipeCode::Broken => "broken",
+            WipeCode::Unresolvable => "unresolvable",
+        }
+    }
+}
+
+/// Options for [`ObsClient::wipe_binaries`]. At least one scope
+/// selector is required: `all`, `arch`, `repository`, or a
+/// non-empty `codes` — an unscoped wipe would delete every binary
+/// in the project, so osc refuses it too.
+#[derive(Debug, Clone, Default)]
+pub struct WipeBinariesOptions {
+    /// The package to wipe. None wipes the whole project. The
+    /// server's `package`.
+    pub package: Option<String>,
+    /// Wipe only binaries for this architecture. The server's
+    /// `arch`.
+    pub arch: Option<String>,
+    /// Wipe only binaries for this repository. The server's
+    /// `repository`.
+    pub repository: Option<String>,
+    /// Wipe all binaries regardless of package status. The
+    /// unfiltered request: no `code` is sent. Combines with no
+    /// status filter.
+    pub all: bool,
+    /// Wipe only binaries of packages in these build states: one
+    /// request per code, in order. The server's `code` parameter.
+    pub codes: Vec<WipeCode>,
+}
+
 /// Options for [`ObsClient::create_package_with_options`]. All
 /// fields are optional: no scmsync means an OBS-native package, no
 /// force means an existing package is refused rather than

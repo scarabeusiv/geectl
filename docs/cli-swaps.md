@@ -149,6 +149,7 @@ beyond osc.
 | `osc rebuild [PROJECT [PACKAGE]]` | `geectl build rebuild-package PROJECT PACKAGE REPOSITORY ARCH` | One command per library operation, explicit coordinates; per-package only |
 | `osc restartbuild [PROJECT [PACKAGE]]` | `geectl build restart-build PROJECT PACKAGE REPOSITORY ARCH` | Same mapping; per-package only |
 | `osc abortbuild [PROJECT [PACKAGE]]` | `geectl build abort-build PROJECT PACKAGE REPOSITORY ARCH` | Same mapping; per-package only |
+| `osc wipebinaries PROJECT [PACKAGE]` | `geectl build wipe-binaries PROJECT [PACKAGE] [--arch ARCH] [--repository REPO] [--all] [--build-disabled] [--build-failed] [--broken] [--unresolvable]` | One command per library operation; `-r` is `--repository`, `-a` is `--arch`. `--all` takes no status filter (osc silently drops it when a filter is given); an unscoped wipe is refused |
 
 `geectl build build-status`, `geectl build job-status`, `geectl build fileinfo`,
 `geectl build dependson`, `geectl build check-constraints`, `geectl build list-binaries` — new surface, reachable in osc

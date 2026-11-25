@@ -232,6 +232,7 @@ directory's `.env` only.
 - `geectl build rebuild-package <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Rebuild a package: rerun a build without touching the sources.
 - `geectl build restart-build <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Restart the running build of a package, without touching the sources.
 - `geectl build abort-build <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Abort the running build of a package.
+- `geectl build wipe-binaries <PROJECT> [PACKAGE]` — Wipe the binary packages of a project or a package; key flags: --all, --arch <ARCH>, --repository <REPOSITORY>, --build-disabled, --build-failed, --broken, --unresolvable
 - `geectl build buildinfo <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Read the buildinfo for a package: the blocking error, if any, and the dependencies the build pulls in; key flags: --alternative-project <ALTERNATIVE_PROJECT>
 - `geectl build buildconfig <PROJECT> <REPOSITORY>` — Read the build configuration for a project/repository: the expanded `_buildconfig` text the engine takes as `--dist`; key flags: --alternative-project <ALTERNATIVE_PROJECT>
 - `geectl build build-history <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — List the completed builds for a package, newest first; key flags: --limit <LIMIT>
