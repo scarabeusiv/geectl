@@ -181,6 +181,7 @@ directory's `.env` only.
 - `geectl remote aggregate-package <SOURCE_PROJECT> <SOURCE_PACKAGE> <TARGET_PROJECT> <TARGET_PACKAGE>` — Aggregate a package's binaries into another package; key flags: --repository-map <REPOSITORY_MAP>, --no-sources, --disable-publish
 - `geectl remote release-package <PROJECT> <PACKAGE>` — Release a package's sources and binaries; key flags: --repository <REPOSITORY>, --arch <ARCH>, --target-project <TARGET_PROJECT>, --target-repository <TARGET_REPOSITORY>, --set-release <SET_RELEASE>, --no-delay
 - `geectl remote release-project <PROJECT>` — Release a whole project's sources and binaries; key flags: --repository <REPOSITORY>, --arch <ARCH>, --target-project <TARGET_PROJECT>, --target-repository <TARGET_REPOSITORY>, --set-release <SET_RELEASE>, --no-delay
+- `geectl remote lock <PROJECT> [PACKAGE]` — Lock a project or a package; key flags: --message <MESSAGE>
 
 ## `request` — submit requests
 

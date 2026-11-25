@@ -251,6 +251,26 @@ fn delete_project_option_suffix(options: &DeleteProjectOptions) -> String {
     }
 }
 
+/// The message suffix for a lock/unlock plan line: the message,
+/// truncated to its first 80 characters, like the delete message:
+/// the plan is one line, and the full message rides the payload.
+/// No message — none given, or an empty one — adds no suffix.
+fn plan_message_suffix(message: Option<&str>) -> String {
+    match message.filter(|message| !message.is_empty()) {
+        Some(message) => {
+            const PLAN_MESSAGE_LEN: usize = 80;
+            let shown: String = message.chars().take(PLAN_MESSAGE_LEN).collect();
+            let more = if message.chars().count() > PLAN_MESSAGE_LEN {
+                "…"
+            } else {
+                ""
+            };
+            format!(" (message {shown}{more})")
+        }
+        None => String::new(),
+    }
+}
+
 /// The option suffix for a package-creation plan line: the set
 /// options, so a dry-run plan reads what the creation would have
 /// done.
@@ -4672,6 +4692,117 @@ impl<'a> ObsClient<'a> {
         }
     }
 
+    /// The shared source-command POST for the admin writes: `POST
+    /// /source/<path>?<query>` with an empty body. `path` is the
+    /// source path segments after `source`; `action` names the
+    /// operation and `what` the target in errors. Success is the
+    /// `<status code="ok"/>` body: any other body is a server
+    /// error, never success.
+    fn source_command(
+        &self,
+        path: &[&str],
+        query: &[(&str, &str)],
+        action: &str,
+        what: &str,
+    ) -> Result<(), GeectlError> {
+        let mut segments = vec!["source"];
+        segments.extend_from_slice(path);
+        let url = build_url(&self.base, &segments, query);
+        let body = self.http.post(&url, "", &self.credentials)?;
+        if parse_status_ok(&body) {
+            Ok(())
+        } else {
+            Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS {action} response for {what}"),
+            ))
+        }
+    }
+
+    /// Lock a project, or a package in it, on OBS. A project lock
+    /// posts `POST /source/<project>?cmd=lock`, with
+    /// `&comment=<message>` when a message is given: the server
+    /// records the comment on the lock (`Project#command_lock`).
+    /// A package lock posts `POST
+    /// /source/<project>/<package>?cmd=set_flag&flag=lock&status=enable`,
+    /// with `&comment=<message>` when a message is given — there
+    /// is no package-scope `lock` command, so the message is sent
+    /// but the server does not record it, exactly as osc does.
+    /// Requires credentials; without them the call fails loudly
+    /// before any request. In dry-run the lock is recorded in the
+    /// plan and nothing is locked — the guard runs before the
+    /// credentials check, like `create_package`. The plan names a
+    /// truncated message, like the delete message.
+    ///
+    /// An agent locks a project or package to freeze it against
+    /// changes while a release or a maintenance incident is in
+    /// flight. A message is optional: osc leaves the lock message
+    /// optional, while unlock requires one.
+    pub fn lock(
+        &self,
+        project: &str,
+        package: Option<&str>,
+        message: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        if let Some(package) = package {
+            if !valid_obs_name(package) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name: {package:?}"),
+                ));
+            }
+        }
+        let what = match package {
+            Some(package) => format!("package {project}/{package}"),
+            None => format!("project {project}"),
+        };
+        if !dry_run.allow(&format!("lock {what}{}", plan_message_suffix(message))) {
+            return Ok(());
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "cannot lock {what} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
+                ),
+            ));
+        }
+        let path: Vec<&str> = match package {
+            Some(package) => vec![project, package],
+            None => vec![project],
+        };
+        // A project lock uses the server's project-only `cmd=lock`
+        // handler, which records the comment; a package lock sets
+        // the flag with `set_flag`, the only package path — the
+        // message is sent but not recorded.
+        let message = message.filter(|message| !message.is_empty());
+        let query: Vec<(&str, &str)> = match package {
+            None => {
+                let mut query: Vec<(&str, &str)> = vec![("cmd", "lock")];
+                if let Some(message) = message {
+                    query.push(("comment", message));
+                }
+                query
+            }
+            Some(_) => {
+                let mut query: Vec<(&str, &str)> =
+                    vec![("cmd", "set_flag"), ("flag", "lock"), ("status", "enable")];
+                if let Some(message) = message {
+                    query.push(("comment", message));
+                }
+                query
+            }
+        };
+        self.source_command(&path, &query, "lock", &what)
+    }
+
     /// Create an operation-scoped trigger token for the
     /// authenticated user (`POST /person/<login>/token`), and return
     /// the id and the secret it was created with. The secret is
@@ -6954,6 +7085,217 @@ mod tests {
                 "test:factory/pkg",
                 &ReleaseOptions::default(),
                 &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn lock_project_posts_lock_and_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=lock",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .lock("test:factory", None, None, &DryRun::new(false))
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn lock_package_posts_set_flag_with_message() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=set_flag&flag=lock&status=enable&comment=freeze%20for%20release",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .lock(
+                "test:factory",
+                Some("test-pkgA"),
+                Some("freeze for release"),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn lock_project_with_message_posts_lock_with_comment() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=lock&comment=freeze%20for%20release",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .lock(
+                "test:factory",
+                None,
+                Some("freeze for release"),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn lock_project_empty_message_posts_lock_without_comment() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=lock",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .lock("test:factory", None, Some(""), &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn lock_project_whitespace_message_posts_lock_with_comment() {
+        // A whitespace-only message is not empty, so it is sent:
+        // only the empty message is dropped from the query.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=lock&comment=%20%20%20",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .lock("test:factory", None, Some("   "), &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn lock_package_empty_message_posts_set_flag_without_comment() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=set_flag&flag=lock&status=enable",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .lock(
+                "test:factory",
+                Some("test-pkgA"),
+                Some(""),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn lock_package_whitespace_message_posts_set_flag_with_comment() {
+        // Sent, like osc sends it — the server does not record it
+        // on a package lock, but the client does not drop it.
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=set_flag&flag=lock&status=enable&comment=%20%20%20",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .lock(
+                "test:factory",
+                Some("test-pkgA"),
+                Some("   "),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn lock_other_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=lock",
+            "<status code=\"error\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .lock("test:factory", None, None, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn lock_dry_run_records_plan_and_locks_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .lock("test:factory", Some("test-pkgA"), None, &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: lock package test:factory/test-pkgA".to_string()]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn lock_dry_run_plan_names_truncated_message() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        // A message longer than 80 characters is truncated, with an
+        // ellipsis marking the cut — the plan is one line.
+        let dry_run = DryRun::new(true);
+        let long = "x".repeat(81);
+        assert!(client
+            .lock("test:factory", Some("test-pkgA"), Some(&long), &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![format!(
+                "[dry-run] would: lock package test:factory/test-pkgA (message {}…)",
+                "x".repeat(80)
+            )]
+        );
+        // A message of exactly 80 characters is shown whole.
+        let dry_run = DryRun::new(true);
+        let exact = "x".repeat(80);
+        assert!(client
+            .lock("test:factory", None, Some(&exact), &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![format!(
+                "[dry-run] would: lock project test:factory (message {})",
+                "x".repeat(80)
+            )]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn lock_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory?cmd=lock",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .lock("test:factory", None, None, &DryRun::new(false))
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn lock_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .lock("test:factory/pkg", None, None, &DryRun::new(false))
+            .is_err());
+        assert!(client
+            .lock(
+                "test:factory",
+                Some("test-pkgA/pkg"),
+                None,
+                &DryRun::new(false)
             )
             .is_err());
         assert!(http.post_calls().is_empty());

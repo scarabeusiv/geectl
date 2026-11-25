@@ -4,8 +4,8 @@
 //! contents and downloads, listings, history, meta, search, ownership,
 //! and diffs — plus the group's mutations, which edit a project's repository
 //! list in its meta (`repo-add`, `repo-remove`), create, upload
-//! to, delete, restore, aggregate, and release projects and
-//! packages, or create an operation-scoped trigger token
+//! to, delete, restore, aggregate, release, and lock projects
+//! and packages, or create an operation-scoped trigger token
 //! (`create-token`). Each command is a thin wrapper over one `ObsClient`
 //! operation: the flags mirror the library parameters, the JSON
 //! payload carries the typed values, and the text renderer prints
@@ -72,7 +72,9 @@
 //! `delete-package` text carries no message (long free text — the
 //! dry-run plan names a truncated message); `create-package` text
 //! carries no `force` (a boolean; the dry-run plan names it when
-//! set).
+//! set). `lock` and `unlock` text carry no message either (a
+//! message, not an identifier — the dry-run plan names a
+//! truncated message).
 //! The JSON payload remains the complete record in every case.
 
 use clap::Subcommand;
@@ -770,6 +772,22 @@ pub enum RemoteCommand {
         #[arg(long)]
         no_delay: bool,
     },
+    /// Lock a project or a package. A mutation: dry-run is the
+    /// default (only the plan is printed); `--live` performs the
+    /// lock. A project lock records the message on the lock; a
+    /// package lock sends it but the server does not record it.
+    Lock {
+        /// The project to lock.
+        project: String,
+        /// The package to lock. Omit to lock the whole project.
+        package: Option<String>,
+        /// A message for the lock, sent as the server's `comment`
+        /// query parameter. A project lock records it; a package
+        /// lock sends it but the server does not record it — there
+        /// is no package-scope lock command.
+        #[arg(long)]
+        message: Option<String>,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
@@ -820,6 +838,7 @@ pub fn run_remote(
         RemoteCommand::AggregatePackage { .. } if !live => Credentials::None,
         RemoteCommand::ReleasePackage { .. } if !live => Credentials::None,
         RemoteCommand::ReleaseProject { .. } if !live => Credentials::None,
+        RemoteCommand::Lock { .. } if !live => Credentials::None,
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -1815,6 +1834,26 @@ pub fn run_remote(
             Ok(release_project_result(
                 &project,
                 &options,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
+        RemoteCommand::Lock {
+            project,
+            package,
+            message,
+        } => {
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.lock(&project, package.as_deref(), message.as_deref(), &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(lock_result(
+                &project,
+                package.as_deref(),
+                message.as_deref(),
                 dry_run.enabled(),
                 plan,
             ))
@@ -2951,6 +2990,41 @@ fn release_project_result(
     mutation_result(
         payload,
         format!("project: {project}"),
+        result_line,
+        dry_run,
+        plan,
+    )
+}
+
+/// The `lock` result: the payload carries the scope and the
+/// message; the text carries the scope and leaves the message to
+/// the payload (a message, not an identifier).
+fn lock_result(
+    project: &str,
+    package: Option<&str>,
+    message: Option<&str>,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let (header, scope) = match package {
+        Some(package) => (
+            format!("project: {project} package: {package}"),
+            format!("package {package} in project {project}"),
+        ),
+        None => (format!("project: {project}"), format!("project {project}")),
+    };
+    let result_line = if dry_run {
+        format!("dry-run: would lock {scope}")
+    } else {
+        format!("locked {scope}")
+    };
+    mutation_result(
+        json!({
+            "project": project,
+            "package": package,
+            "message": message,
+        }),
+        header,
         result_line,
         dry_run,
         plan,
@@ -6382,6 +6456,65 @@ mod tests {
         assert_eq!(
             text,
             "project: P\ndry_run: true\ndry-run: would release project P\n[dry-run] would: release project P"
+        );
+    }
+
+    #[test]
+    fn lock_parses_project_package_and_message() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "lock",
+            "P",
+            "K",
+            "--message",
+            "freeze for release",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::Lock {
+                project,
+                package: Some(package),
+                message: Some(message),
+                ..
+            } if project == "P" && package == "K" && message == "freeze for release"
+        ));
+        let parsed = parse(&["geectl", "remote", "lock", "P"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::Lock {
+                package: None,
+                message: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lock_result_carries_scope_and_message_in_both_formats() {
+        let (payload, text) = lock_result("P", Some("K"), Some("freeze"), false, None);
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["package"], "K");
+        assert_eq!(payload["message"], "freeze");
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: false\nlocked package K in project P"
+        );
+        let (payload, text) = lock_result(
+            "P",
+            None,
+            None,
+            true,
+            Some(vec!["[dry-run] would: lock project P".to_string()]),
+        );
+        assert_eq!(payload["package"], Value::Null);
+        assert_eq!(payload["message"], Value::Null);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(payload["plan"][0], "[dry-run] would: lock project P");
+        assert_eq!(
+            text,
+            "project: P\ndry_run: true\ndry-run: would lock project P\n[dry-run] would: lock project P"
         );
     }
 

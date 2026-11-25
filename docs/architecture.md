@@ -205,7 +205,10 @@ link into a branch and `ObsClient::detach_branch` detaches one;
 `ObsClient::aggregate_package` collects another package's binaries
 under a new name; and `ObsClient::release_package` /
 `ObsClient::release_project` release sources and binaries to a
-release target as built. Every one of these is
+release target as built; `ObsClient::lock` locks a project with
+the server's `cmd=lock`, which records the message, or a package
+by setting its `lock` flag — the message is sent but not recorded.
+Every one of these is
 DryRun-guarded and credentialed like the create and upload calls
 above.
 

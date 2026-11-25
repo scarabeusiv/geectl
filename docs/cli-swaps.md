@@ -44,6 +44,7 @@ the per-group sections list only what is specific to that group.
 | `osc aggregatepac SOURCEPRJ SOURCEPAC DESTPRJ [DESTPAC]` | `geectl remote aggregate-package SOURCE-PROJECT SOURCE-PACKAGE TARGET-PROJECT TARGET-PACKAGE` | Grouped + spelled-out; the target package is required (osc defaults it to the source name). `-m SRC=TARGET` is repeatable `--repository-map SOURCE=TARGET`; `--nosources` is `--no-sources`, `-d` is `--disable-publish` |
 | `osc release [SOURCEPROJECT SOURCEPACKAGE]` | `geectl remote release-package` | One command per library operation. `-r` is `--repository`, `-a` is `--arch`; `--target-project` / `--target-repository` / `--set-release` / `--no-delay` keep their names |
 | `osc release [SOURCEPROJECT]` | `geectl remote release-project` | One command per library operation; same flag mapping as `release-package` |
+| `osc lock PROJECT [PACKAGE]` | `geectl remote lock PROJECT [PACKAGE] [--message TEXT]` | One command per library operation; osc's `-m` stays `--message`, sent as the server's `comment`; a project lock records it (`cmd=lock`), a package lock sends it but the server does not record it (`set_flag` is the only package path) |
 | `osc ls /` | `geectl remote list-projects` | Same listing, named as a leaf under `geectl remote` |
 | — | `geectl remote list-staging-projects PROJECT` | New surface: the library reads `/staging/<workflow>/staging_projects` |
 | — | `geectl remote staging-project PROJECT NAME` | Same; the one-project read |
