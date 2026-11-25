@@ -3440,6 +3440,7 @@ impl<'a> ObsClient<'a> {
         if codes.is_empty() {
             codes.push(None);
         }
+        let mut completed: Vec<&str> = Vec::new();
         for code in codes {
             let mut query: Vec<(&str, &str)> = vec![("cmd", "wipe")];
             if let Some(package) = &options.package {
@@ -3457,14 +3458,25 @@ impl<'a> ObsClient<'a> {
             let url = build_url(&self.base, &["build", project], &query);
             let body = self.http.post(&url, "", &self.credentials)?;
             if !parse_status_ok(&body) {
+                // Name the codes already wiped alongside the failing
+                // one: a mid-batch failure leaves the earlier codes
+                // wiped and the later ones not attempted.
+                let suffix = match (code.map(WipeCode::as_str), completed.is_empty()) {
+                    (Some(failed), false) => format!(
+                        " (code {failed} after completed {})",
+                        completed.join(", ")
+                    ),
+                    (Some(failed), true) => format!(" (code {failed})"),
+                    (None, false) => format!(" (after completed {})", completed.join(", ")),
+                    (None, true) => String::new(),
+                };
                 return Err(GeectlError::new(
                     ErrorKind::ServerError,
-                    format!(
-                        "unexpected OBS wipe response for {what}{}",
-                        code.map(|code| format!(" (code {})", code.as_str()))
-                            .unwrap_or_default()
-                    ),
+                    format!("unexpected OBS wipe response for {what}{suffix}"),
                 ));
+            }
+            if let Some(code) = code {
+                completed.push(code.as_str());
             }
         }
         Ok(())
@@ -8846,7 +8858,8 @@ mod tests {
     #[test]
     fn wipe_binaries_second_code_failure_names_the_failing_code() {
         // The requests run in order and stop at the first failure:
-        // the error names the code that failed, not the first code.
+        // the error names the code that failed and the code already
+        // wiped, not the first code.
         let http = FakeHttp::new()
             .with_post(
                 "https://api.opensuse.org/build/test:factory?cmd=wipe&code=failed",
@@ -8866,8 +8879,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ServerError);
         assert!(
-            err.to_string().contains("(code broken)"),
-            "error names the failing code: {err}"
+            err.to_string()
+                .contains("(code broken after completed failed)"),
+            "error names the failing code and the completed code: {err}"
         );
         assert_eq!(http.post_calls().len(), 2);
     }
