@@ -117,8 +117,8 @@ pub struct BranchArgs {
     target_package: Option<String>,
     /// Seconds to wait for the first build of the forked package in
     /// the fork's test project; 0 skips the wait and reports the
-    /// branch without a build.
-    #[arg(long, default_value_t = 600)]
+    /// branch without a build. No wait by default.
+    #[arg(long, default_value_t = 0)]
     first_build_deadline_secs: u64,
 }
 

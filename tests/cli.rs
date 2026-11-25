@@ -5391,6 +5391,8 @@ fn branch_branch_live_copies_the_source_repositories() {
             "descent3",
             "--target-project",
             "home:fbui:test:descent3",
+            "--first-build-deadline-secs",
+            "600",
         ])
         .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
         .env("GEECTL_OBS_USERNAME", "alice")
@@ -5458,6 +5460,8 @@ fn branch_branch_live_copies_the_source_repositories() {
             "descent3",
             "--target-project",
             "home:fbui:test:descent3",
+            "--first-build-deadline-secs",
+            "600",
         ])
         .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
         .env("GEECTL_OBS_USERNAME", "alice")

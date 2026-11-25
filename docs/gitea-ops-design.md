@@ -318,8 +318,8 @@ fork's test project and reports it on the result: settled once the
 build matrix settles, still running with the latest matrix when the
 deadline passes, not waited at deadline zero, no repositories when
 the source project carries none, and project fork for a project fork.
-The wait is bounded by `--first-build-deadline-secs` (600 seconds by
-default); a slow build is not a branch failure — the branch stands
+The wait is bounded by `--first-build-deadline-secs` (no wait by
+default; pass a positive value to wait); a slow build is not a branch failure — the branch stands
 and the caller sees the latest state. Tracking is the scmsync link:
 a push to the fork branch syncs into the test project and OBS
 rebuilds, with no re-run of the leaf. A second branch reuses the
