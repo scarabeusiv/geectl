@@ -5850,9 +5850,10 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// A temp directory removed on drop.
+    /// A temp directory removed on drop, unless kept.
     struct TempDirGuard {
         path: PathBuf,
+        keep: bool,
     }
 
     impl TempDirGuard {
@@ -5861,13 +5862,26 @@ mod tests {
             let path = std::env::temp_dir()
                 .join(format!("geectl-wc-test-{}-{name}-{n}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
-            TempDirGuard { path }
+            TempDirGuard { path, keep: false }
+        }
+
+        /// Keep the directory: the guard drops without deleting
+        /// it. A fake home's files must outlive the test that
+        /// created them: a concurrent git subprocess still holds
+        /// the redirected HOME in its environment and reads
+        /// `core.excludesFile` lazily (at checkout), so deleting
+        /// the directory mid-run would point it at a file that no
+        /// longer exists.
+        fn keep(mut self) {
+            self.keep = true;
         }
     }
 
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+            if !self.keep {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
         }
     }
 
@@ -10668,7 +10682,82 @@ mod tests {
             "tracked: {tracked:?}"
         );
         let _ = dir;
-        let _ = home;
+        // The home is kept, never deleted: a parallel test's git
+        // subprocess may still hold this HOME and read the
+        // excludes file after this test ends (git reads
+        // `core.excludesFile` lazily, at checkout), so the files
+        // must stay valid for the rest of the process.
+        home.keep();
+    }
+
+    #[test]
+    fn git_still_reads_a_kept_fake_home_after_teardown() {
+        // A fake home's files must outlive the test that created
+        // them: git reads `core.excludesFile` lazily, so a git
+        // subprocess that started while HOME pointed at the fake
+        // home fails once the excludes file is gone — on Windows
+        // the clone fails outright ("cannot use ... as an exclude
+        // file", seen on #371's rust-windows run), elsewhere the
+        // file silently stops being ignored. The home is kept for
+        // the process lifetime, so a concurrent git still finds
+        // its files after the teardown.
+        let home = TempDirGuard::new("fake-home-kept");
+        std::fs::write(home.path.join("excludes"), "*.patch\n").unwrap();
+        let excludes = home
+            .path
+            .join("excludes")
+            .to_string_lossy()
+            .replace('\\', "/");
+        std::fs::write(
+            home.path.join(".gitconfig"),
+            format!("[core]\n\texcludesFile = {excludes}\n"),
+        )
+        .unwrap();
+        let home_dir = home.path.clone();
+        let home_path = home.path.to_string_lossy().into_owned();
+        // A repo holding a file the excludes match: whether git
+        // still ignores it after the teardown is the observable.
+        let dir = TempDirGuard::new("git-kept-home");
+        init_repo(&dir.path);
+        write_file(&dir.path, "fix.patch", "patch\n");
+        // The git read runs on a thread after the teardown: the
+        // channel orders it strictly after the keep, so the test
+        // does not depend on scheduling luck. The child inherits
+        // the stale HOME through its own environment, exactly
+        // like a git subprocess spawned while the test still ran.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let repo = dir.path.clone();
+        let handle = std::thread::spawn(move || {
+            // A dropped sender means the main thread already
+            // failed its teardown asserts: report not-ignored
+            // instead of panicking a second time.
+            if rx.recv().is_err() {
+                return false;
+            }
+            git(
+                &repo,
+                "check-ignore",
+                &["-q", "fix.patch"],
+                &[("HOME", home_path.as_str())],
+            )
+            .is_ok()
+        });
+        // Teardown: the home is kept, never deleted.
+        home.keep();
+        assert!(
+            home_dir.join("excludes").exists(),
+            "the kept home's excludes file survives the teardown"
+        );
+        assert!(
+            home_dir.join(".gitconfig").exists(),
+            "the kept home's gitconfig survives the teardown"
+        );
+        tx.send(()).unwrap();
+        assert!(
+            handle.join().unwrap(),
+            "fix.patch is still ignored after the fake home teardown"
+        );
+        let _ = dir;
     }
 
     #[test]
