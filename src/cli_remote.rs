@@ -7845,6 +7845,7 @@ mod tests {
             name: "al\u{1b}[2Jice".to_string(),
             role: "maintainer".to_string(),
             email: Some("alice\u{7}@example.com".to_string()),
+            realname: None,
         };
         let text = render_named_role(&role);
         assert!(!text.contains('\u{1b}'), "text: {text}");
