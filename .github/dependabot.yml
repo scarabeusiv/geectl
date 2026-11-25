@@ -2,7 +2,9 @@
 #
 # Strictness is intentional: every dependency update gets its own PR
 # (no grouping — nothing hidden in a group), weekly, and the open-PR
-# limit is set high enough that no update is ever suppressed. Each PR
+# limit is set high enough that no update is ever suppressed. The one
+# exception is github/codeql-action below: its init and analyze steps
+# must move together. Each PR
 # goes through the same branch protection as any other change (green CI
 # + at least 1 approving review); Dependabot PRs are NOT auto-merged.
 # The repo is kept green by merging Dependabot PRs promptly, not by
@@ -25,6 +27,14 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 100
+    # Group github/codeql-action: CodeQL requires the init and analyze
+    # steps at the same version, so separate PRs for each can never go
+    # green. Everything else stays ungrouped.
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action/init"
+          - "github/codeql-action/analyze"
     # The dtolnay/rust-toolchain SHA is pinned to the v1 tag's commit
     # (immutable), so Dependabot tracks it and proposes updates when
     # the tag moves. No ignore: freezing it would forfeit security
