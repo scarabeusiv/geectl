@@ -370,7 +370,9 @@ fn url_host(url: &str) -> Option<String> {
 /// path. `None` for anything else: a URL with a scheme (handled by
 /// `url_host`'s `://` branch), a local path (no `:`), or a `host:`
 /// with an empty host or a path that is empty or absolute. A
-/// bracketed host (`git@[::1]:owner/repo`) keeps its colons inside
+/// single-letter drive prefix with a backslash path (`C:\repo`) is
+/// a Windows path, not an scp-like remote with a one-letter host.
+/// A bracketed host (`git@[::1]:owner/repo`) keeps its colons inside
 /// the brackets; the user part, when present, is dropped — the host
 /// is what the instance check needs.
 fn split_scp_like(url: &str) -> Option<(&str, &str)> {
@@ -391,6 +393,15 @@ fn split_scp_like(url: &str) -> Option<(&str, &str)> {
     } else {
         let (left, path) = url.split_once(':')?;
         if left.is_empty() || left.contains('/') {
+            return None;
+        }
+        // A single-letter drive prefix with a backslash path
+        // (`C:\repo`) is a Windows path, not an scp-like remote
+        // with a one-letter host.
+        if left.len() == 1
+            && left.as_bytes()[0].is_ascii_alphabetic()
+            && path.starts_with('\\')
+        {
             return None;
         }
         (left.rsplit('@').next()?, path)
@@ -15101,6 +15112,12 @@ mod tests {
         assert_eq!(split_scp_like("code.opensuse.org:/abs/path"), None);
         assert_eq!(split_scp_like("git@code.opensuse.org:"), None);
         assert_eq!(split_scp_like(":owner/repo"), None);
+        // A Windows drive path is not an scp-like remote; the
+        // backslash is what marks it — a one-letter host with a
+        // plain relative path still parses.
+        assert_eq!(split_scp_like("C:\\repo"), None);
+        assert_eq!(split_scp_like("c:\\Users\\repo"), None);
+        assert_eq!(split_scp_like("c:repo"), Some(("c", "repo")));
     }
 
     #[test]
