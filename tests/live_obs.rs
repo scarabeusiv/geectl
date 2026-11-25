@@ -6395,7 +6395,7 @@ fn full_shape_repository(path_target: &str) -> Repository {
         }],
         release_targets: vec![ReleaseTarget {
             project: path_target.to_string(),
-            repository: Some("standard".to_string()),
+            repository: "standard".to_string(),
             trigger: Some("manual".to_string()),
         }],
         hostsystem: vec![(path_target.to_string(), "standard".to_string())],

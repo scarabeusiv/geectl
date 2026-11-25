@@ -1654,7 +1654,7 @@ pub fn parse_project_meta(body: &str) -> Result<ProjectMeta, GeectlError> {
                 project: xml_unescape(&project),
                 // A release target without a repository is malformed:
                 // the server requires both `project` and `repository`.
-                repository: Some(xml_unescape(&repository)),
+                repository: xml_unescape(&repository),
                 trigger: tag_attr(&target_tag, "trigger").map(|value| xml_unescape(&value)),
             });
         }
@@ -11806,12 +11806,12 @@ mod tests {
                 release_targets: vec![
                     ReleaseTarget {
                         project: "openSUSE:Leap:15.6".to_string(),
-                        repository: Some("standard".to_string()),
+                        repository: "standard".to_string(),
                         trigger: Some("manual".to_string()),
                     },
                     ReleaseTarget {
                         project: "openSUSE:Leap:15.5".to_string(),
-                        repository: Some("ports".to_string()),
+                        repository: "ports".to_string(),
                         trigger: None,
                     },
                 ],

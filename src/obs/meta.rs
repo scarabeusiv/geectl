@@ -1445,7 +1445,7 @@ mod tests {
             }],
             release_targets: vec![ReleaseTarget {
                 project: "openSUSE:Leap:15.5".to_string(),
-                repository: Some("ports".to_string()),
+                repository: "ports".to_string(),
                 trigger: Some("manual".to_string()),
             }],
             hostsystem: vec![("openSUSE:Factory:ARM".to_string(), "standard".to_string())],
@@ -2190,14 +2190,14 @@ mod tests {
     }
 
     #[test]
-    fn set_project_meta_rejects_a_releasetarget_without_a_repository() {
+    fn set_project_meta_rejects_a_releasetarget_with_an_invalid_repository() {
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/source/home:scarabeus_iv/_meta",
             PROJECT_META_WITH_FULL_REPOSITORY,
         );
         let client = project_client(&http);
         let mut meta = parse_project_meta(PROJECT_META_WITH_FULL_REPOSITORY).unwrap();
-        meta.repositories[0].release_targets[1].repository = None;
+        meta.repositories[0].release_targets[1].repository = "not a name".to_string();
         let err = client
             .set_project_meta("home:scarabeus_iv", &meta, &DryRun::new(false))
             .unwrap_err();

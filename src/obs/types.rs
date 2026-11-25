@@ -565,8 +565,10 @@ pub struct DownloadMaster {
 pub struct ReleaseTarget {
     /// Target project.
     pub project: String,
-    /// Target repository, when set.
-    pub repository: Option<String>,
+    /// Target repository: required, like `hostsystem` — the server
+    /// requires both `project` and `repository`, so the model cannot
+    /// render a `<releasetarget>` the parser rejects.
+    pub repository: String,
     /// Release trigger, when set.
     pub trigger: Option<String>,
 }

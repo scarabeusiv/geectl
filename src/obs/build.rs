@@ -2087,7 +2087,7 @@ pub(crate) fn parse_repositories(body: &str) -> Result<Vec<Repository>, GeectlEr
             })?;
             release_targets.push(ReleaseTarget {
                 project,
-                repository: Some(repository),
+                repository,
                 trigger: xml_attr_non_blank(target_tag, "trigger"),
             });
         }
@@ -2181,16 +2181,9 @@ pub(crate) fn repository_element(repository: &Repository) -> String {
     for target in &repository.release_targets {
         out.push_str("<releasetarget project=\"");
         out.push_str(&xml_escape(&target.project));
+        out.push_str("\" repository=\"");
+        out.push_str(&xml_escape(&target.repository));
         out.push('"');
-        if let Some(repo) = target
-            .repository
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        {
-            out.push_str(" repository=\"");
-            out.push_str(&xml_escape(repo));
-            out.push('"');
-        }
         if let Some(trigger) = target.trigger.as_deref().filter(|value| !value.is_empty()) {
             out.push_str(" trigger=\"");
             out.push_str(&xml_escape(trigger));
@@ -2451,13 +2444,10 @@ pub(crate) fn validate_repository_settings(repository: &Repository) -> Result<()
                 target.project
             )));
         }
-        let repo = match &target.repository {
-            Some(repo) => repo,
-            None => return Err(invalid("releasetarget repository is required")),
-        };
-        if !valid_obs_name(repo) {
+        if !valid_obs_name(&target.repository) {
             return Err(invalid(&format!(
-                "releasetarget repository {repo:?} is not a valid name"
+                "releasetarget repository {:?} is not a valid name",
+                target.repository
             )));
         }
     }
@@ -7176,7 +7166,7 @@ mod tests {
                 }],
                 release_targets: vec![ReleaseTarget {
                     project: "openSUSE:Leap:15.6".to_string(),
-                    repository: Some("standard".to_string()),
+                    repository: "standard".to_string(),
                     trigger: Some("manual".to_string()),
                 }],
                 hostsystem: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
@@ -7191,9 +7181,8 @@ mod tests {
 
     #[test]
     fn repository_element_drops_empty_optional_values() {
-        // The emitted `<releasetarget project="..."/>` drops the empty
-        // `repository` and is therefore no longer re-parseable: both
-        // parsers now reject a release target without a repository.
+        // Empty optional values still drop on render; the release
+        // target's repository is required, so it always renders.
         let repo = Repository {
             name: "standard".to_string(),
             arch: vec!["x86_64".to_string()],
@@ -7214,14 +7203,14 @@ mod tests {
             }],
             release_targets: vec![ReleaseTarget {
                 project: "openSUSE:Leap:15.6".to_string(),
-                repository: Some(String::new()),
+                repository: "standard".to_string(),
                 trigger: Some(String::new()),
             }],
             hostsystem: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
         };
         assert_eq!(
             repository_element(&repo),
-            "<repository name=\"standard\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download url=\"https://example.com\"><master url=\"https://master.example.com\"/></download><releasetarget project=\"openSUSE:Leap:15.6\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository>"
+            "<repository name=\"standard\"><arch>x86_64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/><download url=\"https://example.com\"><master url=\"https://master.example.com\"/></download><releasetarget project=\"openSUSE:Leap:15.6\" repository=\"standard\"/><hostsystem project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository>"
         );
     }
 
@@ -7422,10 +7411,7 @@ mod tests {
             repo.downloads[0].master.as_ref().unwrap().sslfingerprint,
             None
         );
-        assert_eq!(
-            repo.release_targets[0].repository.as_deref(),
-            Some("standard")
-        );
+        assert_eq!(repo.release_targets[0].repository, "standard");
         assert_eq!(repo.release_targets[0].trigger, None);
     }
 
@@ -7482,7 +7468,7 @@ mod tests {
             }],
             release_targets: vec![ReleaseTarget {
                 project: "openSUSE:Leap:15.6".to_string(),
-                repository: Some("standard".to_string()),
+                repository: "standard".to_string(),
                 trigger: Some("a<b".to_string()),
             }],
             hostsystem: vec![("openSUSE:Factory".to_string(), "snapshot".to_string())],
@@ -7598,10 +7584,7 @@ mod tests {
             // blank repository is refused at parse, not read as
             // absent (see
             // `both_repository_parsers_reject_a_release_target_without_a_repository`).
-            assert_eq!(
-                repo.release_targets[0].repository.as_deref(),
-                Some("standard")
-            );
+            assert_eq!(repo.release_targets[0].repository, "standard");
             assert_eq!(repo.release_targets[0].trigger, None);
         }
         // The same absent rule covers entity-encoded whitespace:
@@ -8465,14 +8448,14 @@ mod tests {
         repo.downloads[0].master.as_mut().unwrap().url = "https://master.example.com".to_string();
         assert!(validate_repository_settings(&repo).is_ok());
         repo.downloads = vec![];
-        // A release target names its repository.
+        // A release target names a valid repository.
         repo.release_targets = vec![ReleaseTarget {
             project: "openSUSE:Leap:15.6".to_string(),
-            repository: None,
+            repository: "not a name".to_string(),
             trigger: None,
         }];
         assert!(validate_repository_settings(&repo).is_err());
-        repo.release_targets[0].repository = Some("standard".to_string());
+        repo.release_targets[0].repository = "standard".to_string();
         assert!(validate_repository_settings(&repo).is_ok());
         // Empty values the server does not check are accepted.
         repo.block = Some(String::new());
