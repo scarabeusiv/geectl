@@ -17,6 +17,7 @@ use super::valid_obs_filename;
 use super::valid_obs_filename_for_delete;
 use super::valid_obs_name;
 use super::AddChannelsOptions;
+use super::AddContainersOptions;
 use super::AggregateOptions;
 use super::CommitFileEntry;
 use super::CommitFilelistOptions;
@@ -4965,6 +4966,67 @@ impl<'a> ObsClient<'a> {
         self.source_command(&path, &query, "addchannels", &what)
     }
 
+    /// Add the maintained containers for a package on OBS (`POST
+    /// /source/<project>/<package>?cmd=addcontainers`, with
+    /// `&extend_package_names=1` when set). Requires credentials;
+    /// without them the call fails loudly before any request. In
+    /// dry-run the addition is recorded in the plan and nothing is
+    /// added — the guard runs before the credentials check, like
+    /// `create_package`.
+    ///
+    /// An agent adds containers to register every maintained
+    /// container image built from the package's sources. The
+    /// package is required: the server looks the containers up
+    /// from the package's origin.
+    pub fn add_containers(
+        &self,
+        project: &str,
+        package: &str,
+        options: &AddContainersOptions,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+        if !valid_obs_name(package) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS package name: {package:?}"),
+            ));
+        }
+        let suffix = if options.extend_package_names {
+            " (extend package names)"
+        } else {
+            ""
+        };
+        if !dry_run.allow(&format!(
+            "add containers to package {project}/{package}{suffix}"
+        )) {
+            return Ok(());
+        }
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "cannot add containers to package {project}/{package} without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])"
+                ),
+            ));
+        }
+        let mut query: Vec<(&str, &str)> = vec![("cmd", "addcontainers")];
+        if options.extend_package_names {
+            query.push(("extend_package_names", "1"));
+        }
+        self.source_command(
+            &[project, package],
+            &query,
+            "addcontainers",
+            &format!("package {project}/{package}"),
+        )
+    }
+
     /// Create an operation-scoped trigger token for the
     /// authenticated user (`POST /person/<login>/token`), and return
     /// the id and the secret it was created with. The secret is
@@ -7752,6 +7814,123 @@ mod tests {
                 "test:factory",
                 Some("test-pkgA/pkg"),
                 &AddChannelsOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_containers_posts_and_succeeds() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=addcontainers",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .add_containers(
+                "test:factory",
+                "test-pkgA",
+                &AddContainersOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_ok());
+        let posts = http.post_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "");
+        assert!(posts[0].2);
+    }
+
+    #[test]
+    fn add_containers_with_extend_package_names_posts_flag() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=addcontainers&extend_package_names=1",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = AddContainersOptions {
+            extend_package_names: true,
+        };
+        assert!(client
+            .add_containers("test:factory", "test-pkgA", &options, &DryRun::new(false))
+            .is_ok());
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn add_containers_other_body_is_error_not_success() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=addcontainers",
+            "<status code=\"error\"/>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .add_containers(
+                "test:factory",
+                "test-pkgA",
+                &AddContainersOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn add_containers_dry_run_records_plan_and_adds_nothing() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        let options = AddContainersOptions {
+            extend_package_names: true,
+        };
+        assert!(client
+            .add_containers("test:factory", "test-pkgA", &options, &dry_run)
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: add containers to package test:factory/test-pkgA (extend package names)"
+                    .to_string()
+            ]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_containers_without_credentials_fails_closed() {
+        let http = FakeHttp::new().with_post(
+            "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=addcontainers",
+            "<status code=\"ok\"/>",
+        );
+        let client = ObsClient::new(&http);
+        assert!(client
+            .add_containers(
+                "test:factory",
+                "test-pkgA",
+                &AddContainersOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn add_containers_rejects_invalid_names_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .add_containers(
+                "test:factory/pkg",
+                "test-pkgA",
+                &AddContainersOptions::default(),
+                &DryRun::new(false),
+            )
+            .is_err());
+        assert!(client
+            .add_containers(
+                "test:factory",
+                "test-pkgA/pkg",
+                &AddContainersOptions::default(),
                 &DryRun::new(false),
             )
             .is_err());

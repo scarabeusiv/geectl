@@ -5,8 +5,8 @@
 //! and diffs — plus the group's mutations, which edit a project's repository
 //! list in its meta (`repo-add`, `repo-remove`), create, upload
 //! to, delete, restore, aggregate, release, lock, unlock, and
-//! add channels to projects and packages, or create an
-//! operation-scoped trigger token
+//! add channels and containers to projects and packages, or
+//! create an operation-scoped trigger token
 //! (`create-token`). Each command is a thin wrapper over one `ObsClient`
 //! operation: the flags mirror the library parameters, the JSON
 //! payload carries the typed values, and the text renderer prints
@@ -86,12 +86,13 @@ use geectl::error::{ErrorKind, GeectlError};
 use geectl::http::{Timeout, UreqClient};
 use geectl::obs::{
     parse_package_meta, parse_project_meta, valid_obs_name, validate_meta_file_roles,
-    validate_role, AddChannelsOptions, AggregateOptions, CreatePackageOptions, CreateTokenOptions,
-    CreatedToken, DeletePackageOptions, DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus,
-    HistoryEntry, NamedRole, ObsClient, Owner, PackageDiff, PackageDiffStatus, PackageMatch,
-    PackageMeta, Person, ProjectMatch, ProjectMeta, ReleaseOptions, Repository, RevisionPatch,
-    RevisionRange, RevisionSpec, RoleGrant, ScmsyncProjectList, SourceFile, StagedRequest,
-    StagingProject, StagingReadOptions, TokenOperation, FACTORY_PROJECT, OBS_API_BASE,
+    validate_role, AddChannelsOptions, AddContainersOptions, AggregateOptions,
+    CreatePackageOptions, CreateTokenOptions, CreatedToken, DeletePackageOptions,
+    DeleteProjectOptions, DryRun, FilePatch, FilePatchStatus, HistoryEntry, NamedRole, ObsClient,
+    Owner, PackageDiff, PackageDiffStatus, PackageMatch, PackageMeta, Person, ProjectMatch,
+    ProjectMeta, ReleaseOptions, Repository, RevisionPatch, RevisionRange, RevisionSpec, RoleGrant,
+    ScmsyncProjectList, SourceFile, StagedRequest, StagingProject, StagingReadOptions,
+    TokenOperation, FACTORY_PROJECT, OBS_API_BASE,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -821,6 +822,18 @@ pub enum RemoteCommand {
         #[arg(long, conflicts_with = "enable_all")]
         skip_disabled: bool,
     },
+    /// Add the maintained containers for a package. A mutation:
+    /// dry-run is the default (only the plan is printed); `--live`
+    /// performs the addition.
+    AddContainers {
+        /// The project the package lives in.
+        project: String,
+        /// The package to add containers for.
+        package: String,
+        /// Extend the package names with the container names.
+        #[arg(long)]
+        extend_package_names: bool,
+    },
 }
 
 /// Run a `remote` command, returning the JSON payload and its text
@@ -874,6 +887,7 @@ pub fn run_remote(
         RemoteCommand::Lock { .. } if !live => Credentials::None,
         RemoteCommand::Unlock { .. } if !live => Credentials::None,
         RemoteCommand::AddChannels { .. } if !live => Credentials::None,
+        RemoteCommand::AddContainers { .. } if !live => Credentials::None,
         _ => EnvObsAuth::credentials_for_url(&base, &base, &instances)?,
     };
     let client =
@@ -1933,6 +1947,29 @@ pub fn run_remote(
             Ok(add_channels_result(
                 &project,
                 package.as_deref(),
+                &options,
+                dry_run.enabled(),
+                plan,
+            ))
+        }
+        RemoteCommand::AddContainers {
+            project,
+            package,
+            extend_package_names,
+        } => {
+            let options = AddContainersOptions {
+                extend_package_names,
+            };
+            let dry_run = DryRun::new(!live).with_debug(debug.clone());
+            client.add_containers(&project, &package, &options, &dry_run)?;
+            let plan = if dry_run.enabled() {
+                Some(dry_run.plan())
+            } else {
+                None
+            };
+            Ok(add_containers_result(
+                &project,
+                &package,
                 &options,
                 dry_run.enabled(),
                 plan,
@@ -3191,6 +3228,39 @@ fn add_channels_options_suffix(options: &AddChannelsOptions) -> String {
     } else {
         String::new()
     }
+}
+
+/// The `add-containers` result: the payload carries the scope
+/// and the flag; the text carries them too, in the result line.
+fn add_containers_result(
+    project: &str,
+    package: &str,
+    options: &AddContainersOptions,
+    dry_run: bool,
+    plan: Option<Vec<String>>,
+) -> (Value, String) {
+    let header = format!("project: {project} package: {package}");
+    let suffix = if options.extend_package_names {
+        " (extend package names)"
+    } else {
+        ""
+    };
+    let result_line = if dry_run {
+        format!("dry-run: would add containers to package {package} in project {project}{suffix}")
+    } else {
+        format!("added containers to package {package} in project {project}{suffix}")
+    };
+    mutation_result(
+        json!({
+            "project": project,
+            "package": package,
+            "extend_package_names": options.extend_package_names,
+        }),
+        header,
+        result_line,
+        dry_run,
+        plan,
+    )
 }
 
 fn list_packages_result(project: &str, packages: Vec<String>) -> (Value, String) {
@@ -6804,6 +6874,73 @@ mod tests {
         assert_eq!(
             text,
             "project: P\ndry_run: true\ndry-run: would add channels to project P\n[dry-run] would: add channels to project P"
+        );
+    }
+
+    #[test]
+    fn add_containers_parses_project_package_and_flag() {
+        let parsed = parse(&[
+            "geectl",
+            "remote",
+            "add-containers",
+            "P",
+            "K",
+            "--extend-package-names",
+        ]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::AddContainers {
+                project,
+                package,
+                extend_package_names: true,
+                ..
+            } if project == "P" && package == "K"
+        ));
+        let parsed = parse(&["geectl", "remote", "add-containers", "P", "K"]);
+        assert!(matches!(
+            parsed,
+            RemoteCommand::AddContainers {
+                extend_package_names: false,
+                ..
+            }
+        ));
+        // The package is required: a project-only call fails at
+        // parse time, like the server requires the package.
+        assert!(Cli::try_parse_from(["geectl", "remote", "add-containers", "P"]).is_err());
+    }
+
+    #[test]
+    fn add_containers_result_carries_scope_and_flag_in_both_formats() {
+        let options = AddContainersOptions {
+            extend_package_names: true,
+        };
+        let (payload, text) = add_containers_result("P", "K", &options, false, None);
+        assert_eq!(payload["project"], "P");
+        assert_eq!(payload["package"], "K");
+        assert_eq!(payload["extend_package_names"], true);
+        assert_eq!(payload["dry_run"], false);
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: false\nadded containers to package K in project P (extend package names)"
+        );
+        let (payload, text) = add_containers_result(
+            "P",
+            "K",
+            &AddContainersOptions::default(),
+            true,
+            Some(vec![
+                "[dry-run] would: add containers to package P/K".to_string()
+            ]),
+        );
+        assert_eq!(payload["extend_package_names"], false);
+        assert_eq!(payload["dry_run"], true);
+        assert_eq!(
+            payload["plan"][0],
+            "[dry-run] would: add containers to package P/K"
+        );
+        assert_eq!(
+            text,
+            "project: P package: K\ndry_run: true\ndry-run: would add containers to package K in project P\n[dry-run] would: add containers to package P/K"
         );
     }
 

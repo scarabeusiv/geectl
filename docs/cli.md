@@ -184,6 +184,7 @@ directory's `.env` only.
 - `geectl remote lock <PROJECT> [PACKAGE]` — Lock a project or a package; key flags: --message <MESSAGE>
 - `geectl remote unlock <PROJECT> [PACKAGE] --message <MESSAGE>` — Unlock a project or a package
 - `geectl remote add-channels <PROJECT> [PACKAGE]` — Add the channels defined for a project or a package; key flags: --enable-all, --skip-disabled
+- `geectl remote add-containers <PROJECT> <PACKAGE>` — Add the maintained containers for a package; key flags: --extend-package-names
 
 ## `request` — submit requests
 

@@ -1058,6 +1058,14 @@ pub struct AddChannelsOptions {
     pub skip_disabled: bool,
 }
 
+/// Options for [`ObsClient::add_containers`].
+#[derive(Debug, Clone, Default)]
+pub struct AddContainersOptions {
+    /// Extend the package names with the container names when
+    /// adding. The server's `extend_package_names=1`.
+    pub extend_package_names: bool,
+}
+
 /// Options for [`ObsClient::create_package_with_options`]. All
 /// fields are optional: no scmsync means an OBS-native package, no
 /// force means an existing package is refused rather than

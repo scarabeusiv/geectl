@@ -210,7 +210,8 @@ the server's `cmd=lock`, which records the message, or a package
 by setting its `lock` flag — the message is sent but not recorded;
 `ObsClient::unlock` unlocks one with a required comment;
 `ObsClient::add_channels` adds the channels defined for a project
-or a package. Every one of these is
+or a package; `ObsClient::add_containers` adds the maintained
+containers for a package. Every one of these is
 DryRun-guarded and credentialed like the create and upload calls
 above.
 

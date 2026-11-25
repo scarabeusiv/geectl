@@ -47,6 +47,7 @@ the per-group sections list only what is specific to that group.
 | `osc lock PROJECT [PACKAGE]` | `geectl remote lock PROJECT [PACKAGE] [--message TEXT]` | One command per library operation; osc's `-m` stays `--message`, sent as the server's `comment`; a project lock records it (`cmd=lock`), a package lock sends it but the server does not record it (`set_flag` is the only package path) |
 | `osc unlock PROJECT [PACKAGE]` | `geectl remote unlock PROJECT [PACKAGE] --message TEXT` | One command per library operation; the message is a required flag — osc prompts for it in an editor when `-m` is absent, geectl has no editor |
 | `osc addchannels [PROJECT [PACKAGE]]` | `geectl remote add-channels PROJECT [PACKAGE] [--enable-all] [--skip-disabled]` | One command per library operation; `--enable-all` / `--skip-disabled` keep their names and exclude each other |
+| `osc addcontainers PROJECT PACKAGE` | `geectl remote add-containers PROJECT PACKAGE [--extend-package-names]` | One command per library operation; the package is required, like osc |
 | `osc ls /` | `geectl remote list-projects` | Same listing, named as a leaf under `geectl remote` |
 | — | `geectl remote list-staging-projects PROJECT` | New surface: the library reads `/staging/<workflow>/staging_projects` |
 | — | `geectl remote staging-project PROJECT NAME` | Same; the one-project read |
