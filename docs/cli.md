@@ -51,6 +51,8 @@ GEECTL_OBS_USERNAME_LOCAL=... GEECTL_OBS_PASSWORD_FILE_LOCAL=/run/secrets/local-
 GEECTL_OBS_APIKEY_EXAMPLE=...   # a token instead of the pair
 ```
 
+A one-time migration from osc: `geectl config import-oscrc` reads `~/.config/osc/oscrc` once, on explicit request, and writes only the alias to apiurl mapping into `[instances]`; geectl never reads oscrc at runtime and never stores the password — set `GEECTL_OBS_PASSWORD_<ALIAS>` yourself. With more than one apiurl section, `--apiurl` picks one; `--alias` names the instance, defaulting to the apiurl host.
+
 The plain `GEECTL_OBS_APIKEY` (or `..._APIKEY_FILE`) or
 `GEECTL_OBS_USERNAME` / `GEECTL_OBS_PASSWORD` (or
 `..._PASSWORD_FILE`) apply to the configured instance; a call to
@@ -134,6 +136,7 @@ directory's `.env` only.
 - `geectl config` — Inspect or initialise the config file.
 - `geectl config show` — Show the effective config: endpoint URLs with their source, and credential status (never a secret value).
 - `geectl config init` — Write the config template (endpoints only); refuses if the file already exists.
+- `geectl config import-oscrc` — Import one instance mapping from an oscrc file (one-time migration); dry-run is the default, `--live` writes the config.
 
 ## `remote` — inspection and mutations
 

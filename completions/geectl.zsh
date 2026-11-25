@@ -80,6 +80,20 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(import-oscrc)
+_arguments "${_arguments_options[@]}" : \
+'--oscrc=[The oscrc file to read (default \`\$XDG_CONFIG_HOME/osc/oscrc\`, else \`~/.config/osc/oscrc\`)]:OSCRC:_files' \
+'--apiurl=[The apiurl section to import. Required when the file holds more than one section with a username; the only such section otherwise]:APIURL:_default' \
+'--alias=[The instance alias to write. Defaults to the apiurl host with non-alphanumerics as \`_\`]:ALIAS:_default' \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--force[Replace the alias when it already names another URL]' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_geectl__subcmd__config__subcmd__help_commands" \
@@ -97,6 +111,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (init)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(import-oscrc)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -3435,6 +3453,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(import-oscrc)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -4778,6 +4800,7 @@ _geectl__subcmd__config_commands() {
     local commands; commands=(
 'show:Show the effective config\: endpoint URLs with their source, and credential status (never a secret value)' \
 'init:Write the config template (endpoints only). Refuses if the file already exists' \
+'import-oscrc:Import one instance mapping from an oscrc file (one-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config \`\[instances\]\` table. The password is never stored and never printed\: set it with the printed \`GEECTL_OBS_PASSWORD_<ALIAS>\` variable yourself. Dry-run is the default (only the plan is printed); \`--live\` writes the config' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl config commands' commands "$@"
@@ -4787,6 +4810,7 @@ _geectl__subcmd__config__subcmd__help_commands() {
     local commands; commands=(
 'show:Show the effective config\: endpoint URLs with their source, and credential status (never a secret value)' \
 'init:Write the config template (endpoints only). Refuses if the file already exists' \
+'import-oscrc:Import one instance mapping from an oscrc file (one-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config \`\[instances\]\` table. The password is never stored and never printed\: set it with the printed \`GEECTL_OBS_PASSWORD_<ALIAS>\` variable yourself. Dry-run is the default (only the plan is printed); \`--live\` writes the config' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl config help commands' commands "$@"
@@ -4795,6 +4819,11 @@ _geectl__subcmd__config__subcmd__help_commands() {
 _geectl__subcmd__config__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'geectl config help help commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__config__subcmd__help__subcmd__import-oscrc_commands] )) ||
+_geectl__subcmd__config__subcmd__help__subcmd__import-oscrc_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl config help import-oscrc commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__config__subcmd__help__subcmd__init_commands] )) ||
 _geectl__subcmd__config__subcmd__help__subcmd__init_commands() {
@@ -4805,6 +4834,11 @@ _geectl__subcmd__config__subcmd__help__subcmd__init_commands() {
 _geectl__subcmd__config__subcmd__help__subcmd__show_commands() {
     local commands; commands=()
     _describe -t commands 'geectl config help show commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__config__subcmd__import-oscrc_commands] )) ||
+_geectl__subcmd__config__subcmd__import-oscrc_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl config import-oscrc commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__config__subcmd__init_commands] )) ||
 _geectl__subcmd__config__subcmd__init_commands() {
@@ -5227,8 +5261,14 @@ _geectl__subcmd__help__subcmd__config_commands() {
     local commands; commands=(
 'show:Show the effective config\: endpoint URLs with their source, and credential status (never a secret value)' \
 'init:Write the config template (endpoints only). Refuses if the file already exists' \
+'import-oscrc:Import one instance mapping from an oscrc file (one-time migration). Reads the oscrc file once, on explicit request — geectl never reads it at runtime — and writes only the alias to apiurl mapping into the config \`\[instances\]\` table. The password is never stored and never printed\: set it with the printed \`GEECTL_OBS_PASSWORD_<ALIAS>\` variable yourself. Dry-run is the default (only the plan is printed); \`--live\` writes the config' \
     )
     _describe -t commands 'geectl help config commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__config__subcmd__import-oscrc_commands] )) ||
+_geectl__subcmd__help__subcmd__config__subcmd__import-oscrc_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help config import-oscrc commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__config__subcmd__init_commands] )) ||
 _geectl__subcmd__help__subcmd__config__subcmd__init_commands() {

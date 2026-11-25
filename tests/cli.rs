@@ -9697,3 +9697,313 @@ fn local_build_log_missing_log_fails_with_invalid_input() {
         "stderr: {stderr}"
     );
 }
+
+// --- config import-oscrc integration tests (isolated env) ---
+
+/// Write a fixture oscrc into the temp dir and return its path. The
+/// passwords are obviously fake; every test asserts they never appear
+/// in any output.
+fn write_oscrc(dir: &TempDir, content: &str) -> PathBuf {
+    let path = dir.0.join("oscrc");
+    fs::write(&path, content).unwrap();
+    path
+}
+
+const OSRC_SINGLE: &str = "\
+[general]
+apiurl = https://api.opensuse.org
+
+[https://api.opensuse.org]
+user = fakeuser@example.com
+pass = fake-password-7XQ2
+";
+
+const OSRC_TWO: &str = "\
+[general]
+apiurl = https://api.opensuse.org
+
+[https://api.opensuse.org]
+user = fakeuser@example.com
+pass = fake-password-7XQ2
+
+[https://obs.example.com]
+user = otheruser
+pass = fake-password-9ZQ4
+";
+
+const OSRC_NO_USER: &str = "\
+[general]
+apiurl = https://api.opensuse.org
+
+[https://api.opensuse.org]
+pass = fake-password-7XQ2
+";
+
+fn assert_no_fake_password(out: &std::process::Output) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("fake-password-7XQ2") && !stdout.contains("fake-password-9ZQ4"),
+        "password leaked to stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains("fake-password-7XQ2") && !stderr.contains("fake-password-9ZQ4"),
+        "password leaked to stderr: {stderr}"
+    );
+}
+
+#[test]
+fn config_import_oscrc_dry_run_plans_without_writing() {
+    let dir = TempDir::new();
+    let oscrc = write_oscrc(&dir, OSRC_SINGLE);
+    let out = geectl_isolated(&dir)
+        .args(["config", "import-oscrc", "--oscrc"])
+        .arg(&oscrc)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["live"], false);
+    assert_eq!(value["written"], false);
+    assert_eq!(value["outcome"], "added");
+    assert_eq!(value["alias"], "api_opensuse_org");
+    assert_eq!(value["apiurl"], "https://api.opensuse.org");
+    assert_eq!(value["username"], "fakeuser@example.com");
+    assert_eq!(
+        value["username_var"],
+        "GEECTL_OBS_USERNAME_API_OPENSUSE_ORG"
+    );
+    assert_eq!(
+        value["password_var"],
+        "GEECTL_OBS_PASSWORD_API_OPENSUSE_ORG"
+    );
+    assert_eq!(
+        value["set_username"],
+        "GEECTL_OBS_USERNAME_API_OPENSUSE_ORG=fakeuser@example.com"
+    );
+    // The config file is not created by a dry run.
+    assert!(!dir.0.join("geectl").join("config.toml").exists());
+    assert_no_fake_password(&out);
+    // The text rendering carries the same facts and no password.
+    let out = geectl_isolated(&dir)
+        .args(["config", "import-oscrc", "--format", "text", "--oscrc"])
+        .arg(&oscrc)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("api_opensuse_org"), "{text}");
+    assert!(text.contains("fakeuser@example.com"), "{text}");
+    assert!(
+        text.contains("GEECTL_OBS_PASSWORD_API_OPENSUSE_ORG"),
+        "{text}"
+    );
+    assert!(text.contains("would add"), "{text}");
+    assert_no_fake_password(&out);
+}
+
+#[test]
+fn config_import_oscrc_live_writes_instance() {
+    let dir = TempDir::new();
+    let oscrc = write_oscrc(&dir, OSRC_SINGLE);
+    let out = geectl_isolated(&dir)
+        .args(["config", "import-oscrc", "--live", "--oscrc"])
+        .arg(&oscrc)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["live"], true);
+    assert_eq!(value["written"], true);
+    assert_eq!(value["outcome"], "added");
+    assert_no_fake_password(&out);
+    // A read of the config shows the imported mapping and no secret.
+    let config_text = fs::read_to_string(dir.0.join("geectl").join("config.toml")).unwrap();
+    assert!(
+        config_text.contains("api_opensuse_org = \"https://api.opensuse.org\""),
+        "{config_text}"
+    );
+    assert!(!config_text.contains("fake-password-7XQ2"), "{config_text}");
+    let out = geectl_isolated(&dir)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        value["instances"]["api_opensuse_org"],
+        "https://api.opensuse.org"
+    );
+}
+
+#[test]
+fn config_import_oscrc_two_sections_requires_apiurl() {
+    let dir = TempDir::new();
+    let oscrc = write_oscrc(&dir, OSRC_TWO);
+    let out = geectl_isolated(&dir)
+        .args(["config", "import-oscrc", "--oscrc"])
+        .arg(&oscrc)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--apiurl"), "{stderr}");
+    assert!(stderr.contains("https://api.opensuse.org"), "{stderr}");
+    assert!(stderr.contains("https://obs.example.com"), "{stderr}");
+    assert_no_fake_password(&out);
+    assert!(!dir.0.join("geectl").join("config.toml").exists());
+}
+
+#[test]
+fn config_import_oscrc_apiurl_selects_section() {
+    let dir = TempDir::new();
+    let oscrc = write_oscrc(&dir, OSRC_TWO);
+    let out = geectl_isolated(&dir)
+        .args([
+            "config",
+            "import-oscrc",
+            "--apiurl",
+            "https://obs.example.com",
+            "--live",
+            "--oscrc",
+        ])
+        .arg(&oscrc)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["alias"], "obs_example_com");
+    assert_eq!(value["apiurl"], "https://obs.example.com");
+    assert_eq!(value["username"], "otheruser");
+    assert_no_fake_password(&out);
+}
+
+#[test]
+fn config_import_oscrc_section_without_user_refused() {
+    let dir = TempDir::new();
+    let oscrc = write_oscrc(&dir, OSRC_NO_USER);
+    let out = geectl_isolated(&dir)
+        .args([
+            "config",
+            "import-oscrc",
+            "--apiurl",
+            "https://api.opensuse.org",
+            "--live",
+            "--oscrc",
+        ])
+        .arg(&oscrc)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no username"), "{stderr}");
+    assert_no_fake_password(&out);
+    assert!(!dir.0.join("geectl").join("config.toml").exists());
+}
+
+#[test]
+fn config_import_oscrc_malformed_fails_closed() {
+    let dir = TempDir::new();
+    let marker = "MARKER-NOT-A-SECRET-123";
+    let oscrc = write_oscrc(
+        &dir,
+        &format!("[general]\napiurl = https://api.opensuse.org\nbogus line {marker}\n"),
+    );
+    let out = geectl_isolated(&dir)
+        .args(["config", "import-oscrc", "--live", "--oscrc"])
+        .arg(&oscrc)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("malformed"), "{stderr}");
+    assert!(
+        !stderr.contains(marker),
+        "error must not echo the line: {stderr}"
+    );
+    assert_no_fake_password(&out);
+    assert!(!dir.0.join("geectl").join("config.toml").exists());
+}
+
+#[test]
+fn config_import_oscrc_missing_file_fails() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "config",
+            "import-oscrc",
+            "--oscrc",
+            dir.0.join("no-such-oscrc").to_str().unwrap(),
+            "--live",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot read oscrc"), "{stderr}");
+    assert!(!dir.0.join("geectl").join("config.toml").exists());
+}
+
+#[test]
+fn config_import_oscrc_existing_alias_refuses_and_force_replaces() {
+    let dir = TempDir::new();
+    let oscrc = write_oscrc(&dir, OSRC_SINGLE);
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[instances]\napi_opensuse_org = \"https://other.example.com\"\n",
+    )
+    .unwrap();
+    // Without --force: refused, file untouched.
+    let out = geectl_isolated(&dir)
+        .args(["config", "import-oscrc", "--live", "--oscrc"])
+        .arg(&oscrc)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already names"), "{stderr}");
+    assert!(stderr.contains("--force"), "{stderr}");
+    assert_no_fake_password(&out);
+    let before = fs::read_to_string(config_dir.join("config.toml")).unwrap();
+    assert!(before.contains("other.example.com"), "{before}");
+    // With --force: replaced.
+    let out = geectl_isolated(&dir)
+        .args(["config", "import-oscrc", "--live", "--force", "--oscrc"])
+        .arg(&oscrc)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["outcome"], "replaced");
+    assert_eq!(value["written"], true);
+    assert_no_fake_password(&out);
+    let after = fs::read_to_string(config_dir.join("config.toml")).unwrap();
+    assert!(
+        after.contains("api_opensuse_org = \"https://api.opensuse.org\""),
+        "{after}"
+    );
+    assert!(!after.contains("other.example.com"), "{after}");
+}

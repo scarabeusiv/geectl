@@ -9,6 +9,7 @@ use crate::{
     cli_prjconf, cli_pull_request, cli_remote, cli_request, cli_service, maintenance,
 };
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 /// The output format. JSON is the default; it is the only format an agent
 /// should parse. `text` is a human-readable rendering of the same data.
@@ -219,6 +220,32 @@ pub enum ConfigCommand {
     /// Write the config template (endpoints only). Refuses if the
     /// file already exists.
     Init,
+    /// Import one instance mapping from an oscrc file (one-time
+    /// migration). Reads the oscrc file once, on explicit request —
+    /// geectl never reads it at runtime — and writes only the alias
+    /// to apiurl mapping into the config `[instances]` table. The
+    /// password is never stored and never printed: set it with the
+    /// printed `GEECTL_OBS_PASSWORD_<ALIAS>` variable yourself.
+    /// Dry-run is the default (only the plan is printed); `--live`
+    /// writes the config.
+    ImportOscrc {
+        /// The oscrc file to read (default
+        /// `$XDG_CONFIG_HOME/osc/oscrc`, else `~/.config/osc/oscrc`).
+        #[arg(long)]
+        oscrc: Option<PathBuf>,
+        /// The apiurl section to import. Required when the file holds
+        /// more than one section with a username; the only such
+        /// section otherwise.
+        #[arg(long)]
+        apiurl: Option<String>,
+        /// The instance alias to write. Defaults to the apiurl host
+        /// with non-alphanumerics as `_`.
+        #[arg(long)]
+        alias: Option<String>,
+        /// Replace the alias when it already names another URL.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// The clap `Command` for the shipped binary, shared with the `geectl-gen`

@@ -7,14 +7,19 @@
 //! one exit path: the error kind's exit code.
 
 use clap::Parser;
-use geectl::auth::{load_dotenv, AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
+use geectl::auth::{
+    load_dotenv, obs_alias_vars, same_api_url, AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth,
+    GiteaSshKey,
+};
 use geectl::cli::{Cli, Command, ConfigCommand, Format};
 use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::obs::OBS_API_BASE;
+use geectl::oscrc;
 use serde_json::json;
 use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 
 fn run(
@@ -46,6 +51,22 @@ fn run(
             ConfigCommand::Init => {
                 let payload = config_init_payload()?;
                 let text = render_config_init_text(&payload);
+                (payload, text)
+            }
+            ConfigCommand::ImportOscrc {
+                oscrc,
+                apiurl,
+                alias,
+                force,
+            } => {
+                let payload = config_import_oscrc_payload(
+                    oscrc.as_deref(),
+                    apiurl.as_deref(),
+                    alias.as_deref(),
+                    force,
+                    cli.live,
+                )?;
+                let text = render_config_import_oscrc_text(&payload);
                 (payload, text)
             }
         },
@@ -434,6 +455,184 @@ fn render_auth_text(auth: &serde_json::Value) -> String {
 
 fn render_config_init_text(payload: &serde_json::Value) -> String {
     format!("created {}", payload["config_file"].as_str().unwrap_or(""))
+}
+
+/// The `config import-oscrc` payload: the oscrc sections found
+/// (apiurl + username, never a password), the selected section, the
+/// alias and URL written (or planned), and the env lines to set. The
+/// username is reported because it is not a secret (`config show`
+/// reports usernames too); the password is never stored, never
+/// printed, and never read into a value — only its variable name is
+/// reported.
+fn config_import_oscrc_payload(
+    oscrc: Option<&Path>,
+    apiurl: Option<&str>,
+    alias: Option<&str>,
+    force: bool,
+    live: bool,
+) -> Result<serde_json::Value, GeectlError> {
+    let oscrc_path = match oscrc {
+        Some(path) => path.to_path_buf(),
+        None => oscrc::default_oscrc_path()?,
+    };
+    let text = oscrc::read_oscrc(&oscrc_path)?;
+    let sections = oscrc::parse_oscrc(&text, &oscrc_path)?;
+    let importable: Vec<oscrc::OscrcSection> = sections
+        .iter()
+        .filter(|s| s.username.is_some())
+        .cloned()
+        .collect();
+    let selected = match apiurl {
+        Some(wanted) => {
+            let found = sections
+                .iter()
+                .find(|s| same_api_url(&s.apiurl, wanted).unwrap_or(false));
+            match found {
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::ConfigError,
+                        format!(
+                            "{}: no oscrc section for {wanted}; found: {}",
+                            oscrc_path.display(),
+                            list_apiurls(&sections),
+                        ),
+                    ));
+                }
+                Some(section) if section.username.is_none() => {
+                    return Err(GeectlError::new(
+                        ErrorKind::ConfigError,
+                        format!(
+                            "{}: oscrc section {wanted} has no username; add a `user` line to it or pick another section",
+                            oscrc_path.display()
+                        ),
+                    ));
+                }
+                Some(section) => section.clone(),
+            }
+        }
+        None => match importable.as_slice() {
+            [only] => only.clone(),
+            [] => {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!(
+                        "{}: no oscrc section carries a username; nothing to import",
+                        oscrc_path.display()
+                    ),
+                ));
+            }
+            _ => {
+                return Err(GeectlError::new(
+                    ErrorKind::ConfigError,
+                    format!(
+                        "{}: more than one oscrc section carries a username; pass --apiurl to pick one: {}",
+                        oscrc_path.display(),
+                        list_apiurls(&importable),
+                    ),
+                ));
+            }
+        },
+    };
+    // The selection guarantees a username: every path above returns
+    // an importable section or errors.
+    let username = selected.username.clone().unwrap_or_default();
+    let alias = match alias {
+        Some(alias) => alias.to_string(),
+        None => config::alias_from_url(&selected.apiurl)?,
+    };
+    let (username_var, password_var, _, _, _) = obs_alias_vars(&alias);
+    let config_path = config::config_path()?;
+    let outcome = if live {
+        config::add_instance(&config_path, &alias, &selected.apiurl, force)?
+    } else {
+        config::check_add_instance(&config_path, &alias, &selected.apiurl, force)?
+    };
+    let outcome_str = match outcome {
+        config::AddInstance::Added => "added",
+        config::AddInstance::Replaced => "replaced",
+        config::AddInstance::AlreadyPresent => "already_present",
+    };
+    let mut sections_json = Vec::new();
+    for section in &sections {
+        sections_json.push(json!({
+            "apiurl": section.apiurl,
+            "username": section.username,
+        }));
+    }
+    Ok(json!({
+        "config_file": config_path.to_string_lossy(),
+        "oscrc_file": oscrc_path.to_string_lossy(),
+        "live": live,
+        "written": live && outcome != config::AddInstance::AlreadyPresent,
+        "outcome": outcome_str,
+        "alias": alias,
+        "apiurl": selected.apiurl,
+        "username": username,
+        "username_var": username_var,
+        "password_var": password_var,
+        "set_username": format!("{username_var}={username}"),
+        "sections": sections_json,
+    }))
+}
+
+/// The apiurls of oscrc sections, comma-separated, for error
+/// messages. Apiurls are not secrets.
+fn list_apiurls(sections: &[oscrc::OscrcSection]) -> String {
+    sections
+        .iter()
+        .map(|s| s.apiurl.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_config_import_oscrc_text(payload: &serde_json::Value) -> String {
+    let sections = payload["sections"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|s| {
+                    let apiurl = s["apiurl"].as_str().unwrap_or("");
+                    match s["username"].as_str() {
+                        Some(user) => format!("{apiurl} (username {user})"),
+                        None => format!("{apiurl} (no username)"),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let outcome = payload["outcome"].as_str().unwrap_or("");
+    let live = payload["live"].as_bool().unwrap_or(false);
+    let action = match (live, outcome) {
+        (true, "added") => "added".to_string(),
+        (true, "replaced") => "replaced".to_string(),
+        (true, "already_present") => "already present".to_string(),
+        (false, "added") => "would add (dry run; pass --live to write)".to_string(),
+        (false, "replaced") => "would replace (dry run; pass --live to write)".to_string(),
+        (false, "already_present") => "already present".to_string(),
+        _ => outcome.to_string(),
+    };
+    [
+        format!("oscrc: {}", payload["oscrc_file"].as_str().unwrap_or("")),
+        format!("found: {sections}"),
+        format!(
+            "import: {} -> {} (username {}), {action} in {}",
+            payload["alias"].as_str().unwrap_or(""),
+            payload["apiurl"].as_str().unwrap_or(""),
+            payload["username"].as_str().unwrap_or(""),
+            payload["config_file"].as_str().unwrap_or("")
+        ),
+        format!(
+            "set: export {}",
+            payload["set_username"].as_str().unwrap_or("")
+        ),
+        format!(
+            "set: export {}=... (set this yourself; geectl never stores the password)",
+            payload["password_var"].as_str().unwrap_or("")
+        ),
+    ]
+    .join("\n")
 }
 
 /// Write a payload to stdout, terminated with a trailing newline
