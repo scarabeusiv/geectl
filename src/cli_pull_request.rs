@@ -55,7 +55,8 @@ use crate::gitea::{
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
-    CveId, DryRun, ForwardActionResult, ObsClient, ReviewTarget, SrPayload, OBS_API_BASE,
+    AcceptCleanupOutcome, CveId, DryRun, ForwardActionResult, ObsClient, ReviewTarget, SrPayload,
+    OBS_API_BASE,
 };
 use crate::pull_request::{
     PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint, PullRequestRef,
@@ -1370,7 +1371,11 @@ fn merge_obs(
 }
 
 /// Merge a Gitea pull request and forward it to its link parent,
-/// unless `--no-forward` is given. Both arms are resolved and
+/// unless `--no-forward` is given. After the merge lands, the branch
+/// home the pull request came from is cleaned up like the OBS arm's:
+/// the OBS package synced from the merged head is resolved, and its
+/// marker gates the delete. A cleanup that cannot run is reported,
+/// never an error. Both arms are resolved and
 /// validated before the merge lands (see
 /// [`preflight_gitea_forward`]): a missing OBS credential, an
 /// ambiguous or unforwardable package, or a refused hop fails
@@ -1422,6 +1427,16 @@ fn merge_gitea(
         message,
         |client, reference, dry_run| client.merge(reference, message, method, false, dry_run),
     )?;
+    // The merge landed (or, in dry-run, is planned): clean up the
+    // branch home it merged, through the shared helper. A cleanup
+    // that cannot run is reported, never an error here.
+    let (cleanup_payload, cleanup_text) = merge_gitea_cleanup(debug, reference, live);
+    if let Value::Object(map) = &mut payload {
+        map.insert("cleanup".to_string(), cleanup_payload);
+    }
+    if !cleanup_text.is_empty() {
+        text.push_str(&format!("; {cleanup_text}"));
+    }
     if no_forward {
         return Ok((payload, text));
     }
@@ -1458,6 +1473,215 @@ fn merge_gitea(
     }
     text.push_str(&format!("; {forward_text}"));
     Ok((payload, text))
+}
+
+/// Run the merge-time branch cleanup for the Gitea arm: resolve the
+/// OBS package synced from the merged pull request's head (the
+/// fork), then clean up that branch home through the shared
+/// per-source helper. The merge stands regardless: a cleanup that
+/// cannot run at all (no OBS credentials, the fork deleted, the
+/// head repo unreadable, an ambiguous sync) is reported as a
+/// payload with an `error` and the one-line text, never an error
+/// from this call — like the OBS arm's `accept_cleanup`. A pull
+/// request whose head syncs no OBS package (not a geectl branch)
+/// has nothing to clean up: empty outcomes, silent in text, the
+/// payload records the empty result.
+fn merge_gitea_cleanup(debug: &Debug, reference: &str, live: bool) -> (Value, String) {
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    let not_run = |err: GeectlError| -> (Value, String) {
+        (
+            json!({
+                "id": reference,
+                "dry_run": dry_run.enabled(),
+                "outcomes": [],
+                "error": err.to_string(),
+            }),
+            "branch cleanup not run".to_string(),
+        )
+    };
+    // OBS credentials first: without them there is nothing to
+    // resolve against, and the Gitea reads must not run either — a
+    // credential-less dry-run prints the plan without a server.
+    // Live, the merge already landed, so missing credentials report
+    // instead of failing: the merge stands either way.
+    let obs_ready = match with_obs(debug, live, |obs| {
+        Ok(matches!(
+            obs.credentials(),
+            Credentials::Basic { .. } | Credentials::Bearer { .. }
+        ))
+    }) {
+        Ok(ready) => ready,
+        Err(err) => return not_run(err),
+    };
+    if !obs_ready {
+        debug.emit("decision: skipping the merge-time branch cleanup: no OBS credentials in dry-run, so the home package cannot be resolved");
+        return not_run(GeectlError::new(
+            ErrorKind::ConfigError,
+            "cannot clean up the branch home without OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+        ));
+    }
+    let head = match gitea_merge_head_inputs(debug, reference) {
+        Ok(Some(head)) => head,
+        Ok(None) => {
+            debug.emit("decision: skipping the merge-time branch cleanup: the merged pull request's head repo is gone, so no branch home can be resolved");
+            return (
+                merge_gitea_cleanup_json(reference, &[], &dry_run),
+                String::new(),
+            );
+        }
+        Err(err) => return not_run(err),
+    };
+    let outcome = match with_obs(debug, live, |obs| {
+        let package = resolve_forward_package(
+            obs,
+            &head.repo_url,
+            &head.owner,
+            &head.repo,
+            &head.branch,
+            &head.default_branch,
+        )?;
+        match package {
+            Some((project, package)) => Ok(Some(
+                obs.cleanup_branch_source(&project, &package, &dry_run),
+            )),
+            None => {
+                debug.emit(&format!(
+                    "decision: skipping the merge-time branch cleanup: no OBS package is synced from {}#{}",
+                    head.repo_url, head.branch
+                ));
+                Ok(None)
+            }
+        }
+    }) {
+        Ok(outcome) => outcome,
+        Err(err) => return not_run(err),
+    };
+    let outcomes = outcome.into_iter().collect::<Vec<_>>();
+    (
+        merge_gitea_cleanup_json(reference, &outcomes, &dry_run),
+        merge_gitea_cleanup_text(&outcomes, &dry_run),
+    )
+}
+
+/// The head side of a merged Gitea pull request: the fork repo and
+/// branch, and the repo's clone URL and default branch — the
+/// coordinates the merge-time cleanup resolves the branch home
+/// from, through the same scmsync lookup the forward uses for the
+/// base side.
+struct GiteaMergeHeadInputs {
+    owner: String,
+    repo: String,
+    branch: String,
+    default_branch: String,
+    repo_url: String,
+}
+
+/// Read the merged pull request's head: the fork repo and branch,
+/// plus the head repo's clone URL and default branch. `None` when
+/// the fork the branch lived in is deleted — the pull request
+/// keeps its head label, but there is no repo to resolve a branch
+/// home from, so the cleanup has nothing to clean up.
+fn gitea_merge_head_inputs(
+    debug: &Debug,
+    reference: &str,
+) -> Result<Option<GiteaMergeHeadInputs>, GeectlError> {
+    let reference: PullRequestRef = reference.parse()?;
+    let (owner, repo, number) = match &reference {
+        PullRequestRef::Gitea {
+            owner,
+            repo,
+            number,
+        } => (owner.clone(), repo.clone(), *number),
+        PullRequestRef::Obs(_) => {
+            return Err(GeectlError::new(
+                ErrorKind::InternalError,
+                "gitea_merge_head_inputs called on an OBS reference",
+            ));
+        }
+    };
+    let (pr, head) = with_gitea(debug, |gitea| {
+        let pr = gitea.pr_get(&owner, &repo, number)?;
+        let head = match pr.head.repo.as_ref() {
+            Some(head) => {
+                let (head_owner, head_name) =
+                    parse_gitea_full_name(&head.full_name, &reference.to_string())?;
+                let repo = gitea.repo_get(&head_owner, &head_name)?;
+                Some((head_owner, head_name, repo))
+            }
+            None => None,
+        };
+        Ok((pr, head))
+    })?;
+    let Some((head_owner, head_name, head_repo)) = head else {
+        return Ok(None);
+    };
+    let repo_url = head_repo
+        .clone_url
+        .strip_suffix(".git")
+        .unwrap_or(&head_repo.clone_url);
+    Ok(Some(GiteaMergeHeadInputs {
+        owner: head_owner,
+        repo: head_name,
+        branch: pr.head.branch.clone(),
+        default_branch: head_repo.default_branch,
+        repo_url: repo_url.to_string(),
+    }))
+}
+
+/// The Gitea-arm merge-time cleanup as JSON: the pull-request
+/// reference, one outcome for the resolved branch home, and the
+/// dry-run plan when dry-running. Mirrors the OBS arm's
+/// `accept_cleanup` payload, with the reference in place of the
+/// request id.
+fn merge_gitea_cleanup_json(
+    reference: &str,
+    outcomes: &[AcceptCleanupOutcome],
+    dry_run: &DryRun,
+) -> Value {
+    let mut payload = json!({
+        "id": reference,
+        "dry_run": dry_run.enabled(),
+        "outcomes": outcomes
+            .iter()
+            .map(|outcome| json!({
+                "source": format!("{}/{}", outcome.source_project, outcome.source_package),
+                "package": crate::cli_request::cleanup_step_json(&outcome.package),
+                "project": crate::cli_request::cleanup_step_json(&outcome.project),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    add_plan(&mut payload, dry_run);
+    payload
+}
+
+/// The Gitea-arm merge-time cleanup as text: silent when the
+/// outcome was a plain no-marker skip — most merges are not branch
+/// merges — and when nothing was resolved at all. The payload
+/// records every outcome either way.
+fn merge_gitea_cleanup_text(outcomes: &[AcceptCleanupOutcome], dry_run: &DryRun) -> String {
+    let reportable: Vec<_> = outcomes
+        .iter()
+        .filter(|outcome| outcome.package.report_in_text())
+        .collect();
+    if reportable.is_empty() {
+        return String::new();
+    }
+    let mut text = if dry_run.enabled() {
+        "dry-run: branch cleanup:".to_string()
+    } else {
+        "branch cleanup:".to_string()
+    };
+    for outcome in reportable {
+        text.push('\n');
+        text.push_str(&crate::cli_request::branch_cleanup_line(
+            &outcome.source_project,
+            &outcome.source_package,
+            &outcome.package,
+            &outcome.project,
+            dry_run,
+        ));
+    }
+    text
 }
 
 /// The Gitea side of the forward, resolved once and shared by the

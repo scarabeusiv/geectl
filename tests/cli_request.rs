@@ -466,7 +466,7 @@ fn request_accept_dry_run_text_forward_message_names_the_changes_entry() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would change request 42 to accepted; would forward after accept with changes entry: - custom entry"
+        "dry-run: would change request 42 to accepted; branch cleanup not run; would forward after accept with changes entry: - custom entry"
     );
 }
 #[test]

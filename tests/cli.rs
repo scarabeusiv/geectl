@@ -6434,6 +6434,17 @@ fn pull_request_merge_gitea_dry_run_prints_forward_plan() {
         plan[2],
         "[dry-run] note: forward preflight skipped: no OBS credentials, so the forward was not verified"
     );
+    // The merge-time cleanup cannot resolve the branch home without
+    // OBS credentials, so it reports instead of planning deletes.
+    assert_eq!(value["cleanup"]["outcomes"], serde_json::json!([]));
+    assert!(
+        value["cleanup"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("OBS credentials"),
+        "cleanup: {:?}",
+        value["cleanup"]
+    );
 }
 
 #[test]
@@ -6482,7 +6493,7 @@ fn pull_request_merge_gitea_text_dry_run_prints_forward_plan() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would merge gitea:openSUSE/geectl#122; would forward after merge"
+        "dry-run: would merge gitea:openSUSE/geectl#122; branch cleanup not run; would forward after merge"
     );
 }
 
@@ -6504,6 +6515,15 @@ fn pull_request_merge_gitea_dry_run_with_no_forward_prints_no_forward_plan() {
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     let plan = value["plan"].as_array().expect("payload carries a plan");
     assert_eq!(plan.len(), 1);
+    assert_eq!(value["cleanup"]["outcomes"], serde_json::json!([]));
+    assert!(
+        value["cleanup"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("OBS credentials"),
+        "cleanup: {:?}",
+        value["cleanup"]
+    );
     assert!(
         plan[0]
             .as_str()
@@ -6525,7 +6545,7 @@ fn pull_request_merge_gitea_dry_run_with_no_forward_prints_no_forward_plan() {
         .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would merge gitea:openSUSE/geectl#122"
+        "dry-run: would merge gitea:openSUSE/geectl#122; branch cleanup not run"
     );
 }
 
@@ -6561,6 +6581,9 @@ fn serve_gitea_merge_forward() -> (
     let repo_json = format!(
         r#"{{"owner":{{"login":"pool"}},"name":"systemd","full_name":"pool/systemd","default_branch":"factory","private":false,"clone_url":"http://{addr}/pool/systemd.git","ssh_url":"git@{addr}:pool/systemd.git"}}"#
     );
+    let head_repo_json = format!(
+        r#"{{"owner":{{"login":"scarabeus_iv"}},"name":"systemd","full_name":"scarabeus_iv/systemd","default_branch":"main","private":false,"clone_url":"http://{addr}/scarabeus_iv/systemd.git","ssh_url":"git@{addr}:scarabeus_iv/systemd.git"}}"#
+    );
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else {
@@ -6583,6 +6606,8 @@ fn serve_gitea_merge_forward() -> (
                 (200, pr_json.to_string())
             } else if target == "/api/v1/repos/pool/systemd" {
                 (200, repo_json.clone())
+            } else if target == "/api/v1/repos/scarabeus_iv/systemd" {
+                (200, head_repo_json.clone())
             } else {
                 (404, "{}".to_string())
             };
@@ -6777,6 +6802,11 @@ fn pull_request_merge_gitea_live_forwards_after_merge() {
         "openSUSE:Factory/systemd"
     );
     assert_eq!(value["forward"]["actions"][0]["new_id"], 1400001);
+    // The head syncs no OBS package in this stub (the search answers
+    // the devel package, whose scmsync names the base repo), so the
+    // merge-time cleanup has nothing to clean up: empty outcomes,
+    // silent in text.
+    assert_eq!(value["cleanup"]["outcomes"], serde_json::json!([]));
     // The guards must drop before the next run: the stub threads
     // take the same lock per request, and holding it across the
     // run would stall every response.
@@ -6876,6 +6906,364 @@ fn pull_request_merge_gitea_live_preflight_refuses_before_the_merge() {
     }
 }
 
+/// A routing stub OBS server for the live Gitea merge-then-cleanup:
+/// like `serve_obs_gitea_merge_forward`, plus the head-side scmsync
+/// search (the fork repo), the home test project package meta
+/// carrying the fork's scmsync, the home test project meta carrying
+/// `marker` in its description, the package and project deletes,
+/// and the public project listing. The head search and the base
+/// search answer differently: the search target carries the repo
+/// URL, so the fork's owner routes to the home package and anything
+/// else to the devel package. `delete_status` is the HTTP status the
+/// package delete answers with: 200 deletes, anything else fails
+/// the delete (the merge still stands).
+fn serve_obs_gitea_merge_cleanup(
+    gitea_addr: std::net::SocketAddr,
+    marker: &str,
+    delete_status: u16,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let marker = marker.to_string();
+    let base_search_xml = "<collection matches=\"1\"><package name=\"systemd\" project=\"devel:systemd\"><title>systemd</title><description>System and Session Manager</description></package></collection>";
+    let home_search_xml = "<collection matches=\"1\"><package name=\"systemd\" project=\"home:alice:branches:pool\"><title>systemd</title><description>System and Session Manager</description></package></collection>";
+    let base_candidate_meta = format!(
+        "<package name=\"systemd\" project=\"devel:systemd\"><scmsync>http://{gitea_addr}/pool/systemd#factory</scmsync></package>"
+    );
+    let home_candidate_meta = format!(
+        "<package name=\"systemd\" project=\"home:alice:branches:pool\"><scmsync>http://{gitea_addr}/scarabeus_iv/systemd#systemd-257</scmsync></package>"
+    );
+    let home_project_meta = format!(
+        "<project name=\"home:alice:branches:pool\"><title>Branch project for package systemd</title><description>Test project for the systemd-257 branch\n{marker}</description></project>"
+    );
+    let parent_meta = "<package name=\"systemd\" project=\"openSUSE:Factory\"><devel project=\"devel:systemd\" package=\"systemd\"/></package>";
+    let directory_xml =
+        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"systemd\" /></directory>";
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    let empty_directory = "<directory></directory>";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+                )
+            } else if method == "DELETE"
+                && target.contains("/source/home:alice:branches:pool/systemd")
+            {
+                if delete_status == 200 {
+                    (200, "<status code=\"ok\" />".to_string())
+                } else {
+                    (
+                        delete_status,
+                        "<status code=\"error\" summary=\"boom\" />".to_string(),
+                    )
+                }
+            } else if method == "DELETE" && target.contains("/source/home:alice:branches:pool") {
+                (200, "<status code=\"ok\" />".to_string())
+            } else if target.contains("/_meta")
+                && target.contains("/source/home:alice:branches:pool/systemd")
+            {
+                (200, home_candidate_meta.clone())
+            } else if target.contains("/_meta")
+                && target.contains("/source/home:alice:branches:pool")
+            {
+                (200, home_project_meta.clone())
+            } else if target.contains("/_meta") && target.contains("openSUSE:Factory") {
+                (200, parent_meta.to_string())
+            } else if target.contains("/_meta") {
+                (200, base_candidate_meta.clone())
+            } else if target.contains("search/package") && target.contains("scarabeus_iv") {
+                (200, home_search_xml.to_string())
+            } else if target.contains("search/package") {
+                (200, base_search_xml.to_string())
+            } else if target.contains("search/project/id") || target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else if target.contains("/public/source/") {
+                (200, empty_directory.to_string())
+            } else if target.starts_with("/source/") {
+                (200, directory_xml.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let reason = if status == 200 {
+                "OK"
+            } else if status == 404 {
+                "Not Found"
+            } else {
+                "Internal Server Error"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+/// The marker the cleanup stub's home test project carries: the
+/// fork `scarabeus_iv/systemd#systemd-257`, forked from
+/// `pool/systemd`, living in `home:alice:branches:pool/systemd`.
+const GITEA_MERGE_CLEANUP_MARKER: &str = "geectl-branch: fork=scarabeus_iv/systemd#systemd-257 source=pool/systemd target=home:alice:branches:pool/systemd";
+
+/// The live Gitea merge against the cleanup stub, with the
+/// `GEECTL_*` variables pointed at the stubs.
+fn gitea_merge_cleanup_env(
+    dir: &TempDir,
+    gitea_addr: std::net::SocketAddr,
+    obs_addr: std::net::SocketAddr,
+) -> std::process::Command {
+    let mut cmd = geectl_isolated(dir);
+    cmd.env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"));
+    cmd.env("GEECTL_GITEA_TOKEN", "test-token");
+    cmd.env("GEECTL_OBS_URL", format!("http://{obs_addr}"));
+    cmd.env("GEECTL_OBS_USERNAME", "alice");
+    cmd.env("GEECTL_OBS_PASSWORD", "test-password");
+    cmd
+}
+
+#[test]
+fn pull_request_merge_gitea_live_cleanup_deletes_the_branch_home() {
+    let (gitea_addr, _gitea_seen) = serve_gitea_merge_forward();
+    let (obs_addr, obs_seen) =
+        serve_obs_gitea_merge_cleanup(gitea_addr, GITEA_MERGE_CLEANUP_MARKER, 200);
+    let dir = TempDir::new();
+    let out = gitea_merge_cleanup_env(&dir, gitea_addr, obs_addr)
+        .args(["--live", "pull-request", "merge", "gitea:pool/systemd#7"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], "gitea:pool/systemd#7");
+    assert_eq!(value["status"], "merged");
+    assert_eq!(value["forward"]["actions"][0]["outcome"], "forwarded");
+    let outcomes = value["cleanup"]["outcomes"]
+        .as_array()
+        .expect("cleanup carries outcomes");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["source"], "home:alice:branches:pool/systemd");
+    assert_eq!(outcomes[0]["package"]["outcome"], "deleted");
+    assert_eq!(outcomes[0]["project"]["outcome"], "deleted");
+    {
+        let obs_seen = obs_seen.lock().unwrap();
+        assert!(
+            obs_seen.iter().any(|r| r.starts_with("DELETE")
+                && r.contains("/source/home:alice:branches:pool/systemd")),
+            "obs requests: {obs_seen:?}"
+        );
+        assert!(
+            obs_seen.iter().any(|r| r.starts_with("DELETE")
+                && r.contains("/source/home:alice:branches:pool")
+                && !r.contains("/systemd")),
+            "obs requests: {obs_seen:?}"
+        );
+    }
+    let out = gitea_merge_cleanup_env(&dir, gitea_addr, obs_addr)
+        .args([
+            "--live",
+            "--format",
+            "text",
+            "pull-request",
+            "merge",
+            "gitea:pool/systemd#7",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "merged gitea:pool/systemd#7 (now merged); branch cleanup:\ndeleted home package home:alice:branches:pool/systemd and test project home:alice:branches:pool; forwarded devel:systemd/systemd to openSUSE:Factory/systemd as request 1400001"
+    );
+}
+
+#[test]
+fn pull_request_merge_gitea_live_cleanup_skips_on_marker_mismatch() {
+    let (gitea_addr, _gitea_seen) = serve_gitea_merge_forward();
+    let (obs_addr, obs_seen) = serve_obs_gitea_merge_cleanup(
+        gitea_addr,
+        "geectl-branch: fork=scarabeus_iv/other#other-branch source=pool/other target=home:alice:branches:pool/other",
+        200,
+    );
+    let dir = TempDir::new();
+    let out = gitea_merge_cleanup_env(&dir, gitea_addr, obs_addr)
+        .args(["--live", "pull-request", "merge", "gitea:pool/systemd#7"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["status"], "merged");
+    assert_eq!(value["forward"]["actions"][0]["outcome"], "forwarded");
+    let outcomes = value["cleanup"]["outcomes"]
+        .as_array()
+        .expect("cleanup carries outcomes");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["package"]["outcome"], "skipped");
+    assert_eq!(outcomes[0]["project"]["outcome"], "skipped");
+    {
+        let obs_seen = obs_seen.lock().unwrap();
+        assert!(
+            !obs_seen.iter().any(|r| r.starts_with("DELETE")),
+            "a delete ran on a mismatched marker: {obs_seen:?}"
+        );
+    }
+    let out = gitea_merge_cleanup_env(&dir, gitea_addr, obs_addr)
+        .args([
+            "--live",
+            "--format",
+            "text",
+            "pull-request",
+            "merge",
+            "gitea:pool/systemd#7",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "merged gitea:pool/systemd#7 (now merged); branch cleanup:\nkept home package home:alice:branches:pool/systemd: test project marker names home:alice:branches:pool/other (fork scarabeus_iv/other#other-branch), not home:alice:branches:pool/systemd; forwarded devel:systemd/systemd to openSUSE:Factory/systemd as request 1400001"
+    );
+}
+
+#[test]
+fn pull_request_merge_gitea_dry_run_cleanup_plans_the_deletes() {
+    let (gitea_addr, _gitea_seen) = serve_gitea_merge_forward();
+    let (obs_addr, obs_seen) =
+        serve_obs_gitea_merge_cleanup(gitea_addr, GITEA_MERGE_CLEANUP_MARKER, 200);
+    let dir = TempDir::new();
+    let out = gitea_merge_cleanup_env(&dir, gitea_addr, obs_addr)
+        .args(["pull-request", "merge", "gitea:pool/systemd#7"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["dry_run"], true);
+    let outcomes = value["cleanup"]["outcomes"]
+        .as_array()
+        .expect("cleanup carries outcomes");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["package"]["outcome"], "deleted");
+    assert_eq!(outcomes[0]["project"]["outcome"], "deleted");
+    let plan = value["cleanup"]["plan"]
+        .as_array()
+        .expect("cleanup carries a plan");
+    assert!(
+        plan.iter().any(|p| p.as_str().unwrap()
+            == "[dry-run] would: delete package home:alice:branches:pool/systemd"),
+        "cleanup plan: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|p| p.as_str().unwrap()
+                == "[dry-run] would: delete project home:alice:branches:pool"),
+        "cleanup plan: {plan:?}"
+    );
+    {
+        let obs_seen = obs_seen.lock().unwrap();
+        assert!(
+            !obs_seen.iter().any(|r| r.starts_with("DELETE")),
+            "a dry-run deleted: {obs_seen:?}"
+        );
+    }
+    let out = gitea_merge_cleanup_env(&dir, gitea_addr, obs_addr)
+        .args([
+            "--format",
+            "text",
+            "pull-request",
+            "merge",
+            "gitea:pool/systemd#7",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would merge gitea:pool/systemd#7; dry-run: branch cleanup:\nwould delete home package home:alice:branches:pool/systemd and test project home:alice:branches:pool; would forward after merge"
+    );
+}
+
+#[test]
+fn pull_request_merge_gitea_live_cleanup_failure_does_not_fail_the_merge() {
+    let (gitea_addr, _gitea_seen) = serve_gitea_merge_forward();
+    let (obs_addr, _obs_seen) =
+        serve_obs_gitea_merge_cleanup(gitea_addr, GITEA_MERGE_CLEANUP_MARKER, 500);
+    let dir = TempDir::new();
+    let out = gitea_merge_cleanup_env(&dir, gitea_addr, obs_addr)
+        .args(["--live", "pull-request", "merge", "gitea:pool/systemd#7"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["status"], "merged");
+    assert_eq!(value["forward"]["actions"][0]["outcome"], "forwarded");
+    let outcomes = value["cleanup"]["outcomes"]
+        .as_array()
+        .expect("cleanup carries outcomes");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["package"]["outcome"], "failed");
+    assert_eq!(outcomes[0]["project"]["outcome"], "skipped");
+    let out = gitea_merge_cleanup_env(&dir, gitea_addr, obs_addr)
+        .args([
+            "--live",
+            "--format",
+            "text",
+            "pull-request",
+            "merge",
+            "gitea:pool/systemd#7",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("could not delete home package home:alice:branches:pool/systemd"),
+        "text: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn pull_request_merge_gitea_dry_run_verifies_the_forward_when_credentials_are_available() {
     // With both servers up, the dry-run preflight resolves the
@@ -6908,6 +7296,9 @@ fn pull_request_merge_gitea_dry_run_verifies_the_forward_when_credentials_are_av
         plan[1],
         "[dry-run] would: forward gitea:pool/systemd#7 after merge"
     );
+    // The head syncs no OBS package in this stub, so the cleanup
+    // plans nothing: empty outcomes.
+    assert_eq!(value["cleanup"]["outcomes"], serde_json::json!([]));
 }
 
 #[test]

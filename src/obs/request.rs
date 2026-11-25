@@ -3515,7 +3515,7 @@ impl<'a> ObsClient<'a> {
                 continue;
             }
             seen.push(source);
-            outcomes.push(self.cleanup_accepted_source(source_project, source_package, dry_run));
+            outcomes.push(self.cleanup_branch_source(source_project, source_package, dry_run));
         }
         Ok(AcceptCleanup {
             id: request.id,
@@ -3523,11 +3523,16 @@ impl<'a> ObsClient<'a> {
         })
     }
 
-    /// Clean up one submit source of an accepted request: gate on
-    /// the source project's description marker, then delete through
-    /// [`ObsClient::delete_branch_home`]. A missing project reads as
-    /// already gone — the server-side cleanup removed it.
-    fn cleanup_accepted_source(
+    /// Clean up one branch home: gate on the project's description
+    /// marker, then delete through [`ObsClient::delete_branch_home`].
+    /// A missing project reads as already gone — the server-side
+    /// cleanup removed it. Shared by the accept path (one call per
+    /// submit source of an accepted request) and the Gitea merge
+    /// path (one call for the package synced from the merged pull
+    /// request's head): both call it only after the change landed
+    /// live, or in dry-run planning, so there is no accepted-state
+    /// guard here — the caller owns the landed guarantee.
+    pub(crate) fn cleanup_branch_source(
         &self,
         project: &str,
         package: &str,
