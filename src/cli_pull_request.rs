@@ -53,7 +53,7 @@ use crate::gitea::{
     parse_gitea_repo, parse_scmsync_url, validate_gitea_base, GiteaClient, GiteaMergeMethod,
     PrCreateOptions, ScmsyncUrl,
 };
-use crate::http::{Timeout, UreqClient};
+use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
     CveId, DryRun, ForwardActionResult, ObsClient, ReviewTarget, SrPayload, OBS_API_BASE,
 };
@@ -665,9 +665,24 @@ fn submit(args: SubmitArgs, debug: &Debug, live: bool) -> Result<(Value, String)
     match wc.backend {
         Backend::Obs => {
             let target = obs_submit_target(&args, &wc)?;
+            // The freshness check's Gitea client resolves lazily,
+            // live-only, after the source meta says `<scmsync>`: a
+            // dry-run plan reads nothing, so no client is wired
+            // there; live, the filing path resolves the client
+            // itself, so a malformed `gitea_url` / instance config
+            // never fails an OBS-native filing that never reaches
+            // Gitea.
+            let gitea_http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+            let gitea_http = if live {
+                Some(&gitea_http as &dyn HttpClient)
+            } else {
+                None
+            };
             with_obs(debug, live, |obs| {
                 working_copy::refuse_not_submittable_obs(&wc, obs)?;
-                let client = PullRequestClient::new(Some(obs), None).with_debug(debug.clone());
+                let client = PullRequestClient::new(Some(obs), None)
+                    .with_debug(debug.clone())
+                    .with_gitea_http(gitea_http);
                 let submitted = client.submit(&target, &dry_run)?;
                 Ok((
                     submit_payload(&submitted, &dry_run)?,

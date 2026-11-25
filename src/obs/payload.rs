@@ -1,5 +1,6 @@
 use super::action_tag_type;
 use super::changelog_names_cve;
+use super::common::parse_obsinfo_commit;
 use super::request_block_matches_action;
 use super::valid_attribute_name;
 use super::valid_obs_name;
@@ -13,6 +14,8 @@ use super::FACTORY_PROJECT;
 use crate::debug::Debug;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
+use crate::gitea::GiteaClient;
+use crate::http::HttpClient;
 use crate::xml::xml_escape;
 
 /// What OBS does with the source branch when a submit request is
@@ -1578,6 +1581,8 @@ const SUBMIT_REQUIRED_PATHS: &[&str] = &[
 /// pointing at it, in that order.
 pub struct SrFiling<'a> {
     obs: &'a ObsClient<'a>,
+    gitea: Option<&'a GiteaClient<'a>>,
+    gitea_http: Option<&'a dyn HttpClient>,
     dry_run: &'a DryRun,
     debug: Debug,
 }
@@ -1608,6 +1613,8 @@ impl<'a> SrFiling<'a> {
     pub fn new(obs: &'a ObsClient<'a>, dry_run: &'a DryRun) -> Self {
         SrFiling {
             obs,
+            gitea: None,
+            gitea_http: None,
             dry_run,
             debug: Debug::disabled(),
         }
@@ -1618,6 +1625,29 @@ impl<'a> SrFiling<'a> {
     /// caller that owns the debug channel passes its sink here.
     pub fn with_debug(mut self, debug: Debug) -> Self {
         self.debug = debug;
+        self
+    }
+
+    /// Wire the Gitea client the freshness check reads the git head
+    /// through. `None` (the default) leaves the check off: a filing
+    /// without a Gitea client proceeds exactly as before, and the
+    /// skip is recorded on the debug channel — see
+    /// [`SrFiling::check_source_freshness`]. An explicit client wins
+    /// over the lazy HTTP client wired by
+    /// [`SrFiling::with_gitea_http`].
+    pub fn with_gitea(mut self, gitea: Option<&'a GiteaClient<'a>>) -> Self {
+        self.gitea = gitea;
+        self
+    }
+
+    /// Wire the HTTP client the freshness check resolves its Gitea
+    /// client from — lazily, only after the source meta says
+    /// `<scmsync>`. The caller builds no Gitea client up front: a
+    /// malformed `gitea_url`/instance config must not fail an
+    /// OBS-native filing that never reaches Gitea. See
+    /// [`SrFiling::check_source_freshness`].
+    pub fn with_gitea_http(mut self, http: Option<&'a dyn HttpClient>) -> Self {
+        self.gitea_http = http;
         self
     }
 
@@ -1787,6 +1817,15 @@ impl<'a> SrFiling<'a> {
             }
             return Ok(None);
         }
+        // A git-backed source must be current before anything
+        // files: the OBS side must carry the git head, or the
+        // filing would submit a stale source. The check runs here,
+        // on the live path only -- after the dry-run branch, so a
+        // dry-run plan still prints "would file" for a filing the
+        // live check would refuse -- where both clients are
+        // available. The Factory check already ran above, on both
+        // paths.
+        self.check_source_freshness(payload)?;
         let open = match forward_source {
             Some((source_project, source_package)) => {
                 self.obs.open_own_target_request_ids_for_target(
@@ -1821,6 +1860,119 @@ impl<'a> SrFiling<'a> {
         let id = self.obs.create_request(payload)?;
         let superseded = self.supersede_all(&supersede, &id)?;
         Ok(Some(FiledRequest { id, superseded }))
+    }
+
+    /// Verify the source is current before filing from a git-backed
+    /// package: the OBS side must carry the git head, or the filing
+    /// would submit a stale source. The source package meta decides
+    /// git-backed-ness: no `<scmsync>` means an OBS-native source
+    /// and the check passes after that one read. With one, the
+    /// expected head comes from the Gitea side
+    /// ([`GiteaClient::expected_head_for_scmsync`]) and the OBS side
+    /// from the source `_scmsync.obsinfo` `commit:` — the same
+    /// comparison the commit path polls on, read here once instead
+    /// of polled. A mismatch, a missing obsinfo, or an obsinfo with
+    /// no `commit:` refuses the filing with the rule named, both
+    /// SHAs, and the remedy (wait for the git→OBS sync and retry).
+    /// The meta and obsinfo reads are the authenticated ones: the
+    /// public endpoint answers 404 for a package that exists but is
+    /// hidden. Trusting that 404 on the meta read as "no scmsync"
+    /// would file a git-backed source unverified, and trusting it
+    /// on the obsinfo read as "not synced" would refuse a
+    /// hidden-but-current source — the same hidden-404 trap the
+    /// Factory check's authenticated meta read closes.
+    ///
+    /// The check runs on the live path only: dry-run reads nothing,
+    /// so a dry-run plan prints "would file" for a filing the live
+    /// check would refuse. The Gitea client resolves lazily, only
+    /// after the source meta says `<scmsync>`: an explicit client
+    /// wired in ([`SrFiling::with_gitea`]) is used as-is, otherwise
+    /// the HTTP client wired in ([`SrFiling::with_gitea_http`])
+    /// resolves one through [`GiteaClient::try_from_config`]. A
+    /// malformed `gitea_url`/instance config therefore fails only a
+    /// git-backed filing, never an OBS-native one. Without any client
+    /// wired in the check is off before any read — the meta read only
+    /// decides whether a wired client resolves — and the filing
+    /// proceeds exactly as before, like `refuse_when_remote_ahead`
+    /// skipping a checkout with no upstream: the comparison cannot
+    /// be made, so it is not made; the debug channel records the
+    /// skip.
+    fn check_source_freshness(&self, payload: &SrPayload) -> Result<(), GeectlError> {
+        let source = format!("{}/{}", payload.source_project, payload.source_package);
+        let target = format!("{}/{}", payload.target_project, payload.target_package);
+        // Without a client to resolve — neither an explicit client
+        // nor an HTTP client to resolve one from — the check is off
+        // before any read: the meta read only decides whether a wired
+        // client resolves, so with nothing wired there is nothing to
+        // decide, and a filing without a client reads nothing extra.
+        if self.gitea.is_none() && self.gitea_http.is_none() {
+            self.debug.emit(&format!(
+                "decision: no Gitea client wired into the filing path; skipping the freshness check for {source}"
+            ));
+            return Ok(());
+        }
+        let meta = self
+            .obs
+            .package_meta_authenticated(&payload.source_project, &payload.source_package)?;
+        let Some(scmsync) = meta.scmsync else {
+            return Ok(());
+        };
+        // The source is git-backed: only now does the Gitea client
+        // resolve. An explicit client wins; otherwise the wired HTTP
+        // client resolves one through `try_from_config`, so a
+        // malformed `gitea_url`/instance config fails here — a filing
+        // that needs Gitea — and never an OBS-native filing. A
+        // missing token is not an error: the check is off and the
+        // skip is recorded on the debug channel.
+        let lazy;
+        let gitea: &GiteaClient<'_> = match (self.gitea, self.gitea_http) {
+            (Some(client), _) => client,
+            (None, Some(http)) => {
+                lazy = GiteaClient::try_from_config(http, &self.debug)?;
+                match lazy.as_ref() {
+                    Some(client) => client,
+                    None => return Ok(()),
+                }
+            }
+            (None, None) => {
+                self.debug.emit(&format!(
+                    "decision: no Gitea client wired into the filing path; skipping the freshness check for {source}"
+                ));
+                return Ok(());
+            }
+        };
+        let expected = gitea.expected_head_for_scmsync(&scmsync)?;
+        let obsinfo = match self.obs.authed_cat(
+            &payload.source_project,
+            &payload.source_package,
+            "_scmsync.obsinfo",
+        ) {
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to submit {source} to {target}: the OBS side has no _scmsync.obsinfo yet — the git→OBS sync has not landed the source; wait for the sync and retry"
+                    ),
+                ));
+            }
+            Err(err) => return Err(err),
+            Ok(body) => body,
+        };
+        match parse_obsinfo_commit(&obsinfo) {
+            Some(synced) if synced == expected => Ok(()),
+            Some(synced) => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to submit {source} to {target}: the OBS side has not synced the git head yet (OBS _scmsync.obsinfo commit {synced}, git head {expected}); wait for the git→OBS sync and retry"
+                ),
+            )),
+            None => Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to submit {source} to {target}: the OBS side _scmsync.obsinfo carries no commit — the git→OBS sync has not landed the source; wait for the sync and retry"
+                ),
+            )),
+        }
     }
 
     /// Verify a Factory target: the source must be the recorded
@@ -2325,6 +2477,7 @@ mod tests {
     use crate::auth::Credentials;
     use crate::debug::Debug;
     use crate::error::ErrorKind;
+    use crate::gitea::GiteaClient;
     use crate::obs::build_url;
     use crate::obs::test_support::{basic_credentials, payload, FakeHttp};
 
@@ -3412,6 +3565,346 @@ mod tests {
                 "[dry-run] would: supersede all other open submit requests targeting foo with the new request".to_string(),
             ]
         );
+    }
+
+    /// A Gitea client over the canned transport, for the freshness
+    /// tests: the configured instance is `src.opensuse.org`, the
+    /// instance the scmsync fixtures name.
+    fn freshness_gitea_client(http: &FakeHttp) -> GiteaClient<'_> {
+        GiteaClient::with_base(
+            http,
+            "https://src.opensuse.org",
+            Credentials::Bearer {
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// A payload from a git-backed source: the real pair from the
+    /// Gitea fixtures — `science/gsl` carries
+    /// `adamm/gsl.git#factory`.
+    fn git_backed_payload() -> SrPayload {
+        SrPayload::new(
+            "science",
+            "gsl",
+            "devel:languages:python",
+            "gsl",
+            "Update gsl to 2.0",
+            "- Update to version 2.0.\n",
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// The open-request search URL for the git-backed payload's
+    /// target package.
+    fn gsl_search_url() -> String {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        obs.search_url("gsl").unwrap()
+    }
+
+    /// A branch JSON body, shaped like Gitea 1.24.7 answers.
+    fn freshness_branch_json(name: &str, sha: &str) -> String {
+        format!(
+            r#"{{"name": "{name}", "commit": {{"id": "{sha}", "message": "OBS bridge sync"}}, "protected": false}}"#
+        )
+    }
+
+    /// The `science/gsl` obsinfo body, shaped like the live file:
+    /// the `commit:` line is the synced commit, `revision:` the
+    /// tracked branch.
+    fn gsl_obsinfo(commit: &str) -> String {
+        format!(
+            "mtime: 1774534342\ncommit: {commit}\nurl: https://src.opensuse.org/adamm/gsl.git\nrevision: factory\n"
+        )
+    }
+
+    /// The `science/gsl` obsinfo commit observed live at
+    /// implementation time.
+    const GSL_HEAD: &str = "2ec4b574be01c905f83a91b026682b839cfce0521a5b24d164c818d54d0880ec";
+    /// A different commit: the branch head when the OBS side lags.
+    const OTHER_HEAD: &str = "abcdef1234567890abcdef1234567890abcdef12";
+
+    fn gsl_source_meta() -> &'static str {
+        "<package name=\"gsl\" project=\"science\"><scmsync>https://src.opensuse.org/adamm/gsl.git#factory</scmsync></package>"
+    }
+
+    #[test]
+    fn file_live_stale_git_backed_source_refuses() {
+        // The OBS side lags the git head: the filing is refused
+        // before anything is filed, naming both SHAs and the
+        // remedy. The reads run in order: source meta, branch head
+        // (the expected head), obsinfo (the synced commit).
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_meta",
+                gsl_source_meta(),
+            )
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_scmsync.obsinfo",
+                &gsl_obsinfo(GSL_HEAD),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/adamm/gsl/branches/factory",
+                &freshness_branch_json("factory", OTHER_HEAD),
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let gitea = freshness_gitea_client(&http);
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_gitea(Some(&gitea));
+        let err = filing.file(&git_backed_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains(
+                "refusing to submit science/gsl to devel:languages:python/gsl: the OBS side has not synced the git head yet"
+            ),
+            "{}",
+            err.context
+        );
+        assert!(err.context.contains(GSL_HEAD), "{}", err.context);
+        assert!(err.context.contains(OTHER_HEAD), "{}", err.context);
+        assert_eq!(
+            http.get_calls(),
+            vec![
+                (
+                    "https://api.opensuse.org/source/science/gsl/_meta".to_string(),
+                    true
+                ),
+                (
+                    "https://src.opensuse.org/api/v1/repos/adamm/gsl/branches/factory".to_string(),
+                    true
+                ),
+                (
+                    "https://api.opensuse.org/source/science/gsl/_scmsync.obsinfo".to_string(),
+                    true
+                ),
+            ]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_live_current_git_backed_source_files() {
+        // The OBS side carries the git head: the filing proceeds.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_meta",
+                gsl_source_meta(),
+            )
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_scmsync.obsinfo",
+                &gsl_obsinfo(GSL_HEAD),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/adamm/gsl/branches/factory",
+                &freshness_branch_json("factory", GSL_HEAD),
+            )
+            .with_get(&gsl_search_url(), "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let gitea = freshness_gitea_client(&http);
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_gitea(Some(&gitea));
+        assert_eq!(
+            filing.file(&git_backed_payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
+        );
+        assert_eq!(http.get_calls().len(), 4);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_live_obs_native_source_files_with_only_the_meta_read() {
+        // No `<scmsync>` on the source: not git-backed, so the
+        // check costs exactly the source-meta read and the filing
+        // proceeds.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_meta",
+                "<package name=\"gsl\" project=\"science\"></package>",
+            )
+            .with_get(&gsl_search_url(), "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let gitea = freshness_gitea_client(&http);
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_gitea(Some(&gitea));
+        assert_eq!(
+            filing.file(&git_backed_payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
+        );
+        assert_eq!(http.get_calls().len(), 2);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_live_without_gitea_client_files_as_before() {
+        // No Gitea client wired in: the check is off and the filing
+        // reads nothing extra — the canned source meta is never
+        // requested, so a git-backed source files exactly as before.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_meta",
+                gsl_source_meta(),
+            )
+            .with_get(&gsl_search_url(), "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing.file(&git_backed_payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
+        );
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn file_live_missing_obsinfo_refuses() {
+        // A git-backed source with no `_scmsync.obsinfo` on the OBS
+        // side has not synced yet: refuse, do not file blind. The
+        // expected head is resolved first, so the branch read runs
+        // before the missing obsinfo refuses.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_meta",
+                gsl_source_meta(),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/adamm/gsl/branches/factory",
+                &freshness_branch_json("factory", GSL_HEAD),
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/science/gsl/_scmsync.obsinfo",
+                ErrorKind::NotFound,
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let gitea = freshness_gitea_client(&http);
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_gitea(Some(&gitea));
+        let err = filing.file(&git_backed_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains(
+                "refusing to submit science/gsl to devel:languages:python/gsl: the OBS side has no _scmsync.obsinfo yet"
+            ),
+            "{}",
+            err.context
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_live_obsinfo_without_commit_refuses() {
+        // An obsinfo body with no `commit:` line names no synced
+        // commit: refuse, do not file blind. The expected head is
+        // resolved first, so the branch read runs before the
+        // commit-less obsinfo refuses.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_meta",
+                gsl_source_meta(),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/adamm/gsl/branches/factory",
+                &freshness_branch_json("factory", GSL_HEAD),
+            )
+            .with_get(
+                "https://api.opensuse.org/source/science/gsl/_scmsync.obsinfo",
+                "mtime: 1774534342\nurl: https://src.opensuse.org/adamm/gsl.git\nrevision: factory\n",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let gitea = freshness_gitea_client(&http);
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_gitea(Some(&gitea));
+        let err = filing.file(&git_backed_payload()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.context.contains(
+                "refusing to submit science/gsl to devel:languages:python/gsl: the OBS side _scmsync.obsinfo carries no commit"
+            ),
+            "{}",
+            err.context
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn file_live_pinned_sha_source_files_without_a_branch_read() {
+        // The real value from `network:messaging:xmpp/dino`: the
+        // fragment pins a commit while tracking `main`. The pinned
+        // SHA is the expected head itself — no branch read, and the
+        // filing proceeds when the OBS side carries the pin.
+        let pin = "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa";
+        let payload = SrPayload::new(
+            "network:messaging:xmpp",
+            "dino",
+            "devel:languages:python",
+            "dino",
+            "Update dino to 2.0",
+            "- Update to version 2.0.\n",
+            &[],
+        )
+        .unwrap();
+        // The open-request search URL comes from the client, like
+        // the other filing tests.
+        let search_url = {
+            let probe = FakeHttp::new();
+            let probe_obs = ObsClient::with_credentials(&probe, basic_credentials()).unwrap();
+            probe_obs.search_url("dino").unwrap()
+        };
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/network:messaging:xmpp/dino/_meta",
+                &format!(
+                    "<package name=\"dino\" project=\"network:messaging:xmpp\"><scmsync>https://src.opensuse.org/xmpp/dino?trackingbranch=main#{pin}</scmsync></package>"
+                ),
+            )
+            .with_get(
+                "https://api.opensuse.org/source/network:messaging:xmpp/dino/_scmsync.obsinfo",
+                &format!("mtime: 1774534342\ncommit: {pin}\nurl: https://src.opensuse.org/xmpp/dino\nrevision: main\n"),
+            )
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let gitea = freshness_gitea_client(&http);
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry).with_gitea(Some(&gitea));
+        assert_eq!(
+            filing.file(&payload).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec![],
+            })
+        );
+        // Source meta, obsinfo, open-request search — no branch
+        // read: the pin is the expected head.
+        assert_eq!(http.get_calls().len(), 3);
+        assert_eq!(http.post_calls().len(), 1);
     }
 
     #[test]
@@ -4540,7 +5033,11 @@ mod tests {
         let got: Vec<String> = lines.lock().unwrap().clone();
         assert_eq!(
             got,
-            ["decision: no open submit request targets foo; filing".to_string()]
+            [
+                "decision: no Gitea client wired into the filing path; skipping the freshness check for home:scarabeus_iv/foo"
+                    .to_string(),
+                "decision: no open submit request targets foo; filing".to_string()
+            ]
         );
     }
 
@@ -4577,6 +5074,8 @@ mod tests {
         assert_eq!(
             got,
             [
+                "decision: no Gitea client wired into the filing path; skipping the freshness check for home:scarabeus_iv/foo"
+                    .to_string(),
                 "decision: filing for foo; superseding open submit request(s) 1398492 with the new request"
                     .to_string()
             ]

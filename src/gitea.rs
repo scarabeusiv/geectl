@@ -35,9 +35,9 @@
 
 use crate::auth::{
     alias_for_url, gitea_alias_vars, resolve_gitea_bearer_for_url, same_api_url, Credentials,
-    FileReader, VarLookup, GITEA_TOKEN_FILE_VAR, GITEA_TOKEN_VAR,
+    EnvGiteaAuth, FileReader, VarLookup, GITEA_TOKEN_FILE_VAR, GITEA_TOKEN_VAR,
 };
-use crate::config::DEFAULT_GITEA_URL;
+use crate::config::{self, DEFAULT_GITEA_URL};
 use crate::debug::Debug;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
@@ -1218,6 +1218,49 @@ impl<'a> GiteaClient<'a> {
             instances,
         )?;
         Self::with_base(http, base, credentials)
+    }
+
+    /// A `GiteaClient` for the configured Gitea instance when a token
+    /// is configured, `None` when none is: the best-effort twin of
+    /// the `gitea` group's client for callers that can proceed
+    /// without one. A missing token is not an error here — the caller
+    /// records the gap on the debug channel and carries on (the
+    /// filing-path freshness check is off without a client) — but a
+    /// misconfigured credential set still fails closed. The caller
+    /// resolves the client only when it will be used: the filing path
+    /// resolves it after the source meta says `<scmsync>`, so a
+    /// malformed `gitea_url`/instance config never fails an
+    /// OBS-native filing that never reaches Gitea; a dry-run plan
+    /// reads nothing, so no client is built there either.
+    pub fn try_from_config(
+        http: &'a dyn HttpClient,
+        debug: &Debug,
+    ) -> Result<Option<Self>, GeectlError> {
+        let path = config::config_path()?;
+        let file_config = config::load_config_at(&path)?;
+        let effective = config::effective_config(&file_config)?;
+        // Unreachable by construction — effective_config always yields
+        // Some(gitea_url) — but kept as a defensive default rather than
+        // an unwrap: a config change must not turn into a panic here.
+        let base = effective
+            .config
+            .gitea_url
+            .as_deref()
+            .unwrap_or(DEFAULT_GITEA_URL);
+        // Both arguments are `base`: it is the effective URL
+        // (environment, then config file, then default), so the plain
+        // variables belong to it — the same resolution `gitea_client`
+        // performs.
+        let credentials = EnvGiteaAuth::credentials_for_url(base, base, &file_config.instances)?;
+        if matches!(credentials, Credentials::None) {
+            debug.emit(
+                "decision: no Gitea token configured; the filing-path freshness check is off",
+            );
+            return Ok(None);
+        }
+        Self::with_base(http, base, credentials)
+            .map(|client| client.with_debug(debug.clone()))
+            .map(Some)
     }
 
     /// Report the channel's decision lines to `debug` instead of
@@ -2422,6 +2465,48 @@ impl<'a> GiteaClient<'a> {
         branch: &str,
     ) -> Result<String, GeectlError> {
         Ok(self.branch_get(owner, repo, branch)?.commit.id)
+    }
+
+    /// The commit the OBS side should carry for a scmsync URL: the
+    /// expected head the filing-path freshness check compares
+    /// against `_scmsync.obsinfo`. A fragment that pins a commit (a
+    /// full SHA) is the expected head itself — no branch read, so a
+    /// branch that moved on does not change the answer. Otherwise
+    /// the scmsync branch (fragment, else `trackingbranch`, else
+    /// the repo's default branch) is read through
+    /// [`GiteaClient::branch_head`]. A URL on another host than
+    /// this client refuses with `ConfigError`, like the fork path
+    /// (decision 5).
+    pub fn expected_head_for_scmsync(&self, scmsync: &str) -> Result<String, GeectlError> {
+        let parsed = parse_scmsync_url(scmsync)?;
+        let scheme = if self.base.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        };
+        if !parsed
+            .authority
+            .eq_ignore_ascii_case(&normalize_authority(self.authority(), scheme))
+        {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "the scmsync URL {scmsync:?} is on another Gitea host; this client is configured for {}",
+                    self.base
+                ),
+            ));
+        }
+        match parsed.branch {
+            Some(branch) if looks_like_commit_sha(&branch) => Ok(branch),
+            Some(branch) => self.branch_head(&parsed.owner, &parsed.repo, &branch),
+            None => {
+                let default = self.repo_get(&parsed.owner, &parsed.repo)?.default_branch;
+                self.debug.emit(&format!(
+                    "decision: no branch named in the scmsync URL; using the default branch {default}"
+                ));
+                self.branch_head(&parsed.owner, &parsed.repo, &default)
+            }
+        }
     }
 
     /// Read the maintainers recorded in a git project's
@@ -4310,6 +4395,14 @@ fn percent_decode(value: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// True when `value` is a full git commit SHA (40 hex for SHA-1,
+/// 64 hex for SHA-256): a scmsync fragment shaped like this pins a
+/// commit instead of naming a branch — the `trackingbranch` query
+/// names the branch it tracks.
+fn looks_like_commit_sha(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Normalize a repo URL the way [`parse_scmsync_url`] does, so the
@@ -7274,6 +7367,90 @@ mod tests {
             .branch_head("pool", "systemd", "factory")
             .unwrap();
         assert_eq!(head, sha);
+    }
+
+    #[test]
+    fn expected_head_for_scmsync_pinned_sha_needs_no_read() {
+        // The real value from `network:messaging:xmpp/dino`: the
+        // fragment pins a commit while tracking `main`. The pinned
+        // SHA is the expected head itself — no branch read, so a
+        // branch that moved on does not change the answer.
+        let sha = "e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa";
+        let http = FakeHttp::new();
+        let head = client(&http)
+            .expected_head_for_scmsync(&format!(
+                "https://src.opensuse.org/xmpp/dino?trackingbranch=main#{sha}"
+            ))
+            .unwrap();
+        assert_eq!(head, sha);
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn expected_head_for_scmsync_branch_reads_branch_head() {
+        // The real value from `science/gsl`: `adamm/gsl.git#factory`.
+        let sha = "abcdef1234567890abcdef1234567890abcdef12";
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/adamm/gsl/branches/factory",
+            &branch_json("factory", sha, "OBS bridge sync", false),
+        );
+        let head = client(&http)
+            .expected_head_for_scmsync("https://src.opensuse.org/adamm/gsl.git#factory")
+            .unwrap();
+        assert_eq!(head, sha);
+    }
+
+    #[test]
+    fn expected_head_for_scmsync_trackingbranch_names_the_branch() {
+        let sha = "abcdef1234567890abcdef1234567890abcdef12";
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/pool/systemd/branches/factory",
+            &branch_json("factory", sha, "OBS bridge sync", false),
+        );
+        let head = client(&http)
+            .expected_head_for_scmsync(
+                "https://src.opensuse.org/pool/systemd?trackingbranch=factory",
+            )
+            .unwrap();
+        assert_eq!(head, sha);
+    }
+
+    #[test]
+    fn expected_head_for_scmsync_no_branch_uses_default_branch() {
+        // The real value from `home:adamm/git-quick-stats`: no
+        // fragment, so the repo's default branch is resolved first.
+        let sha = "abcdef1234567890abcdef1234567890abcdef12";
+        let http = FakeHttp::new()
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/adamm/git-quick-stats",
+                &repo_json("adamm", "git-quick-stats", None),
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/adamm/git-quick-stats/branches/factory",
+                &branch_json("factory", sha, "OBS bridge sync", false),
+            );
+        let head = client(&http)
+            .expected_head_for_scmsync("https://src.opensuse.org/adamm/git-quick-stats")
+            .unwrap();
+        assert_eq!(head, sha);
+    }
+
+    #[test]
+    fn expected_head_for_scmsync_other_host_refuses() {
+        // Decision 5: one configured Gitea instance per client. A
+        // repo URL on another host fails with `ConfigError` naming
+        // the configured host, like the fork path.
+        let http = FakeHttp::new();
+        let err = client(&http)
+            .expected_head_for_scmsync("https://code.opensuse.org/pool/systemd#factory")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(
+            err.context.contains("another Gitea host"),
+            "{}",
+            err.context
+        );
+        assert!(http.get_calls().is_empty());
     }
 
     /// A v1.0 `_maintainership.json`, shaped like the file osc's

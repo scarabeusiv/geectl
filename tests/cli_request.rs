@@ -505,6 +505,320 @@ fn request_file_dry_run_returns_a_null_id() {
     );
 }
 
+/// A routing stub HTTP server: answers each request with the body
+/// of the first route whose needle the request target contains,
+/// recording every request target. Unmatched requests get a 404, so
+/// an unexpected request fails the test loudly instead of passing
+/// silently. The thread is not joined: if the binary never connects,
+/// the test fails on its own assertion and the thread dies with the
+/// test process.
+fn serve_routes(
+    routes: Vec<(String, String)>,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            let target = text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            seen_in_thread.lock().unwrap().push(target.clone());
+            let body = routes
+                .iter()
+                .find(|(needle, _)| target.contains(needle.as_str()))
+                .map(|(_, body)| body.clone());
+            let (status, body) = match body {
+                Some(body) => ("200 OK", body),
+                None => ("404 Not Found", "<status code=\"not_found\" />".to_string()),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+/// The `science/gsl` obsinfo body, shaped like the live file.
+fn gsl_obsinfo(commit: &str) -> String {
+    format!(
+        "mtime: 1774534342\ncommit: {commit}\nurl: https://src.opensuse.org/adamm/gsl.git\nrevision: factory\n"
+    )
+}
+
+/// The `science/gsl` obsinfo commit observed live at implementation
+/// time; the branch-head answer for the current-source test.
+const CLI_GSL_HEAD: &str = "2ec4b574be01c905f83a91b026682b839cfce0521a5b24d164c818d54d0880ec";
+/// A different commit: the branch-head answer for the stale test.
+const CLI_OTHER_HEAD: &str = "abcdef1234567890abcdef1234567890abcdef12";
+
+/// The `request file --live` arguments for the git-backed
+/// `science/gsl` source.
+fn gsl_file_args() -> Vec<&'static str> {
+    vec![
+        "--live",
+        "request",
+        "file",
+        "--source-project",
+        "science",
+        "--source-package",
+        "gsl",
+        "--target-project",
+        "devel:languages:python",
+        "--target-package",
+        "gsl",
+        "--description",
+        "Update gsl to 2.0",
+        "--changes-entry",
+        "- Update to version 2.0.",
+    ]
+}
+
+/// A live `request file` from a stale git-backed source refuses
+/// before filing: the OBS side lags the git head, so no submit
+/// request is created. The Gitea stub answers the branch head; the
+/// OBS stub answers the source meta and the obsinfo.
+#[test]
+fn request_file_live_stale_git_backed_source_refuses() {
+    let (gitea_addr, gitea_seen) = serve_routes(vec![(
+        "/api/v1/repos/adamm/gsl/branches/factory".to_string(),
+        format!(
+            r#"{{"name": "factory", "commit": {{"id": "{CLI_OTHER_HEAD}", "message": "OBS bridge sync"}}, "protected": false}}"#
+        ),
+    )]);
+    let (obs_addr, obs_seen) = serve_routes(vec![
+        (
+            "/source/science/gsl/_meta".to_string(),
+            format!(
+                "<package name=\"gsl\" project=\"science\"><scmsync>http://{gitea_addr}/adamm/gsl.git#factory</scmsync></package>"
+            ),
+        ),
+        (
+            "/source/science/gsl/_scmsync.obsinfo".to_string(),
+            gsl_obsinfo(CLI_GSL_HEAD),
+        ),
+        (
+            "/search/request".to_string(),
+            "<collection matches=\"0\"></collection>".to_string(),
+        ),
+        (
+            "/request?cmd=create".to_string(),
+            "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+        ),
+    ]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(gsl_file_args())
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "invalid_input");
+    assert!(
+        err["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("refusing to submit science/gsl"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        err["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("has not synced the git head yet"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The branch head was read, but nothing was filed: no create
+    // POST reached the OBS stub.
+    assert!(
+        gitea_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.contains("/api/v1/repos/adamm/gsl/branches/factory")),
+        "gitea requests: {:?}",
+        gitea_seen.lock().unwrap()
+    );
+    assert!(
+        !obs_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.contains("cmd=create")),
+        "obs requests: {:?}",
+        obs_seen.lock().unwrap()
+    );
+}
+
+/// A live `request file` from a current git-backed source files:
+/// the OBS side carries the git head, so the submit request is
+/// created.
+#[test]
+fn request_file_live_current_git_backed_source_files() {
+    let (gitea_addr, _) = serve_routes(vec![(
+        "/api/v1/repos/adamm/gsl/branches/factory".to_string(),
+        format!(
+            r#"{{"name": "factory", "commit": {{"id": "{CLI_GSL_HEAD}", "message": "OBS bridge sync"}}, "protected": false}}"#
+        ),
+    )]);
+    let (obs_addr, obs_seen) = serve_routes(vec![
+        (
+            "/source/science/gsl/_meta".to_string(),
+            format!(
+                "<package name=\"gsl\" project=\"science\"><scmsync>http://{gitea_addr}/adamm/gsl.git#factory</scmsync></package>"
+            ),
+        ),
+        (
+            "/source/science/gsl/_scmsync.obsinfo".to_string(),
+            gsl_obsinfo(CLI_GSL_HEAD),
+        ),
+        (
+            "/search/request".to_string(),
+            "<collection matches=\"0\"></collection>".to_string(),
+        ),
+        (
+            "/request?cmd=create".to_string(),
+            "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+        ),
+    ]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(gsl_file_args())
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["id"], json!(1400001));
+    assert_eq!(value["dry_run"], false);
+    assert!(
+        obs_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.contains("cmd=create")),
+        "obs requests: {:?}",
+        obs_seen.lock().unwrap()
+    );
+}
+
+/// A live `request file` from a git-backed source files with no
+/// Gitea token configured: the freshness check resolves its client
+/// lazily, after the source meta says `<scmsync>` — and with no
+/// token the check is off, so the filing proceeds exactly as
+/// before, the Gitea stub sees no request, and the debug channel
+/// records the skip.
+#[test]
+fn request_file_live_without_gitea_token_files_with_skip_recorded() {
+    let (gitea_addr, gitea_seen) = serve_routes(vec![(
+        "/api/v1/repos/adamm/gsl/branches/factory".to_string(),
+        format!(
+            r#"{{"name": "factory", "commit": {{"id": "{CLI_GSL_HEAD}", "message": "OBS bridge sync"}}, "protected": false}}"#
+        ),
+    )]);
+    let (obs_addr, obs_seen) = serve_routes(vec![
+        (
+            "/source/science/gsl/_meta".to_string(),
+            format!(
+                "<package name=\"gsl\" project=\"science\"><scmsync>http://{gitea_addr}/adamm/gsl.git#factory</scmsync></package>"
+            ),
+        ),
+        (
+            "/source/science/gsl/_scmsync.obsinfo".to_string(),
+            gsl_obsinfo(CLI_GSL_HEAD),
+        ),
+        (
+            "/search/request".to_string(),
+            "<collection matches=\"0\"></collection>".to_string(),
+        ),
+        (
+            "/request?cmd=create".to_string(),
+            "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+        ),
+    ]);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--debug"])
+        .args(gsl_file_args())
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["id"], json!(1400001));
+    assert_eq!(value["dry_run"], false);
+    // The Gitea stub saw nothing: the client never resolved, so no
+    // branch head was read.
+    assert!(
+        gitea_seen.lock().unwrap().is_empty(),
+        "gitea requests: {:?}",
+        gitea_seen.lock().unwrap()
+    );
+    // The create POST did reach the OBS stub.
+    assert!(
+        obs_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.contains("cmd=create")),
+        "obs requests: {:?}",
+        obs_seen.lock().unwrap()
+    );
+    // The skip is recorded on the debug channel.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "decision: no Gitea token configured; the filing-path freshness check is off"
+        ),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn request_file_refuses_a_cve_missing_from_the_changes_entry() {
     let dir = TempDir::new();

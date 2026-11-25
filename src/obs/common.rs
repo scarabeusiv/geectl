@@ -112,6 +112,22 @@ pub fn parse_project_package(s: &str) -> Result<(String, String), GeectlError> {
     Ok((segments[0].clone(), segments[1].clone()))
 }
 
+/// The `commit:` line of a `_scmsync.obsinfo` body (`key: value`
+/// lines): the commit the OBS side synced the git-backed package
+/// to. `None` when the body carries no commit. The parse rules the
+/// commit path's sync poll and the filing-path freshness check
+/// share, adopted from osc's `test_scmsync_obsinfo.py`.
+pub(crate) fn parse_obsinfo_commit(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim() == "commit" {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
 /// Build a request URL from a base, path segments, and query pairs,
 /// using the encoders from `url.rs`. Segments are encoded as exactly
 /// one element each; query pairs as `name=value`.
@@ -1834,5 +1850,15 @@ mod tests {
         assert!(!valid_obs_filename_for_delete("../x"));
         assert!(!valid_obs_filename_for_delete("."));
         assert!(!valid_obs_filename_for_delete(".."));
+    }
+
+    #[test]
+    fn parse_obsinfo_commit_reads_the_commit_line() {
+        let body = "mtime: 1763900000\ncommit: abcdef1234567890abcdef1234567890abcdef12\nurl: https://code.opensuse.org/foo\nrevision: main\n";
+        assert_eq!(
+            parse_obsinfo_commit(body),
+            Some("abcdef1234567890abcdef1234567890abcdef12".to_string())
+        );
+        assert_eq!(parse_obsinfo_commit("mtime: 1\n"), None);
     }
 }

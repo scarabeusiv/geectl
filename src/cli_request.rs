@@ -61,7 +61,7 @@ use crate::auth::{Credentials, EnvObsAuth};
 use crate::config;
 use crate::debug::Debug;
 use crate::error::{ErrorKind, GeectlError};
-use crate::http::{Timeout, UreqClient};
+use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
     AcceptInfo, AddRolePayload, ChangeDevelPayload, CveId, DeletePayload, DeleteTarget, DryRun,
     FiledRequest, ForwardActionResult, ForwardResult, MaintenanceIncidentPayload, ObsClient,
@@ -1209,8 +1209,22 @@ fn file_request(
         payload = payload.without_cleanup();
     }
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    // The freshness check's Gitea client resolves lazily, live-only,
+    // after the source meta says `<scmsync>`: a dry-run plan reads
+    // nothing, so no client is wired there; live, the filing path
+    // resolves the client itself, so a malformed `gitea_url` /
+    // instance config never fails an OBS-native filing that never
+    // reaches Gitea.
+    let gitea_http = UreqClient::new(Timeout::default())?.with_debug(debug.clone());
+    let gitea_http = if live {
+        Some(&gitea_http as &dyn HttpClient)
+    } else {
+        None
+    };
     with_client(debug, live, |client| {
-        let filing = SrFiling::new(client, &dry_run).with_debug(debug.clone());
+        let filing = SrFiling::new(client, &dry_run)
+            .with_debug(debug.clone())
+            .with_gitea_http(gitea_http);
         let filed_request = match supersede {
             Some(old_id) => filing.refile(&payload, old_id)?,
             None => filing.file(&payload)?,

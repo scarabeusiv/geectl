@@ -31,6 +31,7 @@ use crate::config::Config;
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{validate_gitea_name, GiteaClient};
 use crate::local_build::LocalBuild;
+use crate::obs::common::parse_obsinfo_commit;
 use crate::obs::{
     valid_obs_filename, CommitFileEntry, CommitFilelistOptions, DirectoryListing, DryRun,
     ObsClient, RevisionSpec, ServiceCode,
@@ -4821,19 +4822,6 @@ fn commit_git(
     })
 }
 
-/// The `commit:` line of a `_scmsync.obsinfo` body
-/// (`key: value` lines). `None` when the body carries no commit.
-fn parse_obsinfo_commit(body: &str) -> Option<String> {
-    body.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        if key.trim() == "commit" {
-            Some(value.trim().to_string())
-        } else {
-            None
-        }
-    })
-}
-
 /// Add a downloaded file to the temporary index backing a new base
 /// tree.
 fn add_to_tmp_index(
@@ -7402,16 +7390,6 @@ mod tests {
             .collect();
         found.sort();
         assert_eq!(found, vec![("foo.spec".to_string(), StatusCode::Deleted)]);
-    }
-
-    #[test]
-    fn parse_obsinfo_commit_reads_the_commit_line() {
-        let body = "mtime: 1763900000\ncommit: abcdef1234567890abcdef1234567890abcdef12\nurl: https://code.opensuse.org/foo\nrevision: main\n";
-        assert_eq!(
-            parse_obsinfo_commit(body),
-            Some("abcdef1234567890abcdef1234567890abcdef12".to_string())
-        );
-        assert_eq!(parse_obsinfo_commit("mtime: 1\n"), None);
     }
 
     #[test]

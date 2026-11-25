@@ -12,6 +12,7 @@ use crate::gitea::{
     validate_gitea_name, GiteaClient, GiteaComment, GiteaIssue, GiteaMergeMethod, GiteaPullRequest,
     GiteaPullRequestRef, GiteaPullRequestState, GiteaReview, GiteaReviewEvent, PrCreateOptions,
 };
+use crate::http::HttpClient;
 use crate::obs::request::{
     validate_request_id, Request, RequestAction, RequestSearch, RequestState, ReviewState,
     ReviewTarget,
@@ -757,6 +758,7 @@ pub struct Submitted {
 pub struct PullRequestClient<'a> {
     obs: Option<&'a ObsClient<'a>>,
     gitea: Option<&'a GiteaClient<'a>>,
+    gitea_http: Option<&'a dyn HttpClient>,
     debug: Debug,
 }
 
@@ -769,6 +771,7 @@ impl<'a> PullRequestClient<'a> {
         PullRequestClient {
             obs,
             gitea,
+            gitea_http: None,
             debug: Debug::disabled(),
         }
     }
@@ -780,6 +783,14 @@ impl<'a> PullRequestClient<'a> {
     /// `with_debug`.
     pub fn with_debug(mut self, debug: Debug) -> Self {
         self.debug = debug;
+        self
+    }
+
+    /// Wire the HTTP client the OBS-arm filing path resolves its
+    /// Gitea client from — lazily, only after the source meta says
+    /// `<scmsync>`. See [`SrFiling::with_gitea_http`].
+    pub fn with_gitea_http(mut self, http: Option<&'a dyn HttpClient>) -> Self {
+        self.gitea_http = http;
         self
     }
 
@@ -1242,7 +1253,10 @@ impl<'a> PullRequestClient<'a> {
         match target {
             SubmitTarget::Obs(payload) => {
                 let obs = self.obs.ok_or_else(missing_obs_arm)?;
-                let filing = SrFiling::new(obs, dry_run).with_debug(self.debug.clone());
+                let filing = SrFiling::new(obs, dry_run)
+                    .with_debug(self.debug.clone())
+                    .with_gitea(self.gitea)
+                    .with_gitea_http(self.gitea_http);
                 let filed = filing.file(payload)?;
                 let Some(filed) = filed else {
                     return Ok(None);

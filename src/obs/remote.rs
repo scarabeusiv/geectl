@@ -10113,6 +10113,49 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
+    #[test]
+    fn authed_cat_reads_the_file_with_credentials() {
+        // The authenticated twin of `cat`: the same file through
+        // the `/source/` route with the client's credentials, so a
+        // file on a hidden package reads instead of 404ing on the
+        // public route — the filing-path freshness check reads
+        // `_scmsync.obsinfo` through it.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/home:alice/foo/_scmsync.obsinfo",
+            "mtime: 1763900000\ncommit: abcdef1234567890abcdef1234567890abcdef12\n",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .authed_cat("home:alice", "foo", "_scmsync.obsinfo")
+                .unwrap(),
+            "mtime: 1763900000\ncommit: abcdef1234567890abcdef1234567890abcdef12\n"
+        );
+        assert_eq!(
+            http.get_calls(),
+            vec![(
+                "https://api.opensuse.org/source/home:alice/foo/_scmsync.obsinfo".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn authed_cat_rejects_bad_inputs() {
+        // The authenticated twin of `cat`: same validation, so the
+        // same bad inputs fail before any request is made.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client
+            .authed_cat("openSUSE:Factory", "foo/bar", "foo.spec")
+            .is_err());
+        assert!(client
+            .authed_cat("openSUSE:Factory", "foo", ".hidden")
+            .is_err());
+        assert!(client.authed_cat("openSUSE:Factory", "foo", "a/b").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
     /// A scratch destination for a download test: unique per test
     /// name, removed before use so the exclusive create succeeds.
     fn download_dest(name: &str) -> std::path::PathBuf {
