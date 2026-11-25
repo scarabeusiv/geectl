@@ -3441,6 +3441,7 @@ fn apply_person_adds(persons: &mut Vec<NamedRole>, grants: &[RoleGrant]) {
             persons.push(NamedRole {
                 name: name.to_string(),
                 role: grant.role.clone(),
+                email: None,
             });
         }
     }
@@ -3655,9 +3656,15 @@ fn render_maintainers(maintainers: &[NamedRole]) -> String {
     }
     let rows: Vec<Vec<String>> = maintainers
         .iter()
-        .map(|role| vec![role.name.clone(), role.role.clone()])
+        .map(|role| {
+            vec![
+                role.name.clone(),
+                role.role.clone(),
+                role.email.clone().unwrap_or_default(),
+            ]
+        })
         .collect();
-    render_table(&["NAME", "ROLE"], &rows)
+    render_table(&["NAME", "ROLE", "EMAIL"], &rows)
 }
 
 fn link_target_result(
@@ -3733,6 +3740,7 @@ fn named_role_json(role: &NamedRole) -> Value {
     json!({
         "name": role.name,
         "role": role.role,
+        "email": role.email,
     })
 }
 
@@ -4288,7 +4296,7 @@ fn render_owners(owners: &[Owner]) -> String {
                 owner
                     .persons
                     .iter()
-                    .map(|role| format!("{} ({})", role.name, role.role))
+                    .map(render_named_role)
                     .collect::<Vec<_>>()
                     .join(", ")
             };
@@ -4298,7 +4306,7 @@ fn render_owners(owners: &[Owner]) -> String {
                 owner
                     .groups
                     .iter()
-                    .map(|role| format!("{} ({})", role.name, role.role))
+                    .map(render_named_role)
                     .collect::<Vec<_>>()
                     .join(", ")
             };
@@ -4319,6 +4327,16 @@ fn render_owners(owners: &[Owner]) -> String {
         })
         .collect();
     lines.join("\n")
+}
+
+/// A role as `name (role)`, with ` <email>` when the role carries
+/// one (owner searches fill the email in from `whois()`; meta roles
+/// carry none).
+fn render_named_role(role: &NamedRole) -> String {
+    match &role.email {
+        Some(email) => format!("{} ({}) <{}>", role.name, role.role, email),
+        None => format!("{} ({})", role.name, role.role),
+    }
 }
 
 fn render_person(person: &Person) -> String {
@@ -5594,18 +5612,22 @@ mod tests {
             NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
+                email: None,
             },
             NamedRole {
                 name: "bob".to_string(),
                 role: "reviewer".to_string(),
+                email: None,
             },
             NamedRole {
                 name: "alice".to_string(),
                 role: "reviewer".to_string(),
+                email: None,
             },
             NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
+                email: None,
             },
         ];
         assert_eq!(
@@ -5644,6 +5666,7 @@ mod tests {
         meta.persons.push(NamedRole {
             name: "bob".to_string(),
             role: "maintainer".to_string(),
+            email: None,
         });
         assert_eq!(
             plan_project_removals("openSUSE:Factory", &meta, &["alice".to_string()], &[]).unwrap(),
@@ -5665,6 +5688,7 @@ mod tests {
             persons: vec![NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
+                email: None,
             }],
             groups: vec![],
         };
@@ -5987,6 +6011,7 @@ mod tests {
         meta.persons.push(NamedRole {
             name: "bob".to_string(),
             role: "maintainer".to_string(),
+            email: None,
         });
         assert_eq!(
             plan_project_removals(
@@ -6019,6 +6044,7 @@ mod tests {
         meta.persons.push(NamedRole {
             name: "bob".to_string(),
             role: "maintainer".to_string(),
+            email: None,
         });
         // Removing both maintainers leaves none, even though each
         // removal alone looks fine against the current meta.
@@ -6080,6 +6106,7 @@ mod tests {
             persons: vec![NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
+                email: None,
             }],
             groups: vec![],
         };
@@ -7397,6 +7424,7 @@ mod tests {
             persons: vec![NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
+                email: None,
             }],
             groups: vec![],
             repositories: vec![Repository {
@@ -7490,19 +7518,25 @@ mod tests {
             persons: vec![NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
+                email: Some("alice@example.com".to_string()),
             }],
             groups: vec![NamedRole {
                 name: "editors".to_string(),
                 role: "bugowner".to_string(),
+                email: None,
             }],
         }];
         let payload = json!({
             "owners": owners.iter().map(owner_json).collect::<Vec<_>>(),
         });
         assert_eq!(payload["owners"][0]["package"], "vim");
+        assert_eq!(
+            payload["owners"][0]["persons"][0]["email"],
+            "alice@example.com"
+        );
         let text = render_owners(&owners);
         assert!(text.contains("openSUSE:Factory openSUSE:Factory vim:"));
-        assert!(text.contains("persons: alice (maintainer)"));
+        assert!(text.contains("persons: alice (maintainer) <alice@example.com>"));
         assert!(text.contains("groups: editors (bugowner)"));
         assert_eq!(render_owners(&[]), "no owners");
     }
@@ -7519,6 +7553,7 @@ mod tests {
             persons: vec![NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
+                email: None,
             }],
             groups: vec![],
         }];
@@ -7710,13 +7745,17 @@ mod tests {
             vec![NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
+                email: Some("alice@example.com".to_string()),
             }],
         );
         assert_eq!(payload["maintainers"][0]["name"], "alice");
         assert_eq!(payload["maintainers"][0]["role"], "maintainer");
+        assert_eq!(payload["maintainers"][0]["email"], "alice@example.com");
         assert!(text.contains("NAME"));
         assert!(text.contains("alice"));
         assert!(text.contains("maintainer"));
+        assert!(text.contains("EMAIL"));
+        assert!(text.contains("alice@example.com"));
         let (payload, text) = maintainers_result("openSUSE:Factory", "vim", vec![]);
         assert_eq!(payload["maintainers"], json!([]));
         assert_eq!(
@@ -8011,6 +8050,7 @@ mod tests {
             persons: vec![NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
+                email: None,
             }],
             groups: vec![],
         };
@@ -8037,10 +8077,12 @@ mod tests {
             persons: vec![NamedRole {
                 name: "alice".to_string(),
                 role: "maintainer".to_string(),
+                email: None,
             }],
             groups: vec![NamedRole {
                 name: "editors".to_string(),
                 role: "bugowner".to_string(),
+                email: None,
             }],
         }];
         let text = render_owners(&owners);

@@ -202,6 +202,7 @@ fn add_role_to_lists(
             persons.push(NamedRole {
                 name: name.to_string(),
                 role: role.to_string(),
+                email: None,
             });
         }
     }
@@ -213,6 +214,7 @@ fn add_role_to_lists(
             groups.push(NamedRole {
                 name: name.to_string(),
                 role: role.to_string(),
+                email: None,
             });
         }
     }
@@ -2262,10 +2264,12 @@ mod tests {
         meta.persons = vec![NamedRole {
             name: "bob".to_string(),
             role: "bugowner".to_string(),
+            email: None,
         }];
         meta.groups = vec![NamedRole {
             name: "factory-maintainers".to_string(),
             role: "maintainer".to_string(),
+            email: None,
         }];
         meta.repositories = vec![Repository {
             name: "openSUSE_Leap_15.6".to_string(),

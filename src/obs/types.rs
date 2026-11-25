@@ -484,6 +484,11 @@ pub struct NamedRole {
     pub name: String,
     /// Role (`maintainer`, `bugowner`, `reviewer`, ...).
     pub role: String,
+    /// Email address, when the role came from an owner search: the
+    /// search returns name and role only, so the email is filled in
+    /// from `whois()`. `None` for groups and for roles read from
+    /// package meta, which carry no email.
+    pub email: Option<String>,
 }
 
 /// A role grant or removal: a person and/or a group with a role.

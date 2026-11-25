@@ -989,6 +989,7 @@ pub(crate) fn meta_roles(block: &str) -> Result<(Vec<NamedRole>, Vec<NamedRole>)
             persons.push(NamedRole {
                 name: xml_unescape(&name),
                 role: xml_unescape(&role),
+                email: None,
             });
         }
     }
@@ -1000,6 +1001,7 @@ pub(crate) fn meta_roles(block: &str) -> Result<(Vec<NamedRole>, Vec<NamedRole>)
             groups.push(NamedRole {
                 name: xml_unescape(&name),
                 role: xml_unescape(&role),
+                email: None,
             });
         }
     }

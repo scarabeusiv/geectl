@@ -6993,6 +6993,7 @@ fn live_search_projects_by_person_finds_the_maintainer() {
     meta.persons = vec![NamedRole {
         name: "Admin".to_string(),
         role: "maintainer".to_string(),
+        email: None,
     }];
     client
         .set_project_meta(&project, &meta, &DryRun::new(false))
@@ -7033,6 +7034,7 @@ fn live_search_packages_by_person_finds_the_maintainer() {
     meta.persons = vec![NamedRole {
         name: "Admin".to_string(),
         role: "maintainer".to_string(),
+        email: None,
     }];
     client
         .set_package_meta(&project, &package, &meta, &DryRun::new(false))
@@ -7931,6 +7933,7 @@ fn live_server_accepts_project_meta_without_maintainers() {
         meta.persons.push(NamedRole {
             name: user,
             role: "maintainer".to_string(),
+            email: None,
         });
         client
             .set_project_meta(&project, &meta, &DryRun::new(false))

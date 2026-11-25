@@ -1269,11 +1269,20 @@ fn remote_owners_for_package_rejects_an_invalid_name() {
     assert!(value["error"]["remediation"].is_string());
 }
 
+const OWNER_SEARCH_BODY: &str = "<collection matches=\"2\"><owner rootproject=\"openSUSE:Factory\" project=\"devel:languages:python\" package=\"foo\"><person name=\"Admin\" role=\"maintainer\"/><person name=\"scarabeus_iv\" role=\"bugowner\"/><group name=\"factory-maintainers\" role=\"maintainer\"/></owner><owner rootproject=\"openSUSE:Factory\" project=\"openSUSE:Factory\"><person name=\"Admin\" role=\"maintainer\"/></owner></collection>";
+const ADMIN_PERSON_BODY: &str =
+    "<person><login>Admin</login><email>admin@example.com</email><state>confirmed</state></person>";
+const SCARABEUS_PERSON_BODY: &str = "<person><login>scarabeus_iv</login><email>scarabeus@example.com</email><state>confirmed</state></person>";
+
 #[test]
 fn remote_owners_for_package_json_reports_package_and_owners() {
-    let addr = serve_once(
-        "<collection matches=\"2\"><owner rootproject=\"openSUSE:Factory\" project=\"devel:languages:python\" package=\"foo\"><person name=\"Admin\" role=\"maintainer\"/><person name=\"scarabeus_iv\" role=\"bugowner\"/><group name=\"factory-maintainers\" role=\"maintainer\"/></owner><owner rootproject=\"openSUSE:Factory\" project=\"openSUSE:Factory\"><person name=\"Admin\" role=\"maintainer\"/></owner></collection>",
-    );
+    // The search plus one whois per distinct person: the fixture
+    // answers each path, so the enrichment runs offline.
+    let addr = serve_routes(&[
+        ("/search/owner", OWNER_SEARCH_BODY),
+        ("/person/Admin", ADMIN_PERSON_BODY),
+        ("/person/scarabeus_iv", SCARABEUS_PERSON_BODY),
+    ]);
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["remote", "owners-for-package", "foo"])
@@ -1294,13 +1303,23 @@ fn remote_owners_for_package_json_reports_package_and_owners() {
     assert_eq!(value["owners"][0]["root_project"], "openSUSE:Factory");
     assert_eq!(value["owners"][0]["project"], "devel:languages:python");
     assert_eq!(value["owners"][0]["package"], "foo");
+    assert_eq!(
+        value["owners"][0]["persons"][0]["email"],
+        "admin@example.com"
+    );
+    assert_eq!(
+        value["owners"][0]["persons"][1]["email"],
+        "scarabeus@example.com"
+    );
 }
 
 #[test]
 fn remote_owners_for_package_text_mode_opens_with_the_package_header() {
-    let addr = serve_once(
-        "<collection matches=\"2\"><owner rootproject=\"openSUSE:Factory\" project=\"devel:languages:python\" package=\"foo\"><person name=\"Admin\" role=\"maintainer\"/><person name=\"scarabeus_iv\" role=\"bugowner\"/><group name=\"factory-maintainers\" role=\"maintainer\"/></owner><owner rootproject=\"openSUSE:Factory\" project=\"openSUSE:Factory\"><person name=\"Admin\" role=\"maintainer\"/></owner></collection>",
-    );
+    let addr = serve_routes(&[
+        ("/search/owner", OWNER_SEARCH_BODY),
+        ("/person/Admin", ADMIN_PERSON_BODY),
+        ("/person/scarabeus_iv", SCARABEUS_PERSON_BODY),
+    ]);
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["--format", "text", "remote", "owners-for-package", "foo"])
@@ -1317,7 +1336,7 @@ fn remote_owners_for_package_text_mode_opens_with_the_package_header() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("package: foo\n"), "{stdout}");
     assert!(
-        stdout.contains("openSUSE:Factory devel:languages:python foo: persons: Admin (maintainer), scarabeus_iv (bugowner); groups: factory-maintainers (maintainer)"),
+        stdout.contains("openSUSE:Factory devel:languages:python foo: persons: Admin (maintainer) <admin@example.com>, scarabeus_iv (bugowner) <scarabeus@example.com>; groups: factory-maintainers (maintainer)"),
         "{stdout}"
     );
 }
@@ -1541,6 +1560,54 @@ fn serve_many(body: &str) -> std::net::SocketAddr {
             let _ = read_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    addr
+}
+
+/// A multi-connection HTTP fixture answering by request path:
+/// each route is a path prefix and the body served for it, so one
+/// command that fans out over several endpoints (an owner search
+/// plus a `whois` per person) can run offline. An unmatched path
+/// gets a 404; the thread is not joined, like `serve_once`.
+fn serve_routes(routes: &[(&str, &str)]) -> std::net::SocketAddr {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let routes: Vec<(String, String)> = routes
+        .iter()
+        .map(|(path, body)| (path.to_string(), body.to_string()))
+        .collect();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let target = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            let path = target.split('?').next().unwrap_or("");
+            let (status, reason, body) = match routes
+                .iter()
+                .find(|(prefix, _)| path.starts_with(prefix.as_str()))
+            {
+                Some((_, body)) => (200, "OK", body.clone()),
+                None => (404, "Not Found", "<status code=\"not_found\"/>".to_string()),
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
