@@ -1204,9 +1204,10 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
 /// `<user>`, `<comment>`, and `<requestid>` elements). The body must
 /// be a `<revisionlist>` document: a body that is not one is an
 /// error, never an empty history. A `<revision>` without numeric
-/// `rev`/`vrev` attributes, or with a non-numeric `<time>`, is a
-/// malformed history. The entries come back in server order (oldest
-/// first); the parser preserves it.
+/// `rev`/`vrev` attributes, or with a non-numeric `<time>`, or with a
+/// `<srcmd5>` that is not exactly 32 hex digits, is a malformed
+/// history. The entries come back in server order (oldest first); the
+/// parser preserves it.
 pub(crate) fn parse_history(body: &str) -> Result<Vec<HistoryEntry>, GeectlError> {
     let body = body.trim();
     // A malformed history response still fails closed, but the error
@@ -1299,10 +1300,18 @@ pub(crate) fn parse_history(body: &str) -> Result<Vec<HistoryEntry>, GeectlError
             Some(value) => Some(value.trim().parse::<u64>().map_err(|_| malformed())?),
             None => None,
         };
+        // The srcmd5 is a checksum, not free text: a value that is
+        // not exactly 32 hex digits is malformed, not a history
+        // entry to record. It may be absent.
+        let srcmd5 = match element_text(block, "srcmd5") {
+            Some(value) if is_md5(&value) => Some(value),
+            Some(_) => return Err(malformed()),
+            None => None,
+        };
         entries.push(HistoryEntry {
             rev,
             vrev,
-            srcmd5: element_text(block, "srcmd5"),
+            srcmd5,
             version: element_text(block, "version"),
             time,
             user: element_text(block, "user"),
@@ -11158,6 +11167,73 @@ mod tests {
         // The second entry carries no request id.
         assert_eq!(entries[1].rev, 2);
         assert_eq!(entries[1].request_id, None);
+    }
+
+    #[test]
+    fn history_rejects_non_hex_srcmd5() {
+        // The srcmd5 is a checksum, not free text: a non-hex
+        // value is a malformed history, never an entry to record.
+        assert_eq!(
+            parse_history("<revisionlist><revision rev=\"1\" vrev=\"1\"><srcmd5>aaa</srcmd5></revision></revisionlist>")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ServerError
+        );
+        assert!(
+            parse_history("<revisionlist><revision rev=\"1\" vrev=\"1\"><srcmd5>zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz</srcmd5></revision></revisionlist>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn history_rejects_wrong_length_srcmd5() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        assert!(
+            parse_history("<revisionlist><revision rev=\"1\" vrev=\"1\"><srcmd5>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</srcmd5></revision></revisionlist>")
+                .is_err()
+        );
+        assert!(
+            parse_history("<revisionlist><revision rev=\"1\" vrev=\"1\"><srcmd5>bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</srcmd5></revision></revisionlist>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn history_accepts_32_hex_srcmd5() {
+        // Lowercase and uppercase hex both read, carried verbatim.
+        let entries = parse_history(
+            "<revisionlist><revision rev=\"1\" vrev=\"1\"><srcmd5>0123456789abcdef0123456789abcdef</srcmd5></revision></revisionlist>",
+        )
+        .unwrap();
+        assert_eq!(
+            entries[0].srcmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let entries = parse_history(
+            "<revisionlist><revision rev=\"1\" vrev=\"1\"><srcmd5>0123456789ABCDEF0123456789ABCDEF</srcmd5></revision></revisionlist>",
+        )
+        .unwrap();
+        assert_eq!(
+            entries[0].srcmd5.as_deref(),
+            Some("0123456789ABCDEF0123456789ABCDEF")
+        );
+        // A revision without one still parses: the srcmd5 is None.
+        let entries = parse_history(
+            "<revisionlist><revision rev=\"1\" vrev=\"1\"></revision></revisionlist>",
+        )
+        .unwrap();
+        assert_eq!(entries[0].srcmd5, None);
+    }
+
+    #[test]
+    fn history_rejects_escape_sequence_in_srcmd5() {
+        // An escape sequence smuggled into the md5 unescapes to a
+        // value that is not 32 hex digits, so the history is
+        // malformed.
+        assert!(
+            parse_history("<revisionlist><revision rev=\"1\" vrev=\"1\"><srcmd5>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;</srcmd5></revision></revisionlist>")
+                .is_err()
+        );
     }
 
     #[test]
