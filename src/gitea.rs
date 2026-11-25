@@ -2747,13 +2747,15 @@ impl<'a> GiteaClient<'a> {
     /// [...]}`) of the same Repository objects the list endpoints
     /// answer, paginated internally and bounded like `repo_list`;
     /// past the bound the call fails naming the list, never a
-    /// silent truncation — narrow the query instead. An empty query
-    /// is an error before any call.
+    /// silent truncation — narrow the query instead. A blank query
+    /// is an error before any call; surrounding whitespace is
+    /// trimmed.
     pub fn repo_search(&self, query: &str) -> Result<Vec<GiteaRepository>, GeectlError> {
+        let query = query.trim();
         if query.is_empty() {
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,
-                "repo search query must not be empty",
+                "repo search query must not be blank",
             ));
         }
         self.search_paged::<GiteaRepository>(
@@ -6813,7 +6815,19 @@ mod tests {
     fn repo_search_rejects_an_empty_query_without_http() {
         let http = FakeHttp::new();
         assert!(client(&http).repo_search("").is_err());
+        assert!(client(&http).repo_search("   ").is_err());
         assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn repo_search_trims_surrounding_whitespace() {
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/repos/search?q=repo&includeDesc=true&page=1&limit=50",
+            &repo_search_json(&[repo_json("openSUSE", "repo", None)]),
+        );
+        let repos = client(&http).repo_search("  repo  ").unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].full_name, "openSUSE/repo");
     }
 
     #[test]
