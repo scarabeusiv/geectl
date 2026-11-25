@@ -2193,6 +2193,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--mode=[The run mode\: run, manualrun, precommit, localrun, disabledrun]:MODE:_default' \
 '--service=[Run only this service, with the run mode forced as its mode]:SERVICE:_default' \
+'--project=[The OBS project the services validate against\: in a git checkout it names the parent project, in an OBS checkout it defaults to the checkout'\''s project, and a value that disagrees with the checkout refuses]:PROJECT:_default' \
 '--timeout-secs=[Timeout in seconds for the whole run]:TIMEOUT_SECS:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
@@ -2205,6 +2206,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (precommit)
 _arguments "${_arguments_options[@]}" : \
+'--project=[The OBS project the services validate against\: in a git checkout it names the parent project, in an OBS checkout it defaults to the checkout'\''s project, and a value that disagrees with the checkout refuses]:PROJECT:_default' \
 '--timeout-secs=[Timeout in seconds for the whole gate]:TIMEOUT_SECS:_default' \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
 '--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \

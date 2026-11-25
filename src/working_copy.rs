@@ -3171,7 +3171,7 @@ fn refuse_when_commit_inputs_moved(
 /// the gate is hard.
 fn run_service_gate(client: &ObsClient, config: &Config, dir: &Path) -> Result<(), GeectlError> {
     let vertical = LocalBuild::from_config(client, config)?;
-    vertical.precommit(dir, PRECOMMIT_TIMEOUT_SECS, false)?;
+    vertical.precommit(dir, None, PRECOMMIT_TIMEOUT_SECS, false)?;
     Ok(())
 }
 

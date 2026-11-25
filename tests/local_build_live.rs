@@ -792,7 +792,7 @@ fn live_precommit_runs_script_in_the_container() {
     .expect("write pre_checkin.sh");
     with_vertical(|vertical| {
         let record = vertical
-            .precommit(fixture.src(), 3600, false)
+            .precommit(fixture.src(), None, 3600, false)
             .unwrap_or_else(|e| panic!("precommit failed: {e:?}"));
         assert_eq!(record.services.ran.len(), 1);
         assert!(record.pre_checkin.ran);
@@ -818,7 +818,7 @@ fn live_precommit_runs_script_in_the_container() {
         .expect("write pre_checkin.sh");
     with_vertical(|vertical| {
         let err = vertical
-            .precommit(fixture.src(), 3600, false)
+            .precommit(fixture.src(), None, 3600, false)
             .expect_err("a failing pre_checkin.sh must block precommit");
         assert_eq!(err.kind(), ErrorKind::ServiceFailed);
     });

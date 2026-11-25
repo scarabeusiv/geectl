@@ -4,12 +4,15 @@
 .SH NAME
 geectl\-local\-build\-precommit \- The precommit gate: the `precommit`\-mode service run, then `pre_checkin.sh` when the source directory carries one
 .SH SYNOPSIS
-\fBgeectl local\-build precommit\fR [\fB\-\-timeout\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIRECTORY\fR> 
+\fBgeectl local\-build precommit\fR [\fB\-\-project\fR] [\fB\-\-timeout\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIRECTORY\fR> 
 .SH DESCRIPTION
 The precommit gate: the `precommit`\-mode service run, then `pre_checkin.sh` when the source directory carries one.
 .PP
 The script step is part of the gate, not of the service mode: the mode filter alone runs services only.
 .SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The OBS project the services validate against: in a git checkout it names the parent project, in an OBS checkout it defaults to the checkout\*(Aqs project, and a value that disagrees with the checkout refuses
 .TP
 \fB\-\-timeout\-secs\fR \fI<TIMEOUT_SECS>\fR [default: 3600]
 Timeout in seconds for the whole gate

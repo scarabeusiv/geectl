@@ -259,8 +259,8 @@ or a not-installed flag). Text output renders each dependency as
 
 ## `local-build` — podman build vertical
 
-- `geectl local-build service-run <DIRECTORY>` — Run the `_service` file's services in the container, filtered by the run mode; key flags: --mode <MODE>, --service <SERVICE>, --timeout-secs <TIMEOUT_SECS>
-- `geectl local-build precommit <DIRECTORY>` — The precommit gate: the `precommit`-mode service run, then `pre_checkin.sh` when the source directory carries one; key flags: --timeout-secs <TIMEOUT_SECS>
+- `geectl local-build service-run <DIRECTORY>` — Run the `_service` file's services in the container, filtered by the run mode; key flags: --mode <MODE>, --service <SERVICE>, --project <PROJECT>, --timeout-secs <TIMEOUT_SECS>
+- `geectl local-build precommit <DIRECTORY>` — The precommit gate: the `precommit`-mode service run, then `pre_checkin.sh` when the source directory carries one; key flags: --project <PROJECT>, --timeout-secs <TIMEOUT_SECS>
 - `geectl local-build spec-cleaner <DIRECTORY> <SPEC> [-- <ARGS>...]` — Run `spec-cleaner` on a spec in the container; key flags: --timeout-secs <TIMEOUT_SECS>
 - `geectl local-build build --project <PROJECT> --repo <REPO> <DIRECTORY>` — Build the package in the container: the run-mode service run, the precommit gate, then the engine build; key flags: --arch <ARCH>, --flavor <FLAVOR>, --clean, --trust-all-projects, --alternative-project <ALTERNATIVE_PROJECT>, --root <ROOT>, --timeout-secs <TIMEOUT_SECS>
 - `geectl local-build wipe [REPO] [ARCH] [SPEC]` — Wipe a build root: delete its contents (the lock file stays); key flags: --project <PROJECT>, --flavor <FLAVOR>, --root <ROOT>

@@ -7844,6 +7844,7 @@ mod tests {
         let role = NamedRole {
             name: "al\u{1b}[2Jice".to_string(),
             role: "maintainer".to_string(),
+            realname: None,
             email: Some("alice\u{7}@example.com".to_string()),
         };
         let text = render_named_role(&role);

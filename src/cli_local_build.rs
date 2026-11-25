@@ -71,6 +71,12 @@ pub enum LocalBuildCommand {
         /// mode.
         #[arg(long)]
         service: Option<String>,
+        /// The OBS project the services validate against: in a
+        /// git checkout it names the parent project, in an OBS
+        /// checkout it defaults to the checkout's project, and a
+        /// value that disagrees with the checkout refuses.
+        #[arg(long)]
+        project: Option<String>,
         /// Timeout in seconds for the whole run.
         #[arg(long, default_value_t = 3600)]
         timeout_secs: u64,
@@ -84,6 +90,12 @@ pub enum LocalBuildCommand {
         /// The source directory carrying the `_service` file and
         /// optionally `pre_checkin.sh`.
         directory: PathBuf,
+        /// The OBS project the services validate against: in a
+        /// git checkout it names the parent project, in an OBS
+        /// checkout it defaults to the checkout's project, and a
+        /// value that disagrees with the checkout refuses.
+        #[arg(long)]
+        project: Option<String>,
         /// Timeout in seconds for the whole gate.
         #[arg(long, default_value_t = 3600)]
         timeout_secs: u64,
@@ -319,15 +331,17 @@ pub fn run_local_build(
             directory,
             mode,
             service,
+            project,
             timeout_secs,
         } => {
             let mode = ServiceRunMode::from_command_name(&mode)?;
             let mut req = ServiceRunRequest::new(directory.clone(), mode);
             req.service = service.clone();
+            req.project = project;
             req.timeout_secs = timeout_secs;
             req.dry_run = !live;
             let record = vertical.service_run(&req)?;
-            let header = match &service {
+            let mut header = match &service {
                 Some(service) => format!(
                     "directory: {} mode: {} service: {service}",
                     directory.display(),
@@ -339,11 +353,15 @@ pub fn run_local_build(
                     mode.command_name()
                 ),
             };
+            if let Some(project) = &record.project {
+                header.push_str(&format!(" project: {project}"));
+            }
             let text = with_header(&header, render_service_run(&record));
             let payload = json!({
                 "directory": directory,
                 "mode": mode.command_name(),
                 "service": service,
+                "project": record.project.clone(),
                 "dry_run": !live,
                 "record": record,
             });
@@ -351,15 +369,18 @@ pub fn run_local_build(
         }
         LocalBuildCommand::Precommit {
             directory,
+            project,
             timeout_secs,
         } => {
-            let record = vertical.precommit(&directory, timeout_secs, !live)?;
-            let text = with_header(
-                &format!("directory: {}", directory.display()),
-                render_precommit(&record),
-            );
+            let record = vertical.precommit(&directory, project.as_deref(), timeout_secs, !live)?;
+            let mut header = format!("directory: {}", directory.display());
+            if let Some(project) = &record.services.project {
+                header.push_str(&format!(" project: {project}"));
+            }
+            let text = with_header(&header, render_precommit(&record));
             let payload = json!({
                 "directory": directory,
+                "project": record.services.project.clone(),
                 "dry_run": !live,
                 "record": record,
             });
@@ -465,8 +486,13 @@ pub fn run_local_build(
             // fresh full timeout.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
             let services = vertical.service_run_with_deadline(&service_req, deadline)?;
-            let precommit =
-                vertical.precommit_with_deadline(&directory, timeout_secs, deadline, !live)?;
+            let precommit = vertical.precommit_with_deadline(
+                &directory,
+                None,
+                timeout_secs,
+                deadline,
+                !live,
+            )?;
             let record = vertical.build_with_deadline(&build_req, deadline)?;
             let mut header = format!(
                 "directory: {} project: {project} repo: {repo} arch: {arch}",
@@ -1197,6 +1223,8 @@ mod tests {
             "manualrun",
             "--service",
             "tar_scm",
+            "--project",
+            "home:alice",
             "--timeout-secs",
             "60",
         ]) {
@@ -1204,11 +1232,13 @@ mod tests {
                 directory,
                 mode,
                 service,
+                project,
                 timeout_secs,
             } => {
                 assert_eq!(directory, PathBuf::from("/tmp/pkg"));
                 assert_eq!(mode, "manualrun");
                 assert_eq!(service.as_deref(), Some("tar_scm"));
+                assert_eq!(project.as_deref(), Some("home:alice"));
                 assert_eq!(timeout_secs, 60);
             }
             _ => panic!("wrong variant"),
@@ -1217,11 +1247,13 @@ mod tests {
             LocalBuildCommand::ServiceRun {
                 mode,
                 service,
+                project,
                 timeout_secs,
                 ..
             } => {
                 assert_eq!(mode, "run");
                 assert_eq!(service, None);
+                assert_eq!(project, None);
                 assert_eq!(timeout_secs, 3600);
             }
             _ => panic!("wrong variant"),
@@ -1234,6 +1266,25 @@ mod tests {
             parse(&["geectl", "local-build", "precommit", "/tmp/pkg"]),
             LocalBuildCommand::Precommit { .. }
         ));
+        match parse(&[
+            "geectl",
+            "local-build",
+            "precommit",
+            "/tmp/pkg",
+            "--project",
+            "home:alice",
+        ]) {
+            LocalBuildCommand::Precommit {
+                directory,
+                project,
+                timeout_secs,
+            } => {
+                assert_eq!(directory, PathBuf::from("/tmp/pkg"));
+                assert_eq!(project.as_deref(), Some("home:alice"));
+                assert_eq!(timeout_secs, 3600);
+            }
+            _ => panic!("wrong variant"),
+        }
         match parse(&[
             "geectl",
             "local-build",
@@ -1906,6 +1957,7 @@ mod tests {
     fn dry_run_record() -> ServiceRunRecord {
         ServiceRunRecord {
             mode: "run".to_string(),
+            project: None,
             ran: vec![],
             image_digest: None,
             dry_run: true,
@@ -1931,6 +1983,7 @@ mod tests {
         assert!(text.contains("alpha: /usr/lib/obs/service/alpha --outdir"));
         let record = ServiceRunRecord {
             mode: "run".to_string(),
+            project: None,
             ran: vec![
                 ServiceRunOutcome {
                     name: "alpha".to_string(),
@@ -1955,6 +2008,7 @@ mod tests {
         assert!(text.contains("image: sha256:abc"));
         let empty = ServiceRunRecord {
             mode: "run".to_string(),
+            project: None,
             ran: vec![],
             image_digest: None,
             dry_run: false,
@@ -1981,6 +2035,7 @@ mod tests {
         let record = PrecommitRecord {
             services: ServiceRunRecord {
                 mode: "precommit".to_string(),
+                project: None,
                 ran: vec![],
                 image_digest: None,
                 dry_run: false,
@@ -2000,6 +2055,7 @@ mod tests {
         let record = PrecommitRecord {
             services: ServiceRunRecord {
                 mode: "precommit".to_string(),
+                project: None,
                 ran: vec![],
                 image_digest: None,
                 dry_run: false,

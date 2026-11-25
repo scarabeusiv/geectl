@@ -80,6 +80,7 @@ use crate::obs::ObsClient;
 use crate::obs::ServiceDef;
 use crate::obs::ServiceParam;
 use crate::url::encode_path_segment;
+use crate::working_copy;
 
 /// The default build image: Tumbleweed `latest`. One image, one
 /// target — a Leap pool build stays OBS-ONLY.
@@ -575,6 +576,11 @@ pub struct ServiceRunRequest {
     /// Run only this service, with its stored mode forced to the
     /// run mode. `None` runs every service the mode selects.
     pub service: Option<String>,
+    /// The OBS project the services validate against, from
+    /// `--project`: in a git checkout it names the parent
+    /// project, in an OBS checkout it defaults to the
+    /// checkout's project. `None` resolves from the checkout.
+    pub project: Option<String>,
     /// The service timeout in seconds (default 3600): one budget
     /// for the whole run — the image pull, the package install,
     /// and every service share it.
@@ -590,9 +596,74 @@ impl ServiceRunRequest {
             source_dir,
             mode,
             service: None,
+            project: None,
             timeout_secs: DEFAULT_BUILD_TIMEOUT_SECS,
             dry_run: false,
         }
+    }
+}
+
+/// The OBS coordinates a service run carries into the
+/// container: the project, package, and API URL, from the
+/// checkout record, with the project overridable by
+/// `--project`. `osc` sets the same three variables when it
+/// runs services with a project known; the names are kept in
+/// sync with the server-side service runner.
+struct ServiceContext {
+    project: Option<String>,
+    package: Option<String>,
+    apiurl: Option<String>,
+}
+
+/// Resolve the OBS coordinates for a service run: the
+/// `--project` flag wins, else the checkout's project. A flag
+/// that disagrees with the checkout refuses, naming both. A
+/// directory that is no checkout — or a subdirectory of one —
+/// carries no default: the flag alone decides. An inconsistent
+/// checkout record propagates instead of guessing.
+fn resolve_service_context(
+    source_dir: &Path,
+    project: Option<&str>,
+) -> Result<ServiceContext, GeectlError> {
+    if let Some(project) = project {
+        if !valid_obs_name(project) {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid OBS project name: {project:?}"),
+            ));
+        }
+    }
+    let checkout = match working_copy::open_read(source_dir) {
+        Ok(checkout) => Some(checkout),
+        Err(err) => match err.kind() {
+            ErrorKind::WorkingCopyNotFound | ErrorKind::InvalidInput => None,
+            _ => return Err(err),
+        },
+    };
+    match checkout {
+        Some(checkout) => {
+            if let Some(project) = project {
+                if project != checkout.project {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "--project {project} does not match the checkout's project {}: run it in the right checkout, or pass the checkout's project",
+                            checkout.project
+                        ),
+                    ));
+                }
+            }
+            Ok(ServiceContext {
+                project: Some(project.unwrap_or(&checkout.project).to_string()),
+                package: Some(checkout.package),
+                apiurl: Some(checkout.apiurl),
+            })
+        }
+        None => Ok(ServiceContext {
+            project: project.map(str::to_string),
+            package: None,
+            apiurl: None,
+        }),
     }
 }
 
@@ -628,14 +699,19 @@ pub struct ServiceRunPlan {
 }
 
 /// The record of one service run: the mode, one outcome per service
-/// that ran (in `_service` file order), and the resolved image
-/// digest when podman answered. A run that selects no services
-/// records an empty `ran` list and starts no container; stale
-/// service files are still removed.
+/// that ran (in `_service` file order), the resolved image
+/// digest when podman answered, and the OBS project the services
+/// validated against, when the run resolved one. A run that selects
+/// no services records an empty `ran` list and starts no container;
+/// stale service files are still removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServiceRunRecord {
     /// The `osc service` command name for the mode that ran.
     pub mode: String,
+    /// The OBS project the services validated against: the
+    /// `OBS_SERVICE_PROJECT` the container carried, when the
+    /// run resolved one. `None` runs carried no project.
+    pub project: Option<String>,
     pub ran: Vec<ServiceRunOutcome>,
     /// The resolved image digest, when podman answered.
     pub image_digest: Option<String>,
@@ -6803,10 +6879,13 @@ impl<'a> LocalBuild<'a> {
     /// share one timeout budget. A failing service or a failing
     /// `pre_checkin.sh` fails the whole run with
     /// [`ErrorKind::ServiceFailed`]. A dry run returns the plan
-    /// and touches nothing.
+    /// and touches nothing. `project` names the OBS project the
+    /// services validate against, from `--project`; `None`
+    /// resolves it from the checkout.
     pub fn precommit(
         &self,
         source_dir: &Path,
+        project: Option<&str>,
         timeout_secs: u64,
         dry_run: bool,
     ) -> Result<PrecommitRecord, GeectlError> {
@@ -6817,7 +6896,7 @@ impl<'a> LocalBuild<'a> {
             ));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-        self.precommit_with_deadline(source_dir, timeout_secs, deadline, dry_run)
+        self.precommit_with_deadline(source_dir, project, timeout_secs, deadline, dry_run)
     }
 
     /// The precommit gate against a fixed deadline: the caller
@@ -6830,6 +6909,7 @@ impl<'a> LocalBuild<'a> {
     pub fn precommit_with_deadline(
         &self,
         source_dir: &Path,
+        project: Option<&str>,
         timeout_secs: u64,
         deadline: std::time::Instant,
         dry_run: bool,
@@ -6844,6 +6924,7 @@ impl<'a> LocalBuild<'a> {
             source_dir: source_dir.to_path_buf(),
             mode: ServiceRunMode::Precommit,
             service: None,
+            project: project.map(str::to_string),
             timeout_secs,
             dry_run,
         };
@@ -6957,7 +7038,7 @@ impl<'a> LocalBuild<'a> {
         let image = self.resolve_image(false, timeout_secs, deadline)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let container =
-            ServiceContainer::start(self, &source_dir, DEFAULT_IMAGE, remaining.as_secs())?;
+            ServiceContainer::start(self, &source_dir, DEFAULT_IMAGE, remaining.as_secs(), None)?;
         let install = container.exec(
             &service_install_argv(&["spec-cleaner".to_string()]),
             deadline,
@@ -7028,6 +7109,10 @@ impl<'a> LocalBuild<'a> {
                 ),
             ));
         }
+        // The coordinates resolve before any service work: a
+        // bad project refuses before the plan is built, and a dry
+        // run reports the project it would validate against.
+        let context = resolve_service_context(&source_dir, req.project.as_deref())?;
         let definitions = read_local_services(&source_dir)?;
         let selected = select_services(&definitions, req.mode, req.service.as_deref())?;
         let outdirs: Vec<PathBuf> = selected
@@ -7053,6 +7138,7 @@ impl<'a> LocalBuild<'a> {
             };
             return Ok(ServiceRunRecord {
                 mode: req.mode.command_name().to_string(),
+                project: context.project.clone(),
                 ran: Vec::new(),
                 image_digest: None,
                 dry_run: true,
@@ -7074,6 +7160,7 @@ impl<'a> LocalBuild<'a> {
             remove_stash(&stash, &self.debug);
             return Ok(ServiceRunRecord {
                 mode: req.mode.command_name().to_string(),
+                project: context.project.clone(),
                 ran: Vec::new(),
                 image_digest: None,
                 dry_run: false,
@@ -7088,8 +7175,15 @@ impl<'a> LocalBuild<'a> {
             .inspect_err(|_| {
                 remove_stash(&stash, &self.debug);
             })?;
-        let result =
-            self.service_run_inner(req, &source_dir, &selected, &outdirs, &image, deadline);
+        let result = self.service_run_inner(
+            req,
+            &source_dir,
+            &selected,
+            &outdirs,
+            &image,
+            &context,
+            deadline,
+        );
         remove_stash(&stash, &self.debug);
         result
     }
@@ -7098,6 +7192,9 @@ impl<'a> LocalBuild<'a> {
     /// and one binary run per selected service, in file order.
     /// The stash cleanup lives in the caller, so it runs whatever
     /// this returns.
+    // Seven arguments: the request, the source and service inputs,
+    // the image, the resolved project context, and the deadline.
+    #[allow(clippy::too_many_arguments)]
     fn service_run_inner(
         &self,
         req: &ServiceRunRequest,
@@ -7105,11 +7202,17 @@ impl<'a> LocalBuild<'a> {
         selected: &[SelectedService],
         outdirs: &[PathBuf],
         image: &ImageInfo,
+        context: &ServiceContext,
         deadline: std::time::Instant,
     ) -> Result<ServiceRunRecord, GeectlError> {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let container =
-            ServiceContainer::start(self, source_dir, DEFAULT_IMAGE, remaining.as_secs())?;
+        let container = ServiceContainer::start(
+            self,
+            source_dir,
+            DEFAULT_IMAGE,
+            remaining.as_secs(),
+            Some(context),
+        )?;
         let packages = service_packages(selected);
         let install_argv = service_install_argv(&packages);
         let install = container.exec(&install_argv, deadline)?;
@@ -7168,6 +7271,7 @@ impl<'a> LocalBuild<'a> {
         }
         Ok(ServiceRunRecord {
             mode: req.mode.command_name().to_string(),
+            project: context.project.clone(),
             ran,
             image_digest: image.digest.clone(),
             dry_run: false,
@@ -7222,7 +7326,7 @@ impl<'a> LocalBuild<'a> {
             image.digest.as_deref().unwrap_or("<unknown>")
         ));
         let container =
-            ServiceContainer::start(self, source_dir, DEFAULT_IMAGE, remaining.as_secs())?;
+            ServiceContainer::start(self, source_dir, DEFAULT_IMAGE, remaining.as_secs(), None)?;
         let output = container.exec(
             &["bash".to_string(), "./pre_checkin.sh".to_string()],
             deadline,
@@ -7280,7 +7384,10 @@ const SERVICE_CONTAINER_PIDS_LIMIT: &str = "1024";
 /// ends with it instead of running on to the sleep budget. The
 /// container carries the runner version as `OSC_VERSION` (the
 /// value is the geectl version); the `OBS_SERVICE_*` variables
-/// stay unset — a local run carries no project context. No CPU cap
+/// carry the run's OBS coordinates when it resolved any, and
+/// stay unset otherwise — a run with no checkout and no `--project`
+/// carries no project context. The names match what `osc` sets for
+/// a service run with a project known. No CPU cap
 /// is set: the wall-clock timeout already bounds CPU time, and a
 /// fixed CPU count does not scale portably across hosts.
 /// A `,` in the source path is refused: the `--mount` form
@@ -7335,6 +7442,7 @@ impl ServiceContainer {
         source_dir: &Path,
         image: &str,
         timeout_secs: u64,
+        service_env: Option<&ServiceContext>,
     ) -> Result<Self, GeectlError> {
         // Checked at the entry points before any image work; kept
         // here so a future caller cannot build the mount unchecked.
@@ -7351,9 +7459,29 @@ impl ServiceContainer {
         let n = SERVICE_CONTAINER_COUNTER.fetch_add(1, Ordering::SeqCst);
         let name = format!("geectl-service-{}-{n}", std::process::id());
         let osc_version = format!("OSC_VERSION={}", env!("CARGO_PKG_VERSION"));
+        let service_env: Vec<String> = match service_env {
+            Some(env) => [
+                env.project
+                    .as_ref()
+                    .map(|project| format!("OBS_SERVICE_PROJECT={project}")),
+                env.package
+                    .as_ref()
+                    .map(|package| format!("OBS_SERVICE_PACKAGE={package}")),
+                env.apiurl
+                    .as_ref()
+                    .map(|apiurl| format!("OBS_SERVICE_APIURL={apiurl}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            None => Vec::new(),
+        };
         let mut cmd = Command::new(&podman);
+        cmd.arg("run");
+        for var in &service_env {
+            cmd.arg("-e").arg(var);
+        }
         cmd.args([
-            "run",
             "-d",
             "--rm",
             "--name",
@@ -13420,7 +13548,7 @@ exit 0
             let started = std::time::Instant::now();
             let err = (|| -> Result<BuildRecord, GeectlError> {
                 vertical.service_run_with_deadline(&service_req, deadline)?;
-                vertical.precommit_with_deadline(&src, 10, deadline, false)?;
+                vertical.precommit_with_deadline(&src, None, 10, deadline, false)?;
                 vertical.build_with_deadline(&build_req, deadline)
             })()
             .unwrap_err();
@@ -13462,7 +13590,7 @@ exit 0
             let started = std::time::Instant::now();
             let err = (|| -> Result<BuildRecord, GeectlError> {
                 vertical.service_run_with_deadline(&service_req, deadline)?;
-                vertical.precommit_with_deadline(&src, 10, deadline, false)?;
+                vertical.precommit_with_deadline(&src, None, 10, deadline, false)?;
                 vertical.build_with_deadline(&build_req, deadline)
             })()
             .unwrap_err();
@@ -18449,6 +18577,249 @@ exit 0
             );
         }
 
+        /// A minimal geectl working copy: a git repo with the
+        /// record keys `open_read` needs, so a service run can
+        /// resolve the checkout's project without a real checkout.
+        fn make_working_copy(src: &Path, project: &str, package: &str, backend: &str) {
+            let git = |args: &[&str]| {
+                let status = Command::new("git")
+                    .args(args)
+                    .current_dir(src)
+                    .status()
+                    .expect("git runs in the fixture");
+                assert!(status.success(), "git {args:?} failed");
+            };
+            git(&["init", "-q"]);
+            git(&["config", "--local", "user.name", "geectl"]);
+            git(&["config", "--local", "user.email", "geectl@localhost"]);
+            if backend == "obs" {
+                // An OBS checkout's root commit carries the base
+                // coordinates, and `open_read` reads them from the
+                // history: the message names the same rev and
+                // srcmd5 the record carries.
+                git(&[
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "geectl base 1 deadbeefdeadbeefdeadbeefdeadbeef",
+                ]);
+            }
+            for (key, value) in [
+                ("apiurl", "https://api.opensuse.org"),
+                ("project", project),
+                ("package", package),
+                ("backend", backend),
+                ("base-rev", "1"),
+                ("base-srcmd5", "deadbeefdeadbeefdeadbeefdeadbeef"),
+            ] {
+                let key = format!("geectl.{key}");
+                git(&["config", "--local", &key, value]);
+            }
+        }
+
+        #[test]
+        fn service_run_git_checkout_with_project_sets_obs_service_env() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            make_working_copy(&src, "home:alice", "foo", "git");
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            req.project = Some("home:alice".to_string());
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.project.as_deref(), Some("home:alice"));
+            assert_eq!(record.ran.len(), 1);
+            let log = fs::read_to_string(&call_log).unwrap();
+            assert!(
+                log.contains("-e OBS_SERVICE_PROJECT=home:alice"),
+                "container carries no project: {log}"
+            );
+            assert!(
+                log.contains("-e OBS_SERVICE_PACKAGE=foo"),
+                "container carries no package: {log}"
+            );
+            assert!(
+                log.contains("-e OBS_SERVICE_APIURL=https://api.opensuse.org"),
+                "container carries no apiurl: {log}"
+            );
+        }
+
+        #[test]
+        fn service_run_obs_checkout_defaults_to_the_checkout_project() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            make_working_copy(&src, "home:alice", "foo", "obs");
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.project.as_deref(), Some("home:alice"));
+            let log = fs::read_to_string(&call_log).unwrap();
+            assert!(
+                log.contains("-e OBS_SERVICE_PROJECT=home:alice"),
+                "container carries no project: {log}"
+            );
+        }
+
+        #[test]
+        fn service_run_refuses_a_project_mismatch() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            make_working_copy(&src, "home:alice", "foo", "git");
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            req.project = Some("home:bob".to_string());
+            let err = vertical.service_run(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.context.contains("home:bob") && err.context.contains("home:alice"),
+                "refusal names both projects: {err}"
+            );
+            let log = fs::read_to_string(&call_log).unwrap_or_default();
+            assert!(
+                !log.contains("run -d"),
+                "container started before the refusal: {log}"
+            );
+        }
+
+        #[test]
+        fn service_run_dry_run_refuses_a_project_mismatch() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            make_working_copy(&src, "home:alice", "foo", "git");
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            req.project = Some("home:bob".to_string());
+            req.dry_run = true;
+            let err = vertical.service_run(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn service_run_refuses_an_invalid_project_name() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let mut req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            req.project = Some("has space".to_string());
+            let err = vertical.service_run(&req).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(
+                err.context.contains("has space"),
+                "refusal names the bad project: {err}"
+            );
+        }
+
+        #[test]
+        fn service_run_plain_directory_carries_no_obs_service_env() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\"/></services>",
+            )
+            .unwrap();
+            let (podman, call_log) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let req = ServiceRunRequest::new(src.clone(), ServiceRunMode::Run);
+            let record = vertical.service_run(&req).unwrap();
+            assert_eq!(record.project, None);
+            let log = fs::read_to_string(&call_log).unwrap();
+            assert!(
+                !log.contains("OBS_SERVICE_PROJECT"),
+                "plain run carries a project: {log}"
+            );
+        }
+
+        #[test]
+        fn precommit_git_checkout_with_project_accepted() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\" mode=\"trylocal\"/></services>",
+            )
+            .unwrap();
+            make_working_copy(&src, "home:alice", "foo", "git");
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let record = vertical
+                .precommit(&src, Some("home:alice"), 3600, false)
+                .unwrap();
+            assert_eq!(record.services.project.as_deref(), Some("home:alice"));
+        }
+
+        #[test]
+        fn precommit_refuses_a_project_mismatch() {
+            let dir = TempDir::new();
+            let src = dir.path().join("source");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                src.join("_service"),
+                "<services><service name=\"alpha\" mode=\"trylocal\"/></services>",
+            )
+            .unwrap();
+            make_working_copy(&src, "home:alice", "foo", "git");
+            let (podman, _) = stub_service_podman(dir.path(), &src);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
+            let err = vertical
+                .precommit(&src, Some("home:bob"), 3600, false)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+
         #[test]
         fn service_container_mount_survives_a_colon_in_the_source_path() {
             // The `--mount` form carries the path as one value, so
@@ -18759,7 +19130,7 @@ exit 0
             let http = FakeHttp::new();
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
-            let record = vertical.precommit(&src, 3600, false).unwrap();
+            let record = vertical.precommit(&src, None, 3600, false).unwrap();
             assert!(!record.dry_run);
             assert_eq!(record.services.ran.len(), 1);
             assert_eq!(record.services.ran[0].name, "beta");
@@ -18780,7 +19151,7 @@ exit 0
             let http = FakeHttp::new();
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
-            let record = vertical.precommit(&src, 3600, false).unwrap();
+            let record = vertical.precommit(&src, None, 3600, false).unwrap();
             assert!(record.services.ran.is_empty());
             assert!(!record.pre_checkin.ran);
             assert_eq!(record.pre_checkin.exit_code, None);
@@ -18822,7 +19193,7 @@ exit 0
             let http = FakeHttp::new();
             let client = client_with(&http);
             let vertical = vertical(&client, dir.path(), dir.path().join("engine"), podman);
-            let err = vertical.precommit(&src, 3600, false).unwrap_err();
+            let err = vertical.precommit(&src, None, 3600, false).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ServiceFailed);
             assert!(
                 err.context.contains("pre_checkin.sh"),

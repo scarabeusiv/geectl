@@ -6638,12 +6638,16 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__local__subcmd__build__subcmd__precommit)
-            opts="-h --timeout-secs --format --debug --debug-body --live --help"
+            opts="-h --project --timeout-secs --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --project)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --timeout-secs)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
@@ -6678,7 +6682,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__local__subcmd__build__subcmd__service__subcmd__run)
-            opts="-h --mode --service --timeout-secs --format --debug --debug-body --live --help"
+            opts="-h --mode --service --project --timeout-secs --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -6689,6 +6693,10 @@ _geectl() {
                     return 0
                     ;;
                 --service)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
