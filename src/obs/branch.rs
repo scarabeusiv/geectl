@@ -1391,9 +1391,7 @@ impl<'a> ObsClient<'a> {
         if let Some(scmsync) = source_doc.child("scmsync") {
             let url = find_attr(&scmsync, "url")
                 .filter(|url| !url.trim().is_empty())
-                .or_else(|| {
-                    element_text(&scmsync, "scmsync").filter(|url| !url.trim().is_empty())
-                })
+                .or_else(|| element_text(&scmsync, "scmsync").filter(|url| !url.trim().is_empty()))
                 .unwrap_or_default();
             return Err(GeectlError::new(
                 ErrorKind::InvalidInput,

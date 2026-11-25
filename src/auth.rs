@@ -1292,8 +1292,7 @@ fn parse_dotenv(content: &str, path: &Path) -> Result<HashMap<String, String>, G
             let comment = raw_value
                 .char_indices()
                 .find(|(i, c)| {
-                    *c == '#'
-                        && (*i == 0 || raw_value.as_bytes()[i - 1].is_ascii_whitespace())
+                    *c == '#' && (*i == 0 || raw_value.as_bytes()[i - 1].is_ascii_whitespace())
                 })
                 .map(|(i, _)| i);
             match comment {
@@ -2929,11 +2928,8 @@ mod tests {
 
     #[test]
     fn dotenv_hash_after_equals_is_empty() {
-        let map = parse_dotenv(
-            "GEECTL_A=# comment\nGEECTL_B=#comment\n",
-            Path::new(".env"),
-        )
-        .unwrap();
+        let map =
+            parse_dotenv("GEECTL_A=# comment\nGEECTL_B=#comment\n", Path::new(".env")).unwrap();
         assert_eq!(map["GEECTL_A"], "");
         assert_eq!(map["GEECTL_B"], "");
     }

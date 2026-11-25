@@ -3462,10 +3462,9 @@ impl<'a> ObsClient<'a> {
                 // one: a mid-batch failure leaves the earlier codes
                 // wiped and the later ones not attempted.
                 let suffix = match (code.map(WipeCode::as_str), completed.is_empty()) {
-                    (Some(failed), false) => format!(
-                        " (code {failed} after completed {})",
-                        completed.join(", ")
-                    ),
+                    (Some(failed), false) => {
+                        format!(" (code {failed} after completed {})", completed.join(", "))
+                    }
                     (Some(failed), true) => format!(" (code {failed})"),
                     (None, false) => format!(" (after completed {})", completed.join(", ")),
                     (None, true) => String::new(),

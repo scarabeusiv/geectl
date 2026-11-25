@@ -398,10 +398,7 @@ fn split_scp_like(url: &str) -> Option<(&str, &str)> {
         // A single-letter drive prefix with a backslash path
         // (`C:\repo`) is a Windows path, not an scp-like remote
         // with a one-letter host.
-        if left.len() == 1
-            && left.as_bytes()[0].is_ascii_alphabetic()
-            && path.starts_with('\\')
-        {
+        if left.len() == 1 && left.as_bytes()[0].is_ascii_alphabetic() && path.starts_with('\\') {
             return None;
         }
         (left.rsplit('@').next()?, path)

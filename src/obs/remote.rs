@@ -13012,10 +13012,8 @@ mod tests {
 
     #[test]
     fn person_without_email_parses_with_no_email() {
-        let person = parse_person(
-            "<person><login>Admin</login><state>confirmed</state></person>",
-        )
-        .unwrap();
+        let person =
+            parse_person("<person><login>Admin</login><state>confirmed</state></person>").unwrap();
         assert_eq!(person.email, None);
     }
 
@@ -13168,10 +13166,7 @@ mod tests {
                 "https://api.opensuse.org/search/owner?project=openSUSE%3AFactory&package=foo",
                 OWNER_SEARCH_FIXTURE,
             )
-            .with_get_error(
-                "https://api.opensuse.org/person/Admin",
-                ErrorKind::NotFound,
-            )
+            .with_get_error("https://api.opensuse.org/person/Admin", ErrorKind::NotFound)
             .with_get(
                 "https://api.opensuse.org/person/scarabeus_iv",
                 PERSON_SCARABEUS_FIXTURE,
@@ -13695,9 +13690,7 @@ mod tests {
             "build.specials.obscpio"
         ));
         assert!(!ObsClient::is_scmsync_internal_file("foo.spec"));
-        assert!(!ObsClient::is_scmsync_internal_file(
-            "_scmsync.obsinfo.bak"
-        ));
+        assert!(!ObsClient::is_scmsync_internal_file("_scmsync.obsinfo.bak"));
     }
 
     #[test]

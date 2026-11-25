@@ -4113,9 +4113,9 @@ impl<'a> GiteaClient<'a> {
                     Err(err) if err.kind() == ErrorKind::NotFound => {
                         obs.create_project(target, title, description, dry_run)?;
                         if dry_run.live() {
-                            if let Err(wait_err) = self.wait_for_branch_target_project(
-                                obs, target, budget,
-                            ) {
+                            if let Err(wait_err) =
+                                self.wait_for_branch_target_project(obs, target, budget)
+                            {
                                 // The wait timed out after this branch
                                 // created the project: delete the
                                 // orphaned empty project it leaves

@@ -3590,7 +3590,6 @@ fn remote_set_package_meta_live_with_half_set_credentials_fails_with_config_erro
     assert_eq!(value["error"]["code"], "config_error");
 }
 
-
 #[test]
 fn remote_lock_live_with_half_set_credentials_fails_with_config_error() {
     // A live mutation does need credentials, so it fails fast.
@@ -3665,7 +3664,8 @@ fn remote_add_containers_live_with_half_set_credentials_fails_with_config_error(
 }
 
 #[test]
-fn remote_set_project_meta_add_person_dry_run_ignores_half_set_credentials() {    // A person-only change writes no meta itself — the meta write
+fn remote_set_project_meta_add_person_dry_run_ignores_half_set_credentials() {
+    // A person-only change writes no meta itself — the meta write
     // runs only when a field flag is set — so the plan carries only
     // the role entry, and the payload carries the granted person.
     let dir = TempDir::new();
