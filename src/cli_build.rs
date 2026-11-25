@@ -79,7 +79,9 @@ pub enum BuildCommand {
         /// Merge the results from every configured instance into
         /// one view, instead of only the instance currently pointed
         /// at. Cannot combine with `--oldstate`: a state hash is
-        /// per instance.
+        /// per instance. A partially-failing read still exits 0:
+        /// per-instance errors render in the view and payload, and
+        /// only an every-instance failure is an error.
         #[arg(long, conflicts_with = "oldstate")]
         all_instances: bool,
     },

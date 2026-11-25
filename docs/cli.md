@@ -230,7 +230,7 @@ directory's `.env` only.
 
 ## `build` — build status
 
-- `geectl build results <PROJECT>` — Read the build-results matrix for a project; key flags: --package <PACKAGE>, --repository <REPOSITORY>, --arch <ARCH>, --code <CODE>, --multibuild, --lastbuild, --oldstate <OLDSTATE>, --all-instances
+- `geectl build results <PROJECT>` — Read the build-results matrix for a project; key flags: --package <PACKAGE>, --repository <REPOSITORY>, --arch <ARCH>, --code <CODE>, --multibuild, --lastbuild, --oldstate <OLDSTATE>, --all-instances; a partially-failing `--all-instances` read exits 0 with per-instance errors in the view
 - `geectl build wait-for-results --deadline-secs <DEADLINE_SECS> <PROJECT>` — Poll the build results until they settle, or the deadline passes; key flags: --package <PACKAGE>, --repository <REPOSITORY>, --arch <ARCH>, --code <CODE>, --multibuild, --lastbuild
 - `geectl build build-log <PROJECT> [PACKAGE] [REPOSITORY] [ARCH]` — Read the build log for a package; key flags: --start <START>, --last, --lastsucceeded, --multibuild <FLAVOR>, --strip-time
 - `geectl build build-status <PROJECT> <PACKAGE> <REPOSITORY> <ARCH>` — Read the build status code for a package.
