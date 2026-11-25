@@ -48,3 +48,37 @@ Surveyed: osc's Behave suite (77 feature files, 272 scenarios) and unit suite (5
 - Adoption refused (coverage exists):
   `osc token --create` — `behave/features/token.feature` covers
   create → list → trigger end-to-end, but the secret stays with the user. Secret printers (`config --dump-full`, `config pass`) are excluded: the secret stays with the user.
+
+## Reconciliation with issue #40
+
+The map states 227 adopted (120 behave / 107 unit). Issue #40 totals
+246 (129 behave / 117 unit). The gap is 19 (9 behave + 10 unit):
+since the totals stood at 231, the issue added 15 adoptions (+4
+behave, +11 unit) — PR #217 (+6 unit), PR #232 (+1 unit), PR #207
+(+3 unit), PR #177 (+1 behave), PR #298 (+3 behave) and PR #300
+(+1 unit) — while the map's adopted totals rose by only 2 (both
+unit). The map's per-batch table is gone, so the two sides cannot be
+cross-checked case by case; the issue's per-section running counts
+are the live record.
+
+## Osc-test quirks
+
+Reference-suite cases that are wrong as written, and what geectl
+pins instead:
+
+- `branch.feature:13` — the title claims `--nodevelproject`
+  while the command omits the flag. Geectl pins the real
+  `--no-devel-project` flag
+  (`branch_with_no_devel_project_forks_the_named_package`).
+- `submitrequest.feature:25` / `createrequest.feature:25` —
+  create `another_file`, add `new_file`. Neither name is
+  adopted.
+- `buildhist.feature` — titles say `buildist`; the word is not
+  adopted.
+- Multibuild `.src.rpm` listed 3x in the reference fixture;
+  geectl's fixture lists it once.
+- `test_obs_api_request.py:38` — plural
+  `source[@packages=...]`. Deliberate divergence: the server
+  whitelist has `source/@package` only and refuses the plural
+  with 400, so geectl builds the singular form, pinned by
+  `search_source_packages_use_the_singular_attribute`.
