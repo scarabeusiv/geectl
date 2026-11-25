@@ -1210,7 +1210,7 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
     }
 
     #[test]
-    fn service_state_failed_carries_error_verbatim() {
+    fn service_state_failed_carries_error() {
         let http = fake_with(
             &dir_with_serviceinfo(
                 "<serviceinfo code=\"failed\" xsrcmd5=\"aaa\" lsrcmd5=\"bbb\"><error>service run failed: download_url: 404 Not Found\nsecond line</error></serviceinfo>",
@@ -1228,6 +1228,46 @@ line2</pre> --><!-- <ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul> -->
                     "service run failed: download_url: 404 Not Found\nsecond line".to_string()
                 ),
             })
+        );
+    }
+
+    #[test]
+    fn service_state_error_strips_terminal_controls() {
+        // The error is server text, and the typed value is printed
+        // raw to the terminal (state render, working-copy failure
+        // message): escape sequences, carriage returns, bells, and
+        // bidirectional marks are stripped at parse, while the
+        // error's own newlines survive. The entity-decoded form
+        // (`&#27;`) is stripped too: the strip runs after unescape.
+        let http = fake_with(
+            &dir_with_serviceinfo(
+                "<serviceinfo code=\"failed\" xsrcmd5=\"aaa\" lsrcmd5=\"bbb\"><error>bad\u{1b}[2Jline\rwith\u{7}bell\nand\u{202e}bidi</error></serviceinfo>",
+            ),
+            None,
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client.service_state("openSUSE:Factory", "foo").unwrap(),
+            Some(ServiceState {
+                code: ServiceCode::Failed,
+                xsrcmd5: Some("aaa".to_string()),
+                lsrcmd5: Some("bbb".to_string()),
+                error: Some("bad[2Jlinewithbell\nandbidi".to_string()),
+            })
+        );
+        let http = fake_with(
+            &dir_with_serviceinfo(
+                "<serviceinfo code=\"failed\"><error>bad&#27;[2Jline</error></serviceinfo>",
+            ),
+            None,
+        );
+        let client = ObsClient::new(&http);
+        assert_eq!(
+            client
+                .service_state("openSUSE:Factory", "foo")
+                .unwrap()
+                .and_then(|state| state.error),
+            Some("bad[2Jline".to_string())
         );
     }
 

@@ -19,10 +19,10 @@
 //!
 //! Documented omissions (not gaps): `list` text carries
 //! no parameter values beyond `name=value` pairs (the full values
-//! are in the JSON payload); `state` text carries the error verbatim
-//! (multi-line server text) but no md5s beyond the two the state
-//! itself names. The JSON payload remains the complete record in
-//! every case.
+//! are in the JSON payload); `state` text carries the error
+//! (multi-line server text, terminal control characters stripped)
+//! but no md5s beyond the two the state itself names. The JSON
+//! payload remains the complete record in every case.
 //!
 //! Credentials in dry-run: the reads need none, but credentials
 //! resolve up front (see `docs/cli.md`) — a half-configured pair
@@ -33,7 +33,7 @@
 use clap::Subcommand;
 use geectl::auth::EnvObsAuth;
 use geectl::config;
-use geectl::debug::Debug;
+use geectl::debug::{strip_terminal_controls, Debug};
 use geectl::error::GeectlError;
 use geectl::http::{HttpClient, Timeout, UreqClient};
 use geectl::obs::{DryRun, ObsClient, ServiceDef, ServiceState, ServiceTrigger, OBS_API_BASE};
@@ -275,9 +275,9 @@ fn render_comment(name: &str, comment: &str) -> String {
 }
 
 /// The service state as `key: value` lines: the run code, the two
-/// md5s when the listing carries them, and the error verbatim when
-/// the run failed. `None` means the listing carries no service
-/// state at all.
+/// md5s when the listing carries them, and the error when the run
+/// failed, terminal control characters stripped. `None` means the
+/// listing carries no service state at all.
 fn render_service_state(state: &Option<ServiceState>) -> String {
     match state {
         None => "no service state".to_string(),
@@ -290,7 +290,12 @@ fn render_service_state(state: &Option<ServiceState>) -> String {
                 lines.push(format!("lsrcmd5: {lsrcmd5}"));
             }
             if let Some(error) = &state.error {
-                lines.push(format!("error: {error}"));
+                // Terminal control characters are stripped at the
+                // render too: this is the terminal boundary, and a
+                // hand-built state must not reach it unfiltered. The
+                // parse already strips the server's text; the strip
+                // is idempotent.
+                lines.push(format!("error: {}", strip_terminal_controls(error)));
             }
             lines.join("\n")
         }
@@ -529,6 +534,24 @@ mod tests {
         assert_eq!(payload["xsrcmd5"], "abcd1234");
         assert_eq!(payload["lsrcmd5"], Value::Null);
         assert_eq!(render_service_state(&None), "no service state");
+    }
+
+    #[test]
+    fn state_renders_error_without_terminal_controls() {
+        // The error is server text, and the render is the terminal
+        // boundary: escape sequences, carriage returns, bells, and
+        // bidirectional marks are stripped, while the error's own
+        // newlines survive.
+        let state = ServiceState {
+            code: ServiceCode::Failed,
+            xsrcmd5: None,
+            lsrcmd5: None,
+            error: Some("bad\u{1b}[2Jline\rwith\u{7}bell\nand\u{202e}bidi".to_string()),
+        };
+        assert_eq!(
+            render_service_state(&Some(state)),
+            "code: failed\nerror: bad[2Jlinewithbell\nandbidi"
+        );
     }
 
     #[test]

@@ -54,6 +54,7 @@ use super::ServiceState;
 use super::SourceFile;
 use super::FACTORY_PROJECT;
 use crate::auth::Credentials;
+use crate::debug::strip_terminal_controls;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::xml::find_attr;
@@ -1068,7 +1069,13 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
             code,
             xsrcmd5,
             lsrcmd5,
-            error,
+            // Terminal control characters are stripped from the error
+            // text: the listing is server data, and the error reaches
+            // the terminal through the state render and through the
+            // failure message a working-copy commit raises — strip at
+            // the parse, so every consumer sees clean text. Newlines
+            // survive: the error is multi-line.
+            error: error.map(|text| strip_terminal_controls(&text)),
         });
         break;
     }

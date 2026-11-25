@@ -559,9 +559,9 @@ pub fn format_body_preview(body: &str) -> String {
 /// string: C0/C1 control characters (except newline) and the
 /// bidirectional / format characters that reorder displayed text
 /// (U+061C, U+200E-U+200F, U+202A-U+202E, U+2066-U+2069, U+FEFF). Stored
-/// `_service` files and error bodies are untrusted input, and both
-/// are printed raw to the terminal.
-pub(crate) fn strip_terminal_controls(text: &str) -> String {
+/// `_service` files, error bodies, and service run errors are untrusted
+/// input, and all are printed raw to the terminal.
+pub fn strip_terminal_controls(text: &str) -> String {
     text.chars()
         .filter(|c| {
             *c == '\n'

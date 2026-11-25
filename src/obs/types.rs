@@ -414,7 +414,8 @@ pub struct ServiceState {
     pub xsrcmd5: Option<String>,
     /// The linked source md5, when the listing carries it.
     pub lsrcmd5: Option<String>,
-    /// The `<error>` text, on failure. Multi-line; verbatim from the
+    /// The `<error>` text, on failure. Multi-line; terminal control
+    /// characters are stripped at parse, the rest verbatim from the
     /// server.
     pub error: Option<String>,
 }
