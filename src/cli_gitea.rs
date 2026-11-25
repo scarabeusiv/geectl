@@ -644,9 +644,11 @@ fn repo_list_header(args: &RepoListArgs) -> String {
     parts.join(" ")
 }
 
-/// The `repo-search` coordinate header: the keyword searched for.
+/// The `repo-search` coordinate header: the keyword searched for,
+/// quoted, so a newline in the query cannot forge a second header
+/// line (stripping alone keeps `\n`).
 fn repo_search_header(query: &str) -> String {
-    format!("query: {query}")
+    format!("query: {query:?}")
 }
 
 fn gitea_repository_json(repository: &GiteaRepository) -> Value {
@@ -1172,16 +1174,21 @@ mod tests {
 
     #[test]
     fn repo_search_text_carries_the_query_header() {
-        assert_eq!(repo_search_header("geectl"), "query: geectl");
+        assert_eq!(repo_search_header("geectl"), "query: \"geectl\"");
         let text = with_header(
             &repo_search_header("geectl"),
             render_repositories(&[sample_repository(), sample_fork()]),
         );
-        assert!(text.starts_with("query: geectl\n"));
+        assert!(text.starts_with("query: \"geectl\"\n"));
         assert!(text.contains("pool/systemd"));
         assert!(text.contains("alice/systemd"));
         let empty = with_header(&repo_search_header("nobody"), render_repositories(&[]));
-        assert_eq!(empty, "query: nobody\nno repositories");
+        assert_eq!(empty, "query: \"nobody\"\nno repositories");
+        // A newline in the query cannot forge a second header line:
+        // the header stays one line with the escape visible.
+        let forged = repo_search_header("a\nb");
+        assert_eq!(forged, "query: \"a\\nb\"");
+        assert_eq!(forged.lines().count(), 1);
     }
 
     #[test]
