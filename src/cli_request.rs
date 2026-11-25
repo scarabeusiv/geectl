@@ -59,7 +59,7 @@
 
 use crate::auth::{Credentials, EnvObsAuth};
 use crate::config;
-use crate::debug::Debug;
+use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
@@ -1992,10 +1992,13 @@ fn render_request_text(request: &Request) -> String {
     }
     lines.push(format!("creator: {}", request.creator));
     if let Some(title) = &request.title {
-        lines.push(format!("title: {title}"));
+        lines.push(format!("title: {}", strip_terminal_controls(title)));
     }
     if !request.description.is_empty() {
-        lines.push(format!("description: {}", request.description));
+        lines.push(format!(
+            "description: {}",
+            strip_terminal_controls(&request.description)
+        ));
     }
     if let Some(priority) = request.priority {
         lines.push(format!("priority: {}", priority.as_str()));
@@ -2010,7 +2013,10 @@ fn render_request_text(request: &Request) -> String {
         lines.push(format!("approver: {approver}"));
     }
     if !request.state.comment.is_empty() {
-        lines.push(format!("state comment: {}", request.state.comment));
+        lines.push(format!(
+            "state comment: {}",
+            strip_terminal_controls(&request.state.comment)
+        ));
     }
     for (index, action) in request.actions.iter().enumerate() {
         lines.push(format!("action {}: {}", index + 1, action_text(action)));
@@ -2283,7 +2289,7 @@ fn review_text(index: usize, review: &RequestReview) -> String {
         (None, None) => {}
     }
     if !review.comment.is_empty() {
-        line.push_str(&format!(" — {}", review.comment));
+        line.push_str(&format!(" — {}", strip_terminal_controls(&review.comment)));
     }
     line
 }
@@ -2308,10 +2314,10 @@ fn review_target_text(review: &RequestReview) -> String {
 fn history_text(entry: &RequestHistory) -> String {
     let mut line = format!("{} {}", entry.who, entry.when);
     if !entry.description.is_empty() {
-        line.push_str(&format!(" {}", entry.description));
+        line.push_str(&format!(" {}", strip_terminal_controls(&entry.description)));
     }
     if !entry.comment.is_empty() {
-        line.push_str(&format!(" — {}", entry.comment));
+        line.push_str(&format!(" — {}", strip_terminal_controls(&entry.comment)));
     }
     line
 }
@@ -2764,6 +2770,36 @@ mod tests {
                 "text missing {expected:?}:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn request_text_strips_terminal_controls_from_free_text_fields() {
+        // Free text from the server reaches the terminal through the
+        // request render: escape sequences, carriage returns, bells,
+        // and bidirectional marks are stripped, while newlines
+        // survive. The description is stripped here at the render —
+        // it round-trips to the server on forward, so the parse keeps
+        // it verbatim.
+        let mut request = fixture_request();
+        request.title = Some("ti\u{1b}[2Jtle".to_string());
+        request.description = "de\u{7}sc\nription".to_string();
+        request.state.comment = "st\u{202e}ate".to_string();
+        request.reviews[0].comment = "re\u{1b}]8;;http://x\u{7}view".to_string();
+        request.history[0].description = "hi\u{200e}story".to_string();
+        request.history[0].comment = "co\rmment".to_string();
+        let text = render_request_text(&request);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(!text.contains('\r'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(text.contains("title: ti[2Jtle"), "text: {text}");
+        assert!(text.contains("description: desc\nription"), "text: {text}");
+        assert!(text.contains("state comment: state"), "text: {text}");
+        assert!(text.contains(" — re]8;;http://xview"), "text: {text}");
+        assert!(
+            text.contains("history 1: creator 2010-12-11T00:00:00 history — comment"),
+            "text: {text}"
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ use super::ObsClient;
 use super::SourceUpdate;
 use super::SrFiling;
 use super::SrPayload;
+use crate::debug::strip_terminal_controls;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::xml::xml_escape;
@@ -793,7 +794,13 @@ pub fn parse_request(xml: &str) -> Option<Request> {
                 if title.is_some() {
                     return None;
                 }
-                title = Some(leaf_text(child.inner)?);
+                // Terminal control characters are stripped from the
+                // title: it is submitter text, and the title reaches
+                // the terminal through the request render. The
+                // description below is NOT stripped here — it
+                // round-trips to the server when a request is
+                // forwarded, so it is stripped at the render only.
+                title = Some(strip_terminal_controls(&leaf_text(child.inner)?));
             }
             "description" => {
                 if seen_description {
@@ -1357,7 +1364,9 @@ fn parse_state(element: &Element<'_>) -> Option<RequestStateInfo> {
             return None;
         }
         seen_comment = true;
-        comment = leaf_text(child.inner)?;
+        // Terminal control characters are stripped from the state
+        // comment: reviewer text, rendered to the terminal.
+        comment = strip_terminal_controls(&leaf_text(child.inner)?);
     }
     Some(RequestStateInfo {
         name,
@@ -1393,7 +1402,10 @@ fn parse_review(element: &Element<'_>) -> Option<RequestReview> {
                     return None;
                 }
                 seen_comment = true;
-                comment = leaf_text(child.inner)?;
+                // Terminal control characters are stripped from the
+                // review comment: reviewer text, rendered to the
+                // terminal.
+                comment = strip_terminal_controls(&leaf_text(child.inner)?);
             }
             // A review that was acted on carries one `<history>`
             // child per change (accepted, declined, assigned,
@@ -1437,14 +1449,19 @@ fn parse_request_history(element: &Element<'_>) -> Option<RequestHistory> {
                     return None;
                 }
                 seen_description = true;
-                description = leaf_text(child.inner)?;
+                // Terminal control characters are stripped from the
+                // history description: it is rendered to the
+                // terminal.
+                description = strip_terminal_controls(&leaf_text(child.inner)?);
             }
             "comment" => {
                 if seen_comment {
                     return None;
                 }
                 seen_comment = true;
-                comment = leaf_text(child.inner)?;
+                // Terminal control characters are stripped from the
+                // history comment: it is rendered to the terminal.
+                comment = strip_terminal_controls(&leaf_text(child.inner)?);
             }
             _ => return None,
         }
@@ -6310,6 +6327,24 @@ description</description>
         assert_eq!(request.description, "this is a\nvery long\ndescription");
         assert!(request.reviews.is_empty());
         assert_eq!(parse_request(&request.to_xml()), Some(request));
+    }
+
+    #[test]
+    fn parse_request_strips_terminal_controls_from_free_text_fields() {
+        // Free text from the server is stripped at the parse, so no
+        // downstream surface can print it: escape sequences, bells,
+        // and bidirectional marks go, while newlines survive. The
+        // description is NOT stripped here — it round-trips to the
+        // server when a request is forwarded, so it is stripped at
+        // the render only.
+        let xml = "<request creator=\"creator\" id=\"42\">\n  <action type=\"submit\">\n    <source package=\"bar\" project=\"foo\" rev=\"1\" />\n    <target package=\"bar\" project=\"foobar\" />\n  </action>\n  <state name=\"accepted\" when=\"2010-12-27T01:36:29\" who=\"user1\">\n    <comment>st\u{1b}[2Jate</comment>\n  </state>\n  <review by_group=\"group1\" state=\"new\" when=\"2010-12-28T00:11:22\" who=\"abc\">\n    <comment>re\u{7}view</comment>\n  </review>\n  <history when=\"2010-12-13T13:02:03\" who=\"creator\">\n    <description>hi\u{200e}story</description>\n    <comment>co\u{202e}mment</comment>\n  </history>\n  <title>ti\u{1b}[2Jtle</title>\n  <description>de\u{7}sc\nription</description>\n</request>";
+        let request = parse_request(xml).expect("request parses");
+        assert_eq!(request.title.as_deref(), Some("ti[2Jtle"));
+        assert_eq!(request.state.comment, "st[2Jate");
+        assert_eq!(request.reviews[0].comment, "review");
+        assert_eq!(request.history[0].description, "history");
+        assert_eq!(request.history[0].comment, "comment");
+        assert_eq!(request.description, "de\u{7}sc\nription");
     }
 
     #[test]
