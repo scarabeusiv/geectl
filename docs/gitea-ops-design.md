@@ -377,7 +377,9 @@ Typed package and project meta carry `scmsync: Option<String>`
 (`url#branch`); `validate_scmsync` requires the `#fragment`;
 `create_package` takes an `scmsync` option. Creating a package inside a
 scmsync-managed project is refused upfront; a link starts with the
-source's scmsync dropped.
+source's scmsync dropped. Linking *from* a scmsync-managed source is
+refused upfront in `link_package` instead: the target's own scmsync
+still survives the edit-in-place path.
 
 ## Transport and errors
 

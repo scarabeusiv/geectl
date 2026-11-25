@@ -237,7 +237,9 @@ package (`POST /source/<project>/<package>?cmd=branch`, with the
 nodevelproject and new-package behaviours); `ObsClient::copy_package`
 and `ObsClient::copy_project` copy a package or a whole project
 (`?cmd=copy`); `ObsClient::link_package` links a package by composing
-its meta from the source meta and PUTting a `_link`;
+its meta from the source meta and PUTting a `_link` (a scmsync-managed
+source is refused upfront; the target keeps its own scmsync on the
+edit-in-place path);
 `ObsClient::repair_link` repairs a broken link the same way, by
 editing the `_link` itself — the server repairs links only in its
 commit path, which the working-copy commit takes;
