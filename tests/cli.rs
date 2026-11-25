@@ -1605,6 +1605,61 @@ const SUBMIT_PARENT_REPO_JSON: &str = r#"{"owner": {"login": "pool"}, "name": "r
 /// resolve.
 const SUBMIT_NOFORK_REPO_JSON: &str = r#"{"owner": {"login": "owner"}, "name": "repo", "full_name": "owner/repo", "parent": null, "default_branch": "main", "private": false, "clone_url": "http://127.0.0.1/owner/repo.git", "ssh_url": "gitea@127.0.0.1:owner/repo.git"}"#;
 
+/// A recording Gitea fixture for the build-link comment: every
+/// request is recorded (method, target, body) on the channel, and
+/// the comment POST answers with a canned created comment. Other
+/// paths answer 404. The thread is not joined, like `serve_many`:
+/// by the time the binary exits, every request it made has been
+/// recorded, so draining the channel after the run is exact.
+fn serve_gitea_comments() -> (
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<(String, String, String)>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).to_string();
+            let first = text.lines().next().unwrap_or("");
+            let mut parts = first.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let target = parts.next().unwrap_or("").to_string();
+            let body = text
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .unwrap_or("")
+                .to_string();
+            let _ = tx.send((method, target.clone(), body));
+            let (status, response_body) = if target
+                == "/api/v1/repos/owner/repo/issues/122/comments"
+            {
+                (
+                    "200 OK".to_string(),
+                    r#"{"id": 7, "user": {"login": "scarabeusiv"}, "body": "posted", "created_at": "2026-11-25T20:00:00Z"}"#
+                        .to_string(),
+                )
+            } else {
+                ("404 Not Found".to_string(), String::new())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, rx)
+}
+
 /// A many-shot Gitea fixture for the submit reads: repo bodies by
 /// exact path, and a branch body built from the requested branch
 /// name (the branch parse requires the name to match the request)
@@ -6169,6 +6224,7 @@ fn pull_request_help_lists_the_subcommands() {
         "approve",
         "request-changes",
         "comment",
+        "build-comment",
         "comments",
         "cancel-review-request",
         "merge",
@@ -8605,6 +8661,275 @@ fn build_results_all_instances_merges_two_stub_instances() {
     assert_eq!(
         value["instances"][1]["results"][0]["statuses"][0]["code"],
         "failed"
+    );
+}
+
+/// One resultlist cell for the build-comment serve tests: the
+/// `local` stub instance reports `foo` succeeded in
+/// `standard/x86_64`.
+const BUILD_COMMENT_RESULTS_XML: &str = r#"<resultlist state="aaa"><result project="testproject" repository="standard" arch="x86_64" code="published" state="published"><status package="foo" code="succeeded" /></result></resultlist>"#;
+
+/// The build-comment serve setup: the default (production)
+/// instance has no credentials, so its read fails as that
+/// instance's error without any network; the `local` stub
+/// instance answers the results; the Gitea stub records the
+/// post. Returns the Gitea address and its recorder plus the
+/// temp dir holding the `[instances]` config.
+fn build_comment_setup() -> (
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<(String, String, String)>,
+    TempDir,
+) {
+    let results = serve_many(BUILD_COMMENT_RESULTS_XML);
+    let (gitea, recorded) = serve_gitea_comments();
+    let dir = TempDir::new();
+    let config_dir = dir.0.join("geectl");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!("[instances]\nlocal = \"http://{results}\"\n"),
+    )
+    .unwrap();
+    (gitea, recorded, dir)
+}
+
+fn build_comment_env(
+    cmd: &mut std::process::Command,
+    gitea: std::net::SocketAddr,
+) -> &mut std::process::Command {
+    cmd.env("GEECTL_OBS_URL", "https://api.opensuse.org")
+        .env("GEECTL_OBS_USERNAME_LOCAL", "local-user")
+        .env("GEECTL_OBS_PASSWORD_LOCAL", "local-secret")
+        .env("GEECTL_GITEA_URL", format!("http://{gitea}"))
+        .env("GEECTL_GITEA_TOKEN", "dummy-token")
+        // The default instance must fail on missing credentials, not
+        // find an API key in the ambient environment: strip it, so
+        // the read stays offline and deterministic.
+        .env_remove("GEECTL_OBS_APIKEY")
+        .env_remove("GEECTL_OBS_APIKEY_FILE")
+}
+
+#[test]
+fn pull_request_build_comment_dry_run_plans_and_posts_nothing() {
+    let (gitea, recorded, dir) = build_comment_setup();
+    let link = "https://build.opensuse.org/package/show/testproject/foo";
+    let run = |format: &str| {
+        let mut cmd = geectl_isolated(&dir);
+        cmd.args([
+            "--format",
+            format,
+            "pull-request",
+            "build-comment",
+            "gitea:owner/repo#122",
+            "--project",
+            "testproject",
+            "--package",
+            "foo",
+        ]);
+        build_comment_env(&mut cmd, gitea);
+        cmd.output().unwrap()
+    };
+    let out = run("text");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(stdout.contains(link), "stdout: {stdout}");
+    assert!(
+        stdout.contains("instance: default (https://api.opensuse.org): error:"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("GEECTL_OBS_USERNAME"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("instance: local (http://"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("standard/x86_64: succeeded"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "dry-run: would post the build-link comment on gitea:owner/repo#122 for testproject/foo:"
+        ),
+        "stdout: {stdout}"
+    );
+    // The plan carries the comment post; the Gitea stub saw nothing.
+    let out = run("json");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["link"], link);
+    assert_eq!(value["comment"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert!(
+        plan.iter().any(|line| line
+            .as_str()
+            .unwrap()
+            .contains("comment on pull request owner/repo#122")),
+        "plan: {plan:?}"
+    );
+    assert!(
+        recorded.try_iter().next().is_none(),
+        "dry-run posted to Gitea"
+    );
+}
+
+#[test]
+fn pull_request_build_comment_live_posts_once() {
+    let (gitea, recorded, dir) = build_comment_setup();
+    let link = "https://build.opensuse.org/package/show/testproject/foo";
+    let mut cmd = geectl_isolated(&dir);
+    cmd.args([
+        "--live",
+        "--format",
+        "text",
+        "pull-request",
+        "build-comment",
+        "gitea:owner/repo#122",
+        "--project",
+        "testproject",
+        "--package",
+        "foo",
+    ]);
+    build_comment_env(&mut cmd, gitea);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains(
+            "posted the build-link comment on gitea:owner/repo#122 (comment 7 by scarabeusiv) for testproject/foo:"
+        ),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains(link), "stdout: {stdout}");
+    let requests: Vec<_> = recorded.try_iter().collect();
+    assert_eq!(requests.len(), 1, "live posts exactly once: {requests:?}");
+    let (method, target, body) = &requests[0];
+    assert_eq!(method, "POST");
+    assert_eq!(target, "/api/v1/repos/owner/repo/issues/122/comments");
+    let posted: serde_json::Value = serde_json::from_str(body).unwrap();
+    let comment = posted["body"].as_str().unwrap();
+    assert!(comment.contains(link), "posted body: {comment}");
+    assert!(
+        comment.contains("instance: default (https://api.opensuse.org): error:"),
+        "posted body: {comment}"
+    );
+    assert!(
+        comment.contains("standard/x86_64: succeeded"),
+        "posted body: {comment}"
+    );
+}
+
+#[test]
+fn pull_request_build_comment_refuses_an_obs_reference() {
+    // The refusal happens before any credential resolution, so no
+    // servers and no credentials are needed.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "build-comment",
+            "obs:123",
+            "--project",
+            "testproject",
+            "--package",
+            "foo",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("OBS submit request"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn pull_request_build_comment_refuses_a_non_production_host() {
+    // The stub stands in for a non-production OBS: the link forms
+    // before the results read, so the stub answers nothing and the
+    // Gitea stub sees no post.
+    let results = serve_many(BUILD_COMMENT_RESULTS_XML);
+    let (gitea, recorded) = serve_gitea_comments();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "build-comment",
+            "gitea:owner/repo#122",
+            "--project",
+            "testproject",
+            "--package",
+            "foo",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{results}"))
+        .env("GEECTL_OBS_USERNAME", "stub-user")
+        .env("GEECTL_OBS_PASSWORD", "stub-secret")
+        .env("GEECTL_GITEA_URL", format!("http://{gitea}"))
+        .env("GEECTL_GITEA_TOKEN", "dummy-token")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("api.opensuse.org"), "stderr: {stderr}");
+    assert!(stderr.contains(&format!("{results}")), "stderr: {stderr}");
+    assert!(
+        recorded.try_iter().next().is_none(),
+        "a refused host posts nothing"
+    );
+}
+
+#[test]
+fn pull_request_build_comment_without_credentials_fails_with_config_error() {
+    // One configured instance only, no credentials: the merged read
+    // reports that instance's own failure unchanged — no comment is
+    // posted, and the Gitea client is never built.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "build-comment",
+            "gitea:owner/repo#122",
+            "--project",
+            "testproject",
+            "--package",
+            "foo",
+        ])
+        .env_remove("GEECTL_OBS_APIKEY")
+        .env_remove("GEECTL_OBS_APIKEY_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "config_error");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("GEECTL_OBS_USERNAME"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

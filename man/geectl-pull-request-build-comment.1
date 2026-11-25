@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-build-comment 1  "geectl-pull-request-build-comment 0.2.2" 
+.SH NAME
+geectl\-pull\-request\-build\-comment \- Post the build\-link comment on a Gitea pull request: the OBS build results for the test project and package, as a link plus a one\-line per\-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry\-run by default; mutates only with `\-\-live`
+.SH SYNOPSIS
+\fBgeectl pull\-request build\-comment\fR [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> <\fIREFERENCE\fR> 
+.SH DESCRIPTION
+Post the build\-link comment on a Gitea pull request: the OBS build results for the test project and package, as a link plus a one\-line per\-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry\-run by default; mutates only with `\-\-live`
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The test project the build results are read from
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package in the test project
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREFERENCE\fR>
+The pull\-request handle: `gitea:<owner>/<repo>#<number>`. An OBS handle is refused: the build link belongs on the Gitea pull request
+.SH VERSION
+v0.2.2

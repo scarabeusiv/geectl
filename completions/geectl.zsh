@@ -2894,6 +2894,19 @@ _arguments "${_arguments_options[@]}" : \
 ':reference -- The pull-request handle\: `obs\:<id>` or `gitea\:<owner>/<repo>#<number>`:_default' \
 && ret=0
 ;;
+(build-comment)
+_arguments "${_arguments_options[@]}" : \
+'--project=[The test project the build results are read from]:PROJECT:_default' \
+'--package=[The package in the test project]:PACKAGE:_default' \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':reference -- The pull-request handle\: `gitea\:<owner>/<repo>#<number>`. An OBS handle is refused\: the build link belongs on the Gitea pull request:_default' \
+&& ret=0
+;;
 (comments)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
@@ -3022,6 +3035,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (comment)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(build-comment)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -4175,6 +4192,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (comment)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(build-comment)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -5596,6 +5617,7 @@ _geectl__subcmd__help__subcmd__pull-request_commands() {
 'approve:Approve a pull request as the review asked of the target\: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry-run by default; mutates only with \`--live\`' \
 'request-changes:Ask for changes on a pull request, as \`approve\` but with the review declined instead of accepted. Dry-run by default; mutates only with \`--live\`' \
 'comment:Comment on a pull request. Dry-run by default; mutates only with \`--live\`' \
+'build-comment:Post the build-link comment on a Gitea pull request\: the OBS build results for the test project and package, as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry-run by default; mutates only with \`--live\`' \
 'comments:List the comments on a pull request, oldest first. A read, always live' \
 'cancel-review-request:Cancel pending review requests on a pull request. Dry-run by default; mutates only with \`--live\`. On OBS the cancel fails closed' \
 'merge:Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless \`--no-forward\` is given. The forwarded request'\''s \`.changes\` entry is the original description on the OBS arm and the pull request'\''s text on the Gitea arm, overridable with \`-m\` / \`--forward-message\`. Dry-run by default; mutates only with \`--live\`' \
@@ -5610,6 +5632,11 @@ _geectl__subcmd__help__subcmd__pull-request_commands() {
 _geectl__subcmd__help__subcmd__pull-request__subcmd__approve_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help pull-request approve commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__pull-request__subcmd__build-comment_commands] )) ||
+_geectl__subcmd__help__subcmd__pull-request__subcmd__build-comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help pull-request build-comment commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__pull-request__subcmd__cancel-review-request_commands] )) ||
 _geectl__subcmd__help__subcmd__pull-request__subcmd__cancel-review-request_commands() {
@@ -6471,6 +6498,7 @@ _geectl__subcmd__pull-request_commands() {
 'approve:Approve a pull request as the review asked of the target\: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry-run by default; mutates only with \`--live\`' \
 'request-changes:Ask for changes on a pull request, as \`approve\` but with the review declined instead of accepted. Dry-run by default; mutates only with \`--live\`' \
 'comment:Comment on a pull request. Dry-run by default; mutates only with \`--live\`' \
+'build-comment:Post the build-link comment on a Gitea pull request\: the OBS build results for the test project and package, as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry-run by default; mutates only with \`--live\`' \
 'comments:List the comments on a pull request, oldest first. A read, always live' \
 'cancel-review-request:Cancel pending review requests on a pull request. Dry-run by default; mutates only with \`--live\`. On OBS the cancel fails closed' \
 'merge:Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless \`--no-forward\` is given. The forwarded request'\''s \`.changes\` entry is the original description on the OBS arm and the pull request'\''s text on the Gitea arm, overridable with \`-m\` / \`--forward-message\`. Dry-run by default; mutates only with \`--live\`' \
@@ -6486,6 +6514,11 @@ _geectl__subcmd__pull-request_commands() {
 _geectl__subcmd__pull-request__subcmd__approve_commands() {
     local commands; commands=()
     _describe -t commands 'geectl pull-request approve commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__pull-request__subcmd__build-comment_commands] )) ||
+_geectl__subcmd__pull-request__subcmd__build-comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl pull-request build-comment commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__pull-request__subcmd__cancel-review-request_commands] )) ||
 _geectl__subcmd__pull-request__subcmd__cancel-review-request_commands() {
@@ -6515,6 +6548,7 @@ _geectl__subcmd__pull-request__subcmd__help_commands() {
 'approve:Approve a pull request as the review asked of the target\: with no target flag, as the review asked of the acting user (OBS) or the token owner (Gitea). Dry-run by default; mutates only with \`--live\`' \
 'request-changes:Ask for changes on a pull request, as \`approve\` but with the review declined instead of accepted. Dry-run by default; mutates only with \`--live\`' \
 'comment:Comment on a pull request. Dry-run by default; mutates only with \`--live\`' \
+'build-comment:Post the build-link comment on a Gitea pull request\: the OBS build results for the test project and package, as a link plus a one-line per-instance summary. The comment is posted once, on PR opening; there is no polling, no live update, and no edit. Dry-run by default; mutates only with \`--live\`' \
 'comments:List the comments on a pull request, oldest first. A read, always live' \
 'cancel-review-request:Cancel pending review requests on a pull request. Dry-run by default; mutates only with \`--live\`. On OBS the cancel fails closed' \
 'merge:Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless \`--no-forward\` is given. The forwarded request'\''s \`.changes\` entry is the original description on the OBS arm and the pull request'\''s text on the Gitea arm, overridable with \`-m\` / \`--forward-message\`. Dry-run by default; mutates only with \`--live\`' \
@@ -6530,6 +6564,11 @@ _geectl__subcmd__pull-request__subcmd__help_commands() {
 _geectl__subcmd__pull-request__subcmd__help__subcmd__approve_commands() {
     local commands; commands=()
     _describe -t commands 'geectl pull-request help approve commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__pull-request__subcmd__help__subcmd__build-comment_commands] )) ||
+_geectl__subcmd__pull-request__subcmd__help__subcmd__build-comment_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl pull-request help build-comment commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__pull-request__subcmd__help__subcmd__cancel-review-request_commands] )) ||
 _geectl__subcmd__pull-request__subcmd__help__subcmd__cancel-review-request_commands() {

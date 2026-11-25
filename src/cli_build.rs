@@ -1657,7 +1657,7 @@ fn write_downloaded(output: &PathBuf, bytes: &[u8]) -> Result<(), GeectlError> {
 /// The configured OBS base URL and the config file's `[instances]`
 /// table, for credential resolution (see
 /// [`auth::resolve_obs_for_url`]).
-fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
+pub(crate) fn obs_endpoint() -> Result<(String, Vec<(String, String)>), GeectlError> {
     let path = config::config_path()?;
     let file_config = config::load_config_at(&path)?;
     let effective = config::effective_config(&file_config)?;
@@ -1850,26 +1850,24 @@ fn merged_endpoints(
     Ok(endpoints)
 }
 
-/// The merged build-results view for `results --all-instances`:
-/// one read per configured instance, each with that instance's own
-/// credentials, merged into one view. A per-instance failure is
-/// recorded for that instance and rendered next to the other
-/// instances' results, never dropped silently. Every instance
-/// failing is an error: there is no view to show — a single
-/// configured instance reports its own failure unchanged. A single
-/// configured instance that succeeds still renders the merged
-/// shape (one `instance:` section in text, one entry in the
-/// payload's `instances` array), so the flag changes the view even
-/// then; only the failure is identical to the plain read.
-fn results_all_instances(
+/// Read the build results for `project` from every configured
+/// instance, in view order: the configured (default) instance
+/// first, then the `[instances]` table. One read per endpoint,
+/// each with that instance's own credentials; a per-instance
+/// failure is recorded for that instance and returned with the
+/// others, never dropped. Every instance failing is an error:
+/// there is no view to show — a single configured instance
+/// reports its own failure unchanged. Shared by `results
+/// --all-instances` and the build-link comment, so the two reads
+/// never drift apart.
+pub(crate) fn read_results_across_instances(
     http: &UreqClient,
     debug: &Debug,
     base: &str,
     instances: &[(String, String)],
     project: &str,
     query: &ResultsQuery,
-    header: &str,
-) -> Result<(Value, String), GeectlError> {
+) -> Result<Vec<InstanceBuildResults>, GeectlError> {
     let endpoints = merged_endpoints(base, instances)?;
     let refs: Vec<(&str, &str)> = endpoints
         .iter()
@@ -1902,6 +1900,30 @@ fn results_all_instances(
             format!("build results failed on every configured instance: {detail}"),
         ));
     }
+    Ok(outcomes)
+}
+
+/// The merged build-results view for `results --all-instances`:
+/// one read per configured instance, each with that instance's own
+/// credentials, merged into one view. A per-instance failure is
+/// recorded for that instance and rendered next to the other
+/// instances' results, never dropped silently. Every instance
+/// failing is an error: there is no view to show — a single
+/// configured instance reports its own failure unchanged. A single
+/// configured instance that succeeds still renders the merged
+/// shape (one `instance:` section in text, one entry in the
+/// payload's `instances` array), so the flag changes the view even
+/// then; only the failure is identical to the plain read.
+fn results_all_instances(
+    http: &UreqClient,
+    debug: &Debug,
+    base: &str,
+    instances: &[(String, String)],
+    project: &str,
+    query: &ResultsQuery,
+    header: &str,
+) -> Result<(Value, String), GeectlError> {
+    let outcomes = read_results_across_instances(http, debug, base, instances, project, query)?;
     Ok((
         merged_results_payload(project, &outcomes),
         with_header(header, render_merged_results_text(&outcomes)),
