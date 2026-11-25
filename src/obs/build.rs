@@ -663,9 +663,10 @@ pub struct BuildDep {
     /// it, not the binary name: a subpackage binary (`libz1`) lives
     /// under its source package (`zlib`), and listing by the binary
     /// name 404s, like the download: the binary name is not a
-    /// package. Absent, the whole repository is listed instead
-    /// (`_repository`) — the server did not say where the binary
-    /// comes from, so no package segment can be assumed.
+    /// package. Absent, the file name must come from version,
+    /// release and arch instead — without those too the build
+    /// fails loudly rather than listing the whole repository;
+    /// the download URL falls back to the `_repository` segment.
     pub package: Option<String>,
     /// The binary file name (`name-version-release.arch.rpm`), if the
     /// server said. Without it the caller resolves the file name from

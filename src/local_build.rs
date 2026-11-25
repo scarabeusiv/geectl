@@ -2952,10 +2952,11 @@ impl<'a> LocalBuild<'a> {
     /// The list is of the source package (`dep.package`), never
     /// the binary name: a subpackage binary (`libz1`) lives under
     /// its source package (`zlib`), and listing by the binary name
-    /// 404s (the binary name is not a package). Without a source package the
-    /// whole repository is listed (`_repository`) — the server did
-    /// not say where the binary comes from, so no package segment
-    /// can be assumed.
+    /// 404s (the binary name is not a package). Without a source
+    /// package there is no list to ask for — the whole repository
+    /// is never listed — so the build fails loudly, naming what
+    /// the buildinfo `<bdep>` must carry instead (version, release
+    /// and arch, or a `package` attribute).
     fn resolve_dep_filename(
         &self,
         req: &BuildRequest,
@@ -2969,7 +2970,15 @@ impl<'a> LocalBuild<'a> {
             return Ok(format!("{}-{version}-{release}.{arch}.rpm", dep.name));
         }
         let project = dep.project.as_deref().unwrap_or(req.fetch_project());
-        let package = dep.package.as_deref().unwrap_or("_repository");
+        let Some(package) = dep.package.as_deref().filter(|p| !p.is_empty()) else {
+            return Err(GeectlError::new(
+                ErrorKind::ServerError,
+                format!(
+                    "cannot resolve a binary file for dependency {} (project {project}): the buildinfo <bdep> carries neither version, release and arch nor a source package; supply version+release+arch, or a `package` attribute naming the source package",
+                    dep.name
+                ),
+            ));
+        };
         let files = self.obs.list_binaries(
             project,
             Some(package),
@@ -9310,7 +9319,7 @@ exit 0
                 <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\"/>\
                 <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\"/>\
                 <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\"/>\
-                <bdep name=\"helper\" project=\"testproject\" repository=\"standard\"/>\
+                <bdep name=\"helper\" project=\"testproject\" repository=\"standard\" package=\"helper\"/>\
                 </buildinfo>",
                 arch = host_arch()
             )
@@ -9372,7 +9381,7 @@ exit 0
             <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\" vminstall=\"1\" installonly=\"1\"/>\
             <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\" noinstall=\"1\"/>\
             <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\" runscripts=\"1\"/>\
-            <bdep name=\"helper\" project=\"testproject\" repository=\"standard\"/>\
+            <bdep name=\"helper\" project=\"testproject\" repository=\"standard\" package=\"helper\"/>\
             <preinstallimage project=\"testproject\" repository=\"standard\" package=\"_preinstallimage\" filename=\"_preinstallimage.abc123\" hdrmd5=\"abc123\"><binary>glibc</binary><binary>pre</binary></preinstallimage>\
             </buildinfo>",
             arch = host_arch()
@@ -9398,7 +9407,7 @@ exit 0
             <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\" vminstall=\"1\" installonly=\"1\"/>\
             <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\" noinstall=\"1\"/>\
             <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\" runscripts=\"1\"/>\
-            <bdep name=\"helper\" project=\"testproject\" repository=\"standard\"/>\
+            <bdep name=\"helper\" project=\"testproject\" repository=\"standard\" package=\"helper\"/>\
             <preinstallimage project=\"testproject\" repository=\"standard\" package=\"_preinstallimage\" filename=\"_preinstallimage.abc123\" hdrmd5=\"abc123\"><binary>glibc</binary><binary>pre</binary><binary>bad name</binary><binary>a&amp;b</binary><binary>a&lt;b</binary></preinstallimage>\
             </buildinfo>",
             arch = host_arch()
@@ -9409,7 +9418,7 @@ exit 0
         /// token: the source line falls back to the file name.
         fn buildinfo_with_bad_digest_image() -> String {
             format!(
-            "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\n            <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\" vminstall=\"1\" installonly=\"1\"/>\n            <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\" noinstall=\"1\"/>\n            <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\" runscripts=\"1\"/>\n            <bdep name=\"helper\" project=\"testproject\" repository=\"standard\"/>\n            <preinstallimage project=\"testproject\" repository=\"standard\" package=\"_preinstallimage\" filename=\"_preinstallimage.abc123\" hdrmd5=\"bad digest\"><binary>glibc</binary><binary>pre</binary></preinstallimage>\n            </buildinfo>",
+            "<buildinfo project=\"testproject\" repository=\"standard\" package=\"foo\" arch=\"{arch}\">\n            <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\" vminstall=\"1\" installonly=\"1\"/>\n            <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\" noinstall=\"1\"/>\n            <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\" runscripts=\"1\"/>\n            <bdep name=\"helper\" project=\"testproject\" repository=\"standard\" package=\"helper\"/>\n            <preinstallimage project=\"testproject\" repository=\"standard\" package=\"_preinstallimage\" filename=\"_preinstallimage.abc123\" hdrmd5=\"bad digest\"><binary>glibc</binary><binary>pre</binary></preinstallimage>\n            </buildinfo>",
                 arch = host_arch()
             )
         }
@@ -9471,7 +9480,7 @@ exit 0
                     )
                     .with_get(
                         &format!(
-                            "https://api.opensuse.org/build/testproject/standard/{arch}/_repository"
+                            "https://api.opensuse.org/build/testproject/standard/{arch}/helper"
                         ),
                         &format!(
                             "<binarylist><binary filename=\"helper-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/><binary filename=\"helper-debuginfo-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/></binarylist>"
@@ -9479,7 +9488,7 @@ exit 0
                     )
                     .with_get_bytes(
                         &format!(
-                            "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/helper-1.0-1.{arch}.rpm"
+                            "https://api.opensuse.org/build/testproject/standard/{arch}/helper/helper-1.0-1.{arch}.rpm"
                         ),
                         b"fake helper rpm",
                     );
@@ -9951,7 +9960,7 @@ exit 0
                 )
                 .with_get(
                     &format!(
-                        "https://api.opensuse.org/build/testproject/standard/{arch}/_repository"
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/helper"
                     ),
                     &format!(
                         "<binarylist><binary filename=\"helper-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/><binary filename=\"helper-debuginfo-1.0-1.{arch}.rpm\" size=\"10\" mtime=\"1\"/></binarylist>"
@@ -9959,7 +9968,7 @@ exit 0
                 )
                 .with_get_bytes(
                     &format!(
-                        "https://api.opensuse.org/build/testproject/standard/{arch}/_repository/helper-1.0-1.{arch}.rpm"
+                        "https://api.opensuse.org/build/testproject/standard/{arch}/helper/helper-1.0-1.{arch}.rpm"
                     ),
                     b"fake helper rpm",
                 );
@@ -10049,7 +10058,7 @@ exit 0
                 <bdep name=\"glibc\" project=\"testproject\" repository=\"standard\" binary=\"glibc-2.38-1.{arch}.rpm\" hdrmd5=\"{digest}\"/>\
                 <bdep name=\"ownpkg\" project=\"home:scarabeus_iv\" repository=\"standard\" binary=\"ownpkg-1.0-1.{arch}.rpm\"/>\
                 <bdep name=\"pre\" project=\"testproject\" repository=\"standard\" binary=\"pre-1.0-1.{arch}.rpm\" preinstall=\"1\"/>\
-                <bdep name=\"helper\" project=\"testproject\" repository=\"standard\"/>\
+                <bdep name=\"helper\" project=\"testproject\" repository=\"standard\" package=\"helper\"/>\
                 </buildinfo>"
             )
         }
@@ -10093,7 +10102,7 @@ exit 0
                 )
                 .with_get(
                     &format!(
-                        "https://api.opensuse.org/build/testproject/standard/{}/_repository",
+                        "https://api.opensuse.org/build/testproject/standard/{}/helper",
                         host_arch()
                     ),
                     &format!(
@@ -10104,7 +10113,7 @@ exit 0
                 )
                 .with_get_bytes(
                     &format!(
-                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/helper-1.0-1.{}.rpm",
+                        "https://api.opensuse.org/build/testproject/standard/{}/helper/helper-1.0-1.{}.rpm",
                         host_arch(),
                         host_arch()
                     ),
@@ -10171,7 +10180,7 @@ exit 0
                 )
                 .with_get(
                     &format!(
-                        "https://api.opensuse.org/build/testproject/standard/{}/_repository",
+                        "https://api.opensuse.org/build/testproject/standard/{}/helper",
                         host_arch()
                     ),
                     &format!(
@@ -10182,7 +10191,7 @@ exit 0
                 )
                 .with_get_bytes(
                     &format!(
-                        "https://api.opensuse.org/build/testproject/standard/{}/_repository/helper-1.0-1.{}.rpm",
+                        "https://api.opensuse.org/build/testproject/standard/{}/helper/helper-1.0-1.{}.rpm",
                         host_arch(),
                         host_arch()
                     ),
@@ -13648,15 +13657,15 @@ exit 0
             // A package that builds subpackages: the binary list
             // carries helper, helper-devel and helper-lang, plus a
             // source RPM — only the exact package name resolves.
-            // No source package was sent, so the whole repository
-            // is listed (`_repository`): the list must not assume
-            // the binary name is the package.
+            // The source package is sent, so its own binary list
+            // resolves it: the list must not assume the binary
+            // name is the package.
             let dir = TempDir::new();
             let (engine, _) = stub_engine(dir.path());
             let (podman, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new().with_get(
                 &format!(
-                    "https://api.opensuse.org/build/testproject/standard/{}/_repository",
+                    "https://api.opensuse.org/build/testproject/standard/{}/helper",
                     host_arch()
                 ),
                 &format!(
@@ -13676,7 +13685,7 @@ exit 0
                 name: "helper".to_string(),
                 project: Some("testproject".to_string()),
                 repository: None,
-                package: None,
+                package: Some("helper".to_string()),
                 binary: None,
                 version: None,
                 release: None,
@@ -16630,14 +16639,14 @@ exit 0
         fn resolve_dep_filename_falls_back_to_the_list_for_empty_version() {
             // An empty attribute is no attribute: `version=""`
             // must not compute `name--.arch.rpm` and 404 the
-            // download — the binary list of the whole repository
+            // download — the binary list of the source package
             // resolves it instead, exactly like a missing one.
             let dir = TempDir::new();
             let (engine, _) = stub_engine(dir.path());
             let (podman, _) = stub_podman(dir.path(), true);
             let http = FakeHttp::new().with_get(
                 &format!(
-                    "https://api.opensuse.org/build/testproject/standard/{}/_repository",
+                    "https://api.opensuse.org/build/testproject/standard/{}/helper",
                     host_arch()
                 ),
                 &format!(
@@ -16657,7 +16666,7 @@ exit 0
                 name: "helper".to_string(),
                 project: Some("testproject".to_string()),
                 repository: None,
-                package: None,
+                package: Some("helper".to_string()),
                 binary: None,
                 version: Some(String::new()),
                 release: Some(String::new()),
@@ -16681,7 +16690,7 @@ exit 0
                 name: "helper".to_string(),
                 project: Some("testproject".to_string()),
                 repository: None,
-                package: None,
+                package: Some("helper".to_string()),
                 binary: None,
                 version: Some("1.0".to_string()),
                 release: Some(String::new()),
@@ -16698,6 +16707,62 @@ exit 0
             };
             let filename = vertical.resolve_dep_filename(&req, &dep).unwrap();
             assert_eq!(filename, format!("helper-1.0-1.{}.rpm", host_arch()));
+        }
+
+        #[test]
+        fn resolve_dep_filename_bare_dep_fails_loudly() {
+            // A dep with neither version/release/arch nor a source
+            // package must not fall back to listing the whole
+            // repository (`_repository`): the build fails loudly,
+            // naming what the buildinfo `<bdep>` must carry instead.
+            // No HTTP is canned: the failure must fire before any
+            // listing is attempted.
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let http = FakeHttp::new();
+            let client = client_with(&http);
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let req = BuildRequest::new(
+                dir.path().join("source"),
+                "testproject",
+                "standard",
+                host_arch(),
+            );
+            let dep = BuildDep {
+                name: "helper".to_string(),
+                project: Some("testproject".to_string()),
+                repository: None,
+                package: None,
+                binary: None,
+                version: None,
+                release: None,
+                arch: None,
+                epoch: None,
+                hdrmd5: None,
+                preinstall: false,
+                vminstall: false,
+                runscripts: false,
+                noinstall: false,
+                repoarch: None,
+                installonly: false,
+                sysroot: false,
+            };
+            let err = vertical.resolve_dep_filename(&req, &dep).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError, "got: {err}");
+            let err = err.to_string();
+            assert!(err.contains("helper"), "got: {err}");
+            assert!(err.contains("version"), "got: {err}");
+            assert!(err.contains("release"), "got: {err}");
+            assert!(err.contains("arch"), "got: {err}");
+            assert!(err.contains("package"), "got: {err}");
+            // An empty source package is no source package either.
+            let dep = BuildDep {
+                package: Some(String::new()),
+                ..dep
+            };
+            let err = vertical.resolve_dep_filename(&req, &dep).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ServerError, "got: {err}");
         }
 
         /// A single-dep buildinfo carrying an hdrmd5, with the dep's
