@@ -3785,9 +3785,6 @@ impl<'a> ObsClient<'a> {
             }
         }
         Ok(owners)
-    }            }
-        }
-        Ok(owners)
     }
 
     /// List the projects whose scmsync URL starts with `url_prefix`
@@ -12997,7 +12994,7 @@ mod tests {
             "<person><login>Admin</login><email>ad\u{1b}[2Jmin@example.com</email><realname>Ad\u{7}min\u{202e} User</realname><state>confirmed</state></person>",
         )
         .unwrap();
-        assert_eq!(person.email, "ad[2Jmin@example.com");
+        assert_eq!(person.email.as_deref(), Some("ad[2Jmin@example.com"));
         assert_eq!(person.realname.as_deref(), Some("Admin User"));
     }
 

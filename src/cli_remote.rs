@@ -7831,7 +7831,7 @@ mod tests {
         // the stored name.
         let person = Person {
             login: "alice".to_string(),
-            email: "alice\u{1b}[2J@example.com".to_string(),
+            email: Some("alice\u{1b}[2J@example.com".to_string()),
             realname: Some("Al\u{7}ice\u{202e}".to_string()),
             state: "confirmed".to_string(),
         };

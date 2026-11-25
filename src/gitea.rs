@@ -3789,15 +3789,6 @@ impl<'a> GiteaClient<'a> {
                     dry_run,
                     std::time::Duration::from_secs(30),
                 )?
-=======
-                self.ensure_branch_target_project(
-                    obs,
-                    target,
-                    &title,
-                    &description,
-                    dry_run,
-                    std::time::Duration::from_secs(30),
-                )?
             }
             None => false,
         };
