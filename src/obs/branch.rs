@@ -1,4 +1,5 @@
 use super::build_url;
+use super::element_text;
 use super::parse_directory;
 use super::parse_directory_rev;
 use super::parse_linkinfo;
@@ -22,6 +23,7 @@ use super::ObsClient;
 use crate::auth::Credentials;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
+use crate::xml::find_attr;
 use crate::xml::xml_escape;
 use crate::xml::XmlDoc;
 
@@ -1242,7 +1244,13 @@ impl<'a> ObsClient<'a> {
     /// The meta is PUT back only when the edit changes it, and the
     /// link is refused when the target already has one unless `force`
     /// is set — the refusal happens before anything is written, so a
-    /// refused link leaves no half-done meta behind. A target package
+    /// refused link leaves no half-done meta behind. A scmsync-managed
+    /// source is refused the same way, before anything is written: the
+    /// server rejects the client-side link flow from such a source, so
+    /// the refusal names the source and its scmsync URL instead of
+    /// letting the meta PUT fail. The refusal is live-only: in dry-run
+    /// the link is recorded in the plan without reading the source,
+    /// like `copy_package_to_instance`. A target package
     /// that only exists through a project link does not count as
     /// having a link: the shadowed meta's project differs from the
     /// target project, so the link is created explicitly (and the
@@ -1296,6 +1304,27 @@ impl<'a> ObsClient<'a> {
             &[],
         );
         let source_meta = self.http.get_with(&source_url, &self.credentials)?;
+        // A scmsync-managed source is generated from git, and the
+        // server rejects the client-side link flow from such a
+        // source ("Can not change files in SCM bridged packages and
+        // projects") — so refuse it upfront with the reason
+        // instead of letting the meta PUT fail. The refusal is
+        // about the source only: the target keeps its own scmsync
+        // on the edit-in-place path below. The element carries the
+        // URL as text content or as a url attribute; either shape
+        // refuses.
+        let source_doc = XmlDoc::parse(&source_meta)?;
+        if let Some(scmsync) = source_doc.child("scmsync") {
+            let url = find_attr(&scmsync, "url")
+                .or_else(|| element_text(&scmsync, "scmsync"))
+                .unwrap_or_default();
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot link {source_project}/{source_package} to {target_project}/{target_package}: it is scmsync-managed (syncs from {url})"
+                ),
+            ));
+        }
         let target_url = build_url(
             &self.base,
             &["source", target_project, target_package, "_meta"],
@@ -3444,7 +3473,7 @@ mod tests {
 
     #[test]
     fn link_package_creates_link_from_source_meta() {
-        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/><person userid=\"alice\" role=\"maintainer\"/><lock><enable/></lock><scmsync url=\"https://example.com#main\"/></package>";
+        let source_meta = "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><description>A test package</description><devel project=\"test:devel\"/><person userid=\"alice\" role=\"maintainer\"/><lock><enable/></lock></package>";
         let http = FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
@@ -3474,7 +3503,7 @@ mod tests {
             )
             .is_ok());
         // The meta PUT comes first (built from the source meta, with
-        // the devel, person, lock, and scmsync entries stripped),
+        // the devel, person, and lock entries stripped),
         // then the _link PUT.
         let puts = http.put_calls();
         assert_eq!(puts.len(), 2);
@@ -3488,6 +3517,85 @@ mod tests {
         );
         assert!(puts[0].2 && puts[1].2);
         assert_eq!(http.get_calls().len(), 2);
+    }
+
+    #[test]
+    fn link_package_refuses_scmsync_source() {
+        // A scmsync-managed source is refused in both shapes the
+        // element carries the URL in: as text content, and as a url
+        // attribute. Only the source meta is read: the target is
+        // never touched and nothing is PUT.
+        for (label, source_meta) in [
+            (
+                "text",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><scmsync>https://example.com#main</scmsync></package>",
+            ),
+            (
+                "attribute",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><scmsync url=\"https://example.com#main\"/></package>",
+            ),
+        ] {
+            let http = FakeHttp::new().with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                source_meta,
+            );
+            let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+            let err = client
+                .link_package(
+                    "test:factory",
+                    "test-pkgA",
+                    "test:target",
+                    "test-pkgA",
+                    &LinkOptions::default(),
+                    &DryRun::new(false),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "case {label}");
+            assert!(
+                err.to_string().contains("test:factory/test-pkgA"),
+                "case {label}: {err}"
+            );
+            assert!(
+                err.to_string().contains("https://example.com#main"),
+                "case {label}: {err}"
+            );
+            assert_eq!(http.get_calls().len(), 1, "case {label}");
+            assert!(http.put_calls().is_empty(), "case {label}");
+        }
+    }
+
+    #[test]
+    fn link_package_dry_run_does_not_read_scmsync_source() {
+        // The refusal is live-only: the dry-run guard runs before
+        // the source meta is read, like copy_package_to_instance and
+        // the existing-link refusal — a dry-run needs neither
+        // credentials nor a server. Even with a scmsync source
+        // stubbed, the dry-run records the plan and reads nothing.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+            "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test</title><scmsync>https://example.com#main</scmsync></package>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry_run = DryRun::new(true);
+        assert!(client
+            .link_package(
+                "test:factory",
+                "test-pkgA",
+                "test:target",
+                "test-pkgA",
+                &LinkOptions::default(),
+                &dry_run,
+            )
+            .is_ok());
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: link package test:factory/test-pkgA to test:target/test-pkgA"
+                    .to_string()
+            ]
+        );
+        assert!(http.get_calls().is_empty());
+        assert!(http.put_calls().is_empty());
     }
 
     #[test]
