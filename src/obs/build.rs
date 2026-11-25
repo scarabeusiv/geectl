@@ -3391,7 +3391,8 @@ impl<'a> ObsClient<'a> {
     /// `all` combines with no status filter: osc silently drops
     /// `--all` when a filter is given, geectl refuses the
     /// combination instead. Each status filter is its own request,
-    /// in the order given, like osc.
+    /// in the order given, like osc. The batch stops at the first
+    /// failing code; later codes are not attempted.
     ///
     /// Success is the `<status code="ok"/>` body; any other body
     /// is a server error, never success.
