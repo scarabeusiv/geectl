@@ -1,5 +1,6 @@
 use super::build_url;
 use super::parse_status_ok;
+use super::remote::is_md5;
 use super::single_element_text;
 use super::valid_obs_filename;
 use super::valid_obs_name;
@@ -1072,9 +1073,16 @@ pub(crate) fn parse_build_history(body: &str) -> Result<Vec<BuildHistoryEntry>, 
                 )
             })
         };
+        // The srcmd5 is a checksum, not free text: a value that is
+        // not exactly 32 hex digits is malformed, not a history
+        // entry to record.
+        let srcmd5 = required("srcmd5")?;
+        if !is_md5(&srcmd5) {
+            return Err(malformed());
+        }
         entries.push(BuildHistoryEntry {
             rev: required("rev")?,
-            srcmd5: required("srcmd5")?,
+            srcmd5,
             versrel: required("versrel")?,
             bcnt: xml_attr_number_required(tag, "bcnt")?,
             time: xml_attr_number_required(tag, "time")?,
@@ -5607,12 +5615,12 @@ mod tests {
     #[test]
     fn parse_build_history_reads_entries() {
         let parsed = parse_build_history(
-            "<buildhistory><entry rev=\"2\" srcmd5=\"def\" versrel=\"1.0-1\" bcnt=\"1\" time=\"1699900000\"/><entry rev=\"3\" srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\" duration=\"120\"/></buildhistory>",
+            "<buildhistory><entry rev=\"2\" srcmd5=\"dddddddddddddddddddddddddddddddd\" versrel=\"1.0-1\" bcnt=\"1\" time=\"1699900000\"/><entry rev=\"3\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\" duration=\"120\"/></buildhistory>",
         )
         .unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].rev, "3");
-        assert_eq!(parsed[0].srcmd5, "abc");
+        assert_eq!(parsed[0].srcmd5, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert_eq!(parsed[0].versrel, "1.0-1");
         assert_eq!(parsed[0].bcnt, 2);
         assert_eq!(parsed[0].time, 1_700_000_000);
@@ -5638,15 +5646,70 @@ mod tests {
         assert!(parse_build_history("<collection></collection>").is_err());
         assert!(
             parse_build_history(
-                "<buildhistory><entry rev=\"3\" srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"x\" time=\"1\"/></buildhistory>"
+                "<buildhistory><entry rev=\"3\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" versrel=\"1.0-1\" bcnt=\"x\" time=\"1\"/></buildhistory>"
             )
             .is_err()
         );
         assert!(
             parse_build_history(
-                "<buildhistory><entry srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"1\" time=\"1\"/></buildhistory>"
+                "<buildhistory><entry srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" versrel=\"1.0-1\" bcnt=\"1\" time=\"1\"/></buildhistory>"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_build_history_rejects_non_hex_srcmd5() {
+        // The srcmd5 is a checksum, not free text: a non-hex
+        // value is a malformed history, never an entry to record.
+        assert_eq!(
+            parse_build_history("<buildhistory><entry rev=\"3\" srcmd5=\"aaa\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\"/></buildhistory>")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ServerError
+        );
+        assert!(
+            parse_build_history("<buildhistory><entry rev=\"3\" srcmd5=\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\"/></buildhistory>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_build_history_rejects_wrong_length_srcmd5() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        assert!(
+            parse_build_history("<buildhistory><entry rev=\"3\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\"/></buildhistory>")
+                .is_err()
+        );
+        assert!(
+            parse_build_history("<buildhistory><entry rev=\"3\" srcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\"/></buildhistory>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_build_history_accepts_32_hex_srcmd5() {
+        // Lowercase and uppercase hex both read, carried verbatim.
+        let parsed = parse_build_history(
+            "<buildhistory><entry rev=\"3\" srcmd5=\"0123456789abcdef0123456789abcdef\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\"/></buildhistory>",
+        )
+        .unwrap();
+        assert_eq!(parsed[0].srcmd5, "0123456789abcdef0123456789abcdef");
+        let parsed = parse_build_history(
+            "<buildhistory><entry rev=\"3\" srcmd5=\"0123456789ABCDEF0123456789ABCDEF\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\"/></buildhistory>",
+        )
+        .unwrap();
+        assert_eq!(parsed[0].srcmd5, "0123456789ABCDEF0123456789ABCDEF");
+    }
+
+    #[test]
+    fn parse_build_history_rejects_escape_sequence_in_srcmd5() {
+        // An escape sequence smuggled into the md5 unescapes to a
+        // value that is not 32 hex digits, so the history is
+        // malformed.
+        assert!(
+            parse_build_history("<buildhistory><entry rev=\"3\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\"/></buildhistory>")
+                .is_err()
         );
     }
 
@@ -5876,7 +5939,7 @@ mod tests {
         let http = FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_history?limit=1",
-                "<buildhistory><entry rev=\"3\" srcmd5=\"abc\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\"/></buildhistory>",
+                "<buildhistory><entry rev=\"3\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" versrel=\"1.0-1\" bcnt=\"2\" time=\"1700000000\"/></buildhistory>",
             )
             .with_get(
                 "https://api.opensuse.org/build/testproject/standard/x86_64/foo/_history",
