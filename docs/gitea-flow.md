@@ -22,4 +22,16 @@ Issue: https://github.com/scarabeusiv/geectl/issues/23 — the git vs OBS workfl
 | `geectl --live pull-request merge <reference>` (forward to the maintenance incident, PR #313; `--no-forward` skips it) | scmsync syncs the merged branch into the maintenance project package; maintained target files a maintenance incident | PR merges; accepting the PR files the incident automatically; a refused forward reports, the merge stands |
 | `geectl --live request accept <id>` | Incident accepted; update released to `:Update` | Home scmsync version deleted (open: automatic when the fork is pruned, or geectl deletes it on SR acceptance) |
 
+## Forward
+
+Forwarding files the same submit request to the next project in the chain: from the devel package to the link parent of each submit action's target package. The hop resolves from the target package's `<linkinfo>`; an action whose target has no link is skipped and reported, and a broken link refuses the forward. A maintained hop target files a maintenance incident instead of a submit request. The forwarded description is `Forwarded request #{id} from {creator}` plus the original description, and the `.changes` entry is the original description. A re-forward supersedes an earlier still-open forward for the same hop.
+
+Forwarding runs coupled to the step that lands the request: `request accept` files it after accepting, and `pull-request merge` files it after merging. `--no-forward` skips it on both.
+
+The source must be the package's devel project and package as OBS records them in the link parent's package meta: a different recorded devel, or none, refuses the forward. A link-parent package that does not exist yet has no record to verify the source against, so the forward is refused fail-closed.
+
+A refused forward is reported and the work stays queued in the devel project; the accepted request merges and the merge stands.
+
+On a Gitea pull request, the forward is validated before merging, then the merge lands and the forward files afterwards. A preflight failure — a missing OBS credential, an ambiguous or unforwardable package, a refused hop — fails with the pull request still open. A refusal after the merge reports the refusal and changes nothing: the merge already landed, and there is no request to decline on that path.
+
 Leap:Update packages carry no `<devel>` record, so the devel check refuses the forward before the maintenance lookup (open).
