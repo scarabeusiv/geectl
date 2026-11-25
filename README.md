@@ -181,7 +181,7 @@ zypper. Containers fetch the released version — no building random hashes.
 A weekly `freshness` workflow FAILS on any outdated dependency, any
 `cargo audit` advisory, any `cargo deny check` failure, any unused
 dependency (`cargo machete`), or a stale `Cargo.lock`. Dependabot (cargo +
-github-actions, weekly, no grouping, limit 100, no auto-merge) proposes
+github-actions, weekly, no grouping except the github/codeql-action init + analyze pair, limit 100, no auto-merge) proposes
 the updates; the repo stays green by merging them promptly, not by
 relaxing the checks.
 
