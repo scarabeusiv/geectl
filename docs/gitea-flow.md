@@ -32,7 +32,7 @@ Forwarding runs coupled to the step that lands the request: `request accept` fil
 
 The source must be the package's devel project and package as OBS records them in the link parent's package meta: a different recorded devel, or none, refuses the forward. A link-parent package that does not exist yet has no record to verify the source against, so the forward is refused fail-closed.
 
-A refused forward is reported and the work stays queued in the devel project; the accepted request merges and the merge stands.
+A refused forward is reported and the work stays queued in the devel project; the accept/merge stands.
 
 On a Gitea pull request, the forward is validated before merging, then the merge lands and the forward files afterwards. A preflight failure — a missing OBS credential, an ambiguous or unforwardable package, a refused hop — fails with the pull request still open. A refusal after the merge reports the refusal and changes nothing: the merge already landed, and there is no request to decline on that path.
 
