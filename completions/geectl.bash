@@ -7428,13 +7428,21 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__pull__subcmd__request__subcmd__merge)
-            opts="-h --message --method --force --no-forward --format --debug --debug-body --live --help"
+            opts="-m -h --message --forward-message --method --force --no-forward --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --message)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --forward-message)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -m)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -9474,13 +9482,21 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__request__subcmd__accept)
-            opts="-h --comment --force --no-forward --format --debug --debug-body --live --help"
+            opts="-m -h --comment --force --forward-message --no-forward --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --comment)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --forward-message)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -m)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

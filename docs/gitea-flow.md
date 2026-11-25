@@ -24,7 +24,7 @@ Issue: https://github.com/scarabeusiv/geectl/issues/23 — the git vs OBS workfl
 
 ## Forward
 
-Forwarding files the same submit request to the next project in the chain: from the devel package to the link parent of each submit action's target package. The hop resolves from the target package's `<linkinfo>`; an action whose target has no link is skipped and reported, and a broken link refuses the forward. A maintained hop target files a maintenance incident instead of a submit request. The forwarded description is `Forwarded request #{id} from {creator}` plus the original description, and the `.changes` entry is the original description. A re-forward supersedes an earlier still-open forward for the same hop.
+Forwarding files the same submit request to the next project in the chain: from the devel package to the link parent of each submit action's target package. The hop resolves from the target package's `<linkinfo>`; an action whose target has no link is skipped and reported, and a broken link refuses the forward. A maintained hop target files a maintenance incident instead of a submit request. The forwarded description is `Forwarded request #{id} from {creator}` plus the original description, and the `.changes` entry is the original description, or the pull request's text on the Gitea arm, overridable with `-m` / `--forward-message`. A re-forward supersedes an earlier still-open forward for the same hop.
 
 Forwarding runs coupled to the step that lands the request: `request accept` files it after accepting, and `pull-request merge` files it after merging. `--no-forward` skips it on both.
 

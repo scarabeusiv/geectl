@@ -423,6 +423,52 @@ fn request_accept_dry_run_text_renders_the_plan() {
         "dry-run: would change request 42 to accepted; would forward after accept"
     );
 }
+
+#[test]
+fn request_accept_dry_run_forward_message_names_the_changes_entry() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["request", "accept", "42", "-m", "- custom entry"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(
+        value["plan"].as_array().unwrap().iter().any(|line| line
+            .as_str()
+            .unwrap_or("")
+            .contains("[dry-run] would: forward request 42 after accept with changes entry: - custom entry")),
+        "plan: {}",
+        value["plan"]
+    );
+}
+
+#[test]
+fn request_accept_dry_run_text_forward_message_names_the_changes_entry() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "request",
+            "accept",
+            "42",
+            "-m",
+            "- custom entry",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would change request 42 to accepted; would forward after accept with changes entry: - custom entry"
+    );
+}
 #[test]
 fn request_accept_dry_run_with_no_forward_omits_the_forward() {
     let dir = TempDir::new();

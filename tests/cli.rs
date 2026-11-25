@@ -5904,6 +5904,30 @@ fn pull_request_merge_obs_text_dry_run_without_credentials_prints_plan() {
 }
 
 #[test]
+fn pull_request_merge_obs_dry_run_forward_message_names_the_changes_entry() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "merge", "obs:123", "-m", "- custom entry"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(
+        value["plan"].as_array().unwrap().iter().any(|line| line
+            .as_str()
+            .unwrap_or("")
+            .contains("[dry-run] would: forward request 123 after merge with changes entry: - custom entry")),
+        "plan: {}",
+        value["plan"]
+    );
+}
+
+#[test]
 fn pull_request_merge_obs_live_without_credentials_fails_with_config_error() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
@@ -6036,6 +6060,35 @@ fn pull_request_merge_gitea_dry_run_prints_forward_plan() {
     assert_eq!(
         plan[2],
         "[dry-run] note: forward preflight skipped: no OBS credentials, so the forward was not verified"
+    );
+}
+
+#[test]
+fn pull_request_merge_gitea_dry_run_forward_message_names_the_changes_entry() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "merge",
+            "gitea:openSUSE/geectl#122",
+            "-m",
+            "- custom entry",
+        ])
+        .env("GEECTL_GITEA_TOKEN", "tok-fake")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert_eq!(plan.len(), 3);
+    assert_eq!(
+        plan[1],
+        "[dry-run] would: forward gitea:openSUSE/geectl#122 after merge with changes entry: - custom entry"
     );
 }
 

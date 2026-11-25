@@ -188,7 +188,9 @@ pub enum RequestCommand {
     /// with the accept. An accepted request is forwarded to its
     /// link parent unless `--no-forward` is given; a refused
     /// forward is reported and the accepted request stands, with
-    /// the work staying queued in the devel project. Dry-run by
+    /// the work staying queued in the devel project. The forwarded
+    /// request's `.changes` entry is the original description,
+    /// overridable with `-m` / `--forward-message`. Dry-run by
     /// default; mutates only with `--live`.
     Accept {
         /// The request id.
@@ -200,6 +202,11 @@ pub enum RequestCommand {
         /// open reviews.
         #[arg(long)]
         force: bool,
+        /// The changes entry for the forwarded request, overriding
+        /// the original description. Values starting with `-` are
+        /// taken literally: an entry may open with a `- ` bullet.
+        #[arg(short = 'm', long = "forward-message", allow_hyphen_values = true)]
+        forward_message: Option<String>,
         /// Do not forward the request after accepting it: by
         /// default an accepted request is forwarded to its link
         /// parent.
@@ -663,7 +670,16 @@ pub fn run(
             comment,
             force,
             no_forward,
-        } => accept(debug, &id, &comment, force, no_forward, live),
+            forward_message,
+        } => accept(
+            debug,
+            &id,
+            &comment,
+            force,
+            no_forward,
+            forward_message.as_deref(),
+            live,
+        ),
         RequestCommand::Decline { id, comment } => act(
             debug,
             &id,
@@ -1485,7 +1501,9 @@ fn act(
 /// that is refused — or fails any other way — is reported with
 /// the work left queued in the devel project. Nothing is declined
 /// on a refusal: declining the new forward request cannot change
-/// the accepted original. In dry-run nothing is accepted, so
+/// the accepted original. The forwarded request's `.changes`
+/// entry is the original description, overridable with
+/// `-m` / `--forward-message`. In dry-run nothing is accepted, so
 /// nothing is forwarded either — the plan notes the forward that
 /// would follow the accept.
 fn accept(
@@ -1494,6 +1512,7 @@ fn accept(
     comment: &str,
     force: bool,
     no_forward: bool,
+    forward_message: Option<&str>,
     live: bool,
 ) -> Result<(Value, String), GeectlError> {
     let (mut payload, mut text) = act(
@@ -1509,23 +1528,28 @@ fn accept(
         return Ok((payload, text));
     }
     if !live {
+        let forward_note = match forward_message {
+            Some(entry) => format!(" with changes entry: {entry}"),
+            None => String::new(),
+        };
         if let Value::Object(map) = &mut payload {
             if let Some(Value::Array(plan)) = map.get_mut("plan") {
                 plan.push(Value::String(format!(
-                    "[dry-run] would: forward request {id} after accept"
+                    "[dry-run] would: forward request {id} after accept{forward_note}"
                 )));
             }
         }
-        text.push_str("; would forward after accept");
+        text.push_str(&format!("; would forward after accept{forward_note}"));
         return Ok((payload, text));
     }
     // Live: the accept landed; forward the now-accepted request.
-    let (forward_payload, forward_text) = forward(debug, id, None, live).map_err(|err| {
-        GeectlError::new(
-            err.kind(),
-            format!("accepted request {id}, but the forward failed: {err}"),
-        )
-    })?;
+    let (forward_payload, forward_text) =
+        forward(debug, id, forward_message, live).map_err(|err| {
+            GeectlError::new(
+                err.kind(),
+                format!("accepted request {id}, but the forward failed: {err}"),
+            )
+        })?;
     if let Value::Object(map) = &mut payload {
         map.insert("forward".to_string(), forward_payload);
     }
@@ -3384,6 +3408,34 @@ mod tests {
         match cli.command {
             RequestCommand::Accept { comment, .. } => {
                 assert_eq!(comment, "- looks good");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_accepts_a_forward_message_starting_with_a_bullet() {
+        let cli = TestCli::try_parse_from(["geectl", "accept", "42", "-m", "- custom entry"])
+            .expect("a bullet forward message parses");
+        match cli.command {
+            RequestCommand::Accept {
+                forward_message, ..
+            } => {
+                assert_eq!(forward_message.as_deref(), Some("- custom entry"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_accept_without_a_forward_message_leaves_it_empty() {
+        let cli = TestCli::try_parse_from(["geectl", "accept", "42"])
+            .expect("an accept without -m parses");
+        match cli.command {
+            RequestCommand::Accept {
+                forward_message, ..
+            } => {
+                assert_eq!(forward_message, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }

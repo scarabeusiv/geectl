@@ -110,7 +110,10 @@ pub enum PullRequestCommand {
     /// forward is reported and the accepted request stands. On
     /// Gitea the forward is resolved and validated before the
     /// merge lands, and the merged pull request is forwarded to
-    /// its link parent too, unless `--no-forward` is given.
+    /// its link parent too, unless `--no-forward` is given. The
+    /// forwarded request's `.changes` entry is the original
+    /// description on the OBS arm and the pull request's text on
+    /// the Gitea arm, overridable with `-m` / `--forward-message`.
     /// Dry-run by default; mutates only with `--live`.
     Merge(MergeArgs),
     /// Decline a pull request. On OBS this changes the request
@@ -271,6 +274,13 @@ pub struct MergeArgs {
     /// are taken literally: a message may open with a `- ` bullet.
     #[arg(long, allow_hyphen_values = true)]
     message: Option<String>,
+    /// The changes entry for the forwarded request, overriding
+    /// the original description on the OBS arm and the pull
+    /// request's text on the Gitea arm. Values starting with
+    /// `-` are taken literally: an entry may open with a `- `
+    /// bullet.
+    #[arg(short = 'm', long = "forward-message", allow_hyphen_values = true)]
+    forward_message: Option<String>,
     /// The Gitea merge style (Gitea only; refused on an OBS ref).
     #[arg(long, value_parser = ["merge", "rebase", "rebase-merge", "squash", "fast-forward-only"])]
     method: Option<String>,
@@ -450,6 +460,7 @@ pub fn run_pull_request(
                 None => None,
             };
             let message = args.message.as_deref();
+            let forward_message = args.forward_message.as_deref();
             // Backend-only options are refused before any
             // credential resolution, so the refusal is reachable
             // without credentials — the library refuses again, as
@@ -490,15 +501,21 @@ pub fn run_pull_request(
             // pull request to its link parent, unless
             // `--no-forward` is given.
             match &reference {
-                PullRequestRef::Obs(id) => {
-                    merge_obs(debug, &id.to_string(), message, args.force, live)
-                }
+                PullRequestRef::Obs(id) => merge_obs(
+                    debug,
+                    &id.to_string(),
+                    message,
+                    args.force,
+                    forward_message,
+                    live,
+                ),
                 PullRequestRef::Gitea { .. } => merge_gitea(
                     debug,
                     &args.reference,
                     message,
                     method,
                     args.no_forward,
+                    forward_message,
                     live,
                 ),
             }
@@ -1293,12 +1310,14 @@ fn review_act_text(
 /// in the devel project. Nothing is declined on a refusal. When
 /// no submit action has a link parent, no forward happens. The
 /// forwarded `.changes` entry is the original request's
-/// description, as with `request accept`.
+/// description, as with `request accept`, overridable with
+/// `-m` / `--forward-message`.
 fn merge_obs(
     debug: &Debug,
     id: &str,
     message: Option<&str>,
     force: bool,
+    forward_message: Option<&str>,
     live: bool,
 ) -> Result<(Value, String), GeectlError> {
     let (mut payload, mut text) = level_act_with(
@@ -1311,19 +1330,23 @@ fn merge_obs(
         |client, reference, dry_run| client.merge(reference, message, None, force, dry_run),
     )?;
     if !live {
+        let forward_note = match forward_message {
+            Some(entry) => format!(" with changes entry: {entry}"),
+            None => String::new(),
+        };
         if let Value::Object(map) = &mut payload {
             if let Some(Value::Array(plan)) = map.get_mut("plan") {
                 plan.push(Value::String(format!(
-                    "[dry-run] would: forward request {id} after merge"
+                    "[dry-run] would: forward request {id} after merge{forward_note}"
                 )));
             }
         }
-        text.push_str("; would forward after merge");
+        text.push_str(&format!("; would forward after merge{forward_note}"));
         return Ok((payload, text));
     }
     // Live: the merge landed; forward the now-merged request.
-    let (forward_payload, forward_text) = crate::cli_request::forward(debug, id, None, live)
-        .map_err(|err| {
+    let (forward_payload, forward_text) =
+        crate::cli_request::forward(debug, id, forward_message, live).map_err(|err| {
             GeectlError::new(
                 err.kind(),
                 format!("merged request {id}, but the forward failed: {err}"),
@@ -1361,6 +1384,7 @@ fn merge_gitea(
     message: Option<&str>,
     method: Option<GiteaMergeMethod>,
     no_forward: bool,
+    forward_message: Option<&str>,
     live: bool,
 ) -> Result<(Value, String), GeectlError> {
     // Both arms are resolved and validated before the merge
@@ -1372,7 +1396,12 @@ fn merge_gitea(
     let preflight = if no_forward {
         None
     } else {
-        Some(preflight_gitea_forward(debug, reference, live)?)
+        Some(preflight_gitea_forward(
+            debug,
+            reference,
+            forward_message,
+            live,
+        )?)
     };
     let (mut payload, mut text) = level_act_with(
         reference.to_string(),
@@ -1387,10 +1416,14 @@ fn merge_gitea(
         return Ok((payload, text));
     }
     if !live {
+        let forward_note = match forward_message {
+            Some(entry) => format!(" with changes entry: {entry}"),
+            None => String::new(),
+        };
         if let Value::Object(map) = &mut payload {
             if let Some(Value::Array(plan)) = map.get_mut("plan") {
                 plan.push(Value::String(format!(
-                    "[dry-run] would: forward {reference} after merge"
+                    "[dry-run] would: forward {reference} after merge{forward_note}"
                 )));
                 if matches!(preflight, Some(ForwardPreflight::SkippedNoObsCredentials)) {
                     plan.push(Value::String(
@@ -1399,16 +1432,17 @@ fn merge_gitea(
                 }
             }
         }
-        text.push_str("; would forward after merge");
+        text.push_str(&format!("; would forward after merge{forward_note}"));
         return Ok((payload, text));
     }
     // Live: the merge landed; forward the merged pull request.
-    let (forward_payload, forward_text) = forward_gitea(debug, reference).map_err(|err| {
-        GeectlError::new(
-            err.kind(),
-            format!("merged {reference}, but the forward failed: {err}"),
-        )
-    })?;
+    let (forward_payload, forward_text) = forward_gitea(debug, reference, forward_message)
+        .map_err(|err| {
+            GeectlError::new(
+                err.kind(),
+                format!("merged {reference}, but the forward failed: {err}"),
+            )
+        })?;
     if let Value::Object(map) = &mut payload {
         map.insert("forward".to_string(), forward_payload);
     }
@@ -1421,7 +1455,8 @@ fn merge_gitea(
 /// what the merge targeted: the merged pull request's base repo and
 /// branch, the repo's clone URL and default branch, and the forward
 /// description and `.changes` entry carried from the pull request's
-/// text.
+/// text — or the `-m` / `--forward-message` override for the
+/// `.changes` entry.
 struct GiteaForwardInputs {
     base_owner: String,
     base_repo: String,
@@ -1436,7 +1471,11 @@ struct GiteaForwardInputs {
 /// branch name the scmsync record, the repo's clone URL spells
 /// the repo URL, and its default branch is the branch a scmsync
 /// URL without one tracks.
-fn gitea_forward_inputs(debug: &Debug, reference: &str) -> Result<GiteaForwardInputs, GeectlError> {
+fn gitea_forward_inputs(
+    debug: &Debug,
+    reference: &str,
+    forward_message: Option<&str>,
+) -> Result<GiteaForwardInputs, GeectlError> {
     let reference: PullRequestRef = reference.parse()?;
     let (owner, repo, number) = match &reference {
         PullRequestRef::Gitea {
@@ -1468,19 +1507,27 @@ fn gitea_forward_inputs(debug: &Debug, reference: &str) -> Result<GiteaForwardIn
     let repo_url = clone_url.strip_suffix(".git").unwrap_or(&clone_url);
     // The forward description and `.changes` entry carry the pull
     // request's text: the body when it has one, else the title,
-    // else the forward line alone.
+    // else the forward line alone. An explicit `-m` override
+    // replaces the `.changes` entry only: the description still
+    // carries the pull request's text.
     let forward_line = format!(
         "Forwarded Gitea pull request {base_owner}/{base_repo_name}#{number} from {}",
         pr.user.login
     );
     let body = pr.body.as_deref().unwrap_or("").trim();
     let title = pr.title.trim();
-    let (description, changes_entry) = if !body.is_empty() {
-        (format!("{forward_line}\n\n{body}"), body.to_string())
+    let description = if !body.is_empty() {
+        format!("{forward_line}\n\n{body}")
     } else if !title.is_empty() {
-        (format!("{forward_line}\n\n{title}"), title.to_string())
+        format!("{forward_line}\n\n{title}")
     } else {
-        (forward_line.clone(), forward_line)
+        forward_line.clone()
+    };
+    let changes_entry = match forward_message {
+        Some(entry) => entry.to_string(),
+        None if !body.is_empty() => body.to_string(),
+        None if !title.is_empty() => title.to_string(),
+        None => forward_line,
     };
     Ok(GiteaForwardInputs {
         base_owner,
@@ -1546,6 +1593,7 @@ enum ForwardPreflight {
 fn preflight_gitea_forward(
     debug: &Debug,
     reference: &str,
+    forward_message: Option<&str>,
     live: bool,
 ) -> Result<ForwardPreflight, GeectlError> {
     // OBS credentials first: without them there is nothing to
@@ -1569,7 +1617,7 @@ fn preflight_gitea_forward(
         debug.emit("decision: skipping the forward preflight: no OBS credentials in dry-run, so the forward is planned unverified");
         return Ok(ForwardPreflight::SkippedNoObsCredentials);
     }
-    let inputs = gitea_forward_inputs(debug, reference)?;
+    let inputs = gitea_forward_inputs(debug, reference, forward_message)?;
     let dry_run = DryRun::new(true).with_debug(debug.clone());
     with_obs(debug, live, |obs| {
         let package = resolve_forward_package(
@@ -1601,8 +1649,12 @@ fn preflight_gitea_forward(
 /// pull request and repo come from [`gitea_forward_inputs`],
 /// shared with the preflight, so the forward cannot disagree
 /// with what was validated before the merge.
-fn forward_gitea(debug: &Debug, reference: &str) -> Result<(Value, String), GeectlError> {
-    let inputs = gitea_forward_inputs(debug, reference)?;
+fn forward_gitea(
+    debug: &Debug,
+    reference: &str,
+    forward_message: Option<&str>,
+) -> Result<(Value, String), GeectlError> {
+    let inputs = gitea_forward_inputs(debug, reference, forward_message)?;
     let dry_run = DryRun::new(false).with_debug(debug.clone());
     let action = with_obs(debug, true, |obs| {
         let package = resolve_forward_package(
