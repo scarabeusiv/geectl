@@ -134,16 +134,20 @@ fn current_dir() -> Result<PathBuf, GeectlError> {
     })
 }
 
-/// The working copy in the current directory. `live` decides
-/// whether the record may be healed from the root commit: a
-/// dry-run plan must not rewrite `geectl.base-*` config, so it
-/// opens read-only.
-fn open_working_copy(live: bool) -> Result<WorkingCopy, GeectlError> {
+/// The working copy in the current directory, for `client`
+/// when one is in use: the recorded apiurl must match the
+/// client's, so a checkout from another instance refuses at open,
+/// naming both URLs. `live` decides whether the record may be
+/// healed from the root commit: a dry-run plan must not rewrite
+/// `geectl.base-*` config, so it opens read-only. Leaves without
+/// a client pass `None` and open unchecked.
+fn open_working_copy(live: bool, client: Option<&ObsClient>) -> Result<WorkingCopy, GeectlError> {
     let dir = current_dir()?;
-    if live {
-        working_copy::open(&dir)
-    } else {
-        working_copy::open_read(&dir)
+    match (live, client) {
+        (true, Some(client)) => working_copy::open_for(client, &dir),
+        (true, None) => working_copy::open(&dir),
+        (false, Some(client)) => working_copy::open_read_for(client, &dir),
+        (false, None) => working_copy::open_read(&dir),
     }
 }
 
@@ -313,7 +317,7 @@ pub fn update(
     // token here would resolve credentials for a plan.
     let auth = if live { gitea_auth(&endpoints)? } else { None };
     let auth = gitea_auth_ref(&auth);
-    let mut wc = open_working_copy(live)?;
+    let mut wc = open_working_copy(live, Some(&client))?;
     let report = working_copy::update(&mut wc, &client, rev, auth.as_ref(), &dry_run)?;
     Ok(update_result(
         &wc,
@@ -382,7 +386,7 @@ fn update_result(
 /// Show the working copy's state against the base.
 pub fn status(debug: &Debug) -> Result<(Value, String), GeectlError> {
     let _ = debug;
-    let wc = open_working_copy(false)?;
+    let wc = open_working_copy(false, None)?;
     let entries = working_copy::status(&wc)?;
     Ok(status_result(&wc, &entries))
 }
@@ -422,7 +426,7 @@ fn status_result(wc: &WorkingCopy, entries: &[working_copy::StatusEntry]) -> (Va
 /// stderr note, not an error.
 pub fn diff(debug: &Debug) -> Result<(Value, String), GeectlError> {
     let _ = debug;
-    let wc = open_working_copy(false)?;
+    let wc = open_working_copy(false, None)?;
     // The link read runs only on a linked checkout: an unlinked
     // `diff` stays purely local — no HTTP client, no config, no
     // credentials — exactly as before. The client carries no
@@ -462,7 +466,7 @@ fn diff_result(wc: &WorkingCopy, diff: &str) -> (Value, String) {
 pub fn add(files: &[String], debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let wc = open_working_copy(live)?;
+    let wc = open_working_copy(live, None)?;
     working_copy::add(&wc, files, &dry_run)?;
     Ok(add_result(&wc, files, dry_run.enabled(), plan_of(&dry_run)))
 }
@@ -502,7 +506,7 @@ fn add_result(
 pub fn rm(files: &[String], debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let wc = open_working_copy(live)?;
+    let wc = open_working_copy(live, None)?;
     working_copy::rm(&wc, files, &dry_run)?;
     Ok(rm_result(&wc, files, dry_run.enabled(), plan_of(&dry_run)))
 }
@@ -542,7 +546,7 @@ fn rm_result(
 pub fn addremove(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let wc = open_working_copy(live)?;
+    let wc = open_working_copy(live, None)?;
     working_copy::addremove(&wc, &dry_run)?;
     Ok(addremove_result(&wc, dry_run.enabled(), plan_of(&dry_run)))
 }
@@ -592,7 +596,7 @@ pub fn commit(
     // token here would resolve credentials for a plan.
     let auth = if live { gitea_auth(&endpoints)? } else { None };
     let auth = gitea_auth_ref(&auth);
-    let mut wc = open_working_copy(live)?;
+    let mut wc = open_working_copy(live, Some(&client))?;
     let report = working_copy::commit(
         &mut wc,
         &client,
@@ -668,7 +672,7 @@ pub fn pull(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     // and the plan is read-only.
     let client = obs_client(&http, &endpoints, "pull", live, debug)?;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let mut wc = open_working_copy(live)?;
+    let mut wc = open_working_copy(live, Some(&client))?;
     let report = working_copy::pull(&mut wc, &client, &dry_run)?;
     Ok(pull_result(
         &wc,
@@ -738,7 +742,7 @@ fn pull_result(
 pub fn resolve(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
     let _ = debug;
     let dry_run = DryRun::new(!live).with_debug(debug.clone());
-    let mut wc = open_working_copy(live)?;
+    let mut wc = open_working_copy(live, None)?;
     let resolved = working_copy::resolve(&mut wc, &dry_run)?;
     Ok(resolve_result(
         &wc,

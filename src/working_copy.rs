@@ -185,6 +185,25 @@ impl WorkingCopy {
             Backend::Git => Ok(self.base_rev.clone()),
         }
     }
+
+    /// Refuse when the checkout's recorded apiurl differs from
+    /// `apiurl`: the checkout came from another OBS instance, and
+    /// operating on it with this client would read or file against
+    /// the wrong server. The refusal names both URLs.
+    pub fn check_apiurl(&self, apiurl: &str) -> Result<(), GeectlError> {
+        if self.apiurl != apiurl {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "the working copy at {} was checked out from {}, but the client is using {}: check it out again from the right instance, or fix the configured OBS URL",
+                    self.root.display(),
+                    self.apiurl,
+                    apiurl
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The `owner/repo` the checkout's `origin` remote points at, for
@@ -1281,6 +1300,27 @@ pub fn open_read(dir: &Path) -> Result<WorkingCopy, GeectlError> {
     open_inner(dir, false)
 }
 
+/// Open the working copy at `dir` for `client`: the record is
+/// read, and the recorded apiurl must match the client's — a
+/// checkout from another instance refuses loudly, naming both
+/// URLs, instead of operating against the wrong server.
+pub fn open_for(client: &ObsClient, dir: &Path) -> Result<WorkingCopy, GeectlError> {
+    let wc = open(dir)?;
+    wc.check_apiurl(&client.base)?;
+    Ok(wc)
+}
+
+/// Open the working copy at `dir` for `client` without touching
+/// local state: the record is read, never rewritten, and the
+/// recorded apiurl must match the client's. Dry-run plans use
+/// this: a read must not rewrite `geectl.base-*` config, and a
+/// plan against the wrong instance refuses like a live open.
+pub fn open_read_for(client: &ObsClient, dir: &Path) -> Result<WorkingCopy, GeectlError> {
+    let wc = open_read(dir)?;
+    wc.check_apiurl(&client.base)?;
+    Ok(wc)
+}
+
 fn open_inner(dir: &Path, heal: bool) -> Result<WorkingCopy, GeectlError> {
     if !dir.is_dir() {
         return Err(GeectlError::new(
@@ -1701,6 +1741,14 @@ pub fn checkout(
     // cleanup below) outside `dir`.
     let target = checkout_target(dir, project, package)?;
     if target.exists() {
+        // An existing working copy recorded from another
+        // instance refuses with the apiurl mismatch, naming both
+        // URLs: the generic exists error would hide the cause.
+        // Anything that is not a readable working copy keeps the
+        // generic refusal.
+        if let Ok(existing) = open_read(&target) {
+            existing.check_apiurl(&client.base)?;
+        }
         return Err(GeectlError::new(
             ErrorKind::InvalidInput,
             format!(
@@ -4083,6 +4131,9 @@ fn commit_obs(
     noservice: bool,
     dry_run: &DryRun,
 ) -> Result<CommitReport, GeectlError> {
+    // The client must be the checkout's own instance before any
+    // other check reads the server.
+    wc.check_apiurl(&client.base)?;
     // The upstream check: the checkout's base must equal the
     // server's latest revision, else the commit would land on top
     // of a revision the checkout never saw.
@@ -4342,6 +4393,9 @@ fn commit_git(
     noservice: bool,
     gitea_auth: Option<&GiteaAuth<'_>>,
 ) -> Result<CommitReport, GeectlError> {
+    // The client must be the checkout's own instance before any
+    // other check reads the server.
+    wc.check_apiurl(&client.base)?;
     let auth = gitea_auth.ok_or_else(|| {
         GeectlError::new(
             ErrorKind::ConfigError,
@@ -4801,6 +4855,9 @@ pub fn update(
     gitea_auth: Option<&GiteaAuth<'_>>,
     dry_run: &DryRun,
 ) -> Result<Option<UpdateReport>, GeectlError> {
+    // The client must be the checkout's own instance before the
+    // plan reads the server or the update moves the base.
+    wc.check_apiurl(&client.base)?;
     if !dry_run.allow(&format!(
         "update working copy {}/{}",
         wc.project, wc.package
@@ -4958,6 +5015,7 @@ fn refuse_on_rebase(wc: &WorkingCopy) -> Result<(), GeectlError> {
 /// files exactly the branch state the agent sees — nothing
 /// silently omitted.
 pub fn refuse_not_submittable_obs(wc: &WorkingCopy, obs: &ObsClient) -> Result<(), GeectlError> {
+    wc.check_apiurl(&obs.base)?;
     refuse_when_outdated_obs(wc, obs)?;
     refuse_on_conflicts(wc)?;
     refuse_uncommitted(wc)?;
@@ -5549,6 +5607,9 @@ pub fn pull(
     client: &ObsClient,
     dry_run: &DryRun,
 ) -> Result<Option<PullReport>, GeectlError> {
+    // The client must be the checkout's own instance before any
+    // other refusal runs.
+    wc.check_apiurl(&client.base)?;
     // The refusals run before the dry-run guard, so a dry-run pull
     // on a git-backed checkout or an unlinked package refuses
     // instead of planning a pull that live would never do.
@@ -7183,6 +7244,115 @@ mod tests {
         git_config_set(&wc.root, "mtimes", "bogus").unwrap();
         let err = open(&wc.root).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::WorkingCopyInconsistent);
+        let _ = dir;
+    }
+
+    #[test]
+    fn check_apiurl_accepts_the_recorded_instance() {
+        let http = checkout_http();
+        let (dir, wc) = do_checkout(&http);
+        wc.check_apiurl("https://api.opensuse.org").unwrap();
+        let _ = dir;
+    }
+
+    #[test]
+    fn check_apiurl_refuses_another_instance_naming_both() {
+        let http = checkout_http();
+        let (dir, wc) = do_checkout(&http);
+        let err = wc.check_apiurl("https://api.example.com").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        let message = err.to_string();
+        assert!(message.contains("https://api.opensuse.org"), "{message}");
+        assert!(message.contains("https://api.example.com"), "{message}");
+        let _ = dir;
+    }
+
+    #[test]
+    fn open_for_refuses_another_instance() {
+        let http = checkout_http();
+        let (dir, wc) = do_checkout(&http);
+        let other = ObsClient::with_base_and_credentials(
+            &http,
+            "https://api.example.com",
+            basic_credentials(),
+        )
+        .unwrap();
+        let err = open_for(&other, &wc.root).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        let message = err.to_string();
+        assert!(message.contains("https://api.opensuse.org"), "{message}");
+        assert!(message.contains("https://api.example.com"), "{message}");
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_refuses_an_existing_target_from_another_instance() {
+        let http = checkout_http();
+        let (dir, _wc) = do_checkout(&http);
+        let other = ObsClient::with_base_and_credentials(
+            &http,
+            "https://api.example.com",
+            basic_credentials(),
+        )
+        .unwrap();
+        let err = checkout(
+            &other,
+            "home:alice",
+            "foo",
+            None,
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        let message = err.to_string();
+        assert!(message.contains("https://api.opensuse.org"), "{message}");
+        assert!(message.contains("https://api.example.com"), "{message}");
+        let _ = dir;
+    }
+
+    #[test]
+    fn checkout_refuses_an_existing_target_from_the_same_instance() {
+        let http = checkout_http();
+        let (dir, _wc) = do_checkout(&http);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = checkout(
+            &client,
+            "home:alice",
+            "foo",
+            None,
+            &dir.path,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("already exists"),
+            "{}",
+            err.to_string()
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn commit_refuses_a_foreign_apiurl_before_any_server_read() {
+        let http = checkout_http();
+        let (dir, mut wc) = do_checkout(&http);
+        wc.apiurl = "https://api.example.com".to_string();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = commit(
+            &mut wc,
+            &client,
+            &Config::default(),
+            "test",
+            true,
+            None,
+            &DryRun::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
         let _ = dir;
     }
 
