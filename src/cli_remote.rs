@@ -80,7 +80,7 @@
 
 use crate::auth::{Credentials, EnvObsAuth};
 use crate::config;
-use crate::debug::Debug;
+use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{Timeout, UreqClient};
 use crate::obs::{
@@ -4096,10 +4096,13 @@ fn render_named_roles(label: &str, roles: &[NamedRole]) -> Vec<String> {
 fn render_project_meta(meta: &ProjectMeta) -> String {
     let mut lines = vec![format!("name: {}", meta.name)];
     if let Some(title) = &meta.title {
-        lines.push(format!("title: {title}"));
+        lines.push(format!("title: {}", strip_terminal_controls(title)));
     }
     if let Some(description) = &meta.description {
-        lines.push(format!("description: {description}"));
+        lines.push(format!(
+            "description: {}",
+            strip_terminal_controls(description)
+        ));
     }
     if let Some(url) = &meta.url {
         lines.push(format!("url: {url}"));
@@ -4142,10 +4145,13 @@ fn render_package_meta(meta: &PackageMeta) -> String {
         format!("project: {}", meta.project),
     ];
     if let Some(title) = &meta.title {
-        lines.push(format!("title: {title}"));
+        lines.push(format!("title: {}", strip_terminal_controls(title)));
     }
     if let Some(description) = &meta.description {
-        lines.push(format!("description: {description}"));
+        lines.push(format!(
+            "description: {}",
+            strip_terminal_controls(description)
+        ));
     }
     if let Some(url) = &meta.url {
         lines.push(format!("url: {url}"));
@@ -7456,6 +7462,30 @@ mod tests {
     }
 
     #[test]
+    fn project_meta_text_strips_terminal_controls_from_title_and_description() {
+        // Meta title and description are maintainer text and reach
+        // the terminal through the meta render: escape sequences,
+        // bells, and bidirectional marks are stripped, while
+        // newlines survive. The parse keeps them verbatim — meta is
+        // written back to the server (the setter compares the parsed
+        // current meta, and branch copies the title/description to
+        // the new package), so stripping at the parse would silently
+        // rewrite what gets filed.
+        let mut meta = sample_project_meta();
+        meta.title = Some("Fa\u{1b}[2Jctory".to_string());
+        meta.description = Some("The\u{7} rolling\ndistri\u{202e}bution".to_string());
+        let text = render_project_meta(&meta);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(text.contains("title: Fa[2Jctory"), "text: {text}");
+        assert!(
+            text.contains("description: The rolling\ndistribution"),
+            "text: {text}"
+        );
+    }
+
+    #[test]
     fn package_meta_renders_devel_pair() {
         let meta = PackageMeta {
             name: "vim".to_string(),
@@ -7477,6 +7507,34 @@ mod tests {
         assert!(text.contains("project: openSUSE:Factory"));
         assert!(text.contains("releasename: vim"));
         assert!(text.contains("devel: editors/vim"));
+    }
+
+    #[test]
+    fn package_meta_text_strips_terminal_controls_from_title_and_description() {
+        // Same rule as the project meta: strip at the render only,
+        // never at the parse — the title/description round-trip to
+        // the server.
+        let meta = PackageMeta {
+            name: "vim".to_string(),
+            project: "openSUSE:Factory".to_string(),
+            title: Some("Vi\u{1b}[2J IMproved".to_string()),
+            description: Some("A\rvery long\u{7} description".to_string()),
+            url: None,
+            scmsync: None,
+            releasename: None,
+            devel: None,
+            persons: vec![],
+            groups: vec![],
+        };
+        let text = render_package_meta(&meta);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\r'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(text.contains("title: Vi[2J IMproved"), "text: {text}");
+        assert!(
+            text.contains("description: Avery long description"),
+            "text: {text}"
+        );
     }
 
     #[test]
