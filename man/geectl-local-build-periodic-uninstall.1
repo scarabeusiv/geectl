@@ -1,0 +1,15 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-local-build-periodic-uninstall 1  "geectl-local-build-periodic-uninstall 0.2.2" 
+.SH NAME
+geectl\-local\-build\-periodic\-uninstall \- Remove the daily periodic cleanup for this platform: disable the scheduler entry, then remove its files. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the uninstall
+.SH SYNOPSIS
+\fBgeectl local\-build periodic\-uninstall\fR [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Remove the daily periodic cleanup for this platform: disable the scheduler entry, then remove its files. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the uninstall
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

@@ -1,0 +1,30 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-check-constraints 1  "geectl-build-check-constraints 0.2.2" 
+.SH NAME
+geectl\-build\-check\-constraints \- List the worker ids satisfying a `_constraints` document
+.SH SYNOPSIS
+\fBgeectl build check\-constraints\fR [\fB\-\-constraints\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> <\fIREPOSITORY\fR> <\fIARCH\fR> 
+.SH DESCRIPTION
+List the worker ids satisfying a `_constraints` document
+.SH OPTIONS
+.TP
+\fB\-\-constraints\fR \fI<CONSTRAINTS>\fR
+The constraints document, as authored. Without it, an empty body is posted, which the server accepts
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package is in
+.TP
+<\fIPACKAGE\fR>
+The package to check the constraints for
+.TP
+<\fIREPOSITORY\fR>
+The repository the package builds in
+.TP
+<\fIARCH\fR>
+The architecture the package builds for
+.SH VERSION
+v0.2.2

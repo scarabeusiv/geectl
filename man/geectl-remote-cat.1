@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-cat 1  "geectl-remote-cat 0.2.2" 
+.SH NAME
+geectl\-remote\-cat \- Print a source file to standard output. Text only: the library reads the file as a UTF\-8 string, so a binary file fails the call with a server error ("response body is not valid UTF\-8") instead of printing bytes
+.SH SYNOPSIS
+\fBgeectl remote cat\fR [\fB\-\-rev\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> <\fIFILE\fR> 
+.SH DESCRIPTION
+Print a source file to standard output. Text only: the library reads the file as a UTF\-8 string, so a binary file fails the call with a server error ("response body is not valid UTF\-8") instead of printing bytes
+.SH OPTIONS
+.TP
+\fB\-\-rev\fR \fI<REV>\fR
+Print the file as of this revision (default: latest): a revision number or a srcmd5
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package the file lives in
+.TP
+<\fIFILE\fR>
+The file to print
+.SH VERSION
+v0.2.2

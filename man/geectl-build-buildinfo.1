@@ -1,0 +1,30 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-buildinfo 1  "geectl-build-buildinfo 0.2.2" 
+.SH NAME
+geectl\-build\-buildinfo \- Read the buildinfo for a package: the blocking error, if any, and the dependencies the build pulls in
+.SH SYNOPSIS
+\fBgeectl build buildinfo\fR [\fB\-\-alternative\-project\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> <\fIREPOSITORY\fR> <\fIARCH\fR> 
+.SH DESCRIPTION
+Read the buildinfo for a package: the blocking error, if any, and the dependencies the build pulls in
+.SH OPTIONS
+.TP
+\fB\-\-alternative\-project\fR \fI<ALTERNATIVE_PROJECT>\fR
+Read the buildinfo for another project instead of `project`: the dep set the package would build against there
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package is in
+.TP
+<\fIPACKAGE\fR>
+The package to read the buildinfo for
+.TP
+<\fIREPOSITORY\fR>
+The repository the package builds in
+.TP
+<\fIARCH\fR>
+The architecture the package builds for
+.SH VERSION
+v0.2.2

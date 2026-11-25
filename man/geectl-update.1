@@ -1,0 +1,18 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-update 1  "geectl-update 0.2.2" 
+.SH NAME
+geectl\-update \- Update the working copy in the current directory to the latest base
+.SH SYNOPSIS
+\fBgeectl update\fR [\fB\-\-rev\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Update the working copy in the current directory to the latest base
+.SH OPTIONS
+.TP
+\fB\-\-rev\fR \fI<REV>\fR
+The revision to update to (a number or a source md5). The latest when omitted
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

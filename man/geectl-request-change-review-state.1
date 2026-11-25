@@ -1,0 +1,48 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-change-review-state 1  "geectl-request-change-review-state 0.2.2" 
+.SH NAME
+geectl\-request\-change\-review\-state \- Change the state of one review on a submit request: accept it, decline it, or reopen it to new
+.SH SYNOPSIS
+\fBgeectl request change\-review\-state\fR [\fB\-\-user\fR] [\fB\-\-group\fR] [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-comment\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR> <\fISTATE\fR> 
+.SH DESCRIPTION
+Change the state of one review on a submit request: accept it, decline it, or reopen it to new
+.SH OPTIONS
+.TP
+\fB\-\-user\fR \fI<USER>\fR
+The user the review was asked of
+.TP
+\fB\-\-group\fR \fI<GROUP>\fR
+The group the review was asked of
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The project the review was asked of
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package the review was asked of (needs its project)
+.TP
+\fB\-\-comment\fR \fI<COMMENT>\fR [default: ]
+The message left with the change. Values starting with `\-` are taken literally: a comment may open with a `\- ` bullet
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIID\fR>
+The request id
+.TP
+<\fISTATE\fR>
+The state to change the review to
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+new
+.IP \(bu 2
+accepted
+.IP \(bu 2
+declined
+.RE
+.SH VERSION
+v0.2.2

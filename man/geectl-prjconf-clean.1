@@ -1,0 +1,23 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-prjconf-clean 1  "geectl-prjconf-clean 0.2.2" 
+.SH NAME
+geectl\-prjconf\-clean \- Clean a project\*(Aqs prjconf. A mutation: dry\-run is the default. Shares validate\*(Aqs credential gate and 32\-repository bound
+.SH SYNOPSIS
+\fBgeectl prjconf clean\fR [\fB\-\-include\-path\-dependent\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
+.SH DESCRIPTION
+Clean a project\*(Aqs prjconf. A mutation: dry\-run is the default. Shares validate\*(Aqs credential gate and 32\-repository bound.
+.PP
+A prjconf is inherited: downstream projects concatenate this config with different repository paths, architectures and `_repository` / `_project` values. By default clean removes only lines proven dead independent of the repository path and architecture (same\-line duplicate tokens and unconditionally overridden `Substitute` lines); `\-\-include\-path\-dependent` also removes lines proven dead in every repository and architecture evaluation of this project.
+.SH OPTIONS
+.TP
+\fB\-\-include\-path\-dependent\fR
+Also remove lines proven dead only in this project\*(Aqs own repository and architecture evaluations
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIPROJECT\fR>
+The project to clean the prjconf of
+.SH VERSION
+v0.2.2

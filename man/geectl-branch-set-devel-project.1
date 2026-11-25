@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-branch-set-devel-project 1  "geectl-branch-set-devel-project 0.2.2" 
+.SH NAME
+geectl\-branch\-set\-devel\-project \- Set (or, without `\-\-devel\-project`, remove) the devel project of a package. A mutation: dry\-run is the default
+.SH SYNOPSIS
+\fBgeectl branch set\-devel\-project\fR [\fB\-\-devel\-project\fR] [\fB\-\-devel\-package\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> 
+.SH DESCRIPTION
+Set (or, without `\-\-devel\-project`, remove) the devel project of a package. A mutation: dry\-run is the default
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The project holding the package
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package whose devel project to set
+.TP
+\fB\-\-devel\-project\fR \fI<DEVEL_PROJECT>\fR
+The devel project. Without it, the devel project is removed
+.TP
+\fB\-\-devel\-package\fR \fI<DEVEL_PACKAGE>\fR
+The devel package. Without it, the devel project alone is set
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

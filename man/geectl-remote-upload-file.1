@@ -1,0 +1,30 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-upload-file 1  "geectl-remote-upload-file 0.2.2" 
+.SH NAME
+geectl\-remote\-upload\-file \- Upload a file into a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the upload. The local file is read from `\-\-from`; `\-\-binary` uploads bytes instead of text
+.SH SYNOPSIS
+\fBgeectl remote upload\-file\fR [\fB\-\-binary\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-from\fR> <\fIPROJECT\fR> <\fIPACKAGE\fR> <\fIFILE\fR> 
+.SH DESCRIPTION
+Upload a file into a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the upload. The local file is read from `\-\-from`; `\-\-binary` uploads bytes instead of text
+.SH OPTIONS
+.TP
+\fB\-\-from\fR \fI<FROM>\fR
+The local file to read the content from
+.TP
+\fB\-\-binary\fR
+Upload bytes instead of text: a binary file uploads instead of failing the UTF\-8 check a text upload would hit
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package to upload into
+.TP
+<\fIFILE\fR>
+The file name on the server
+.SH VERSION
+v0.2.2

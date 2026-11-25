@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-file-maintenance-incident 1  "geectl-request-file-maintenance-incident 0.2.2" 
+.SH NAME
+geectl\-request\-file\-maintenance\-incident \- File a maintenance incident request: ask the maintenance team to start a maintenance incident from a maintenance update
+.SH SYNOPSIS
+\fBgeectl request file\-maintenance\-incident\fR [\fB\-\-source\-package\fR] [\fB\-\-release\-project\fR] [\fB\-\-with\-cleanup\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-source\-project\fR> <\fB\-\-target\-project\fR> <\fB\-\-description\fR> 
+.SH DESCRIPTION
+File a maintenance incident request: ask the maintenance team to start a maintenance incident from a maintenance update
+.SH OPTIONS
+.TP
+\fB\-\-source\-project\fR \fI<SOURCE_PROJECT>\fR
+The project the maintenance update comes from
+.TP
+\fB\-\-source\-package\fR \fI<SOURCE_PACKAGE>\fR
+A package in the source project. Repeatable: one action per package; at least one is required
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The maintenance project the incident goes to
+.TP
+\fB\-\-release\-project\fR \fI<RELEASE_PROJECT>\fR
+The release project the update releases into. When omitted, the server resolves it from the maintenance project
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+The request description. Values starting with `\-` are taken literally: a description may open with a `\- ` bullet
+.TP
+\fB\-\-with\-cleanup\fR
+Delete the source branch when the incident is accepted. By default the branch survives the incident
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

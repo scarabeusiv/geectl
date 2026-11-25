@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-merge 1  "geectl-pull-request-merge 0.2.2" 
+.SH NAME
+geectl\-pull\-request\-merge \- Merge a pull request. On OBS this accepts the submit request; on Gitea it merges the pull request. Dry\-run by default; mutates only with `\-\-live`
+.SH SYNOPSIS
+\fBgeectl pull\-request merge\fR [\fB\-\-message\fR] [\fB\-\-method\fR] [\fB\-\-force\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+.SH DESCRIPTION
+Merge a pull request. On OBS this accepts the submit request; on Gitea it merges the pull request. Dry\-run by default; mutates only with `\-\-live`
+.SH OPTIONS
+.TP
+\fB\-\-message\fR \fI<MESSAGE>\fR
+The message left with the merge. Values starting with `\-` are taken literally: a message may open with a `\- ` bullet
+.TP
+\fB\-\-method\fR \fI<METHOD>\fR
+The Gitea merge style (Gitea only; refused on an OBS ref)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+merge
+.IP \(bu 2
+rebase
+.IP \(bu 2
+rebase\-merge
+.IP \(bu 2
+squash
+.IP \(bu 2
+fast\-forward\-only
+.RE
+.TP
+\fB\-\-force\fR
+Accept past open reviews (OBS only; refused on a Gitea ref)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREFERENCE\fR>
+The pull\-request handle: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+.SH VERSION
+v0.2.2

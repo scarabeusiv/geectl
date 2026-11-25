@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-job-history 1  "geectl-build-job-history 0.2.2" 
+.SH NAME
+geectl\-build\-job\-history \- List the build jobs that ran in a repository, newest first
+.SH SYNOPSIS
+\fBgeectl build job\-history\fR [\fB\-\-package\fR] [\fB\-\-limit\fR] [\fB\-\-code\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIREPOSITORY\fR> <\fIARCH\fR> 
+.SH DESCRIPTION
+List the build jobs that ran in a repository, newest first
+.SH OPTIONS
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+Only jobs for this package
+.TP
+\fB\-\-limit\fR \fI<LIMIT>\fR
+At most this many entries
+.TP
+\fB\-\-code\fR \fI<CODE>\fR
+Only jobs with this result code (e.g. `failed`)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the repository is in
+.TP
+<\fIREPOSITORY\fR>
+The repository the jobs ran in
+.TP
+<\fIARCH\fR>
+The architecture the jobs ran on
+.SH VERSION
+v0.2.2

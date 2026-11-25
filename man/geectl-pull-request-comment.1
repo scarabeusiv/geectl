@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-comment 1  "geectl-pull-request-comment 0.2.2" 
+.SH NAME
+geectl\-pull\-request\-comment \- Comment on a pull request. Dry\-run by default; mutates only with `\-\-live`
+.SH SYNOPSIS
+\fBgeectl pull\-request comment\fR [\fB\-\-parent\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-body\fR> <\fIREFERENCE\fR> 
+.SH DESCRIPTION
+Comment on a pull request. Dry\-run by default; mutates only with `\-\-live`
+.SH OPTIONS
+.TP
+\fB\-\-body\fR \fI<BODY>\fR
+The comment text. Values starting with `\-` are taken literally: the body may open with a `\- ` bullet
+.TP
+\fB\-\-parent\fR \fI<PARENT>\fR
+The comment being replied to, when this is a reply (OBS only; refused on a Gitea ref)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREFERENCE\fR>
+The pull\-request handle: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+.SH VERSION
+v0.2.2

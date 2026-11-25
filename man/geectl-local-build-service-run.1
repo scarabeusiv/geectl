@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-local-build-service-run 1  "geectl-local-build-service-run 0.2.2" 
+.SH NAME
+geectl\-local\-build\-service\-run \- Run the `_service` file\*(Aqs services in the container, filtered by the run mode
+.SH SYNOPSIS
+\fBgeectl local\-build service\-run\fR [\fB\-\-mode\fR] [\fB\-\-service\fR] [\fB\-\-timeout\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIRECTORY\fR> 
+.SH DESCRIPTION
+Run the `_service` file\*(Aqs services in the container, filtered by the run mode
+.SH OPTIONS
+.TP
+\fB\-\-mode\fR \fI<MODE>\fR [default: run]
+The run mode: run, manualrun, precommit, localrun, disabledrun
+.TP
+\fB\-\-service\fR \fI<SERVICE>\fR
+Run only this service, with the run mode forced as its mode
+.TP
+\fB\-\-timeout\-secs\fR \fI<TIMEOUT_SECS>\fR [default: 3600]
+Timeout in seconds for the whole run
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIDIRECTORY\fR>
+The source directory carrying the `_service` file
+.SH VERSION
+v0.2.2

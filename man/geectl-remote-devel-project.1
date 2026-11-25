@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-devel-project 1  "geectl-remote-devel-project 0.2.2" 
+.SH NAME
+geectl\-remote\-devel\-project \- Show the devel project and devel package of a package, when it has one
+.SH SYNOPSIS
+\fBgeectl remote devel\-project\fR [\fB\-\-target\-project\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+Show the devel project and devel package of a package, when it has one
+.SH OPTIONS
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The target project the package lives in (default: openSUSE:Factory)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPACKAGE\fR>
+The package to look up
+.SH VERSION
+v0.2.2

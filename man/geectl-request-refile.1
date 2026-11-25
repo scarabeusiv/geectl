@@ -1,0 +1,42 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-refile 1  "geectl-request-refile 0.2.2" 
+.SH NAME
+geectl\-request\-refile \- File a submit request and supersede an old one with it, plus every other open submit request for the package from the same user: the new request is filed first, and only then is each open one superseded pointing at it
+.SH SYNOPSIS
+\fBgeectl request refile\fR [\fB\-\-cve\fR] [\fB\-\-without\-cleanup\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-source\-project\fR> <\fB\-\-source\-package\fR> <\fB\-\-target\-project\fR> <\fB\-\-target\-package\fR> <\fB\-\-description\fR> <\fB\-\-changes\-entry\fR> <\fB\-\-supersede\fR> 
+.SH DESCRIPTION
+File a submit request and supersede an old one with it, plus every other open submit request for the package from the same user: the new request is filed first, and only then is each open one superseded pointing at it
+.SH OPTIONS
+.TP
+\fB\-\-source\-project\fR \fI<SOURCE_PROJECT>\fR
+The project the change comes from (the branch)
+.TP
+\fB\-\-source\-package\fR \fI<SOURCE_PACKAGE>\fR
+The package in the source project
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The project the request targets: the devel project, or openSUSE:Factory when the source is the recorded devel project and package
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+The package in the target project
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+The request description: one headline, then `\- ` lines for staging, needs, and rebuilds. Values starting with `\-` are taken literally: a description may open with a `\- ` bullet
+.TP
+\fB\-\-changes\-entry\fR \fI<CHANGES_ENTRY>\fR
+The one `.changes` entry for this submission. It must name every CVE passed with `\-\-cve`. Values starting with `\-` are taken literally: a `.changes` entry starts with `\- `
+.TP
+\fB\-\-cve\fR \fI<CVE>\fR
+A CVE this submission claims to fix. Repeatable; each one must be named in `\-\-changes\-entry`
+.TP
+\fB\-\-without\-cleanup\fR
+Keep the source branch on accept instead of deleting it (cleanup is the default)
+.TP
+\fB\-\-supersede\fR \fI<SUPERSEDE>\fR
+The open request this filing supersedes
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

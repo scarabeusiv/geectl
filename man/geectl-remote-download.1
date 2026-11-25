@@ -1,0 +1,30 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-download 1  "geectl-remote-download 0.2.2" 
+.SH NAME
+geectl\-remote\-download \- Download a source file to a local path. The binary counterpart of `cat`: the library streams the file to disk instead of reading it as a UTF\-8 string, so a binary file (a source tarball) downloads instead of failing the UTF\-8 check, and a file larger than the transport\*(Aqs 10 MiB body cap downloads instead of failing. A read: `\-\-live` is ignored, like `cat`
+.SH SYNOPSIS
+\fBgeectl remote download\fR [\fB\-\-rev\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-output\fR> <\fIPROJECT\fR> <\fIPACKAGE\fR> <\fIFILE\fR> 
+.SH DESCRIPTION
+Download a source file to a local path. The binary counterpart of `cat`: the library streams the file to disk instead of reading it as a UTF\-8 string, so a binary file (a source tarball) downloads instead of failing the UTF\-8 check, and a file larger than the transport\*(Aqs 10 MiB body cap downloads instead of failing. A read: `\-\-live` is ignored, like `cat`
+.SH OPTIONS
+.TP
+\fB\-\-rev\fR \fI<REV>\fR
+Download the file as of this revision: a revision number or a srcmd5 (default: latest)
+.TP
+\fB\-\-output\fR \fI<OUTPUT>\fR
+Where to write the downloaded bytes
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package the file lives in
+.TP
+<\fIFILE\fR>
+The file to download
+.SH VERSION
+v0.2.2

@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-list-files 1  "geectl-remote-list-files 0.2.2" 
+.SH NAME
+geectl\-remote\-list\-files \- List the files of a package
+.SH SYNOPSIS
+\fBgeectl remote list\-files\fR [\fB\-\-rev\fR] [\fB\-\-include\-deleted\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+List the files of a package
+.SH OPTIONS
+.TP
+\fB\-\-rev\fR \fI<REV>\fR
+List the files as of this revision (default: latest): a revision number or a srcmd5
+.TP
+\fB\-\-include\-deleted\fR
+Include files from deleted revisions in the listing: the files of a deleted package, for asking whether a project ever held it. Requires OBS credentials: the deleted listing reads the authenticated source route
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package to list
+.SH VERSION
+v0.2.2

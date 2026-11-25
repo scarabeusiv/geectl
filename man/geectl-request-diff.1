@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-diff 1  "geectl-request-diff 0.2.2" 
+.SH NAME
+geectl\-request\-diff \- Show the diff of a submit request: the unified diff, or the request XML with the diff injected with `\-\-xml`
+.SH SYNOPSIS
+\fBgeectl request diff\fR [\fB\-\-xml\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR> 
+.SH DESCRIPTION
+Show the diff of a submit request: the unified diff, or the request XML with the diff injected with `\-\-xml`
+.SH OPTIONS
+.TP
+\fB\-\-xml\fR
+Render the request XML with the diff injected, instead of the unified diff
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIID\fR>
+The request id
+.SH VERSION
+v0.2.2

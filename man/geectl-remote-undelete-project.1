@@ -1,0 +1,18 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-undelete-project 1  "geectl-remote-undelete-project 0.2.2" 
+.SH NAME
+geectl\-remote\-undelete\-project \- Restore a deleted project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the restore
+.SH SYNOPSIS
+\fBgeectl remote undelete\-project\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
+.SH DESCRIPTION
+Restore a deleted project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the restore
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to restore
+.SH VERSION
+v0.2.2

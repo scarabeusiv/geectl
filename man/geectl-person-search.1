@@ -1,0 +1,31 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-person-search 1  "geectl-person-search 0.2.2" 
+.SH NAME
+geectl\-person\-search \- Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword. With no `\-\-backend` both arms run, OBS first then Gitea
+.SH SYNOPSIS
+\fBgeectl person search\fR [\fB\-\-backend\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIQUERY\fR> 
+.SH DESCRIPTION
+Search for a person: the OBS projects naming the login, and the Gitea users matching the keyword. With no `\-\-backend` both arms run, OBS first then Gitea
+.SH OPTIONS
+.TP
+\fB\-\-backend\fR \fI<BACKEND>\fR
+Only search this backend (`obs` or `gitea`). With no backend both arms run, OBS first then Gitea
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+obs
+.IP \(bu 2
+gitea
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIQUERY\fR>
+The query: an OBS login, a Gitea keyword
+.SH VERSION
+v0.2.2

@@ -1,0 +1,18 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-comments 1  "geectl-pull-request-comments 0.2.2" 
+.SH NAME
+geectl\-pull\-request\-comments \- List the comments on a pull request, oldest first. A read, always live
+.SH SYNOPSIS
+\fBgeectl pull\-request comments\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+.SH DESCRIPTION
+List the comments on a pull request, oldest first. A read, always live
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREFERENCE\fR>
+The pull\-request handle: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+.SH VERSION
+v0.2.2

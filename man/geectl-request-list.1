@@ -1,0 +1,30 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-list 1  "geectl-request-list 0.2.2" 
+.SH NAME
+geectl\-request\-list \- List submit requests: the same search, with the states still awaiting action (new, review) as the default. A thin wrapper over the search operation: the flags select the same server\-side search
+.SH SYNOPSIS
+\fBgeectl request list\fR [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-state\fR] [\fB\-\-since\fR] [\fB\-\-limit\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+List submit requests: the same search, with the states still awaiting action (new, review) as the default. A thin wrapper over the search operation: the flags select the same server\-side search
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+Requests touching this project
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+Requests touching this package; requires `\-\-project`
+.TP
+\fB\-\-state\fR \fI<STATE>\fR
+Requests in this state; when empty, new and review
+.TP
+\fB\-\-since\fR \fI<SINCE>\fR
+Only requests with a history entry at or after this date, or a last update at or after it, as `YYYY\-MM\-DD` or `YYYY\-MM\-DDTHH:MM:SS`
+.TP
+\fB\-\-limit\fR \fI<LIMIT>\fR
+Ask the server for at most this many matches
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

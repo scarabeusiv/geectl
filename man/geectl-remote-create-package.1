@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-create-package 1  "geectl-remote-create-package 0.2.2" 
+.SH NAME
+geectl\-remote\-create\-package \- Create a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation. Without `\-\-scmsync` and `\-\-force` the package is created directly; with either, the creation goes through the options form, which refuses an existing package unless `\-\-force` is set and refuses a project managed in git
+.SH SYNOPSIS
+\fBgeectl remote create\-package\fR [\fB\-\-scmsync\fR] [\fB\-\-force\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-title\fR> <\fB\-\-description\fR> <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+Create a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation. Without `\-\-scmsync` and `\-\-force` the package is created directly; with either, the creation goes through the options form, which refuses an existing package unless `\-\-force` is set and refuses a project managed in git
+.SH OPTIONS
+.TP
+\fB\-\-title\fR \fI<TITLE>\fR
+The package title
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+The package description
+.TP
+\fB\-\-scmsync\fR \fI<SCMSYNC>\fR
+The git repository and branch the package syncs its sources from, as `url#branch`
+.TP
+\fB\-\-force\fR
+Overwrite the package when it already exists
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to create the package in
+.TP
+<\fIPACKAGE\fR>
+The package to create
+.SH VERSION
+v0.2.2

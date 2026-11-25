@@ -1,0 +1,42 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-wait-for-results 1  "geectl-build-wait-for-results 0.2.2" 
+.SH NAME
+geectl\-build\-wait\-for\-results \- Poll the build results until they settle, or the deadline passes
+.SH SYNOPSIS
+\fBgeectl build wait\-for\-results\fR [\fB\-\-package\fR] [\fB\-\-repository\fR] [\fB\-\-arch\fR] [\fB\-\-code\fR] [\fB\-\-multibuild\fR] [\fB\-\-locallink\fR] [\fB\-\-lastbuild\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-deadline\-secs\fR> <\fIPROJECT\fR> 
+.SH DESCRIPTION
+Poll the build results until they settle, or the deadline passes
+.SH OPTIONS
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+Only this package\*(Aqs statuses (the repository/architecture cells still come back whole)
+.TP
+\fB\-\-repository\fR \fI<REPOSITORY>\fR
+Only these repositories (repeatable)
+.TP
+\fB\-\-arch\fR \fI<ARCH>\fR
+Only these architectures (repeatable)
+.TP
+\fB\-\-code\fR \fI<CODE>\fR
+Only packages with this build code (e.g. `failed`)
+.TP
+\fB\-\-multibuild\fR
+Expand multibuild flavors into their own statuses
+.TP
+\fB\-\-locallink\fR
+Follow local links when expanding multibuild flavors
+.TP
+\fB\-\-lastbuild\fR
+The last build\*(Aqs results instead of the current state
+.TP
+\fB\-\-deadline\-secs\fR \fI<DEADLINE_SECS>\fR
+Deadline in seconds: the wait fails with a timeout past it
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to poll
+.SH VERSION
+v0.2.2

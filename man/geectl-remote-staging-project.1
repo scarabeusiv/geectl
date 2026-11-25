@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-staging-project 1  "geectl-remote-staging-project 0.2.2" 
+.SH NAME
+geectl\-remote\-staging\-project \- Show one staging project of a workflow project
+.SH SYNOPSIS
+\fBgeectl remote staging\-project\fR [\fB\-\-no\-requests\fR] [\fB\-\-no\-status\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fINAME\fR> 
+.SH DESCRIPTION
+Show one staging project of a workflow project
+.SH OPTIONS
+.TP
+\fB\-\-no\-requests\fR
+Leave out the staged, untracked, and obsolete request lists
+.TP
+\fB\-\-no\-status\fR
+Leave out the overall state of the staging project
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The workflow project the staging project belongs to
+.TP
+<\fINAME\fR>
+The staging project name
+.SH VERSION
+v0.2.2

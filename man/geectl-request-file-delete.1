@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-file-delete 1  "geectl-request-file-delete 0.2.2" 
+.SH NAME
+geectl\-request\-file\-delete \- File a delete request: delete a package, a repository, or a whole project
+.SH SYNOPSIS
+\fBgeectl request file\-delete\fR [\fB\-\-package\fR] [\fB\-\-repository\fR] [\fB\-\-whole\-project\fR] [\fB\-\-accept\-in\-hours\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-target\-project\fR> <\fB\-\-description\fR> 
+.SH DESCRIPTION
+File a delete request: delete a package, a repository, or a whole project
+.SH OPTIONS
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The project the deletion targets
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package to delete. Omit both this and `\-\-repository` to delete the whole project (with `\-\-whole\-project`)
+.TP
+\fB\-\-repository\fR \fI<REPOSITORY>\fR
+The repository to delete. Omit both this and `\-\-package` to delete the whole project (with `\-\-whole\-project`)
+.TP
+\fB\-\-whole\-project\fR
+Delete the whole project: required when neither `\-\-package` nor `\-\-repository` is given. A whole\-project deletion is destructive, so omitting the target is not enough — the flag is the explicit confirmation
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+The request description. Values starting with `\-` are taken literally: a description may open with a `\- ` bullet
+.TP
+\fB\-\-accept\-in\-hours\fR \fI<ACCEPT_IN_HOURS>\fR
+Auto\-accept the request this many hours after filing (the server accepts it on its own once the time passes), as `osc deletereq \-\-accept\-in\-hours` does. The timestamp is computed at filing time; 0 means accept immediately
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2
