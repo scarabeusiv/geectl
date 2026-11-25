@@ -5,7 +5,7 @@
 //! `--help` and `--version` exit 0, the version payload is valid JSON on
 //! stdout, and errors go to stderr with a structured shape.
 
-use geectl::changelog::changes::parse_header;
+use geectl::changelog::changes::{parse_changes, parse_header};
 use std::process::Command;
 
 fn geectl() -> Command {
@@ -8767,8 +8767,11 @@ fn normalize_header_time(entry: &str) -> String {
 
 #[test]
 fn changelog_generate_prints_draft_with_news_slots() {
+    // The bump shape: the spec is at 2.0 while the newest
+    // `.changes` entry is still at 1.0, so the version is new and
+    // the NEWS section is extracted as a highlights slot.
     let dir = TempDir::new();
-    let pkg = changelog_fixture(&dir, "- Update to 2.0", true);
+    let pkg = changelog_fixture(&dir, "- Update to 1.0", true);
     let out = geectl_isolated(&dir)
         .args(["changelog", "generate"])
         .arg(&pkg)
@@ -8812,8 +8815,10 @@ fn changelog_generate_prints_draft_with_news_slots() {
 
 #[test]
 fn changelog_generate_write_refuses_incomplete_draft() {
+    // The bump shape (see `changelog_generate_prints_draft_with_news_slots`):
+    // the draft carries the NEWS highlights slot, so `--write` refuses it.
     let dir = TempDir::new();
-    let pkg = changelog_fixture(&dir, "- Update to 2.0", true);
+    let pkg = changelog_fixture(&dir, "- Update to 1.0", true);
     let before = fs::read_to_string(pkg.join("foo.changes")).unwrap();
     let out = geectl_isolated(&dir)
         .args(["changelog", "generate"])
@@ -8839,9 +8844,10 @@ fn changelog_generate_write_refuses_slot_only_draft() {
     // carries the no-news TODO slot — `--write` refuses it. (The
     // `--write` success path, a slot-free draft, needs a target diff
     // and is covered at the lib level by
-    // `generate_license_only_change_has_no_slots`.)
+    // `generate_license_only_change_has_no_slots`.) The fixture is
+    // the bump shape, so the slot exists at all.
     let dir = TempDir::new();
-    let pkg = changelog_fixture(&dir, "- Update to 2.0", false);
+    let pkg = changelog_fixture(&dir, "- Update to 1.0", false);
     let before = fs::read_to_string(pkg.join("foo.changes")).unwrap();
     let out = geectl_isolated(&dir)
         .args(["changelog", "generate"])
@@ -8863,6 +8869,220 @@ fn changelog_generate_write_refuses_slot_only_draft() {
     );
     // The file is untouched.
     assert_eq!(fs::read_to_string(pkg.join("foo.changes")).unwrap(), before);
+}
+
+#[test]
+fn changelog_generate_message_hotfix_carries_only_the_message() {
+    // The hotfix shape: the spec is at 2.0 and the newest
+    // `.changes` entry already documents 2.0, so the version is
+    // unchanged — no version line, no summarize slot. The message
+    // is the whole entry.
+    let dir = TempDir::new();
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", false);
+    let out = geectl_isolated(&dir)
+        .args(["changelog", "generate"])
+        .arg(&pkg)
+        .args([
+            "--author",
+            "Jane Packager <jane@example.com>",
+            "-m",
+            "Fix the parser crash",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["needs_detail"], false);
+    assert_eq!(value["slots"], 0);
+    let entry = value["entry"].as_str().unwrap();
+    assert!(entry.contains("- Fix the parser crash"));
+    assert!(!entry.contains("Update to"));
+    assert!(!entry.contains("TODO"));
+}
+
+#[test]
+fn changelog_generate_message_hotfix_skips_news() {
+    // The hotfix shape with upstream NEWS: the version is
+    // unchanged, so no NEWS is extracted — no highlights slot, no
+    // version line, no detail demanded. The message is the entry.
+    // (The bump shape, where the message replaces the highlights
+    // slot, is pinned at the lib level by
+    // `message_replaces_the_highlights_slot_when_news_exists`.)
+    let dir = TempDir::new();
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", true);
+    let out = geectl_isolated(&dir)
+        .args(["changelog", "generate"])
+        .arg(&pkg)
+        .args([
+            "--author",
+            "Jane Packager <jane@example.com>",
+            "-m",
+            "Rework the parser error path",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["needs_detail"], false);
+    assert_eq!(value["news_found"], false);
+    assert_eq!(value["slots"], 0);
+    let entry = value["entry"].as_str().unwrap();
+    assert!(entry.contains("- Rework the parser error path"));
+    assert!(!entry.contains("Update to"));
+    assert!(!entry.contains("Upstream highlights"));
+    assert!(!entry.contains("Fix a crash"));
+    assert!(!entry.contains("TODO"));
+}
+
+#[test]
+fn changelog_generate_hotfix_message_write_prepends_and_validates() {
+    // The hotfix shape, end to end: the written entry is just the
+    // message — no version line, no NEWS — and it validates clean.
+    let dir = TempDir::new();
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", true);
+    let before = fs::read_to_string(pkg.join("foo.changes")).unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["changelog", "generate"])
+        .arg(&pkg)
+        .args([
+            "--author",
+            "Jane Packager <jane@example.com>",
+            "-m",
+            "fix bug123",
+            "--write",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = fs::read_to_string(pkg.join("foo.changes")).unwrap();
+    assert!(after.ends_with(&before));
+    let written = parse_changes(&after);
+    let first = written.entries.first().expect("a written entry");
+    let bullets: Vec<String> = first
+        .bullets()
+        .into_iter()
+        .map(|(_, text, _)| text)
+        .collect();
+    assert_eq!(bullets, vec!["- fix bug123"]);
+    // The written entry validates clean on its own.
+    let out = geectl_isolated(&dir)
+        .args(["changelog", "validate"])
+        .arg(&pkg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+}
+
+#[test]
+fn changelog_generate_hotfix_without_message_is_nothing_to_generate() {
+    // The hotfix shape without a message or a target diff: there
+    // is nothing to generate, so the command refuses loudly
+    // instead of printing a bare header.
+    let dir = TempDir::new();
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", true);
+    let out = geectl_isolated(&dir)
+        .args(["changelog", "generate"])
+        .arg(&pkg)
+        .args(["--author", "Jane Packager <jane@example.com>"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(
+        value["error"]["context"]
+            .as_str()
+            .unwrap()
+            .contains("nothing to generate"),
+        "context: {}",
+        value["error"]["context"]
+    );
+}
+
+#[test]
+fn changelog_generate_message_write_prepends_and_validates() {
+    let dir = TempDir::new();
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", false);
+    let before = fs::read_to_string(pkg.join("foo.changes")).unwrap();
+    let out = geectl_isolated(&dir)
+        .args(["changelog", "generate"])
+        .arg(&pkg)
+        .args([
+            "--author",
+            "Jane Packager <jane@example.com>",
+            "-m",
+            "Fix the parser crash",
+            "--write",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = fs::read_to_string(pkg.join("foo.changes")).unwrap();
+    assert!(after.contains("- Fix the parser crash"));
+    assert!(after.ends_with(&before));
+    // The written entry validates clean on its own.
+    let out = geectl_isolated(&dir)
+        .args(["changelog", "validate"])
+        .arg(&pkg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+}
+
+#[test]
+fn changelog_generate_message_multiline_and_repeatable() {
+    let dir = TempDir::new();
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", false);
+    let out = geectl_isolated(&dir)
+        .args(["changelog", "generate"])
+        .arg(&pkg)
+        .args([
+            "--author",
+            "Jane Packager <jane@example.com>",
+            "-m",
+            "First line\nsecond line",
+            "-m",
+            "Second bullet",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let entry = value["entry"].as_str().unwrap();
+    assert!(entry.contains("- First line\n  second line\n"));
+    assert!(entry.contains("- Second bullet\n"));
+}
+
+#[test]
+fn changelog_generate_message_empty_is_refused() {
+    let dir = TempDir::new();
+    let pkg = changelog_fixture(&dir, "- Update to 2.0", false);
+    let out = geectl_isolated(&dir)
+        .args(["changelog", "generate"])
+        .arg(&pkg)
+        .args(["--author", "Jane Packager <jane@example.com>", "-m", ""])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
+    assert_eq!(value["error"]["code"], "invalid_input");
+    assert!(value["error"]["context"]
+        .as_str()
+        .unwrap()
+        .contains("--message must carry text"));
 }
 
 #[test]

@@ -2970,7 +2970,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__changelog__subcmd__generate)
-            opts="-h --target-project --target-package --author --write --format --debug --debug-body --live --help"
+            opts="-m -h --target-project --target-package --author --message --write --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2985,6 +2985,14 @@ _geectl() {
                     return 0
                     ;;
                 --author)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --message)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -m)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

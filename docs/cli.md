@@ -327,7 +327,7 @@ without evaluating trust.
 ## `changelog` — `.changes` validation and generation
 
 - `geectl changelog validate [DIR]` — Validate the `.changes` entries in a package directory against the V1–V12 rules; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --entries <ENTRIES>
-- `geectl changelog generate [DIR]` — Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --author <AUTHOR>, --write
+- `geectl changelog generate [DIR]` — Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --author <AUTHOR>, --message <MESSAGE>, --write
 
 ## Working copy — git working copy
 

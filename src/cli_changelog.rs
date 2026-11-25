@@ -18,7 +18,7 @@
 //! rules — the same shape the skill's `changes-lint.sh` prints.
 
 use crate::changelog::changes::normalize_changes_content;
-use crate::changelog::generate::{generate, prepend_entry};
+use crate::changelog::generate::{generate, message_bullets, prepend_entry, version_is_new};
 use crate::changelog::news::{extract_news_section, find_tarball, NewsSection};
 use crate::changelog::spec::parse_spec;
 use crate::changelog::validate::{validate, PackageSnapshot, ValidateOptions};
@@ -78,6 +78,18 @@ pub enum ChangelogCommand {
         /// form — exactly what a bare `changelog` invocation writes.
         #[arg(long)]
         author: Option<String>,
+        /// Custom message bullets for the entry, one bullet per
+        /// `-m`. Repeatable: `-m "Fix the crash" -m "Add the
+        /// subcommand"`. A message may span lines — embedded
+        /// newlines become indented continuation lines of that
+        /// bullet, and a blank line inside a message is a paragraph
+        /// break within it. A leading `- `, `* ` or `+ ` marker is
+        /// stripped, never double-bulleted. The message is the
+        /// human detail: it replaces the TODO summary slot, so
+        /// `--write` no longer refuses the draft for the missing
+        /// message; other TODO slots still refuse.
+        #[arg(short, long)]
+        message: Vec<String>,
         /// Prepend the draft into the package's `.changes` file
         /// instead of printing it. The whole file is normalized
         /// on write: trailing ASCII whitespace stripped, CRLF→LF,
@@ -113,8 +125,17 @@ pub fn run_changelog(
             target_project,
             target_package,
             author,
+            message,
             write,
-        } => run_generate(&dir, target_project, target_package, author, write, debug),
+        } => run_generate(
+            &dir,
+            target_project,
+            target_package,
+            author,
+            message,
+            write,
+            debug,
+        ),
     }
 }
 
@@ -457,6 +478,7 @@ fn run_generate(
     target_project: Option<String>,
     target_package: Option<String>,
     author: Option<String>,
+    message: Vec<String>,
     write: bool,
     debug: &Debug,
 ) -> Result<(Value, String), GeectlError> {
@@ -469,15 +491,48 @@ fn run_generate(
             ));
         }
     };
+    // A message must carry text: blank lines or a bare bullet
+    // marker alone render to no bullet at all. Leading and
+    // trailing blank lines are trimmed first, so a message that
+    // is only whitespace around its text still renders as one
+    // bullet.
+    let messages: Vec<String> = message
+        .iter()
+        .map(|message| message.trim().to_string())
+        .collect();
+    for message in &messages {
+        if message_bullets(message)
+            .iter()
+            .all(|line| line.trim().is_empty())
+        {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                "--message must carry text, not just blank lines or a bare bullet marker",
+            ));
+        }
+    }
     let target = resolve_target(target_project, target_package)?;
     let local = load_local(dir)?;
     let target_snapshot = match &target {
         Some((project, package)) => fetch_target(debug, project, package)?,
         None => None,
     };
-    let (news, news_error, _) = lookup_news(dir, &local);
-    let generation = generate(&local, target_snapshot.as_ref(), &author, news.as_ref())
-        .map_err(|err| GeectlError::new(ErrorKind::InternalError, err))?;
+    // NEWS is only looked up for a new version: when the version
+    // is unchanged, the upstream section for it was already
+    // distilled when the version landed, so there is nothing to
+    // extract.
+    let (news, news_error, _) = if version_is_new(&local, target_snapshot.as_ref()) {
+        lookup_news(dir, &local)
+    } else {
+        (None, None, false)
+    };
+    let generation = generate(
+        &local,
+        target_snapshot.as_ref(),
+        &author,
+        news.as_ref(),
+        &messages,
+    )?;
     let spec_name = local
         .spec_names()
         .first()
