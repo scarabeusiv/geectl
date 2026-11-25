@@ -1931,7 +1931,12 @@ fn all_failed_kind(outcomes: &[InstanceBuildResults]) -> ErrorKind {
     kinds
         .first()
         .map(|(_, _, kind)| *kind)
-        .expect("an every-instance failure has at least one outcome")
+        // An every-instance failure always carries at least one
+        // outcome: `merged_endpoints` pushes the default endpoint
+        // first, so the outcomes list is never empty. The fallback
+        // is unreachable; it keeps a violated invariant an error
+        // instead of a panic.
+        .unwrap_or(ErrorKind::InternalError)
 }
 
 /// The merged results as JSON: the project plus one object per
