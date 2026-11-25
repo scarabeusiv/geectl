@@ -1,0 +1,60 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-branch-link-package 1  "geectl-branch-link-package 0.2.2" 
+.SH NAME
+geectl\-branch\-link\-package \- Link a package to another package. A mutation: dry\-run is the default
+.SH SYNOPSIS
+\fBgeectl branch link\-package\fR [\fB\-\-force\fR] [\fB\-\-revision\fR] [\fB\-\-vrev\fR] [\fB\-\-cicount\fR] [\fB\-\-missing\-target\fR] [\fB\-\-disable\-build\fR] [\fB\-\-disable\-publish\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-source\-project\fR> <\fB\-\-source\-package\fR> <\fB\-\-target\-project\fR> <\fB\-\-target\-package\fR> 
+.SH DESCRIPTION
+Link a package to another package. A mutation: dry\-run is the default
+.SH OPTIONS
+.TP
+\fB\-\-source\-project\fR \fI<SOURCE_PROJECT>\fR
+The project to link from
+.TP
+\fB\-\-source\-package\fR \fI<SOURCE_PACKAGE>\fR
+The package to link
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The project to link in
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+The package to link as
+.TP
+\fB\-\-force\fR
+Replace an existing link in the target package
+.TP
+\fB\-\-revision\fR \fI<REVISION>\fR
+Pin the link at this source revision (a number or an md5)
+.TP
+\fB\-\-vrev\fR \fI<VREV>\fR
+The link\*(Aqs vrev attribute
+.TP
+\fB\-\-cicount\fR \fI<CICOUNT>\fR
+The link\*(Aqs cicount attribute: `add`, `copy`, or `local`
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+add
+.IP \(bu 2
+copy
+.IP \(bu 2
+local
+.RE
+.TP
+\fB\-\-missing\-target\fR
+Allow the link to point at a package that does not exist yet
+.TP
+\fB\-\-disable\-build\fR
+Disable building the target package
+.TP
+\fB\-\-disable\-publish\fR
+Disable publishing the target package
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

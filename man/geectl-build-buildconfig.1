@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-buildconfig 1  "geectl-build-buildconfig 0.2.2" 
+.SH NAME
+geectl\-build\-buildconfig \- Read the build configuration for a project/repository: the expanded `_buildconfig` text the engine takes as `\-\-dist`
+.SH SYNOPSIS
+\fBgeectl build buildconfig\fR [\fB\-\-alternative\-project\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIREPOSITORY\fR> 
+.SH DESCRIPTION
+Read the build configuration for a project/repository: the expanded `_buildconfig` text the engine takes as `\-\-dist`
+.SH OPTIONS
+.TP
+\fB\-\-alternative\-project\fR \fI<ALTERNATIVE_PROJECT>\fR
+Read the build configuration for another project instead of `project`: the expanded `_buildconfig` text the engine takes as `\-\-dist` there
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to read the build configuration for
+.TP
+<\fIREPOSITORY\fR>
+The repository to read the build configuration for
+.SH VERSION
+v0.2.2

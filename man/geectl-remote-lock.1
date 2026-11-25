@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-lock 1  "geectl-remote-lock 0.2.2" 
+.SH NAME
+geectl\-remote\-lock \- Lock a project or a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the lock. A project lock records the message on the lock; a package lock sends it but the server does not record it
+.SH SYNOPSIS
+\fBgeectl remote lock\fR [\fB\-\-message\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> [\fIPACKAGE\fR] 
+.SH DESCRIPTION
+Lock a project or a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the lock. A project lock records the message on the lock; a package lock sends it but the server does not record it
+.SH OPTIONS
+.TP
+\fB\-\-message\fR \fI<MESSAGE>\fR
+A message for the lock, sent as the server\*(Aqs `comment` query parameter. A project lock records it; a package lock sends it but the server does not record it — there is no package\-scope lock command
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to lock
+.TP
+[\fIPACKAGE\fR]
+The package to lock. Omit to lock the whole project
+.SH VERSION
+v0.2.2

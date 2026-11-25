@@ -1,0 +1,42 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-wipe-binaries 1  "geectl-build-wipe-binaries 0.2.2" 
+.SH NAME
+geectl\-build\-wipe\-binaries \- Wipe the binary packages of a project or a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the wipe. At least one scope selector is required: `\-\-all`, `\-\-arch`, `\-\-repository`, or a status filter
+.SH SYNOPSIS
+\fBgeectl build wipe\-binaries\fR [\fB\-\-arch\fR] [\fB\-\-repository\fR] [\fB\-\-all\fR] [\fB\-\-build\-disabled\fR] [\fB\-\-build\-failed\fR] [\fB\-\-broken\fR] [\fB\-\-unresolvable\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> [\fIPACKAGE\fR] 
+.SH DESCRIPTION
+Wipe the binary packages of a project or a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the wipe. At least one scope selector is required: `\-\-all`, `\-\-arch`, `\-\-repository`, or a status filter
+.SH OPTIONS
+.TP
+\fB\-\-arch\fR \fI<ARCH>\fR
+Wipe only binaries for this architecture
+.TP
+\fB\-\-repository\fR \fI<REPOSITORY>\fR
+Wipe only binaries for this repository
+.TP
+\fB\-\-all\fR
+Wipe all binaries regardless of package status. Combines with no status filter
+.TP
+\fB\-\-build\-disabled\fR
+Wipe only binaries of packages whose build is disabled
+.TP
+\fB\-\-build\-failed\fR
+Wipe only binaries of packages whose build failed
+.TP
+\fB\-\-broken\fR
+Wipe only binaries of packages whose sources are bad
+.TP
+\fB\-\-unresolvable\fR
+Wipe only binaries of packages with dependency errors
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to wipe binaries in
+.TP
+[\fIPACKAGE\fR]
+The package to wipe binaries for. Omit to wipe the whole project
+.SH VERSION
+v0.2.2

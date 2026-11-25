@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-fileinfo 1  "geectl-build-fileinfo 0.2.2" 
+.SH NAME
+geectl\-build\-fileinfo \- Read the metadata of a built file: RPM header fields plus dependency lists
+.SH SYNOPSIS
+\fBgeectl build fileinfo\fR [\fB\-\-ext\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> <\fIREPOSITORY\fR> <\fIARCH\fR> <\fIFILENAME\fR> 
+.SH DESCRIPTION
+Read the metadata of a built file: RPM header fields plus dependency lists
+.SH OPTIONS
+.TP
+\fB\-\-ext\fR
+The `fileinfo_ext` view: each dependency names the packages providing or requiring it
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package is in
+.TP
+<\fIPACKAGE\fR>
+The package the file belongs to
+.TP
+<\fIREPOSITORY\fR>
+The repository the file was built in
+.TP
+<\fIARCH\fR>
+The architecture the file was built for
+.TP
+<\fIFILENAME\fR>
+The file to read the metadata for
+.SH VERSION
+v0.2.2

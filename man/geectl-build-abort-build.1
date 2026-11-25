@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-abort-build 1  "geectl-build-abort-build 0.2.2" 
+.SH NAME
+geectl\-build\-abort\-build \- Abort the running build of a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the abort
+.SH SYNOPSIS
+\fBgeectl build abort\-build\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> <\fIREPOSITORY\fR> <\fIARCH\fR> 
+.SH DESCRIPTION
+Abort the running build of a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the abort
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package is in
+.TP
+<\fIPACKAGE\fR>
+The package to abort the build for
+.TP
+<\fIREPOSITORY\fR>
+The repository the package builds in
+.TP
+<\fIARCH\fR>
+The architecture the package builds for
+.SH VERSION
+v0.2.2

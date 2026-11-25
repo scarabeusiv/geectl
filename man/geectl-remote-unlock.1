@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-unlock 1  "geectl-remote-unlock 0.2.2" 
+.SH NAME
+geectl\-remote\-unlock \- Unlock a project or a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the unlock. The message is required: the server refuses an unlock without a comment
+.SH SYNOPSIS
+\fBgeectl remote unlock\fR [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-message\fR> <\fIPROJECT\fR> [\fIPACKAGE\fR] 
+.SH DESCRIPTION
+Unlock a project or a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the unlock. The message is required: the server refuses an unlock without a comment
+.SH OPTIONS
+.TP
+\fB\-\-message\fR \fI<MESSAGE>\fR
+A message recorded on the unlock, sent as the server\*(Aqs `comment` query parameter
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to unlock
+.TP
+[\fIPACKAGE\fR]
+The package to unlock. Omit to unlock the whole project
+.SH VERSION
+v0.2.2

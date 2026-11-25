@@ -1,0 +1,57 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-set-package-meta 1  "geectl-remote-set-package-meta 0.2.2" 
+.SH NAME
+geectl\-remote\-set\-package\-meta \- Set a package\*(Aqs meta, field by field or whole from a file. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Field flags change only the given fields; the rest of the meta is kept as it is. Clear a field with `\-\-from\-file`: fields the file omits are cleared
+.SH SYNOPSIS
+\fBgeectl remote set\-package\-meta\fR [\fB\-\-from\-file\fR] [\fB\-\-title\fR] [\fB\-\-description\fR] [\fB\-\-url\fR] [\fB\-\-scmsync\fR] [\fB\-\-releasename\fR] [\fB\-\-devel\-project\fR] [\fB\-\-devel\-package\fR] [\fB\-\-add\-person\fR] [\fB\-\-remove\-person\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+Set a package\*(Aqs meta, field by field or whole from a file. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Field flags change only the given fields; the rest of the meta is kept as it is. Clear a field with `\-\-from\-file`: fields the file omits are cleared.
+.PP
+`\-\-from\-file FILE` writes the given meta file as the whole meta instead: the file\*(Aqs title, description, URL, scmsync, release name, devel project and package, persons, and groups replace what the server holds, and fields the file omits are cleared. The file\*(Aqs package name and project must match the package. Settings outside the typed meta survive, as in the field\-wise write. `\-\-from\-file` conflicts with every field and person flag.
+.PP
+`\-\-add\-person LOGIN:ROLE` grants a role to a person; `\-\-remove\-person LOGIN` removes every role that login holds. Removal applies before addition, so the pair moves a person to a new role. There is no last\-maintainer refusal on a package: the project maintainers still cover it. Roles: maintainer, bugowner, reviewer, reader, downloader.
+.PP
+The field\-wise write is not atomic: the field write runs first, then each person change is a separate read\-modify\-write, so a failure part\-way leaves the earlier changes applied, with no rollback. The `\-\-from\-file` write is a single `set_package_meta` call instead — one read\-modify\-write, one GET and at most one PUT when live — so a failure leaves either the old meta or the file\*(Aqs meta, never a half\-written mix. Dry\-run does not read the live meta, so a removal is not validated there: a login holding no role only fails with `\-\-live`.
+.SH OPTIONS
+.TP
+\fB\-\-from\-file\fR \fI<FROM_FILE>\fR
+Write the given meta file as the whole meta instead of setting fields: the file is a `<package>` document whose name and project match the package. Conflicts with every field and person flag
+.TP
+\fB\-\-title\fR \fI<TITLE>\fR
+The new title
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+The new description
+.TP
+\fB\-\-url\fR \fI<URL>\fR
+The new URL
+.TP
+\fB\-\-scmsync\fR \fI<SCMSYNC>\fR
+The new scmsync URL
+.TP
+\fB\-\-releasename\fR \fI<RELEASENAME>\fR
+The new release name
+.TP
+\fB\-\-devel\-project\fR \fI<DEVEL_PROJECT>\fR
+The new devel project
+.TP
+\fB\-\-devel\-package\fR \fI<DEVEL_PACKAGE>\fR
+The new devel package. Needs `\-\-devel\-project` unless the package already has a devel project
+.TP
+\fB\-\-add\-person\fR \fI<ADD_PERSON>\fR
+Grant a role to a person: `LOGIN:ROLE`, repeatable
+.TP
+\fB\-\-remove\-person\fR \fI<REMOVE_PERSON>\fR
+Remove a person: every role the login holds, repeatable
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package whose meta is written
+.SH VERSION
+v0.2.2

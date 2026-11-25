@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-gitea-repo-create 1  "geectl-gitea-repo-create 0.2.2" 
+.SH NAME
+geectl\-gitea\-repo\-create \- Create a repository under the token owner\*(Aqs account. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation
+.SH SYNOPSIS
+\fBgeectl gitea repo\-create\fR [\fB\-\-private\fR] [\fB\-\-description\fR] [\fB\-\-default\-branch\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fINAME\fR> 
+.SH DESCRIPTION
+Create a repository under the token owner\*(Aqs account. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation
+.SH OPTIONS
+.TP
+\fB\-\-private\fR
+Create a private repository; public by default
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+A short description
+.TP
+\fB\-\-default\-branch\fR \fI<DEFAULT_BRANCH>\fR
+The default branch; the server default when unset
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fINAME\fR>
+The repository name
+.SH VERSION
+v0.2.2

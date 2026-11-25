@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-withdraw 1  "geectl-pull-request-withdraw 0.2.2" 
+.SH NAME
+geectl\-pull\-request\-withdraw \- Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry\-run by default; mutates only with `\-\-live`
+.SH SYNOPSIS
+\fBgeectl pull\-request withdraw\fR [\fB\-\-message\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+.SH DESCRIPTION
+Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry\-run by default; mutates only with `\-\-live`
+.SH OPTIONS
+.TP
+\fB\-\-message\fR \fI<MESSAGE>\fR
+The reason for the decline or withdrawal. Values starting with `\-` are taken literally: a message may open with a `\- ` bullet
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREFERENCE\fR>
+The pull\-request handle: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+.SH VERSION
+v0.2.2

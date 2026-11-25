@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-gitea-repo-fork 1  "geectl-gitea-repo-fork 0.2.2" 
+.SH NAME
+geectl\-gitea\-repo\-fork \- Fork a repository into the token owner\*(Aqs account (or an organization with `\-\-organization`). A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the fork
+.SH SYNOPSIS
+\fBgeectl gitea repo\-fork\fR [\fB\-\-new\-name\fR] [\fB\-\-organization\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIOWNER\fR> <\fIREPO\fR> 
+.SH DESCRIPTION
+Fork a repository into the token owner\*(Aqs account (or an organization with `\-\-organization`). A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the fork
+.SH OPTIONS
+.TP
+\fB\-\-new\-name\fR \fI<NEW_NAME>\fR
+Name for the fork; defaults to the source repo name
+.TP
+\fB\-\-organization\fR \fI<ORGANIZATION>\fR
+Organization to fork into; defaults to the token owner\*(Aqs account
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIOWNER\fR>
+The repository owner
+.TP
+<\fIREPO\fR>
+The repository name
+.SH VERSION
+v0.2.2

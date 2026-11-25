@@ -1,0 +1,36 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-download-binary 1  "geectl-build-download-binary 0.2.2" 
+.SH NAME
+geectl\-build\-download\-binary \- Download one built file by name. With `\-\-all`, every built file
+.SH SYNOPSIS
+\fBgeectl build download\-binary\fR [\fB\-\-all\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-output\fR> <\fIPROJECT\fR> <\fIPACKAGE\fR> <\fIREPOSITORY\fR> <\fIARCH\fR> [\fIFILENAME\fR] 
+.SH DESCRIPTION
+Download one built file by name. With `\-\-all`, every built file
+.SH OPTIONS
+.TP
+\fB\-\-output\fR \fI<OUTPUT>\fR
+Where to write the downloaded bytes: the file path (it must not already exist), or the directory every built file goes into with `\-\-all`
+.TP
+\fB\-\-all\fR
+Download every built file into the `\-\-output` directory; a file already there refuses the run. The downloads are sequential, not atomic: if one fails, the files already downloaded stay
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package is in
+.TP
+<\fIPACKAGE\fR>
+The package the file belongs to
+.TP
+<\fIREPOSITORY\fR>
+The repository the file was built in
+.TP
+<\fIARCH\fR>
+The architecture the file was built for
+.TP
+[\fIFILENAME\fR]
+The file to download (e.g. `foo\-1.0\-1.x86_64.rpm`). Required unless `\-\-all` downloads every built file
+.SH VERSION
+v0.2.2

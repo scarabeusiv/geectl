@@ -1,0 +1,36 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-file-add-role 1  "geectl-request-file-add-role 0.2.2" 
+.SH NAME
+geectl\-request\-file\-add\-role \- File an add\-role request: grant a person or a group a role on a project or a package
+.SH SYNOPSIS
+\fBgeectl request file\-add\-role\fR [\fB\-\-target\-package\fR] [\fB\-\-person\fR] [\fB\-\-person\-role\fR] [\fB\-\-group\fR] [\fB\-\-group\-role\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-target\-project\fR> <\fB\-\-description\fR> 
+.SH DESCRIPTION
+File an add\-role request: grant a person or a group a role on a project or a package
+.SH OPTIONS
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The project the role is granted on
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+The package the role is granted on; omit for a project\-level grant
+.TP
+\fB\-\-person\fR \fI<PERSON>\fR
+The person granted the role
+.TP
+\fB\-\-person\-role\fR \fI<PERSON_ROLE>\fR
+The role granted to the person
+.TP
+\fB\-\-group\fR \fI<GROUP>\fR
+The group granted the role
+.TP
+\fB\-\-group\-role\fR \fI<GROUP_ROLE>\fR
+The role granted to the group
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+The request description. Values starting with `\-` are taken literally: a description may open with a `\- ` bullet
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

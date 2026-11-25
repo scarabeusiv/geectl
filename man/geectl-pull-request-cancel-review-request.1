@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-cancel-review-request 1  "geectl-pull-request-cancel-review-request 0.2.2" 
+.SH NAME
+geectl\-pull\-request\-cancel\-review\-request \- Cancel pending review requests on a pull request. Dry\-run by default; mutates only with `\-\-live`. On OBS the cancel fails closed
+.SH SYNOPSIS
+\fBgeectl pull\-request cancel\-review\-request\fR [\fB\-\-reviewer\fR] [\fB\-\-all\fR] [\fB\-\-exclude\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+.SH DESCRIPTION
+Cancel pending review requests on a pull request. Dry\-run by default; mutates only with `\-\-live`. On OBS the cancel fails closed
+.SH OPTIONS
+.TP
+\fB\-\-reviewer\fR \fI<REVIEWER>\fR
+The reviewers to cancel, repeatable; `@team` names a team
+.TP
+\fB\-\-all\fR
+Cancel every pending review request
+.TP
+\fB\-\-exclude\fR \fI<EXCLUDE>\fR
+With `\-\-all`, leave these reviewers out; `@team` names a team
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREFERENCE\fR>
+The pull\-request handle: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+.SH VERSION
+v0.2.2

@@ -1,0 +1,41 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-create-token 1  "geectl-remote-create-token 0.2.2" 
+.SH NAME
+geectl\-remote\-create\-token \- Create an operation\-scoped trigger token for the authenticated user. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation. The secret prints once, at creation: store it now. Project and package go together: give both to scope the token to a package, or neither for a global token
+.SH SYNOPSIS
+\fBgeectl remote create\-token\fR [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-description\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-operation\fR> 
+.SH DESCRIPTION
+Create an operation\-scoped trigger token for the authenticated user. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation. The secret prints once, at creation: store it now. Project and package go together: give both to scope the token to a package, or neither for a global token
+.SH OPTIONS
+.TP
+\fB\-\-operation\fR \fI<OPERATION>\fR
+The operation the token authorises: runservice, rebuild, release, or workflow
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+runservice: Run source services: the `runservice` trigger
+.IP \(bu 2
+rebuild: Rebuild packages: the `rebuild` trigger
+.IP \(bu 2
+release: Release packages: the `release` trigger
+.IP \(bu 2
+workflow: Run SCM/CI workflows: the `workflow` trigger
+.RE
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The project of the package the token is scoped to
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package the token is scoped to
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+A description identifying the token, at most 64 characters
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH VERSION
+v0.2.2

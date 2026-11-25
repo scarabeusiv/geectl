@@ -1,0 +1,30 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-changelog-generate 1  "geectl-changelog-generate 0.2.2" 
+.SH NAME
+geectl\-changelog\-generate \- Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball. The output is a draft: what the diff cannot supply arrives as explicit `TODO` slots for a human to fill. `\-\-write` prepends the draft into the package\*(Aqs `.changes` file, and refuses an incomplete draft (V9 needs\-detail)
+.SH SYNOPSIS
+\fBgeectl changelog generate\fR [\fB\-\-target\-project\fR] [\fB\-\-target\-package\fR] [\fB\-\-author\fR] [\fB\-\-write\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIDIR\fR] 
+.SH DESCRIPTION
+Generate a skeleton `.changes` entry from the diff against the target (version line, patch and dependency lists, license lines) plus the upstream NEWS section for the new version, extracted from the source tarball. The output is a draft: what the diff cannot supply arrives as explicit `TODO` slots for a human to fill. `\-\-write` prepends the draft into the package\*(Aqs `.changes` file, and refuses an incomplete draft (V9 needs\-detail)
+.SH OPTIONS
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The target project to diff against
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+The target package to diff against
+.TP
+\fB\-\-author\fR \fI<AUTHOR>\fR
+The author line for the entry header, in `Name <email>` form — exactly what a bare `changelog` invocation writes
+.TP
+\fB\-\-write\fR
+Prepend the draft into the package\*(Aqs `.changes` file instead of printing it. The whole file is normalized on write: trailing ASCII whitespace stripped, CRLF→LF, legacy encodings transcoded to UTF\-8, a BOM stripped. The write is atomic and refuses a symlink destination, an unreadable file, or bytes no known encoding decodes. A file decoded from a guessed single\-byte encoding is transcoded on the guess instead — a wrong guess cannot be detected — and the write warns about it, naming the encoding
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+[\fIDIR\fR] [default: .]
+The package directory (default: the current directory)
+.SH VERSION
+v0.2.2

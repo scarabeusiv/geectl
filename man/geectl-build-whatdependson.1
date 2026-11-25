@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-whatdependson 1  "geectl-build-whatdependson 0.2.2" 
+.SH NAME
+geectl\-build\-whatdependson \- List the packages that depend on a package for their build
+.SH SYNOPSIS
+\fBgeectl build whatdependson\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> <\fIREPOSITORY\fR> <\fIARCH\fR> 
+.SH DESCRIPTION
+List the packages that depend on a package for their build
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the repository is in
+.TP
+<\fIPACKAGE\fR>
+The package to find the dependents of
+.TP
+<\fIREPOSITORY\fR>
+The repository to read
+.TP
+<\fIARCH\fR>
+The architecture to read
+.SH VERSION
+v0.2.2

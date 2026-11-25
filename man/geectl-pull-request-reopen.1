@@ -1,0 +1,18 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-pull-request-reopen 1  "geectl-pull-request-reopen 0.2.2" 
+.SH NAME
+geectl\-pull\-request\-reopen \- Reopen a pull request. On OBS this changes a declined request back to `new`; on Gitea it reopens the closed pull request. Dry\-run by default; mutates only with `\-\-live`
+.SH SYNOPSIS
+\fBgeectl pull\-request reopen\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIREFERENCE\fR> 
+.SH DESCRIPTION
+Reopen a pull request. On OBS this changes a declined request back to `new`; on Gitea it reopens the closed pull request. Dry\-run by default; mutates only with `\-\-live`
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREFERENCE\fR>
+The pull\-request handle: `obs:<id>` or `gitea:<owner>/<repo>#<number>`
+.SH VERSION
+v0.2.2

@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-diff-packages 1  "geectl-remote-diff-packages 0.2.2" 
+.SH NAME
+geectl\-remote\-diff\-packages \- Diff two packages, file by file. Computed client\-side: the library diffs the two file lists and cats each changed file, so a differing binary file fails the call
+.SH SYNOPSIS
+\fBgeectl remote diff\-packages\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIOLD_PROJECT\fR> <\fIOLD_PACKAGE\fR> <\fINEW_PROJECT\fR> <\fINEW_PACKAGE\fR> 
+.SH DESCRIPTION
+Diff two packages, file by file. Computed client\-side: the library diffs the two file lists and cats each changed file, so a differing binary file fails the call
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIOLD_PROJECT\fR>
+The old project
+.TP
+<\fIOLD_PACKAGE\fR>
+The old package
+.TP
+<\fINEW_PROJECT\fR>
+The new project
+.TP
+<\fINEW_PACKAGE\fR>
+The new package
+.SH VERSION
+v0.2.2

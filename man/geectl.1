@@ -1,0 +1,119 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl 1  "geectl 0.2.2" 
+.SH NAME
+geectl \- Geeko Controller — a CLI for openSUSE packaging workflows (OBS + src.opensuse.org)
+.SH SYNOPSIS
+\fBgeectl\fR [\fB\-\-format\fR] [\fB\-\-debug\fR] [\fB\-\-debug\-body\fR] [\fB\-\-live\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIsubcommands\fR]
+.SH DESCRIPTION
+Geeko Controller — a CLI for openSUSE packaging workflows (OBS + src.opensuse.org)
+.SH OPTIONS
+.TP
+\fB\-\-format\fR \fI<FORMAT>\fR
+Output format for the result payload. Applies to every command. Default: the `GEECTL_FORMAT` environment variable, else the `format` key in the config file, else `json`
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+json
+.IP \(bu 2
+text
+.RE
+.TP
+\fB\-\-debug\fR
+Enable the debug channel: human\-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; `GEECTL_DEBUG=1` enables it without the flag
+.TP
+\fB\-\-debug\-body\fR
+Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies `\-\-debug`
+.TP
+\fB\-\-live\fR
+Actually perform mutations. Without it, only the plan is printed: dry\-run is the default for mutations
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+geectl\-version(1)
+Print version information as the result payload
+.TP
+geectl\-config(1)
+Inspect or initialise the config file
+.TP
+geectl\-remote(1)
+Remote reads and mutations: inspect what the distribution holds, and change it
+.TP
+geectl\-request(1)
+Read and act on OBS submit requests, and file new ones
+.TP
+geectl\-branch(1)
+Branch, copy, and link packages
+.TP
+geectl\-build(1)
+Build\-status commands: results, logs, histories, binaries, buildconfig
+.TP
+geectl\-local\-build(1)
+Local builds in the podman build vertical: build a package, run its `_service` services, the precommit gate, `spec\-cleaner`, wipe a build root, prune the cache, manage the daily periodic cleanup, enter the preserved build root, and read the log of the last local build
+.TP
+geectl\-maintenance(1)
+Maintenance operations: maintained\-instances listing and maintenance branching
+.TP
+geectl\-service(1)
+Service reads and trigger: list a package\*(Aqs services, their run state, and trigger a server\-side run
+.TP
+geectl\-gitea(1)
+Gitea operations: repository and branch reads and mutations on the configured instance
+.TP
+geectl\-pull\-request(1)
+Read and act on pull requests: OBS submit requests and Gitea pull requests as one surface
+.TP
+geectl\-person(1)
+Search for a person: the OBS projects naming the login and the Gitea users matching the keyword, as one operation
+.TP
+geectl\-meta(1)
+Set the meta of an OBS project, an OBS package, or a Gitea repository as one operation: the target selects the backend
+.TP
+geectl\-changelog(1)
+Validate and generate `.changes` entries in a package directory, pre\-file
+.TP
+geectl\-checkout(1)
+Check out a package into a git working copy, under the current directory
+.TP
+geectl\-update(1)
+Update the working copy in the current directory to the latest base
+.TP
+geectl\-status(1)
+Show the working copy\*(Aqs state against the base
+.TP
+geectl\-diff(1)
+Show the diff of the worktree and the index against the base, plus the link diff on a linked checkout
+.TP
+geectl\-add(1)
+Stage files for commit
+.TP
+geectl\-rm(1)
+Remove files from the working copy
+.TP
+geectl\-addremove(1)
+Stage new files and worktree deletions
+.TP
+geectl\-commit(1)
+Commit the staged changes
+.TP
+geectl\-pull(1)
+Pull a linked package to the link target\*(Aqs latest revision
+.TP
+geectl\-resolve(1)
+Stage the resolved files and continue a stopped rebase
+.TP
+geectl\-prjconf(1)
+Read, validate and clean a project\*(Aqs prjconf
+.TP
+geectl\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.2.2

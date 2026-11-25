@@ -1,0 +1,65 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-local-build-build 1  "geectl-local-build-build 0.2.2" 
+.SH NAME
+geectl\-local\-build\-build \- Build the package in the container: the run\-mode service run, the precommit gate, then the engine build
+.SH SYNOPSIS
+\fBgeectl local\-build build\fR [\fB\-\-arch\fR] [\fB\-\-flavor\fR] [\fB\-\-clean\fR] [\fB\-\-release\fR] [\fB\-\-trust\-all\-projects\fR] [\fB\-\-refresh\-image\fR] [\fB\-\-alternative\-project\fR] [\fB\-\-root\fR] [\fB\-\-noinit\fR] [\fB\-\-preinstall\-image\fR] [\fB\-k\fR|\fB\-\-keep\-rpms\fR] [\fB\-p\fR|\fB\-\-prefer\-packages\fR] [\fB\-\-timeout\-secs\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-repo\fR> <\fIDIRECTORY\fR> 
+.SH DESCRIPTION
+Build the package in the container: the run\-mode service run, the precommit gate, then the engine build.
+.PP
+A failing pre\-step fails the command before the build runs.
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The OBS project the package belongs to
+.TP
+\fB\-\-repo\fR \fI<REPO>\fR
+The repository to build for (e.g. `standard`)
+.TP
+\fB\-\-arch\fR \fI<ARCH>\fR
+The architecture to build for; must equal the host arch
+.TP
+\fB\-\-flavor\fR \fI<FLAVOR>\fR
+The multibuild flavor; required when the source carries a `_multibuild` file. One invocation builds one flavor
+.TP
+\fB\-\-clean\fR
+Wipe the root before building
+.TP
+\fB\-\-release\fR \fI<RELEASE>\fR
+The release number, passed through to the engine
+.TP
+\fB\-\-trust\-all\-projects\fR
+Allow build dependencies from other users\*(Aq `home:` projects (their packages run code in the build root). Without this such builds are refused
+.TP
+\fB\-\-refresh\-image\fR
+Force an image pull even when the local image is fresh
+.TP
+\fB\-\-alternative\-project\fR \fI<ALTERNATIVE_PROJECT>\fR
+Build against another project instead of `project`: buildinfo, buildconfig, the trust check, and dep resolution use it. The root stays keyed by `project`
+.TP
+\fB\-\-root\fR \fI<ROOT>\fR
+Build in this directory instead of the derived cache\-dir root
+.TP
+\fB\-\-noinit\fR
+Skip the root initialization: start the build immediately in the existing root. Needs an initialized root (a previous build wrote the rpmlist and buildconfig there)
+.TP
+\fB\-\-preinstall\-image\fR
+Use the preinstall image when the buildinfo offers one. Off by default: the engine extracts the image with bsdtar `\-\-chroot` plus device nodes, which fail as a non\-root user, so a rootless build never selects the image. Only set it when the engine runs as root
+.TP
+\fB\-k\fR, \fB\-\-keep\-rpms\fR \fI<KEEP_RPMS>\fR
+Save the built RPMs into this directory (created when missing) on a green build
+.TP
+\fB\-p\fR, \fB\-\-prefer\-packages\fR \fI<PREFER_PACKAGES>\fR
+Prefer RPMs from this directory when installing the build root: a dep whose file is there is used instead of the cached or downloaded copy
+.TP
+\fB\-\-timeout\-secs\fR \fI<TIMEOUT_SECS>\fR [default: 3600]
+Timeout in seconds for the whole run
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIDIRECTORY\fR>
+The source directory (spec + sources)
+.SH VERSION
+v0.2.2

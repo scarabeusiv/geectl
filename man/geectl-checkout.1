@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-checkout 1  "geectl-checkout 0.2.2" 
+.SH NAME
+geectl\-checkout \- Check out a package into a git working copy, under the current directory
+.SH SYNOPSIS
+\fBgeectl checkout\fR [\fB\-\-rev\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+Check out a package into a git working copy, under the current directory
+.SH OPTIONS
+.TP
+\fB\-\-rev\fR \fI<REV>\fR
+The revision to check out (a number or a source md5). The latest when omitted
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The OBS project
+.TP
+<\fIPACKAGE\fR>
+The OBS package
+.SH VERSION
+v0.2.2

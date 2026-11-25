@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-search-packages 1  "geectl-remote-search-packages 0.2.2" 
+.SH NAME
+geectl\-remote\-search\-packages \- Search packages by name. Substring matches on name, title, and description by default; `\-\-exact` keeps only exact\-name matches (the filter runs client\-side). With `\-\-devel\-project`, only packages developed in that project; without a term, every package the devel project develops
+.SH SYNOPSIS
+\fBgeectl remote search\-packages\fR [\fB\-\-exact\fR] [\fB\-\-devel\-project\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fITERM\fR] 
+.SH DESCRIPTION
+Search packages by name. Substring matches on name, title, and description by default; `\-\-exact` keeps only exact\-name matches (the filter runs client\-side). With `\-\-devel\-project`, only packages developed in that project; without a term, every package the devel project develops
+.SH OPTIONS
+.TP
+\fB\-\-exact\fR
+Only show packages whose name is exactly the term
+.TP
+\fB\-\-devel\-project\fR \fI<DEVEL_PROJECT>\fR
+Only show packages developed in this project
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+[\fITERM\fR]
+The search term; required unless `\-\-devel\-project` is given
+.SH VERSION
+v0.2.2

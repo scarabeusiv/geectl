@@ -1,0 +1,42 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-build-log 1  "geectl-build-build-log 0.2.2" 
+.SH NAME
+geectl\-build\-build\-log \- Read the build log for a package
+.SH SYNOPSIS
+\fBgeectl build build\-log\fR [\fB\-\-start\fR] [\fB\-\-last\fR] [\fB\-\-lastsucceeded\fR] [\fB\-\-multibuild\fR] [\fB\-\-strip\-time\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> [\fIPACKAGE\fR] [\fIREPOSITORY\fR] [\fIARCH\fR] 
+.SH DESCRIPTION
+Read the build log for a package
+.SH OPTIONS
+.TP
+\fB\-\-start\fR \fI<START>\fR
+Start reading at this byte offset; a negative offset reads from the end of the log
+.TP
+\fB\-\-last\fR
+The last build\*(Aqs log instead of the current one. Cannot combine with `\-\-lastsucceeded`
+.TP
+\fB\-\-lastsucceeded\fR
+The last succeeded build\*(Aqs log. Cannot combine with `\-\-last`
+.TP
+\fB\-\-multibuild\fR \fI<FLAVOR>\fR
+Only this multibuild flavor\*(Aqs log: appends `:FLAVOR` to the package. Refused when the package already carries a flavor
+.TP
+\fB\-\-strip\-time\fR
+Strip the leading `[timestamp] ` from each log line
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package is in — or a build\-log URL, in which case the other coordinates are omitted. The URL form takes an API log URL (`http(s)://<api\-host>/build/<project>/<repository>/<arch>/<package>/_log`) or a web\-UI log URL (`http(s)://build.opensuse.org/package/live_build_log/<project>/<package>/<repository>/<arch>`)
+.TP
+[\fIPACKAGE\fR]
+The package to read the log for. Omit with a URL
+.TP
+[\fIREPOSITORY\fR]
+The repository the package builds in. Omit with a URL
+.TP
+[\fIARCH\fR]
+The architecture the package builds for. Omit with a URL
+.SH VERSION
+v0.2.2

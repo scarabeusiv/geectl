@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-local-build-wipe 1  "geectl-local-build-wipe 0.2.2" 
+.SH NAME
+geectl\-local\-build\-wipe \- Wipe a build root: delete its contents (the lock file stays). A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the wipe. The marker check and the in\-use lock are safety invariants, never bypassed
+.SH SYNOPSIS
+\fBgeectl local\-build wipe\fR [\fB\-\-project\fR] [\fB\-\-flavor\fR] [\fB\-\-root\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIREPO\fR] [\fIARCH\fR] [\fISPEC\fR] 
+.SH DESCRIPTION
+Wipe a build root: delete its contents (the lock file stays). A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the wipe. The marker check and the in\-use lock are safety invariants, never bypassed
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The OBS project the package belongs to. Required unless `\-\-root` names the root directly
+.TP
+\fB\-\-flavor\fR \fI<FLAVOR>\fR
+The multibuild flavor; required when the source carries a `_multibuild` file
+.TP
+\fB\-\-root\fR \fI<ROOT>\fR
+The root to wipe, named directly. Conflicts with the coordinates: when set, the root is wiped as named
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+[\fIREPO\fR]
+The repository the root was built for. Required unless `\-\-root` names the root directly
+.TP
+[\fIARCH\fR]
+The architecture the root was built for. Required unless `\-\-root` names the root directly
+.TP
+[\fISPEC\fR]
+The source directory (spec + sources); the package comes from the spec file in it, like the build. Required unless `\-\-root` names the root directly
+.SH VERSION
+v0.2.2

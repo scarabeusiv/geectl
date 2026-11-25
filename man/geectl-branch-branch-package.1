@@ -1,0 +1,63 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-branch-branch-package 1  "geectl-branch-branch-package 0.2.2" 
+.SH NAME
+geectl\-branch\-branch\-package \- Branch a package: create a linked copy under a branch project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the branch
+.SH SYNOPSIS
+\fBgeectl branch branch\-package\fR [\fB\-\-target\-project\fR] [\fB\-\-target\-package\fR] [\fB\-\-no\-devel\-project\fR] [\fB\-\-new\-package\fR] [\fB\-\-force\fR] [\fB\-\-revision\fR] [\fB\-\-linkrev\fR] [\fB\-\-comment\fR] [\fB\-\-noaccess\fR] [\fB\-\-add\-repositories\fR] [\fB\-\-add\-repositories\-block\fR] [\fB\-\-add\-repositories\-rebuild\fR] [\fB\-\-extend\-package\-names\fR] [\fB\-\-maintenance\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fB\-\-package\fR> 
+.SH DESCRIPTION
+Branch a package: create a linked copy under a branch project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the branch
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The project to branch from
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The package to branch
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The branch project. Without it, the server picks the default (usually `home:<user>:branches:<source project>`)
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+The branch package name. Without it, the source package name
+.TP
+\fB\-\-no\-devel\-project\fR
+Ignore the devel project when resolving the link source
+.TP
+\fB\-\-new\-package\fR
+Branch a package that does not exist yet
+.TP
+\fB\-\-force\fR
+Overwrite an existing target package
+.TP
+\fB\-\-revision\fR \fI<REVISION>\fR
+Branch from this source revision instead of the latest
+.TP
+\fB\-\-linkrev\fR \fI<LINKREV>\fR
+The link revision the branch records
+.TP
+\fB\-\-comment\fR \fI<COMMENT>\fR
+A comment recorded on the branch
+.TP
+\fB\-\-noaccess\fR
+Withhold the branch\*(Aqs read access to the source package\*(Aqs project
+.TP
+\fB\-\-add\-repositories\fR
+Add the source project\*(Aqs repositories to the branch project
+.TP
+\fB\-\-add\-repositories\-block\fR \fI<ADD_REPOSITORIES_BLOCK>\fR
+Block the added repositories. Only sent with `\-\-add\-repositories` (clap refuses it without that flag: a block the live run would silently drop must fail at parse time, not vanish)
+.TP
+\fB\-\-add\-repositories\-rebuild\fR \fI<ADD_REPOSITORIES_REBUILD>\fR
+Rebuild the added repositories. Only sent with `\-\-add\-repositories` (clap refuses it without that flag, as above)
+.TP
+\fB\-\-extend\-package\-names\fR
+Extend the branch package names with the source project name
+.TP
+\fB\-\-maintenance\fR
+Branch as a maintenance incident
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

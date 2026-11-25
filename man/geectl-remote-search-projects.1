@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-search-projects 1  "geectl-remote-search-projects 0.2.2" 
+.SH NAME
+geectl\-remote\-search\-projects \- Search projects by name. Substring matches on name, title, and description by default; `\-\-exact` keeps only exact\-name matches (the filter runs client\-side)
+.SH SYNOPSIS
+\fBgeectl remote search\-projects\fR [\fB\-\-exact\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fITERM\fR> 
+.SH DESCRIPTION
+Search projects by name. Substring matches on name, title, and description by default; `\-\-exact` keeps only exact\-name matches (the filter runs client\-side)
+.SH OPTIONS
+.TP
+\fB\-\-exact\fR
+Only show projects whose name is exactly the term
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fITERM\fR>
+The search term
+.SH VERSION
+v0.2.2

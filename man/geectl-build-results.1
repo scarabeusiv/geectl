@@ -1,0 +1,45 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-build-results 1  "geectl-build-results 0.2.2" 
+.SH NAME
+geectl\-build\-results \- Read the build\-results matrix for a project
+.SH SYNOPSIS
+\fBgeectl build results\fR [\fB\-\-package\fR] [\fB\-\-repository\fR] [\fB\-\-arch\fR] [\fB\-\-code\fR] [\fB\-\-multibuild\fR] [\fB\-\-locallink\fR] [\fB\-\-lastbuild\fR] [\fB\-\-oldstate\fR] [\fB\-\-all\-instances\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
+.SH DESCRIPTION
+Read the build\-results matrix for a project
+.SH OPTIONS
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+Only this package\*(Aqs statuses (the repository/architecture cells still come back whole)
+.TP
+\fB\-\-repository\fR \fI<REPOSITORY>\fR
+Only these repositories (repeatable)
+.TP
+\fB\-\-arch\fR \fI<ARCH>\fR
+Only these architectures (repeatable)
+.TP
+\fB\-\-code\fR \fI<CODE>\fR
+Only packages with this build code (e.g. `failed`)
+.TP
+\fB\-\-multibuild\fR
+Expand multibuild flavors into their own statuses
+.TP
+\fB\-\-locallink\fR
+Follow local links when expanding multibuild flavors
+.TP
+\fB\-\-lastbuild\fR
+The last build\*(Aqs results instead of the current state
+.TP
+\fB\-\-oldstate\fR \fI<OLDSTATE>\fR
+Poll for changes since this state hash (from a previous run). Only `results` takes it: `wait\-for\-results` polls plainly
+.TP
+\fB\-\-all\-instances\fR
+Merge the results from every configured instance into one view, instead of only the instance currently pointed at. Cannot combine with `\-\-oldstate`: a state hash is per instance
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to read
+.SH VERSION
+v0.2.2

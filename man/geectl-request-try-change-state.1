@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-try-change-state 1  "geectl-request-try-change-state 0.2.2" 
+.SH NAME
+geectl\-request\-try\-change\-state \- Best\-effort state change: try it, and report whether it happened
+.SH SYNOPSIS
+\fBgeectl request try\-change\-state\fR [\fB\-\-comment\fR] [\fB\-\-force\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR> <\fISTATE\fR> 
+.SH DESCRIPTION
+Best\-effort state change: try it, and report whether it happened
+.SH OPTIONS
+.TP
+\fB\-\-comment\fR \fI<COMMENT>\fR [default: ]
+The message left with the change. Values starting with `\-` are taken literally: a comment may open with a `\- ` bullet
+.TP
+\fB\-\-force\fR
+Force the change, overriding open reviews. Only honoured when changing to accepted
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIID\fR>
+The request id
+.TP
+<\fISTATE\fR>
+The state to change to
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+new
+.IP \(bu 2
+review
+.IP \(bu 2
+accepted
+.IP \(bu 2
+declined
+.IP \(bu 2
+revoked
+.RE
+.SH VERSION
+v0.2.2

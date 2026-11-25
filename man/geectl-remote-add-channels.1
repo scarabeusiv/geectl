@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-add-channels 1  "geectl-remote-add-channels 0.2.2" 
+.SH NAME
+geectl\-remote\-add\-channels \- Add the channels defined for a project or a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the addition. A project or package with no channels defined is a no\-op
+.SH SYNOPSIS
+\fBgeectl remote add\-channels\fR [\fB\-\-enable\-all\fR] [\fB\-\-skip\-disabled\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> [\fIPACKAGE\fR] 
+.SH DESCRIPTION
+Add the channels defined for a project or a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the addition. A project or package with no channels defined is a no\-op
+.SH OPTIONS
+.TP
+\fB\-\-enable\-all\fR
+Enable all added channels including the ones disabled by default. Cannot combine with `\-\-skip\-disabled`
+.TP
+\fB\-\-skip\-disabled\fR
+Skip disabled channels: add the channel packages but not their repositories. Cannot combine with `\-\-enable\-all`
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to add channels to
+.TP
+[\fIPACKAGE\fR]
+The package to add channels to. Omit for the whole project
+.SH VERSION
+v0.2.2

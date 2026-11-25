@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-commit 1  "geectl-commit 0.2.2" 
+.SH NAME
+geectl\-commit \- Commit the staged changes
+.SH SYNOPSIS
+\fBgeectl commit\fR [\fB\-\-noservice\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-m\fR|\fB\-\-message\fR> 
+.SH DESCRIPTION
+Commit the staged changes
+.SH OPTIONS
+.TP
+\fB\-m\fR, \fB\-\-message\fR \fI<MESSAGE>\fR
+The commit message
+.TP
+\fB\-\-noservice\fR
+Skip the service gate (source services and `pre_checkin.sh`)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

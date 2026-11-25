@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-decline 1  "geectl-request-decline 0.2.2" 
+.SH NAME
+geectl\-request\-decline \- Decline a submit request, with a comment as the reason
+.SH SYNOPSIS
+\fBgeectl request decline\fR [\fB\-\-comment\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIID\fR> 
+.SH DESCRIPTION
+Decline a submit request, with a comment as the reason
+.SH OPTIONS
+.TP
+\fB\-\-comment\fR \fI<COMMENT>\fR [default: ]
+The reason for the decline. Values starting with `\-` are taken literally: a comment may open with a `\- ` bullet
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIID\fR>
+The request id
+.SH VERSION
+v0.2.2

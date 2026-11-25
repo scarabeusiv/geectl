@@ -1,0 +1,86 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-search 1  "geectl-request-search 0.2.2" 
+.SH NAME
+geectl\-request\-search \- List the submit requests matching the filters: a typed search
+.SH SYNOPSIS
+\fBgeectl request search\fR [\fB\-\-request\-id\fR] [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-source\-project\fR] [\fB\-\-source\-package\fR] [\fB\-\-target\-project\fR] [\fB\-\-target\-package\fR] [\fB\-\-creator\fR] [\fB\-\-who\fR] [\fB\-\-reviewer\fR] [\fB\-\-state\fR] [\fB\-\-type\fR] [\fB\-\-exclude\-target\-project\fR] [\fB\-\-with\-history\fR] [\fB\-\-with\-full\-history\fR] [\fB\-\-since\fR] [\fB\-\-limit\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+List the submit requests matching the filters: a typed search
+.SH OPTIONS
+.TP
+\fB\-\-request\-id\fR \fI<REQUEST_IDS>\fR
+Only requests with these ids
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+Only requests with an action from or to these projects
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+Only requests with an action from or to these packages
+.TP
+\fB\-\-source\-project\fR \fI<SOURCE_PROJECT>\fR
+Only requests with an action from these source projects
+.TP
+\fB\-\-source\-package\fR \fI<SOURCE_PACKAGE>\fR
+Only requests with an action from these source packages
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+Only requests with an action to these target projects
+.TP
+\fB\-\-target\-package\fR \fI<TARGET_PACKAGE>\fR
+Only requests with an action to these target packages
+.TP
+\fB\-\-creator\fR \fI<CREATOR>\fR
+Only requests filed by these users
+.TP
+\fB\-\-who\fR \fI<WHO>\fR
+Only requests involving these users
+.TP
+\fB\-\-reviewer\fR \fI<REVIEWER>\fR
+Only requests with an open review addressed to these users. With no `\-\-state`, only new and review requests are listed
+.TP
+\fB\-\-state\fR \fI<STATE>\fR
+Only requests in these states. When none are given, only new, review and declined requests are listed; `\-\-reviewer` narrows this to new and review
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+new
+.IP \(bu 2
+review
+.IP \(bu 2
+accepted
+.IP \(bu 2
+declined
+.IP \(bu 2
+revoked
+.IP \(bu 2
+superseded
+.IP \(bu 2
+deleted
+.RE
+.TP
+\fB\-\-type\fR \fI<TYPES>\fR
+Only requests with an action of these types
+.TP
+\fB\-\-exclude\-target\-project\fR \fI<EXCLUDE_TARGET_PROJECT>\fR
+Exclude requests with an action targeting these projects
+.TP
+\fB\-\-with\-history\fR
+Include the history of each request
+.TP
+\fB\-\-with\-full\-history\fR
+Include the full history of each request
+.TP
+\fB\-\-since\fR \fI<SINCE>\fR
+Only requests with a history entry at or after this date, or a last update at or after it, as `YYYY\-MM\-DD` or `YYYY\-MM\-DDTHH:MM:SS`
+.TP
+\fB\-\-limit\fR \fI<LIMIT>\fR
+Ask the server for at most this many matches
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

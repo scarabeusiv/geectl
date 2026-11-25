@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-create-project 1  "geectl-remote-create-project 0.2.2" 
+.SH NAME
+geectl\-remote\-create\-project \- Create a project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation
+.SH SYNOPSIS
+\fBgeectl remote create\-project\fR [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-title\fR> <\fB\-\-description\fR> <\fIPROJECT\fR> 
+.SH DESCRIPTION
+Create a project. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the creation
+.SH OPTIONS
+.TP
+\fB\-\-title\fR \fI<TITLE>\fR
+The project title
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+The project description
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to create
+.SH VERSION
+v0.2.2

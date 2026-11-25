@@ -1,0 +1,45 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-branch-copy-project 1  "geectl-branch-copy-project 0.2.2" 
+.SH NAME
+geectl\-branch\-copy\-project \- Copy a whole project. A mutation: dry\-run is the default
+.SH SYNOPSIS
+\fBgeectl branch copy\-project\fR [\fB\-\-with\-binaries\fR] [\fB\-\-with\-history\fR] [\fB\-\-make\-older\fR] [\fB\-\-make\-origin\-older\fR] [\fB\-\-noservice\fR] [\fB\-\-resign\fR] [\fB\-\-comment\fR] [\fB\-\-no\-delay\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-source\-project\fR> <\fB\-\-target\-project\fR> 
+.SH DESCRIPTION
+Copy a whole project. A mutation: dry\-run is the default
+.SH OPTIONS
+.TP
+\fB\-\-source\-project\fR \fI<SOURCE_PROJECT>\fR
+The project to copy from
+.TP
+\fB\-\-target\-project\fR \fI<TARGET_PROJECT>\fR
+The project to copy to
+.TP
+\fB\-\-with\-binaries\fR
+Copy the built binaries as well. Admin\-only on the server
+.TP
+\fB\-\-with\-history\fR
+Copy the project history as well
+.TP
+\fB\-\-make\-older\fR
+Make the copied project older than the source
+.TP
+\fB\-\-make\-origin\-older\fR
+Make the copied project older than the source\*(Aqs origin
+.TP
+\fB\-\-noservice\fR
+Do not run source services on the copied files
+.TP
+\fB\-\-resign\fR
+Re\-sign the copied project
+.TP
+\fB\-\-comment\fR \fI<COMMENT>\fR
+A comment recorded on the copy
+.TP
+\fB\-\-no\-delay\fR
+Run the copy synchronously instead of as a background job
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

@@ -1,0 +1,30 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-meta-set 1  "geectl-meta-set 0.2.2" 
+.SH NAME
+geectl\-meta\-set \- Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `\-\-project` (with `\-\-package` for a package) writes OBS meta, `\-\-repo` writes Gitea repo settings. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
+.SH SYNOPSIS
+\fBgeectl meta set\fR [\fB\-\-project\fR] [\fB\-\-package\fR] [\fB\-\-repo\fR] [\fB\-\-description\fR] [\fB\-\-url\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Set the meta of an OBS project, an OBS package, or a Gitea repository: the description and/or URL. The target selects the backend: `\-\-project` (with `\-\-package` for a package) writes OBS meta, `\-\-repo` writes Gitea repo settings. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the write. Only the given fields change; the rest of the meta is kept as it is. There is no flag to clear a field
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The OBS project whose meta to set
+.TP
+\fB\-\-package\fR \fI<PACKAGE>\fR
+The OBS package in `\-\-project` whose meta to set; the project meta when omitted
+.TP
+\fB\-\-repo\fR \fI<REPO>\fR
+The Gitea repository, as `owner/repo`, whose settings to set
+.TP
+\fB\-\-description\fR \fI<DESCRIPTION>\fR
+A short description
+.TP
+\fB\-\-url\fR \fI<URL>\fR
+A URL with more information; the repository website on the Gitea arm
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH VERSION
+v0.2.2

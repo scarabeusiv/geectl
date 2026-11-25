@@ -1,0 +1,24 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-add-containers 1  "geectl-remote-add-containers 0.2.2" 
+.SH NAME
+geectl\-remote\-add\-containers \- Add the maintained containers for a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the addition
+.SH SYNOPSIS
+\fBgeectl remote add\-containers\fR [\fB\-\-extend\-package\-names\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+Add the maintained containers for a package. A mutation: dry\-run is the default (only the plan is printed); `\-\-live` performs the addition
+.SH OPTIONS
+.TP
+\fB\-\-extend\-package\-names\fR
+Extend the package names with the container names
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package to add containers for
+.SH VERSION
+v0.2.2

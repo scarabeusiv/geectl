@@ -1,0 +1,36 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-local-build-log 1  "geectl-local-build-log 0.2.2" 
+.SH NAME
+geectl\-local\-build\-log \- Read the log of the last local build: the `<root>/.build.log` the build\*(Aqs coordinates name. A read: no `\-\-live` needed. The text is the log verbatim (design rule 4); the verdict, exit code, log path, and truncation flag ride in the JSON payload
+.SH SYNOPSIS
+\fBgeectl local\-build log\fR [\fB\-\-flavor\fR] [\fB\-\-tail\fR] [\fB\-\-full\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-project\fR> <\fIREPO\fR> <\fIARCH\fR> <\fISPEC\fR> 
+.SH DESCRIPTION
+Read the log of the last local build: the `<root>/.build.log` the build\*(Aqs coordinates name. A read: no `\-\-live` needed. The text is the log verbatim (design rule 4); the verdict, exit code, log path, and truncation flag ride in the JSON payload
+.SH OPTIONS
+.TP
+\fB\-\-project\fR \fI<PROJECT>\fR
+The OBS project the package belongs to
+.TP
+\fB\-\-flavor\fR \fI<FLAVOR>\fR
+The multibuild flavor; required when the source carries a `_multibuild` file
+.TP
+\fB\-\-tail\fR \fI<TAIL>\fR
+Print only the last N lines of the log
+.TP
+\fB\-\-full\fR
+Read the whole log without the 4 MiB cap
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIREPO\fR>
+The repository the root was built for
+.TP
+<\fIARCH\fR>
+The architecture the root was built for
+.TP
+<\fISPEC\fR>
+The source directory (spec + sources); the package comes from the spec file in it, like the build
+.SH VERSION
+v0.2.2

@@ -1,0 +1,21 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-request-supersede 1  "geectl-request-supersede 0.2.2" 
+.SH NAME
+geectl\-request\-supersede \- Supersede one request with another existing one. A mutation that needs `\-\-live`; the dry\-runnable supersede flow is `request refile \-\-supersede`
+.SH SYNOPSIS
+\fBgeectl request supersede\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIOLD_ID\fR> <\fINEW_ID\fR> 
+.SH DESCRIPTION
+Supersede one request with another existing one. A mutation that needs `\-\-live`; the dry\-runnable supersede flow is `request refile \-\-supersede`
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIOLD_ID\fR>
+The open request being superseded
+.TP
+<\fINEW_ID\fR>
+The existing request superseding it
+.SH VERSION
+v0.2.2

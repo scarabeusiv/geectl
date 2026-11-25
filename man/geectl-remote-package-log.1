@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH geectl-remote-package-log 1  "geectl-remote-package-log 0.2.2" 
+.SH NAME
+geectl\-remote\-package\-log \- Show the commit history of a package
+.SH SYNOPSIS
+\fBgeectl remote package\-log\fR [\fB\-\-range\fR] [\fB\-\-limit\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> <\fIPACKAGE\fR> 
+.SH DESCRIPTION
+Show the commit history of a package
+.SH OPTIONS
+.TP
+\fB\-\-range\fR \fI<RANGE>\fR
+Only entries in this revision range (`FROM:TO`, either side may be empty; a side is a revision number or a srcmd5)
+.TP
+\fB\-\-limit\fR \fI<LIMIT>\fR
+At most this many entries
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project the package lives in
+.TP
+<\fIPACKAGE\fR>
+The package to show the history of
+.SH VERSION
+v0.2.2
