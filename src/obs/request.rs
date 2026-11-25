@@ -4462,7 +4462,7 @@ mod tests {
     const FORWARD_FACTORY_SEARCH_URL: &str = "https://api.opensuse.org/search/project/id?match=maintenance%2Fmaintains%2F%40project%3D%27openSUSE%3AFactory%27";
     const FORWARD_CREATE_URL: &str = "https://api.opensuse.org/request?cmd=create";
     const FORWARD_DIR_FACTORY: &str =
-        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" srcmd5=\"abc\" /></directory>";
+        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" /></directory>";
     const FORWARD_FACTORY_META_URL: &str =
         "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta";
     const FORWARD_FACTORY_META: &str =

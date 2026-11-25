@@ -489,9 +489,21 @@ pub(crate) fn parse_linkinfo(body: &str) -> Result<Option<LinkInfo>, GeectlError
             info.package = Some(value);
         }
         if let Some(value) = find_attr(tag, "srcmd5") {
+            // The md5 is a checksum, not free text: a value that
+            // is not exactly 32 hex digits is malformed, not a
+            // value to carry.
+            if !is_md5(&value) {
+                return Err(malformed());
+            }
             info.srcmd5 = Some(value);
         }
         if let Some(value) = find_attr(tag, "baserev") {
+            // The baserev is an md5, like the srcmd5: a value that
+            // is not exactly 32 hex digits is malformed, not a
+            // value to carry.
+            if !is_md5(&value) {
+                return Err(malformed());
+            }
             info.baserev = Some(value);
         }
         if let Some(value) = find_attr(tag, "xsrcmd5") {
@@ -504,6 +516,12 @@ pub(crate) fn parse_linkinfo(body: &str) -> Result<Option<LinkInfo>, GeectlError
             info.xsrcmd5 = Some(value);
         }
         if let Some(value) = find_attr(tag, "lastworking") {
+            // The lastworking revision is an md5: a value that is
+            // not exactly 32 hex digits is malformed, not a
+            // revision to fetch.
+            if !is_md5(&value) {
+                return Err(malformed());
+            }
             info.lastworking = Some(value);
         }
         if let Some(value) = find_attr(tag, "error") {
@@ -5830,6 +5848,86 @@ mod tests {
         assert!(
             parse_linkinfo(
                 "<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" xsrcmd5=\"\u{1b}[31maaaaaaaaaaaaaaaaaaaaaaaaaa\"/></directory>",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_linkinfo_rejects_non_hex_srcmd5_baserev_lastworking() {
+        // The srcmd5, baserev and lastworking are md5s, not free
+        // text: a non-hex value is a malformed listing, never a
+        // value to carry.
+        let base = "<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\"";
+        assert_eq!(
+            parse_linkinfo(&format!("{base} srcmd5=\"aaa\"/></directory>"))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ServerError
+        );
+        assert!(parse_linkinfo(&format!("{base} baserev=\"aaa\"/></directory>")).is_err());
+        assert!(parse_linkinfo(&format!("{base} lastworking=\"aaa\"/></directory>")).is_err());
+        assert!(parse_linkinfo(&format!(
+            "{base} srcmd5=\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"/></directory>"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn parse_linkinfo_rejects_wrong_length_srcmd5_baserev_lastworking() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        let base = "<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\"";
+        for (field, value) in [
+            ("srcmd5", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ("srcmd5", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            ("baserev", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ("lastworking", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ] {
+            assert!(
+                parse_linkinfo(&format!("{base} {field}=\"{value}\"/></directory>")).is_err(),
+                "{field}={value} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_linkinfo_accepts_32_hex_srcmd5_baserev_lastworking() {
+        // Lowercase and uppercase hex both read, carried verbatim.
+        let info = parse_linkinfo(
+            "<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"0123456789abcdef0123456789abcdef\" baserev=\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\" lastworking=\"33333333333333333333333333333333\"/></directory>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            info.srcmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            info.baserev.as_deref(),
+            Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+        );
+        assert_eq!(
+            info.lastworking.as_deref(),
+            Some("33333333333333333333333333333333")
+        );
+        let info = parse_linkinfo(
+            "<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"0123456789ABCDEF0123456789ABCDEF\"/></directory>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            info.srcmd5.as_deref(),
+            Some("0123456789ABCDEF0123456789ABCDEF")
+        );
+    }
+
+    #[test]
+    fn parse_linkinfo_rejects_escape_sequence_in_srcmd5() {
+        // An escape sequence smuggled into the md5 is not 32
+        // hex digits, so the listing is malformed.
+        assert!(
+            parse_linkinfo(
+                "<directory name=\"test:factory/test-pkgA\"><linkinfo project=\"test:factory\" package=\"test-pkgA\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;\"/></directory>",
             )
             .is_err()
         );
