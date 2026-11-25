@@ -979,6 +979,128 @@ fn xml_element_end(inner: &str, start: usize, name: &str) -> Option<usize> {
     None
 }
 
+/// One construct in element content, as scanned from its `<`, and the
+/// offset just past it.
+enum XmlConstruct<'a> {
+    /// A closing tag at this level (`</...>`).
+    CloseTag,
+    /// A comment, up to and past `-->`.
+    Comment,
+    /// A processing instruction, up to and past `?>`.
+    Pi,
+    /// A CDATA section, up to and past `]]>`.
+    Cdata,
+    /// Other markup (`<!...>` that is neither a comment nor CDATA),
+    /// up to and past `>`.
+    Markup,
+    /// An element: its tag name, the offset just past its opening
+    /// tag, the offset just past the whole element, and whether the
+    /// opening tag is self-closing (then the two offsets agree).
+    Child {
+        name: &'a str,
+        tag_end: usize,
+        elem_end: usize,
+        self_closing: bool,
+    },
+}
+
+/// Why `xml_next_construct` could not scan the construct at a `<`:
+/// the construct never terminates, or the tag has no name. `child`
+/// names the element whose end was missing, when the scan got that far.
+enum XmlScanError<'a> {
+    Unterminated { at: usize, child: Option<&'a str> },
+    EmptyName { at: usize },
+}
+
+/// Scan the construct starting at `tag_start` (the `<` of its opening
+/// tag) in `inner`: classify it and return the offset just past it.
+/// The caller renders the error: the two callers name the fault
+/// differently, so the scan reports the fact and the offset, not the
+/// message.
+fn xml_next_construct(
+    inner: &str,
+    tag_start: usize,
+) -> Result<(XmlConstruct<'_>, usize), XmlScanError<'_>> {
+    let after_lt = &inner[tag_start + 1..];
+    let unterminated = |child| XmlScanError::Unterminated {
+        at: tag_start,
+        child,
+    };
+    if after_lt.starts_with('/') {
+        return Ok((XmlConstruct::CloseTag, tag_start + 1));
+    }
+    if let Some(content) = after_lt.strip_prefix("!--") {
+        // Comment (`after_lt` is past the `<`, so the marker is
+        // `!--`): skip to `-->`, not to the first `>`. The search
+        // starts past the opener: a `-->` overlapping it (`<!-->`,
+        // `<!--->`) is not a terminator, it is an unterminated
+        // comment.
+        let Some(rel) = content.find("-->") else {
+            return Err(unterminated(None));
+        };
+        return Ok((XmlConstruct::Comment, tag_start + 1 + 3 + rel + 3));
+    }
+    if after_lt.starts_with('?') {
+        // Processing instruction: skip to `?>`.
+        let Some(end) = after_lt.find("?>") else {
+            return Err(unterminated(None));
+        };
+        return Ok((XmlConstruct::Pi, tag_start + 1 + end + 2));
+    }
+    if let Some(cdata) = after_lt.strip_prefix("![CDATA[") {
+        // CDATA section: opaque character data, skipped to `]]>` — a
+        // `>` or `<!--` inside it is content, not markup.
+        let Some(rel) = cdata.find("]]>") else {
+            return Err(unterminated(None));
+        };
+        return Ok((
+            XmlConstruct::Cdata,
+            tag_start + 1 + "![CDATA[".len() + rel + 3,
+        ));
+    }
+    if after_lt.starts_with('!') {
+        // Other markup (e.g. a doctype): skip to `>`.
+        let Some(end) = after_lt.find('>') else {
+            return Err(unterminated(None));
+        };
+        return Ok((XmlConstruct::Markup, tag_start + 1 + end + 1));
+    }
+    let name_end = after_lt
+        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .unwrap_or(after_lt.len());
+    let tag_name = &after_lt[..name_end];
+    let Some(gt) = find_tag_end(after_lt) else {
+        return Err(unterminated(None));
+    };
+    if tag_name.is_empty() {
+        return Err(XmlScanError::EmptyName { at: tag_start });
+    }
+    let tag_end = tag_start + 1 + gt + 1;
+    if after_lt[..gt].trim_end().ends_with('/') {
+        return Ok((
+            XmlConstruct::Child {
+                name: tag_name,
+                tag_end,
+                elem_end: tag_end,
+                self_closing: true,
+            },
+            tag_end,
+        ));
+    }
+    let Some(elem_end) = xml_element_end(inner, tag_start, tag_name) else {
+        return Err(unterminated(Some(tag_name)));
+    };
+    Ok((
+        XmlConstruct::Child {
+            name: tag_name,
+            tag_end,
+            elem_end,
+            self_closing: false,
+        },
+        elem_end,
+    ))
+}
+
 /// The direct child elements named `name` in `inner` (the content
 /// between an element's open and close tags), as their full text
 /// including the tags. Unlike [`xml_elements`], this does not descend:
@@ -1012,82 +1134,26 @@ pub(crate) fn xml_child_elements<'a>(
             break;
         };
         let tag_start = offset + lt;
-        let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with('/') {
-            // A closing tag at this level is stray: the parent's close
-            // was stripped by the caller, so nothing may close here.
-            return Err(stray_close());
-        }
-        if let Some(content) = after_lt.strip_prefix("!--") {
-            // Comment (`after_lt` is past the `<`, so the marker
-            // is `!--`): skip to `-->`, not to the first `>`. The
-            // search starts past the opener: a `-->` overlapping
-            // it (`<!-->`, `<!--->`) is not a terminator, it is an
-            // unterminated comment.
-            let Some(rel) = content.find("-->") else {
-                return Err(unterminated());
-            };
-            let end = 3 + rel;
-            offset = tag_start + 1 + end + 3;
-            continue;
-        }
-        if after_lt.starts_with('?') {
-            // Processing instruction: skip to `?>`.
-            let Some(end) = after_lt.find("?>") else {
-                return Err(unterminated());
-            };
-            offset = tag_start + 1 + end + 2;
-            continue;
-        }
-        if let Some(cdata) = after_lt.strip_prefix("![CDATA[") {
-            // CDATA section: opaque character data, skipped to
-            // `]]>` — a `>` or `<!--` inside it is content, not
-            // markup.
-            let Some(rel) = cdata.find("]]>") else {
-                return Err(unterminated());
-            };
-            offset = tag_start + 1 + "![CDATA[".len() + rel + 3;
-            continue;
-        }
-        if after_lt.starts_with('!') {
-            // Other markup (e.g. a doctype): skip to `>`.
-            let Some(end) = after_lt.find('>') else {
-                return Err(unterminated());
-            };
-            offset = tag_start + 1 + end + 1;
-            continue;
-        }
-        let name_end = after_lt
-            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
-            .unwrap_or(after_lt.len());
-        let tag_name = &after_lt[..name_end];
-        let Some(gt) = find_tag_end(after_lt) else {
-            return Err(unterminated());
-        };
-        if tag_name.is_empty() {
-            // An empty tag (`<></>`) has no name to match or to close
-            // against: it is malformed content, not a child to skip.
-            return Err(GeectlError::new(
-                ErrorKind::ServerError,
-                "unexpected OBS response: empty tag name in element content",
-            ));
-        }
-        let tag_end = tag_start + 1 + gt + 1;
-        if after_lt[..gt].trim_end().ends_with('/') {
-            // Self-closing: a direct child when the name matches.
-            if tag_name == name {
-                out.push(&inner[tag_start..tag_end]);
+        let (construct, next) = match xml_next_construct(inner, tag_start) {
+            Ok(found) => found,
+            Err(XmlScanError::Unterminated { .. }) => return Err(unterminated()),
+            Err(XmlScanError::EmptyName { .. }) => {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    "unexpected OBS response: empty tag name in element content",
+                ));
             }
-            offset = tag_end;
-            continue;
-        }
-        let Some(elem_end) = xml_element_end(inner, tag_start, tag_name) else {
-            return Err(unterminated());
         };
-        if tag_name == name {
-            out.push(&inner[tag_start..elem_end]);
+        match construct {
+            XmlConstruct::Child {
+                name: tag_name,
+                elem_end,
+                ..
+            } if tag_name == name => out.push(&inner[tag_start..elem_end]),
+            XmlConstruct::CloseTag => return Err(stray_close()),
+            _ => {}
         }
-        offset = elem_end;
+        offset = next;
     }
     Ok(out)
 }
@@ -1212,110 +1278,83 @@ pub(crate) fn xml_reject_stray_text(inner: &str, element: &str) -> Result<(), Ge
             return Err(stray_text(offset + first_content(&rest[..lt])));
         }
         let tag_start = offset + lt;
-        let after_lt = &rest[lt + 1..];
-        if after_lt.starts_with("![CDATA[") {
-            // A CDATA section is character data, not markup.
-            return Err(cdata(tag_start));
-        }
-        if let Some(content) = after_lt.strip_prefix("!--") {
-            // Search past the opener: a `-->` overlapping it
-            // (`<!-->`, `<!--->`) is an unterminated comment.
-            let Some(rel) = content.find("-->") else {
-                return Err(unterminated(tag_start));
-            };
-            offset = tag_start + 1 + 3 + rel + 3;
-            if let Some((tag, rel)) = hidden_tag(&inner[tag_start..offset]) {
-                return Err(hidden_modeled_tag(tag, tag_start + rel));
+        let (construct, next) = match xml_next_construct(inner, tag_start) {
+            Ok(found) => found,
+            Err(XmlScanError::Unterminated { at, child }) => {
+                return Err(match child {
+                    Some(child) => unterminated_child(child, at),
+                    None => unterminated(at),
+                });
             }
-            continue;
-        }
-        if after_lt.starts_with('?') {
-            let Some(end) = after_lt.find("?>") else {
-                return Err(unterminated(tag_start));
-            };
-            offset = tag_start + 1 + end + 2;
-            if let Some((tag, rel)) = hidden_tag(&inner[tag_start..offset]) {
-                return Err(hidden_modeled_tag(tag, tag_start + rel));
+            Err(XmlScanError::EmptyName { at }) => {
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!(
+                        "unexpected OBS response: empty tag name in <{element}> at offset {at}"
+                    ),
+                ));
             }
-            continue;
-        }
-        if after_lt.starts_with('!') {
-            let Some(end) = after_lt.find('>') else {
-                return Err(unterminated(tag_start));
-            };
-            offset = tag_start + 1 + end + 1;
-            if let Some((tag, rel)) = hidden_tag(&inner[tag_start..offset]) {
-                return Err(hidden_modeled_tag(tag, tag_start + rel));
-            }
-            continue;
-        }
-        if after_lt.starts_with('/') {
-            // The parent's close was stripped by the caller, so nothing may close here.
-            return Err(GeectlError::new(
-                ErrorKind::ServerError,
-                format!("unexpected OBS response: stray closing tag in <{element}> at offset {tag_start}"),
-            ));
-        }
-        let name_end = after_lt
-            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
-            .unwrap_or(after_lt.len());
-        let tag_name = &after_lt[..name_end];
-        let Some(gt) = find_tag_end(after_lt) else {
-            return Err(unterminated(tag_start));
         };
-        if tag_name.is_empty() {
-            return Err(GeectlError::new(
-                ErrorKind::ServerError,
-                format!(
-                    "unexpected OBS response: empty tag name in <{element}> at offset {tag_start}"
-                ),
-            ));
-        }
-        let tag_end = tag_start + 1 + gt + 1;
-        if after_lt[..gt].trim_end().ends_with('/') {
-            // Self-closing child: skip it whole, past its own tag
-            // name so the name itself is not read as hidden.
-            let after_name = tag_start + 1 + tag_name.len();
-            if let Some((tag, rel)) = hidden_tag(&inner[after_name..tag_end]) {
-                return Err(hidden_modeled_tag(tag, after_name + rel));
-            }
-            offset = tag_end;
-            continue;
-        }
-        let Some(elem_end) = xml_element_end(inner, tag_start, tag_name) else {
-            return Err(unterminated_child(tag_name, tag_start));
-        };
-        // A modeled text child holds plain text only: the readers
-        // decode entities only, so any markup inside it would read
-        // as the literal value. Any other child is skipped whole,
-        // but a modeled tag hidden in one would still be found by
-        // the descendant readers, so any occurrence is rejected.
-        if matches!(
-            (element, tag_name),
-            ("repository", "arch")
-                | ("download", "archfilter")
-                | ("download", "pubkey")
-                | ("project", "title")
-                | ("project", "description")
-                | ("project", "url")
-                | ("project", "scmsync")
-        ) {
-            let tail = &inner[tag_end..elem_end];
-            let close = tail.rfind('<').unwrap_or(tail.len());
-            if let Some(rel) = tail[..close].find('<') {
-                let at = tag_end + rel;
-                if tail[rel..].starts_with("<![CDATA[") {
-                    return Err(cdata_in_child(tag_name, at));
+        match construct {
+            XmlConstruct::Cdata => return Err(cdata(tag_start)),
+            XmlConstruct::Comment | XmlConstruct::Pi | XmlConstruct::Markup => {
+                if let Some((tag, rel)) = hidden_tag(&inner[tag_start..next]) {
+                    return Err(hidden_modeled_tag(tag, tag_start + rel));
                 }
-                return Err(markup_in_child(tag_name, at));
             }
-        } else {
-            let after_name = tag_start + 1 + tag_name.len();
-            if let Some((tag, rel)) = hidden_tag(&inner[after_name..elem_end]) {
-                return Err(hidden_modeled_tag(tag, after_name + rel));
+            XmlConstruct::CloseTag => {
+                // The parent's close was stripped by the caller, so nothing may close here.
+                return Err(GeectlError::new(
+                    ErrorKind::ServerError,
+                    format!("unexpected OBS response: stray closing tag in <{element}> at offset {tag_start}"),
+                ));
+            }
+            XmlConstruct::Child {
+                name: tag_name,
+                tag_end,
+                elem_end,
+                self_closing,
+            } => {
+                if self_closing {
+                    // Self-closing child: skip it whole, past its own tag
+                    // name so the name itself is not read as hidden.
+                    let after_name = tag_start + 1 + tag_name.len();
+                    if let Some((tag, rel)) = hidden_tag(&inner[after_name..tag_end]) {
+                        return Err(hidden_modeled_tag(tag, after_name + rel));
+                    }
+                // A modeled text child holds plain text only: the readers
+                // decode entities only, so any markup inside it would read
+                // as the literal value. Any other child is skipped whole,
+                // but a modeled tag hidden in one would still be found by
+                // the descendant readers, so any occurrence is rejected.
+                } else if matches!(
+                    (element, tag_name),
+                    ("repository", "arch")
+                        | ("download", "archfilter")
+                        | ("download", "pubkey")
+                        | ("project", "title")
+                        | ("project", "description")
+                        | ("project", "url")
+                        | ("project", "scmsync")
+                ) {
+                    let tail = &inner[tag_end..elem_end];
+                    let close = tail.rfind('<').unwrap_or(tail.len());
+                    if let Some(rel) = tail[..close].find('<') {
+                        let at = tag_end + rel;
+                        if tail[rel..].starts_with("<![CDATA[") {
+                            return Err(cdata_in_child(tag_name, at));
+                        }
+                        return Err(markup_in_child(tag_name, at));
+                    }
+                } else {
+                    let after_name = tag_start + 1 + tag_name.len();
+                    if let Some((tag, rel)) = hidden_tag(&inner[after_name..elem_end]) {
+                        return Err(hidden_modeled_tag(tag, after_name + rel));
+                    }
+                }
             }
         }
-        offset = elem_end;
+        offset = next;
     }
     Ok(())
 }
@@ -1929,6 +1968,31 @@ mod tests {
         assert!(xml_child_elements("</package>", "package").is_err());
         assert!(xml_child_elements("<></>", "package").is_err());
         assert!(xml_child_elements("<package name=\"a\"/><></>", "package").is_err());
+    }
+
+    #[test]
+    fn xml_child_elements_errors_name_the_fault() {
+        // The shared construct scan reports the fault; the collect
+        // policy renders it in its own coarse terms — the searched
+        // name for anything unterminated, no offsets.
+        let err = xml_child_elements("<package name=\"a\"", "package").unwrap_err();
+        assert!(
+            err.context.contains("unterminated <package> element"),
+            "{}",
+            err.context
+        );
+        let err = xml_child_elements("</package>", "package").unwrap_err();
+        assert!(
+            err.context.contains("stray closing tag in element content"),
+            "{}",
+            err.context
+        );
+        let err = xml_child_elements("<></>", "package").unwrap_err();
+        assert!(
+            err.context.contains("empty tag name in element content"),
+            "{}",
+            err.context
+        );
     }
 
     #[test]
