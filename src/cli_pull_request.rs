@@ -55,8 +55,8 @@ use crate::gitea::{
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
-    AcceptCleanupOutcome, CveId, DryRun, ForwardActionResult, ObsClient, ResultsQuery,
-    ReviewTarget, SrPayload, package_show_url, OBS_API_BASE,
+    package_show_url, AcceptCleanupOutcome, CveId, DryRun, ForwardActionResult, ObsClient,
+    ResultsQuery, ReviewTarget, SrPayload, OBS_API_BASE,
 };
 use crate::pull_request::{
     build_comment_body, PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint,
