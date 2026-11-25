@@ -757,22 +757,13 @@ pub(crate) fn parse_status_invoked(body: &str) -> bool {
     xml_attr(element, "code").is_some_and(|code| code == "invoked")
 }
 
-/// The value of attribute `name` in an opening tag's text (the text
-/// between `<tag` and `>`), read order-tolerantly in either quote
-/// style. None when the tag carries no such attribute. The attribute
-/// name must stand on its own — `myname="..."` must not match — so
-/// the character before the name has to be whitespace. The scan is
-/// quote-aware: a `name=` inside an earlier attribute's value must
-/// not match, and a malformed occurrence (an unquoted value) is
-/// skipped, not fatal. Whitespace around `=` is allowed: `name =
-/// "value"` is the same attribute. An empty or whitespace-only
-/// value reads as absent. Entity-encoded whitespace counts too:
-/// `&#32;` is a space once read, so it reads as absent as well.
-/// That is the rule for every caller —
-/// directory listings, request and status parsing, project meta —
-/// a whitespace-only value is absent everywhere this is read.
-/// The blank rule is the shared one, see
-/// `crate::xml::xml_attr_blank`.
+/// The value of attribute `name` in an opening tag's text, read
+/// order-tolerantly in either quote style. The name must stand on its
+/// own and the scan is quote-aware, so a `name=` inside an earlier
+/// attribute's value cannot match; a malformed occurrence is skipped,
+/// not fatal. An empty or whitespace-only value reads as absent —
+/// entity-encoded whitespace (`&#32;`) counts too. The blank rule is
+/// the shared one, see `crate::xml::xml_attr_blank`.
 pub(crate) fn tag_attr(element: &str, name: &str) -> Option<String> {
     if name.is_empty() {
         return None;

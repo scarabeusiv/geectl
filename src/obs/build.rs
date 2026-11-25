@@ -2637,17 +2637,11 @@ pub(crate) fn xml_attr(element: &str, name: &str) -> Option<String> {
 }
 
 /// The attribute value, or None when the attribute is absent, empty,
-/// or whitespace-only. Repository parsing only: the modeled
-/// Repository treats a blank flag or optional value as unset, and
-/// rendering drops empty values, so the parse must read them as
-/// absent to round-trip. The exception is `<releasetarget
-/// repository>`: it is required, so a blank value errors at parse
-/// rather than reading as unset. The blank rule is the shared
-/// one, see `crate::xml::xml_attr_blank`.
-/// Every other caller reads through [`xml_attr`], where an empty
-/// value stays present. A required repository attribute whose empty
-/// value fails closed reads through [`xml_attr`] too: the empty case
-/// errors, so no empty value can round-trip.
+/// or whitespace-only. Repository parsing only, so a blank value
+/// reads as absent and render/parse round-trips; the exception is
+/// `<releasetarget repository>`, which is required, so a blank value
+/// errors at parse. The blank rule is the shared one, see
+/// `crate::xml::xml_attr_blank`.
 fn xml_attr_non_blank(element: &str, name: &str) -> Option<String> {
     xml_attr_raw(element, name).filter(|value| !xml_attr_blank(value))
 }

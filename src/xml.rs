@@ -211,21 +211,13 @@ pub(crate) fn find_attr(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-/// XML whitespace, one definition per domain. The two domains
-/// disagree on NBSP (U+00A0) and the split is the rule, stated
-/// once here — no other helper defines XML whitespace.
-///
-/// - Attribute values: Unicode whitespace (`str::trim`). A value
-///   of only Unicode whitespace carries nothing, so it reads as
-///   absent, like an empty value. NBSP is whitespace here.
-/// - Element content: the four XML whitespace characters (space,
-///   tab, CR, LF). Anything else between children — including
-///   NBSP — is character data, not formatting, so a stray-text
-///   check sees it.
-///
-/// The attribute side is the rule for the `tag_attr`,
-/// `xml_attr_non_blank`, and remote-parser optional-attribute
-/// reads; the content side is the stray-text rule.
+/// XML whitespace, one definition per domain. Attribute values use
+/// Unicode whitespace (`str::trim`): a whitespace-only value is
+/// blank, and NBSP counts as whitespace. Element content uses only
+/// the four XML whitespace characters (space, tab, CR, LF), so NBSP
+/// between children is character data, not formatting. The attribute
+/// side is the rule for `tag_attr`, `xml_attr_non_blank`, and the
+/// remote-parser optional-attribute reads.
 pub(crate) fn xml_attr_blank(value: &str) -> bool {
     value.trim().is_empty()
 }
