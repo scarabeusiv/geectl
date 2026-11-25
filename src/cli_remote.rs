@@ -78,13 +78,12 @@
 //! truncated message).
 //! The JSON payload remains the complete record in every case.
 
-use clap::Subcommand;
-use geectl::auth::{Credentials, EnvObsAuth};
-use geectl::config;
-use geectl::debug::Debug;
-use geectl::error::{ErrorKind, GeectlError};
-use geectl::http::{Timeout, UreqClient};
-use geectl::obs::{
+use crate::auth::{Credentials, EnvObsAuth};
+use crate::config;
+use crate::debug::Debug;
+use crate::error::{ErrorKind, GeectlError};
+use crate::http::{Timeout, UreqClient};
+use crate::obs::{
     parse_package_meta, parse_project_meta, valid_obs_name, validate_meta_file_roles,
     validate_role, AddChannelsOptions, AddContainersOptions, AggregateOptions,
     CreatePackageOptions, CreateTokenOptions, CreatedToken, DeletePackageOptions,
@@ -94,6 +93,7 @@ use geectl::obs::{
     ScmsyncProjectList, SourceFile, StagedRequest, StagingProject, StagingReadOptions,
     TokenOperation, FACTORY_PROJECT, OBS_API_BASE,
 };
+use clap::Subcommand;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -4370,7 +4370,7 @@ fn render_project_diff(packages: &[PackageDiff]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Cli, Command};
+    use crate::cli::{Cli, Command};
     use clap::Parser;
 
     fn parse(args: &[&str]) -> RemoteCommand {

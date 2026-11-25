@@ -18,13 +18,13 @@
 //! coordinate header, then `dry_run:`, then the result line and the
 //! plan.
 
-use geectl::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
-use geectl::config::{self, DEFAULT_GITEA_URL};
-use geectl::debug::Debug;
-use geectl::error::{ErrorKind, GeectlError};
-use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{DryRun, ObsClient, RevisionSpec, OBS_API_BASE};
-use geectl::working_copy::{
+use crate::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
+use crate::config::{self, DEFAULT_GITEA_URL};
+use crate::debug::Debug;
+use crate::error::{ErrorKind, GeectlError};
+use crate::http::{HttpClient, Timeout, UreqClient};
+use crate::obs::{DryRun, ObsClient, RevisionSpec, OBS_API_BASE};
+use crate::working_copy::{
     self, Backend, CommitReport, PullReport, StatusCode, UpdateReport, WorkingCopy,
 };
 use serde_json::{json, Value};
@@ -789,7 +789,7 @@ fn resolve_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geectl::working_copy::StatusEntry;
+    use crate::working_copy::StatusEntry;
 
     fn wc() -> WorkingCopy {
         WorkingCopy {

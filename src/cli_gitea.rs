@@ -34,17 +34,17 @@
 //! free text) and `repo-create` text carries no description (long
 //! free text). The JSON payload remains the complete record in every case.
 
-use clap::{Args, Subcommand};
-use geectl::auth::EnvGiteaAuth;
-use geectl::config::{self, DEFAULT_GITEA_URL};
-use geectl::debug::Debug;
-use geectl::error::GeectlError;
-use geectl::gitea::{
+use crate::auth::EnvGiteaAuth;
+use crate::config::{self, DEFAULT_GITEA_URL};
+use crate::debug::Debug;
+use crate::error::GeectlError;
+use crate::gitea::{
     require_credentials_for_url, ForkRepoOptions, GiteaBranch, GiteaClient, GiteaRepository,
     MaintainerInfo, Maintainership, RepoCreateOptions,
 };
-use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::DryRun;
+use crate::http::{HttpClient, Timeout, UreqClient};
+use crate::obs::DryRun;
+use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
 /// The `gitea` subcommands. Names are the library operation names
@@ -665,9 +665,9 @@ fn join_row(cells: &[&str], widths: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Cli, Command};
+    use crate::cli::{Cli, Command};
+    use crate::gitea::{GiteaBranchCommit, GiteaOwner, GiteaParent};
     use clap::Parser;
-    use geectl::gitea::{GiteaBranchCommit, GiteaOwner, GiteaParent};
 
     fn parse(args: &[&str]) -> GiteaCommand {
         match Cli::parse_from(args).command {

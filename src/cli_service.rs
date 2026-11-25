@@ -30,13 +30,13 @@
 //! mutation like any other: dry-run is the default, `--live`
 //! performs it.
 
+use crate::auth::EnvObsAuth;
+use crate::config;
+use crate::debug::{strip_terminal_controls, Debug};
+use crate::error::GeectlError;
+use crate::http::{HttpClient, Timeout, UreqClient};
+use crate::obs::{DryRun, ObsClient, ServiceDef, ServiceState, ServiceTrigger, OBS_API_BASE};
 use clap::Subcommand;
-use geectl::auth::EnvObsAuth;
-use geectl::config;
-use geectl::debug::{strip_terminal_controls, Debug};
-use geectl::error::GeectlError;
-use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{DryRun, ObsClient, ServiceDef, ServiceState, ServiceTrigger, OBS_API_BASE};
 use serde_json::{json, Value};
 
 /// The `service` subcommands. Names are the library operation names
@@ -391,9 +391,9 @@ fn join_row(cells: &[&str], widths: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Cli, Command};
+    use crate::cli::{Cli, Command};
+    use crate::obs::{ServiceCode, ServiceParam};
     use clap::Parser;
-    use geectl::obs::{ServiceCode, ServiceParam};
 
     fn parse(args: &[&str]) -> ServiceCommand {
         match Cli::parse_from(args).command {

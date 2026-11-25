@@ -57,18 +57,18 @@
 //! These omissions are decided, not gaps: do not expand the tables
 //! to echo the full payload.
 
-use clap::{Args, Subcommand};
-use geectl::auth::{Credentials, EnvObsAuth};
-use geectl::config;
-use geectl::debug::Debug;
-use geectl::error::{ErrorKind, GeectlError};
-use geectl::http::{Timeout, UreqClient};
-use geectl::obs::{
+use crate::auth::{Credentials, EnvObsAuth};
+use crate::config;
+use crate::debug::Debug;
+use crate::error::{ErrorKind, GeectlError};
+use crate::http::{Timeout, UreqClient};
+use crate::obs::{
     AcceptInfo, AddRolePayload, ChangeDevelPayload, CveId, DeletePayload, DeleteTarget, DryRun,
     FiledRequest, MaintenanceIncidentPayload, ObsClient, Request, RequestAction, RequestComment,
     RequestHistory, RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewState,
     ReviewTarget, SrFiling, SrPayload, OBS_API_BASE,
 };
+use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
 /// The `request` subcommands: one leaf per library operation, named
@@ -2450,8 +2450,8 @@ fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obs::{parse_comments, parse_request};
     use clap::Parser;
-    use geectl::obs::{parse_comments, parse_request};
 
     const REQUEST_XML: &str = r#"<request creator="creator" id="123">
   <action type="submit">
@@ -3161,7 +3161,7 @@ mod tests {
 
     #[test]
     fn review_text_keeps_a_lone_who_or_when_and_names_no_reviewer() {
-        use geectl::obs::ReviewState;
+        use crate::obs::ReviewState;
         let who_only = RequestReview {
             state: ReviewState::New,
             when: None,

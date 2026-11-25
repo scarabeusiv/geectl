@@ -39,17 +39,17 @@
 //! with one header line echoing the query coordinates (`project: …`);
 //! findings follow as `repository/project:line: kind: message` lines.
 
-use clap::Subcommand;
-use geectl::auth::EnvObsAuth;
-use geectl::config;
-use geectl::debug::Debug;
-use geectl::error::{ErrorKind, GeectlError};
-use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{
+use crate::auth::EnvObsAuth;
+use crate::config;
+use crate::debug::Debug;
+use crate::error::{ErrorKind, GeectlError};
+use crate::http::{HttpClient, Timeout, UreqClient};
+use crate::obs::{
     format_prjconf_report, prjconf_finding_line, prjconf_skipped_line, DryRun, ObsClient,
     PrjconfCleanResult, PrjconfFinding, PrjconfSeverity, PrjconfSkipped, PrjconfValidation,
     OBS_API_BASE,
 };
+use clap::Subcommand;
 use serde_json::{json, Value};
 
 /// The `prjconf` subcommands. Names are the library operation names

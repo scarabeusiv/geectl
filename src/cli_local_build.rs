@@ -38,19 +38,19 @@
 //! coordinates, log path, verdict, exit code, and truncation flag
 //! ride in the JSON payload only (a DOCUMENTED omission).
 
-use clap::Subcommand;
-use geectl::auth::{Credentials, EnvObsAuth};
-use geectl::config;
-use geectl::debug::Debug;
-use geectl::error::{ErrorKind, GeectlError};
-use geectl::http::{Timeout, UreqClient};
-use geectl::local_build::{
+use crate::auth::{Credentials, EnvObsAuth};
+use crate::config;
+use crate::debug::Debug;
+use crate::error::{ErrorKind, GeectlError};
+use crate::http::{Timeout, UreqClient};
+use crate::local_build::{
     validate_build_request, BuildLog, BuildRecord, BuildRequest, ChrootRecord, EvictionReport,
     LocalBuild, PrecommitRecord, ServiceRunMode, ServiceRunRecord, ServiceRunRequest,
     SpecCleanerResult, WipeOutcome,
 };
-use geectl::obs::{DryRun, ObsClient, OBS_API_BASE};
-use geectl::periodic::{self, PeriodicOs, PeriodicOutcome, PeriodicStatus};
+use crate::obs::{DryRun, ObsClient, OBS_API_BASE};
+use crate::periodic::{self, PeriodicOs, PeriodicOutcome, PeriodicStatus};
+use clap::Subcommand;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
@@ -115,7 +115,7 @@ pub enum LocalBuildCommand {
         #[arg(long)]
         repo: String,
         /// The architecture to build for; must equal the host arch.
-        #[arg(long, default_value_t = std::env::consts::ARCH.to_string())]
+        #[arg(long, default_value_t = std::env::consts::ARCH.to_string(), hide_default_value = true)]
         arch: String,
         /// The multibuild flavor; required when the source carries
         /// a `_multibuild` file. One invocation builds one flavor.
@@ -245,7 +245,7 @@ pub enum LocalBuildCommand {
         #[arg(long)]
         repo: String,
         /// The architecture the root was built for; defaults to the host arch.
-        #[arg(long, default_value_t = std::env::consts::ARCH.to_string())]
+        #[arg(long, default_value_t = std::env::consts::ARCH.to_string(), hide_default_value = true)]
         arch: String,
         /// The multibuild flavor; required when the source
         /// carries a `_multibuild` file.
@@ -1167,13 +1167,13 @@ fn render_build_log(log: &BuildLog) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Cli, Command};
-    use clap::Parser;
-    use geectl::local_build::{
+    use crate::cli::{Cli, Command};
+    use crate::local_build::{
         BuildLog, BuildRecord, CacheStats, CheckSummary, EnginePlan, EvictedItem, EvictionReport,
         PlannedService, PrecheckinOutcome, RpmlintSummary, ServiceRunOutcome, ServiceRunPlan,
         ShellResult,
     };
+    use clap::Parser;
 
     fn parse(args: &[&str]) -> LocalBuildCommand {
         match Cli::parse_from(args).command {

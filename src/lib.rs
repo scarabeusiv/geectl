@@ -3,8 +3,7 @@
 //! The library is the core of geectl: the binary is a thin CLI over it, so
 //! tools (e.g. freshcrab) can link the same logic instead of shelling out.
 //!
-//! The library is deliberately small at scaffolding time. It carries the
-//! pieces the design doc names as load-bearing from the start:
+//! It carries the pieces the design doc names as load-bearing:
 //! - [`error`]: the centralized error store (one definition per error kind,
 //!   with code, message, remediation, and exit code).
 //! - [`url`]: the single URL builder (one encoder per context: path segments
@@ -20,6 +19,9 @@
 //!   credentials are stored anywhere here.
 //! - [`config`]: the XDG config file (endpoint URLs only, never
 //!   credentials) and the secure-write primitive.
+//! - [`cli`]: the clap CLI definition for every command group — the shipped
+//!   binary parses these types, and the `geectl-gen` generator builds the same
+//!   `Command` from them, so the generated assets can never drift from the CLI.
 //! - [`debug`]: the debug channel — one coherent `--debug` stream of
 //!   human-readable lines on stderr (HTTP attempts, retries, library
 //!   decision points), with bodies only behind `--debug-body`.
@@ -58,12 +60,27 @@
 
 pub mod auth;
 pub mod changelog;
+pub mod cli;
+pub mod cli_branch;
+pub mod cli_build;
+pub mod cli_changelog;
+pub mod cli_gitea;
+pub mod cli_local_build;
+pub mod cli_meta;
+pub mod cli_person;
+pub mod cli_prjconf;
+pub mod cli_pull_request;
+pub mod cli_remote;
+pub mod cli_request;
+pub mod cli_service;
+pub mod cli_working_copy;
 pub mod config;
 pub mod debug;
 pub mod error;
 pub mod gitea;
 pub mod http;
 pub mod local_build;
+pub mod maintenance;
 pub mod meta;
 pub mod obs;
 pub mod periodic;

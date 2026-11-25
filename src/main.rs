@@ -6,23 +6,9 @@
 //! every diagnostic, warning, and error goes to stderr. There is exactly
 //! one exit path: the error kind's exit code.
 
-mod cli_branch;
-mod cli_build;
-mod cli_changelog;
-mod cli_gitea;
-mod cli_local_build;
-mod cli_meta;
-mod cli_person;
-mod cli_prjconf;
-mod cli_pull_request;
-mod cli_remote;
-mod cli_request;
-mod cli_service;
-mod cli_working_copy;
-mod maintenance;
-
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::Parser;
 use geectl::auth::{load_dotenv, AuthProvider, Credentials, EnvGiteaAuth, EnvObsAuth, GiteaSshKey};
+use geectl::cli::{Cli, Command, ConfigCommand, Format};
 use geectl::config;
 use geectl::debug::Debug;
 use geectl::error::{ErrorKind, GeectlError};
@@ -30,217 +16,6 @@ use geectl::obs::OBS_API_BASE;
 use serde_json::json;
 use std::io::Write;
 use std::process::ExitCode;
-
-/// The output format. JSON is the default; it is the only format an agent
-/// should parse. `text` is a human-readable rendering of the same data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Format {
-    Json,
-    Text,
-}
-
-impl Format {
-    /// The config-file / environment spelling of this format
-    /// (`"json"` / `"text"`).
-    fn as_str(self) -> &'static str {
-        match self {
-            Format::Json => "json",
-            Format::Text => "text",
-        }
-    }
-}
-
-// The binary name is pinned so --help reads the same on every
-// platform: without it clap prints argv[0], `geectl.exe` on Windows.
-#[derive(Debug, Parser)]
-#[command(
-    name = "geectl",
-    bin_name = "geectl",
-    version,
-    about = "Geeko Controller — a CLI for openSUSE packaging workflows (OBS + src.opensuse.org)",
-    long_about = None
-)]
-struct Cli {
-    /// Output format for the result payload. Applies to every command.
-    /// Default: the `GEECTL_FORMAT` environment variable, else the
-    /// `format` key in the config file, else `json`.
-    #[arg(long, global = true, value_enum)]
-    format: Option<Format>,
-
-    /// Enable the debug channel: human-readable diagnostic lines on
-    /// stderr (HTTP attempts, retries, library decisions). Off by
-    /// default; `GEECTL_DEBUG=1` enables it without the flag.
-    #[arg(long, global = true)]
-    debug: bool,
-
-    /// Also print request and response bodies on the debug channel
-    /// (capped at 2048 bytes, redacted, never headers). Implies
-    /// `--debug`.
-    #[arg(long, global = true)]
-    debug_body: bool,
-
-    /// Actually perform mutations. Without it, only the plan is
-    /// printed: dry-run is the default for mutations.
-    #[arg(long, global = true)]
-    live: bool,
-
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Print version information as the result payload.
-    Version,
-    /// Inspect or initialise the config file.
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
-    },
-    /// Remote reads and mutations: inspect what the
-    /// distribution holds, and change it.
-    Remote {
-        #[command(subcommand)]
-        command: cli_remote::RemoteCommand,
-    },
-    /// Read and act on OBS submit requests, and file new ones.
-    Request {
-        #[command(subcommand)]
-        command: Box<cli_request::RequestCommand>,
-    },
-    /// Branch, copy, and link packages.
-    Branch {
-        #[command(subcommand)]
-        // Boxed: the ten branch subcommands make BranchCommand far
-        // larger than the other variants (clippy::large_enum_variant).
-        command: Box<cli_branch::BranchCommand>,
-    },
-    /// Build-status commands: results, logs, histories, binaries, buildconfig.
-    Build {
-        #[command(subcommand)]
-        command: cli_build::BuildCommand,
-    },
-    /// Local builds in the podman build vertical: build a package,
-    /// run its `_service` services, the precommit gate,
-    /// `spec-cleaner`, wipe a build root, prune the cache, manage
-    /// the daily periodic cleanup, enter the preserved build root,
-    /// and read the log of the last local build.
-    LocalBuild {
-        #[command(subcommand)]
-        command: cli_local_build::LocalBuildCommand,
-    },
-    /// Maintenance operations: maintained-instances listing and
-    /// maintenance branching.
-    Maintenance {
-        #[command(subcommand)]
-        command: maintenance::MaintenanceCommand,
-    },
-    /// Service reads and trigger: list a package's services, their
-    /// run state, and trigger a server-side run.
-    Service {
-        #[command(subcommand)]
-        command: cli_service::ServiceCommand,
-    },
-    /// Gitea operations: repository and branch reads and mutations
-    /// on the configured instance.
-    Gitea {
-        #[command(subcommand)]
-        command: cli_gitea::GiteaCommand,
-    },
-    /// Read and act on pull requests: OBS submit requests and
-    /// Gitea pull requests as one surface.
-    PullRequest {
-        #[command(subcommand)]
-        command: cli_pull_request::PullRequestCommand,
-    },
-    /// Search for a person: the OBS projects naming the login
-    /// and the Gitea users matching the keyword, as one operation.
-    Person {
-        #[command(subcommand)]
-        command: cli_person::PersonCommand,
-    },
-    /// Set the meta of an OBS project, an OBS package, or a Gitea
-    /// repository as one operation: the target selects the backend.
-    Meta {
-        #[command(subcommand)]
-        command: cli_meta::MetaCommand,
-    },
-    /// Validate and generate `.changes` entries in a package
-    /// directory, pre-file.
-    Changelog {
-        #[command(subcommand)]
-        command: cli_changelog::ChangelogCommand,
-    },
-    /// Check out a package into a git working copy, under the
-    /// current directory.
-    Checkout {
-        /// The OBS project.
-        project: String,
-        /// The OBS package.
-        package: String,
-        /// The revision to check out (a number or a source md5).
-        /// The latest when omitted.
-        #[arg(long)]
-        rev: Option<String>,
-    },
-    /// Update the working copy in the current directory to the
-    /// latest base.
-    Update {
-        /// The revision to update to (a number or a source md5).
-        /// The latest when omitted.
-        #[arg(long)]
-        rev: Option<String>,
-    },
-    /// Show the working copy's state against the base.
-    Status,
-    /// Show the diff of the worktree and the index against the base,
-    /// plus the link diff on a linked checkout.
-    Diff,
-    /// Stage files for commit.
-    Add {
-        /// The files to stage, relative to the checkout root.
-        #[arg(required = true)]
-        files: Vec<String>,
-    },
-    /// Remove files from the working copy.
-    Rm {
-        /// The files to remove, relative to the checkout root.
-        #[arg(required = true)]
-        files: Vec<String>,
-    },
-    /// Stage new files and worktree deletions.
-    Addremove,
-    /// Commit the staged changes.
-    Commit {
-        /// The commit message.
-        #[arg(long, short)]
-        message: String,
-        /// Skip the service gate (source services and
-        /// `pre_checkin.sh`).
-        #[arg(long)]
-        noservice: bool,
-    },
-    /// Pull a linked package to the link target's latest revision.
-    Pull,
-    /// Stage the resolved files and continue a stopped rebase.
-    Resolve,
-    /// Read, validate and clean a project's prjconf.
-    Prjconf {
-        #[command(subcommand)]
-        command: cli_prjconf::PrjconfCommand,
-    },
-}
-
-/// The `config` subcommands.
-#[derive(Debug, Subcommand)]
-enum ConfigCommand {
-    /// Show the effective config: endpoint URLs with their source,
-    /// and credential status (never a secret value).
-    Show,
-    /// Write the config template (endpoints only). Refuses if the
-    /// file already exists.
-    Init,
-}
 
 fn run(
     cli: Cli,
@@ -257,10 +32,10 @@ fn run(
             let text = format!("geectl {}", env!("CARGO_PKG_VERSION"));
             (payload, text)
         }
-        Some(Command::Request { command }) => cli_request::run(*command, debug, cli.live)?,
-        Some(Command::Build { command }) => cli_build::run_build(debug, command, cli.live)?,
+        Some(Command::Request { command }) => geectl::cli_request::run(*command, debug, cli.live)?,
+        Some(Command::Build { command }) => geectl::cli_build::run_build(debug, command, cli.live)?,
         Some(Command::LocalBuild { command }) => {
-            cli_local_build::run_local_build(debug, command, cli.live)?
+            geectl::cli_local_build::run_local_build(debug, command, cli.live)?
         }
         Some(Command::Config { command }) => match command {
             ConfigCommand::Show => {
@@ -274,39 +49,53 @@ fn run(
                 (payload, text)
             }
         },
-        Some(Command::Remote { command }) => cli_remote::run_remote(command, debug, cli.live)?,
-        Some(Command::Branch { command }) => cli_branch::run_branch(*command, debug, cli.live)?,
+        Some(Command::Remote { command }) => {
+            geectl::cli_remote::run_remote(command, debug, cli.live)?
+        }
+        Some(Command::Branch { command }) => {
+            geectl::cli_branch::run_branch(*command, debug, cli.live)?
+        }
         Some(Command::Maintenance { command }) => {
-            let (payload, text) = maintenance::run(command, debug, cli.live)?;
+            let (payload, text) = geectl::maintenance::run(command, debug, cli.live)?;
             (payload, text)
         }
-        Some(Command::Service { command }) => cli_service::run_service(command, debug, cli.live)?,
-        Some(Command::Gitea { command }) => cli_gitea::run_gitea(command, debug, cli.live)?,
-        Some(Command::PullRequest { command }) => {
-            cli_pull_request::run_pull_request(command, debug, cli.live)?
+        Some(Command::Service { command }) => {
+            geectl::cli_service::run_service(command, debug, cli.live)?
         }
-        Some(Command::Person { command }) => cli_person::run_person(command, debug, cli.live)?,
-        Some(Command::Meta { command }) => cli_meta::run_meta(command, debug, cli.live)?,
+        Some(Command::Gitea { command }) => geectl::cli_gitea::run_gitea(command, debug, cli.live)?,
+        Some(Command::PullRequest { command }) => {
+            geectl::cli_pull_request::run_pull_request(command, debug, cli.live)?
+        }
+        Some(Command::Person { command }) => {
+            geectl::cli_person::run_person(command, debug, cli.live)?
+        }
+        Some(Command::Meta { command }) => geectl::cli_meta::run_meta(command, debug, cli.live)?,
         Some(Command::Changelog { command }) => {
-            cli_changelog::run_changelog(command, debug, cli.live)?
+            geectl::cli_changelog::run_changelog(command, debug, cli.live)?
         }
         Some(Command::Checkout {
             project,
             package,
             rev,
-        }) => cli_working_copy::checkout(&project, &package, rev.as_deref(), debug, cli.live)?,
-        Some(Command::Update { rev }) => cli_working_copy::update(rev.as_deref(), debug, cli.live)?,
-        Some(Command::Status) => cli_working_copy::status(debug)?,
-        Some(Command::Diff) => cli_working_copy::diff(debug)?,
-        Some(Command::Add { files }) => cli_working_copy::add(&files, debug, cli.live)?,
-        Some(Command::Rm { files }) => cli_working_copy::rm(&files, debug, cli.live)?,
-        Some(Command::Addremove) => cli_working_copy::addremove(debug, cli.live)?,
-        Some(Command::Commit { message, noservice }) => {
-            cli_working_copy::commit(&message, noservice, debug, cli.live)?
+        }) => {
+            geectl::cli_working_copy::checkout(&project, &package, rev.as_deref(), debug, cli.live)?
         }
-        Some(Command::Pull) => cli_working_copy::pull(debug, cli.live)?,
-        Some(Command::Resolve) => cli_working_copy::resolve(debug, cli.live)?,
-        Some(Command::Prjconf { command }) => cli_prjconf::run_prjconf(command, debug, cli.live)?,
+        Some(Command::Update { rev }) => {
+            geectl::cli_working_copy::update(rev.as_deref(), debug, cli.live)?
+        }
+        Some(Command::Status) => geectl::cli_working_copy::status(debug)?,
+        Some(Command::Diff) => geectl::cli_working_copy::diff(debug)?,
+        Some(Command::Add { files }) => geectl::cli_working_copy::add(&files, debug, cli.live)?,
+        Some(Command::Rm { files }) => geectl::cli_working_copy::rm(&files, debug, cli.live)?,
+        Some(Command::Addremove) => geectl::cli_working_copy::addremove(debug, cli.live)?,
+        Some(Command::Commit { message, noservice }) => {
+            geectl::cli_working_copy::commit(&message, noservice, debug, cli.live)?
+        }
+        Some(Command::Pull) => geectl::cli_working_copy::pull(debug, cli.live)?,
+        Some(Command::Resolve) => geectl::cli_working_copy::resolve(debug, cli.live)?,
+        Some(Command::Prjconf { command }) => {
+            geectl::cli_prjconf::run_prjconf(command, debug, cli.live)?
+        }
     };
     Ok(match format {
         Format::Json => payload.to_string(),

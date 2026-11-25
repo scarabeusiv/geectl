@@ -23,16 +23,16 @@
 //! when they need credentials. How the other groups handle a
 //! half-configured pair is stated in `docs/cli.md`.
 
-use clap::{Args, Subcommand};
-use geectl::auth::EnvObsAuth;
-use geectl::config;
-use geectl::debug::Debug;
-use geectl::error::GeectlError;
-use geectl::http::{HttpClient, Timeout, UreqClient};
-use geectl::obs::{
+use crate::auth::EnvObsAuth;
+use crate::config;
+use crate::debug::Debug;
+use crate::error::GeectlError;
+use crate::http::{HttpClient, Timeout, UreqClient};
+use crate::obs::{
     DryRun, MaintainedInstance, MaintenanceBranchOptions, MaintenanceBranchResult, ObsClient,
     OBS_API_BASE,
 };
+use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
 /// The `maintenance` subcommands. Names are the library operation names

@@ -43,19 +43,19 @@
 //! performs them, and the text opens with the coordinate header, then
 //! `dry_run:`, then the result line and the plan.
 
-use clap::{Args, Subcommand};
-use fs2::FileExt;
-use geectl::auth::{alias_for_url, same_api_url, Credentials, EnvObsAuth};
-use geectl::config;
-use geectl::debug::Debug;
-use geectl::error::{ErrorKind, GeectlError};
-use geectl::http::{Timeout, UreqClient};
-use geectl::obs::{
+use crate::auth::{alias_for_url, same_api_url, Credentials, EnvObsAuth};
+use crate::config;
+use crate::debug::Debug;
+use crate::error::{ErrorKind, GeectlError};
+use crate::http::{Timeout, UreqClient};
+use crate::obs::{
     parse_build_log_url, results_across_instances, valid_obs_filename, valid_obs_name, BinaryFile,
     BuildHistoryEntry, BuildInfo, BuildLogQuery, BuildResults, DryRun, ExtDependency, FileInfo,
     InstanceBuildResults, JobHistoryEntry, JobStatus, ObsClient, PackageDeps, ProvidedBy,
     Repository, ResultsQuery, WipeBinariesOptions, WipeCode, OBS_API_BASE,
 };
+use clap::{Args, Subcommand};
+use fs2::FileExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -2510,8 +2510,8 @@ fn render_repositories_text(repositories: &[Repository]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obs::{BuildDep, BuildResult, InstanceBuildResults, PackageBuildStatus};
     use clap::FromArgMatches;
-    use geectl::obs::{BuildDep, BuildResult, InstanceBuildResults, PackageBuildStatus};
 
     /// The clap `Command` for the `build` group, built from the
     /// `Subcommand` derive: there is no `CommandFactory` for a

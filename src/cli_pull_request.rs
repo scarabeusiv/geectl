@@ -45,22 +45,22 @@
 //! title (long free text) and no review detail — those are a
 //! `show` call away.
 
-use clap::{Args, Subcommand};
-use geectl::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
-use geectl::config::{self, DEFAULT_GITEA_URL};
-use geectl::debug::Debug;
-use geectl::error::{ErrorKind, GeectlError};
-use geectl::gitea::{
+use crate::auth::{Credentials, EnvGiteaAuth, EnvObsAuth};
+use crate::config::{self, DEFAULT_GITEA_URL};
+use crate::debug::Debug;
+use crate::error::{ErrorKind, GeectlError};
+use crate::gitea::{
     parse_gitea_repo, validate_gitea_base, GiteaClient, GiteaMergeMethod, PrCreateOptions,
 };
-use geectl::http::{Timeout, UreqClient};
-use geectl::obs::{CveId, DryRun, ObsClient, ReviewTarget, SrPayload, OBS_API_BASE};
-use geectl::pull_request::{
+use crate::http::{Timeout, UreqClient};
+use crate::obs::{CveId, DryRun, ObsClient, ReviewTarget, SrPayload, OBS_API_BASE};
+use crate::pull_request::{
     PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint, PullRequestRef,
     PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewComment, ReviewOpinion,
     SubmitTarget, Submitted,
 };
-use geectl::working_copy::{self, Backend};
+use crate::working_copy::{self, Backend};
+use clap::{Args, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -1798,9 +1798,9 @@ fn render_table(headers: &[&str], rows: &[Vec<String>]) -> Result<String, Geectl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geectl::gitea::{GiteaPullRequest, GiteaReview};
-    use geectl::http::HttpClient;
-    use geectl::obs::parse_request;
+    use crate::gitea::{GiteaPullRequest, GiteaReview};
+    use crate::http::HttpClient;
+    use crate::obs::parse_request;
 
     const REQUEST_XML: &str = r#"<request creator="creator" id="123">
   <action type="submit">
@@ -2012,7 +2012,7 @@ mod tests {
     fn fixture_opinion() -> ReviewOpinion {
         ReviewOpinion {
             reviewer: "plusky".to_string(),
-            state: geectl::pull_request::OpinionState::Approved,
+            state: crate::pull_request::OpinionState::Approved,
             comment: "Looks good.".to_string(),
             when: Some("2026-11-22T19:52:58Z".to_string()),
         }
