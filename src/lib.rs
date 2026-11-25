@@ -83,6 +83,7 @@ pub mod local_build;
 pub mod maintenance;
 pub mod meta;
 pub mod obs;
+pub mod oscrc;
 pub mod periodic;
 pub mod person;
 pub mod pull_request;

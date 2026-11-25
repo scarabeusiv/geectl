@@ -1041,6 +1041,244 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp-{pid}-{nanos}-{n}"))
 }
 
+/// The outcome of adding an instance to the config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddInstance {
+    /// A new `[instances]` entry was written.
+    Added,
+    /// The alias already named the same URL; the file is untouched.
+    AlreadyPresent,
+    /// The alias existed with a different URL and `force` replaced it.
+    Replaced,
+}
+
+/// Check whether an instance can be added: the alias and URL pass the
+/// same validation the loader applies, the alias does not already
+/// name another URL (unless `force`), and no other alias already
+/// names this URL (the loader refuses two aliases for one URL).
+/// Returns what a write would do. No file is touched.
+pub fn check_add_instance(
+    path: &Path,
+    alias: &str,
+    url: &str,
+    force: bool,
+) -> Result<AddInstance, GeectlError> {
+    let mut seen_upper = HashSet::new();
+    validate_alias(alias, &mut seen_upper, path)?;
+    let url = validate_endpoint_url(url, &format!("{}: '[instances] {alias}'", path.display()))?;
+    let current = load_config_at(path)?;
+    if let Some((_, existing_url)) = current
+        .instances
+        .iter()
+        .find(|(a, _)| a.eq_ignore_ascii_case(alias))
+    {
+        if same_api_url(existing_url, &url).unwrap_or(false) {
+            return Ok(AddInstance::AlreadyPresent);
+        }
+        if !force {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "{}: instance alias {alias:?} already names {existing_url}; pass --force to replace it",
+                    path.display()
+                ),
+            ));
+        }
+        return Ok(AddInstance::Replaced);
+    }
+    if let Some((other, _)) = current
+        .instances
+        .iter()
+        .find(|(a, u)| !a.eq_ignore_ascii_case(alias) && same_api_url(u, &url).unwrap_or(false))
+    {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!(
+                "{}: instance alias {other:?} already names {url}; use that alias instead of adding {alias:?}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(AddInstance::Added)
+}
+
+/// Add an instance to the config file's `[instances]` table: the
+/// alias to URL mapping only, never a credential. The existing file
+/// is validated through the loader first, so a malformed config
+/// fails closed instead of gaining a spliced entry; the spliced text
+/// is validated through the loader again before the atomic write, so
+/// a splice bug never lands in the file. The rest of the file is
+/// preserved apart from the inserted (or replaced) line — comments
+/// and key order survive. A missing file gains a minimal
+/// `[instances]` section only; endpoint lines are never invented.
+pub fn add_instance(
+    path: &Path,
+    alias: &str,
+    url: &str,
+    force: bool,
+) -> Result<AddInstance, GeectlError> {
+    let outcome = check_add_instance(path, alias, url, force)?;
+    if outcome == AddInstance::AlreadyPresent {
+        return Ok(outcome);
+    }
+    let url = validate_endpoint_url(url, &format!("{}: '[instances] {alias}'", path.display()))?;
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(io_error(path, e)),
+    };
+    let new_text = splice_instance(&text, alias, &url, outcome == AddInstance::Replaced, path)?;
+    // Validate the spliced text before writing: a splice bug must
+    // fail here, never land in the file.
+    parse_config(&new_text, path)?;
+    secure_write(path, new_text.as_bytes())?;
+    Ok(outcome)
+}
+
+/// Derive an instance alias from an endpoint URL: the host,
+/// lowercased, with every character outside ASCII alphanumerics
+/// replaced by `_`, so the alias is valid under [`validate_alias`]
+/// and names the env-var segment (`GEECTL_OBS_USERNAME_<ALIAS>`).
+/// A URL with no host is an error naming the URL.
+pub fn alias_from_url(url: &str) -> Result<String, GeectlError> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed host (IPv6): up to the closing bracket.
+        rest.split(']').next().unwrap_or("")
+    } else {
+        // Strip a trailing `:port` (a port is all digits after the
+        // last colon).
+        match authority.rfind(':') {
+            Some(i)
+                if !authority[i + 1..].is_empty()
+                    && authority[i + 1..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                &authority[..i]
+            }
+            _ => authority,
+        }
+    };
+    let alias: String = host
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let alias = alias.trim_matches('_').to_string();
+    if alias.is_empty() {
+        return Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            format!("cannot derive an instance alias from {url:?}; pass --alias"),
+        ));
+    }
+    Ok(alias)
+}
+
+/// Splice one `[instances]` entry into config TOML text: insert
+/// `alias = "url"` after the `[instances]` header, replace the
+/// alias's line when `replace`, or append a new `[instances]`
+/// section when the table is absent. The entry value is TOML-escaped
+/// through the `toml` crate, never interpolated raw. An `[instances]`
+/// entry written inline or with dotted keys (no section header) is
+/// refused with a clear error: appending a section there would
+/// duplicate the table, so the file needs the section form first.
+fn splice_instance(
+    text: &str,
+    alias: &str,
+    url: &str,
+    replace: bool,
+    path: &Path,
+) -> Result<String, GeectlError> {
+    let entry = format!("{alias} = {}", toml::Value::String(url.to_string()));
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    // Find the `[instances]` header: a line whose bracketed name is
+    // `instances` (quotes stripped). A comment line never matches:
+    // it does not start with `[`.
+    let header = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('[') {
+            return false;
+        }
+        let Some(rest) = trimmed.strip_prefix('[') else {
+            return false;
+        };
+        let Some(inner) = rest.split(']').next() else {
+            return false;
+        };
+        let name = inner.trim().trim_matches(|c| c == '"' || c == '\'');
+        name == "instances"
+    });
+    match header {
+        Some(h) => {
+            // The section runs to the next header line or EOF.
+            let end = lines[h + 1..]
+                .iter()
+                .position(|line| line.trim_start().starts_with('['))
+                .map(|i| h + 1 + i)
+                .unwrap_or(lines.len());
+            if replace {
+                let entry_line = lines[h + 1..end].iter().position(|line| {
+                    entry_key(line).is_some_and(|key| key.eq_ignore_ascii_case(alias))
+                });
+                let Some(i) = entry_line else {
+                    return Err(GeectlError::new(
+                        ErrorKind::ConfigError,
+                        format!(
+                            "{}: cannot replace '[instances] {alias}': the entry is not a plain line in the section",
+                            path.display()
+                        ),
+                    ));
+                };
+                lines[h + 1 + i] = entry;
+            } else {
+                lines.insert(h + 1, entry);
+            }
+        }
+        None => {
+            // No section header: the table must be absent entirely —
+            // an inline or dotted `[instances]` would duplicate the
+            // table if a section were appended.
+            if !text.trim().is_empty() {
+                let parsed = parse_config(text, path)?;
+                if !parsed.instances.is_empty() {
+                    return Err(GeectlError::new(
+                        ErrorKind::ConfigError,
+                        format!(
+                            "{}: the '[instances]' table is written inline or with dotted keys; rewrite it as an [instances] section and retry",
+                            path.display()
+                        ),
+                    ));
+                }
+                if !text.ends_with('\n') {
+                    lines.push(String::new());
+                }
+                lines.push(String::new());
+            }
+            lines.push("[instances]".to_string());
+            lines.push(entry);
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    Ok(out)
+}
+
+/// The key of an `[instances]` entry line (`alias = "url"`, quotes
+/// stripped), or `None` for a comment, blank, or header line.
+fn entry_key(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+        return None;
+    }
+    let before_eq = trimmed.split('=').next()?;
+    let key = before_eq.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let key = key.trim_matches(|c| c == '"' || c == '\'');
+    Some(key.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1896,5 +2134,224 @@ mod tests {
         let effective = effective_config(&Config::default()).unwrap();
         assert_eq!(effective.config.format.as_deref(), Some("json"));
         assert_eq!(effective.format_source, "default");
+    }
+
+    // --- add_instance / splice_instance / alias_from_url ---
+
+    #[test]
+    fn add_instance_writes_section_to_new_file() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        let outcome =
+            add_instance(&path, "api_opensuse_org", "https://api.opensuse.org", false).unwrap();
+        assert_eq!(outcome, AddInstance::Added);
+        let config = load_config_at(&path).unwrap();
+        assert_eq!(
+            config.instances,
+            vec![(
+                "api_opensuse_org".to_string(),
+                "https://api.opensuse.org".to_string()
+            )]
+        );
+        // A minimal file: only the section, no invented endpoints.
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[instances]\napi_opensuse_org = \"https://api.opensuse.org\"\n"
+        );
+    }
+
+    #[test]
+    fn add_instance_inserts_into_existing_section_preserving_rest() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        fs::write(
+            &path,
+            "# a user comment\nobs_url = \"https://api.opensuse.org\"\n[instances]\nexample = \"https://obs.example.com\"\n",
+        )
+        .unwrap();
+        let outcome = add_instance(&path, "local", "http://127.0.0.1:3001", false).unwrap();
+        assert_eq!(outcome, AddInstance::Added);
+        let text = fs::read_to_string(&path).unwrap();
+        // The comment, the endpoint line and the old entry survive.
+        assert!(text.contains("# a user comment\n"), "{text}");
+        assert!(
+            text.contains("obs_url = \"https://api.opensuse.org\"\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("example = \"https://obs.example.com\"\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("local = \"http://127.0.0.1:3001\"\n"),
+            "{text}"
+        );
+        let config = load_config_at(&path).unwrap();
+        assert_eq!(config.instances.len(), 2);
+    }
+
+    #[test]
+    fn add_instance_refuses_existing_alias_without_force() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        fs::write(
+            &path,
+            "[instances]\napi_opensuse_org = \"https://other.example.com\"\n",
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let err =
+            add_instance(&path, "api_opensuse_org", "https://api.opensuse.org", false).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("already names"), "{}", err.context);
+        assert!(err.context.contains("--force"), "{}", err.context);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn add_instance_force_replaces_alias() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        fs::write(
+            &path,
+            "[instances]\napi_opensuse_org = \"https://other.example.com\"\nother = \"https://obs.example.com\"\n",
+        )
+        .unwrap();
+        let outcome =
+            add_instance(&path, "api_opensuse_org", "https://api.opensuse.org", true).unwrap();
+        assert_eq!(outcome, AddInstance::Replaced);
+        let config = load_config_at(&path).unwrap();
+        assert_eq!(
+            config.instances,
+            vec![
+                (
+                    "api_opensuse_org".to_string(),
+                    "https://api.opensuse.org".to_string()
+                ),
+                ("other".to_string(), "https://obs.example.com".to_string()),
+            ]
+        );
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("other.example.com"),
+            "old URL must be gone"
+        );
+    }
+
+    #[test]
+    fn add_instance_already_present_is_noop() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        fs::write(
+            &path,
+            "[instances]\napi_opensuse_org = \"https://api.opensuse.org\"\n",
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let outcome =
+            add_instance(&path, "api_opensuse_org", "https://api.opensuse.org", false).unwrap();
+        assert_eq!(outcome, AddInstance::AlreadyPresent);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn add_instance_refuses_url_named_by_another_alias() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        fs::write(
+            &path,
+            "[instances]\nexample = \"https://api.opensuse.org\"\n",
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let err = add_instance(&path, "other", "https://api.opensuse.org", false).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("example"), "{}", err.context);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn add_instance_malformed_existing_config_fails_closed() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        fs::write(
+            &path,
+            "obs_url = \"https://api.opensuse.org\"\n[instances\n",
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let err =
+            add_instance(&path, "api_opensuse_org", "https://api.opensuse.org", false).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn add_instance_inline_instances_refused() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        fs::write(
+            &path,
+            "instances = { example = \"https://obs.example.com\" }\n",
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let err = add_instance(&path, "local", "http://127.0.0.1:3001", false).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+        assert!(err.context.contains("section"), "{}", err.context);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn add_instance_validates_alias_and_url() {
+        let dir = TempDir::new();
+        let path = dir.0.join("config.toml");
+        // A bad alias and a userinfo URL are both refused, and
+        // neither writes anything.
+        assert!(add_instance(&path, "bad-alias", "https://api.opensuse.org", false).is_err());
+        assert!(add_instance(&path, "file", "https://api.opensuse.org", false).is_err());
+        assert!(add_instance(&path, "ok", "https://user:secret@api.opensuse.org", false).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn alias_from_url_derives_host() {
+        assert_eq!(
+            alias_from_url("https://api.opensuse.org").unwrap(),
+            "api_opensuse_org"
+        );
+        assert_eq!(
+            alias_from_url("https://api.opensuse.org:443").unwrap(),
+            "api_opensuse_org"
+        );
+        assert_eq!(
+            alias_from_url("http://127.0.0.1:3001").unwrap(),
+            "127_0_0_1"
+        );
+        assert_eq!(
+            alias_from_url("https://obs.example.com/base").unwrap(),
+            "obs_example_com"
+        );
+        assert_eq!(alias_from_url("https://[::1]:3001").unwrap(), "1");
+        assert!(alias_from_url("https://").is_err());
+        assert!(alias_from_url("").is_err());
+    }
+
+    #[test]
+    fn splice_instance_replaces_quoted_key() {
+        let text = "[instances]\n\"api_opensuse_org\" = \"https://other.example.com\"\n";
+        let out = splice_instance(
+            text,
+            "api_opensuse_org",
+            "https://api.opensuse.org",
+            true,
+            &config_path(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "[instances]\napi_opensuse_org = \"https://api.opensuse.org\"\n"
+        );
     }
 }
