@@ -45,7 +45,7 @@
 
 use crate::auth::{alias_for_url, same_api_url, Credentials, EnvObsAuth};
 use crate::config;
-use crate::debug::Debug;
+use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{Timeout, UreqClient};
 use crate::obs::{
@@ -2076,7 +2076,7 @@ fn buildinfo_payload(
 fn render_buildinfo_text(info: &BuildInfo) -> String {
     let mut lines = Vec::new();
     match &info.error {
-        Some(error) => lines.push(format!("error: {error}")),
+        Some(error) => lines.push(format!("error: {}", strip_terminal_controls(error))),
         None => lines.push("no blocking error".to_string()),
     }
     if info.bdeps.is_empty() {
@@ -3718,6 +3718,25 @@ mod tests {
         assert_eq!(payload["bdeps"][1], "make");
         assert_eq!(payload["bdep_projects"][0], "openSUSE:Factory");
         assert!(payload["bdep_projects"][1].is_null());
+    }
+
+    #[test]
+    fn buildinfo_renders_error_without_terminal_controls() {
+        // The error is server text, and the render is the terminal
+        // boundary: escape sequences, carriage returns, bells, and
+        // bidirectional marks are stripped, while the error's own
+        // newlines survive.
+        let blocked = BuildInfo {
+            error: Some("bad\u{1b}[2Jline\rwith\u{7}bell\nand\u{202e}bidi".to_string()),
+            bdeps: vec![],
+            preinstall_image: None,
+            urls: std::collections::HashMap::new(),
+            skipped_paths: 0,
+        };
+        assert_eq!(
+            render_buildinfo_text(&blocked),
+            "error: bad[2Jlinewithbell\nandbidi\nno dependencies"
+        );
     }
 
     #[test]

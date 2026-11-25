@@ -890,7 +890,13 @@ pub(crate) fn parse_buildinfo(body: &str) -> Result<BuildInfo, GeectlError> {
         return Err(malformed());
     }
     let inner = &inner[..close];
-    let error = xml_element_text(inner, "error");
+    // Terminal control characters are stripped from the error text:
+    // the buildinfo is server data, and the error reaches the
+    // terminal through the info render and through the failure a
+    // local build raises — strip at the parse, so every consumer
+    // sees clean text. Newlines survive: the error is multi-line.
+    let error =
+        xml_element_text(inner, "error").map(|text| crate::debug::strip_terminal_controls(&text));
     let mut bdeps = Vec::new();
     for element in xml_elements(inner, "bdep")? {
         let (tag, _) = xml_split_element(element, "bdep");
@@ -5294,6 +5300,21 @@ mod tests {
                 .map(|dep| dep.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["gcc", "make"]
+        );
+    }
+
+    #[test]
+    fn parse_buildinfo_strips_terminal_controls_from_the_error() {
+        // The error is server text: escape sequences, carriage
+        // returns, bells, and bidirectional marks are stripped at
+        // the parse, so no downstream surface can print them.
+        let parsed = parse_buildinfo(
+            "<buildinfo project=\"p\" repository=\"r\" package=\"foo\" arch=\"x86_64\"><error>unresolvable:\u{1b}[2J\u{1b}]8;;http://x\u{7}DOES-NOT-EXIST</error></buildinfo>",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.error.as_deref(),
+            Some("unresolvable:[2J]8;;http://xDOES-NOT-EXIST")
         );
     }
 
