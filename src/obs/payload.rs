@@ -84,7 +84,9 @@ pub struct SrPayload {
     /// The project the SR targets: the devel project, or
     /// `openSUSE:Factory` when the source is the recorded devel
     /// project and package — the filing path verifies the Factory
-    /// case live against the target package meta.
+    /// case live against the target package meta, for a direct
+    /// filing and a forward alike. A forward payload targets the
+    /// link parent instead — see [`SrPayload::new_forward`].
     target_project: String,
     /// The package in the target project.
     target_package: String,
@@ -115,6 +117,48 @@ impl SrPayload {
     /// a payload that could not be filed, except a Factory target
     /// whose devel check runs at filing.
     pub fn new(
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+        description: &str,
+        changes_entry: &str,
+        cves: &[CveId],
+    ) -> Result<Self, GeectlError> {
+        let payload = SrPayload {
+            source_project: source_project.to_string(),
+            source_package: source_package.to_string(),
+            target_project: target_project.to_string(),
+            target_package: target_package.to_string(),
+            description: description.to_string(),
+            changes_entry: changes_entry.to_string(),
+            cves: cves.to_vec(),
+            source_update: SourceUpdate::default(),
+        };
+        payload.validate_semantics()?;
+        // The payload must render to well-formed XML, or it is not a
+        // payload at all — check now, not at filing time.
+        payload.validate_xml()?;
+        Ok(payload)
+    }
+
+    /// Build and validate a forward payload: a submit request whose
+    /// target is the link parent of a devel-project package. A
+    /// Factory target is permitted here exactly as for a direct
+    /// filing — when the source is the recorded devel project and
+    /// package of the target — and the filing path verifies that
+    /// live against the target package meta, like any direct filing
+    /// (see [`SrPayload::new`]). There is no forward-only Factory
+    /// bypass: the regular constructor permits the same target.
+    /// [`SrFiling::file`] re-runs the same semantic checks on the
+    /// filing path, so a forward payload is validated there too.
+    /// The description is the forwarded description
+    /// (`Forwarded request #<id> from <creator>` plus the original);
+    /// the `.changes` entry is the original description unless the
+    /// caller passes an override. The caller opts out of cleanup
+    /// with [`SrPayload::without_cleanup`] — a forward must not
+    /// delete the devel package on accept.
+    pub fn new_forward(
         source_project: &str,
         source_package: &str,
         target_project: &str,
@@ -1584,7 +1628,31 @@ impl<'a> SrFiling<'a> {
             "would: supersede all open submit requests targeting {} with the new request",
             payload.target_package
         );
-        self.file_with_supersede(payload, &[], &[supersede_note])
+        self.file_with_supersede(payload, &[], &[supersede_note], None)
+    }
+
+    /// File `payload` for a forward: like [`SrFiling::file`], but the
+    /// supersede is scoped to the payload's hop — source and target
+    /// in one action — so an earlier forward for the same hop is
+    /// superseded, never an open request for the same package aimed
+    /// elsewhere (a staging flow, another devel target, another
+    /// source). The forward fires on every default accept, so the
+    /// unscoped supersede-all would close unrelated requests on
+    /// every accept.
+    pub fn file_forward(&self, payload: &SrPayload) -> Result<Option<FiledRequest>, GeectlError> {
+        let supersede_note = format!(
+            "would: supersede the open forward from {}/{} to {}/{} with the new request",
+            payload.source_project,
+            payload.source_package,
+            payload.target_project,
+            payload.target_package
+        );
+        self.file_with_supersede(
+            payload,
+            &[],
+            &[supersede_note],
+            Some((&payload.source_project, &payload.source_package)),
+        )
     }
 
     /// File `payload` as a new submit request and supersede `old_id`
@@ -1616,13 +1684,18 @@ impl<'a> SrFiling<'a> {
                 payload.target_package
             ),
         ];
-        self.file_with_supersede(payload, &[old_id.to_string()], &supersede_notes)
+        self.file_with_supersede(payload, &[old_id.to_string()], &supersede_notes, None)
     }
 
     /// File `payload` and supersede every open submit request for
     /// the package from the authenticated user, plus `extra` (the
     /// named request a refile supersedes, which may be declined and
     /// so absent from the open list), the named request first.
+    /// When `forward_source` is given — the source project and
+    /// package of a forward filing — the open-request search is
+    /// scoped to that hop: the forward filing supersedes an
+    /// earlier forward for the same hop, never an open request
+    /// for the same package aimed elsewhere.
     /// Returns the filed request in live mode, or None in dry-run.
     /// In dry-run nothing is read or filed: the plan records the
     /// supersede as `dry_run_supersede` lines against the package,
@@ -1646,6 +1719,7 @@ impl<'a> SrFiling<'a> {
         payload: &SrPayload,
         extra: &[String],
         dry_run_supersede: &[String],
+        forward_source: Option<(&str, &str)>,
     ) -> Result<Option<FiledRequest>, GeectlError> {
         // The payload is validated on the filing path, not only at
         // construction: the semantic checks run here as well as the
@@ -1685,9 +1759,19 @@ impl<'a> SrFiling<'a> {
         if payload.target_project == FACTORY_PROJECT {
             self.check_factory_target(payload)?;
         }
-        let open = self
-            .obs
-            .open_own_target_request_ids(&payload.target_package)?;
+        let open = match forward_source {
+            Some((source_project, source_package)) => {
+                self.obs.open_own_target_request_ids_for_target(
+                    source_project,
+                    source_package,
+                    &payload.target_project,
+                    &payload.target_package,
+                )?
+            }
+            None => self
+                .obs
+                .open_own_target_request_ids(&payload.target_package)?,
+        };
         let mut supersede: Vec<String> = extra.to_vec();
         for id in open {
             if !supersede.contains(&id) {
@@ -2278,6 +2362,48 @@ mod tests {
         assert!(payload_with_cve().validate_semantics().is_ok());
     }
 
+    #[test]
+    fn new_forward_and_new_both_accept_a_factory_target() {
+        // A Factory target passes construction from either
+        // constructor: the recorded-devel rule is verified live
+        // on the filing path, not at construction.
+        let forward = SrPayload::new_forward(
+            "devel:languages:python",
+            "foo",
+            "openSUSE:Factory",
+            "foo",
+            "Forwarded request #42 from alice\n\nUpdate foo to 2.0",
+            "Update foo to 2.0",
+            &[],
+        )
+        .unwrap();
+        assert!(forward.validate_semantics().is_ok());
+        assert!(forward.validate_xml().is_ok());
+        // The direct constructor accepts the same target at
+        // construction too; the filing path verifies the
+        // recorded devel live.
+        assert!(SrPayload::new(
+            "devel:languages:python",
+            "foo",
+            "openSUSE:Factory",
+            "foo",
+            "Forwarded request #42 from alice\n\nUpdate foo to 2.0",
+            "Update foo to 2.0",
+            &[],
+        )
+        .is_ok());
+        // A forward payload still validates names and text.
+        assert!(SrPayload::new_forward(
+            "devel:languages:python",
+            "foo",
+            "openSUSE:Factory",
+            "foo",
+            "   ",
+            "Update foo to 2.0",
+            &[],
+        )
+        .is_err());
+    }
     #[test]
     fn noupdate_renders_and_validates() {
         let mut p = payload();
@@ -3157,6 +3283,73 @@ mod tests {
             "https://api.opensuse.org/request/1398492?cmd=changestate&newstate=superseded&superseded_by=1400001"
         );
         assert_eq!(posted[1].1, "superseded by 1400001");
+    }
+
+    #[test]
+    fn file_forward_supersedes_only_the_same_hop_open_sr() {
+        // The forward filing scopes its supersede to the payload's
+        // hop: an open SR from the same user for the same hop is
+        // superseded, and the search that found it carried source
+        // and target in one action — an open request for the same
+        // package from another source, and a multi-action request
+        // spreading the hop across actions, never appear in it.
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let search_url = obs
+            .search_url_for_target("home:scarabeus_iv", "foo", "devel:languages:python", "foo")
+            .unwrap();
+        let http = FakeHttp::new()
+            .with_get(
+                &search_url,
+                "<collection matches=\"3\"><request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"1398493\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:alice\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"1398494\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:other\" package=\"foo\" /></action><action type=\"submit\"><source project=\"home:alice\" package=\"bar\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create",
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request/1398492?cmd=changestate&newstate=superseded&superseded_by=1400001",
+                "<status code=\"ok\" />",
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing.file_forward(&payload()).unwrap(),
+            Some(FiledRequest {
+                id: "1400001".to_string(),
+                superseded: vec!["1398492".to_string()],
+            })
+        );
+        // The search ran against the hop-scoped URL, then the
+        // filing POST, then the one supersede POST.
+        assert_eq!(http.get_calls().len(), 1);
+        assert_eq!(http.get_calls()[0].0, search_url);
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 2);
+        assert_eq!(posted[0].0, "https://api.opensuse.org/request?cmd=create");
+        assert_eq!(
+            posted[1].0,
+            "https://api.opensuse.org/request/1398492?cmd=changestate&newstate=superseded&superseded_by=1400001"
+        );
+    }
+
+    #[test]
+    fn file_forward_dry_run_scopes_the_supersede_note() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::default();
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(filing.file_forward(&payload()).unwrap(), None);
+        assert!(http.get_calls().is_empty());
+        assert!(http.post_calls().is_empty());
+        assert!(
+            dry.plan().iter().any(|line| line.contains(
+                "would: supersede the open forward from home:scarabeus_iv/foo to devel:languages:python/foo with the new request"
+            )),
+            "plan: {:?}",
+            dry.plan()
+        );
     }
 
     #[test]

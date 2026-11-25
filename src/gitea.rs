@@ -1052,16 +1052,22 @@ const MAX_LIST_PAGES: u32 = 10;
 /// stripped and a `git+` scheme prefix stripped; the branch is the
 /// `#fragment`; the `trackingbranch` query value is a separate
 /// field, honoured as the branch only when no fragment names one.
-struct ScmsyncUrl {
+pub struct ScmsyncUrl {
     /// The authority (host, plus port when present) of the repo URL.
-    authority: String,
+    pub authority: String,
     /// The repo's owner.
-    owner: String,
+    pub owner: String,
     /// The repo name.
-    repo: String,
+    pub repo: String,
     /// The branch: the `#fragment` when present, else the
     /// `trackingbranch` query value when present, else `None`.
-    branch: Option<String>,
+    pub branch: Option<String>,
+    /// The `trackingbranch` query value when one is present,
+    /// whether or not a fragment names a branch too: the branch
+    /// the package tracks, as distinct from the revision the
+    /// fragment pins (a fragment may name a commit while the
+    /// package tracks a branch).
+    pub tracking_branch: Option<String>,
 }
 
 /// The Gitea client: the transport client for the git-backed
@@ -4280,30 +4286,21 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Parse a scmsync URL (`url#branch`, `trackingbranch` query
-/// honoured) into its parts, mirroring the server's
-/// `generate_scmsyncinfo`: the repo is scheme + host + path with a
-/// trailing `.git` stripped and a `git+` scheme prefix stripped;
-/// the branch is the `#fragment`; the `trackingbranch` query value
-/// is honoured as the branch only when no fragment names one.
-fn parse_scmsync_url(scmsync: &str) -> Result<ScmsyncUrl, GeectlError> {
+/// Normalize a repo URL the way [`parse_scmsync_url`] does, so the
+/// prefix search and the parse cannot disagree on what names a
+/// repo: strip a `git+` scheme prefix, strip userinfo and the
+/// scheme's default port from the authority, strip a trailing
+/// `.git` and trailing slashes from the path. The scheme must be
+/// https (or http for a test instance); anything else is not a
+/// repo URL this client can name.
+pub(crate) fn normalize_repo_url(url: &str) -> Result<String, GeectlError> {
     let invalid = |reason: &str| {
         GeectlError::new(
             ErrorKind::InvalidInput,
-            format!("invalid scmsync URL {scmsync:?}: {reason}"),
+            format!("invalid repo URL {url:?}: {reason}"),
         )
     };
-    let (before_fragment, fragment) = match scmsync.split_once('#') {
-        Some((before, fragment)) => (before, Some(fragment)),
-        None => (scmsync, None),
-    };
-    let (repo_url, query) = match before_fragment.split_once('?') {
-        Some((before, query)) => (before, Some(query)),
-        None => (before_fragment, None),
-    };
-    let (scheme, rest) = repo_url
-        .split_once("://")
-        .ok_or_else(|| invalid("no scheme"))?;
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| invalid("no scheme"))?;
     let scheme = scheme.strip_prefix("git+").unwrap_or(scheme);
     if scheme != "https" && scheme != "http" {
         return Err(invalid(
@@ -4318,10 +4315,52 @@ fn parse_scmsync_url(scmsync: &str) -> Result<ScmsyncUrl, GeectlError> {
     }
     // Userinfo and the scheme's default port do not change which
     // instance the URL names, so both are stripped before the
-    // authority is compared with the client's.
+    // authority is compared — the same strip the parse applies.
     let authority = normalize_authority(authority, scheme);
-    // Strip a trailing `.git` from the path, like the server.
+    // Strip a trailing `.git` from the path, like the server, and
+    // trailing slashes, which the parse ignores when it splits the
+    // path into segments.
     let path = path.strip_suffix(".git").unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return Err(invalid("no host/path"));
+    }
+    Ok(format!("{scheme}://{authority}/{path}"))
+}
+
+/// Parse a scmsync URL (`url#branch`, `trackingbranch` query
+/// honoured) into its parts, mirroring the server's
+/// `generate_scmsyncinfo`: the repo is scheme + host + path with a
+/// trailing `.git` stripped and a `git+` scheme prefix stripped;
+/// the branch is the `#fragment`; the `trackingbranch` query value
+/// is honoured as the branch only when no fragment names one.
+pub fn parse_scmsync_url(scmsync: &str) -> Result<ScmsyncUrl, GeectlError> {
+    let invalid = |reason: &str| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid scmsync URL {scmsync:?}: {reason}"),
+        )
+    };
+    let (before_fragment, fragment) = match scmsync.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (scmsync, None),
+    };
+    let (repo_url, query) = match before_fragment.split_once('?') {
+        Some((before, query)) => (before, Some(query)),
+        None => (before_fragment, None),
+    };
+    // The repo URL normalises the way the prefix search does —
+    // `git+` scheme prefix, userinfo, default ports, a trailing
+    // `.git` — so the parse and the search agree on what names a
+    // repo. The normaliser's error names the repo part; the
+    // scmsync value is named by the caller's error below.
+    let repo_url = normalize_repo_url(repo_url)?;
+    let (_, rest) = repo_url
+        .split_once("://")
+        .ok_or_else(|| invalid("no scheme"))?;
+    let (authority, path) = rest
+        .split_once('/')
+        .ok_or_else(|| invalid("no host/path"))?;
     let mut segments = path.split('/').filter(|segment| !segment.is_empty());
     let owner = segments.next().ok_or_else(|| invalid("no owner"))?;
     let repo = segments.next().ok_or_else(|| invalid("no repo"))?;
@@ -4350,12 +4389,13 @@ fn parse_scmsync_url(scmsync: &str) -> Result<ScmsyncUrl, GeectlError> {
     let branch = fragment
         .filter(|fragment| !fragment.is_empty())
         .map(percent_decode)
-        .or(tracking_branch);
+        .or(tracking_branch.clone());
     Ok(ScmsyncUrl {
         authority: authority.to_string(),
         owner: owner.to_string(),
         repo: repo.to_string(),
         branch,
+        tracking_branch,
     })
 }
 
@@ -7962,6 +8002,7 @@ mod tests {
             parse_scmsync_url("https://src.opensuse.org/pool/systemd?trackingbranch=factory")
                 .unwrap();
         assert_eq!(parsed.branch, Some("factory".to_string()));
+        assert_eq!(parsed.tracking_branch, Some("factory".to_string()));
         // The fragment wins over trackingbranch when both name one
         // — the real value from `network:messaging:xmpp/dino`,
         // which pins a commit while tracking `main`.
@@ -7975,6 +8016,9 @@ mod tests {
             parsed.branch,
             Some("e490820bfabf010f5f267335067a52757aca72af2f62b02e38dad0d43a50f7aa".to_string())
         );
+        // The fragment pins a commit; the package still tracks
+        // `main` — the tracking branch is recorded separately.
+        assert_eq!(parsed.tracking_branch, Some("main".to_string()));
         // A `subdir` query names the package inside a
         // project-synced repo — the real value from
         // `openSUSE:Leap:16.0/000release-packages`.
@@ -7990,6 +8034,7 @@ mod tests {
         // fragment.
         let parsed = parse_scmsync_url("https://src.opensuse.org/adamm/git-quick-stats").unwrap();
         assert_eq!(parsed.branch, None);
+        assert_eq!(parsed.tracking_branch, None);
         // An empty fragment names no branch.
         let parsed = parse_scmsync_url("https://src.opensuse.org/pool/systemd#").unwrap();
         assert_eq!(parsed.branch, None);
@@ -8003,6 +8048,7 @@ mod tests {
         let parsed =
             parse_scmsync_url("https://src.opensuse.org/pool/systemd#feature%2Fx").unwrap();
         assert_eq!(parsed.branch, Some("feature/x".to_string()));
+
         for invalid in [
             "https://src.opensuse.org/pool",
             "https://src.opensuse.org/pool/systemd/extra#factory",
@@ -8014,6 +8060,36 @@ mod tests {
                 parse_scmsync_url(invalid).is_err(),
                 "{invalid} should be invalid"
             );
+        }
+    }
+    #[test]
+    fn normalize_repo_url_matches_the_parse() {
+        // Every spelling the parse accepts normalises to the same
+        // repo URL the prefix search sends.
+        for spelling in [
+            "https://src.opensuse.org/pool/systemd",
+            "https://src.opensuse.org/pool/systemd.git",
+            "git+https://src.opensuse.org/pool/systemd",
+            "https://src.opensuse.org:443/pool/systemd",
+            "https://fbui@src.opensuse.org/pool/systemd",
+            "https://src.opensuse.org/pool/systemd/",
+        ] {
+            assert_eq!(
+                normalize_repo_url(spelling).unwrap(),
+                "https://src.opensuse.org/pool/systemd",
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            normalize_repo_url("https://src.opensuse.org:8443/pool/systemd").unwrap(),
+            "https://src.opensuse.org:8443/pool/systemd"
+        );
+        for invalid in [
+            "pool/systemd",
+            "ssh://git@src.opensuse.org/pool/systemd",
+            "https:///pool/systemd",
+        ] {
+            assert!(normalize_repo_url(invalid).is_err(), "{invalid}");
         }
     }
 

@@ -396,6 +396,14 @@ fn request_accept_dry_run_prints_plan_and_changes_nothing() {
     assert_eq!(value["dry_run"], true);
     assert_plan_non_empty(&value);
     assert!(
+        value["plan"].as_array().unwrap().iter().any(|line| line
+            .as_str()
+            .unwrap_or("")
+            .contains("[dry-run] would: forward request 42 after accept")),
+        "plan: {}",
+        value["plan"]
+    );
+    assert!(
         String::from_utf8_lossy(&out.stderr).contains("[dry-run]"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
@@ -407,6 +415,26 @@ fn request_accept_dry_run_text_renders_the_plan() {
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["--format", "text", "request", "accept", "42"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would change request 42 to accepted; would forward after accept"
+    );
+}
+#[test]
+fn request_accept_dry_run_with_no_forward_omits_the_forward() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "request",
+            "accept",
+            "42",
+            "--no-forward",
+        ])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -1032,6 +1060,786 @@ fn request_supersede_live_shape_carries_ids_and_dry_run_false() {
     );
 }
 
+/// A routing stub OBS server for the live accept-then-forward: the
+/// changestate POST, the request read, the target package's
+/// directory listing, the maintenance search, the filing dedup
+/// search, and the create POST each get their canned answer, by
+/// method and request target. Anything else is a 404. The seen
+/// request lines are recorded so the test can prove the accept
+/// landed before the forward was filed.
+fn serve_accept_forward_live() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let request_xml = "<request id=\"42\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"accepted\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo to 2.0</description></request>";
+    let directory_xml =
+        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" /></directory>";
+    let meta_xml = "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>";
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    let ok = "<status code=\"ok\" />";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("changestate") {
+                (200, ok.to_string())
+            } else if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+                )
+            } else if target.contains("/_meta") {
+                (200, meta_xml.to_string())
+            } else if target.contains("search/project/id") || target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else if target.starts_with("/source/") {
+                (200, directory_xml.to_string())
+            } else if target.starts_with("/request/") {
+                (200, request_xml.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+#[test]
+fn request_accept_live_forwards_after_accept() {
+    let (addr, seen) = serve_accept_forward_live();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "accept", "42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["state"], "accepted");
+    assert_eq!(value["dry_run"], false);
+    assert_eq!(value["forward"]["actions"][0]["outcome"], "forwarded");
+    assert_eq!(
+        value["forward"]["actions"][0]["target"],
+        "openSUSE:Factory/foo"
+    );
+    assert_eq!(value["forward"]["actions"][0]["new_id"], 1400001);
+    // The guard must drop before the second run: the stub thread
+    // takes the same lock per request, and holding it across the
+    // run would stall every response.
+    {
+        let seen = seen.lock().unwrap();
+        let change = seen
+            .iter()
+            .position(|r| r.contains("changestate") && r.contains("newstate=accepted"))
+            .expect("no changestate POST recorded");
+        let create = seen
+            .iter()
+            .position(|r| r.contains("cmd=create"))
+            .expect("no create POST recorded");
+        assert!(
+            change < create,
+            "the forward was filed before the accept landed: {seen:?}"
+        );
+    }
+    let out = geectl_isolated(&dir)
+        .args(["--live", "--format", "text", "request", "accept", "42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "changed request 42 to accepted; forwarded request 42\nforwarded devel:languages:python/foo to openSUSE:Factory/foo as request 1400001"
+    );
+}
+
+/// A routing stub OBS server for a live accept whose forward is
+/// refused: the link parent's meta records a different devel
+/// package (a rename). The request read answers the post-accept
+/// state, like the live server would after the accept lands. The
+/// seen request lines are recorded so the test can prove the
+/// accept landed and nothing was declined or filed.
+fn serve_accept_forward_refused() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let request_xml = "<request id=\"42\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"accepted\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo to 2.0</description></request>";
+    let directory_xml =
+        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" /></directory>";
+    let meta_xml = "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>";
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    let ok = "<status code=\"ok\" />";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("changestate") {
+                (200, ok.to_string())
+            } else if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+                )
+            } else if target.contains("/_meta") {
+                (200, meta_xml.to_string())
+            } else if target.contains("search/project/id") || target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else if target.starts_with("/source/") {
+                (200, directory_xml.to_string())
+            } else if target.starts_with("/request/") {
+                (200, request_xml.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+/// A routing stub OBS server for a live accept whose forward
+/// fails transiently: the link parent's directory listing answers
+/// 500, so the forward fails after the accept lands. The request
+/// read answers the post-accept state. The seen request lines are
+/// recorded so the test can prove the accept landed and nothing
+/// was declined or filed.
+fn serve_accept_forward_transient_error() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let request_xml = "<request id=\"42\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"accepted\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo to 2.0</description></request>";
+    let meta_xml = "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>";
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    let ok = "<status code=\"ok\" />";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("changestate") {
+                (200, ok.to_string())
+            } else if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+                )
+            } else if target.contains("/_meta") {
+                (200, meta_xml.to_string())
+            } else if target.contains("search/project/id") || target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else if target.starts_with("/source/") {
+                (500, "<status code=\"internal_error\" />".to_string())
+            } else if target.starts_with("/request/") {
+                (200, request_xml.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+/// A routing stub OBS server for a live accept whose forward
+/// fails transiently at the devel record: the hop resolves from the
+/// link parent, but the link parent's meta read answers 500, so the
+/// forward fails after the accept lands. The same shape as
+/// `serve_accept_forward_refused`, with a `ServerError` check
+/// failure instead of a refusal. The request read answers the
+/// post-accept state. The seen request lines are recorded so the
+/// test can prove the accept landed and nothing was declined or
+/// filed.
+fn serve_accept_forward_transient_check_error() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let request_xml = "<request id=\"42\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"accepted\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo to 2.0</description></request>";
+    let directory_xml =
+        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" /></directory>";
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    let ok = "<status code=\"ok\" />";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("changestate") {
+                (200, ok.to_string())
+            } else if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+                )
+            } else if target.contains("/_meta") {
+                (500, "<status code=\"internal_error\" />".to_string())
+            } else if target.contains("search/project/id") || target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else if target.starts_with("/source/") {
+                (200, directory_xml.to_string())
+            } else if target.starts_with("/request/") {
+                (200, request_xml.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+#[test]
+fn request_accept_live_accepts_when_the_forward_is_refused() {
+    // The refused fixture: the accept lands, and the forward then
+    // refuses on the renamed devel — the refusal is reported, the
+    // accepted request stands, and nothing is declined or filed.
+    let (addr, seen) = serve_accept_forward_refused();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "accept", "42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the refused accept exited 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("accepted request 42, but the forward failed"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("devel:languages:python/bar"),
+        "stderr: {stderr}"
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("changestate") && r.contains("newstate=accepted")),
+            "no accept changestate recorded: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("newstate=declined")),
+            "the refusal declined the accepted request: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("cmd=create")),
+            "a forward was filed after the refusal: {seen:?}"
+        );
+    }
+}
+
+#[test]
+fn request_accept_live_transient_check_failure_accepts_and_reports() {
+    // The same refused fixture shape, but the hop read fails
+    // transiently (500) instead of refusing: the accept lands,
+    // the forward fails with the server's error, and the request
+    // stays accepted with the work queued — nothing is declined
+    // or filed.
+    let (addr, seen) = serve_accept_forward_transient_error();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "accept", "42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the transient accept exited 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(6));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("accepted request 42, but the forward failed"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("returned 500"), "stderr: {stderr}");
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("changestate") && r.contains("newstate=accepted")),
+            "no accept changestate recorded: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("newstate=declined")),
+            "the transient failure declined the accepted request: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("cmd=create")),
+            "a forward was filed after the transient failure: {seen:?}"
+        );
+    }
+}
+
+#[test]
+fn request_accept_live_transient_devel_check_failure_accepts_and_reports() {
+    // The refused fixture shape, but the devel-record read fails
+    // transiently (500) instead of returning a mismatched devel:
+    // the hop resolves, the forward fails with a ServerError
+    // after the accept lands, and the request stays accepted with
+    // the work queued — nothing is declined or filed.
+    let (addr, seen) = serve_accept_forward_transient_check_error();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "accept", "42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the transient accept exited 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(6));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("accepted request 42, but the forward failed"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("returned 500"), "stderr: {stderr}");
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("changestate") && r.contains("newstate=accepted")),
+            "no accept changestate recorded: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("newstate=declined")),
+            "the transient failure declined the accepted request: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("cmd=create")),
+            "a forward was filed after the transient check failure: {seen:?}"
+        );
+    }
+}
+
+#[test]
+fn request_accept_live_no_forward_skips_the_gate() {
+    // The same refused fixture: with --no-forward the accept
+    // runs without the devel check, so the request is accepted
+    // and nothing is declined or filed.
+    let (addr, seen) = serve_accept_forward_refused();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "request", "accept", "42", "--no-forward"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["state"], "accepted");
+    assert_eq!(value["dry_run"], false);
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("changestate") && r.contains("newstate=accepted")),
+            "no accept changestate recorded: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("newstate=declined")),
+            "the gate declined a --no-forward accept: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("cmd=create")),
+            "a forward was filed for a --no-forward accept: {seen:?}"
+        );
+    }
+}
+
+#[test]
+fn pull_request_merge_obs_live_forwards_after_merge() {
+    // The OBS arm of `pull-request merge` merges with the
+    // accept-coupled forward: the same routing stub serves it, and
+    // the merge must land before the forward is filed.
+    let (addr, seen) = serve_accept_forward_live();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "pull-request", "merge", "obs:42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], "obs:42");
+    assert_eq!(value["status"], "merged");
+    assert_eq!(value["dry_run"], false);
+    assert_eq!(value["forward"]["actions"][0]["outcome"], "forwarded");
+    assert_eq!(
+        value["forward"]["actions"][0]["target"],
+        "openSUSE:Factory/foo"
+    );
+    assert_eq!(value["forward"]["actions"][0]["new_id"], 1400001);
+    // The guard must drop before the second run: the stub thread
+    // takes the same lock per request, and holding it across the
+    // run would stall every response.
+    {
+        let seen = seen.lock().unwrap();
+        let change = seen
+            .iter()
+            .position(|r| r.contains("changestate") && r.contains("newstate=accepted"))
+            .expect("no changestate POST recorded");
+        let create = seen
+            .iter()
+            .position(|r| r.contains("cmd=create"))
+            .expect("no create POST recorded");
+        assert!(
+            change < create,
+            "the forward was filed before the merge landed: {seen:?}"
+        );
+    }
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "--format",
+            "text",
+            "pull-request",
+            "merge",
+            "obs:42",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "merged obs:42 (now merged); forwarded request 42\nforwarded devel:languages:python/foo to openSUSE:Factory/foo as request 1400001"
+    );
+}
+
+#[test]
+fn pull_request_merge_obs_live_merges_when_the_forward_is_refused() {
+    // The same rename fixture: the merge lands, and the forward
+    // then refuses — the refusal is reported, the merged request
+    // stands, and nothing is declined or filed.
+    let (addr, seen) = serve_accept_forward_refused();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "pull-request", "merge", "obs:42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the refused merge exited 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("merged request 42, but the forward failed"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("devel:languages:python/bar"),
+        "stderr: {stderr}"
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("changestate") && r.contains("newstate=accepted")),
+            "no accept changestate recorded: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("newstate=declined")),
+            "the refusal declined the merged request: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("cmd=create")),
+            "a forward was filed after the refusal: {seen:?}"
+        );
+    }
+}
+
+/// A routing stub OBS server for a live merge whose target package
+/// has no link parent: the merge lands and the forward reports
+/// the hop skipped, filing nothing.
+fn serve_merge_no_link_parent() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let request_xml = "<request id=\"42\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"accepted\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo to 2.0</description></request>";
+    let directory_xml = "<directory></directory>";
+    let meta_xml = "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>";
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    let ok = "<status code=\"ok\" />";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("changestate") {
+                (200, ok.to_string())
+            } else if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+                )
+            } else if target.contains("/_meta") {
+                (200, meta_xml.to_string())
+            } else if target.contains("search/project/id") || target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else if target.starts_with("/source/") {
+                (200, directory_xml.to_string())
+            } else if target.starts_with("/request/") {
+                (200, request_xml.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+#[test]
+fn pull_request_merge_obs_live_no_link_parent_forwards_nothing() {
+    // No link parent means no hop: the merge lands, the forward
+    // reports the action skipped, and nothing is filed.
+    let (addr, seen) = serve_merge_no_link_parent();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "pull-request", "merge", "obs:42"])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], "obs:42");
+    assert_eq!(value["status"], "merged");
+    assert_eq!(value["dry_run"], false);
+    assert_eq!(value["forward"]["actions"][0]["outcome"], "skipped");
+    assert_eq!(
+        value["forward"]["actions"][0]["reason"],
+        "the package has no link parent"
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("changestate") && r.contains("newstate=accepted")),
+            "no merge changestate recorded: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("cmd=create")),
+            "a forward was filed with no link parent: {seen:?}"
+        );
+    }
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "--format",
+            "text",
+            "pull-request",
+            "merge",
+            "obs:42",
+        ])
+        .env("GEECTL_OBS_URL", format!("http://{addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "merged obs:42 (now merged); request 42: nothing forwarded\nskipped devel:languages:python/foo: the package has no link parent"
+    );
+}
+
+#[test]
+fn pull_request_merge_obs_dry_run_plans_the_forward() {
+    // No server: the dry run plans the merge and the forward
+    // after it, and changes nothing.
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "merge", "obs:42"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], "obs:42");
+    assert!(value["status"].is_null());
+    assert_eq!(value["dry_run"], true);
+    assert_plan_non_empty(&value);
+    assert!(
+        value["plan"].as_array().unwrap().iter().any(|line| line
+            .as_str()
+            .unwrap_or("")
+            .contains("[dry-run] would: forward request 42 after merge")),
+        "plan: {}",
+        value["plan"]
+    );
+    let out = geectl_isolated(&dir)
+        .args(["--format", "text", "pull-request", "merge", "obs:42"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would merge obs:42; would forward after merge"
+    );
+}
+
 #[test]
 fn request_show_without_credentials_text_error_renders_as_text() {
     let dir = TempDir::new();
@@ -1119,7 +1927,7 @@ fn request_accept_dry_run_text_echoes_the_comment() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would change request 42 to accepted \u{2014} looks good"
+        "dry-run: would change request 42 to accepted \u{2014} looks good; would forward after accept"
     );
 }
 

@@ -194,7 +194,7 @@ directory's `.env` only.
 - `geectl request list` — List submit requests: the same search, with the states still awaiting action (new, review) as the default; key flags: --project <PROJECT>, --package <PACKAGE>, --state <STATE>, --since <SINCE>, --limit <LIMIT>
 - `geectl request diff <ID>` — Show the diff of a submit request: the unified diff, or the request XML with the diff injected with `--xml`; key flags: --xml
 - `geectl request list-comments <ID>` — List the comments on a submit request, in id order.
-- `geectl request accept <ID>` — Accept a submit request, with a comment as the message left with the accept; key flags: --comment <COMMENT>, --force
+- `geectl request accept <ID>` — Accept a submit request, with a comment as the message left with the accept. An accepted request is forwarded to its link parent unless `--no-forward` is given; a refused forward is reported and the accepted request stands, with the work staying queued in the devel project; key flags: --comment <COMMENT>, --force, --no-forward
 - `geectl request decline <ID>` — Decline a submit request, with a comment as the reason; key flags: --comment <COMMENT>
 - `geectl request revoke <ID>` — Revoke (withdraw) a submit request, with a comment as the reason; key flags: --comment <COMMENT>
 - `geectl request change-state <ID> <STATE>` — Change a submit request's state to one of new/review/accepted/declined/revoked; key flags: --comment <COMMENT>, --force
@@ -309,7 +309,7 @@ without evaluating trust.
 - `geectl pull-request comment --body <BODY> <REFERENCE>` — Comment on a pull request; key flags: --parent <PARENT>
 - `geectl pull-request comments <REFERENCE>` — List the comments on a pull request, oldest first.
 - `geectl pull-request cancel-review-request <REFERENCE>` — Cancel pending review requests on a pull request; key flags: --reviewer <REVIEWER>, --all, --exclude <EXCLUDE>
-- `geectl pull-request merge <REFERENCE>` — Merge a pull request; key flags: --message <MESSAGE>, --method <METHOD>, --force
+- `geectl pull-request merge <REFERENCE>` — Merge a pull request. On OBS this accepts the submit request and forwards it to its link parent; a refused forward is reported and the accepted request stands. On Gitea the forward is resolved and validated before the merge lands, and the merged pull request is forwarded to its link parent too, unless `--no-forward` is given. The OBS arm checks the hop after accepting while the Gitea arm preflights it, because the Gitea merge is irreversible while the accept flow's forward is retryable; key flags: --message <MESSAGE>, --method <METHOD>, --force, --no-forward
 - `geectl pull-request decline <REFERENCE>` — Decline a pull request; key flags: --message <MESSAGE>
 - `geectl pull-request withdraw <REFERENCE>` — Withdraw a pull request; key flags: --message <MESSAGE>
 - `geectl pull-request reopen <REFERENCE>` — Reopen a pull request.

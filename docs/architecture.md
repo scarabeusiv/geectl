@@ -168,6 +168,48 @@ with cleanup deletes the devel package.
 branches server-side cleanup leaves: a superseded request's branch
 and a declined request's branch.
 
+Forwarding is a submit to the next project in the chain:
+`ObsClient::forward_request` files a submit request from the devel
+package to the link parent of each submit action's target package —
+the same submit `request submit` files. It runs coupled to the step
+that lands the request: `request accept` files it after accepting,
+and `pull-request merge` files it after merging. Filed on its own,
+it is a direct submit to the next project. The hop resolves from the
+target package's
+`<linkinfo>`; an action whose target has no link is skipped and
+reported, and a broken link refuses the forward. The forwarded
+description is `Forwarded request #{id} from {creator}` plus the
+original description, and the `.changes` entry is the original
+description. A maintained hop target files a
+maintenance incident instead of a submit request. The forwarded
+payload is built with `SrPayload::new_forward`. A Factory target is
+permitted from the recorded devel project and package, and the rule
+is verified live on the filing path. `request accept` accepts the
+request and forwards it afterwards unless `--no-forward` is given.
+A refused forward is reported and the work stays queued in the
+devel project; the accepted request merges. `pull-request merge`
+on an OBS request accepts the request and forwards it after
+merging. A refused forward is reported and the work stays queued
+in the devel project; the merged request is unaffected.
+`pull-request merge` on a Gitea pull
+request validates the forward before merging, then merges and
+forwards afterwards: the target package is resolved from the
+pull request's base repo and branch through its scmsync record,
+and the same hop — linkinfo, recorded devel, maintenance
+incident — files the forward from that package. A preflight
+failure — a missing OBS credential, an ambiguous or
+unforwardable package, a refused hop — fails with the pull
+request still open. A refusal after the merge reports the
+refusal and changes nothing: the merge already landed, and
+there is no request to decline on that path. `--no-forward`
+merges without forwarding. Dry-run performs the same preflight
+without merging, when OBS credentials are available. The
+source must be the package's devel project and package as OBS
+records them in the link parent's package meta: a different
+recorded devel, or none, refuses the forward. A link-parent
+package that does not exist yet has no record to verify the
+source against, so the forward is refused fail-closed.
+
 Branch setup is creation plus upload: a fresh branch project
 (`ObsClient::create_project`, `PUT /source/<project>/_meta`) and the
 branch package in it (`ObsClient::create_package`, `PUT

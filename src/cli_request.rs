@@ -64,9 +64,9 @@ use crate::error::{ErrorKind, GeectlError};
 use crate::http::{Timeout, UreqClient};
 use crate::obs::{
     AcceptInfo, AddRolePayload, ChangeDevelPayload, CveId, DeletePayload, DeleteTarget, DryRun,
-    FiledRequest, MaintenanceIncidentPayload, ObsClient, Request, RequestAction, RequestComment,
-    RequestHistory, RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewState,
-    ReviewTarget, SrFiling, SrPayload, OBS_API_BASE,
+    FiledRequest, ForwardActionResult, ForwardResult, MaintenanceIncidentPayload, ObsClient,
+    Request, RequestAction, RequestComment, RequestHistory, RequestReview, RequestSearch,
+    RequestState, RequestStateInfo, ReviewState, ReviewTarget, SrFiling, SrPayload, OBS_API_BASE,
 };
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -185,7 +185,11 @@ pub enum RequestCommand {
         id: String,
     },
     /// Accept a submit request, with a comment as the message left
-    /// with the accept.
+    /// with the accept. An accepted request is forwarded to its
+    /// link parent unless `--no-forward` is given; a refused
+    /// forward is reported and the accepted request stands, with
+    /// the work staying queued in the devel project. Dry-run by
+    /// default; mutates only with `--live`.
     Accept {
         /// The request id.
         id: String,
@@ -196,6 +200,11 @@ pub enum RequestCommand {
         /// open reviews.
         #[arg(long)]
         force: bool,
+        /// Do not forward the request after accepting it: by
+        /// default an accepted request is forwarded to its link
+        /// parent.
+        #[arg(long)]
+        no_forward: bool,
     },
     /// Decline a submit request, with a comment as the reason.
     Decline {
@@ -649,15 +658,12 @@ pub fn run(
             });
             Ok((payload, render_comments_text(&id, &comments)))
         }),
-        RequestCommand::Accept { id, comment, force } => act(
-            debug,
-            &id,
-            RequestState::Accepted,
-            &comment,
+        RequestCommand::Accept {
+            id,
+            comment,
             force,
-            live,
-            "accepted",
-        ),
+            no_forward,
+        } => accept(debug, &id, &comment, force, no_forward, live),
         RequestCommand::Decline { id, comment } => act(
             debug,
             &id,
@@ -1457,6 +1463,216 @@ fn act(
         }
         Ok((payload, text))
     })
+}
+
+/// Accept a submit request, and forward it to its link parent
+/// afterwards unless `--no-forward` is given. The accept stands
+/// on its own: once it lands, the request merges, and a forward
+/// that is refused — or fails any other way — is reported with
+/// the work left queued in the devel project. Nothing is declined
+/// on a refusal: declining the new forward request cannot change
+/// the accepted original. In dry-run nothing is accepted, so
+/// nothing is forwarded either — the plan notes the forward that
+/// would follow the accept.
+fn accept(
+    debug: &Debug,
+    id: &str,
+    comment: &str,
+    force: bool,
+    no_forward: bool,
+    live: bool,
+) -> Result<(Value, String), GeectlError> {
+    let (mut payload, mut text) = act(
+        debug,
+        id,
+        RequestState::Accepted,
+        comment,
+        force,
+        live,
+        "accepted",
+    )?;
+    if no_forward {
+        return Ok((payload, text));
+    }
+    if !live {
+        if let Value::Object(map) = &mut payload {
+            if let Some(Value::Array(plan)) = map.get_mut("plan") {
+                plan.push(Value::String(format!(
+                    "[dry-run] would: forward request {id} after accept"
+                )));
+            }
+        }
+        text.push_str("; would forward after accept");
+        return Ok((payload, text));
+    }
+    // Live: the accept landed; forward the now-accepted request.
+    let (forward_payload, forward_text) = forward(debug, id, None, live).map_err(|err| {
+        GeectlError::new(
+            err.kind(),
+            format!("accepted request {id}, but the forward failed: {err}"),
+        )
+    })?;
+    if let Value::Object(map) = &mut payload {
+        map.insert("forward".to_string(), forward_payload);
+    }
+    text.push_str(&format!("; {forward_text}"));
+    Ok((payload, text))
+}
+
+/// Forward an accepted submit request: resolve each submit action's
+/// hop and file the forwards, or record the plan in dry-run. The
+/// accept-coupled forward, shared by `request accept` and
+/// `pull-request merge` (OBS arm): there is no standalone forward
+/// leaf — the retry path after an accept with `--no-forward` is a
+/// direct submit from the devel project to Factory.
+pub(crate) fn forward(
+    debug: &Debug,
+    id: &str,
+    message: Option<&str>,
+    live: bool,
+) -> Result<(Value, String), GeectlError> {
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    with_client(debug, live, |client| {
+        let result = client.forward_request(id, message, &dry_run)?;
+        Ok((
+            forward_json(&result, &dry_run),
+            forward_text(&result, &dry_run),
+        ))
+    })
+}
+
+/// The forward result as JSON: the original id, one outcome per
+/// submit action, and the dry-run plan when dry-running.
+fn forward_json(result: &ForwardResult, dry_run: &DryRun) -> Value {
+    let mut payload = json!({
+        "id": result.id,
+        "actions": result.actions.iter().map(forward_action_json).collect::<Vec<_>>(),
+        "dry_run": dry_run.enabled(),
+    });
+    add_plan(&mut payload, dry_run);
+    payload
+}
+
+/// One forward outcome as JSON: the forwarded package, the hop
+/// target — the maintenance project for an incident, with the
+/// maintained hop target as `release_project` — the outcome, the
+/// new request id when one was filed, and the skip reason when the
+/// action was not forwarded.
+pub(crate) fn forward_action_json(action: &ForwardActionResult) -> Value {
+    match action {
+        ForwardActionResult::Forwarded {
+            source,
+            target,
+            new_id,
+        } => json!({
+            "source": source,
+            "target": target,
+            "outcome": "forwarded",
+            "new_id": new_id.as_ref().map(|id| request_id_json(id)).unwrap_or(Value::Null),
+            "reason": Value::Null,
+        }),
+        ForwardActionResult::Incident {
+            source,
+            target,
+            release_project,
+            new_id,
+        } => json!({
+            "source": source,
+            "target": target,
+            "release_project": release_project,
+            "outcome": "incident",
+            "new_id": new_id.as_ref().map(|id| request_id_json(id)).unwrap_or(Value::Null),
+            "reason": Value::Null,
+        }),
+        ForwardActionResult::Skipped { source, reason } => json!({
+            "source": source,
+            "target": Value::Null,
+            "outcome": "skipped",
+            "new_id": Value::Null,
+            "reason": reason,
+        }),
+    }
+}
+
+/// The forward result as text: one header line naming the
+/// request and whether anything was forwarded, then one line per
+/// action. The full result is the JSON payload.
+fn forward_text(result: &ForwardResult, dry_run: &DryRun) -> String {
+    let filed = result.actions.iter().any(|action| {
+        matches!(
+            action,
+            ForwardActionResult::Forwarded { .. } | ForwardActionResult::Incident { .. }
+        )
+    });
+    let mut text = if result.actions.is_empty() {
+        if dry_run.enabled() {
+            format!(
+                "dry-run: request {} has no submit actions to forward",
+                result.id
+            )
+        } else {
+            format!("request {} has no submit actions to forward", result.id)
+        }
+    } else if filed {
+        if dry_run.enabled() {
+            format!("dry-run: would forward request {}", result.id)
+        } else {
+            format!("forwarded request {}", result.id)
+        }
+    } else if dry_run.enabled() {
+        format!("dry-run: request {} has no forwardable actions", result.id)
+    } else {
+        format!("request {}: nothing forwarded", result.id)
+    };
+    if result.actions.is_empty() {
+        return text;
+    }
+    for action in &result.actions {
+        text.push('\n');
+        text.push_str(&forward_action_text(action, dry_run));
+    }
+    text
+}
+
+/// One forward outcome as a text line: the hop and the new request
+/// id, or the skip with its reason.
+pub(crate) fn forward_action_text(action: &ForwardActionResult, dry_run: &DryRun) -> String {
+    match action {
+        ForwardActionResult::Forwarded {
+            source,
+            target,
+            new_id,
+        } => {
+            if dry_run.enabled() {
+                format!("would forward {source} to {target}")
+            } else {
+                format!(
+                    "forwarded {source} to {target} as request {}",
+                    new_id.as_deref().unwrap_or("?")
+                )
+            }
+        }
+        ForwardActionResult::Incident {
+            source,
+            target,
+            release_project,
+            new_id,
+        } => {
+            if dry_run.enabled() {
+                format!(
+                    "would file a maintenance incident for {source} to {target} (release project {release_project})"
+                )
+            } else {
+                format!(
+                    "filed maintenance incident {} for {source} to {target} (release project {release_project})",
+                    new_id.as_deref().unwrap_or("?")
+                )
+            }
+        }
+        ForwardActionResult::Skipped { source, reason } => {
+            format!("skipped {source}: {reason}")
+        }
+    }
 }
 
 /// Build the OBS client from the effective config and the

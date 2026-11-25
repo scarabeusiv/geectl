@@ -1190,7 +1190,8 @@ pub enum LinkRevision {
 /// would never see an open whole-project delete; and the server's
 /// incident identity includes the release project
 /// (`BsRequestActionMaintenanceIncident#uniq_key`), which the search
-/// does not match on.
+/// does not match on. The forward supersede search narrows the same
+/// way, on the hop identity — source plus target in one action.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ActionShape<'a> {
     /// Any action of the type counts.
@@ -1215,6 +1216,20 @@ pub(crate) enum ActionShape<'a> {
         package: Option<&'a str>,
         repository: Option<&'a str>,
     },
+    /// Only submit actions for one forward hop: the action's
+    /// `<source>` names `source_project`/`source_package` and its
+    /// `<target>` names `target_project`/`target_package`, in the
+    /// same action. An action whose source or target cannot be read
+    /// does not count: superseding a request that cannot be verified
+    /// as the same hop is the overbroad supersede this shape exists
+    /// to prevent, so an unverifiable action slips past instead of
+    /// blocking fail-closed.
+    SubmitHop {
+        source_project: &'a str,
+        source_package: &'a str,
+        target_project: &'a str,
+        target_package: &'a str,
+    },
 }
 
 impl<'a> ActionShape<'a> {
@@ -1227,7 +1242,10 @@ impl<'a> ActionShape<'a> {
     /// target-less action blocks for every other shape: for
     /// `DeleteTarget` it reads as carrying nothing, and for
     /// `ReleaseProject(Some(_))` a missing target is malformed, so it
-    /// blocks fail-closed rather than slipping past the dedup.
+    /// blocks fail-closed rather than slipping past the dedup. For
+    /// `SubmitHop` the direction is the other way: an action that
+    /// cannot be verified as the hop never counts, because counting
+    /// it would supersede a request that is not the same hop.
     pub(crate) fn matches_action(&self, inner: Option<&str>) -> bool {
         match self {
             ActionShape::Any => true,
@@ -1266,6 +1284,24 @@ impl<'a> ActionShape<'a> {
                 let repo_blocks_whole_project =
                     open_repository.is_some() && package.is_none() && repository.is_none();
                 open_whole_project || same_package || same_repository || repo_blocks_whole_project
+            }
+            ActionShape::SubmitHop {
+                source_project,
+                source_package,
+                target_project,
+                target_package,
+            } => {
+                let source = inner.and_then(|inner| find_element_tag(inner, "source"));
+                let target = inner.and_then(|inner| find_element_tag(inner, "target"));
+                let source_matches = source.is_some_and(|tag| {
+                    tag_attr(tag, "project").as_deref() == Some(source_project)
+                        && tag_attr(tag, "package").as_deref() == Some(source_package)
+                });
+                let target_matches = target.is_some_and(|tag| {
+                    tag_attr(tag, "project").as_deref() == Some(target_project)
+                        && tag_attr(tag, "package").as_deref() == Some(target_package)
+                });
+                source_matches && target_matches
             }
         }
     }

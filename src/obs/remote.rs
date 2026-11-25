@@ -3330,8 +3330,10 @@ impl<'a> ObsClient<'a> {
     /// so a write-path caller that trusted the public read alone
     /// would PUT a reduced view over it and wipe its title,
     /// description, URL, scmsync, release name, devel, and persons.
-    /// A 404 here means the package really is missing for this
-    /// caller; any other failure fails loudly, like the public read.
+    /// The filing path would likewise skip the recorded-devel
+    /// verification, and the forward would file unchecked. A 404
+    /// here means the package really is missing for this caller; any
+    /// other failure fails loudly, like the public read.
     pub fn package_meta_authenticated(
         &self,
         project: &str,
@@ -3543,6 +3545,49 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// Search packages by their scmsync URL (`GET
+    /// /search/package?match=starts-with(scmsync,'...')`): the
+    /// packages whose git source starts with `repo_url` — the
+    /// repo URL without a branch fragment, so `.git` and
+    /// `#branch` spellings still match. A prefix search, not an
+    /// exact one: a repo name that prefixes another (`foo` vs
+    /// `foobar`) matches both, so the caller verifies each hit
+    /// against the package's own scmsync URL before trusting it.
+    /// Requires credentials; without them the search fails loudly
+    /// before any request. An unexpected response (no `matches`
+    /// count) is an error, never an empty list.
+    pub fn search_packages_by_scmsync(
+        &self,
+        repo_url: &str,
+    ) -> Result<Vec<PackageMatch>, GeectlError> {
+        // The prefix is normalised the way `parse_scmsync_url`
+        // normalises a stored scmsync URL — a `git+` scheme prefix,
+        // userinfo, default ports, a trailing `.git` — so a stored
+        // spelling the parser accepts is found by the search too,
+        // instead of resolving to Skipped after the merge.
+        let repo_url = crate::gitea::normalize_repo_url(repo_url)?;
+        let repo_url = validate_search_term(&repo_url)?;
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "searching packages by scmsync URL requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let match_expr = format!("starts-with(scmsync,'{repo_url}')");
+        let url = build_url(
+            &self.base,
+            &["search", "package"],
+            &[("match", &match_expr)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_package_search(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS package search response for scmsync URL {repo_url:?}"),
+            )
+        })
+    }
+
     /// Count the projects whose scmsync URL starts with `url_prefix`
     /// (`GET /search/project/id?match=starts-with(scmsync,'...')`).
     /// Requires credentials; a response without a `matches` count is
@@ -3695,6 +3740,46 @@ impl<'a> ObsClient<'a> {
             matches: total,
             offset,
         })
+    }
+
+    /// The maintenance project maintaining `target_project`, when
+    /// one exists (`GET /search/project/id?match=maintenance/maintains/@project='...'`):
+    /// the project whose `<maintenance><maintains>` lists the
+    /// target. The first match wins. None when no maintenance
+    /// project maintains the target. Requires credentials; an
+    /// unexpected response is an error, never an empty answer.
+    ///
+    /// A forward files a maintenance incident instead of a submit
+    /// request when the hop target is maintained; this is the
+    /// lookup behind that decision, mirroring the search osc runs
+    /// after the server refuses the submit with
+    /// `submit_request_rejected` — here it runs before filing,
+    /// because the transport drops the server's error code.
+    pub(crate) fn maintenance_project_for(
+        &self,
+        target_project: &str,
+    ) -> Result<Option<String>, GeectlError> {
+        let target_project = validate_search_term(target_project)?;
+        if !self.has_auth() {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "finding the maintenance project requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+            ));
+        }
+        let match_expr = format!("maintenance/maintains/@project='{target_project}'");
+        let url = build_url(
+            &self.base,
+            &["search", "project", "id"],
+            &[("match", &match_expr)],
+        );
+        let body = self.http.get_with(&url, &self.credentials)?;
+        let projects = parse_project_search(&body).ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS maintenance search response for {target_project:?}"),
+            )
+        })?;
+        Ok(projects.into_iter().map(|project| project.name).next())
     }
 
     /// The owners of package `package` in project `project` (`GET
@@ -4066,6 +4151,58 @@ impl<'a> ObsClient<'a> {
         // the client-side filter stays as defence-in-depth.
         let match_expr = format!(
             "action/target/@package='{package}' and (state/@name='new' or state/@name='review')"
+        );
+        Ok(build_url(
+            &self.base,
+            &["search", "request"],
+            &[("match", &match_expr)],
+        ))
+    }
+
+    /// Build the OBS search URL for open submit requests for one
+    /// forward hop — from `source_project`/`source_package` to
+    /// `target_project`/`target_package`: the hop-scoped twin of
+    /// [`ObsClient::search_url`]. The match scopes source and
+    /// target to a single action — `action[...]` with all four
+    /// coordinates in one predicate, like `open_action_request_ids`
+    /// — so a multi-action request cannot match by spreading the
+    /// hop across actions: the package of one action and the
+    /// project of another never counts. A forward filing therefore
+    /// finds only an earlier forward for the same hop, never an
+    /// open request for the same package aimed elsewhere. All four
+    /// names go into single-quoted XPath string literals, so all
+    /// must be valid OBS names.
+    pub fn search_url_for_target(
+        &self,
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+    ) -> Result<String, GeectlError> {
+        for (label, value) in [
+            ("source project", source_project),
+            ("target project", target_project),
+        ] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS project name for {label}: {value:?}"),
+                ));
+            }
+        }
+        for (label, value) in [
+            ("source package", source_package),
+            ("target package", target_package),
+        ] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS package name for {label}: {value:?}"),
+                ));
+            }
+        }
+        let match_expr = format!(
+            "action[source/@project='{source_project}' and source/@package='{source_package}' and target/@project='{target_project}' and target/@package='{target_package}'] and (state/@name='new' or state/@name='review')"
         );
         Ok(build_url(
             &self.base,
@@ -5456,6 +5593,43 @@ mod tests {
         // Valid OBS names pass.
         assert!(client.search_url("python3-requests").is_ok());
         assert!(client.search_url("foo:bar").is_ok());
+    }
+
+    #[test]
+    fn search_url_for_target_narrows_by_target_project() {
+        // The hop-scoped search carries source and target in one
+        // action predicate: a forward filing finds only an earlier
+        // forward for the same hop, never the package-only set,
+        // and a multi-action request cannot match by spreading the
+        // hop across actions.
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        let url = client
+            .search_url_for_target("devel:languages:python", "foo", "openSUSE:Factory", "foo")
+            .unwrap();
+        assert_ne!(url, client.search_url("foo").unwrap());
+        assert!(
+            url.contains("openSUSE%3AFactory"),
+            "scoped search URL names the target project: {url}"
+        );
+        assert!(
+            url.contains("action%5Bsource%2F%40project%3D%27devel%3Alanguages%3Apython%27"),
+            "the hop is scoped to one action: {url}"
+        );
+        assert!(client
+            .search_url_for_target("devel:languages:python", "foo'", "openSUSE:Factory", "foo",)
+            .is_err());
+        assert!(client
+            .search_url_for_target("bad name", "foo", "openSUSE:Factory", "foo")
+            .is_err());
+        assert!(client
+            .search_url_for_target(
+                "devel:languages:python",
+                "foo",
+                "openSUSE:Factory",
+                "bad name",
+            )
+            .is_err());
     }
 
     #[test]
@@ -11250,7 +11424,8 @@ mod tests {
     fn package_meta_authenticated_reads_the_authenticated_endpoint() {
         // The authenticated package-meta read hits the plain
         // `/source/…/_meta` endpoint with the client's credentials
-        // — the read a write-path caller uses to tell a hidden
+        // — the read a write-path caller, the forward's devel check,
+        // and the filing-path Factory check use to tell a hidden
         // package apart from a missing one.
         let http = FakeHttp::new().with_get(
             "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta",
@@ -11263,6 +11438,10 @@ mod tests {
         assert_eq!(meta.name, "foo");
         assert_eq!(meta.project, "openSUSE:Factory");
         assert_eq!(meta.persons.len(), 2);
+        assert_eq!(
+            meta.devel,
+            Some(("devel:languages:python".to_string(), "foo".to_string()))
+        );
         assert_eq!(
             http.get_calls(),
             vec![(
@@ -11390,6 +11569,46 @@ mod tests {
                 true
             )]
         );
+    }
+
+    #[test]
+    fn search_packages_by_scmsync_sends_the_scmsync_match_authed() {
+        let match_expr = "starts-with(scmsync,'https://src.opensuse.org/pool/systemd')";
+        let url = build_url(
+            "https://api.opensuse.org",
+            &["search", "package"],
+            &[("match", match_expr)],
+        );
+        let http = FakeHttp::new().with_get(&url, PACKAGE_SEARCH_FIXTURE);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let matches = client
+            .search_packages_by_scmsync("https://src.opensuse.org/pool/systemd")
+            .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].name, "foo");
+        // The search carries credentials.
+        assert_eq!(http.get_calls(), vec![(url, true)]);
+    }
+
+    #[test]
+    fn search_packages_by_scmsync_normalises_the_prefix_like_the_parser() {
+        // A spelling the parser accepts — `git+`, userinfo, the
+        // default port, a trailing `.git` — sends the normalised
+        // prefix: the stored scmsync URL is found instead of
+        // resolving to Skipped after the merge.
+        let match_expr = "starts-with(scmsync,'https://src.opensuse.org/pool/systemd')";
+        let url = build_url(
+            "https://api.opensuse.org",
+            &["search", "package"],
+            &[("match", match_expr)],
+        );
+        let http = FakeHttp::new().with_get(&url, PACKAGE_SEARCH_FIXTURE);
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let matches = client
+            .search_packages_by_scmsync("git+https://user@src.opensuse.org:443/pool/systemd.git")
+            .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(http.get_calls(), vec![(url, true)]);
     }
 
     #[test]
@@ -11895,6 +12114,50 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn maintenance_project_for_returns_the_maintaining_project() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=maintenance%2Fmaintains%2F%40project%3D%27openSUSE%3ALeap%3A15.6%3AUpdate%27",
+            "<collection matches=\"1\"><project name=\"openSUSE:Maintenance:1234\"/></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client
+                .maintenance_project_for("openSUSE:Leap:15.6:Update")
+                .unwrap(),
+            Some("openSUSE:Maintenance:1234".to_string())
+        );
+    }
+
+    #[test]
+    fn maintenance_project_for_returns_none_when_unmaintained() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/search/project/id?match=maintenance%2Fmaintains%2F%40project%3D%27openSUSE%3AFactory%27",
+            "<collection matches=\"0\"></collection>",
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert_eq!(
+            client.maintenance_project_for("openSUSE:Factory").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn maintenance_project_for_rejects_a_quoted_target_without_http() {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        assert!(client.maintenance_project_for("").is_err());
+        assert!(client.maintenance_project_for("x' or '1'='1").is_err());
+        assert!(http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn maintenance_project_for_requires_credentials() {
+        let http = FakeHttp::new();
+        let client = ObsClient::new(&http);
+        assert!(client.maintenance_project_for("openSUSE:Factory").is_err());
+        assert!(http.get_calls().is_empty());
+    }
     #[test]
     fn search_requires_credentials() {
         let http = FakeHttp::new();

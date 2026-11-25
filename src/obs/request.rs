@@ -6,12 +6,16 @@ use super::parse_search_matches;
 use super::parse_status_ok;
 use super::parse_submit_request_ids;
 use super::parse_submit_request_ids_for_creator;
+use super::parse_submit_request_ids_for_forward_hop;
+use super::remote::parse_linkinfo;
 use super::valid_obs_name;
 use super::ActionShape;
 use super::ActionTarget;
 use super::DryRun;
+use super::MaintenanceIncidentPayload;
 use super::ObsClient;
 use super::SourceUpdate;
+use super::SrFiling;
 use super::SrPayload;
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
@@ -640,6 +644,101 @@ impl Request {
         }
         out.push_str("</request>");
         out
+    }
+}
+
+/// One submit action's forward outcome: where the hop landed, or
+/// why it did not happen. `new_id` is the filed request in live
+/// mode, None in dry-run (nothing was filed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardActionResult {
+    /// A new submit request filed to the link parent.
+    Forwarded {
+        /// The forwarded package, as `project/package` in the
+        /// original request's target.
+        source: String,
+        /// The link parent the new request targets.
+        target: String,
+        /// The new request id.
+        new_id: Option<String>,
+    },
+    /// A maintenance incident filed instead: the link parent is a
+    /// maintained project, so the submit would be refused.
+    Incident {
+        /// The forwarded package, as `project/package` in the
+        /// original request's target.
+        source: String,
+        /// The maintenance project the incident targets.
+        target: String,
+        /// The maintained hop target the incident releases into.
+        release_project: String,
+        /// The new request id.
+        new_id: Option<String>,
+    },
+    /// Not forwarded: the action names no target, or its package
+    /// has no link parent.
+    Skipped {
+        /// The action's package, as `project/package` in the
+        /// original request's target (or source, when the action
+        /// names no target).
+        source: String,
+        /// Why the action was not forwarded.
+        reason: String,
+    },
+}
+
+/// The result of forwarding one request: the original id and one
+/// outcome per submit action, in action order. Non-submit actions
+/// are ignored, so a request with no submit actions forwards
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardResult {
+    /// The forwarded request's id.
+    pub id: u64,
+    /// One outcome per submit action.
+    pub actions: Vec<ForwardActionResult>,
+}
+
+/// One submit action's resolved hop: the filing coordinates, or
+/// the skip with its reason. Resolution reads the target package's
+/// directory listing for its `<linkinfo>` and, for a link parent,
+/// the maintenance project maintaining it; it files nothing.
+enum ForwardHop {
+    Forward {
+        source_project: String,
+        source_package: String,
+        target_project: String,
+        target_package: String,
+        /// The maintenance project maintaining the hop target, when
+        /// one exists: the hop files an incident instead.
+        maintenance: Option<String>,
+    },
+    Skipped {
+        source: String,
+        reason: String,
+    },
+}
+
+impl ForwardHop {
+    /// The hop as `source -> target` (a skip as its source with its
+    /// reason), for messages that name hops — the partial-forward
+    /// error names only forwardable hops this way; skips are
+    /// reported in the result, never as not filed.
+    fn label(&self) -> String {
+        match self {
+            ForwardHop::Forward {
+                source_project,
+                source_package,
+                target_project,
+                target_package,
+                ..
+            } => {
+                format!("{source_project}/{source_package} -> {target_project}/{target_package}")
+            }
+            ForwardHop::Skipped { source, reason } => {
+                format!("{source} (skipped: {reason})")
+            }
+        }
     }
 }
 
@@ -2638,6 +2737,55 @@ impl<'a> ObsClient<'a> {
         })
     }
 
+    /// The ids of the open submit requests for the same forward hop
+    /// — from `source_project`/`source_package` to `target_project`/
+    /// `target_package`, state `new` or `review`, created by the
+    /// authenticated user: the hop-scoped twin of
+    /// [`ObsClient::open_own_target_request_ids`]. A forward filing
+    /// supersedes an earlier forward for the same hop, never an open
+    /// request for the same package aimed elsewhere (a staging flow,
+    /// another devel target, another source). The search scopes
+    /// source and target to one action, and the parser re-checks
+    /// that one action names the hop, so a multi-action request
+    /// cannot match by spreading the hop across actions. Requires
+    /// credentials; an unexpected response is an error, never an
+    /// empty list.
+    pub(crate) fn open_own_target_request_ids_for_target(
+        &self,
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+    ) -> Result<Vec<String>, GeectlError> {
+        let Some(username) = self.credentials.username() else {
+            return Err(GeectlError::new(
+                ErrorKind::ConfigError,
+                "checking for open submit requests requires an OBS username — an API token carries no username (unset the OBS API key first, then set GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            ));
+        };
+        let url = self.search_url_for_target(
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        )?;
+        let body = self.http.get_with(&url, &self.credentials)?;
+        parse_submit_request_ids_for_forward_hop(
+            &body,
+            username,
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        )
+        .ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::ServerError,
+                format!("unexpected OBS search response for package {target_package:?}"),
+            )
+        })
+    }
+
     /// The ids of the open requests (`new` or `review` state) whose
     /// single action matches `target` exactly. The search filters on
     /// source/target, state, and action type (`action/@type`); the
@@ -2976,6 +3124,473 @@ impl<'a> ObsClient<'a> {
     /// backend.
     pub fn show_request(&self, id: &str) -> Result<Request, GeectlError> {
         self.fetch_request(id)
+    }
+
+    /// Forward an accepted submit request to the link parent of
+    /// each submit action's target package: the devel-to-Factory
+    /// step, following osc `forward_request`. One new submit request
+    /// per forwardable action, filed from the action's target to
+    /// its link parent with description `Forwarded request
+    /// #<id> from <creator>` plus the original description, and
+    /// without cleanup (accept must not delete the devel package).
+    /// The `.changes` entry is the original description, or
+    /// `changes_entry` when the caller passes an override — an
+    /// explicit override is used as given; when both are empty it
+    /// falls back to `Forwarded request #{id} from {creator}`. A
+    /// re-forward supersedes
+    /// an earlier still-open forward: filing goes through
+    /// [`SrFiling::file`].
+    ///
+    /// Only an accepted request may be forwarded; any other state
+    /// is refused. An action whose target has no link is skipped
+    /// and reported; an action whose link is broken refuses the
+    /// whole forward — the hops, link parent and maintenance
+    /// decision alike, are resolved before anything is filed, so a
+    /// refusal files nothing. The source must be the package's devel
+    /// project and package as OBS records them in the link parent's
+    /// package meta: a different recorded devel, or none, refuses
+    /// the forward; a link-parent package that does not exist yet
+    /// has no record to verify the source against, so the forward is
+    /// refused fail-closed. A hop whose target
+    /// is a maintained
+    /// project files a maintenance incident instead (release
+    /// project: the hop target). Non-submit actions are
+    /// ignored; a request with no submit actions forwards nothing.
+    ///
+    /// In dry-run the hops are resolved and the plan printed, but
+    /// nothing is filed; the filed ids read None. The reads (the
+    /// request, the linkinfo listings, the maintenance lookups) run
+    /// in dry-run too — the plan cannot name the hops without them
+    /// — so a forward dry-run needs credentials, unlike a filing
+    /// dry-run that plans from flags alone.
+    pub fn forward_request(
+        &self,
+        id: &str,
+        changes_entry: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<ForwardResult, GeectlError> {
+        let request = self.show_request(id)?;
+        if request.state.name != RequestState::Accepted {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "only an accepted request can be forwarded: request {} is {}",
+                    request.id,
+                    request.state.name.as_str()
+                ),
+            ));
+        }
+        let forwarded_description = format!(
+            "Forwarded request #{} from {}\n\n{}",
+            request.id, request.creator, request.description
+        );
+        // An explicit override is authoritative: it is used as
+        // given, and the payload validation rejects it when it is
+        // empty. Otherwise the original description, falling back
+        // to the single-line forward prefix when that is empty too.
+        let changes_entry = match changes_entry {
+            Some(entry) => entry.to_string(),
+            None if !request.description.trim().is_empty() => request.description.clone(),
+            None => format!("Forwarded request #{} from {}", request.id, request.creator),
+        };
+        // Resolve every hop before filing anything: a broken link
+        // refuses the whole forward, and must not leave earlier
+        // actions filed.
+        let hops = self.resolve_forward_hops(&request)?;
+        let filing = SrFiling::new(self, dry_run);
+        let mut actions = Vec::new();
+        let mut hops = hops.into_iter();
+        while let Some(hop) = hops.next() {
+            match hop {
+                ForwardHop::Skipped { source, reason } => {
+                    self.debug
+                        .emit(&format!("decision: skipping forward of {source}: {reason}"));
+                    actions.push(ForwardActionResult::Skipped { source, reason });
+                }
+                ForwardHop::Forward {
+                    source_project,
+                    source_package,
+                    target_project,
+                    target_package,
+                    maintenance,
+                } => {
+                    let source = format!("{source_project}/{source_package}");
+                    let target = format!("{target_project}/{target_package}");
+                    // A failure filing one hop must not drop the
+                    // actions already filed: the error names them,
+                    // the hop that failed, and the hops never
+                    // attempted, so the caller finishes the forward
+                    // manually instead of re-filing blind.
+                    let outcome: Result<ForwardActionResult, GeectlError> = match maintenance {
+                        Some(maintenance_project) => {
+                            (|| -> Result<ForwardActionResult, GeectlError> {
+                                let incident = MaintenanceIncidentPayload::new(
+                                    &source_project,
+                                    &[source_package.as_str()],
+                                    &maintenance_project,
+                                    &forwarded_description,
+                                )?
+                                .with_release_project(&target_project)?;
+                                let filed = filing.file_maintenance_incident(&incident)?;
+                                Ok(ForwardActionResult::Incident {
+                                    source: source.clone(),
+                                    target: maintenance_project,
+                                    release_project: target_project,
+                                    new_id: filed,
+                                })
+                            })()
+                        }
+                        None => (|| -> Result<ForwardActionResult, GeectlError> {
+                            let payload = SrPayload::new_forward(
+                                &source_project,
+                                &source_package,
+                                &target_project,
+                                &target_package,
+                                &forwarded_description,
+                                &changes_entry,
+                                &[],
+                            )?
+                            .without_cleanup();
+                            let filed = filing.file_forward(&payload)?;
+                            Ok(ForwardActionResult::Forwarded {
+                                source: source.clone(),
+                                target: target.clone(),
+                                new_id: filed.map(|filed| filed.id),
+                            })
+                        })(),
+                    };
+                    match outcome {
+                        Ok(action) => actions.push(action),
+                        Err(err) => {
+                            // Only forwardable hops are named as not
+                            // filed: a skipped hop was never going to
+                            // be filed, so listing it as "not filed"
+                            // would claim a loss that never existed.
+                            let remaining = hops
+                                .by_ref()
+                                .filter(|hop| matches!(hop, ForwardHop::Forward { .. }))
+                                .map(|hop| hop.label())
+                                .collect();
+                            return Err(Self::partial_forward_error(
+                                request.id, &actions, &source, &target, remaining, err,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(ForwardResult {
+            id: request.id,
+            actions,
+        })
+    }
+
+    /// Forward one package to its link parent: the Gitea-merge
+    /// forward — the merged pull request's target package,
+    /// resolved from its scmsync record, forwarded like one submit
+    /// action of [`ObsClient::forward_request`]. The same gates:
+    /// the hop resolves from the package's `<linkinfo>`; a package
+    /// with no link is skipped and reported; a broken link, a
+    /// different recorded devel, or no recorded devel refuses the
+    /// forward; a maintained hop target files a maintenance
+    /// incident instead. The description and `.changes` entry are
+    /// the caller's — the merged pull request's text — and the
+    /// filed request carries no cleanup, like the accept-coupled forward:
+    /// accept must not delete the devel package. A single hop
+    /// resolves before anything is filed, so a refusal files
+    /// nothing.
+    ///
+    /// In dry-run the hop is resolved and the plan printed, but
+    /// nothing is filed; the filed id reads None.
+    pub fn forward_package(
+        &self,
+        project: &str,
+        package: &str,
+        description: &str,
+        changes_entry: &str,
+        dry_run: &DryRun,
+    ) -> Result<ForwardActionResult, GeectlError> {
+        for (label, value) in [("project", project), ("package", package)] {
+            if !valid_obs_name(value) {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid OBS {label} name: {value:?}"),
+                ));
+            }
+        }
+        let hop = self.resolve_forward_hop_for_package(project, package)?;
+        match hop {
+            ForwardHop::Skipped { source, reason } => {
+                self.debug
+                    .emit(&format!("decision: skipping forward of {source}: {reason}"));
+                Ok(ForwardActionResult::Skipped { source, reason })
+            }
+            ForwardHop::Forward {
+                source_project,
+                source_package,
+                target_project,
+                target_package,
+                maintenance,
+            } => {
+                let source = format!("{source_project}/{source_package}");
+                let target = format!("{target_project}/{target_package}");
+                let filing = SrFiling::new(self, dry_run);
+                match maintenance {
+                    Some(maintenance_project) => {
+                        let incident = MaintenanceIncidentPayload::new(
+                            &source_project,
+                            &[source_package.as_str()],
+                            &maintenance_project,
+                            description,
+                        )?
+                        .with_release_project(&target_project)?;
+                        let filed = filing.file_maintenance_incident(&incident)?;
+                        Ok(ForwardActionResult::Incident {
+                            source,
+                            target: maintenance_project,
+                            release_project: target_project,
+                            new_id: filed,
+                        })
+                    }
+                    None => {
+                        let payload = SrPayload::new_forward(
+                            &source_project,
+                            &source_package,
+                            &target_project,
+                            &target_package,
+                            description,
+                            changes_entry,
+                            &[],
+                        )?
+                        .without_cleanup();
+                        let filed = filing.file_forward(&payload)?;
+                        Ok(ForwardActionResult::Forwarded {
+                            source,
+                            target,
+                            new_id: filed.map(|filed| filed.id),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// The error for a forward that filed some actions and then
+    /// failed: the shape `file_with_supersede` uses — the error names
+    /// what landed, the hop that failed, and the forwardable hops
+    /// never attempted, so the caller finishes the forward manually
+    /// instead of re-filing blind. `filed` holds only the actions
+    /// that filed a request; skips file nothing, so they are not
+    /// named — neither as filed nor as not filed.
+    fn partial_forward_error(
+        id: u64,
+        filed: &[ForwardActionResult],
+        source: &str,
+        target: &str,
+        remaining: Vec<String>,
+        err: GeectlError,
+    ) -> GeectlError {
+        let filed: Vec<String> = filed
+            .iter()
+            .filter_map(|action| match action {
+                ForwardActionResult::Forwarded {
+                    source,
+                    target,
+                    new_id,
+                } => Some(format!(
+                    "{source} -> {target} as request {}",
+                    new_id.as_deref().unwrap_or("<no id>")
+                )),
+                ForwardActionResult::Incident {
+                    source,
+                    target,
+                    new_id,
+                    ..
+                } => Some(format!(
+                    "{source} -> incident {target} as request {}",
+                    new_id.as_deref().unwrap_or("<no id>")
+                )),
+                ForwardActionResult::Skipped { .. } => None,
+            })
+            .collect();
+        let mut message = if filed.is_empty() {
+            format!("could not file the forward of request {id} for {source} -> {target}: {err}")
+        } else {
+            format!(
+                "forwarded request {id}: {}; could not file the forward for {source} -> {target}: {err}",
+                filed.join("; ")
+            )
+        };
+        match remaining.len() {
+            0 => {}
+            1 => message.push_str(&format!("; the forward for {} was not filed", remaining[0])),
+            _ => message.push_str(&format!(
+                "; the forwards for {} were not filed",
+                remaining.join(", ")
+            )),
+        }
+        GeectlError::new(err.kind(), message)
+    }
+
+    /// Verify a request can be forwarded: resolve each submit
+    /// action's hop without filing anything. A preflight that
+    /// gates nothing: it reports what the forward would do — a
+    /// refusal is an `InvalidInput` error naming the hop — and
+    /// changes no state. The accept and merge call sites do not
+    /// run it before landing: once a request is accepted it
+    /// merges, and a refused forward is reported with the work
+    /// left queued in the devel project. No state requirement:
+    /// the request need not be accepted yet.
+    pub fn verify_forward(&self, id: &str) -> Result<(), GeectlError> {
+        let request = self.show_request(id)?;
+        self.resolve_forward_hops(&request)?;
+        Ok(())
+    }
+
+    /// Resolve every submit action's hop for `request`, without
+    /// filing. Shared by [`ObsClient::forward_request`] and
+    /// [`ObsClient::verify_forward`].
+    fn resolve_forward_hops(&self, request: &Request) -> Result<Vec<ForwardHop>, GeectlError> {
+        let mut hops = Vec::new();
+        for action in request.actions_of(&["submit"]) {
+            hops.push(self.resolve_forward_hop(action)?);
+        }
+        Ok(hops)
+    }
+
+    /// Resolve one submit action's hop from the action's target
+    /// package: an action naming no target is skipped, the rest is
+    /// the package hop below.
+    fn resolve_forward_hop(&self, action: &RequestAction) -> Result<ForwardHop, GeectlError> {
+        let RequestAction::Submit {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+            ..
+        } = action
+        else {
+            // The caller passes submit actions only; anything else
+            // is a caller error, never a skip.
+            return Err(GeectlError::new(
+                ErrorKind::InternalError,
+                "forward hop resolution called on a non-submit action",
+            ));
+        };
+        let Some(target_project) = target_project else {
+            return Ok(ForwardHop::Skipped {
+                source: format!("{source_project}/{source_package}"),
+                reason: "the action names no target project".to_string(),
+            });
+        };
+        let Some(target_package) = target_package else {
+            return Ok(ForwardHop::Skipped {
+                source: format!("{source_project}/{source_package}"),
+                reason: "the action names no target package".to_string(),
+            });
+        };
+        self.resolve_forward_hop_for_package(target_project, target_package)
+    }
+
+    /// Resolve one package's hop: read the package's directory
+    /// listing (`GET /source/{project}/{package}?rev=latest`)
+    /// and take the link parent from its `<linkinfo>`. A linkinfo
+    /// without a package points at the same package name in the
+    /// parent project. Then verify the source is the package's devel
+    /// project and package as OBS records them in the link parent's
+    /// package meta: a different recorded devel, or none, refuses
+    /// the forward, and so does a link-parent package that does
+    /// not exist yet — missing metadata cannot establish the
+    /// required recorded-devel origin. The parent meta is read
+    /// authenticated: the public read answers 404 for a hidden
+    /// parent, which would skip this check entirely.
+    fn resolve_forward_hop_for_package(
+        &self,
+        target_project: &str,
+        target_package: &str,
+    ) -> Result<ForwardHop, GeectlError> {
+        let directory_url = build_url(
+            &self.base,
+            &["source", target_project, target_package],
+            &[("rev", "latest")],
+        );
+        let directory = self.http.get_with(&directory_url, &self.credentials)?;
+        let linkinfo = parse_linkinfo(&directory)?;
+        let Some(linkinfo) = linkinfo else {
+            return Ok(ForwardHop::Skipped {
+                source: format!("{target_project}/{target_package}"),
+                reason: "the package has no link parent".to_string(),
+            });
+        };
+        if let Some(error) = linkinfo.error {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("the link of {target_project}/{target_package} is broken: {error}"),
+            ));
+        }
+        let Some(parent_project) = linkinfo.project else {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!("the link of {target_project}/{target_package} names no parent project"),
+            ));
+        };
+        let parent_package = linkinfo
+            .package
+            .unwrap_or_else(|| target_package.to_string());
+        // The forward files from the devel project only: the source
+        // must be the package's devel project and package as OBS
+        // records them in the link parent's package meta. A
+        // different recorded devel, or none, refuses the forward —
+        // and so does a link-parent package that does not exist
+        // yet: with no meta there is no recorded devel to verify
+        // against, so the forward is refused fail-closed instead
+        // of proceeding on an unverified origin. The read is
+        // authenticated: a hidden parent still answers, so the
+        // check runs; only a genuinely absent package answers
+        // NotFound.
+        match self.package_meta_authenticated(&parent_project, &parent_package) {
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Err(GeectlError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to forward {target_project}/{target_package}: {parent_project}/{parent_package} does not exist yet, so no devel record verifies the forward"
+                    ),
+                ));
+            }
+            Err(err) => return Err(err),
+            Ok(meta) => match meta.devel {
+                Some((recorded_project, recorded_package))
+                    if recorded_project == target_project && recorded_package == target_package => {
+                }
+                Some((recorded_project, recorded_package)) => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "refusing to forward {target_project}/{target_package}: {parent_project}/{parent_package} records devel {recorded_project}/{recorded_package}, not {target_project}/{target_package}"
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "refusing to forward {target_project}/{target_package}: {parent_project}/{parent_package} records no devel project"
+                        ),
+                    ));
+                }
+            },
+        }
+        // The maintenance decision is part of resolution, not
+        // filing: a lookup failure before anything is filed keeps
+        // the forward atomic.
+        let maintenance = self.maintenance_project_for(&parent_project)?;
+        Ok(ForwardHop::Forward {
+            source_project: target_project.to_string(),
+            source_package: target_package.to_string(),
+            target_project: parent_project,
+            target_package: parent_package,
+            maintenance,
+        })
     }
 
     /// Read one request's history (`GET /request/:id` with
@@ -3833,6 +4448,1010 @@ mod tests {
         assert_eq!(posted[0].1, payload.to_xml());
         // The filing POST carried the credentials.
         assert!(posted[0].2);
+    }
+
+    fn accepted_request_xml(state: &str) -> String {
+        format!(
+            "<request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"{state}\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo to 2.0</description></request>"
+        )
+    }
+
+    const FORWARD_SHOW_URL: &str = "https://api.opensuse.org/request/1398492?withhistory=1";
+    const FORWARD_DIR_URL: &str =
+        "https://api.opensuse.org/source/devel:languages:python/foo?rev=latest";
+    const FORWARD_FACTORY_SEARCH_URL: &str = "https://api.opensuse.org/search/project/id?match=maintenance%2Fmaintains%2F%40project%3D%27openSUSE%3AFactory%27";
+    const FORWARD_CREATE_URL: &str = "https://api.opensuse.org/request?cmd=create";
+    const FORWARD_DIR_FACTORY: &str =
+        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" srcmd5=\"abc\" /></directory>";
+    const FORWARD_FACTORY_META_URL: &str =
+        "https://api.opensuse.org/source/openSUSE:Factory/foo/_meta";
+    const FORWARD_FACTORY_META: &str =
+        "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>";
+    const FORWARD_LEAP_META_URL: &str =
+        "https://api.opensuse.org/source/openSUSE:Leap:15.6:Update/foo/_meta";
+    const FORWARD_LEAP_META: &str =
+        "<package name=\"foo\" project=\"openSUSE:Leap:15.6:Update\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>";
+
+    /// The open-own-requests search URL for the forward hop from
+    /// `source_project`/`source_package` to `target_project`/
+    /// `target_package`, computed through the client like the
+    /// `has_open_sr` tests do: the test pins the behavior, not a
+    /// rebuild of the URL.
+    fn own_search_url_for_target(
+        source_project: &str,
+        source_package: &str,
+        target_project: &str,
+        target_package: &str,
+    ) -> String {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        client
+            .search_url_for_target(
+                source_project,
+                source_package,
+                target_project,
+                target_package,
+            )
+            .unwrap()
+    }
+
+    fn forward_client(http: &FakeHttp) -> ObsClient<'_> {
+        ObsClient::with_credentials(http, basic_credentials()).unwrap()
+    }
+
+    #[test]
+    fn forward_request_files_one_submit_action_to_the_link_parent() {
+        let search_url =
+            own_search_url_for_target("devel:languages:python", "foo", "openSUSE:Factory", "foo");
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                FORWARD_CREATE_URL,
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let result = client.forward_request("1398492", None, &dry_run).unwrap();
+        assert_eq!(result.id, 1398492);
+        assert_eq!(result.actions.len(), 1);
+        assert_eq!(
+            result.actions[0],
+            ForwardActionResult::Forwarded {
+                source: "devel:languages:python/foo".to_string(),
+                target: "openSUSE:Factory/foo".to_string(),
+                new_id: Some("1400001".to_string()),
+            }
+        );
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 1);
+        // The filed request carries the devel package as its source,
+        // the link parent as its target, the forwarded description,
+        // and update (not cleanup): accept must not delete the devel
+        // package.
+        assert!(posted[0]
+            .1
+            .contains("<source project=\"devel:languages:python\" package=\"foo\" />"));
+        assert!(posted[0]
+            .1
+            .contains("<target project=\"openSUSE:Factory\" package=\"foo\" />"));
+        assert!(posted[0].1.contains(
+            "<description>Forwarded request #1398492 from scarabeus_iv\n\nUpdate foo to 2.0</description>"
+        ));
+        assert!(posted[0]
+            .1
+            .contains("<options><sourceupdate>update</sourceupdate></options>"));
+    }
+
+    #[test]
+    fn forward_request_dry_run_resolves_the_hop_without_filing() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let result = client.forward_request("1398492", None, &dry_run).unwrap();
+        assert_eq!(result.actions.len(), 1);
+        assert_eq!(
+            result.actions[0],
+            ForwardActionResult::Forwarded {
+                source: "devel:languages:python/foo".to_string(),
+                target: "openSUSE:Factory/foo".to_string(),
+                new_id: None,
+            }
+        );
+        assert!(http.post_calls().is_empty());
+        let plan = dry_run.plan();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("would: file submit request for foo to openSUSE:Factory")),
+            "plan: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("changes entry: Update foo to 2.0")),
+            "plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn forward_request_message_override_replaces_the_changes_entry() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        client
+            .forward_request("1398492", Some("- Forward to Factory.\n"), &dry_run)
+            .unwrap();
+        let plan = dry_run.plan();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("changes entry: - Forward to Factory.")),
+            "plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn forward_request_skips_a_package_without_a_link() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(
+                FORWARD_DIR_URL,
+                "<directory><entry name=\"foo.spec\" /></directory>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let result = client.forward_request("1398492", None, &dry_run).unwrap();
+        assert_eq!(
+            result.actions,
+            vec![ForwardActionResult::Skipped {
+                source: "devel:languages:python/foo".to_string(),
+                reason: "the package has no link parent".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn forward_request_refuses_a_broken_link_before_filing() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(
+                FORWARD_DIR_URL,
+                "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" error=\"link target not found\" /></directory>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let err = client
+            .forward_request("1398492", None, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("is broken"), "error: {err}");
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_request_refuses_a_request_that_is_not_accepted() {
+        let http = FakeHttp::new().with_get(FORWARD_SHOW_URL, &accepted_request_xml("new"));
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let err = client
+            .forward_request("1398492", None, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("is new"), "error: {err}");
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn forward_request_with_no_submit_actions_forwards_nothing() {
+        let http = FakeHttp::new().with_get(
+            FORWARD_SHOW_URL,
+            "<request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"delete\"><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"accepted\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Drop foo</description></request>",
+        );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let result = client.forward_request("1398492", None, &dry_run).unwrap();
+        assert_eq!(result.id, 1398492);
+        assert!(result.actions.is_empty());
+        assert_eq!(http.get_calls().len(), 1);
+    }
+
+    #[test]
+    fn forward_request_files_an_incident_for_a_maintained_target() {
+        let match_expr = "(state/@name='new' or state/@name='review') and action/@type='maintenance_incident' and action[source/@package='foo' and target/@project='openSUSE:Maintenance:1234']";
+        let dedup_url = build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[("match", match_expr)],
+        );
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(
+                FORWARD_DIR_URL,
+                "<directory><linkinfo project=\"openSUSE:Leap:15.6:Update\" package=\"foo\" /></directory>",
+            )
+            .with_get(FORWARD_LEAP_META_URL, FORWARD_LEAP_META)
+            .with_get(
+                "https://api.opensuse.org/search/project/id?match=maintenance%2Fmaintains%2F%40project%3D%27openSUSE%3ALeap%3A15.6%3AUpdate%27",
+                "<collection matches=\"1\"><project name=\"openSUSE:Maintenance:1234\"/></collection>",
+            )
+            .with_get(&dedup_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create&addrevision=1",
+                "<request id=\"1400002\" creator=\"scarabeus_iv\"></request>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let result = client.forward_request("1398492", None, &dry_run).unwrap();
+        assert_eq!(
+            result.actions,
+            vec![ForwardActionResult::Incident {
+                source: "devel:languages:python/foo".to_string(),
+                target: "openSUSE:Maintenance:1234".to_string(),
+                release_project: "openSUSE:Leap:15.6:Update".to_string(),
+                new_id: Some("1400002".to_string()),
+            }]
+        );
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 1);
+        assert!(posted[0]
+            .1
+            .contains("<action type=\"maintenance_incident\">"));
+        assert!(posted[0].1.contains(
+            "<target project=\"openSUSE:Maintenance:1234\" releaseproject=\"openSUSE:Leap:15.6:Update\" />"
+        ));
+        assert!(posted[0]
+            .1
+            .contains("<source project=\"devel:languages:python\" package=\"foo\" />"));
+    }
+
+    fn two_action_request_xml() -> String {
+        "<request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"bar\" /><target project=\"devel:languages:python\" package=\"bar\" /></action><state name=\"accepted\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo and bar</description></request>"
+            .to_string()
+    }
+
+    const FORWARD_DIR_BAR_URL: &str =
+        "https://api.opensuse.org/source/devel:languages:python/bar?rev=latest";
+
+    #[test]
+    fn forward_request_forwards_two_actions_and_skips_the_unlinked_one() {
+        let search_url =
+            own_search_url_for_target("devel:languages:python", "foo", "openSUSE:Factory", "foo");
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &two_action_request_xml())
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_get(
+                FORWARD_DIR_BAR_URL,
+                "<directory><entry name=\"bar.spec\" /></directory>",
+            )
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                FORWARD_CREATE_URL,
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let result = client.forward_request("1398492", None, &dry_run).unwrap();
+        assert_eq!(
+            result.actions,
+            vec![
+                ForwardActionResult::Forwarded {
+                    source: "devel:languages:python/foo".to_string(),
+                    target: "openSUSE:Factory/foo".to_string(),
+                    new_id: Some("1400001".to_string()),
+                },
+                ForwardActionResult::Skipped {
+                    source: "devel:languages:python/bar".to_string(),
+                    reason: "the package has no link parent".to_string(),
+                },
+            ]
+        );
+        assert_eq!(http.post_calls().len(), 1);
+    }
+
+    #[test]
+    fn forward_request_broken_second_link_files_nothing() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &two_action_request_xml())
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_get(
+                FORWARD_DIR_BAR_URL,
+                "<directory><linkinfo project=\"openSUSE:Factory\" package=\"bar\" error=\"link target not found\" /></directory>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let err = client
+            .forward_request("1398492", None, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("is broken"), "error: {err}");
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_request_linkinfo_without_package_defaults_to_the_target_package() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(
+                FORWARD_DIR_URL,
+                "<directory><linkinfo project=\"openSUSE:Factory\" /></directory>",
+            )
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let result = client.forward_request("1398492", None, &dry_run).unwrap();
+        assert_eq!(
+            result.actions,
+            vec![ForwardActionResult::Forwarded {
+                source: "devel:languages:python/foo".to_string(),
+                target: "openSUSE:Factory/foo".to_string(),
+                new_id: None,
+            }]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_request_dry_run_files_an_incident_for_a_maintained_target() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(
+                FORWARD_DIR_URL,
+                "<directory><linkinfo project=\"openSUSE:Leap:15.6:Update\" package=\"foo\" /></directory>",
+            )
+            .with_get(FORWARD_LEAP_META_URL, FORWARD_LEAP_META)
+            .with_get(
+                "https://api.opensuse.org/search/project/id?match=maintenance%2Fmaintains%2F%40project%3D%27openSUSE%3ALeap%3A15.6%3AUpdate%27",
+                "<collection matches=\"1\"><project name=\"openSUSE:Maintenance:1234\"/></collection>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let result = client.forward_request("1398492", None, &dry_run).unwrap();
+        assert_eq!(
+            result.actions,
+            vec![ForwardActionResult::Incident {
+                source: "devel:languages:python/foo".to_string(),
+                target: "openSUSE:Maintenance:1234".to_string(),
+                release_project: "openSUSE:Leap:15.6:Update".to_string(),
+                new_id: None,
+            }]
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_request_refuses_a_source_that_is_not_the_devel_project() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(
+                FORWARD_FACTORY_META_URL,
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:ruby\" package=\"foo\"/></package>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let err = client
+            .forward_request("1398492", None, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("devel:languages:python")
+                && err.to_string().contains("devel:languages:ruby"),
+            "error: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_request_refuses_a_recorded_devel_package_that_differs() {
+        // The recorded devel project matches, but the package is a
+        // rename: the forward would file from foo while Factory
+        // records bar as the devel package.
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(
+                FORWARD_FACTORY_META_URL,
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let err = client
+            .forward_request("1398492", None, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("devel:languages:python/bar"),
+            "error: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    const FORWARD_PACKAGE_DESCRIPTION: &str =
+        "Forwarded Gitea pull request pool/systemd#7 from scarabeus_iv\n\nUpdate systemd to 257";
+    const FORWARD_PACKAGE_CHANGES_ENTRY: &str = "Update systemd to 257";
+
+    #[test]
+    fn forward_package_files_a_package_to_the_link_parent() {
+        let search_url =
+            own_search_url_for_target("devel:languages:python", "foo", "openSUSE:Factory", "foo");
+        let http = FakeHttp::new()
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                FORWARD_CREATE_URL,
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let action = client
+            .forward_package(
+                "devel:languages:python",
+                "foo",
+                FORWARD_PACKAGE_DESCRIPTION,
+                FORWARD_PACKAGE_CHANGES_ENTRY,
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            ForwardActionResult::Forwarded {
+                source: "devel:languages:python/foo".to_string(),
+                target: "openSUSE:Factory/foo".to_string(),
+                new_id: Some("1400001".to_string()),
+            }
+        );
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 1);
+        // The filed request carries the devel package as its source,
+        // the link parent as its target, the pull request's text,
+        // and update (not cleanup): accept must not delete the devel
+        // package.
+        assert!(posted[0]
+            .1
+            .contains("<source project=\"devel:languages:python\" package=\"foo\" />"));
+        assert!(posted[0]
+            .1
+            .contains("<target project=\"openSUSE:Factory\" package=\"foo\" />"));
+        assert!(posted[0].1.contains(
+            "<description>Forwarded Gitea pull request pool/systemd#7 from scarabeus_iv\n\nUpdate systemd to 257</description>"
+        ));
+        assert!(posted[0]
+            .1
+            .contains("<options><sourceupdate>update</sourceupdate></options>"));
+    }
+
+    #[test]
+    fn forward_package_dry_run_resolves_the_hop_without_filing() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let action = client
+            .forward_package(
+                "devel:languages:python",
+                "foo",
+                FORWARD_PACKAGE_DESCRIPTION,
+                FORWARD_PACKAGE_CHANGES_ENTRY,
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            ForwardActionResult::Forwarded {
+                source: "devel:languages:python/foo".to_string(),
+                target: "openSUSE:Factory/foo".to_string(),
+                new_id: None,
+            }
+        );
+        assert!(http.post_calls().is_empty());
+        let plan = dry_run.plan();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("would: file submit request for foo to openSUSE:Factory")),
+            "plan: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("changes entry: Update systemd to 257")),
+            "plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn forward_package_skips_a_package_without_a_link() {
+        let http = FakeHttp::new().with_get(
+            FORWARD_DIR_URL,
+            "<directory><entry name=\"foo.spec\" /></directory>",
+        );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let action = client
+            .forward_package(
+                "devel:languages:python",
+                "foo",
+                FORWARD_PACKAGE_DESCRIPTION,
+                FORWARD_PACKAGE_CHANGES_ENTRY,
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            ForwardActionResult::Skipped {
+                source: "devel:languages:python/foo".to_string(),
+                reason: "the package has no link parent".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn forward_package_refuses_a_broken_link_before_filing() {
+        let http = FakeHttp::new().with_get(
+            FORWARD_DIR_URL,
+            "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" error=\"link target not found\" /></directory>",
+        );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let err = client
+            .forward_package(
+                "devel:languages:python",
+                "foo",
+                FORWARD_PACKAGE_DESCRIPTION,
+                FORWARD_PACKAGE_CHANGES_ENTRY,
+                &dry_run,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("is broken"), "error: {err}");
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_package_refuses_a_recorded_devel_package_that_differs() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(
+                FORWARD_FACTORY_META_URL,
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let err = client
+            .forward_package(
+                "devel:languages:python",
+                "foo",
+                FORWARD_PACKAGE_DESCRIPTION,
+                FORWARD_PACKAGE_CHANGES_ENTRY,
+                &dry_run,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("devel:languages:python/bar"),
+            "error: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_package_files_an_incident_for_a_maintained_target() {
+        let match_expr = "(state/@name='new' or state/@name='review') and action/@type='maintenance_incident' and action[source/@package='foo' and target/@project='openSUSE:Maintenance:1234']";
+        let dedup_url = build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[("match", match_expr)],
+        );
+        let http = FakeHttp::new()
+            .with_get(
+                FORWARD_DIR_URL,
+                "<directory><linkinfo project=\"openSUSE:Leap:15.6:Update\" package=\"foo\" /></directory>",
+            )
+            .with_get(FORWARD_LEAP_META_URL, FORWARD_LEAP_META)
+            .with_get(
+                "https://api.opensuse.org/search/project/id?match=maintenance%2Fmaintains%2F%40project%3D%27openSUSE%3ALeap%3A15.6%3AUpdate%27",
+                "<collection matches=\"1\"><project name=\"openSUSE:Maintenance:1234\"/></collection>",
+            )
+            .with_get(&dedup_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create&addrevision=1",
+                "<request id=\"1400002\" creator=\"scarabeus_iv\"></request>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let action = client
+            .forward_package(
+                "devel:languages:python",
+                "foo",
+                FORWARD_PACKAGE_DESCRIPTION,
+                FORWARD_PACKAGE_CHANGES_ENTRY,
+                &dry_run,
+            )
+            .unwrap();
+        assert_eq!(
+            action,
+            ForwardActionResult::Incident {
+                source: "devel:languages:python/foo".to_string(),
+                target: "openSUSE:Maintenance:1234".to_string(),
+                release_project: "openSUSE:Leap:15.6:Update".to_string(),
+                new_id: Some("1400002".to_string()),
+            }
+        );
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 1);
+        assert!(posted[0]
+            .1
+            .contains("<action type=\"maintenance_incident\">"));
+    }
+
+    #[test]
+    fn verify_forward_resolves_hops_without_filing() {
+        // A request that need not be accepted yet: the preflight
+        // resolves the hops without filing, and gates nothing.
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("new"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            );
+        let client = forward_client(&http);
+        client.verify_forward("1398492").unwrap();
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn verify_forward_refuses_a_recorded_devel_package_that_differs() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("new"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(
+                FORWARD_FACTORY_META_URL,
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
+            );
+        let client = forward_client(&http);
+        let err = client.verify_forward("1398492").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("devel:languages:python/bar"),
+            "error: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_request_dry_run_refuses_a_source_that_is_not_the_devel_project() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(
+                FORWARD_FACTORY_META_URL,
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:ruby\" package=\"foo\"/></package>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let err = client
+            .forward_request("1398492", None, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("devel:languages:ruby"),
+            "error: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_request_refuses_a_target_with_no_devel_recorded() {
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(
+                FORWARD_FACTORY_META_URL,
+                "<package name=\"foo\" project=\"openSUSE:Factory\"></package>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let err = client
+            .forward_request("1398492", None, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("records no devel project"),
+            "error: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_request_refuses_a_link_parent_package_that_does_not_exist_yet() {
+        // A new package has no link-parent package yet, so there is
+        // no recorded devel to verify the source against: missing
+        // metadata cannot establish the required recorded-devel
+        // origin, so the forward is refused fail-closed instead of
+        // proceeding on an unverified origin. The work stays queued
+        // in the devel project, for a direct submit.
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get_error(FORWARD_FACTORY_META_URL, ErrorKind::NotFound);
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let err = client
+            .forward_request("1398492", None, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("does not exist yet"),
+            "error: {err}"
+        );
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn verify_forward_server_error_propagates_without_filing() {
+        // A 5xx from the hop read aborts the check with the
+        // server's kind, and files nothing: the check reports the
+        // failure, and the accept — which lands on its own, if at
+        // all — is a separate step the caller owns.
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("new"))
+            .with_get_error(FORWARD_DIR_URL, ErrorKind::ServerError);
+        let client = forward_client(&http);
+        let err = client.verify_forward("1398492").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn verify_forward_broken_link_is_a_refusal() {
+        // The definitive refusals are InvalidInput: a broken link —
+        // and the recorded-devel refusals beside it — refuse the
+        // forward, and file nothing. The refusal is reported to
+        // the caller; nothing is declined on it.
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("new"))
+            .with_get(
+                FORWARD_DIR_URL,
+                "<directory><linkinfo project=\"openSUSE:Factory\" package=\"foo\" error=\"link target not found\" /></directory>",
+            );
+        let client = forward_client(&http);
+        let err = client.verify_forward("1398492").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.post_calls().is_empty());
+    }
+
+    #[test]
+    fn forward_request_reads_the_link_parent_meta_authenticated() {
+        // A link parent hidden from /public/source still records a
+        // devel: the forward reads its meta authenticated, runs the
+        // check, and files. The public meta URL is deliberately not
+        // stubbed — a read there fails the test.
+        let search_url =
+            own_search_url_for_target("devel:languages:python", "foo", "openSUSE:Factory", "foo");
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &accepted_request_xml("accepted"))
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                FORWARD_CREATE_URL,
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let result = client.forward_request("1398492", None, &dry_run).unwrap();
+        assert_eq!(result.actions.len(), 1);
+        // The meta read carried the credentials, and no public
+        // meta URL was ever requested.
+        let calls = http.get_calls();
+        assert!(
+            calls
+                .iter()
+                .any(|(url, authed)| url == FORWARD_FACTORY_META_URL && *authed),
+            "meta read: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|(url, _)| url.contains("/public/source/")),
+            "no public read: {calls:?}"
+        );
+    }
+
+    fn three_action_request_xml() -> String {
+        "<request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"bar\" /><target project=\"devel:languages:python\" package=\"bar\" /></action><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"baz\" /><target project=\"devel:languages:python\" package=\"baz\" /></action><state name=\"accepted\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo, bar and baz</description></request>"
+            .to_string()
+    }
+
+    #[test]
+    fn forward_request_mid_loop_failure_names_what_filed() {
+        // Three hops: foo files, bar's incident filing fails, baz is
+        // never attempted. The error names the filed forward, the
+        // failed hop, and the hop not filed — it does not drop the
+        // record of what already landed.
+        let dedup_url = build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[(
+                "match",
+                "(state/@name='new' or state/@name='review') and action/@type='maintenance_incident' and action[source/@package='bar' and target/@project='openSUSE:Maintenance:1234']",
+            )],
+        );
+        let search_url =
+            own_search_url_for_target("devel:languages:python", "foo", "openSUSE:Factory", "foo");
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &three_action_request_xml())
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                FORWARD_CREATE_URL,
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/devel:languages:python/bar?rev=latest",
+                "<directory><linkinfo project=\"openSUSE:Leap:15.6:Update\" package=\"bar\" /></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Leap:15.6:Update/bar/_meta",
+                "<package name=\"bar\" project=\"openSUSE:Leap:15.6:Update\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/search/project/id?match=maintenance%2Fmaintains%2F%40project%3D%27openSUSE%3ALeap%3A15.6%3AUpdate%27",
+                "<collection matches=\"1\"><project name=\"openSUSE:Maintenance:1234\"/></collection>",
+            )
+            .with_get(&dedup_url, "<collection matches=\"0\"></collection>")
+            .with_get(
+                "https://api.opensuse.org/source/devel:languages:python/baz?rev=latest",
+                "<directory><linkinfo project=\"openSUSE:Factory\" package=\"baz\" /></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Factory/baz/_meta",
+                "<package name=\"baz\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"baz\"/></package>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let err = client
+            .forward_request("1398492", None, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NetworkError);
+        let text = err.to_string();
+        assert!(
+            text.contains("1400001"),
+            "error names the filed forward: {text}"
+        );
+        assert!(text.contains("bar"), "error names the failed hop: {text}");
+        assert!(
+            text.contains("baz"),
+            "error names the hop never filed: {text}"
+        );
+        // Two filing POSTs went out: foo's (which filed 1400001)
+        // and bar's incident filing (which failed) — and baz never
+        // reached filing.
+        let posted = http.post_calls();
+        assert_eq!(posted.len(), 2);
+        assert_eq!(posted[0].0, FORWARD_CREATE_URL);
+        assert_eq!(
+            posted[1].0,
+            "https://api.opensuse.org/request?cmd=create&addrevision=1"
+        );
+    }
+
+    #[test]
+    fn forward_request_partial_error_names_only_forwardable_hops() {
+        // The mid-loop shape with a skip after the failure: foo
+        // files, bar's incident filing fails, baz has no link and
+        // is skipped. The error names the filed forward and the
+        // failed hop, but not the skipped hop: a skip was never
+        // going to be filed, so it is not "not filed".
+        let dedup_url = build_url(
+            "https://api.opensuse.org",
+            &["search", "request"],
+            &[(
+                "match",
+                "(state/@name='new' or state/@name='review') and action/@type='maintenance_incident' and action[source/@package='bar' and target/@project='openSUSE:Maintenance:1234']",
+            )],
+        );
+        let search_url =
+            own_search_url_for_target("devel:languages:python", "foo", "openSUSE:Factory", "foo");
+        let http = FakeHttp::new()
+            .with_get(FORWARD_SHOW_URL, &three_action_request_xml())
+            .with_get(FORWARD_DIR_URL, FORWARD_DIR_FACTORY)
+            .with_get(FORWARD_FACTORY_META_URL, FORWARD_FACTORY_META)
+            .with_get(
+                FORWARD_FACTORY_SEARCH_URL,
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post(
+                FORWARD_CREATE_URL,
+                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/devel:languages:python/bar?rev=latest",
+                "<directory><linkinfo project=\"openSUSE:Leap:15.6:Update\" package=\"bar\" /></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/openSUSE:Leap:15.6:Update/bar/_meta",
+                "<package name=\"bar\" project=\"openSUSE:Leap:15.6:Update\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
+            )
+            .with_get(
+                "https://api.opensuse.org/search/project/id?match=maintenance%2Fmaintains%2F%40project%3D%27openSUSE%3ALeap%3A15.6%3AUpdate%27",
+                "<collection matches=\"1\"><project name=\"openSUSE:Maintenance:1234\"/></collection>",
+            )
+            .with_get(&dedup_url, "<collection matches=\"0\"></collection>")
+            .with_get(
+                "https://api.opensuse.org/source/devel:languages:python/baz?rev=latest",
+                "<directory></directory>",
+            );
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(false);
+        let err = client
+            .forward_request("1398492", None, &dry_run)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NetworkError);
+        let text = err.to_string();
+        assert!(
+            text.contains("1400001"),
+            "error names the filed forward: {text}"
+        );
+        assert!(text.contains("bar"), "error names the failed hop: {text}");
+        assert!(
+            !text.contains("was not filed"),
+            "a skipped hop must not read as not filed: {text}"
+        );
+        assert!(
+            !text.contains("baz"),
+            "the skipped hop must not be named at all: {text}"
+        );
     }
 
     #[test]

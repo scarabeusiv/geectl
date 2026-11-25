@@ -465,6 +465,37 @@ pub(crate) fn parse_submit_request_ids_for_creator(
     parse_request_ids_for_action(body, "submit", ActionShape::Any, Some(creator))
 }
 
+/// The ids of the submit requests in a search-response collection
+/// created by `creator` for one forward hop — one action whose
+/// `<source>` names `source_project`/`source_package` and whose
+/// `<target>` names `target_project`/`target_package`. The
+/// hop-scoped form of [`parse_submit_request_ids_for_creator`]:
+/// the search already scopes to one action, and the parser
+/// re-checks it here, so a multi-action request that spreads the
+/// hop across actions never counts. A request carrying no
+/// `creator` attribute cannot be attributed to anyone, so it is
+/// not a match.
+pub(crate) fn parse_submit_request_ids_for_forward_hop(
+    body: &str,
+    creator: &str,
+    source_project: &str,
+    source_package: &str,
+    target_project: &str,
+    target_package: &str,
+) -> Option<Vec<String>> {
+    parse_request_ids_for_action(
+        body,
+        "submit",
+        ActionShape::SubmitHop {
+            source_project,
+            source_package,
+            target_project,
+            target_package,
+        },
+        Some(creator),
+    )
+}
+
 /// The ids of the requests in a search-response collection whose
 /// action is of type `action_type` (state is whatever the search
 /// matched) and matches `shape`. The search already filters on the
@@ -1327,6 +1358,27 @@ mod tests {
         assert_eq!(
             parse_submit_request_ids_for_creator("not a collection", "scarabeus_iv"),
             None
+        );
+    }
+
+    #[test]
+    fn parse_submit_request_ids_for_forward_hop_scopes_to_one_action() {
+        // Three open submit requests from the same creator: one for
+        // the hop, one for the same target from another source, one
+        // spreading the hop across two actions. Only the first counts:
+        // the supersede must never close a request that is not the
+        // same forward.
+        let body = "<collection matches=\"3\"><request id=\"1\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"2\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:alice\" package=\"foo\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request><request id=\"3\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\" /><target project=\"devel:other\" package=\"foo\" /></action><action type=\"submit\"><source project=\"home:alice\" package=\"bar\" /><target project=\"devel:languages:python\" package=\"foo\" /></action><state name=\"new\" /></request></collection>";
+        assert_eq!(
+            parse_submit_request_ids_for_forward_hop(
+                body,
+                "scarabeus_iv",
+                "home:scarabeus_iv",
+                "foo",
+                "devel:languages:python",
+                "foo",
+            ),
+            Some(vec!["1".to_string()])
         );
     }
 

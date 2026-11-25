@@ -5832,7 +5832,7 @@ fn pull_request_merge_obs_text_dry_run_without_credentials_prints_plan() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would merge obs:123"
+        "dry-run: would merge obs:123; would forward after merge"
     );
 }
 
@@ -5915,6 +5915,555 @@ fn pull_request_merge_gitea_with_force_is_invalid_input_without_credentials() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
     assert!(stderr.contains("--force"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_merge_obs_with_no_forward_is_invalid_input() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "merge", "obs:123", "--no-forward"])
+        .output()
+        .unwrap();
+    // InvalidInput exits 2; --no-forward does not apply to OBS.
+    // The refusal precedes credential resolution, so the dry-run
+    // credential warning never appears; the assertions are
+    // substrings, not a JSON parse.
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid_input"), "stderr: {stderr}");
+    assert!(stderr.contains("--no-forward"), "stderr: {stderr}");
+}
+
+#[test]
+fn pull_request_merge_gitea_dry_run_prints_forward_plan() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "merge", "gitea:openSUSE/geectl#122"])
+        .env("GEECTL_GITEA_TOKEN", "tok-fake")
+        .output()
+        .unwrap();
+    // A dry-run Gitea merge prints without a server: the plan
+    // names the merge, the forward that would follow it, and the
+    // note that the forward preflight was skipped without OBS
+    // credentials — the forward is planned unverified.
+    assert!(out.status.success());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], "gitea:openSUSE/geectl#122");
+    assert_eq!(value["status"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert_eq!(plan.len(), 3);
+    assert!(
+        plan[0]
+            .as_str()
+            .unwrap()
+            .contains("merge pull request openSUSE/geectl#122"),
+        "plan: {plan:?}"
+    );
+    assert_eq!(
+        plan[1],
+        "[dry-run] would: forward gitea:openSUSE/geectl#122 after merge"
+    );
+    assert_eq!(
+        plan[2],
+        "[dry-run] note: forward preflight skipped: no OBS credentials, so the forward was not verified"
+    );
+}
+
+#[test]
+fn pull_request_merge_gitea_text_dry_run_prints_forward_plan() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "pull-request",
+            "merge",
+            "gitea:openSUSE/geectl#122",
+        ])
+        .env("GEECTL_GITEA_TOKEN", "tok-fake")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would merge gitea:openSUSE/geectl#122; would forward after merge"
+    );
+}
+
+#[test]
+fn pull_request_merge_gitea_dry_run_with_no_forward_prints_no_forward_plan() {
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args([
+            "pull-request",
+            "merge",
+            "gitea:openSUSE/geectl#122",
+            "--no-forward",
+        ])
+        .env("GEECTL_GITEA_TOKEN", "tok-fake")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert_eq!(plan.len(), 1);
+    assert!(
+        plan[0]
+            .as_str()
+            .unwrap()
+            .contains("merge pull request openSUSE/geectl#122"),
+        "plan: {plan:?}"
+    );
+    let out = geectl_isolated(&dir)
+        .args([
+            "--format",
+            "text",
+            "pull-request",
+            "merge",
+            "gitea:openSUSE/geectl#122",
+            "--no-forward",
+        ])
+        .env("GEECTL_GITEA_TOKEN", "tok-fake")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "dry-run: would merge gitea:openSUSE/geectl#122"
+    );
+}
+
+/// A routing stub Gitea server for the live merge-then-forward:
+/// the merge POST, the pull-request read, the reviews read, and
+/// the repo read each get their canned answer, by method and
+/// request target. Anything else is a 404. The PR merges into
+/// `pool/systemd` on `factory`; the repo's clone URL spells the
+/// scmsync repo the OBS stub's package syncs from.
+fn serve_gitea_merge_forward() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let pr_json = r#"{"number":7,"title":"Update systemd to 257","body":"Update systemd to 257","state":"closed","draft":false,"merged":true,"user":{"login":"scarabeus_iv"},"labels":[],"head":{"label":"scarabeus_iv:systemd-257","ref":"systemd-257","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repo":{"full_name":"scarabeus_iv/systemd"}},"base":{"label":"factory","ref":"factory","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repo":{"full_name":"pool/systemd"}}}"#;
+    let repo_json = format!(
+        r#"{{"owner":{{"login":"pool"}},"name":"systemd","full_name":"pool/systemd","default_branch":"factory","private":false,"clone_url":"http://{addr}/pool/systemd.git","ssh_url":"git@{addr}:pool/systemd.git"}}"#
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("/pulls/7/merge") {
+                (200, "{}".to_string())
+            } else if target.contains("/pulls/7/reviews") {
+                (200, "[]".to_string())
+            } else if target.contains("/pulls/7") {
+                (200, pr_json.to_string())
+            } else if target == "/api/v1/repos/pool/systemd" {
+                (200, repo_json.clone())
+            } else {
+                (404, "{}".to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+/// A routing stub OBS server for the live Gitea merge-then-forward:
+/// the scmsync package search, the candidate meta, the target
+/// package's directory listing, the link parent's meta, the
+/// maintenance search, the filing dedup search, and the create
+/// POST each get their canned answer. The candidate package
+/// `devel:systemd/systemd` syncs from the Gitea stub's repo on
+/// `factory` and links to `openSUSE:Factory/systemd`.
+fn serve_obs_gitea_merge_forward(
+    gitea_addr: std::net::SocketAddr,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let search_xml = "<collection matches=\"1\"><package name=\"systemd\" project=\"devel:systemd\"><title>systemd</title><description>System and Session Manager</description></package></collection>";
+    let candidate_meta = format!(
+        "<package name=\"systemd\" project=\"devel:systemd\"><scmsync>http://{gitea_addr}/pool/systemd#factory</scmsync></package>"
+    );
+    let parent_meta = "<package name=\"systemd\" project=\"openSUSE:Factory\"><devel project=\"devel:systemd\" package=\"systemd\"/></package>";
+    let directory_xml =
+        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"systemd\" /></directory>";
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+                )
+            } else if target.contains("/_meta") && target.contains("openSUSE:Factory") {
+                (200, parent_meta.to_string())
+            } else if target.contains("/_meta") {
+                (200, candidate_meta.clone())
+            } else if target.contains("search/package") {
+                (200, search_xml.to_string())
+            } else if target.contains("search/project/id") || target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else if target.starts_with("/source/") {
+                (200, directory_xml.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+/// A routing stub OBS server for the live Gitea merge-then-forward
+/// with an ambiguous scmsync repo: the package search returns two
+/// packages synced from the same repo, so the forward must refuse
+/// to guess which one the merge targeted. The candidate metas both
+/// name the Gitea stub's repo on `factory`; everything else answers
+/// like `serve_obs_gitea_merge_forward`.
+fn serve_obs_gitea_merge_forward_ambiguous(
+    gitea_addr: std::net::SocketAddr,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in_thread = std::sync::Arc::clone(&seen);
+    let search_xml = "<collection matches=\"2\"><package name=\"systemd\" project=\"devel:systemd\"><title>systemd</title><description>System and Session Manager</description></package><package name=\"systemd\" project=\"home:alice\"><title>systemd</title><description>System and Session Manager</description></package></collection>";
+    let candidate_meta = format!(
+        "<package name=\"systemd\" project=\"devel:systemd\"><scmsync>http://{gitea_addr}/pool/systemd#factory</scmsync></package>"
+    );
+    let parent_meta = "<package name=\"systemd\" project=\"openSUSE:Factory\"><devel project=\"devel:systemd\" package=\"systemd\"/></package>";
+    let directory_xml =
+        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"systemd\" /></directory>";
+    let empty_collection = "<collection matches=\"0\"></collection>";
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let request = read_request(&mut stream);
+            let text = String::from_utf8_lossy(&request).into_owned();
+            seen_in_thread
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_string());
+            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let (status, body) = if method == "POST" && target.contains("cmd=create") {
+                (
+                    200,
+                    "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+                )
+            } else if target.contains("/_meta") && target.contains("openSUSE:Factory") {
+                (200, parent_meta.to_string())
+            } else if target.contains("/_meta") {
+                (200, candidate_meta.clone())
+            } else if target.contains("search/package") {
+                (200, search_xml.to_string())
+            } else if target.contains("search/project/id") || target.contains("search/request") {
+                (200, empty_collection.to_string())
+            } else if target.starts_with("/source/") {
+                (200, directory_xml.to_string())
+            } else {
+                (404, "<status code=\"not_found\" />".to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    });
+    (addr, seen)
+}
+
+#[test]
+fn pull_request_merge_gitea_live_forwards_after_merge() {
+    let (gitea_addr, gitea_seen) = serve_gitea_merge_forward();
+    let (obs_addr, obs_seen) = serve_obs_gitea_merge_forward(gitea_addr);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "pull-request", "merge", "gitea:pool/systemd#7"])
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], "gitea:pool/systemd#7");
+    assert_eq!(value["status"], "merged");
+    assert_eq!(value["dry_run"], false);
+    assert_eq!(value["forward"]["actions"][0]["outcome"], "forwarded");
+    assert_eq!(
+        value["forward"]["actions"][0]["source"],
+        "devel:systemd/systemd"
+    );
+    assert_eq!(
+        value["forward"]["actions"][0]["target"],
+        "openSUSE:Factory/systemd"
+    );
+    assert_eq!(value["forward"]["actions"][0]["new_id"], 1400001);
+    // The guards must drop before the next run: the stub threads
+    // take the same lock per request, and holding it across the
+    // run would stall every response.
+    {
+        let gitea_seen = gitea_seen.lock().unwrap();
+        assert!(
+            gitea_seen
+                .iter()
+                .any(|r| r.contains("POST") && r.contains("/pulls/7/merge")),
+            "gitea requests: {gitea_seen:?}"
+        );
+        assert!(
+            gitea_seen.iter().any(|r| r.contains("/pulls/7")),
+            "gitea requests: {gitea_seen:?}"
+        );
+    }
+    {
+        let obs_seen = obs_seen.lock().unwrap();
+        assert!(
+            obs_seen.iter().any(|r| r.contains("search/package")),
+            "obs requests: {obs_seen:?}"
+        );
+        assert!(
+            obs_seen.iter().any(|r| r.contains("cmd=create")),
+            "obs requests: {obs_seen:?}"
+        );
+    }
+    let out = geectl_isolated(&dir)
+        .args([
+            "--live",
+            "--format",
+            "text",
+            "pull-request",
+            "merge",
+            "gitea:pool/systemd#7",
+        ])
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "merged gitea:pool/systemd#7 (now merged); forwarded devel:systemd/systemd to openSUSE:Factory/systemd as request 1400001"
+    );
+}
+
+#[test]
+fn pull_request_merge_gitea_live_preflight_refuses_before_the_merge() {
+    // The preflight finds two OBS packages synced from the merged
+    // repo and refuses to guess which one the merge targeted — the
+    // merge never lands, and nothing is filed.
+    let (gitea_addr, gitea_seen) = serve_gitea_merge_forward();
+    let (obs_addr, obs_seen) = serve_obs_gitea_merge_forward_ambiguous(gitea_addr);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "pull-request", "merge", "gitea:pool/systemd#7"])
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the ambiguous merge exited 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("refusing to guess which one the merge targeted"),
+        "stderr: {stderr}"
+    );
+    // The guards must drop before the next run: the stub threads
+    // take the same lock per request, and holding it across the
+    // run would stall every response.
+    {
+        let gitea_seen = gitea_seen.lock().unwrap();
+        assert!(
+            !gitea_seen
+                .iter()
+                .any(|r| r.contains("POST") && r.contains("/pulls/7/merge")),
+            "the merge landed before the preflight refused: {gitea_seen:?}"
+        );
+    }
+    {
+        let obs_seen = obs_seen.lock().unwrap();
+        assert!(
+            !obs_seen.iter().any(|r| r.contains("cmd=create")),
+            "a forward was filed for an ambiguous merge: {obs_seen:?}"
+        );
+    }
+}
+
+#[test]
+fn pull_request_merge_gitea_dry_run_verifies_the_forward_when_credentials_are_available() {
+    // With both servers up, the dry-run preflight resolves the
+    // hop: the plan names the verified forward, with no skip note.
+    let (gitea_addr, _gitea_seen) = serve_gitea_merge_forward();
+    let (obs_addr, _obs_seen) = serve_obs_gitea_merge_forward(gitea_addr);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "merge", "gitea:pool/systemd#7"])
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["reference"], "gitea:pool/systemd#7");
+    assert_eq!(value["status"], serde_json::Value::Null);
+    assert_eq!(value["dry_run"], true);
+    let plan = value["plan"].as_array().expect("payload carries a plan");
+    assert_eq!(plan.len(), 2);
+    assert_eq!(
+        plan[1],
+        "[dry-run] would: forward gitea:pool/systemd#7 after merge"
+    );
+}
+
+#[test]
+fn pull_request_merge_gitea_dry_run_preflight_refuses_an_ambiguous_forward() {
+    // The same ambiguous repo in dry-run: the preflight refuses,
+    // so the dry-run fails instead of printing "would forward".
+    let (gitea_addr, gitea_seen) = serve_gitea_merge_forward();
+    let (obs_addr, _obs_seen) = serve_obs_gitea_merge_forward_ambiguous(gitea_addr);
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["pull-request", "merge", "gitea:pool/systemd#7"])
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .env("GEECTL_OBS_URL", format!("http://{obs_addr}"))
+        .env("GEECTL_OBS_USERNAME", "alice")
+        .env("GEECTL_OBS_PASSWORD", "test-password")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the ambiguous dry-run exited 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("refusing to guess which one the merge targeted"),
+        "stderr: {stderr}"
+    );
+    {
+        let gitea_seen = gitea_seen.lock().unwrap();
+        assert!(
+            !gitea_seen
+                .iter()
+                .any(|r| r.contains("POST") && r.contains("/pulls/7/merge")),
+            "a dry-run merged: {gitea_seen:?}"
+        );
+    }
+}
+
+#[test]
+fn pull_request_merge_gitea_live_without_obs_credentials_fails_before_the_merge() {
+    // A live Gitea merge without OBS credentials fails at the
+    // preflight, before the merge: the forward cannot be
+    // validated, so the pull request stays open.
+    let (gitea_addr, gitea_seen) = serve_gitea_merge_forward();
+    let dir = TempDir::new();
+    let out = geectl_isolated(&dir)
+        .args(["--live", "pull-request", "merge", "gitea:pool/systemd#7"])
+        .env("GEECTL_GITEA_URL", format!("http://{gitea_addr}"))
+        .env("GEECTL_GITEA_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("GEECTL_OBS_USERNAME"), "stderr: {stderr}");
+    {
+        let gitea_seen = gitea_seen.lock().unwrap();
+        assert!(
+            !gitea_seen
+                .iter()
+                .any(|r| r.contains("POST") && r.contains("/pulls/7/merge")),
+            "the merge landed without OBS credentials: {gitea_seen:?}"
+        );
+    }
 }
 
 /// Run git in `dir`, asserting success.
