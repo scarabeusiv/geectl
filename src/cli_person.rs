@@ -32,7 +32,7 @@
 
 use crate::auth::{EnvGiteaAuth, EnvObsAuth};
 use crate::config::{self, DEFAULT_GITEA_URL};
-use crate::debug::Debug;
+use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::gitea::{GiteaClient, GiteaUser};
 use crate::http::{HttpClient, Timeout, UreqClient};
@@ -239,7 +239,11 @@ fn render_project_matches(term: &str, matches: &[ProjectMatch]) -> Result<String
         .map(|match_| {
             vec![
                 match_.name.clone(),
-                match_.title.clone().unwrap_or_else(|| "-".to_string()),
+                match_
+                    .title
+                    .as_deref()
+                    .map(strip_terminal_controls)
+                    .unwrap_or_else(|| "-".to_string()),
             ]
         })
         .collect();
@@ -258,15 +262,21 @@ fn render_users(term: &str, users: &[GiteaUser]) -> Result<String, GeectlError> 
         .map(|user| {
             vec![
                 user.login.clone(),
-                if user.full_name.is_empty() {
-                    "-".to_string()
-                } else {
-                    user.full_name.clone()
+                {
+                    let full_name = strip_terminal_controls(&user.full_name);
+                    if full_name.is_empty() {
+                        "-".to_string()
+                    } else {
+                        full_name
+                    }
                 },
-                if user.email.is_empty() {
-                    "-".to_string()
-                } else {
-                    user.email.clone()
+                {
+                    let email = strip_terminal_controls(&user.email);
+                    if email.is_empty() {
+                        "-".to_string()
+                    } else {
+                        email
+                    }
                 },
             ]
         })
@@ -478,5 +488,27 @@ mod tests {
         assert_eq!(user_json["login"], "alice");
         assert_eq!(user_json["full_name"], "Alice");
         assert_eq!(user_json["email"], "alice@example.com");
+    }
+
+    #[test]
+    fn search_text_strips_terminal_controls_from_titles_and_users() {
+        // Project titles and Gitea full names and emails reach the
+        // terminal through the person search tables: escape
+        // sequences, bells, and bidirectional marks are stripped,
+        // while a name that strips to empty still renders as `-`.
+        let projects = vec![project("devel:languages:python", Some("Py\u{1b}[2Jthon"))];
+        let text = render_project_matches("alice", &projects).unwrap();
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(text.contains("Py[2Jthon"), "text: {text}");
+        let users = vec![
+            user("alice", "Al\u{7}ice\u{202e}", "alice@example.com"),
+            user("bob", "\u{7}", ""),
+        ];
+        let text = render_users("alice", &users).unwrap();
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(text.contains("Alice"), "text: {text}");
+        assert!(text.contains("bob"), "text: {text}");
     }
 }

@@ -1704,7 +1704,11 @@ pub(crate) fn parse_package_search(body: &str) -> Option<Vec<PackageMatch>> {
         matches.push(PackageMatch {
             name: xml_unescape(&name),
             project: xml_unescape(&project),
-            title: element_text(&inner, "title"),
+            // Terminal control characters are stripped from the
+            // title: it is maintainer text, and it reaches the
+            // terminal through the search render. The description
+            // stays verbatim — it is JSON-only, never rendered.
+            title: element_text(&inner, "title").map(|text| strip_terminal_controls(&text)),
             description: element_text(&inner, "description"),
         });
     }
@@ -1733,7 +1737,9 @@ pub(crate) fn parse_project_search(body: &str) -> Option<Vec<ProjectMatch>> {
         };
         matches.push(ProjectMatch {
             name: xml_unescape(&name),
-            title: element_text(&inner, "title"),
+            // Same strip as the package search title: maintainer
+            // text, reaching the terminal through the search render.
+            title: element_text(&inner, "title").map(|text| strip_terminal_controls(&text)),
             description: element_text(&inner, "description"),
         });
     }
@@ -1819,7 +1825,13 @@ pub(crate) fn parse_owners(body: &str) -> Option<Vec<Owner>> {
                 tag_attr(&person_element, "role"),
             ) {
                 persons.push(NamedRole {
-                    name: xml_unescape(&name),
+                    // Terminal control characters are stripped from
+                    // the owner name: it is server-reported free
+                    // text, and it reaches the terminal through the
+                    // owner render. (Meta role names are stripped
+                    // at the render only — they round-trip to the
+                    // server on a role grant.)
+                    name: strip_terminal_controls(&xml_unescape(&name)),
                     role: xml_unescape(&role),
                     email: None,
                 });
@@ -1832,7 +1844,8 @@ pub(crate) fn parse_owners(body: &str) -> Option<Vec<Owner>> {
                 tag_attr(&group_element, "role"),
             ) {
                 groups.push(NamedRole {
-                    name: xml_unescape(&name),
+                    // Same strip as the owner person names.
+                    name: strip_terminal_controls(&xml_unescape(&name)),
                     role: xml_unescape(&role),
                     email: None,
                 });
@@ -1863,8 +1876,12 @@ pub(crate) fn parse_person(body: &str) -> Option<Person> {
     };
     Some(Person {
         login: token("login")?,
-        email: token("email")?,
-        realname: token("realname"),
+        // Terminal control characters are stripped from the email
+        // and real name: they are account-holder free text, and
+        // both reach the terminal through the person render (and
+        // the email through owner role lines).
+        email: token("email").map(|value| strip_terminal_controls(&value))?,
+        realname: token("realname").map(|value| strip_terminal_controls(&value)),
         state: token("state")?,
     })
 }
@@ -11612,6 +11629,25 @@ mod tests {
     }
 
     #[test]
+    fn search_parsers_strip_terminal_controls_from_titles() {
+        // Titles are maintainer text: escape sequences, bells, and
+        // bidirectional marks are stripped at the parse, so no
+        // downstream surface can print them. Descriptions stay
+        // verbatim — they are JSON-only, never rendered.
+        let matches = parse_package_search(
+            "<collection matches=\"1\"><package name=\"foo\" project=\"openSUSE:Factory\"><title>Fo\u{1b}[2Jo package</title><description>A test package</description></package></collection>",
+        )
+        .unwrap();
+        assert_eq!(matches[0].title.as_deref(), Some("Fo[2Jo package"));
+        assert_eq!(matches[0].description.as_deref(), Some("A test package"));
+        let matches = parse_project_search(
+            "<collection matches=\"1\"><project name=\"devel:languages:python\"><title>Py\u{7}thon\u{202e}</title><description>Python packages</description></project></collection>",
+        )
+        .unwrap();
+        assert_eq!(matches[0].title.as_deref(), Some("Python"));
+    }
+
+    #[test]
     fn search_parsers_are_fail_closed() {
         // Not a collection, or no matches count: None.
         assert_eq!(parse_package_search(""), None);
@@ -12356,6 +12392,20 @@ mod tests {
     }
 
     #[test]
+    fn owner_search_strips_terminal_controls_from_role_names() {
+        // Owner names are logins as the server reports them: escape
+        // sequences, bells, and bidirectional marks are stripped at
+        // the parse. (Meta role names are stripped at the render
+        // only — they round-trip to the server on a role grant.)
+        let owners = parse_owners(
+            "<collection><owner rootproject=\"openSUSE:Factory\" project=\"devel:languages:python\"><person name=\"Ad\u{1b}[2Jmin\" role=\"maintainer\"/><group name=\"factory\u{7}-maintainers\" role=\"maintainer\"/></owner></collection>",
+        )
+        .unwrap();
+        assert_eq!(owners[0].persons[0].name, "Ad[2Jmin");
+        assert_eq!(owners[0].groups[0].name, "factory-maintainers");
+    }
+
+    #[test]
     fn owner_search_parsers_are_fail_closed() {
         assert_eq!(parse_owners(""), None);
         assert_eq!(parse_owners("<directory></directory>"), None);
@@ -12388,6 +12438,17 @@ mod tests {
                 state: "confirmed".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn person_strips_terminal_controls_from_email_and_realname() {
+        // The email and real name are account-holder free text.
+        let person = parse_person(
+            "<person><login>Admin</login><email>ad\u{1b}[2Jmin@example.com</email><realname>Ad\u{7}min\u{202e} User</realname><state>confirmed</state></person>",
+        )
+        .unwrap();
+        assert_eq!(person.email, "ad[2Jmin@example.com");
+        assert_eq!(person.realname.as_deref(), Some("Admin User"));
     }
 
     #[test]

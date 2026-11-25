@@ -38,7 +38,7 @@ use crate::auth::{
     EnvGiteaAuth, FileReader, VarLookup, GITEA_TOKEN_FILE_VAR, GITEA_TOKEN_VAR,
 };
 use crate::config::{self, DEFAULT_GITEA_URL};
-use crate::debug::Debug;
+use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::ErrorKind;
 use crate::error::GeectlError;
 use crate::http::is_loopback_url;
@@ -2619,12 +2619,20 @@ impl<'a> GiteaClient<'a> {
                 "user search query must not be empty",
             ));
         }
-        self.search_paged::<GiteaUser>(
+        let mut users = self.search_paged::<GiteaUser>(
             &["api", "v1", "users", "search"],
             &[("q", query)],
             &format!("users matching {query:?}"),
             "narrow the search query",
-        )
+        )?;
+        // Terminal control characters are stripped from the full
+        // name and email: they are account-holder free text, and
+        // both reach the terminal through the person search render.
+        for user in &mut users {
+            user.full_name = strip_terminal_controls(&user.full_name);
+            user.email = strip_terminal_controls(&user.email);
+        }
+        Ok(users)
     }
 
     /// Search repositories across the instance (`GET
@@ -6113,6 +6121,24 @@ mod tests {
         assert_eq!(users[1].login, "alice2");
         assert_eq!(users[1].full_name, "");
         assert_eq!(users[1].email, "");
+    }
+
+    #[test]
+    fn user_search_strips_terminal_controls_from_full_name_and_email() {
+        // The fixture carries the controls as JSON escapes (a raw
+        // control byte is not valid inside a JSON string); serde
+        // decodes them, and the search strips them.
+        let http = FakeHttp::new().with_get(
+            "https://src.opensuse.org/api/v1/users/search?q=alice&page=1&limit=50",
+            &user_search_json(&[user_json(
+                "alice",
+                "Al\\u001b[2Jice",
+                "alice\\u0007@example.com",
+            )]),
+        );
+        let users = client(&http).user_search("alice").unwrap();
+        assert_eq!(users[0].full_name, "Al[2Jice");
+        assert_eq!(users[0].email, "alice@example.com");
     }
 
     #[test]
