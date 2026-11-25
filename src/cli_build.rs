@@ -1769,7 +1769,12 @@ fn render_results_text(results: &BuildResults) -> String {
             *counts.entry(cell.code.clone()).or_insert(0) += 1;
         } else {
             if let Some(details) = &cell.details {
-                cell_notes.push(format!("{} {}: {details}", cell.repository, cell.arch));
+                cell_notes.push(format!(
+                    "{} {}: {}",
+                    cell.repository,
+                    cell.arch,
+                    strip_terminal_controls(details)
+                ));
             }
             for status in &cell.statuses {
                 rows.push(vec![
@@ -1804,7 +1809,7 @@ fn render_results_text(results: &BuildResults) -> String {
 /// A code with its server detail text in parentheses, when present.
 fn code_with_details(code: &str, details: &Option<String>) -> String {
     match details {
-        Some(details) => format!("{code} ({details})"),
+        Some(details) => format!("{code} ({})", strip_terminal_controls(details)),
         None => code.to_string(),
     }
 }
@@ -2007,7 +2012,10 @@ fn render_job_status_text(job: &Option<JobStatus>) -> String {
     };
     let mut lines = vec![format!("code: {}", job.code)];
     lines.extend(opt_line("result", &job.result));
-    lines.extend(opt_line("details", &job.details));
+    lines.extend(opt_line(
+        "details",
+        &job.details.as_deref().map(strip_terminal_controls),
+    ));
     lines.extend(opt_num_line("starttime", &job.starttime));
     lines.extend(opt_num_line("endtime", &job.endtime));
     lines.extend(opt_num_line("lastduration", &job.lastduration));
@@ -3608,6 +3616,26 @@ mod tests {
     }
 
     #[test]
+    fn results_text_strips_terminal_controls_from_details() {
+        // Cell-level detail text (in the code cell and in the note
+        // line) and package-level detail text reach the terminal
+        // through the results render: escape sequences, bells, and
+        // bidirectional marks are stripped.
+        let mut results = results_fixture();
+        results.results[0].details = Some("repo\u{1b}[2J broken".to_string());
+        results.results[0].statuses[0].details = Some("miss\u{7}ing foo\u{202e}".to_string());
+        let text = render_results_text(&results);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(
+            text.contains("standard x86_64: repo[2J broken"),
+            "text: {text}"
+        );
+        assert!(text.contains("failed (missing foo)"), "text: {text}");
+    }
+
+    #[test]
     fn workers_empty_and_list() {
         assert_eq!(render_workers_text(&[]), "no workers");
         let text = render_workers_text(&["worker:1".to_string(), "worker:2".to_string()]);
@@ -3649,6 +3677,31 @@ mod tests {
             job_status_payload("p", "k", "r", "a", &job)["job"]["code"],
             "building"
         );
+    }
+
+    #[test]
+    fn job_status_text_strips_terminal_controls_from_details() {
+        // Job detail text is server-authored free text and reaches
+        // the terminal through the job status render.
+        let job = Some(JobStatus {
+            code: "building".to_string(),
+            result: None,
+            details: Some("build\u{1b}[2Jing\u{7}".to_string()),
+            starttime: None,
+            endtime: None,
+            lastduration: None,
+            workerid: None,
+            hostarch: None,
+            uri: None,
+            arch: None,
+            job: None,
+            jobid: None,
+            attempt: None,
+        });
+        let text = render_job_status_text(&job);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{7}'), "text: {text}");
+        assert!(text.contains("details: build[2Jing"), "text: {text}");
     }
 
     #[test]

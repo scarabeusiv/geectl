@@ -234,7 +234,11 @@ pub(crate) fn parse_build_results(body: &str) -> Result<BuildResults, GeectlErro
         let code = required("code")?;
         let state = xml_attr(tag, "state").unwrap_or_else(|| code.clone());
         let dirty = xml_attr(tag, "dirty").as_deref() == Some("true");
-        let details = xml_attr(tag, "details");
+        // Terminal control characters are stripped from the
+        // cell detail text: it is server-authored free text, and it
+        // reaches the terminal through the results render.
+        let details =
+            xml_attr(tag, "details").map(|text| crate::debug::strip_terminal_controls(&text));
         let mut statuses = Vec::new();
         for status_element in xml_elements(content, "status")? {
             let (status_tag, status_content) = xml_split_element(status_element, "status");
@@ -250,7 +254,11 @@ pub(crate) fn parse_build_results(body: &str) -> Result<BuildResults, GeectlErro
                     "unexpected OBS build results response: <status> without code",
                 )
             })?;
-            let details = xml_element_text(status_content, "details");
+            // Same strip as the cell-level details:
+            // package-level detail text is server-authored free
+            // text too.
+            let details = xml_element_text(status_content, "details")
+                .map(|text| crate::debug::strip_terminal_controls(&text));
             statuses.push(PackageBuildStatus {
                 package,
                 code,
@@ -560,7 +568,10 @@ pub(crate) fn parse_job_status(body: &str) -> Result<Option<JobStatus>, GeectlEr
     Ok(Some(JobStatus {
         code,
         result: xml_attr(tag, "result"),
-        details: xml_attr(tag, "details"),
+        // Terminal control characters are stripped from the
+        // detail text: it is server-authored free text, and it
+        // reaches the terminal through the job status render.
+        details: xml_attr(tag, "details").map(|text| crate::debug::strip_terminal_controls(&text)),
         starttime: number("starttime")?,
         endtime: number("endtime")?,
         lastduration: number("lastduration")?,
@@ -4189,6 +4200,34 @@ mod tests {
         assert_eq!(blocked.details.as_deref(), Some("suspendproject"));
         assert!(blocked.dirty);
         assert!(!results_settled(&parsed, None));
+    }
+
+    #[test]
+    fn parse_build_results_strips_terminal_controls_from_details() {
+        // Cell-level and package-level detail text are
+        // server-authored free text: escape sequences, bells, and
+        // bidirectional marks are stripped at the parse, so no
+        // downstream surface can print them.
+        let parsed = parse_build_results(
+            "<resultlist state=\"abc\"><result project=\"p\" repository=\"standard\" arch=\"x86_64\" code=\"broken\" state=\"broken\" details=\"repo\u{1b}[2J broken\"><status package=\"foo\" code=\"failed\"><details>miss\u{7}ing foo\u{202e}</details></status></result></resultlist>",
+        )
+        .unwrap();
+        assert_eq!(parsed.results[0].details.as_deref(), Some("repo[2J broken"));
+        assert_eq!(
+            parsed.results[0].statuses[0].details.as_deref(),
+            Some("missing foo")
+        );
+    }
+
+    #[test]
+    fn parse_job_status_strips_terminal_controls_from_details() {
+        // Job detail text is server-authored free text too.
+        let parsed = parse_job_status(
+            "<jobstatus code=\"building\" details=\"build\u{1b}[2Jing\u{7}\"><workerid>worker:1</workerid></jobstatus>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.details.as_deref(), Some("build[2Jing"));
     }
 
     #[test]
