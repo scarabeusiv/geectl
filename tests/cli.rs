@@ -6534,13 +6534,15 @@ fn pull_request_merge_gitea_live_without_obs_credentials_fails_before_the_merge(
 }
 
 /// A routing stub OBS server for the live Gitea merge-then-forward
-/// whose filing fails: every read answers like
-/// `serve_obs_gitea_merge_forward`, but the create POST answers
-/// 500, so the forward fails after the merge lands. The dry-run
-/// preflight never files, so it verifies the hop and passes —
-/// the failure surfaces only in the live forward.
-fn serve_obs_gitea_merge_forward_create_fails(
+/// with a chosen create outcome and package-search outcome: the
+/// create POST either files (200 with a request id) or fails (500),
+/// and the scmsync package search either finds the one synced
+/// package or finds nothing. Everything else answers like
+/// `serve_obs_gitea_merge_forward`.
+fn serve_obs_gitea_merge_forward_outcomes(
     gitea_addr: std::net::SocketAddr,
+    create_fails: bool,
+    search_finds_package: bool,
 ) -> (
     std::net::SocketAddr,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -6573,82 +6575,25 @@ fn serve_obs_gitea_merge_forward_create_fails(
             let method = parts.next().unwrap_or("");
             let target = parts.next().unwrap_or("");
             let (status, body) = if method == "POST" && target.contains("cmd=create") {
-                (500, "<status code=\"internal_error\" />".to_string())
+                if create_fails {
+                    (500, "<status code=\"internal_error\" />".to_string())
+                } else {
+                    (
+                        200,
+                        "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
+                    )
+                }
             } else if target.contains("/_meta") && target.contains("openSUSE:Factory") {
                 (200, parent_meta.to_string())
             } else if target.contains("/_meta") {
                 (200, candidate_meta.clone())
             } else if target.contains("search/package") {
-                (200, search_xml.to_string())
+                if search_finds_package {
+                    (200, search_xml.to_string())
+                } else {
+                    (200, empty_collection.to_string())
+                }
             } else if target.contains("search/project/id") || target.contains("search/request") {
-                (200, empty_collection.to_string())
-            } else if target.starts_with("/source/") {
-                (200, directory_xml.to_string())
-            } else {
-                (404, "<status code=\"not_found\" />".to_string())
-            };
-            let response = format!(
-                "HTTP/1.1 {status} OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-        }
-    });
-    (addr, seen)
-}
-
-/// A routing stub OBS server for the live Gitea merge-then-forward
-/// with no package synced from the merged repo: the scmsync
-/// package search answers empty, so there is nothing to forward.
-/// Everything else answers like `serve_obs_gitea_merge_forward`.
-fn serve_obs_gitea_merge_forward_no_package(
-    gitea_addr: std::net::SocketAddr,
-) -> (
-    std::net::SocketAddr,
-    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-) {
-    use std::io::Write;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let seen_in_thread = std::sync::Arc::clone(&seen);
-    let candidate_meta = format!(
-        "<package name=\"systemd\" project=\"devel:systemd\"><scmsync>http://{gitea_addr}/pool/systemd#factory</scmsync></package>"
-    );
-    let parent_meta = "<package name=\"systemd\" project=\"openSUSE:Factory\"><devel project=\"devel:systemd\" package=\"systemd\"/></package>";
-    let directory_xml =
-        "<directory><linkinfo project=\"openSUSE:Factory\" package=\"systemd\" /></directory>";
-    let empty_collection = "<collection matches=\"0\"></collection>";
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else {
-                continue;
-            };
-            let request = read_request(&mut stream);
-            let text = String::from_utf8_lossy(&request).into_owned();
-            seen_in_thread
-                .lock()
-                .unwrap()
-                .push(text.lines().next().unwrap_or("").to_string());
-            let mut parts = text.lines().next().unwrap_or("").split_whitespace();
-            let method = parts.next().unwrap_or("");
-            let target = parts.next().unwrap_or("");
-            let (status, body) = if method == "POST" && target.contains("cmd=create") {
-                (
-                    200,
-                    "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
-                )
-            } else if target.contains("/_meta") && target.contains("openSUSE:Factory") {
-                (200, parent_meta.to_string())
-            } else if target.contains("/_meta") {
-                (200, candidate_meta.clone())
-            } else if target.contains("search/package")
-                || target.contains("search/project/id")
-                || target.contains("search/request")
-            {
                 (200, empty_collection.to_string())
             } else if target.starts_with("/source/") {
                 (200, directory_xml.to_string())
@@ -6675,7 +6620,7 @@ fn pull_request_merge_gitea_live_merge_stands_when_the_forward_fails() {
     // forward then fails — the failure is reported with the merge
     // standing, and nothing is filed.
     let (gitea_addr, gitea_seen) = serve_gitea_merge_forward();
-    let (obs_addr, obs_seen) = serve_obs_gitea_merge_forward_create_fails(gitea_addr);
+    let (obs_addr, obs_seen) = serve_obs_gitea_merge_forward_outcomes(gitea_addr, true, true);
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["--live", "pull-request", "merge", "gitea:pool/systemd#7"])
@@ -6724,7 +6669,7 @@ fn pull_request_merge_gitea_live_no_package_forwards_nothing() {
     // No OBS package syncs from the merged repo: the merge lands,
     // the forward reports the hop skipped, and nothing is filed.
     let (gitea_addr, gitea_seen) = serve_gitea_merge_forward();
-    let (obs_addr, obs_seen) = serve_obs_gitea_merge_forward_no_package(gitea_addr);
+    let (obs_addr, obs_seen) = serve_obs_gitea_merge_forward_outcomes(gitea_addr, false, false);
     let dir = TempDir::new();
     let out = geectl_isolated(&dir)
         .args(["--live", "pull-request", "merge", "gitea:pool/systemd#7"])
