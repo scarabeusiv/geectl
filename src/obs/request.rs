@@ -1,4 +1,5 @@
 use super::build_url;
+use super::parse_branch_marker;
 use super::parse_request_id;
 use super::parse_request_ids;
 use super::parse_request_ids_for_action;
@@ -12,6 +13,8 @@ use super::remote::parse_linkinfo;
 use super::valid_obs_name;
 use super::ActionShape;
 use super::ActionTarget;
+use super::DeletePackageOptions;
+use super::DeleteProjectOptions;
 use super::DryRun;
 use super::MaintenanceIncidentPayload;
 use super::ObsClient;
@@ -699,6 +702,68 @@ pub struct ForwardResult {
     pub id: u64,
     /// One outcome per submit action.
     pub actions: Vec<ForwardActionResult>,
+}
+
+/// One step of a branch cleanup: what happened to the home package
+/// or to its test project. A step never fails the accept that
+/// triggered it: a failure is a `Failed` step, reported with the
+/// accept standing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupStep {
+    /// Deleted (live), or planned for deletion (dry-run).
+    Deleted,
+    /// Already gone: the server-side cleanup removed it first, or
+    /// a concurrent cleanup did.
+    AlreadyGone,
+    /// Left in place; the reason says why.
+    Skipped { reason: String },
+    /// A delete was attempted and failed; the reason names the
+    /// failure.
+    Failed { reason: String },
+}
+
+/// The reason for a skip that says nothing on its own: the source
+/// project was never a branch home, so there is nothing to clean up
+/// and nothing to report in text. The payload still records it.
+pub const NO_BRANCH_MARKER_REASON: &str = "no geectl branch marker in the test project description";
+
+impl CleanupStep {
+    /// Whether this step is reported in text: a delete, an
+    /// already-gone, a failure, or a skip with a reason to act on.
+    /// A plain no-marker skip is silent in text — most accepts are
+    /// not branch accepts, and reporting each one would bury the
+    /// accepts that did clean something up. The payload records
+    /// every step either way.
+    pub fn report_in_text(&self) -> bool {
+        match self {
+            CleanupStep::Deleted | CleanupStep::AlreadyGone | CleanupStep::Failed { .. } => true,
+            CleanupStep::Skipped { reason } => reason != NO_BRANCH_MARKER_REASON,
+        }
+    }
+}
+
+/// One submit action's cleanup: what happened to its home package
+/// and its test project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptCleanupOutcome {
+    /// The project the change came from.
+    pub source_project: String,
+    /// The package in the source project.
+    pub source_package: String,
+    /// What happened to the home package.
+    pub package: CleanupStep,
+    /// What happened to the test project.
+    pub project: CleanupStep,
+}
+
+/// The accept-time cleanup of a request: one outcome per distinct
+/// submit source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptCleanup {
+    /// The cleaned-up request's id.
+    pub id: u64,
+    /// One outcome per distinct submit source, in action order.
+    pub outcomes: Vec<AcceptCleanupOutcome>,
 }
 
 /// One submit action's resolved hop: the filing coordinates, or
@@ -3316,6 +3381,225 @@ impl<'a> ObsClient<'a> {
             id: request.id,
             actions,
         })
+    }
+
+    /// Delete the branch home package `project`/`package` and then
+    /// its test project when it holds no other package — the
+    /// package, then the project-if-empty, matching what OBS does
+    /// on accept for a request filed with cleanup. The two steps are
+    /// reported separately, so a deleted package with a kept project
+    /// (other branches still live in it) reads as exactly that. A
+    /// step never errors: a delete failure is a `Failed` step, a
+    /// package or project already gone is `AlreadyGone`. The project
+    /// delete is skipped when the package was not deleted, and when
+    /// other packages still live in the project.
+    ///
+    /// In dry-run both deletes are planned (the plan lines are
+    /// recorded by the delete calls) and the remaining-packages read
+    /// still runs, so the plan names the project delete only when
+    /// the project would be empty after the package delete.
+    pub fn delete_branch_home(
+        &self,
+        project: &str,
+        package: &str,
+        dry_run: &DryRun,
+    ) -> (CleanupStep, CleanupStep) {
+        let package_step = match self.delete_package(
+            project,
+            package,
+            &DeletePackageOptions::default(),
+            dry_run,
+        ) {
+            Ok(()) => CleanupStep::Deleted,
+            Err(err) if err.kind() == ErrorKind::NotFound => CleanupStep::AlreadyGone,
+            Err(err) => CleanupStep::Failed {
+                reason: err.to_string(),
+            },
+        };
+        let project_step = match &package_step {
+            CleanupStep::Deleted | CleanupStep::AlreadyGone => {
+                match self.list_packages(project) {
+                    Ok(packages) if packages.iter().any(|name| name != package) => {
+                        let remaining: Vec<&str> = packages
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|name| *name != package)
+                            .collect();
+                        CleanupStep::Skipped {
+                            reason: format!(
+                                "still holds {}: {}",
+                                remaining.len(),
+                                remaining.join(", ")
+                            ),
+                        }
+                    }
+                    Ok(_) => self.delete_branch_project(project, dry_run),
+                    // The project itself is gone (the server-side
+                    // cleanup removed it): the authenticated delete
+                    // decides, so a hidden-but-existing project is
+                    // never misread as gone from the public listing.
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        self.delete_branch_project(project, dry_run)
+                    }
+                    Err(err) => CleanupStep::Failed {
+                        reason: format!("could not list packages of {project}: {err}"),
+                    },
+                }
+            }
+            _ => CleanupStep::Skipped {
+                reason: "the home package was not deleted".to_string(),
+            },
+        };
+        (package_step, project_step)
+    }
+
+    /// The project half of [`ObsClient::delete_branch_home`]: delete
+    /// `project` (non-recursive — a non-empty project refuses
+    /// client-side), mapping a missing project to `AlreadyGone`.
+    fn delete_branch_project(&self, project: &str, dry_run: &DryRun) -> CleanupStep {
+        match self.delete_project(project, &DeleteProjectOptions::default(), dry_run) {
+            Ok(()) => CleanupStep::Deleted,
+            Err(err) if err.kind() == ErrorKind::NotFound => CleanupStep::AlreadyGone,
+            Err(err) => CleanupStep::Failed {
+                reason: err.to_string(),
+            },
+        }
+    }
+
+    /// Clean up the branch home packages of accepted request `id`:
+    /// for each distinct submit source, read the source project's
+    /// description marker and, when the marker names this fork's
+    /// target, delete the home package and then the test project
+    /// when it holds no other package. The accept stands regardless:
+    /// a per-source failure is a `Failed` step in the result, never
+    /// an error from this call. A source with no marker, an
+    /// unparsable marker, or a marker naming another target is
+    /// left in place and reported — never deleted blindly. A
+    /// project fork (`_project`) has no single home package to
+    /// delete and is left in place.
+    ///
+    /// In dry-run the request is read as it stands (it is not
+    /// accepted yet — the accept is only planned), and the deletes
+    /// are planned, not performed. Live, only an accepted request
+    /// is cleaned up: cleaning up an open request would destroy an
+    /// in-flight branch.
+    pub fn cleanup_accepted_request(
+        &self,
+        id: &str,
+        dry_run: &DryRun,
+    ) -> Result<AcceptCleanup, GeectlError> {
+        let request = self.show_request(id)?;
+        if dry_run.live() && request.state.name != RequestState::Accepted {
+            return Err(GeectlError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "only an accepted request can be cleaned up: request {} is {}",
+                    request.id,
+                    request.state.name.as_str()
+                ),
+            ));
+        }
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut outcomes = Vec::new();
+        for action in &request.actions {
+            let RequestAction::Submit {
+                source_project,
+                source_package,
+                ..
+            } = action
+            else {
+                continue;
+            };
+            let source = (source_project.clone(), source_package.clone());
+            if seen.contains(&source) {
+                continue;
+            }
+            seen.push(source);
+            outcomes.push(self.cleanup_accepted_source(source_project, source_package, dry_run));
+        }
+        Ok(AcceptCleanup {
+            id: request.id,
+            outcomes,
+        })
+    }
+
+    /// Clean up one submit source of an accepted request: gate on
+    /// the source project's description marker, then delete through
+    /// [`ObsClient::delete_branch_home`]. A missing project reads as
+    /// already gone — the server-side cleanup removed it.
+    fn cleanup_accepted_source(
+        &self,
+        project: &str,
+        package: &str,
+        dry_run: &DryRun,
+    ) -> AcceptCleanupOutcome {
+        let not_deleted = || CleanupStep::Skipped {
+            reason: "the home package was not deleted".to_string(),
+        };
+        let (package_step, project_step) = match self.project_meta_authenticated(project) {
+            Ok(meta) => match meta.description.as_deref().map(parse_branch_marker) {
+                Some(Ok(Some(marker))) => {
+                    if marker.target_project != project || marker.target_package != package {
+                        (
+                            CleanupStep::Skipped {
+                                reason: format!(
+                                    "test project marker names {}/{} (fork {}), not {}/{}",
+                                    marker.target_project,
+                                    marker.target_package,
+                                    marker.fork(),
+                                    project,
+                                    package,
+                                ),
+                            },
+                            not_deleted(),
+                        )
+                    } else if package == "_project" {
+                        (
+                            CleanupStep::Skipped {
+                                reason: "project fork: no single home package to delete"
+                                    .to_string(),
+                            },
+                            not_deleted(),
+                        )
+                    } else {
+                        self.delete_branch_home(project, package, dry_run)
+                    }
+                }
+                Some(Ok(None)) => (
+                    CleanupStep::Skipped {
+                        reason: NO_BRANCH_MARKER_REASON.to_string(),
+                    },
+                    not_deleted(),
+                ),
+                Some(Err(reason)) => (
+                    CleanupStep::Skipped {
+                        reason: format!("unparsable geectl branch marker: {reason}"),
+                    },
+                    not_deleted(),
+                ),
+                None => (
+                    CleanupStep::Skipped {
+                        reason: NO_BRANCH_MARKER_REASON.to_string(),
+                    },
+                    not_deleted(),
+                ),
+            },
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                (CleanupStep::AlreadyGone, CleanupStep::AlreadyGone)
+            }
+            Err(err) => (
+                CleanupStep::Failed {
+                    reason: format!("could not read the test project meta: {err}"),
+                },
+                not_deleted(),
+            ),
+        };
+        AcceptCleanupOutcome {
+            source_project: project.to_string(),
+            source_package: package.to_string(),
+            package: package_step,
+            project: project_step,
+        }
     }
 
     /// Forward one package to its link parent: the Gitea-merge
@@ -8536,6 +8820,280 @@ description</description>
             ObsClient::format_budget(std::time::Duration::from_millis(0)),
             "0s"
         );
+    }
+
+    const CLEANUP_SHOW_URL: &str = "https://api.opensuse.org/request/1398492?withhistory=1";
+    const CLEANUP_PROJECT: &str = "home:scarabeus_iv:branches:games";
+    const CLEANUP_PACKAGE: &str = "descent3";
+    const CLEANUP_PACKAGE_URL: &str =
+        "https://api.opensuse.org/source/home:scarabeus_iv:branches:games/descent3";
+    const CLEANUP_PROJECT_URL: &str =
+        "https://api.opensuse.org/source/home:scarabeus_iv:branches:games";
+    const CLEANUP_LIST_URL: &str =
+        "https://api.opensuse.org/public/source/home:scarabeus_iv:branches:games";
+    const CLEANUP_MARKER: &str = "geectl-branch: fork=fbui/descent3#master source=games/descent3 target=home:scarabeus_iv:branches:games/descent3";
+
+    /// An accepted (or, with `state`, open) submit request from
+    /// `source_project`/`source_package` to the `games` project.
+    fn cleanup_request_xml(source_project: &str, source_package: &str, state: &str) -> String {
+        format!(
+            "<request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"{source_project}\" package=\"{source_package}\" /><target project=\"games\" package=\"{source_package}\" /></action><state name=\"{state}\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update descent3 to 2.0</description></request>"
+        )
+    }
+
+    fn cleanup_meta_url(project: &str) -> String {
+        format!("https://api.opensuse.org/source/{project}/_meta")
+    }
+
+    /// A test-project meta carrying `description` (or none).
+    fn cleanup_meta(description: Option<&str>) -> String {
+        match description {
+            Some(description) => format!(
+                "<project name=\"{CLEANUP_PROJECT}\"><title>Branch project for package descent3</title><description>{description}</description></project>"
+            ),
+            None => format!(
+                "<project name=\"{CLEANUP_PROJECT}\"><title>Branch project for package descent3</title></project>"
+            ),
+        }
+    }
+
+    fn cleanup_search_url(project: &str, package: &str) -> String {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        client
+            .package_requests_search_url(project, package)
+            .unwrap()
+    }
+
+    /// The fixture for a marker-bearing source: the accepted request,
+    /// the marker description, and an empty open-requests search.
+    fn cleanup_http(description: &str, state: &str) -> FakeHttp {
+        FakeHttp::new()
+            .with_get(
+                CLEANUP_SHOW_URL,
+                &cleanup_request_xml(CLEANUP_PROJECT, CLEANUP_PACKAGE, state),
+            )
+            .with_get(
+                &cleanup_meta_url(CLEANUP_PROJECT),
+                &cleanup_meta(Some(description)),
+            )
+            .with_get(
+                &cleanup_search_url(CLEANUP_PROJECT, CLEANUP_PACKAGE),
+                "<collection matches=\"0\"></collection>",
+            )
+    }
+
+    fn cleanup_description(marker: &str) -> String {
+        format!("Test project for the master branch of games/descent3\n{marker}")
+    }
+
+    #[test]
+    fn cleanup_accepted_request_deletes_package_then_empty_project() {
+        let http = cleanup_http(&cleanup_description(CLEANUP_MARKER), "accepted")
+            .with_delete(CLEANUP_PACKAGE_URL, "<status code=\"ok\" />")
+            .with_get(CLEANUP_LIST_URL, "<directory></directory>")
+            .with_get(CLEANUP_PROJECT_URL, "<directory></directory>")
+            .with_delete(CLEANUP_PROJECT_URL, "<status code=\"ok\" />");
+        let client = forward_client(&http);
+        let result = client
+            .cleanup_accepted_request("1398492", &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.id, 1398492);
+        assert_eq!(result.outcomes.len(), 1);
+        assert_eq!(result.outcomes[0].source_project, CLEANUP_PROJECT);
+        assert_eq!(result.outcomes[0].source_package, CLEANUP_PACKAGE);
+        assert_eq!(result.outcomes[0].package, CleanupStep::Deleted);
+        assert_eq!(result.outcomes[0].project, CleanupStep::Deleted);
+        let deleted = http.delete_calls();
+        assert_eq!(deleted.len(), 2);
+        assert_eq!(deleted[0].0, CLEANUP_PACKAGE_URL);
+        assert_eq!(deleted[1].0, CLEANUP_PROJECT_URL);
+        assert!(deleted[0].1 && deleted[1].1);
+    }
+
+    #[test]
+    fn cleanup_accepted_request_without_a_marker_deletes_nothing() {
+        let http = FakeHttp::new()
+            .with_get(
+                CLEANUP_SHOW_URL,
+                &cleanup_request_xml(CLEANUP_PROJECT, CLEANUP_PACKAGE, "accepted"),
+            )
+            .with_get(&cleanup_meta_url(CLEANUP_PROJECT), &cleanup_meta(None));
+        let client = forward_client(&http);
+        let result = client
+            .cleanup_accepted_request("1398492", &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.outcomes.len(), 1);
+        assert!(matches!(
+            result.outcomes[0].package,
+            CleanupStep::Skipped { .. }
+        ));
+        assert!(matches!(
+            result.outcomes[0].project,
+            CleanupStep::Skipped { .. }
+        ));
+        assert!(http.delete_calls().is_empty());
+        assert!(http.get_calls().len() == 2);
+    }
+
+    #[test]
+    fn cleanup_accepted_request_with_a_mismatched_marker_deletes_nothing() {
+        let marker = "geectl-branch: fork=fbui/other#master source=games/other target=home:scarabeus_iv:branches:games/other";
+        let http = cleanup_http(&cleanup_description(marker), "accepted");
+        let client = forward_client(&http);
+        let result = client
+            .cleanup_accepted_request("1398492", &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.outcomes.len(), 1);
+        assert!(matches!(
+            result.outcomes[0].package,
+            CleanupStep::Skipped { .. }
+        ));
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn cleanup_accepted_request_with_an_unparsable_marker_deletes_nothing() {
+        let http = cleanup_http(&cleanup_description("geectl-branch: junk"), "accepted");
+        let client = forward_client(&http);
+        let result = client
+            .cleanup_accepted_request("1398492", &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.outcomes.len(), 1);
+        assert!(matches!(
+            result.outcomes[0].package,
+            CleanupStep::Skipped { .. }
+        ));
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn cleanup_accepted_request_with_a_non_empty_project_deletes_the_package_only() {
+        let http = cleanup_http(&cleanup_description(CLEANUP_MARKER), "accepted")
+            .with_delete(CLEANUP_PACKAGE_URL, "<status code=\"ok\" />")
+            .with_get(
+                CLEANUP_LIST_URL,
+                "<directory><entry name=\"other\" /></directory>",
+            );
+        let client = forward_client(&http);
+        let result = client
+            .cleanup_accepted_request("1398492", &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.outcomes[0].package, CleanupStep::Deleted);
+        assert_eq!(
+            result.outcomes[0].project,
+            CleanupStep::Skipped {
+                reason: "still holds 1: other".to_string(),
+            }
+        );
+        let deleted = http.delete_calls();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].0, CLEANUP_PACKAGE_URL);
+    }
+
+    #[test]
+    fn cleanup_accepted_request_dry_run_plans_without_deleting() {
+        let http = cleanup_http(&cleanup_description(CLEANUP_MARKER), "new")
+            .with_get(CLEANUP_LIST_URL, "<directory></directory>");
+        let client = forward_client(&http);
+        let dry_run = DryRun::new(true);
+        let result = client
+            .cleanup_accepted_request("1398492", &dry_run)
+            .unwrap();
+        assert_eq!(result.outcomes.len(), 1);
+        assert_eq!(result.outcomes[0].package, CleanupStep::Deleted);
+        assert_eq!(result.outcomes[0].project, CleanupStep::Deleted);
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: delete package home:scarabeus_iv:branches:games/descent3"
+                    .to_string(),
+                "[dry-run] would: delete project home:scarabeus_iv:branches:games".to_string(),
+            ]
+        );
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn cleanup_accepted_request_reports_a_delete_failure_with_the_accept_standing() {
+        let http = FakeHttp::new()
+            .with_get(
+                CLEANUP_SHOW_URL,
+                &cleanup_request_xml(CLEANUP_PROJECT, CLEANUP_PACKAGE, "accepted"),
+            )
+            .with_get(
+                &cleanup_meta_url(CLEANUP_PROJECT),
+                &cleanup_meta(Some(&cleanup_description(CLEANUP_MARKER))),
+            )
+            .with_get(
+                &cleanup_search_url(CLEANUP_PROJECT, CLEANUP_PACKAGE),
+                "<collection matches=\"1\"><request id=\"1398500\" /></collection>",
+            );
+        let client = forward_client(&http);
+        let result = client
+            .cleanup_accepted_request("1398492", &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.outcomes.len(), 1);
+        assert!(matches!(
+            result.outcomes[0].package,
+            CleanupStep::Failed { .. }
+        ));
+        assert!(matches!(
+            result.outcomes[0].project,
+            CleanupStep::Skipped { .. }
+        ));
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn cleanup_accepted_request_treats_an_already_gone_branch_as_gone() {
+        let http = cleanup_http(&cleanup_description(CLEANUP_MARKER), "accepted")
+            .with_delete_error(CLEANUP_PACKAGE_URL, ErrorKind::NotFound)
+            .with_get(CLEANUP_LIST_URL, "<directory></directory>")
+            .with_get(CLEANUP_PROJECT_URL, "<directory></directory>")
+            .with_delete_error(CLEANUP_PROJECT_URL, ErrorKind::NotFound);
+        let client = forward_client(&http);
+        let result = client
+            .cleanup_accepted_request("1398492", &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.outcomes[0].package, CleanupStep::AlreadyGone);
+        assert_eq!(result.outcomes[0].project, CleanupStep::AlreadyGone);
+    }
+
+    #[test]
+    fn cleanup_accepted_request_leaves_a_project_fork_in_place() {
+        let marker = "geectl-branch: fork=fbui/_ObsPrj#master source=network:messaging:xmpp/_project target=home:scarabeus_iv:branches:games/_project";
+        let http = FakeHttp::new()
+            .with_get(
+                CLEANUP_SHOW_URL,
+                &cleanup_request_xml(CLEANUP_PROJECT, "_project", "accepted"),
+            )
+            .with_get(
+                &cleanup_meta_url(CLEANUP_PROJECT),
+                &cleanup_meta(Some(&cleanup_description(marker))),
+            );
+        let client = forward_client(&http);
+        let result = client
+            .cleanup_accepted_request("1398492", &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.outcomes.len(), 1);
+        assert_eq!(result.outcomes[0].source_package, "_project");
+        assert!(matches!(
+            result.outcomes[0].package,
+            CleanupStep::Skipped { .. }
+        ));
+        assert!(http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn cleanup_accepted_request_refuses_an_open_request_when_live() {
+        let http = cleanup_http(&cleanup_description(CLEANUP_MARKER), "new");
+        let client = forward_client(&http);
+        let err = client
+            .cleanup_accepted_request("1398492", &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(http.delete_calls().is_empty());
     }
 
     #[test]

@@ -420,7 +420,7 @@ fn request_accept_dry_run_text_renders_the_plan() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would change request 42 to accepted; would forward after accept"
+        "dry-run: would change request 42 to accepted; branch cleanup not run; would forward after accept"
     );
 }
 
@@ -486,7 +486,7 @@ fn request_accept_dry_run_with_no_forward_omits_the_forward() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would change request 42 to accepted"
+        "dry-run: would change request 42 to accepted; branch cleanup not run"
     );
 }
 
@@ -1427,6 +1427,22 @@ fn request_supersede_live_shape_carries_ids_and_dry_run_false() {
 /// method and request target. Anything else is a 404. The seen
 /// request lines are recorded so the test can prove the accept
 /// landed before the forward was filed.
+/// What a real OBS returns for a project-meta read: a `<project>`
+/// document. The stubs used to answer package meta for every `/_meta`
+/// URL, which made the accept-time cleanup read a package document
+/// as a project and report a failure; the project carries no branch
+/// marker, so the cleanup skips it.
+const PROJECT_META_XML: &str = "<project name=\"home:scarabeus_iv\"><description>Test project for the master branch of home:scarabeus_iv/foo</description></project>";
+
+/// A project-meta URL carries one path segment between `/source/`
+/// and `/_meta`; a package-meta URL carries two.
+fn is_project_meta_url(target: &str) -> bool {
+    target
+        .strip_prefix("/source/")
+        .and_then(|rest| rest.strip_suffix("/_meta"))
+        .is_some_and(|middle| !middle.contains('/'))
+}
+
 fn serve_accept_forward_live() -> (
     std::net::SocketAddr,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -1463,6 +1479,8 @@ fn serve_accept_forward_live() -> (
                     200,
                     "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
                 )
+            } else if is_project_meta_url(target) {
+                (200, PROJECT_META_XML.to_string())
             } else if target.contains("/_meta") {
                 (200, meta_xml.to_string())
             } else if target.contains("search/project/id") || target.contains("search/request") {
@@ -1587,6 +1605,8 @@ fn serve_accept_forward_refused() -> (
                     200,
                     "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
                 )
+            } else if is_project_meta_url(target) {
+                (200, PROJECT_META_XML.to_string())
             } else if target.contains("/_meta") {
                 (200, meta_xml.to_string())
             } else if target.contains("search/project/id") || target.contains("search/request") {
@@ -1650,6 +1670,8 @@ fn serve_accept_forward_transient_error() -> (
                     200,
                     "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
                 )
+            } else if is_project_meta_url(target) {
+                (200, PROJECT_META_XML.to_string())
             } else if target.contains("/_meta") {
                 (200, meta_xml.to_string())
             } else if target.contains("search/project/id") || target.contains("search/request") {
@@ -1718,6 +1740,8 @@ fn serve_accept_forward_transient_check_error() -> (
                     200,
                     "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
                 )
+            } else if is_project_meta_url(target) {
+                (200, PROJECT_META_XML.to_string())
             } else if target.contains("/_meta") {
                 (500, "<status code=\"internal_error\" />".to_string())
             } else if target.contains("search/project/id") || target.contains("search/request") {
@@ -2076,6 +2100,8 @@ fn serve_merge_no_link_parent() -> (
                     200,
                     "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>".to_string(),
                 )
+            } else if is_project_meta_url(target) {
+                (200, PROJECT_META_XML.to_string())
             } else if target.contains("/_meta") {
                 (200, meta_xml.to_string())
             } else if target.contains("search/project/id") || target.contains("search/request") {
@@ -2196,7 +2222,7 @@ fn pull_request_merge_obs_dry_run_plans_the_forward() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would merge obs:42; would forward after merge"
+        "dry-run: would merge obs:42; branch cleanup not run; would forward after merge"
     );
 }
 
@@ -2287,7 +2313,7 @@ fn request_accept_dry_run_text_echoes_the_comment() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would change request 42 to accepted \u{2014} looks good; would forward after accept"
+        "dry-run: would change request 42 to accepted \u{2014} looks good; branch cleanup not run; would forward after accept"
     );
 }
 

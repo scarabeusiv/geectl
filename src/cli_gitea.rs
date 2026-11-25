@@ -41,8 +41,9 @@ use crate::config::{self, DEFAULT_GITEA_URL};
 use crate::debug::Debug;
 use crate::error::GeectlError;
 use crate::gitea::{
-    require_credentials_for_url, ForkRepoOptions, GiteaBranch, GiteaClient, GiteaRepository,
-    MaintainerInfo, Maintainership, RepoCreateOptions,
+    require_credentials_for_url, CleanupForkEntry, CleanupForkOutcome, CleanupForksResult,
+    ForkRepoOptions, GiteaBranch, GiteaClient, GiteaRepository, MaintainerInfo, Maintainership,
+    RepoCreateOptions,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::DryRun;
@@ -128,6 +129,18 @@ pub enum GiteaCommand {
         owner: String,
         /// The repository name.
         repo: String,
+    },
+    /// List obsolete Gitea forks and their OBS home test projects,
+    /// and delete them. A mutation: dry-run is the default (only the
+    /// plan is printed); `--live` performs the deletion. A project
+    /// is deleted only when its description marker names a fork that
+    /// no longer exists on Gitea; every other project is listed and
+    /// left in place.
+    CleanupForks {
+        /// The OBS user whose `home:<user>:branches:*` projects are
+        /// listed; defaults to the OBS credential username.
+        #[arg(long)]
+        user: Option<String>,
     },
 }
 
@@ -347,6 +360,164 @@ pub fn run_gitea(
         GiteaCommand::Maintainers { owner, repo } => {
             let maintainership = client.maintainership(&owner, &repo)?;
             Ok(maintainers_result(&owner, &repo, &maintainership))
+        }
+        GiteaCommand::CleanupForks { user } => {
+            let result = crate::cli_request::with_client(debug, live, |obs| {
+                client.cleanup_forks(obs, user.as_deref(), &dry_run)
+            })?;
+            let mut payload = cleanup_forks_json(&result, &dry_run);
+            crate::cli_request::add_plan(&mut payload, &dry_run);
+            let mut text = cleanup_forks_text(&result, &dry_run);
+            if dry_run.enabled() {
+                for line in dry_run.plan() {
+                    text.push('\n');
+                    text.push_str(&line);
+                }
+            }
+            Ok((payload, text))
+        }
+    }
+}
+
+/// The `cleanup-forks` result as JSON: the user, one entry per home
+/// branch project, and `dry_run`.
+fn cleanup_forks_json(result: &CleanupForksResult, dry_run: &DryRun) -> Value {
+    json!({
+        "user": result.user,
+        "dry_run": dry_run.enabled(),
+        "projects": result
+            .projects
+            .iter()
+            .map(cleanup_fork_entry_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// One `cleanup-forks` entry as JSON: the project, the marker's
+/// target package when one parsed, the outcome, the fork when the
+/// outcome names one, the reason when the outcome carries one, and
+/// the two cleanup steps when the fork was deleted.
+fn cleanup_fork_entry_json(entry: &CleanupForkEntry) -> Value {
+    let (outcome, fork, reason, fork_obsolete, package_step, project_step) = match &entry.outcome {
+        CleanupForkOutcome::Live { fork } => ("live", Some(fork.as_str()), None, None, None, None),
+        CleanupForkOutcome::Deleted { package, project } => {
+            ("deleted", None, None, None, Some(package), Some(project))
+        }
+        CleanupForkOutcome::Unmarked => ("unmarked", None, None, None, None, None),
+        CleanupForkOutcome::Unparsable { reason } => {
+            ("unparsable", None, Some(reason.as_str()), None, None, None)
+        }
+        CleanupForkOutcome::Mismatch { reason } => {
+            ("mismatch", None, Some(reason.as_str()), None, None, None)
+        }
+        CleanupForkOutcome::ProjectFork {
+            fork,
+            fork_obsolete,
+        } => (
+            "project_fork",
+            Some(fork.as_str()),
+            None,
+            Some(*fork_obsolete),
+            None,
+            None,
+        ),
+        CleanupForkOutcome::ForkCheckFailed { reason } => (
+            "fork_check_failed",
+            None,
+            Some(reason.as_str()),
+            None,
+            None,
+            None,
+        ),
+        CleanupForkOutcome::MetaFailed { reason } => {
+            ("meta_failed", None, Some(reason.as_str()), None, None, None)
+        }
+    };
+    json!({
+        "project": entry.project,
+        "package": entry.package,
+        "outcome": outcome,
+        "fork": fork,
+        "reason": reason,
+        "fork_obsolete": fork_obsolete,
+        "package_cleanup": package_step.map(crate::cli_request::cleanup_step_json),
+        "project_cleanup": project_step.map(crate::cli_request::cleanup_step_json),
+    })
+}
+
+/// The `cleanup-forks` result as text: one header line echoing the
+/// user, then one line per home branch project.
+fn cleanup_forks_text(result: &CleanupForksResult, dry_run: &DryRun) -> String {
+    let body = if result.projects.is_empty() {
+        "no home branch projects".to_string()
+    } else {
+        result
+            .projects
+            .iter()
+            .map(|entry| cleanup_fork_entry_line(entry, dry_run))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    with_header(&format!("user: {}", result.user), body)
+}
+
+/// One `cleanup-forks` entry as a text line.
+fn cleanup_fork_entry_line(entry: &CleanupForkEntry, dry_run: &DryRun) -> String {
+    match &entry.outcome {
+        CleanupForkOutcome::Live { fork } => {
+            format!("{}: fork {fork} still exists; kept", entry.project)
+        }
+        CleanupForkOutcome::Deleted { package, project } => {
+            crate::cli_request::branch_cleanup_line(
+                &entry.project,
+                entry.package.as_deref().unwrap_or("?"),
+                package,
+                project,
+                dry_run,
+            )
+        }
+        CleanupForkOutcome::Unmarked => {
+            format!("{}: no geectl branch marker; left in place", entry.project)
+        }
+        CleanupForkOutcome::Unparsable { reason } => {
+            format!(
+                "{}: unparsable geectl branch marker: {reason}; left in place",
+                entry.project
+            )
+        }
+        CleanupForkOutcome::Mismatch { reason } => {
+            format!(
+                "{}: marker names another target: {reason}; left in place",
+                entry.project
+            )
+        }
+        CleanupForkOutcome::ProjectFork {
+            fork,
+            fork_obsolete,
+        } => {
+            if *fork_obsolete {
+                format!(
+                    "{}: project fork {fork} is obsolete; delete its packages by hand",
+                    entry.project
+                )
+            } else {
+                format!(
+                    "{}: project fork {fork} still exists; left in place",
+                    entry.project
+                )
+            }
+        }
+        CleanupForkOutcome::ForkCheckFailed { reason } => {
+            format!(
+                "{}: could not check the fork: {reason}; left in place",
+                entry.project
+            )
+        }
+        CleanupForkOutcome::MetaFailed { reason } => {
+            format!(
+                "{}: could not read the project meta: {reason}; left in place",
+                entry.project
+            )
         }
     }
 }
@@ -870,6 +1041,20 @@ mod tests {
     fn unknown_gitea_command_fails_to_parse() {
         assert!(Cli::try_parse_from(["geectl", "gitea", "frobnicate"]).is_err());
         assert!(Cli::try_parse_from(["geectl", "gitea", "repo-get", "only-one"]).is_err());
+    }
+
+    #[test]
+    fn cleanup_forks_parses() {
+        assert!(matches!(
+            parse(&["geectl", "gitea", "cleanup-forks"]),
+            GiteaCommand::CleanupForks { user: None }
+        ));
+        assert!(matches!(
+            parse(&["geectl", "gitea", "cleanup-forks", "--user", "fbui"]),
+            GiteaCommand::CleanupForks {
+                user: Some(user)
+            } if user == "fbui"
+        ));
     }
 
     fn sample_repository() -> GiteaRepository {

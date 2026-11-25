@@ -6268,9 +6268,11 @@ fn pull_request_merge_obs_text_dry_run_without_credentials_prints_plan() {
         .output()
         .unwrap();
     assert!(out.status.success());
+    // The accept-time branch cleanup cannot read the request without
+    // credentials, so it reports instead of planning the deletes.
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "dry-run: would merge obs:123; would forward after merge"
+        "dry-run: would merge obs:123; branch cleanup not run; would forward after merge"
     );
 }
 

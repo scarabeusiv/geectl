@@ -2727,6 +2727,17 @@ _arguments "${_arguments_options[@]}" : \
 ':repo -- The repository name:_default' \
 && ret=0
 ;;
+(cleanup-forks)
+_arguments "${_arguments_options[@]}" : \
+'--user=[The OBS user whose \`home\:<user>\:branches\:*\` projects are listed; defaults to the OBS credential username]:USER:_default' \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_geectl__subcmd__gitea__subcmd__help_commands" \
@@ -2776,6 +2787,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (maintainers)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(cleanup-forks)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -4123,6 +4138,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(cleanup-forks)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -4914,6 +4933,7 @@ _geectl__subcmd__gitea_commands() {
 'branch-get:Show one branch\: name, head commit, protection' \
 'branch-head:Print the head commit SHA of a branch. Content command\: the text IS the SHA, with no header' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
+'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl gitea commands' commands "$@"
@@ -4933,6 +4953,11 @@ _geectl__subcmd__gitea__subcmd__branch-list_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea branch-list commands' commands "$@"
 }
+(( $+functions[_geectl__subcmd__gitea__subcmd__cleanup-forks_commands] )) ||
+_geectl__subcmd__gitea__subcmd__cleanup-forks_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea cleanup-forks commands' commands "$@"
+}
 (( $+functions[_geectl__subcmd__gitea__subcmd__help_commands] )) ||
 _geectl__subcmd__gitea__subcmd__help_commands() {
     local commands; commands=(
@@ -4946,6 +4971,7 @@ _geectl__subcmd__gitea__subcmd__help_commands() {
 'branch-get:Show one branch\: name, head commit, protection' \
 'branch-head:Print the head commit SHA of a branch. Content command\: the text IS the SHA, with no header' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
+'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl gitea help commands' commands "$@"
@@ -4964,6 +4990,11 @@ _geectl__subcmd__gitea__subcmd__help__subcmd__branch-head_commands() {
 _geectl__subcmd__gitea__subcmd__help__subcmd__branch-list_commands() {
     local commands; commands=()
     _describe -t commands 'geectl gitea help branch-list commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__cleanup-forks_commands] )) ||
+_geectl__subcmd__gitea__subcmd__help__subcmd__cleanup-forks_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl gitea help cleanup-forks commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__gitea__subcmd__help__subcmd__help_commands] )) ||
 _geectl__subcmd__gitea__subcmd__help__subcmd__help_commands() {
@@ -5350,6 +5381,7 @@ _geectl__subcmd__help__subcmd__gitea_commands() {
 'branch-get:Show one branch\: name, head commit, protection' \
 'branch-head:Print the head commit SHA of a branch. Content command\: the text IS the SHA, with no header' \
 'maintainers:Show the maintainers recorded in a git project'\''s \`_maintainership.json\`\: the project maintainers and the per-package maintainers. The git-side counterpart of \`remote maintainers\`, read from the repo'\''s default branch' \
+'cleanup-forks:List obsolete Gitea forks and their OBS home test projects, and delete them. A mutation\: dry-run is the default (only the plan is printed); \`--live\` performs the deletion. A project is deleted only when its description marker names a fork that no longer exists on Gitea; every other project is listed and left in place' \
     )
     _describe -t commands 'geectl help gitea commands' commands "$@"
 }
@@ -5367,6 +5399,11 @@ _geectl__subcmd__help__subcmd__gitea__subcmd__branch-head_commands() {
 _geectl__subcmd__help__subcmd__gitea__subcmd__branch-list_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help gitea branch-list commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__cleanup-forks_commands] )) ||
+_geectl__subcmd__help__subcmd__gitea__subcmd__cleanup-forks_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help gitea cleanup-forks commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__gitea__subcmd__maintainers_commands] )) ||
 _geectl__subcmd__help__subcmd__gitea__subcmd__maintainers_commands() {

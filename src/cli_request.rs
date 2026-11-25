@@ -63,10 +63,11 @@ use crate::debug::{strip_terminal_controls, Debug};
 use crate::error::{ErrorKind, GeectlError};
 use crate::http::{HttpClient, Timeout, UreqClient};
 use crate::obs::{
-    AcceptInfo, AddRolePayload, ChangeDevelPayload, CveId, DeletePayload, DeleteTarget, DryRun,
-    FiledRequest, ForwardActionResult, ForwardResult, MaintenanceIncidentPayload, ObsClient,
-    Request, RequestAction, RequestComment, RequestHistory, RequestReview, RequestSearch,
-    RequestState, RequestStateInfo, ReviewState, ReviewTarget, SrFiling, SrPayload, OBS_API_BASE,
+    AcceptCleanup, AcceptInfo, AddRolePayload, ChangeDevelPayload, CleanupStep, CveId,
+    DeletePayload, DeleteTarget, DryRun, FiledRequest, ForwardActionResult, ForwardResult,
+    MaintenanceIncidentPayload, ObsClient, Request, RequestAction, RequestComment, RequestHistory,
+    RequestReview, RequestSearch, RequestState, RequestStateInfo, ReviewState, ReviewTarget,
+    SrFiling, SrPayload, OBS_API_BASE,
 };
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -1435,7 +1436,7 @@ fn file_maintenance_incident_text(
 /// is a dry run. A live run's plan is empty by construction (the
 /// library records plan lines only when dry-run is enabled), so the
 /// field is omitted there.
-fn add_plan(payload: &mut Value, dry_run: &DryRun) {
+pub(crate) fn add_plan(payload: &mut Value, dry_run: &DryRun) {
     if dry_run.enabled() {
         if let Value::Object(map) = payload {
             map.insert(
@@ -1524,6 +1525,16 @@ fn accept(
         live,
         "accepted",
     )?;
+    // The accept landed (or, in dry-run, is planned): clean up the
+    // branch home packages it merged, through the shared helper.
+    // A cleanup that cannot run is reported, never an error here.
+    let (cleanup_payload, cleanup_text) = accept_cleanup(debug, id, live);
+    if let Value::Object(map) = &mut payload {
+        map.insert("cleanup".to_string(), cleanup_payload);
+    }
+    if !cleanup_text.is_empty() {
+        text.push_str(&format!("; {cleanup_text}"));
+    }
     if no_forward {
         return Ok((payload, text));
     }
@@ -1555,6 +1566,155 @@ fn accept(
     }
     text.push_str(&format!("; {forward_text}"));
     Ok((payload, text))
+}
+
+/// Run the accept-time branch cleanup for request `id` and render
+/// it as payload and text. The accept stands regardless: a cleanup
+/// that cannot run at all (the request cannot be read, no
+/// credentials in dry-run) is reported as a payload with an `error`
+/// and a one-line text, never an error from this call.
+pub(crate) fn accept_cleanup(debug: &Debug, id: &str, live: bool) -> (Value, String) {
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    match with_client(debug, live, |client| {
+        client.cleanup_accepted_request(id, &dry_run)
+    }) {
+        Ok(cleanup) => (
+            accept_cleanup_json(&cleanup, &dry_run),
+            accept_cleanup_text(&cleanup, &dry_run),
+        ),
+        Err(err) => (
+            json!({
+                "id": request_id_json(id),
+                "dry_run": dry_run.enabled(),
+                "outcomes": [],
+                "error": err.to_string(),
+            }),
+            "branch cleanup not run".to_string(),
+        ),
+    }
+}
+
+/// The accept-time cleanup as JSON: the request id, one outcome per
+/// submit source, and the dry-run plan when dry-running.
+fn accept_cleanup_json(cleanup: &AcceptCleanup, dry_run: &DryRun) -> Value {
+    let mut payload = json!({
+        "id": cleanup.id,
+        "dry_run": dry_run.enabled(),
+        "outcomes": cleanup
+            .outcomes
+            .iter()
+            .map(|outcome| json!({
+                "source": format!("{}/{}", outcome.source_project, outcome.source_package),
+                "package": cleanup_step_json(&outcome.package),
+                "project": cleanup_step_json(&outcome.project),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    add_plan(&mut payload, dry_run);
+    payload
+}
+
+/// One cleanup step as JSON: the outcome and the reason when the
+/// step was skipped or failed.
+pub(crate) fn cleanup_step_json(step: &CleanupStep) -> Value {
+    match step {
+        CleanupStep::Deleted => json!({"outcome": "deleted", "reason": Value::Null}),
+        CleanupStep::AlreadyGone => json!({"outcome": "already_gone", "reason": Value::Null}),
+        CleanupStep::Skipped { reason } => json!({"outcome": "skipped", "reason": reason}),
+        CleanupStep::Failed { reason } => json!({"outcome": "failed", "reason": reason}),
+    }
+}
+
+/// The accept-time cleanup as text: one header line, then one line
+/// per submit source with something to report. Silent when every
+/// source was a plain no-marker skip — most accepts are not branch
+/// accepts — and when the request had no submit actions at all. The
+/// payload records every outcome either way.
+fn accept_cleanup_text(cleanup: &AcceptCleanup, dry_run: &DryRun) -> String {
+    let reportable: Vec<_> = cleanup
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.package.report_in_text())
+        .collect();
+    if reportable.is_empty() {
+        return String::new();
+    }
+    let mut text = if dry_run.enabled() {
+        "dry-run: branch cleanup:".to_string()
+    } else {
+        "branch cleanup:".to_string()
+    };
+    for outcome in reportable {
+        text.push('\n');
+        text.push_str(&branch_cleanup_line(
+            &outcome.source_project,
+            &outcome.source_package,
+            &outcome.package,
+            &outcome.project,
+            dry_run,
+        ));
+    }
+    text
+}
+
+/// One branch-cleanup outcome as a text line: what happened to the
+/// home package and its test project. Shared by the accept-time
+/// cleanup and `gitea cleanup-forks`: the same outcome renders the
+/// same line in both.
+pub(crate) fn branch_cleanup_line(
+    project: &str,
+    package: &str,
+    package_step: &CleanupStep,
+    project_step: &CleanupStep,
+    dry_run: &DryRun,
+) -> String {
+    let delete = if dry_run.enabled() {
+        "would delete"
+    } else {
+        "deleted"
+    };
+    match (package_step, project_step) {
+        (CleanupStep::Deleted, CleanupStep::Deleted) => {
+            format!("{delete} home package {project}/{package} and test project {project}")
+        }
+        (CleanupStep::Deleted, CleanupStep::AlreadyGone) => {
+            format!("{delete} home package {project}/{package}; test project {project} was already gone")
+        }
+        (CleanupStep::Deleted, CleanupStep::Skipped { reason }) => {
+            format!(
+                "{delete} home package {project}/{package}; test project {project} left in place: {reason}"
+            )
+        }
+        (CleanupStep::Deleted, CleanupStep::Failed { reason }) => {
+            format!(
+                "{delete} home package {project}/{package}; could not delete test project {project}: {reason}"
+            )
+        }
+        (CleanupStep::AlreadyGone, CleanupStep::Deleted) => {
+            format!(
+                "home package {project}/{package} was already gone; {delete} test project {project}"
+            )
+        }
+        (CleanupStep::AlreadyGone, CleanupStep::AlreadyGone) => {
+            format!("home package {project}/{package} and test project {project} were already gone")
+        }
+        (CleanupStep::AlreadyGone, CleanupStep::Skipped { reason }) => {
+            format!(
+                "home package {project}/{package} was already gone; test project {project} left in place: {reason}"
+            )
+        }
+        (CleanupStep::AlreadyGone, CleanupStep::Failed { reason }) => {
+            format!(
+                "home package {project}/{package} was already gone; could not delete test project {project}: {reason}"
+            )
+        }
+        (CleanupStep::Skipped { reason }, _) => {
+            format!("kept home package {project}/{package}: {reason}")
+        }
+        (CleanupStep::Failed { reason }, _) => {
+            format!("could not delete home package {project}/{package}: {reason}")
+        }
+    }
 }
 
 /// Forward an accepted submit request: resolve each submit action's
@@ -1731,7 +1891,7 @@ pub(crate) fn forward_action_text(action: &ForwardActionResult, dry_run: &DryRun
 /// A live run — and every
 /// read, which is always live — still resolves credentials up front,
 /// so a misconfiguration fails fast with the precise error.
-fn with_client<T>(
+pub(crate) fn with_client<T>(
     debug: &Debug,
     live: bool,
     f: impl FnOnce(&ObsClient) -> Result<T, GeectlError>,

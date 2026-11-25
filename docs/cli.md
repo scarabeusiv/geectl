@@ -304,6 +304,7 @@ without evaluating trust.
 - `geectl gitea branch-get <OWNER> <REPO> <BRANCH>` — Show one branch: name, head commit, protection.
 - `geectl gitea branch-head <OWNER> <REPO> <BRANCH>` — Print the head commit SHA of a branch.
 - `geectl gitea maintainers <OWNER> <REPO>` — Show the maintainers recorded in a git project's `_maintainership.json`: the project maintainers and the per-package maintainers.
+- `geectl gitea cleanup-forks` — List obsolete Gitea forks and their OBS home test projects, and delete them; key flags: --user <USER>
 
 ## `pull-request` — unified pull-request read and act
 

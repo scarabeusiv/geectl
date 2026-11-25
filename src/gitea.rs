@@ -45,8 +45,12 @@ use crate::http::is_loopback_url;
 use crate::http::HttpClient;
 use crate::obs::build_url;
 use crate::obs::common::is_bare_authority;
+use crate::obs::format_branch_marker;
+use crate::obs::parse_branch_marker;
 use crate::obs::valid_obs_name;
+use crate::obs::BranchMarker;
 use crate::obs::BuildResults;
+use crate::obs::CleanupStep;
 use crate::obs::DeleteProjectOptions;
 use crate::obs::DryRun;
 use crate::obs::ObsClient;
@@ -233,6 +237,59 @@ pub enum FirstBuild {
     /// alongside it — with the read error — instead of failing the
     /// branch on a read the build itself never produced.
     Unreadable(String),
+}
+
+/// One `home:<user>:branches:*` project in a `cleanup-forks` run:
+/// the project and what happened to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupForkEntry {
+    /// The home test project.
+    pub project: String,
+    /// The marker's target package, when the project carries a
+    /// parsed marker.
+    pub package: Option<String>,
+    /// What happened to the project.
+    pub outcome: CleanupForkOutcome,
+}
+
+/// What `cleanup-forks` did with one home test project. A project
+/// is deleted only when its marker names a fork that no longer
+/// exists on Gitea; every other shape is listed and left in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupForkOutcome {
+    /// The fork still exists; kept.
+    Live { fork: String },
+    /// The fork is gone; the home package and the test project were
+    /// cleaned up through the shared branch-home delete.
+    Deleted {
+        package: CleanupStep,
+        project: CleanupStep,
+    },
+    /// No marker line in the description; never deleted.
+    Unmarked,
+    /// A marker line is present but unparsable; never deleted.
+    Unparsable { reason: String },
+    /// The marker names another test project; never deleted.
+    Mismatch { reason: String },
+    /// The marker names a project fork (`_project`): no single home
+    /// package to delete. `fork_obsolete` says whether the fork is
+    /// still on Gitea; an obsolete project fork still needs its
+    /// packages deleted by hand.
+    ProjectFork { fork: String, fork_obsolete: bool },
+    /// The fork existence check failed; never deleted.
+    ForkCheckFailed { reason: String },
+    /// The project meta read failed; never deleted.
+    MetaFailed { reason: String },
+}
+
+/// The `cleanup-forks` result: the user whose branch projects were
+/// listed, and one entry per `home:<user>:branches:*` project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupForksResult {
+    /// The OBS user whose branch projects were listed.
+    pub user: String,
+    /// One entry per listed project, in project order.
+    pub projects: Vec<CleanupForkEntry>,
 }
 
 /// The body of `POST /api/v1/repos/{owner}/{repo}/forks`: both
@@ -3701,6 +3758,27 @@ impl<'a> GiteaClient<'a> {
                         ),
                     )
                 };
+                // The marker line records this fork in the test
+                // project's description, under the human text: the
+                // record accept-time cleanup and `cleanup-forks`
+                // read back. The target package is the requested
+                // one — the explicit target, else the source package
+                // name — the same name the fork that follows
+                // creates. A project the branch only reuses keeps
+                // the marker its creation wrote.
+                let marker = format_branch_marker(&BranchMarker {
+                    fork_owner: fork.owner.login.clone(),
+                    fork_repo: fork.name.clone(),
+                    fork_branch: source_branch.clone(),
+                    source_project: source_project.clone(),
+                    source_package: source_package.clone(),
+                    target_project: target.clone(),
+                    target_package: options
+                        .target_package
+                        .clone()
+                        .unwrap_or_else(|| source_package.clone()),
+                });
+                let description = format!("{description}\n{marker}");
                 self.ensure_branch_target_project(obs, target, &title, &description, dry_run)?
             }
             None => false,
@@ -3807,6 +3885,149 @@ impl<'a> GiteaClient<'a> {
             ssh_url: fork.ssh_url,
             first_build,
         }))
+    }
+
+    /// List the obsolete Gitea forks and their OBS home test
+    /// projects, and delete them: for every
+    /// `home:<user>:branches:*` project, read its description
+    /// marker and check the fork it names still exists on Gitea (a
+    /// 404 means the fork is gone). A project whose fork is gone is
+    /// cleaned up through [`ObsClient::delete_branch_home`] — the
+    /// home package, then the test project when it holds no other
+    /// package. Every other project is listed and left in place: a
+    /// live fork, a project with no marker, an unparsable marker, a
+    /// marker naming another target, a project fork, or a fork whose
+    /// existence could not be checked. No background scanning: this
+    /// runs only when the user or the agent asks for it, and orphans
+    /// it cannot reach stay for OBS auto-clean.
+    ///
+    /// `user` is the OBS user whose branch projects are listed; when
+    /// unset it comes from the OBS credentials. A Bearer <redacted>
+    /// carries no username, so the caller passes one. In dry-run the
+    /// deletes are planned, not performed, but the fork checks still
+    /// run — the plan cannot name the obsolete forks without them.
+    pub fn cleanup_forks(
+        &self,
+        obs: &ObsClient,
+        user: Option<&str>,
+        dry_run: &DryRun,
+    ) -> Result<CleanupForksResult, GeectlError> {
+        let user = match user {
+            Some(user) => {
+                if !valid_obs_name(user) {
+                    return Err(GeectlError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid OBS username: {user:?}"),
+                    ));
+                }
+                user.to_string()
+            }
+            None => obs
+                .credentials()
+                .username()
+                .ok_or_else(|| {
+                    GeectlError::new(
+                        ErrorKind::ConfigError,
+                        "cleanup-forks needs an OBS username (GEECTL_OBS_USERNAME, or --user): a Bearer <redacted> carries none",
+                    )
+                })?
+                .to_string(),
+        };
+        let prefix = format!("home:{user}:branches:");
+        let mut projects = Vec::new();
+        for project in obs.list_projects()? {
+            if !project.starts_with(&prefix) {
+                continue;
+            }
+            projects.push(self.cleanup_fork_entry(obs, &project, dry_run));
+        }
+        Ok(CleanupForksResult { user, projects })
+    }
+
+    /// One `cleanup-forks` entry: read the project's marker, check
+    /// the fork it names, and delete only when the fork is gone.
+    fn cleanup_fork_entry(
+        &self,
+        obs: &ObsClient,
+        project: &str,
+        dry_run: &DryRun,
+    ) -> CleanupForkEntry {
+        let (package, outcome) = match obs.project_meta_authenticated(project) {
+            Ok(meta) => match meta.description.as_deref().map(parse_branch_marker) {
+                Some(Ok(Some(marker))) => {
+                    let package = Some(marker.target_package.clone());
+                    let outcome = if marker.target_project != project {
+                        CleanupForkOutcome::Mismatch {
+                            reason: format!(
+                                "marker names target {}/{}",
+                                marker.target_project, marker.target_package
+                            ),
+                        }
+                    } else {
+                        self.cleanup_fork_marker(obs, project, &marker, dry_run)
+                    };
+                    (package, outcome)
+                }
+                Some(Ok(None)) => (None, CleanupForkOutcome::Unmarked),
+                Some(Err(reason)) => (None, CleanupForkOutcome::Unparsable { reason }),
+                None => (None, CleanupForkOutcome::Unmarked),
+            },
+            Err(err) => (
+                None,
+                CleanupForkOutcome::MetaFailed {
+                    reason: err.to_string(),
+                },
+            ),
+        };
+        CleanupForkEntry {
+            project: project.to_string(),
+            package,
+            outcome,
+        }
+    }
+
+    /// The fork check and delete for a project whose marker parsed
+    /// and names this project: a live fork is kept, a gone fork is
+    /// cleaned up, a project fork is reported (it has no single home
+    /// package to delete).
+    fn cleanup_fork_marker(
+        &self,
+        obs: &ObsClient,
+        project: &str,
+        marker: &BranchMarker,
+        dry_run: &DryRun,
+    ) -> CleanupForkOutcome {
+        if marker.target_package == "_project" {
+            return match self.repo_get(&marker.fork_owner, &marker.fork_repo) {
+                Ok(_) => CleanupForkOutcome::ProjectFork {
+                    fork: marker.fork(),
+                    fork_obsolete: false,
+                },
+                Err(err) if err.kind() == ErrorKind::NotFound => CleanupForkOutcome::ProjectFork {
+                    fork: marker.fork(),
+                    fork_obsolete: true,
+                },
+                Err(err) => CleanupForkOutcome::ForkCheckFailed {
+                    reason: err.to_string(),
+                },
+            };
+        }
+        match self.repo_get(&marker.fork_owner, &marker.fork_repo) {
+            Ok(_) => CleanupForkOutcome::Live {
+                fork: marker.fork(),
+            },
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                let (package, project_step) =
+                    obs.delete_branch_home(project, &marker.target_package, dry_run);
+                CleanupForkOutcome::Deleted {
+                    package,
+                    project: project_step,
+                }
+            }
+            Err(err) => CleanupForkOutcome::ForkCheckFailed {
+                reason: err.to_string(),
+            },
+        }
     }
 
     /// Ensure the branch target project `target` exists, generating
@@ -8941,7 +9162,7 @@ mod tests {
             obs_http.put_calls(),
             vec![(
                 "https://api.opensuse.org/source/home:fbui:test:descent3/_meta".to_string(),
-                "<project name=\"home:fbui:test:descent3\"><title>Branch project for package descent3</title><description>Test project for the master branch of games/descent3</description></project>".to_string(),
+                "<project name=\"home:fbui:test:descent3\"><title>Branch project for package descent3</title><description>Test project for the master branch of games/descent3\ngeectl-branch: fork=fbui/descent3#master source=games/descent3 target=home:fbui:test:descent3/descent3</description></project>".to_string(),
                 true,
             )]
         );
@@ -10434,7 +10655,7 @@ mod tests {
             vec![(
                 "https://api.opensuse.org/source/home:scarabeus_iv:branches:games/_meta"
                     .to_string(),
-                "<project name=\"home:scarabeus_iv:branches:games\"><title>Branch project for package descent3</title><description>Test project for the master branch of games/descent3</description></project>".to_string(),
+                "<project name=\"home:scarabeus_iv:branches:games\"><title>Branch project for package descent3</title><description>Test project for the master branch of games/descent3\ngeectl-branch: fork=scarabeus_iv/descent3#master source=games/descent3 target=home:scarabeus_iv:branches:games/descent3</description></project>".to_string(),
                 true,
             )]
         );
@@ -10785,7 +11006,7 @@ mod tests {
             obs_http.put_calls(),
             vec![(
                 "https://api.opensuse.org/source/home:fbui:test:xmpp/_meta".to_string(),
-                "<project name=\"home:fbui:test:xmpp\"><title>Branch project for project network:messaging:xmpp</title><description>Test project for the master branch of project network:messaging:xmpp</description></project>".to_string(),
+                "<project name=\"home:fbui:test:xmpp\"><title>Branch project for project network:messaging:xmpp</title><description>Test project for the master branch of project network:messaging:xmpp\ngeectl-branch: fork=fbui/_ObsPrj#master source=network:messaging:xmpp/_project target=home:fbui:test:xmpp/_project</description></project>".to_string(),
                 true,
             )]
         );
@@ -12988,6 +13209,300 @@ mod tests {
         );
         assert!(http.get_calls().is_empty());
         assert!(http.delete_calls().is_empty());
+    }
+
+    const CLEANUP_LIST_URL: &str = "https://api.opensuse.org/source";
+    const CLEANUP_GAMES_PROJECT: &str = "home:scarabeus_iv:branches:games";
+    const CLEANUP_GAMES_MARKER: &str = "geectl-branch: fork=fbui/descent3#master source=games/descent3 target=home:scarabeus_iv:branches:games/descent3";
+    const CLEANUP_SCIENCE_PROJECT: &str = "home:scarabeus_iv:branches:science";
+    const CLEANUP_SCIENCE_MARKER: &str = "geectl-branch: fork=adamm/gsl#factory source=science/gsl target=home:scarabeus_iv:branches:science/gsl";
+
+    /// A branch test-project meta carrying `description`.
+    fn branch_project_meta(project: &str, description: &str) -> String {
+        format!(
+            "<project name=\"{project}\"><title>Branch project</title><description>{description}</description></project>"
+        )
+    }
+
+    fn cleanup_fork_description(marker: &str) -> String {
+        format!("Test project\n{marker}")
+    }
+
+    fn cleanup_fork_meta_url(project: &str) -> String {
+        format!("https://api.opensuse.org/source/{project}/_meta")
+    }
+
+    fn cleanup_fork_search_url(project: &str, package: &str) -> String {
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        client
+            .package_requests_search_url(project, package)
+            .unwrap()
+    }
+
+    /// The project listing for the cleanup-forks tests: two branch
+    /// projects plus a home project and a distro project, which the
+    /// prefix filter drops.
+    fn cleanup_list_body() -> String {
+        "<directory><entry name=\"home:scarabeus_iv:branches:games\"/><entry name=\"home:scarabeus_iv:branches:science\"/><entry name=\"home:scarabeus_iv\"/><entry name=\"openSUSE:Factory\"/></directory>"
+            .to_string()
+    }
+
+    /// The OBS half of an obsolete-fork delete: the open-requests
+    /// search, the package DELETE, the empty listing, and the
+    /// project DELETE.
+    fn cleanup_delete_fixture(http: FakeHttp) -> FakeHttp {
+        http.with_get(
+            &cleanup_fork_search_url(CLEANUP_GAMES_PROJECT, "descent3"),
+            "<collection matches=\"0\"></collection>",
+        )
+        .with_delete(
+            "https://api.opensuse.org/source/home:scarabeus_iv:branches:games/descent3",
+            "<status code=\"ok\" />",
+        )
+        .with_get(
+            "https://api.opensuse.org/public/source/home:scarabeus_iv:branches:games",
+            "<directory></directory>",
+        )
+        .with_get(
+            "https://api.opensuse.org/source/home:scarabeus_iv:branches:games",
+            "<directory></directory>",
+        )
+        .with_delete(
+            "https://api.opensuse.org/source/home:scarabeus_iv:branches:games",
+            "<status code=\"ok\" />",
+        )
+    }
+
+    #[test]
+    fn cleanup_forks_deletes_obsolete_forks_and_keeps_live_ones() {
+        let gitea_http = FakeHttp::new()
+            .with_get_error(
+                "https://src.opensuse.org/api/v1/repos/fbui/descent3",
+                ErrorKind::NotFound,
+            )
+            .with_get(
+                "https://src.opensuse.org/api/v1/repos/adamm/gsl",
+                &repo_json_branch("adamm", "gsl", Some(("pool", "gsl")), "factory", false),
+            );
+        let obs_http = cleanup_delete_fixture(
+            FakeHttp::new()
+                .with_get(CLEANUP_LIST_URL, &cleanup_list_body())
+                .with_get(
+                    &cleanup_fork_meta_url(CLEANUP_GAMES_PROJECT),
+                    &branch_project_meta(
+                        CLEANUP_GAMES_PROJECT,
+                        &cleanup_fork_description(CLEANUP_GAMES_MARKER),
+                    ),
+                )
+                .with_get(
+                    &cleanup_fork_meta_url(CLEANUP_SCIENCE_PROJECT),
+                    &branch_project_meta(
+                        CLEANUP_SCIENCE_PROJECT,
+                        &cleanup_fork_description(CLEANUP_SCIENCE_MARKER),
+                    ),
+                ),
+        );
+        let result = client(&gitea_http)
+            .cleanup_forks(&obs_client(&obs_http), None, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.user, "scarabeus_iv");
+        assert_eq!(result.projects.len(), 2);
+        assert_eq!(result.projects[0].project, CLEANUP_GAMES_PROJECT);
+        assert_eq!(result.projects[0].package.as_deref(), Some("descent3"));
+        assert_eq!(
+            result.projects[0].outcome,
+            CleanupForkOutcome::Deleted {
+                package: CleanupStep::Deleted,
+                project: CleanupStep::Deleted,
+            }
+        );
+        assert_eq!(result.projects[1].project, CLEANUP_SCIENCE_PROJECT);
+        assert_eq!(
+            result.projects[1].outcome,
+            CleanupForkOutcome::Live {
+                fork: "adamm/gsl#factory".to_string(),
+            }
+        );
+        let deleted = obs_http.delete_calls();
+        assert_eq!(deleted.len(), 2);
+        assert_eq!(
+            deleted[0].0,
+            "https://api.opensuse.org/source/home:scarabeus_iv:branches:games/descent3"
+        );
+        assert_eq!(
+            deleted[1].0,
+            "https://api.opensuse.org/source/home:scarabeus_iv:branches:games"
+        );
+    }
+
+    #[test]
+    fn cleanup_forks_reports_unmarked_and_unparsable_without_deleting() {
+        let gitea_http = FakeHttp::new();
+        let obs_http = FakeHttp::new()
+            .with_get(CLEANUP_LIST_URL, &cleanup_list_body())
+            .with_get(
+                &cleanup_fork_meta_url(CLEANUP_GAMES_PROJECT),
+                "<project name=\"{project}\"><title>Branch project</title></project>",
+            )
+            .with_get(
+                &cleanup_fork_meta_url(CLEANUP_SCIENCE_PROJECT),
+                &branch_project_meta(
+                    CLEANUP_SCIENCE_PROJECT,
+                    &cleanup_fork_description("geectl-branch: junk"),
+                ),
+            );
+        let result = client(&gitea_http)
+            .cleanup_forks(&obs_client(&obs_http), None, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.projects.len(), 2);
+        assert_eq!(result.projects[0].outcome, CleanupForkOutcome::Unmarked);
+        assert!(matches!(
+            result.projects[1].outcome,
+            CleanupForkOutcome::Unparsable { .. }
+        ));
+        assert!(obs_http.delete_calls().is_empty());
+        assert!(gitea_http.get_calls().is_empty());
+    }
+
+    #[test]
+    fn cleanup_forks_dry_run_plans_without_deleting() {
+        let gitea_http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/fbui/descent3",
+            ErrorKind::NotFound,
+        );
+        let obs_http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source",
+                "<directory><entry name=\"home:scarabeus_iv:branches:games\"/></directory>",
+            )
+            .with_get(
+                &cleanup_fork_meta_url(CLEANUP_GAMES_PROJECT),
+                &branch_project_meta(
+                    CLEANUP_GAMES_PROJECT,
+                    &cleanup_fork_description(CLEANUP_GAMES_MARKER),
+                ),
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:scarabeus_iv:branches:games",
+                "<directory></directory>",
+            );
+        let dry_run = DryRun::new(true);
+        let result = client(&gitea_http)
+            .cleanup_forks(&obs_client(&obs_http), None, &dry_run)
+            .unwrap();
+        assert_eq!(result.projects.len(), 1);
+        assert_eq!(
+            result.projects[0].outcome,
+            CleanupForkOutcome::Deleted {
+                package: CleanupStep::Deleted,
+                project: CleanupStep::Deleted,
+            }
+        );
+        assert_eq!(
+            dry_run.plan(),
+            vec![
+                "[dry-run] would: delete package home:scarabeus_iv:branches:games/descent3"
+                    .to_string(),
+                "[dry-run] would: delete project home:scarabeus_iv:branches:games".to_string(),
+            ]
+        );
+        assert!(obs_http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn cleanup_forks_reports_a_project_fork_without_deleting() {
+        let marker = "geectl-branch: fork=fbui/_ObsPrj#master source=network:messaging:xmpp/_project target=home:scarabeus_iv:branches:games/_project";
+        let gitea_http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/fbui/_ObsPrj",
+            ErrorKind::NotFound,
+        );
+        let obs_http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source",
+                "<directory><entry name=\"home:scarabeus_iv:branches:games\"/></directory>",
+            )
+            .with_get(
+                &cleanup_fork_meta_url(CLEANUP_GAMES_PROJECT),
+                &branch_project_meta(CLEANUP_GAMES_PROJECT, &cleanup_fork_description(marker)),
+            );
+        let result = client(&gitea_http)
+            .cleanup_forks(&obs_client(&obs_http), None, &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.projects.len(), 1);
+        assert_eq!(
+            result.projects[0].outcome,
+            CleanupForkOutcome::ProjectFork {
+                fork: "fbui/_ObsPrj#master".to_string(),
+                fork_obsolete: true,
+            }
+        );
+        assert!(obs_http.delete_calls().is_empty());
+    }
+
+    #[test]
+    fn cleanup_forks_needs_a_username_without_one() {
+        let http = FakeHttp::new();
+        let obs = ObsClient::new(&http);
+        let err = client(&FakeHttp::new())
+            .cleanup_forks(&obs, None, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConfigError);
+    }
+
+    #[test]
+    fn cleanup_forks_with_an_explicit_user_lists_that_users_projects() {
+        let gitea_http = FakeHttp::new().with_get_error(
+            "https://src.opensuse.org/api/v1/repos/fbui/descent3",
+            ErrorKind::NotFound,
+        );
+        let obs_http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source",
+                "<directory><entry name=\"home:fbui:branches:games\"/><entry name=\"home:scarabeus_iv:branches:games\"/></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/home:fbui:branches:games/_meta",
+                &branch_project_meta(
+                    "home:fbui:branches:games",
+                    &cleanup_fork_description(
+                        "geectl-branch: fork=fbui/descent3#master source=games/descent3 target=home:fbui:branches:games/descent3",
+                    ),
+                ),
+            )
+            .with_get(
+                &cleanup_fork_search_url("home:fbui:branches:games", "descent3"),
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_delete(
+                "https://api.opensuse.org/source/home:fbui:branches:games/descent3",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/public/source/home:fbui:branches:games",
+                "<directory></directory>",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/home:fbui:branches:games",
+                "<directory></directory>",
+            )
+            .with_delete(
+                "https://api.opensuse.org/source/home:fbui:branches:games",
+                "<status code=\"ok\" />",
+            );
+        let result = client(&gitea_http)
+            .cleanup_forks(&obs_client(&obs_http), Some("fbui"), &DryRun::new(false))
+            .unwrap();
+        assert_eq!(result.user, "fbui");
+        assert_eq!(result.projects.len(), 1);
+        assert_eq!(result.projects[0].project, "home:fbui:branches:games");
+        assert_eq!(
+            result.projects[0].outcome,
+            CleanupForkOutcome::Deleted {
+                package: CleanupStep::Deleted,
+                project: CleanupStep::Deleted,
+            }
+        );
     }
 
     #[test]

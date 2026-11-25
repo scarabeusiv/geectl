@@ -10,7 +10,8 @@ Issue: https://github.com/scarabeusiv/geectl/issues/23 — the git vs OBS workfl
 | `git push` (local-build pre-push step planned, on by default) | scmsync syncs the pushed branch into the home package; OBS rebuilds | Branch head advances; PR diff updates |
 | `geectl --live pull-request comment <reference>` (live build-info comment planned) | Build results read from the home test project | PR comment carries the build result, updated on each rebuild |
 | `geectl --live pull-request merge <reference>` (forwards after merge; `--no-forward` skips it) | scmsync syncs the merged branch into the devel project package; forward SR filed from the devel package to its link parent; devel check (recorded project and package) runs first | PR merges; accepting the PR files the Factory submit automatically; a refused forward reports, the merge stands |
-| `geectl --live request accept <id>` | Factory SR accepted; package lands in Factory | Home scmsync version deleted (open: automatic when the fork is pruned, or geectl deletes it on SR acceptance) |
+| `geectl --live request accept <id>` | Factory SR accepted; package lands in Factory | Home package deleted, and the test project when it holds no other package |
+| `geectl gitea cleanup-forks` | Home test projects of gone forks deleted (home package, then project when empty) | Gone forks listed with their home test projects |
 
 ## Maintenance
 
@@ -20,7 +21,8 @@ Issue: https://github.com/scarabeusiv/geectl/issues/23 — the git vs OBS workfl
 | `git push` (local-build pre-push step planned, on by default) | scmsync syncs the pushed branch into the home package; OBS rebuilds | Branch head advances; PR diff updates |
 | `geectl --live pull-request comment <reference>` (live build-info comment planned) | Build results read from the home test project | PR comment carries the build result, updated on each rebuild |
 | `geectl --live pull-request merge <reference>` (forwards to the maintenance incident; `--no-forward` skips it) | scmsync syncs the merged branch into the maintenance project package; maintained target files a maintenance incident | PR merges; accepting the PR files the incident automatically; a refused forward reports, the merge stands |
-| `geectl --live request accept <id>` | Incident accepted; update released to `:Update` | Home scmsync version deleted (open: automatic when the fork is pruned, or geectl deletes it on SR acceptance) |
+| `geectl --live request accept <id>` | Incident accepted; update released to `:Update` | Home package deleted, and the test project when it holds no other package |
+| `geectl gitea cleanup-forks` | Home test projects of gone forks deleted (home package, then project when empty) | Gone forks listed with their home test projects |
 
 ## Forward
 

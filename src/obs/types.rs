@@ -872,6 +872,149 @@ pub struct DeletePackageOptions {
     pub message: Option<String>,
 }
 
+/// The marker line a git-backed branch writes into its test
+/// project's description: one line, carrying the fork
+/// (`owner/repo#branch`), the forked source (`project/package`),
+/// and the OBS target (`project/package`). The human description
+/// text is preserved above it; the marker is the machine-readable
+/// record accept-time cleanup and `cleanup-forks` read back. A
+/// description that carries no marker line, or a marker line that
+/// does not parse, never authorizes a delete.
+pub const BRANCH_MARKER_PREFIX: &str = "geectl-branch:";
+
+/// The parsed branch marker: the fork the test project was created
+/// for, the source it was forked from, and the OBS target it holds.
+/// Plain fields only — no `Gitea*` type leaks into the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchMarker {
+    /// The fork's owner (the token owner, or the organization).
+    pub fork_owner: String,
+    /// The fork's repo name.
+    pub fork_repo: String,
+    /// The branch named in the fork's scmsync URL.
+    pub fork_branch: String,
+    /// The project the fork was forked from.
+    pub source_project: String,
+    /// The package the fork was forked from (`_project` for a
+    /// project fork).
+    pub source_package: String,
+    /// The OBS project the fork lives in.
+    pub target_project: String,
+    /// The OBS package the fork lives in (`_project` for a project
+    /// fork).
+    pub target_package: String,
+}
+
+impl BranchMarker {
+    /// The fork as `owner/repo#branch`, the shape the marker
+    /// carries and the cleanup reports render.
+    pub fn fork(&self) -> String {
+        format!(
+            "{}/{}#{}",
+            self.fork_owner, self.fork_repo, self.fork_branch
+        )
+    }
+}
+
+/// Render a branch marker as its one description line.
+pub fn format_branch_marker(marker: &BranchMarker) -> String {
+    format!(
+        "{BRANCH_MARKER_PREFIX} fork={} source={}/{} target={}/{}",
+        marker.fork(),
+        marker.source_project,
+        marker.source_package,
+        marker.target_project,
+        marker.target_package,
+    )
+}
+
+/// Read the branch marker from a project description: `Ok(None)`
+/// when no marker line is present, `Err(reason)` when a marker line
+/// is present but unparsable or ambiguous — a missing marker and a
+/// bad marker are different failures, and only a parsed marker
+/// authorizes a delete, so the caller must tell them apart. A
+/// description with two marker lines is ambiguous, not the first:
+/// two writers means the record cannot name one fork.
+pub fn parse_branch_marker(description: &str) -> Result<Option<BranchMarker>, String> {
+    let lines: Vec<&str> = description
+        .lines()
+        .filter(|line| line.starts_with(BRANCH_MARKER_PREFIX))
+        .collect();
+    match lines.len() {
+        0 => return Ok(None),
+        1 => {}
+        n => {
+            return Err(format!(
+                "found {n} geectl-branch marker lines, expected one"
+            ));
+        }
+    }
+    let rest = lines[0][BRANCH_MARKER_PREFIX.len()..].trim_start();
+    let mut fork = None;
+    let mut source = None;
+    let mut target = None;
+    for token in rest.split_ascii_whitespace() {
+        let (key, value) = token
+            .split_once('=')
+            .ok_or_else(|| format!("marker token {token:?} is not key=value"))?;
+        let slot = match key {
+            "fork" => &mut fork,
+            "source" => &mut source,
+            "target" => &mut target,
+            _ => {
+                return Err(format!("marker key {key:?} is not fork, source, or target"));
+            }
+        };
+        if slot.is_some() {
+            return Err(format!("marker key {key:?} appears twice"));
+        }
+        if value.is_empty() {
+            return Err(format!("marker key {key:?} has an empty value"));
+        }
+        *slot = Some(value);
+    }
+    let fork = fork.ok_or_else(|| "marker is missing fork".to_string())?;
+    let source = source.ok_or_else(|| "marker is missing source".to_string())?;
+    let target = target.ok_or_else(|| "marker is missing target".to_string())?;
+    let (fork_owner, fork_repo, fork_branch) = parse_marker_fork(fork)?;
+    let (source_project, source_package) = parse_marker_coordinates(source, "source")?;
+    let (target_project, target_package) = parse_marker_coordinates(target, "target")?;
+    Ok(Some(BranchMarker {
+        fork_owner,
+        fork_repo,
+        fork_branch,
+        source_project,
+        source_package,
+        target_project,
+        target_package,
+    }))
+}
+
+fn parse_marker_fork(value: &str) -> Result<(String, String, String), String> {
+    let (owner, rest) = value
+        .split_once('/')
+        .ok_or_else(|| format!("marker fork {value:?} is not owner/repo#branch"))?;
+    let (repo, branch) = rest
+        .split_once('#')
+        .ok_or_else(|| format!("marker fork {value:?} is not owner/repo#branch"))?;
+    if owner.is_empty() || repo.is_empty() || branch.is_empty() {
+        return Err(format!("marker fork {value:?} is not owner/repo#branch"));
+    }
+    Ok((owner.to_string(), repo.to_string(), branch.to_string()))
+}
+
+fn parse_marker_coordinates(value: &str, key: &str) -> Result<(String, String), String> {
+    let (project, package) = value
+        .split_once('/')
+        .ok_or_else(|| format!("marker {key} {value:?} is not project/package"))?;
+    if !super::valid_obs_name(project) || !super::valid_obs_name(package) {
+        return Err(format!(
+            "marker {key} {value:?} is not a valid project/package"
+        ));
+    }
+    Ok((project.to_string(), package.to_string()))
+}
+
 /// Options for [`ObsClient::aggregate_package`]. All fields are
 /// optional: an unset flag means off, an empty repository map means
 /// no repository mappings.
@@ -1515,5 +1658,75 @@ mod tests {
         assert!(!dry.allow("file submit request for foo to devel:languages:python"));
         assert!(lines.lock().unwrap().is_empty());
         assert_eq!(dry.plan().len(), 1);
+    }
+
+    fn sample_marker() -> BranchMarker {
+        BranchMarker {
+            fork_owner: "fbui".to_string(),
+            fork_repo: "descent3".to_string(),
+            fork_branch: "master".to_string(),
+            source_project: "games".to_string(),
+            source_package: "descent3".to_string(),
+            target_project: "home:fbui:branches:games".to_string(),
+            target_package: "descent3".to_string(),
+        }
+    }
+
+    #[test]
+    fn branch_marker_round_trips_through_format_and_parse() {
+        let marker = sample_marker();
+        let line = format_branch_marker(&marker);
+        assert_eq!(
+            line,
+            "geectl-branch: fork=fbui/descent3#master source=games/descent3 target=home:fbui:branches:games/descent3"
+        );
+        let description = format!("Test project for the master branch of games/descent3\n{line}");
+        assert_eq!(parse_branch_marker(&description).unwrap(), Some(marker));
+    }
+
+    #[test]
+    fn branch_marker_missing_is_none_not_an_error() {
+        assert_eq!(
+            parse_branch_marker("Test project for the master branch of games/descent3").unwrap(),
+            None
+        );
+        assert_eq!(parse_branch_marker("").unwrap(), None);
+    }
+
+    #[test]
+    fn branch_marker_unparsable_fails_closed() {
+        for bad in [
+            // Fork without a branch.
+            "geectl-branch: fork=fbui/descent3 source=games/descent3 target=home:fbui:branches:games/descent3",
+            // Missing target.
+            "geectl-branch: fork=fbui/descent3#master source=games/descent3",
+            // Unknown key.
+            "geectl-branch: fork=fbui/descent3#master source=games/descent3 target=home:fbui:branches:games/descent3 extra=1",
+            // Duplicate key.
+            "geectl-branch: fork=fbui/descent3#master fork=fbui/descent3#master source=games/descent3 target=home:fbui:branches:games/descent3",
+            // Two marker lines.
+            "geectl-branch: fork=fbui/descent3#master source=games/descent3 target=home:fbui:branches:games/descent3\ngeectl-branch: fork=fbui/descent3#master source=games/descent3 target=home:fbui:branches:games/descent3",
+            // Token without `=`.
+            "geectl-branch: junk",
+            // Empty target package.
+            "geectl-branch: fork=fbui/descent3#master source=games/descent3 target=home:fbui:branches:games/",
+            // Empty fork owner.
+            "geectl-branch: fork=/descent3#master source=games/descent3 target=home:fbui:branches:games/descent3",
+            // Target is not a project/package.
+            "geectl-branch: fork=fbui/descent3#master source=games/descent3 target=home:fbui:branches:games",
+        ] {
+            assert!(parse_branch_marker(bad).is_err(), "should fail: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn branch_marker_project_fork_round_trips() {
+        let marker = BranchMarker {
+            source_package: "_project".to_string(),
+            target_package: "_project".to_string(),
+            ..sample_marker()
+        };
+        let line = format_branch_marker(&marker);
+        assert_eq!(parse_branch_marker(&line).unwrap(), Some(marker));
     }
 }

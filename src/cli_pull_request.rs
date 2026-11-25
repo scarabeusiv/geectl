@@ -1329,6 +1329,16 @@ fn merge_obs(
         message,
         |client, reference, dry_run| client.merge(reference, message, None, force, dry_run),
     )?;
+    // The merge landed (or, in dry-run, is planned): clean up the
+    // branch home packages it merged, through the shared helper.
+    // A cleanup that cannot run is reported, never an error here.
+    let (cleanup_payload, cleanup_text) = crate::cli_request::accept_cleanup(debug, id, live);
+    if let Value::Object(map) = &mut payload {
+        map.insert("cleanup".to_string(), cleanup_payload);
+    }
+    if !cleanup_text.is_empty() {
+        text.push_str(&format!("; {cleanup_text}"));
+    }
     if !live {
         let forward_note = match forward_message {
             Some(entry) => format!(" with changes entry: {entry}"),
