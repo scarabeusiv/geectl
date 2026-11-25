@@ -973,8 +973,14 @@ pub(crate) fn parse_directory(body: &str) -> Result<DirectoryListing, GeectlErro
     let open_tag = &after_open[..end];
     // The listing's srcmd5 pins the revision the entries belong to
     // (see the `srcmd5` field): read it off the opening tag once,
-    // before the self-closing early return.
-    let srcmd5 = tag_attr(open_tag, "srcmd5").map(|value| xml_unescape(&value));
+    // before the self-closing early return. The srcmd5 is a
+    // checksum, not free text: a value that is not exactly 32 hex
+    // digits is malformed, not a revision to download against.
+    let srcmd5 = match tag_attr(open_tag, "srcmd5").map(|value| xml_unescape(&value)) {
+        Some(value) if is_md5(&value) => Some(value),
+        Some(_) => return Err(malformed()),
+        None => None,
+    };
     if open_tag.trim_end().ends_with('/') {
         // Self-closing `<directory .../>`: no children, so no files
         // and no service state.
@@ -10022,6 +10028,72 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef")
         );
         assert!(listing.entries.is_empty());
+    }
+
+    #[test]
+    fn directory_listing_rejects_non_hex_srcmd5() {
+        // The srcmd5 pins the revision the entries belong to: a
+        // non-hex value is a malformed listing, never a revision
+        // to download against.
+        assert_eq!(
+            parse_directory("<directory name=\"foo\" srcmd5=\"aaa\"></directory>")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ServerError
+        );
+        assert_eq!(
+            parse_directory(
+                "<directory name=\"foo\" srcmd5=\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"></directory>"
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ServerError
+        );
+    }
+
+    #[test]
+    fn directory_listing_rejects_wrong_length_srcmd5() {
+        // 31 and 33 hex digits: the length is part of the shape.
+        assert!(parse_directory(
+            "<directory name=\"foo\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"></directory>"
+        )
+        .is_err());
+        assert!(parse_directory(
+            "<directory name=\"foo\" srcmd5=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"></directory>"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn directory_listing_accepts_32_hex_srcmd5() {
+        // Lowercase and uppercase hex both read, carried verbatim.
+        let listing = parse_directory(
+            "<directory name=\"foo\" srcmd5=\"0123456789abcdef0123456789abcdef\"></directory>",
+        )
+        .unwrap();
+        assert_eq!(
+            listing.srcmd5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let listing = parse_directory(
+            "<directory name=\"foo\" srcmd5=\"0123456789ABCDEF0123456789ABCDEF\"/>",
+        )
+        .unwrap();
+        assert_eq!(
+            listing.srcmd5.as_deref(),
+            Some("0123456789ABCDEF0123456789ABCDEF")
+        );
+    }
+
+    #[test]
+    fn directory_listing_rejects_escape_sequence_in_srcmd5() {
+        // An escape sequence smuggled into the md5 unescapes to a
+        // value that is not 32 hex digits, so the listing is
+        // malformed.
+        assert!(parse_directory(
+            "<directory name=\"foo\" srcmd5=\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;\"></directory>"
+        )
+        .is_err());
     }
 
     #[test]
