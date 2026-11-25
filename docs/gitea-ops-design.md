@@ -108,7 +108,7 @@ under a branch project, with `--target-project`, `--target-package`,
 `--linkrev`. The group also carries the link operations
 `repair-link`, `set-link-rev`, `set-link-rev-project`,
 `link-to-branch`, and `detach-branch`. The git-backed fork composite is a
-library operation.
+library operation, exposed as `branch branch`.
 
 ## The pull-request handle
 
@@ -300,6 +300,11 @@ read takes the file from the repo's default branch; a missing file answers
 it reads the source meta, answering `InvalidInput` for a source carrying
 no `<scmsync>`, resolves the devel project unless `--no-devel-project` is
 given, forks the repo, and wires the OBS fork to the fork's scmsync URL.
+Then it copies the source project's repositories into the fork's test
+project, the server-resolved target: all of them, verbatim, skipping
+any the target already carries — the server adds no repositories on
+`cmd=fork`, and a source project with no repositories copies nothing.
+A copy failure fails the branch loudly.
 The scmsync URL carries the fork branch (`url#branch`); when the branch is
 unnamed, the composite resolves it with `repo_get` on the default branch, and
 `--git-branch` names it explicitly. The composite returns, typed, the fork

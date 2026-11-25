@@ -213,6 +213,7 @@ directory's `.env` only.
 
 ## `branch` — branch, copy, link
 
+- `geectl branch branch --project <PROJECT> --package <PACKAGE>` — Branch a git-backed package: Gitea fork + OBS fork into a test project with the source project's repositories; key flags: --new-repo-name <NEW_REPO_NAME>, --organization <ORGANIZATION>, --git-branch <GIT_BRANCH>, --no-devel-project, --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>
 - `geectl branch branch-package --project <PROJECT> --package <PACKAGE>` — Branch a package: create a linked copy under a branch project; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --add-repositories, --maintenance, --revision <REVISION>, --force, --new-package
 - `geectl branch copy-package --source-project <SOURCE_PROJECT> --source-package <SOURCE_PACKAGE> --target-project <TARGET_PROJECT> --target-package <TARGET_PACKAGE>` — Copy a package to another project (or another OBS instance with `--to-apiurl`); key flags: --revision <REVISION>, --keep-link, --expand, --comment <COMMENT>, --noservice, --to-apiurl <TO_APIURL>
 - `geectl branch copy-project --source-project <SOURCE_PROJECT> --target-project <TARGET_PROJECT>` — Copy a whole project; key flags: --with-binaries, --with-history, --noservice, --comment <COMMENT>
