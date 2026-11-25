@@ -3781,7 +3781,23 @@ impl<'a> GiteaClient<'a> {
                         .unwrap_or_else(|| source_package.clone()),
                 });
                 let description = format!("{description}\n{marker}");
-                self.ensure_branch_target_project(obs, target, &title, &description, dry_run)?
+                self.ensure_branch_target_project(
+                    obs,
+                    target,
+                    &title,
+                    &description,
+                    dry_run,
+                    std::time::Duration::from_secs(30),
+                )?
+=======
+                self.ensure_branch_target_project(
+                    obs,
+                    target,
+                    &title,
+                    &description,
+                    dry_run,
+                    std::time::Duration::from_secs(30),
+                )?
             }
             None => false,
         };
@@ -4070,7 +4086,12 @@ impl<'a> GiteaClient<'a> {
     /// [`ObsClient::create_package`] papers over with
     /// `put_with_registration_retry`, before the caller forks into
     /// it. In dry-run nothing is created, so there is nothing to
-    /// wait for.
+    /// wait for. The budget bounds the registration wait; a wait
+    /// that times out deletes the just-created project again, like
+    /// the fork-failure path in `branch`, instead of orphaning it.
+    /// The budget is a parameter so tests can pass a zero budget
+    /// for the never-registers case instead of waiting out the
+    /// 30 s the branch passes.
     fn ensure_branch_target_project(
         &self,
         obs: &ObsClient,
@@ -4078,6 +4099,7 @@ impl<'a> GiteaClient<'a> {
         title: &str,
         description: &str,
         dry_run: &DryRun,
+        budget: std::time::Duration,
     ) -> Result<bool, GeectlError> {
         match obs.project_meta(target) {
             Ok(_) => Ok(false),
@@ -4091,11 +4113,35 @@ impl<'a> GiteaClient<'a> {
                     Err(err) if err.kind() == ErrorKind::NotFound => {
                         obs.create_project(target, title, description, dry_run)?;
                         if dry_run.live() {
-                            self.wait_for_branch_target_project(
-                                obs,
-                                target,
-                                std::time::Duration::from_secs(30),
-                            )?;
+                            if let Err(wait_err) = self.wait_for_branch_target_project(
+                                obs, target, budget,
+                            ) {
+                                // The wait timed out after this branch
+                                // created the project: delete the
+                                // orphaned empty project it leaves
+                                // behind, like the fork-failure path
+                                // in `branch`. The delete is
+                                // non-recursive: a concurrent branch
+                                // that populated the project leaves it
+                                // behind rather than deleting another
+                                // branch's package, and a delete
+                                // failure is reported alongside the
+                                // wait error instead of silently
+                                // swallowing the orphan.
+                                if let Err(delete_err) = obs.delete_project(
+                                    target,
+                                    &DeleteProjectOptions::default(),
+                                    dry_run,
+                                ) {
+                                    return Err(GeectlError::new(
+                                        wait_err.kind(),
+                                        format!(
+                                            "{wait_err} (and deleting the just-created test project {target} failed: {delete_err})"
+                                        ),
+                                    ));
+                                }
+                                return Err(wait_err);
+                            }
                         }
                         self.debug.emit(&format!("created test project {target}"));
                         Ok(true)
@@ -11136,6 +11182,101 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn branch_deletes_the_created_target_project_when_the_wait_times_out() {
+        // The wait times out after the branch created the target
+        // project: the orphaned empty project is deleted again, so
+        // a failed branch leaves nothing behind in the user's
+        // home-project namespace.
+        let gitea_http = FakeHttp::new();
+        let obs_http = FakeHttp::new()
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:fbui:test:descent3/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/home:fbui:test:descent3/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:fbui:test:descent3/_meta",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/home:fbui:test:descent3",
+                "<directory name=\"home:fbui:test:descent3\"/>",
+            )
+            .with_delete(
+                "https://api.opensuse.org/source/home:fbui:test:descent3",
+                "<status code=\"ok\"/>",
+            );
+        let err = client(&gitea_http)
+            .ensure_branch_target_project(
+                &obs_client(&obs_http),
+                "home:fbui:test:descent3",
+                "Branch project for package descent3",
+                "Test project for the master branch of games/descent3",
+                &DryRun::new(false),
+                std::time::Duration::from_secs(0),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(
+            obs_http.delete_calls(),
+            vec![(
+                "https://api.opensuse.org/source/home:fbui:test:descent3".to_string(),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn branch_reports_the_wait_error_when_deleting_the_orphan_fails() {
+        // The wait times out and the orphan delete fails too: the
+        // branch error keeps the wait error's kind and names the
+        // failed delete alongside it, instead of silently leaving
+        // the orphan behind.
+        let gitea_http = FakeHttp::new();
+        let obs_http = FakeHttp::new()
+            .with_get_error(
+                "https://api.opensuse.org/public/source/home:fbui:test:descent3/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_get_error(
+                "https://api.opensuse.org/source/home:fbui:test:descent3/_meta",
+                ErrorKind::NotFound,
+            )
+            .with_put(
+                "https://api.opensuse.org/source/home:fbui:test:descent3/_meta",
+                "<status code=\"ok\" />",
+            )
+            .with_get(
+                "https://api.opensuse.org/source/home:fbui:test:descent3",
+                "<directory name=\"home:fbui:test:descent3\"/>",
+            )
+            .with_delete_error(
+                "https://api.opensuse.org/source/home:fbui:test:descent3",
+                ErrorKind::ServerError,
+            );
+        let err = client(&gitea_http)
+            .ensure_branch_target_project(
+                &obs_client(&obs_http),
+                "home:fbui:test:descent3",
+                "Branch project for package descent3",
+                "Test project for the master branch of games/descent3",
+                &DryRun::new(false),
+                std::time::Duration::from_secs(0),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains(
+                "and deleting the just-created test project home:fbui:test:descent3 failed"
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
