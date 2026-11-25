@@ -1352,6 +1352,12 @@ pub fn maybe_auto_install(
     if marker.is_file() {
         return None;
     }
+    // A failed attempt is negatively cached, and the check sits
+    // above the scheduler probe below: a recent failure skips the
+    // probes outright instead of paying for them on every build.
+    if auto_install_failed_recently(home, xdg_config_home) {
+        return None;
+    }
     // Already installed by hand: record the decision and stop. The
     // files answer it on Linux/macOS; on Windows the query does. A
     // scheduler that cannot be asked leaves the decision unrecorded,
@@ -1363,12 +1369,6 @@ pub fn maybe_auto_install(
             record_auto_install_decided(home, xdg_config_home);
             return None;
         }
-    }
-    // A failed attempt is negatively cached: without this every
-    // build re-runs the scheduler probes and the install attempt
-    // for a failure that has not changed.
-    if auto_install_failed_recently(home, xdg_config_home) {
-        return None;
     }
     let outcome = match install(os, exe, home, xdg_config_home, false) {
         Ok(outcome) => outcome,
