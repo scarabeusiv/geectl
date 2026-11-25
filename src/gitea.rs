@@ -3400,10 +3400,14 @@ impl<'a> GiteaClient<'a> {
     /// channel (a Bearer token carries no username, so the default
     /// cannot be named client-side and the server's branch path
     /// generates it); OBS fork with the full scmsync URL
-    /// `{base}/{fork-owner}/{fork-repo}#{branch}`. The fork's
-    /// scmsync URL is built from the configured Gitea base, and a
-    /// source repo on another host fails with `ConfigError`
-    /// naming the configured host (one instance per client).
+    /// `{base}/{fork-owner}/{fork-repo}#{branch}`; then copy all of
+    /// the source project's repositories into the fork's target
+    /// project (the server-resolved name), skipping any the target
+    /// already carries — the server adds no repositories on
+    /// `cmd=fork`. The fork's scmsync URL is built from the
+    /// configured Gitea base, and a source repo on another host
+    /// fails with `ConfigError` naming the configured host (one
+    /// instance per client).
     ///
     /// In dry-run the fork is recorded in the plan and nothing is
     /// created — the guard runs before any server read, like
@@ -3679,6 +3683,13 @@ impl<'a> GiteaClient<'a> {
                 return Err(fork_err);
             }
         };
+        // The OBS server adds no repositories on `cmd=fork`, so the
+        // composite copies them itself, into the fork's target
+        // project — the server-resolved name, which also covers the
+        // Bearer case, where the client could not name the target
+        // up front: all of the source project's repositories,
+        // verbatim, skipping any the target already carries.
+        self.copy_branch_repositories(obs, &source_project, &forked.target_project, dry_run)?;
         Ok(Some(ForkResult {
             owner: fork.owner.login,
             repo: fork.name,
@@ -3802,6 +3813,86 @@ impl<'a> GiteaClient<'a> {
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    /// Copy the source project's repositories into the branch's
+    /// test project: the OBS server adds no repositories on
+    /// `cmd=fork`, so the composite copies them itself — all of
+    /// them, from the source project the branch forked from (the
+    /// PR's target-branch codestream), verbatim: name,
+    /// architectures, rebuild sources, rebuild/block/linkedbuild
+    /// flags, downloads, release targets, host system. A
+    /// repository already in the target is skipped when it
+    /// matches the source, not an error — a reused target project
+    /// (or a retried branch) already carries it, and the copy's
+    /// end state is the same. A repository already there but
+    /// differing from the source (an older arch set, paths, or
+    /// block mode) is replaced — remove, then add — so the copy
+    /// stays verbatim. A source project with no repositories
+    /// copies nothing and does not fail. Any other failure fails
+    /// the branch loudly: a test project without its repositories
+    /// never builds, so a silent skip would leave a branch that
+    /// looks done and builds nothing. Each copied or replaced
+    /// repository is reported on the debug channel.
+    fn copy_branch_repositories(
+        &self,
+        obs: &ObsClient,
+        source_project: &str,
+        target_project: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), GeectlError> {
+        let repositories = obs.list_repositories(source_project)?;
+        let mut target_repositories = None;
+ 51c71d7 (fixup! gitea: copy the source project repositories into the branch test project)
+        for repository in &repositories {
+            match obs.add_repository(target_project, repository, false, dry_run) {
+                Ok(_) => {
+                    self.debug.emit(&format!(
+                        "copied repository {} into test project {target_project}",
+                        repository.name
+                    ));
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                    // Already there — but only the desired end state
+                    // when it matches the source: a reused target
+                    // may carry an older arch set, paths, or block
+                    // mode, and skipping it would leave the copy
+                    // short of verbatim. A differing repository is
+                    // replaced (remove, then add); an identical one
+                    // is skipped. The target list is read lazily,
+                    // once, only when a skip is actually in question.
+                    if target_repositories.is_none() {
+                        // The authenticated meta: the document the
+                        // add above edits, so the comparison is
+                        // against the repositories the copy actually
+                        // sees — not the public list, which may lag
+                        // it.
+                        target_repositories =
+                            Some(obs.project_meta_authenticated(target_project)?.repositories);
+                    }
+                    let existing = target_repositories
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .find(|existing| existing.name == repository.name);
+                    match existing {
+                        // Already there as copied: the desired end
+                        // state, skipped silently as before.
+                        Some(existing) if existing == repository => {}
+                        _ => {
+                            obs.remove_repository(target_project, &repository.name, dry_run)?;
+                            obs.add_repository(target_project, repository, false, dry_run)?;
+                            self.debug.emit(&format!(
+                                "replaced differing repository {} in test project {target_project}",
+                                repository.name
+                            ));
+                        }
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -8472,6 +8563,28 @@ mod tests {
         )
     }
 
+    /// The source-project repository read the branch composite makes
+    /// after the OBS fork: the public meta of the project the branch
+    /// forked from, answered with the given repository XML (empty
+    /// when the project carries no repositories).
+    fn branch_source_repos_fixture(http: FakeHttp, source_project: &str, repos: &str) -> FakeHttp {
+        let meta = format!("<project name=\"{source_project}\">{repos}</project>");
+        http.with_get(
+            &format!("https://api.opensuse.org/public/source/{source_project}/_meta"),
+            &meta,
+        )
+    }
+
+    /// Two repositories of a Factory codestream: the Factory repo
+    /// (its build blocks) and a second repo (its build never
+    /// blocks). The copy carries both verbatim, block modes
+    /// included — in the Factory flow only the Factory build
+    /// blocks, and that is decided by the copied repos, not by
+    /// the copy rewriting them.
+    fn factory_codestream_repos() -> &'static str {
+        "<repository name=\"openSUSE_Factory\" rebuild=\"local\" block=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository><repository name=\"openSUSE_Tumbleweed\" block=\"never\"><arch>x86_64</arch><path project=\"openSUSE:Tumbleweed\" repository=\"standard\"/></repository>"
+    }
+
     #[test]
     fn branch_forks_a_package() {
         // The real per-package scmsync case: `games/descent3`
@@ -8499,7 +8612,7 @@ mod tests {
             Some("https://src.opensuse.org/jengelh/descent3#master"),
             None,
         );
-        let obs_http = obs_fork_fixture(
+        let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             branch_target_fixture(FakeHttp::new(), "games"),
             "https://api.opensuse.org/public/source/games/descent3/_meta",
             &meta,
@@ -8510,7 +8623,7 @@ mod tests {
                 "games",
                 "descent3",
             ),
-        );
+        ), "games", "");
         let result = client(&gitea_http)
             .branch(
                 &obs_client(&obs_http),
@@ -8579,7 +8692,7 @@ mod tests {
             Some("https://src.opensuse.org/jengelh/descent3#master"),
             None,
         );
-        let obs_http = FakeHttp::new()
+        let obs_http = branch_source_repos_fixture(FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/public/source/games/descent3/_meta",
                 &meta,
@@ -8603,7 +8716,7 @@ mod tests {
             .with_post(
                 "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master&target_project=home%3Afbui%3Atest%3Adescent3",
                 &fork_status("home:fbui:test:descent3", "descent3", "games", "descent3"),
-            );
+            ), "games", "");
         let options = ForkOptions {
             target_project: Some("home:fbui:test:descent3".to_string()),
             ..ForkOptions::default()
@@ -8663,6 +8776,357 @@ mod tests {
     }
 
     #[test]
+    fn branch_copies_the_source_project_repositories_into_the_test_project() {
+        // The OBS server adds no repositories on `cmd=fork`, so the
+        // composite copies them itself: after the fork lands, every
+        // repository of the source project is added to the fork's
+        // test project, verbatim — names, architectures, rebuild
+        // sources, and the block modes (Factory blocks, the other
+        // repo never does). Each copy is reported on the debug
+        // channel.
+        let fork_body = repo_json_branch(
+            "fbui",
+            "descent3",
+            Some(("jengelh", "descent3")),
+            "master",
+            false,
+        );
+        let gitea_http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            ),
+            "jengelh",
+            "descent3",
+            "https://src.opensuse.org/api/v1/repos/fbui/descent3",
+            &fork_body,
+        );
+        let (debug, lines) = Debug::captured(true, false);
+        let meta = package_meta(
+            "games",
+            "descent3",
+            Some("https://src.opensuse.org/jengelh/descent3#master"),
+            None,
+        );
+        let target = "home:fbui:test:descent3";
+        let obs_http = branch_source_repos_fixture(
+            FakeHttp::new()
+                .with_get(
+                    "https://api.opensuse.org/public/source/games/descent3/_meta",
+                    &meta,
+                )
+                .with_get(
+                    "https://api.opensuse.org/public/source/home:fbui:test:descent3/_meta",
+                    &project_meta(target, None, None),
+                )
+                .with_get(
+                    "https://api.opensuse.org/source/home:fbui:test:descent3/_meta",
+                    &project_meta(target, None, None),
+                )
+                .with_put(
+                    "https://api.opensuse.org/source/home:fbui:test:descent3/_meta",
+                    "<status code=\"ok\" />",
+                )
+                .with_post(
+                    "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master&target_project=home%3Afbui%3Atest%3Adescent3",
+                    &fork_status(target, "descent3", "games", "descent3"),
+                ),
+            "games",
+            factory_codestream_repos(),
+        );
+        let options = ForkOptions {
+            target_project: Some(target.to_string()),
+            ..ForkOptions::default()
+        };
+        let result = client(&gitea_http)
+            .with_debug(debug)
+            .branch(
+                &obs_client(&obs_http),
+                "games",
+                "descent3",
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.target_project, target);
+        // The copies ran after the fork POST, one PUT per
+        // repository, each carrying the source repository
+        // verbatim — including its block mode.
+        assert_eq!(
+            obs_http.mutation_calls(),
+            vec![
+                (
+                    "POST".to_string(),
+                    "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master&target_project=home%3Afbui%3Atest%3Adescent3".to_string(),
+                ),
+                (
+                    "PUT".to_string(),
+                    "https://api.opensuse.org/source/home:fbui:test:descent3/_meta".to_string(),
+                ),
+                (
+                    "PUT".to_string(),
+                    "https://api.opensuse.org/source/home:fbui:test:descent3/_meta".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            obs_http.put_calls(),
+            vec![
+                (
+                    "https://api.opensuse.org/source/home:fbui:test:descent3/_meta".to_string(),
+                    "<project name=\"home:fbui:test:descent3\"><repository name=\"openSUSE_Factory\" rebuild=\"local\" block=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository></project>".to_string(),
+                    true,
+                ),
+                (
+                    "https://api.opensuse.org/source/home:fbui:test:descent3/_meta".to_string(),
+                    "<project name=\"home:fbui:test:descent3\"><repository name=\"openSUSE_Tumbleweed\" block=\"never\"><arch>x86_64</arch><path project=\"openSUSE:Tumbleweed\" repository=\"standard\"/></repository></project>".to_string(),
+                    true,
+                ),
+            ]
+        );
+        assert_eq!(
+            lines.lock().unwrap().clone(),
+            vec![
+                "copied repository openSUSE_Factory into test project home:fbui:test:descent3"
+                    .to_string(),
+                "copied repository openSUSE_Tumbleweed into test project home:fbui:test:descent3"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_copies_no_repositories_when_the_source_project_has_none() {
+        // A source project with no repositories copies nothing and
+        // does not fail: the branch still lands the fork.
+        let fork_body = repo_json_branch(
+            "fbui",
+            "descent3",
+            Some(("jengelh", "descent3")),
+            "master",
+            false,
+        );
+        let gitea_http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            ),
+            "jengelh",
+            "descent3",
+            "https://src.opensuse.org/api/v1/repos/fbui/descent3",
+            &fork_body,
+        );
+        let (debug, lines) = Debug::captured(true, false);
+        let meta = package_meta(
+            "games",
+            "descent3",
+            Some("https://src.opensuse.org/jengelh/descent3#master"),
+            None,
+        );
+        let target = "home:fbui:test:descent3";
+        let obs_http = branch_source_repos_fixture(
+            FakeHttp::new()
+                .with_get(
+                    "https://api.opensuse.org/public/source/games/descent3/_meta",
+                    &meta,
+                )
+                .with_get(
+                    "https://api.opensuse.org/public/source/home:fbui:test:descent3/_meta",
+                    &project_meta(target, None, None),
+                )
+                .with_post(
+                    "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master&target_project=home%3Afbui%3Atest%3Adescent3",
+                    &fork_status(target, "descent3", "games", "descent3"),
+                ),
+            "games",
+            "",
+        );
+        let options = ForkOptions {
+            target_project: Some(target.to_string()),
+            ..ForkOptions::default()
+        };
+        let result = client(&gitea_http)
+            .with_debug(debug)
+            .branch(
+                &obs_client(&obs_http),
+                "games",
+                "descent3",
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.target_project, target);
+        assert!(obs_http.put_calls().is_empty());
+        assert!(lines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn branch_skips_repositories_already_in_the_test_project() {
+        // A reused target project already carries one of the source
+        // repositories: the copy skips it instead of failing on the
+        // duplicate, and adds only the missing one — the end state
+        // is the same, so a retried branch converges too.
+        let fork_body = repo_json_branch(
+            "fbui",
+            "descent3",
+            Some(("jengelh", "descent3")),
+            "master",
+            false,
+        );
+        let gitea_http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            ),
+            "jengelh",
+            "descent3",
+            "https://src.opensuse.org/api/v1/repos/fbui/descent3",
+            &fork_body,
+        );
+        let (debug, lines) = Debug::captured(true, false);
+        let meta = package_meta(
+            "games",
+            "descent3",
+            Some("https://src.opensuse.org/jengelh/descent3#master"),
+            None,
+        );
+        let target = "home:fbui:test:descent3";
+        let factory_repo = "<repository name=\"openSUSE_Factory\" rebuild=\"local\" block=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository>";
+        let target_meta = format!("<project name=\"{target}\">{factory_repo}</project>");
+        let obs_http = branch_source_repos_fixture(
+            FakeHttp::new()
+                .with_get(
+                    "https://api.opensuse.org/public/source/games/descent3/_meta",
+                    &meta,
+                )
+                .with_get(
+                    "https://api.opensuse.org/public/source/home:fbui:test:descent3/_meta",
+                    &project_meta(target, None, None),
+                )
+                .with_get(
+                    "https://api.opensuse.org/source/home:fbui:test:descent3/_meta",
+                    &target_meta,
+                )
+                .with_put(
+                    "https://api.opensuse.org/source/home:fbui:test:descent3/_meta",
+                    "<status code=\"ok\" />",
+                )
+                .with_post(
+                    "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master&target_project=home%3Afbui%3Atest%3Adescent3",
+                    &fork_status(target, "descent3", "games", "descent3"),
+                ),
+            "games",
+            factory_codestream_repos(),
+        );
+        let options = ForkOptions {
+            target_project: Some(target.to_string()),
+            ..ForkOptions::default()
+        };
+        let result = client(&gitea_http)
+            .with_debug(debug)
+            .branch(
+                &obs_client(&obs_http),
+                "games",
+                "descent3",
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.target_project, target);
+        assert_eq!(obs_http.put_calls().len(), 1);
+        assert_eq!(
+            obs_http.put_calls()[0].1,
+            format!(
+                "<project name=\"{target}\">{factory_repo}<repository name=\"openSUSE_Tumbleweed\" block=\"never\"><arch>x86_64</arch><path project=\"openSUSE:Tumbleweed\" repository=\"standard\"/></repository></project>"
+            )
+        );
+        assert_eq!(
+            lines.lock().unwrap().clone(),
+            vec![
+                "copied repository openSUSE_Tumbleweed into test project home:fbui:test:descent3"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_fails_loudly_when_copying_the_repositories_fails() {
+        // The fork landed, then the repository copy failed: the
+        // branch fails loudly instead of reporting a branch that
+        // builds nothing — and nothing is deleted, the forked
+        // package is in the test project, so a retried branch
+        // converges on the missing repositories.
+        let fork_body = repo_json_branch(
+            "fbui",
+            "descent3",
+            Some(("jengelh", "descent3")),
+            "master",
+            false,
+        );
+        let gitea_http = fork_fixture(
+            FakeHttp::new().with_get(
+                "https://src.opensuse.org/api/v1/user",
+                r#"{"login": "fbui"}"#,
+            ),
+            "jengelh",
+            "descent3",
+            "https://src.opensuse.org/api/v1/repos/fbui/descent3",
+            &fork_body,
+        );
+        let meta = package_meta(
+            "games",
+            "descent3",
+            Some("https://src.opensuse.org/jengelh/descent3#master"),
+            None,
+        );
+        let target = "home:fbui:test:descent3";
+        let factory_repo = "<repository name=\"openSUSE_Factory\" rebuild=\"local\" block=\"all\"><arch>x86_64</arch><arch>aarch64</arch><path project=\"openSUSE:Factory\" repository=\"snapshot\"/></repository>";
+        let obs_http = branch_source_repos_fixture(
+            FakeHttp::new()
+                .with_get(
+                    "https://api.opensuse.org/public/source/games/descent3/_meta",
+                    &meta,
+                )
+                .with_get(
+                    "https://api.opensuse.org/public/source/home:fbui:test:descent3/_meta",
+                    &project_meta(target, None, None),
+                )
+                .with_get(
+                    "https://api.opensuse.org/source/home:fbui:test:descent3/_meta",
+                    &project_meta(target, None, None),
+                )
+                .with_put_error_sequence(
+                    "https://api.opensuse.org/source/home:fbui:test:descent3/_meta",
+                    &[ErrorKind::ServerError],
+                )
+                .with_post(
+                    "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master&target_project=home%3Afbui%3Atest%3Adescent3",
+                    &fork_status(target, "descent3", "games", "descent3"),
+                ),
+            "games",
+            factory_repo,
+        );
+        let options = ForkOptions {
+            target_project: Some(target.to_string()),
+            ..ForkOptions::default()
+        };
+        let err = client(&gitea_http)
+            .branch(
+                &obs_client(&obs_http),
+                "games",
+                "descent3",
+                &options,
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ServerError);
+        assert!(obs_http.delete_calls().is_empty());
+    }
+
+    #[test]
     fn branch_reuses_an_existing_target_project() {
         // The explicit target already exists: the branch reads it,
         // creates nothing, and forks straight into it — no creation
@@ -8691,7 +9155,7 @@ mod tests {
             Some("https://src.opensuse.org/jengelh/descent3#master"),
             None,
         );
-        let obs_http = FakeHttp::new()
+        let obs_http = branch_source_repos_fixture(FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/public/source/games/descent3/_meta",
                 &meta,
@@ -8703,7 +9167,7 @@ mod tests {
             .with_post(
                 "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master&target_project=home%3Afbui%3Atest%3Adescent3",
                 &fork_status("home:fbui:test:descent3", "descent3", "games", "descent3"),
-            );
+            ), "games", "");
         let options = ForkOptions {
             target_project: Some("home:fbui:test:descent3".to_string()),
             ..ForkOptions::default()
@@ -8755,7 +9219,7 @@ mod tests {
             Some("https://src.opensuse.org/jengelh/descent3#master"),
             None,
         );
-        let obs_http = FakeHttp::new()
+        let obs_http = branch_source_repos_fixture(FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/public/source/games/descent3/_meta",
                 &meta,
@@ -8771,7 +9235,7 @@ mod tests {
             .with_post(
                 "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master&target_project=home%3Afbui%3Atest%3Adescent3",
                 &fork_status("home:fbui:test:descent3", "descent3", "games", "descent3"),
-            );
+            ), "games", "");
         let options = ForkOptions {
             target_project: Some("home:fbui:test:descent3".to_string()),
             ..ForkOptions::default()
@@ -8792,7 +9256,8 @@ mod tests {
         assert!(lines.lock().unwrap().is_empty());
         // The target was read twice — publicly, then with the
         // client's credentials — and the authenticated read is what
-        // saw the hidden project.
+        // saw the hidden project; after the fork the source
+        // project's repository list is read too.
         assert_eq!(
             obs_http.get_calls(),
             vec![
@@ -8808,6 +9273,10 @@ mod tests {
                 (
                     "https://api.opensuse.org/source/home:fbui:test:descent3/_meta".to_string(),
                     true
+                ),
+                (
+                    "https://api.opensuse.org/public/source/games/_meta".to_string(),
+                    false
                 ),
             ]
         );
@@ -8843,7 +9312,7 @@ mod tests {
             Some("https://src.opensuse.org/jengelh/descent3#master"),
             None,
         );
-        let obs_http = FakeHttp::new()
+        let obs_http = branch_source_repos_fixture(FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/public/source/games/descent3/_meta",
                 &meta,
@@ -8872,7 +9341,7 @@ mod tests {
                     "games",
                     "descent3",
                 ),
-            );
+            ), "games", "");
         let result = client(&gitea_http)
             .with_debug(debug)
             .branch(
@@ -8929,13 +9398,13 @@ mod tests {
             Some("https://src.opensuse.org/jengelh/descent3#master"),
             None,
         );
-        let obs_http = obs_fork_fixture(
+        let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             FakeHttp::new(),
             "https://api.opensuse.org/public/source/games/descent3/_meta",
             &meta,
             "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master",
             &fork_status("home:fbui:branches:games", "descent3", "games", "descent3"),
-        );
+        ), "games", "");
         let obs = ObsClient::with_credentials(
             &obs_http,
             Credentials::Bearer {
@@ -8954,7 +9423,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.target_project, "home:fbui:branches:games");
-        // The only OBS read is the package meta: no existence read
+        // The OBS reads are the package meta and, after the fork,
+        // the source project's repository list: no existence read
         // for a target the client cannot name.
         assert_eq!(
             obs_http
@@ -8962,7 +9432,10 @@ mod tests {
                 .iter()
                 .map(|(url, _)| url.as_str())
                 .collect::<Vec<_>>(),
-            vec!["https://api.opensuse.org/public/source/games/descent3/_meta"]
+            vec![
+                "https://api.opensuse.org/public/source/games/descent3/_meta",
+                "https://api.opensuse.org/public/source/games/_meta",
+            ]
         );
         assert!(obs_http.put_calls().is_empty());
     }
@@ -8998,13 +9471,13 @@ mod tests {
             Some("https://src.opensuse.org/jengelh/descent3#master"),
             None,
         );
-        let obs_http = obs_fork_fixture(
+        let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             FakeHttp::new(),
             "https://api.opensuse.org/public/source/games/descent3/_meta",
             &meta,
             "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master",
             &fork_status("home:fbui:branches:games", "descent3", "games", "descent3"),
-        );
+        ), "games", "");
         let obs = ObsClient::with_credentials(
             &obs_http,
             Credentials::Basic {
@@ -9024,14 +9497,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.target_project, "home:fbui:branches:games");
-        // The only OBS read is the package meta: no existence read
+        // The OBS reads are the package meta and, after the fork,
+        // the source project's repository list: no existence read
         // for a default the client could not name.
         assert_eq!(
             obs_http.get_calls(),
-            vec![(
-                "https://api.opensuse.org/public/source/games/descent3/_meta".to_string(),
-                false
-            )]
+            vec![
+                (
+                    "https://api.opensuse.org/public/source/games/descent3/_meta".to_string(),
+                    false
+                ),
+                (
+                    "https://api.opensuse.org/public/source/games/_meta".to_string(),
+                    false
+                ),
+            ]
         );
         assert!(obs_http.put_calls().is_empty());
     }
@@ -9271,7 +9751,7 @@ mod tests {
             Some("https://src.opensuse.org/jengelh/descent3#master"),
             None,
         );
-        let obs_http = FakeHttp::new()
+        let obs_http = branch_source_repos_fixture(FakeHttp::new()
             .with_get(
                 "https://api.opensuse.org/public/source/games/descent3/_meta",
                 &meta,
@@ -9299,7 +9779,7 @@ mod tests {
             .with_post(
                 "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fdescent3%23master&target_project=home%3Afbui%3Atest%3Adescent3",
                 &fork_status("home:fbui:test:descent3", "descent3", "games", "descent3"),
-            );
+            ), "games", "");
         let options = ForkOptions {
             target_project: Some("home:fbui:test:descent3".to_string()),
             ..ForkOptions::default()
@@ -9635,7 +10115,7 @@ mod tests {
             Some("https://src.opensuse.org/adamm/gsl.git#factory"),
             None,
         );
-        let obs_http = branch_target_fixture(FakeHttp::new(), "science")
+        let obs_http = branch_source_repos_fixture(branch_target_fixture(FakeHttp::new(), "science")
             .with_get(
                 "https://api.opensuse.org/public/source/openSUSE:Factory/gsl/_meta",
                 &named_meta,
@@ -9647,7 +10127,7 @@ mod tests {
             .with_post(
                 "https://api.opensuse.org/source/science/gsl?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgsl%23factory",
                 &fork_status("home:fbui:branches:science", "gsl", "science", "gsl"),
-            );
+            ), "science", "");
         let result = client(&gitea_http)
             .with_debug(debug)
             .branch(
@@ -9699,13 +10179,13 @@ mod tests {
             Some("https://src.opensuse.org/adamm/gsl.git#factory"),
             Some("science"),
         );
-        let obs_http = obs_fork_fixture(
+        let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             branch_target_fixture(FakeHttp::new(), "openSUSE:Factory"),
             "https://api.opensuse.org/public/source/openSUSE:Factory/gsl/_meta",
             &named_meta,
             "https://api.opensuse.org/source/openSUSE:Factory/gsl?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgsl%23factory",
             &fork_status("home:fbui:branches:openSUSE:Factory", "gsl", "openSUSE:Factory", "gsl"),
-        );
+        ), "openSUSE:Factory", "");
         let options = ForkOptions {
             no_devel_project: true,
             ..ForkOptions::default()
@@ -9722,7 +10202,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.target_project, "home:fbui:branches:openSUSE:Factory");
         // The devel package's meta was never read: the named meta,
-        // then the target-project existence read.
+        // then the target-project existence read, then — after the
+        // fork — the source project's repository list.
         assert_eq!(
             obs_http
                 .get_calls()
@@ -9732,6 +10213,7 @@ mod tests {
             vec![
                 "https://api.opensuse.org/public/source/openSUSE:Factory/gsl/_meta",
                 "https://api.opensuse.org/public/source/home:scarabeus_iv:branches:openSUSE:Factory/_meta",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/_meta",
             ]
         );
     }
@@ -9818,13 +10300,13 @@ mod tests {
             Some("https://src.opensuse.org/jengelh/descent3#master"),
             None,
         );
-        let obs_http = obs_fork_fixture(
+        let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             branch_target_fixture(FakeHttp::new(), "games"),
             "https://api.opensuse.org/public/source/games/descent3/_meta",
             &meta,
             "https://api.opensuse.org/source/games/descent3?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%3A443%2Ffbui%2Fdescent3%23master",
             &fork_status("home:fbui:branches:games", "descent3", "games", "descent3"),
-        );
+        ), "games", "");
         let client =
             GiteaClient::with_base(&gitea_http, "https://src.opensuse.org:443", bearer()).unwrap();
         let result = client
@@ -9941,13 +10423,13 @@ mod tests {
             Some("https://src.opensuse.org/adamm/git-quick-stats"),
             None,
         );
-        let obs_http = obs_fork_fixture(
+        let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             branch_target_fixture(FakeHttp::new(), "home:adamm"),
             "https://api.opensuse.org/public/source/home:adamm/git-quick-stats/_meta",
             &meta,
             "https://api.opensuse.org/source/home:adamm/git-quick-stats?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgit-quick-stats%23main",
             &fork_status("home:fbui:branches:home:adamm", "git-quick-stats", "home:adamm", "git-quick-stats"),
-        );
+        ), "home:adamm", "");
         let result = client(&gitea_http)
             .with_debug(debug)
             .branch(
@@ -9991,13 +10473,13 @@ mod tests {
             Some("https://src.opensuse.org/adamm/gsl.git#factory"),
             None,
         );
-        let obs_http = obs_fork_fixture(
+        let obs_http = branch_source_repos_fixture(obs_fork_fixture(
             branch_target_fixture(FakeHttp::new(), "science"),
             "https://api.opensuse.org/public/source/science/gsl/_meta",
             &meta,
             "https://api.opensuse.org/source/science/gsl?cmd=fork&scmsync=https%3A%2F%2Fsrc.opensuse.org%2Ffbui%2Fgsl%23slfo-main",
             &fork_status("home:fbui:branches:science", "gsl", "science", "gsl"),
-        );
+        ), "science", "");
         let options = ForkOptions {
             fork_branch: Some("slfo-main".to_string()),
             ..ForkOptions::default()
