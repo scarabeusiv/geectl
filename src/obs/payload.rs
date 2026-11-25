@@ -4494,6 +4494,38 @@ mod tests {
     }
 
     #[test]
+    fn file_maintenance_incident_permission_denied_names_update_fallback() {
+        // A permission denial on the incident filing names the
+        // `:Update` fallback: branch the package from the `:Update`
+        // project instead.
+        let search_url = action_match_url(
+            "maintenance_incident",
+            &[
+                "source/@package='foo'",
+                "target/@project='openSUSE:Maintenance'",
+            ],
+        );
+        let http = FakeHttp::new()
+            .with_get(&search_url, "<collection matches=\"0\"></collection>")
+            .with_post_error(
+                "https://api.opensuse.org/request?cmd=create&addrevision=1",
+                ErrorKind::AuthFailed,
+            );
+        let obs = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        let err = filing
+            .file_maintenance_incident(&incident_payload())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+        assert!(
+            err.to_string()
+                .contains("branch the package from the :Update project instead"),
+            "error names the :Update fallback: {err}",
+        );
+    }
+
+    #[test]
     fn file_maintenance_incident_live_refuses_when_open_incident_exists() {
         let search_url = action_match_url(
             "maintenance_incident",

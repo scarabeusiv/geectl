@@ -1,4 +1,5 @@
 use super::build_url;
+use super::common::map_maintenance_permission_denied;
 use super::element_text;
 use super::parse_directory;
 use super::parse_directory_rev;
@@ -567,7 +568,20 @@ impl<'a> ObsClient<'a> {
             query.push(("maintenance", "1"));
         }
         let url = build_url(&self.base, &["source", project, package], &query);
-        let body = self.http.post(&url, "", &self.credentials)?;
+        // A permission denial on a maintenance branch names the
+        // `:Update` fallback: branch the package from the `:Update`
+        // project instead. A plain branch has no such route, so its
+        // denial propagates as-is.
+        let body = self.http.post(&url, "", &self.credentials).map_err(|err| {
+            if options.maintenance {
+                map_maintenance_permission_denied(
+                    err,
+                    &format!("branching {project}/{package} as a maintenance incident"),
+                )
+            } else {
+                err
+            }
+        })?;
         match parse_branch_result(&body) {
             Some(result) => Ok(Some(result)),
             None => Err(GeectlError::new(
@@ -2460,6 +2474,65 @@ mod tests {
             .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
             .unwrap();
         assert_eq!(result.unwrap().target_package, "renamed".to_string());
+    }
+
+    #[test]
+    fn branch_package_maintenance_permission_denied_names_update_fallback() {
+        // A permission denial on a maintenance branch names the
+        // `:Update` fallback: branch the package from the `:Update`
+        // project instead.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
+            )
+            .with_post_error(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch&maintenance=1",
+                ErrorKind::AuthFailed,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let options = BranchOptions {
+            maintenance: true,
+            ..BranchOptions::default()
+        };
+        let err = client
+            .branch_package("test:factory", "test-pkgA", &options, &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+        assert!(
+            err.to_string()
+                .contains("branch the package from the :Update project instead"),
+            "error names the :Update fallback: {err}",
+        );
+    }
+
+    #[test]
+    fn branch_package_plain_permission_denied_names_no_fallback() {
+        // A plain branch has no `:Update` route to name: its denial
+        // propagates as-is.
+        let http = FakeHttp::new()
+            .with_get(
+                "https://api.opensuse.org/source/test:factory/test-pkgA/_meta",
+                "<package name=\"test-pkgA\" project=\"test:factory\"><title>Test package</title></package>",
+            )
+            .with_post_error(
+                "https://api.opensuse.org/source/test:factory/test-pkgA?cmd=branch",
+                ErrorKind::AuthFailed,
+            );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .branch_package(
+                "test:factory",
+                "test-pkgA",
+                &BranchOptions::default(),
+                &DryRun::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+        assert!(
+            !err.to_string().contains(":Update"),
+            "plain branch denial names no fallback: {err}",
+        );
     }
 
     #[test]

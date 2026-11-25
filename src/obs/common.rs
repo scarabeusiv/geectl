@@ -31,6 +31,25 @@ pub fn valid_obs_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | ':'))
 }
 
+/// Map a permission-denied error from a maintenance branch or a
+/// maintenance-incident filing to an error naming the `:Update`
+/// fallback route: branch the package from the `:Update` project
+/// instead. The kind stays `AuthFailed` and the original context
+/// (the URL and status) is kept, so the failure stays diagnosable;
+/// only the fallback route is added. Any other error passes through
+/// unchanged: only a permission denial has a `:Update` route to name.
+pub(crate) fn map_maintenance_permission_denied(err: GeectlError, action: &str) -> GeectlError {
+    if err.kind() != ErrorKind::AuthFailed {
+        return err;
+    }
+    let mut message = format!("permission denied {action}");
+    if !err.context.is_empty() {
+        message.push_str(&format!(" ({})", err.context));
+    }
+    message.push_str("; branch the package from the :Update project instead");
+    GeectlError::new(ErrorKind::AuthFailed, message)
+}
+
 /// True when `name` is an OBS attribute name in `NAMESPACE:NAME`
 /// shape: exactly one colon, both sides non-empty. The server's
 /// shape check is only "exactly two parts when split on the colon"
@@ -1117,6 +1136,34 @@ mod tests {
         assert!(!valid_obs_name("foo/bar"));
         assert!(!valid_obs_name("foo?x=1"));
         assert!(!valid_obs_name("foo' or '1'='1"));
+    }
+
+    #[test]
+    fn map_maintenance_permission_denied_names_update_fallback_on_auth_failed() {
+        let err = GeectlError::new(
+            ErrorKind::AuthFailed,
+            "https://api.opensuse.org/source?cmd=branch returned 403",
+        );
+        let mapped = map_maintenance_permission_denied(err, "branching maintained package foo");
+        assert_eq!(mapped.kind(), ErrorKind::AuthFailed);
+        assert_eq!(
+            mapped.context,
+            "permission denied branching maintained package foo (https://api.opensuse.org/source?cmd=branch returned 403); branch the package from the :Update project instead",
+        );
+    }
+
+    #[test]
+    fn map_maintenance_permission_denied_passes_other_kinds_through() {
+        let err = GeectlError::new(
+            ErrorKind::NotFound,
+            "https://api.opensuse.org/source/foo returned 404",
+        );
+        let mapped = map_maintenance_permission_denied(err, "branching maintained package foo");
+        assert_eq!(mapped.kind(), ErrorKind::NotFound);
+        assert_eq!(
+            mapped.context,
+            "https://api.opensuse.org/source/foo returned 404",
+        );
     }
 
     #[test]

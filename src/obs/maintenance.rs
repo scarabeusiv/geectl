@@ -1,4 +1,5 @@
 use super::build_url;
+use super::common::map_maintenance_permission_denied;
 use super::find_element_tag;
 use super::parse_status_ok;
 use super::tag_attr;
@@ -237,7 +238,12 @@ impl<'a> ObsClient<'a> {
                 "branching a maintained package requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             ));
         }
-        let body = self.http.post(&url, "", &self.credentials)?;
+        // A permission denial here names the `:Update` fallback:
+        // branch the package from the `:Update` project instead.
+        let body = self
+            .http
+            .post(&url, "", &self.credentials)
+            .map_err(|err| map_maintenance_permission_denied(err, &what))?;
         let result = parse_maintenance_branch_result(&body).ok_or_else(|| {
             GeectlError::new(ErrorKind::ServerError, "unexpected OBS branch response")
         })?;
@@ -540,5 +546,26 @@ mod tests {
             "<status code=\"ok\"><data name=\"target_project\"/></status>"
         )
         .is_none());
+    }
+
+    #[test]
+    fn maintenance_branch_permission_denied_names_update_fallback() {
+        // A permission denial on the maintenance branch names the
+        // `:Update` fallback: branch the package from the `:Update`
+        // project instead.
+        let http = FakeHttp::new().with_post_error(
+            "https://api.opensuse.org/source?cmd=branch&attribute=OBS%3AMaintained&update_project_attribute=OBS%3AUpdateProject&package=foo",
+            ErrorKind::AuthFailed,
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let err = client
+            .maintenance_branch("foo", &MaintenanceBranchOptions::new(), &DryRun::new(false))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+        assert!(
+            err.to_string()
+                .contains("branch the package from the :Update project instead"),
+            "error names the :Update fallback: {err}",
+        );
     }
 }

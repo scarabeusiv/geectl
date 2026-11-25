@@ -1,4 +1,5 @@
 use super::build_url;
+use super::common::map_maintenance_permission_denied;
 use super::parse_branch_marker;
 use super::parse_request_id;
 use super::parse_request_ids;
@@ -3025,11 +3026,18 @@ impl<'a> ObsClient<'a> {
         &self,
         xml: &str,
     ) -> Result<String, GeectlError> {
+        // A permission denial on the incident filing names the
+        // `:Update` fallback: branch the package from the `:Update`
+        // project instead. The shared filing POST is untouched, so
+        // other request kinds keep their error as-is.
         self.create_request_with_query(
             xml,
             &[("cmd", "create"), ("addrevision", "1")],
             "maintenance incident",
         )
+        .map_err(|err| {
+            map_maintenance_permission_denied(err, "filing the maintenance incident request")
+        })
     }
 
     /// The shared filing POST: `POST /request` with the given query
