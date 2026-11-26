@@ -507,10 +507,14 @@ pub fn validate(
         }
     }
 
-    // V5 (file-global) and V11 (newest N entries), per `.changes` file.
+    // V5 (file-global) and V11 (newest N entries, plus the file
+    // ending), per `.changes` file.
     for (changes_name, file) in &parsed.changes {
         check_sequence(changes_name, file, &mut report);
         check_entry_format(changes_name, file, entries, &mut report);
+        if let Some(text) = local.files.get(changes_name) {
+            check_file_ending(changes_name, file, text, &mut report);
+        }
     }
 
     // Target-relative rules. `target` and `target_parsed` are built
@@ -1228,6 +1232,39 @@ fn is_unfilled_slot(line: &str) -> bool {
     line.contains("reason: TODO") || line.contains("TODO:")
 }
 
+/// V11 (file-global): the file ends with exactly one newline — the
+/// skill's `--all` end-of-file checks, in the gate. A missing final
+/// newline and trailing blank lines are findings. An empty file is
+/// already a V11 finding in `check_entry_format`, so it is skipped
+/// here. `lines()` cannot see the ending, so this reads the raw
+/// snapshot text (the load normalization keeps the trailing-newline
+/// state, so the check sees what the file holds).
+fn check_file_ending(
+    changes_name: &str,
+    file: &ChangesFile,
+    text: &str,
+    report: &mut ValidationReport,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if !text.ends_with('\n') {
+        report.findings.push(Finding {
+            rule: Rule::V11,
+            file: changes_name.to_string(),
+            line: file.lines.len(),
+            message: "missing newline at end of file".to_string(),
+        });
+    } else if text.ends_with("\n\n") {
+        report.findings.push(Finding {
+            rule: Rule::V11,
+            file: changes_name.to_string(),
+            line: file.lines.len(),
+            message: "trailing blank line(s) at end of file".to_string(),
+        });
+    }
+}
+
 /// V9: a version update carries more than a bare version line. The
 /// author, not NEWS, decides there is nothing to say: a bare update
 /// with no substantive line and no no-visible-changes statement is
@@ -1776,7 +1813,7 @@ mod tests {
     fn changes_file(newest_body: &str, older: &str) -> String {
         let sep = "-".repeat(67);
         format!(
-            "{sep}\n{}\n\n{}\n\n{sep}\n{}\n\n{}\n\n",
+            "{sep}\n{}\n\n{}\n\n{sep}\n{}\n\n{}\n",
             header("Wed May 27 16:31:48 UTC 2026"),
             newest_body,
             header("Tue May 26 10:00:00 UTC 2026"),
@@ -1825,7 +1862,7 @@ mod tests {
     fn v5_flags_out_of_sequence_and_bad_dates() {
         let sep = "-".repeat(67);
         let text = format!(
-            "{sep}\n{}\n\n- Update to 2.0\n\n{sep}\n{}\n\n- Initial package\n\n",
+            "{sep}\n{}\n\n- Update to 2.0\n\n{sep}\n{}\n\n- Initial package\n",
             header("Tue May 26 10:00:00 UTC 2026"),
             header("Wed May 27 16:31:48 UTC 2026"),
         );
@@ -1866,7 +1903,7 @@ mod tests {
         // only move the refusal to the Factory submission.
         let sep = "-".repeat(67);
         let text = format!(
-            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash\n\n{sep}\nSat Apr 14 2007 Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash\n\n{sep}\nSat Apr 14 2007 Tobias Blomberg <t@example.com>\n\n- Initial package\n"
         );
         let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &text)]);
         let report = validate(&local, None, &ValidateOptions::default());
@@ -1902,7 +1939,7 @@ mod tests {
         // parse, and the whole file passes.
         let sep = "-".repeat(67);
         let text = format!(
-            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash\n\n{sep}\nSat Apr 14 10:00:00 UTC 2007 - Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash\n\n{sep}\nSat Apr 14 10:00:00 UTC 2007 - Tobias Blomberg <t@example.com>\n\n- Initial package\n"
         );
         let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &text)]);
         let report = validate(&local, None, &ValidateOptions::default());
@@ -1917,7 +1954,7 @@ mod tests {
         // with the separator clears it.
         let sep = "-".repeat(67);
         let unrepaired = format!(
-            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash\n\n{sep}\nSat Apr 14 2007 - Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash\n\n{sep}\nSat Apr 14 2007 - Tobias Blomberg <t@example.com>\n\n- Initial package\n"
         );
         let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &unrepaired)]);
         let report = validate(&local, None, &ValidateOptions::default());
@@ -1945,7 +1982,7 @@ mod tests {
         // with no `-` above them. The gate still refuses; the remedy
         // is converting the old history to separated entries.
         let sep = "-".repeat(67);
-        let old = "* Sat Apr 14 2007 Tobias Blomberg <t@example.com>\n- Old Meego change\n\n* Fri Apr 13 2007 Tobias Blomberg <t@example.com>\n- Older change\n\n";
+        let old = "* Sat Apr 14 2007 Tobias Blomberg <t@example.com>\n- Old Meego change\n\n* Fri Apr 13 2007 Tobias Blomberg <t@example.com>\n- Older change\n";
         let text = format!(
             "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{old}"
         );
@@ -2013,7 +2050,7 @@ mod tests {
         // a `+` bullet, and a bare prose line.
         let bad_sep = "-".repeat(66);
         let text = format!(
-            "{bad_sep}\n{}\n- Update to 2.0, a very long line that runs past sixty-seven characters for sure\n  + third level\nbare prose\n\n{sep}\n{}\n\n- Initial package\n\n",
+            "{bad_sep}\n{}\n- Update to 2.0, a very long line that runs past sixty-seven characters for sure\n  + third level\nbare prose\n\n{sep}\n{}\n\n- Initial package\n",
             header("Wed May 27 16:31:48 UTC 2026"),
             header("Tue May 26 10:00:00 UTC 2026"),
         );
@@ -2328,7 +2365,7 @@ mod tests {
         ]);
         let sep = "-".repeat(67);
         let local_changes = format!(
-            "{sep}\nThu May 28 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.0\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package   \n\n"
+            "{sep}\nThu May 28 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.0\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package   \n"
         );
         let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &local_changes)]);
         let report = validate(&local, Some(&target), &ValidateOptions::default());
@@ -2356,7 +2393,7 @@ mod tests {
         std::fs::write(dir.path().join("foo.spec"), SPEC).unwrap();
         let sep = "-".repeat(67);
         let local_changes = format!(
-            "{sep}\nThu May 28 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.0\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Fix the thé\n\n"
+            "{sep}\nThu May 28 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.0\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Fix the thé\n"
         );
         // The older entry's `thé` is Latin-1: its UTF-8 bytes
         // C3 A9 become the single byte E9.
@@ -2555,6 +2592,43 @@ mod tests {
     }
 
     #[test]
+    fn v11_flags_a_missing_newline_at_end_of_file() {
+        // The skill's `--all` end-of-file check: a file whose last
+        // line carries no newline is a V11 finding on that line.
+        let text = changes_file("- Update to 2.0\n  * Fix a crash", "- Initial package")
+            .trim_end_matches('\n')
+            .to_string();
+        let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &text)]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        let eof: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == Rule::V11 && f.message.contains("missing newline"))
+            .collect();
+        assert_eq!(eof.len(), 1, "findings: {:?}", report.findings);
+        assert_eq!(eof[0].line, 10);
+    }
+
+    #[test]
+    fn v11_flags_trailing_blank_lines_at_end_of_file() {
+        // The skill's `--all` end-of-file check: blank lines after
+        // the last entry are a V11 finding on the last line.
+        let text = format!(
+            "{}\n",
+            changes_file("- Update to 2.0\n  * Fix a crash", "- Initial package")
+        );
+        let local = snapshot(&[("foo.spec", SPEC), ("foo.changes", &text)]);
+        let report = validate(&local, None, &ValidateOptions::default());
+        let eof: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == Rule::V11 && f.message.contains("trailing blank line"))
+            .collect();
+        assert_eq!(eof.len(), 1, "findings: {:?}", report.findings);
+        assert_eq!(eof[0].line, 11);
+    }
+
+    #[test]
     fn v12_flags_a_top_level_cve_named_as_not_affected() {
         let local = snapshot(&[
             ("foo.spec", SPEC),
@@ -2661,7 +2735,7 @@ mod tests {
             (
                 "foo.changes",
                 &format!(
-                    "{sep}\nMon May 25 09:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.0\n\n{sep}\nSun May 24 09:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package\n\n"
+                    "{sep}\nMon May 25 09:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.0\n\n{sep}\nSun May 24 09:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package\n"
                 ),
             ),
         ]);
@@ -2672,7 +2746,7 @@ mod tests {
             (
                 "foo.changes",
                 &format!(
-                    "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.9\n\n{sep}\nMon May 25 09:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.0\n\n{sep}\nSun May 24 09:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package\n\n"
+                    "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.9\n\n{sep}\nMon May 25 09:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 1.0\n\n{sep}\nSun May 24 09:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package\n"
                 ),
             ),
         ]);
@@ -2691,7 +2765,7 @@ mod tests {
             (
                 "foo.changes",
                 &format!(
-                    "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n"
+                    "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n"
                 ),
             ),
         ]);

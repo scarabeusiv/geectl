@@ -9748,7 +9748,7 @@ mod tests {
     fn valid_changes() -> String {
         let sep = "-".repeat(67);
         format!(
-            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash (boo#123456)\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package\n\n"
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n  * Fix a crash (boo#123456)\n\n{sep}\nTue May 26 10:00:00 UTC 2026 - Jane Packager <jane@example.com>\n\n- Initial package\n"
         )
     }
 
@@ -9757,7 +9757,7 @@ mod tests {
     fn violating_changes() -> String {
         let sep = "-".repeat(20);
         format!(
-            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n"
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n"
         )
     }
 
@@ -9806,7 +9806,7 @@ mod tests {
         let (dir, mut wc) = do_checkout(&http);
         let sep = "-".repeat(67);
         let text = format!(
-            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nSat Apr 14 2007 Tobias Blomberg <t@example.com>\n\n- Initial package\n\n"
+            "{sep}\nWed May 27 16:31:48 UTC 2026 - Jane Packager <jane@example.com>\n\n- Update to 2.0\n\n{sep}\nSat Apr 14 2007 Tobias Blomberg <t@example.com>\n\n- Initial package\n"
         );
         write_file(&wc.root, "foo.changes", &text);
         add(&wc, &["foo.changes".to_string()], &DryRun::new(false))

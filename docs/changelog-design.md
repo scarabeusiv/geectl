@@ -62,8 +62,9 @@ skipped. Any other fetch failure is a hard error.
   `License:` is unchanged vs the target is also a finding (a line
   stating there is no change counts as no claim).
 - V11 — the newest N entries (default 1) pass the format lint
-  (bullets `- ` at indent 0, `* ` nested at indent 2), and the
-  submission carries at most N new entries vs the target; older
+  (bullets `- ` at indent 0, `* ` nested at indent 2), the file ends
+  with exactly one newline, and the submission carries at most N new
+  entries vs the target; older
   entries match the target's up to the whole-file normalization
   `generate --write` applies (sanctioned exceptions are named in
   the message for the human to judge).
