@@ -3,12 +3,14 @@
 #
 # Usage: scripts/bump-version.sh X.Y.Z
 #
-# The version surfaces in this repo are exactly two: the [package]
-# version in Cargo.toml and the geectl entry in Cargo.lock (README.md
-# and docs/ carry no version string — verified by grepping for the
-# current version before writing this script). The script rewrites
-# both, then verifies the result, so a half-applied bump fails here
-# rather than riding along in a version-bump PR.
+# The version surfaces in this repo are three: the [package] version
+# in Cargo.toml, the geectl entry in Cargo.lock, and the man pages
+# under man/, which stamp the version in their `.TH` header
+# (README.md and docs/ carry no version string — verified by grepping
+# for the current version before writing this script). The script
+# rewrites the two manifest surfaces and regenerates the pages, then
+# verifies the result, so a half-applied bump fails here rather than
+# riding along in a version-bump PR.
 set -euo pipefail
 
 # No leading zeros: Cargo rejects them, and only after the tree is edited.
@@ -40,15 +42,22 @@ fi
 # to restore.
 subst_tmp=""
 stale_tmp=""
+gen_tmp=""
 cleanup() {
   local rc=$?
   if [ -n "$subst_tmp" ]; then rm -f "$subst_tmp"; fi
   if [ -n "$stale_tmp" ]; then rm -f "$stale_tmp"; fi
+  if [ -n "$gen_tmp" ]; then rm -rf "$gen_tmp"; fi
   if [ "$rc" -ne 0 ]; then
     # One file at a time: a single checkout naming a surface that is
     # not in the index (no Cargo.lock yet, say) restores neither.
     git checkout -- Cargo.toml 2>/dev/null || true
     git checkout -- Cargo.lock 2>/dev/null || true
+    # The regenerated pages are restored the same way. The tree was
+    # clean at entry (see the precondition above), so any untracked
+    # file under man/ was created by this run and is removed with it.
+    git checkout -- man/ 2>/dev/null || true
+    git clean -f man/ 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -115,6 +124,24 @@ if [ "$toml_diff" != "$(printf '1\t1')" ] || [ "$lock_diff" != "$(printf '1\t1')
   git diff HEAD -- Cargo.toml Cargo.lock >&2
   exit 1
 fi
+
+# The man pages stamp the version in their `.TH` header, so they are
+# a version surface too — regenerated, never edited: the generator is
+# the single source of truth for their content (the assets-drift job
+# fails if the committed pages differ from a fresh generation).
+# Generate into a temp dir and copy only the pages over; the
+# completions carry no version string and stay untouched. This runs
+# after the manifest edits, so the generator builds against the new
+# version.
+gen_tmp=$(mktemp -d)
+cargo run --locked --quiet --features gen --bin geectl-gen -- "$gen_tmp"
+cp "$gen_tmp"/man/*.1 man/
+# Prune pages the generator no longer produces, mirroring the
+# generator pruning of stale pages: a removed leaf leaves no orphan
+# page behind.
+for page in man/*.1; do
+  [ -f "$gen_tmp/man/$(basename "$page")" ] || rm -f "$page"
+done
 
 # Verify both surfaces carry the new version, and that no other
 # tracked file still carries the old one.

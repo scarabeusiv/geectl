@@ -11210,3 +11210,78 @@ fn config_import_oscrc_existing_alias_refuses_and_force_replaces() {
     );
     assert!(!after.contains("other.example.com"), "{after}");
 }
+
+/// The version bump regenerates the man pages: a bump must leave no
+/// stale version anywhere, including the `.TH` headers under man/.
+/// Release run 45789359871 failed `post-release-bump` because the
+/// bump never regenerated them, so 165 pages still stamped 0.2.2.
+/// Runs the real script on a scratch worktree of this repo and
+/// asserts the bump succeeds and the pages carry the new version.
+#[test]
+#[cfg(unix)]
+fn bump_version_regenerates_man_pages() {
+    let current = env!("CARGO_PKG_VERSION");
+    let mut parts: Vec<u64> = current
+        .split('.')
+        .map(|p| p.parse().expect("semver part"))
+        .collect();
+    assert_eq!(parts.len(), 3, "CARGO_PKG_VERSION is X.Y.Z");
+    parts[2] += 1;
+    let next = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Scratch worktree: a cheap hardlinked checkout, clean by
+    // construction (the script refuses a dirty tree). TempDir creates
+    // the dir; `git worktree add` wants the path gone.
+    let dir = TempDir::new();
+    fs::remove_dir(&dir.0).expect("remove temp dir for worktree");
+    let git = |args: &[&str]| -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("run git")
+    };
+    let wt = dir.0.to_str().expect("temp path is UTF-8");
+    let out = git(&["worktree", "add", wt, "HEAD"]);
+    assert!(
+        out.status.success(),
+        "git worktree add: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The worktree build is fresh: a shared target dir would
+    // deadlock, since the outer `cargo test` holds the target lock.
+    let bump = Command::new("bash")
+        .args(["scripts/bump-version.sh", &next])
+        .current_dir(&dir.0)
+        .output()
+        .expect("run bump-version.sh");
+    let stderr = String::from_utf8_lossy(&bump.stderr);
+    assert!(bump.status.success(), "bump-version.sh failed: {stderr}");
+    let manifest = fs::read_to_string(dir.0.join("Cargo.toml")).expect("read Cargo.toml");
+    assert!(
+        manifest.contains(&format!("version = \"{next}\"")),
+        "Cargo.toml carries {next}"
+    );
+    let mut stale = Vec::new();
+    for entry in fs::read_dir(dir.0.join("man")).expect("read man/") {
+        let path = entry.expect("man entry").path();
+        if path.extension().is_some_and(|e| e == "1") {
+            let text = fs::read_to_string(&path).expect("read man page");
+            assert!(text.contains(&next), "{} carries {next}", path.display());
+            if text.contains(current) {
+                stale.push(path);
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "man pages still stamp {current}: {stale:?}"
+    );
+    let out = git(&["worktree", "remove", "--force", wt]);
+    assert!(
+        out.status.success(),
+        "git worktree remove: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

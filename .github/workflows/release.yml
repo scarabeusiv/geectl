@@ -487,13 +487,15 @@ jobs:
           # Stage only the version surfaces: the bump script touches
           # nothing else, and anything else it touched must fail the
           # job rather than ride along in a version-bump PR.
-          git add Cargo.toml Cargo.lock
-          # Exactly the two version surfaces, staged as modifications,
-          # may be present — nothing else. The old `^[AMD] ` filter let
-          # staged adds/deletes through; renames (`R` lines) fell
-          # outside its vocabulary too (failing closed, noisily). An
-          # exact allowlist fails closed on any of those.
-          stray=$(git status --porcelain=v1 | grep -v '^M  Cargo\.toml$' | grep -v '^M  Cargo\.lock$' || true)
+          git add Cargo.toml Cargo.lock man/
+          # Exactly the version surfaces, staged as modifications —
+          # plus the regenerated man pages, as modifications,
+          # additions, or deletions of `*.1` files — may be present,
+          # nothing else. The old `^[AMD] ` filter let staged
+          # adds/deletes through; renames (`R` lines) fell outside its
+          # vocabulary too (failing closed, noisily). An exact
+          # allowlist fails closed on any of those.
+          stray=$(git status --porcelain=v1 | grep -v '^M  Cargo\.toml$' | grep -v '^M  Cargo\.lock$' | grep -v '^[MAD]  man/[^/]*\.1$' || true)
           if [ -n "$stray" ]; then
             echo "::error::the bump changed files outside the version surfaces:" >&2
             echo "$stray" >&2
