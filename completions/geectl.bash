@@ -706,6 +706,9 @@ _geectl() {
             geectl__subcmd__help__subcmd__pull__subcmd__request,cancel-review-request)
                 cmd="geectl__subcmd__help__subcmd__pull__subcmd__request__subcmd__cancel__subcmd__review__subcmd__request"
                 ;;
+            geectl__subcmd__help__subcmd__pull__subcmd__request,cleanup)
+                cmd="geectl__subcmd__help__subcmd__pull__subcmd__request__subcmd__cleanup"
+                ;;
             geectl__subcmd__help__subcmd__pull__subcmd__request,comment)
                 cmd="geectl__subcmd__help__subcmd__pull__subcmd__request__subcmd__comment"
                 ;;
@@ -1105,6 +1108,9 @@ _geectl() {
             geectl__subcmd__pull__subcmd__request,cancel-review-request)
                 cmd="geectl__subcmd__pull__subcmd__request__subcmd__cancel__subcmd__review__subcmd__request"
                 ;;
+            geectl__subcmd__pull__subcmd__request,cleanup)
+                cmd="geectl__subcmd__pull__subcmd__request__subcmd__cleanup"
+                ;;
             geectl__subcmd__pull__subcmd__request,comment)
                 cmd="geectl__subcmd__pull__subcmd__request__subcmd__comment"
                 ;;
@@ -1149,6 +1155,9 @@ _geectl() {
                 ;;
             geectl__subcmd__pull__subcmd__request__subcmd__help,cancel-review-request)
                 cmd="geectl__subcmd__pull__subcmd__request__subcmd__help__subcmd__cancel__subcmd__review__subcmd__request"
+                ;;
+            geectl__subcmd__pull__subcmd__request__subcmd__help,cleanup)
+                cmd="geectl__subcmd__pull__subcmd__request__subcmd__help__subcmd__cleanup"
                 ;;
             geectl__subcmd__pull__subcmd__request__subcmd__help,comment)
                 cmd="geectl__subcmd__pull__subcmd__request__subcmd__help__subcmd__comment"
@@ -5125,7 +5134,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help__subcmd__pull__subcmd__request)
-            opts="show diff search approve request-changes comment build-comment comments cancel-review-request merge decline withdraw reopen submit"
+            opts="show diff search approve request-changes comment build-comment comments cancel-review-request merge decline withdraw reopen submit cleanup"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -5167,6 +5176,20 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__help__subcmd__pull__subcmd__request__subcmd__cancel__subcmd__review__subcmd__request)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__help__subcmd__pull__subcmd__request__subcmd__cleanup)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -7465,7 +7488,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__pull__subcmd__request)
-            opts="-h --format --debug --debug-body --live --help show diff search approve request-changes comment build-comment comments cancel-review-request merge decline withdraw reopen submit help"
+            opts="-h --format --debug --debug-body --live --help show diff search approve request-changes comment build-comment comments cancel-review-request merge decline withdraw reopen submit cleanup help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -7576,6 +7599,24 @@ _geectl() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        geectl__subcmd__pull__subcmd__request__subcmd__cleanup)
+            opts="-h --format --debug --debug-body --live --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "json text" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         geectl__subcmd__pull__subcmd__request__subcmd__comment)
             opts="-h --body --parent --format --debug --debug-body --live --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -7661,7 +7702,7 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__pull__subcmd__request__subcmd__help)
-            opts="show diff search approve request-changes comment build-comment comments cancel-review-request merge decline withdraw reopen submit help"
+            opts="show diff search approve request-changes comment build-comment comments cancel-review-request merge decline withdraw reopen submit cleanup help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -7703,6 +7744,20 @@ _geectl() {
             return 0
             ;;
         geectl__subcmd__pull__subcmd__request__subcmd__help__subcmd__cancel__subcmd__review__subcmd__request)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        geectl__subcmd__pull__subcmd__request__subcmd__help__subcmd__cleanup)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

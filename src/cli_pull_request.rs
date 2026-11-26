@@ -8,7 +8,7 @@
 //!
 //! Reads are always live; the act leaves (`approve`,
 //! `request-changes`, `comment`, `build-comment`, `cancel-review-request`,
-//! `merge`, `decline`, `withdraw`, `reopen`, `submit`) are
+//! `merge`, `decline`, `withdraw`, `reopen`, `submit`, `cleanup`) are
 //! dry-run by default and mutate only with the global `--live`.
 //! `submit` files from the working copy in the current directory:
 //! an OBS submit request from an OBS-native checkout, a Gitea pull
@@ -54,9 +54,10 @@ use crate::gitea::{
     PrCreateOptions, ScmsyncUrl,
 };
 use crate::http::{HttpClient, Timeout, UreqClient};
+use crate::local_build::LocalBuild;
 use crate::obs::{
     package_show_url, AcceptCleanupOutcome, CveId, DryRun, ForwardActionResult, ObsClient,
-    ResultsQuery, ReviewTarget, SrPayload, OBS_API_BASE,
+    RequestAction, RequestState, ResultsQuery, ReviewTarget, SrPayload, OBS_API_BASE,
 };
 use crate::pull_request::{
     build_comment_body, PullRequest, PullRequestBackend, PullRequestClient, PullRequestEndpoint,
@@ -160,6 +161,15 @@ pub enum PullRequestCommand {
     /// checkout's backend decides; the other arm's flags are
     /// refused. Dry-run by default; mutates only with `--live`.
     Submit(SubmitArgs),
+    /// Clean the local build roots for the submit request filed
+    /// from the working copy in the current directory, when that
+    /// request is accepted. The request id was recorded by
+    /// `submit` in the checkout; the leaf reads the request state
+    /// once and wipes the roots only on `accepted`. A request in
+    /// any other state, and a checkout with nothing recorded,
+    /// delete nothing. Dry-run by default; mutates only with
+    /// `--live`.
+    Cleanup,
 }
 
 /// Arguments for `pull-request submit`: the OBS arm's flags and
@@ -685,6 +695,7 @@ pub fn run_pull_request(
             |client, reference, dry_run| client.reopen(reference, dry_run),
         ),
         PullRequestCommand::Submit(args) => submit(args, debug, live),
+        PullRequestCommand::Cleanup => cleanup(debug, live),
         PullRequestCommand::Search(args) => {
             // The filters are parsed and validated before any
             // credential resolution, like the handle above.
@@ -832,6 +843,7 @@ fn submit(args: SubmitArgs, debug: &Debug, live: bool) -> Result<(Value, String)
                     .with_debug(debug.clone())
                     .with_gitea_http(gitea_http);
                 let submitted = client.submit(&target, &dry_run)?;
+                record_submitted_request(&wc.root, &submitted);
                 Ok((
                     submit_payload(&submitted, &dry_run)?,
                     submit_text(&target, &submitted, &dry_run),
@@ -2331,6 +2343,272 @@ fn build_comment_text(
     }
 }
 
+/// Record a filed OBS submit request in the checkout at
+/// `root`, for `pull-request cleanup` to watch. Only the OBS arm
+/// files a submit request: a Gitea pull request, or a dry run that
+/// filed nothing, records nothing. A record that fails to write is
+/// a warning, not a failed filing: the request was filed, only the
+/// bookkeeping failed.
+fn record_submitted_request(root: &std::path::Path, submitted: &Option<Submitted>) {
+    let Some(Submitted {
+        reference: PullRequestRef::Obs(id),
+        ..
+    }) = submitted
+    else {
+        return;
+    };
+    if let Err(err) = working_copy::record_submitted_request(root, *id) {
+        eprintln!("warning: filed obs:{id} but could not record it in the checkout: {err}");
+    }
+}
+
+/// One build root's cleanup outcome: wiped live, planned in
+/// dry-run, pending while the request is not accepted, or refused
+/// with the reason.
+struct CleanupRootOutcome {
+    root: std::path::PathBuf,
+    entries: usize,
+    bytes: u64,
+    status: &'static str,
+    refused: Option<String>,
+}
+
+/// Clean the local build roots for the submit request recorded in
+/// the working copy in the current directory, when that request is
+/// accepted. The checkout opens first (a local read, no
+/// credentials); the request state is read once, live only — a dry
+/// run plans from the local record alone, with no server read.
+fn cleanup(debug: &Debug, live: bool) -> Result<(Value, String), GeectlError> {
+    let dry_run = DryRun::new(!live).with_debug(debug.clone());
+    let wc = if live {
+        working_copy::open(&current_dir()?)
+    } else {
+        working_copy::open_read(&current_dir()?)
+    }?;
+    let Some(id) = working_copy::submitted_request(&wc.root)? else {
+        return cleanup_result(&wc.project, &wc.package, None, None, &[], false, &dry_run);
+    };
+    with_obs(debug, live, |obs| {
+        let path = config::config_path()?;
+        let file_config = config::load_config_at(&path)?;
+        let effective = config::effective_config(&file_config)?;
+        cleanup_with(obs, &effective.config, &wc, id, &dry_run)
+    })
+}
+
+/// The cleanup body over an already-built client: the state gate
+/// and the wipe. Separated from `cleanup` so tests can drive it
+/// with a canned request read.
+fn cleanup_with(
+    obs: &ObsClient,
+    effective_config: &config::Config,
+    wc: &working_copy::WorkingCopy,
+    id: u64,
+    dry_run: &DryRun,
+) -> Result<(Value, String), GeectlError> {
+    let vertical = LocalBuild::from_config(obs, effective_config)?;
+    let roots = vertical.roots_for_package(&wc.project, &wc.package)?;
+    if dry_run.enabled() {
+        // The plan from the local record alone: the state is
+        // unknown until the live check, so the roots plan as
+        // pending wipes, and nothing is read from the server.
+        let mut planned = Vec::new();
+        for root in &roots {
+            let outcome = vertical.wipe_named_root(root, true)?;
+            planned.push(CleanupRootOutcome {
+                root: root.clone(),
+                entries: outcome.entries,
+                bytes: outcome.bytes,
+                status: "planned",
+                refused: None,
+            });
+        }
+        return cleanup_result(
+            &wc.project,
+            &wc.package,
+            Some(id),
+            None,
+            &planned,
+            false,
+            dry_run,
+        );
+    }
+    let request = obs.show_request(&id.to_string())?;
+    // The recorded request must be the one filed from this
+    // checkout: a stale or hand-edited record pointing at a
+    // foreign accepted request would otherwise wipe this
+    // checkout build roots. The request submit action names
+    // its source; refuse when no submit action names this
+    // checkout project and package.
+    let filed_here = request.actions_of(&["submit"]).iter().any(|action| {
+        matches!(action, RequestAction::Submit { source_project, source_package, .. }
+            if source_project == &wc.project && source_package == &wc.package)
+    });
+    if !filed_here {
+        return Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "recorded request obs:{id} was not filed from {}/{}; refusing to wipe its build roots",
+                wc.project, wc.package
+            ),
+        ));
+    }
+    let state = request.state.name;
+    if state != RequestState::Accepted {
+        let mut pending = Vec::new();
+        for root in &roots {
+            let outcome = vertical.wipe_named_root(root, true)?;
+            pending.push(CleanupRootOutcome {
+                root: root.clone(),
+                entries: outcome.entries,
+                bytes: outcome.bytes,
+                status: "pending",
+                refused: None,
+            });
+        }
+        return cleanup_result(
+            &wc.project,
+            &wc.package,
+            Some(id),
+            Some(state.as_str()),
+            &pending,
+            false,
+            dry_run,
+        );
+    }
+    // Accepted: wipe live, collecting refusals instead of stopping
+    // at the first one. The record is cleared only when every
+    // matching root is gone, so a partial cleanup retries on the
+    // next run. The eviction pressure rules do not apply here: the
+    // acceptance is the explicit done-signal, and a root rebuilt
+    // after the filing still belongs to the same package — only
+    // derived build cache goes away, never the working copy. What
+    // does apply is the wipe's own safety: the marker must name
+    // this project and package, and a locked root is refused,
+    // never deleted around.
+    let mut outcomes = Vec::new();
+    let mut refused = false;
+    for root in &roots {
+        match vertical.wipe_named_root(root, false) {
+            Ok(outcome) => outcomes.push(CleanupRootOutcome {
+                root: root.clone(),
+                entries: outcome.entries,
+                bytes: outcome.bytes,
+                status: "wiped",
+                refused: None,
+            }),
+            Err(err) => {
+                refused = true;
+                outcomes.push(CleanupRootOutcome {
+                    root: root.clone(),
+                    entries: 0,
+                    bytes: 0,
+                    status: "refused",
+                    refused: Some(err.to_string()),
+                });
+            }
+        }
+    }
+    let mut record_cleared = false;
+    if !refused {
+        match working_copy::clear_submitted_request(&wc.root) {
+            Ok(()) => record_cleared = true,
+            Err(err) => eprintln!(
+                "warning: cleaned the build roots for obs:{id} but could not clear the recorded request: {err}"
+            ),
+        }
+    }
+    cleanup_result(
+        &wc.project,
+        &wc.package,
+        Some(id),
+        Some(state.as_str()),
+        &outcomes,
+        record_cleared,
+        dry_run,
+    )
+}
+
+/// The `cleanup` result as JSON: the checkout, the recorded
+/// request and its state (`null` in dry-run, where the state is
+/// not read), one entry per matching root, and whether the record
+/// was cleared.
+fn cleanup_result(
+    project: &str,
+    package: &str,
+    recorded: Option<u64>,
+    state: Option<&str>,
+    roots: &[CleanupRootOutcome],
+    record_cleared: bool,
+    dry_run: &DryRun,
+) -> Result<(Value, String), GeectlError> {
+    let mut payload = json!({
+        "project": project,
+        "package": package,
+        "recorded": match recorded {
+            Some(id) => payload_json(&PullRequestRef::Obs(id))?,
+            None => Value::Null,
+        },
+        "state": state,
+        "roots": roots
+            .iter()
+            .map(|outcome| json!({
+                "root": outcome.root,
+                "entries": outcome.entries,
+                "bytes": outcome.bytes,
+                "status": outcome.status,
+                "refused": outcome.refused,
+            }))
+            .collect::<Vec<_>>(),
+        "record_cleared": record_cleared,
+        "dry_run": dry_run.enabled(),
+    });
+    add_plan(&mut payload, dry_run);
+    let mut text = match recorded {
+        Some(id) => format!("project: {project} package: {package} request: obs:{id}"),
+        None => format!("project: {project} package: {package} request: none recorded"),
+    };
+    if let Some(state) = state {
+        text.push_str(&format!(" state: {state}"));
+    }
+    for outcome in roots {
+        text.push('\n');
+        match outcome.status {
+            "wiped" => text.push_str(&format!(
+                "wiped {} ({} entries, {} bytes)",
+                outcome.root.display(),
+                outcome.entries,
+                outcome.bytes
+            )),
+            "planned" => text.push_str(&format!(
+                "would wipe {} ({} entries, {} bytes)",
+                outcome.root.display(),
+                outcome.entries,
+                outcome.bytes
+            )),
+            "pending" => text.push_str(&format!(
+                "pending {} ({} entries, {} bytes)",
+                outcome.root.display(),
+                outcome.entries,
+                outcome.bytes
+            )),
+            _ => text.push_str(&format!(
+                "refused {}: {}",
+                outcome.root.display(),
+                outcome.refused.as_deref().unwrap_or("refused")
+            )),
+        }
+    }
+    if dry_run.enabled() {
+        if let Some(id) = recorded {
+            text.push_str(&format!(
+                "\nrequest state not read in dry-run; the roots wipe only if obs:{id} is accepted"
+            ));
+        }
+    }
+    Ok((payload, text))
+}
+
 /// The payload for a submit: the filed handle (`null` in
 /// dry-run), the superseded handles (`null` in dry-run), and
 /// `dry_run`, plus the plan in dry-run.
@@ -2805,7 +3083,9 @@ mod tests {
     use super::*;
     use crate::gitea::{GiteaPullRequest, GiteaReview};
     use crate::http::HttpClient;
+    use crate::local_build::RootMarker;
     use crate::obs::parse_request;
+    use crate::obs::test_support::{basic_credentials, FakeHttp};
 
     const REQUEST_XML: &str = r#"<request creator="creator" id="123">
   <action type="submit">
@@ -3443,6 +3723,248 @@ mod tests {
         assert_eq!(
             text,
             "dry-run: would file a submit request for home:alice/foo to home:devel"
+        );
+    }
+
+    #[test]
+    fn record_submitted_request_records_obs_and_ignores_gitea() {
+        let (_dir, wc) = git_parts_checkout(None);
+        record_submitted_request(&wc.root, &Some(obs_submitted_fixture()));
+        assert_eq!(
+            working_copy::submitted_request(&wc.root).unwrap(),
+            Some(123)
+        );
+        // A Gitea pull request is not a submit request: the
+        // earlier record stands.
+        record_submitted_request(&wc.root, &Some(gitea_submitted_fixture()));
+        assert_eq!(
+            working_copy::submitted_request(&wc.root).unwrap(),
+            Some(123)
+        );
+        // A dry run that filed nothing records nothing.
+        record_submitted_request(&wc.root, &None);
+        assert_eq!(
+            working_copy::submitted_request(&wc.root).unwrap(),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn cleanup_result_json_and_text_agree() {
+        let dry_run = DryRun::new(false);
+        let (payload, text) =
+            cleanup_result("home:alice", "foo", None, None, &[], false, &dry_run).unwrap();
+        assert_eq!(payload["recorded"], serde_json::Value::Null);
+        assert_eq!(payload["state"], serde_json::Value::Null);
+        assert_eq!(payload["roots"], serde_json::json!([]));
+        assert_eq!(
+            text,
+            "project: home:alice package: foo request: none recorded"
+        );
+
+        let pending = CleanupRootOutcome {
+            root: std::path::PathBuf::from("/cache/build-roots/home%3Aalice/foo/standard-x86_64"),
+            entries: 3,
+            bytes: 99,
+            status: "pending",
+            refused: None,
+        };
+        let (payload, text) = cleanup_result(
+            "home:alice",
+            "foo",
+            Some(1398492),
+            Some("review"),
+            std::slice::from_ref(&pending),
+            false,
+            &dry_run,
+        )
+        .unwrap();
+        assert_eq!(payload["recorded"], "obs:1398492");
+        assert_eq!(payload["state"], "review");
+        assert_eq!(payload["roots"][0]["status"], "pending");
+        assert_eq!(payload["record_cleared"], false);
+        assert_eq!(
+            text,
+            "project: home:alice package: foo request: obs:1398492 state: review\npending /cache/build-roots/home%3Aalice/foo/standard-x86_64 (3 entries, 99 bytes)"
+        );
+
+        let wiped = CleanupRootOutcome {
+            root: std::path::PathBuf::from("/cache/build-roots/home%3Aalice/foo/standard-x86_64"),
+            entries: 3,
+            bytes: 99,
+            status: "wiped",
+            refused: None,
+        };
+        let (payload, text) = cleanup_result(
+            "home:alice",
+            "foo",
+            Some(1398492),
+            Some("accepted"),
+            std::slice::from_ref(&wiped),
+            true,
+            &dry_run,
+        )
+        .unwrap();
+        assert_eq!(payload["roots"][0]["status"], "wiped");
+        assert_eq!(payload["record_cleared"], true);
+        assert_eq!(
+            text,
+            "project: home:alice package: foo request: obs:1398492 state: accepted\nwiped /cache/build-roots/home%3Aalice/foo/standard-x86_64 (3 entries, 99 bytes)"
+        );
+    }
+
+    /// A build root for the cleanup tests:
+    /// `cache/build-roots/home%3Aalice/foo/standard-<arch>` with a
+    /// marker naming the `git_parts_checkout` package. The marker
+    /// file name mirrors `local_build::ROOT_MARKER`.
+    fn cleanup_root(cache: &std::path::Path) -> std::path::PathBuf {
+        let root = cache
+            .join("build-roots")
+            .join("home%3Aalice")
+            .join("foo")
+            .join(format!("standard-{}", std::env::consts::ARCH));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = RootMarker {
+            project: "home:alice".to_string(),
+            package: "foo".to_string(),
+            repo: "standard".to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            flavor: None,
+            image_digest: None,
+            engine_version: None,
+            created_unix: 0,
+            last_build_unix: 0,
+            last_success_digest: None,
+        };
+        std::fs::write(
+            root.join(".geectl-build-root"),
+            serde_json::to_string(&marker).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("stale-output"), b"stale").unwrap();
+        root
+    }
+
+    /// A submit-request read for the cleanup tests, in the given
+    /// state, from the given source project and package.
+    fn cleanup_request_xml_for(state: &str, source_project: &str, source_package: &str) -> String {
+        format!(
+            "<request id=\"1398492\" creator=\"scarabeus_iv\"><action type=\"submit\"><source project=\"{source_project}\" package=\"{source_package}\" /><target project=\"home:devel\" package=\"foo\" /></action><state name=\"{state}\" who=\"alice\" when=\"2026-11-24T00:00:00Z\" /><description>Update foo</description></request>"
+        )
+    }
+
+    /// A submit-request read for the cleanup tests, in the given
+    /// state, filed from this checkout (home:alice/foo).
+    fn cleanup_request_xml(state: &str) -> String {
+        cleanup_request_xml_for(state, "home:alice", "foo")
+    }
+
+    #[test]
+    fn cleanup_with_wipes_roots_and_clears_the_record_on_accept() {
+        let (_dir, wc) = git_parts_checkout(None);
+        working_copy::record_submitted_request(&wc.root, 1398492).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = cleanup_root(cache.path());
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/request/1398492?withhistory=1",
+            &cleanup_request_xml("accepted"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let cfg = config::Config {
+            build_cache_dir: Some(cache.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(false);
+        let (payload, text) = cleanup_with(&client, &cfg, &wc, 1398492, &dry_run).unwrap();
+        assert_eq!(payload["state"], "accepted");
+        assert_eq!(payload["recorded"], "obs:1398492");
+        assert_eq!(payload["roots"][0]["status"], "wiped");
+        assert_eq!(payload["record_cleared"], true);
+        assert!(text.contains("wiped"));
+        assert!(!root.join("stale-output").exists());
+        assert_eq!(working_copy::submitted_request(&wc.root).unwrap(), None);
+    }
+
+    #[test]
+    fn cleanup_with_keeps_roots_and_the_record_while_in_review() {
+        let (_dir, wc) = git_parts_checkout(None);
+        working_copy::record_submitted_request(&wc.root, 1398492).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = cleanup_root(cache.path());
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/request/1398492?withhistory=1",
+            &cleanup_request_xml("review"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let cfg = config::Config {
+            build_cache_dir: Some(cache.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(false);
+        let (payload, text) = cleanup_with(&client, &cfg, &wc, 1398492, &dry_run).unwrap();
+        assert_eq!(payload["state"], "review");
+        assert_eq!(payload["roots"][0]["status"], "pending");
+        assert_eq!(payload["record_cleared"], false);
+        assert!(text.contains("pending"));
+        assert!(root.join("stale-output").exists());
+        assert_eq!(
+            working_copy::submitted_request(&wc.root).unwrap(),
+            Some(1398492)
+        );
+    }
+
+    #[test]
+    fn cleanup_with_refuses_a_foreign_accepted_request() {
+        let (_dir, wc) = git_parts_checkout(None);
+        working_copy::record_submitted_request(&wc.root, 1398492).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = cleanup_root(cache.path());
+        // Accepted, but filed from another checkout: the wipe
+        // must not happen and the record must stay.
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/request/1398492?withhistory=1",
+            &cleanup_request_xml_for("accepted", "home:bob", "bar"),
+        );
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let cfg = config::Config {
+            build_cache_dir: Some(cache.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(false);
+        let err = cleanup_with(&client, &cfg, &wc, 1398492, &dry_run).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not filed from home:alice/foo"));
+        assert!(root.join("stale-output").exists());
+        assert_eq!(
+            working_copy::submitted_request(&wc.root).unwrap(),
+            Some(1398492)
+        );
+    }
+
+    #[test]
+    fn cleanup_with_plans_from_the_local_record_in_dry_run() {
+        let (_dir, wc) = git_parts_checkout(None);
+        working_copy::record_submitted_request(&wc.root, 1398492).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = cleanup_root(cache.path());
+        // No canned reads: a dry run must not touch the server.
+        let http = FakeHttp::new();
+        let client = ObsClient::with_credentials(&http, basic_credentials()).unwrap();
+        let cfg = config::Config {
+            build_cache_dir: Some(cache.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let dry_run = DryRun::new(true);
+        let (payload, text) = cleanup_with(&client, &cfg, &wc, 1398492, &dry_run).unwrap();
+        assert_eq!(payload["state"], serde_json::Value::Null);
+        assert_eq!(payload["roots"][0]["status"], "planned");
+        assert_eq!(payload["dry_run"], true);
+        assert!(text.contains("would wipe"));
+        assert!(text.contains("request state not read in dry-run"));
+        assert!(root.join("stale-output").exists());
+        assert_eq!(
+            working_copy::submitted_request(&wc.root).unwrap(),
+            Some(1398492)
         );
     }
 

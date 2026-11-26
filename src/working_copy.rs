@@ -1236,6 +1236,48 @@ fn git_config_set(dir: &Path, key: &str, value: &str) -> Result<(), GeectlError>
     Ok(())
 }
 
+/// Record the submit request filed from the checkout in `dir`: the
+/// OBS request id from `pull-request submit`, under
+/// `geectl.submitted-request`. A later filing overwrites the
+/// earlier id: only the live request can trigger cleanup.
+pub fn record_submitted_request(dir: &Path, id: u64) -> Result<(), GeectlError> {
+    git_config_set(dir, "submitted-request", &id.to_string())
+}
+
+/// The submit request id recorded for the checkout in `dir`, if
+/// `pull-request submit` filed one from it. `Ok(None)` when
+/// nothing was recorded. A recorded value that is not a request
+/// number is an error: the record is geectl's own, so a corrupt
+/// value means the checkout record is broken, not something to
+/// silently ignore.
+pub fn submitted_request(dir: &Path) -> Result<Option<u64>, GeectlError> {
+    let Some(value) = git_config_get(dir, "submitted-request")? else {
+        return Ok(None);
+    };
+    value.parse::<u64>().map(Some).map_err(|_| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            format!("geectl.submitted-request value {value:?} is not a request number"),
+        )
+    })
+}
+
+/// Clear the recorded submit request for the checkout in `dir`,
+/// once its roots are cleaned. A missing key is already clear.
+pub fn clear_submitted_request(dir: &Path) -> Result<(), GeectlError> {
+    let (success, _stdout, stderr) = git_status(
+        dir,
+        "config",
+        &["--local", "--unset", "geectl.submitted-request"],
+        &[],
+    )?;
+    if success || stderr.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(git_error("config", stderr.as_bytes()))
+    }
+}
+
 /// The root commit of the repository in `dir`: the synthesized base
 /// commit of an OBS-native checkout.
 /// The root commit of the checkout: the one whose message parses
@@ -15211,5 +15253,29 @@ mod tests {
             "https://codeberg.org/owner/repo@2"
         );
         assert_eq!(strip_url_userinfo("/tmp/origin"), "/tmp/origin");
+    }
+
+    #[test]
+    fn submitted_request_round_trip() {
+        let dir = TempDirGuard::new("submitted-request");
+        git(&dir.path, "init", &["--quiet"], &[]).unwrap();
+        assert_eq!(submitted_request(&dir.path).unwrap(), None);
+        record_submitted_request(&dir.path, 1398492).unwrap();
+        assert_eq!(submitted_request(&dir.path).unwrap(), Some(1398492));
+        // A later filing overwrites the earlier id.
+        record_submitted_request(&dir.path, 1398493).unwrap();
+        assert_eq!(submitted_request(&dir.path).unwrap(), Some(1398493));
+        clear_submitted_request(&dir.path).unwrap();
+        assert_eq!(submitted_request(&dir.path).unwrap(), None);
+        // Clearing an already-clear record is a no-op.
+        clear_submitted_request(&dir.path).unwrap();
+    }
+
+    #[test]
+    fn submitted_request_corrupt_value_errors() {
+        let dir = TempDirGuard::new("submitted-request-corrupt");
+        git(&dir.path, "init", &["--quiet"], &[]).unwrap();
+        git_config_set(&dir.path, "submitted-request", "not-a-number").unwrap();
+        assert!(submitted_request(&dir.path).is_err());
     }
 }

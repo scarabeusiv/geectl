@@ -3058,6 +3058,16 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(cleanup)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format for the result payload. Applies to every command. Default\: the \`GEECTL_FORMAT\` environment variable, else the \`format\` key in the config file, else \`json\`]:FORMAT:(json text)' \
+'--debug[Enable the debug channel\: human-readable diagnostic lines on stderr (HTTP attempts, retries, library decisions). Off by default; \`GEECTL_DEBUG=1\` enables it without the flag]' \
+'--debug-body[Also print request and response bodies on the debug channel (capped at 2048 bytes, redacted, never headers). Implies \`--debug\`]' \
+'--live[Actually perform mutations. Without it, only the plan is printed\: dry-run is the default for mutations]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_geectl__subcmd__pull-request__subcmd__help_commands" \
@@ -3123,6 +3133,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (submit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(cleanup)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -4292,6 +4306,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (submit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(cleanup)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -5730,6 +5748,7 @@ _geectl__subcmd__help__subcmd__pull-request_commands() {
 'withdraw:Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'reopen:Reopen a pull request. On OBS this changes a declined request back to \`new\`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with \`--live\`' \
 'submit:File a submission from the working copy in the current directory\: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one. The checkout'\''s backend decides; the other arm'\''s flags are refused. Dry-run by default; mutates only with \`--live\`' \
+'cleanup:Clean the local build roots for the submit request filed from the working copy in the current directory, when that request is accepted. The request id was recorded by \`submit\` in the checkout; the leaf reads the request state once and wipes the roots only on \`accepted\`. A request in any other state, and a checkout with nothing recorded, delete nothing. Dry-run by default; mutates only with \`--live\`' \
     )
     _describe -t commands 'geectl help pull-request commands' commands "$@"
 }
@@ -5747,6 +5766,11 @@ _geectl__subcmd__help__subcmd__pull-request__subcmd__build-comment_commands() {
 _geectl__subcmd__help__subcmd__pull-request__subcmd__cancel-review-request_commands() {
     local commands; commands=()
     _describe -t commands 'geectl help pull-request cancel-review-request commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__help__subcmd__pull-request__subcmd__cleanup_commands] )) ||
+_geectl__subcmd__help__subcmd__pull-request__subcmd__cleanup_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl help pull-request cleanup commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__help__subcmd__pull-request__subcmd__comment_commands] )) ||
 _geectl__subcmd__help__subcmd__pull-request__subcmd__comment_commands() {
@@ -6617,6 +6641,7 @@ _geectl__subcmd__pull-request_commands() {
 'withdraw:Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'reopen:Reopen a pull request. On OBS this changes a declined request back to \`new\`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with \`--live\`' \
 'submit:File a submission from the working copy in the current directory\: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one. The checkout'\''s backend decides; the other arm'\''s flags are refused. Dry-run by default; mutates only with \`--live\`' \
+'cleanup:Clean the local build roots for the submit request filed from the working copy in the current directory, when that request is accepted. The request id was recorded by \`submit\` in the checkout; the leaf reads the request state once and wipes the roots only on \`accepted\`. A request in any other state, and a checkout with nothing recorded, delete nothing. Dry-run by default; mutates only with \`--live\`' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl pull-request commands' commands "$@"
@@ -6635,6 +6660,11 @@ _geectl__subcmd__pull-request__subcmd__build-comment_commands() {
 _geectl__subcmd__pull-request__subcmd__cancel-review-request_commands() {
     local commands; commands=()
     _describe -t commands 'geectl pull-request cancel-review-request commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__pull-request__subcmd__cleanup_commands] )) ||
+_geectl__subcmd__pull-request__subcmd__cleanup_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl pull-request cleanup commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__pull-request__subcmd__comment_commands] )) ||
 _geectl__subcmd__pull-request__subcmd__comment_commands() {
@@ -6673,6 +6703,7 @@ _geectl__subcmd__pull-request__subcmd__help_commands() {
 'withdraw:Withdraw a pull request. On OBS this revokes the request; on Gitea it closes the pull request. Dry-run by default; mutates only with \`--live\`' \
 'reopen:Reopen a pull request. On OBS this changes a declined request back to \`new\`; on Gitea it reopens the closed pull request. Dry-run by default; mutates only with \`--live\`' \
 'submit:File a submission from the working copy in the current directory\: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one. The checkout'\''s backend decides; the other arm'\''s flags are refused. Dry-run by default; mutates only with \`--live\`' \
+'cleanup:Clean the local build roots for the submit request filed from the working copy in the current directory, when that request is accepted. The request id was recorded by \`submit\` in the checkout; the leaf reads the request state once and wipes the roots only on \`accepted\`. A request in any other state, and a checkout with nothing recorded, delete nothing. Dry-run by default; mutates only with \`--live\`' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'geectl pull-request help commands' commands "$@"
@@ -6691,6 +6722,11 @@ _geectl__subcmd__pull-request__subcmd__help__subcmd__build-comment_commands() {
 _geectl__subcmd__pull-request__subcmd__help__subcmd__cancel-review-request_commands() {
     local commands; commands=()
     _describe -t commands 'geectl pull-request help cancel-review-request commands' commands "$@"
+}
+(( $+functions[_geectl__subcmd__pull-request__subcmd__help__subcmd__cleanup_commands] )) ||
+_geectl__subcmd__pull-request__subcmd__help__subcmd__cleanup_commands() {
+    local commands; commands=()
+    _describe -t commands 'geectl pull-request help cleanup commands' commands "$@"
 }
 (( $+functions[_geectl__subcmd__pull-request__subcmd__help__subcmd__comment_commands] )) ||
 _geectl__subcmd__pull-request__subcmd__help__subcmd__comment_commands() {

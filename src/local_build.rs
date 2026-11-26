@@ -6576,6 +6576,57 @@ impl<'a> LocalBuild<'a> {
         self.wipe_root_at(&root, &holder, None, dry_run)
     }
 
+    /// The build roots for one (project, package): the children of
+    /// the package directory whose marker parses and names this
+    /// project and package. A child without a marker, or with a
+    /// marker that does not parse or names another package, is not
+    /// listed: the wipe refuses an unverified directory, so the
+    /// cleanup only ever names roots it verified. A locked root is
+    /// listed: the wipe refuses it, and the cleanup reports the
+    /// refusal instead of deleting around it. A missing package
+    /// directory lists as empty; any other listing failure is an
+    /// error, never an empty list: reporting no roots on an I/O
+    /// error would let the caller clear the record with zero
+    /// wipes.
+    pub fn roots_for_package(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<Vec<PathBuf>, GeectlError> {
+        let dir = self
+            .cache_dir
+            .join("build-roots")
+            .join(Self::encode_path_segment(project))
+            .join(Self::encode_path_segment(package));
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(GeectlError::new(
+                    ErrorKind::InternalError,
+                    format!("cannot list build roots in {}: {e}", dir.display()),
+                ));
+            }
+        };
+        let mut roots = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(marker) =
+                trusted_marker_at(&self.cache_dir.join("build-roots"), &path.join(ROOT_MARKER))
+            else {
+                continue;
+            };
+            if marker.project == project && marker.package == package {
+                roots.push(path);
+            }
+        }
+        roots.sort();
+        Ok(roots)
+    }
+
     /// Wipe the root at `root`, returning the outcome with the
     /// plan (entries, bytes). The root as named is reported in the
     /// outcome; the checks and the wipe itself run on the
@@ -11613,6 +11664,107 @@ fi
                 holder.contains(&format!("package=standard-{}", host_arch())),
                 "holder: {holder}"
             );
+        }
+
+        #[test]
+        fn roots_for_package_lists_only_verified_roots_for_the_package() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            let (root_a, _) = wipe_fixture(&dir);
+            // A second root for the same package, another repo.
+            let root_b = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("repo2-{}", host_arch()));
+            fs::create_dir_all(&root_b).unwrap();
+            let mut marker_b = valid_marker();
+            marker_b.repo = "repo2".to_string();
+            fs::write(
+                root_b.join(ROOT_MARKER),
+                serde_json::to_string(&marker_b).unwrap(),
+            )
+            .unwrap();
+            // A root for another package under the same project.
+            let other = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("bar")
+                .join(format!("standard-{}", host_arch()));
+            fs::create_dir_all(&other).unwrap();
+            let mut marker_other = valid_marker();
+            marker_other.package = "bar".to_string();
+            fs::write(
+                other.join(ROOT_MARKER),
+                serde_json::to_string(&marker_other).unwrap(),
+            )
+            .unwrap();
+            // An unmarked directory and a corrupt marker: not roots.
+            fs::create_dir_all(
+                dir.path()
+                    .join("cache")
+                    .join("build-roots")
+                    .join("testproject")
+                    .join("foo")
+                    .join(format!("unmarked-{}", host_arch())),
+            )
+            .unwrap();
+            let corrupt = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo")
+                .join(format!("corrupt-{}", host_arch()));
+            fs::create_dir_all(&corrupt).unwrap();
+            fs::write(corrupt.join(ROOT_MARKER), b"{not json").unwrap();
+
+            // Sorted: `repo2-…` before `standard-…`.
+            assert_eq!(
+                vertical.roots_for_package("testproject", "foo").unwrap(),
+                vec![root_b, root_a]
+            );
+            assert_eq!(
+                vertical.roots_for_package("testproject", "bar").unwrap(),
+                vec![other]
+            );
+            assert!(vertical
+                .roots_for_package("testproject", "missing")
+                .unwrap()
+                .is_empty());
+        }
+
+        #[test]
+        fn roots_for_package_errors_when_the_package_entry_cannot_be_listed() {
+            let dir = TempDir::new();
+            let (engine, _) = stub_engine(dir.path());
+            let (podman, _) = stub_podman(dir.path(), true);
+            let setup = Setup::new();
+            let client = setup.client();
+            let vertical = vertical(&client, dir.path(), engine, podman);
+            // A file where the package directory should be: the
+            // listing fails with an I/O error other than NotFound,
+            // so the call must fail instead of reporting no roots.
+            let package_path = dir
+                .path()
+                .join("cache")
+                .join("build-roots")
+                .join("testproject")
+                .join("foo");
+            fs::create_dir_all(package_path.parent().unwrap()).unwrap();
+            fs::write(&package_path, b"not a directory").unwrap();
+            let err = vertical
+                .roots_for_package("testproject", "foo")
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InternalError);
         }
 
         #[test]

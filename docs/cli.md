@@ -323,6 +323,7 @@ without evaluating trust.
 - `geectl pull-request withdraw <REFERENCE>` — Withdraw a pull request; key flags: --message <MESSAGE>
 - `geectl pull-request reopen <REFERENCE>` — Reopen a pull request.
 - `geectl pull-request submit` — File a submission from the working copy in the current directory: an OBS submit request from an OBS-native checkout, a Gitea pull request from a git-backed one; key flags: --target-project <TARGET_PROJECT>, --target-package <TARGET_PACKAGE>, --description <DESCRIPTION>, --changes-entry <CHANGES_ENTRY>, --title <TITLE>, --body <BODY>, --draft
+- `geectl pull-request cleanup` — Clean the local build roots for the submit request filed from the working copy in the current directory, when that request is accepted.
 
 ## `person` — unified person search
 
