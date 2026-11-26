@@ -2696,8 +2696,9 @@ fn comments_payload(
 
 /// The text for a comment list: one header line echoing the
 /// reference and the count, then one line per comment — id,
-/// author, time when recorded, body, and the parent when it is a
-/// reply — or `no comments` under the header when empty.
+/// author, time when recorded, the diff position when it is a
+/// comment on a diff, body, and the parent when it is a reply —
+/// or `no comments` under the header when empty.
 fn comments_text(reference: &PullRequestRef, comments: &[ReviewComment]) -> String {
     let header = format!(
         "comments for {reference} ({} comment{})",
@@ -2712,6 +2713,16 @@ fn comments_text(reference: &PullRequestRef, comments: &[ReviewComment]) -> Stri
         let mut line = format!("comment {} by {}", comment.id, comment.author);
         if !comment.created.is_empty() {
             line.push_str(&format!(" at {}", comment.created));
+        }
+        if let (Some(target), Some(file), Some(line_number)) =
+            (&comment.diff_target, &comment.diff_file, comment.diff_line)
+        {
+            line.push_str(&format!(
+                " on {} {}:{}",
+                strip_terminal_controls_marked(target),
+                strip_terminal_controls_marked(file),
+                line_number
+            ));
         }
         line.push_str(&format!(
             ": {}",
@@ -3393,6 +3404,9 @@ mod tests {
             created: "2026-11-22T19:52:58Z".to_string(),
             body: "One nit.".to_string(),
             parent_id: None,
+            diff_target: None,
+            diff_file: None,
+            diff_line: None,
         }
     }
 
@@ -3600,6 +3614,49 @@ mod tests {
         assert!(!text.contains('\u{202e}'), "text: {text}");
         assert!(
             text.contains("comment 7 by plusky at 2026-11-22T19:52:58Z: fi…[2Jx…ed\nline…two"),
+            "text: {text}"
+        );
+    }
+
+    #[test]
+    fn comments_text_and_json_name_the_diff_anchor() {
+        let reference = gitea_reference();
+        let mut comment = fixture_comment();
+        comment.diff_target = Some("openSUSE:Factory/vim".to_string());
+        comment.diff_file = Some("src/vim.c".to_string());
+        comment.diff_line = Some(42);
+        comment.body = "please fix this".to_string();
+        let payload = comments_payload(&reference, &[comment.clone()]).unwrap();
+        assert_eq!(
+            payload["comments"][0]["diff_target"],
+            "openSUSE:Factory/vim"
+        );
+        assert_eq!(payload["comments"][0]["diff_file"], "src/vim.c");
+        assert_eq!(payload["comments"][0]["diff_line"], 42);
+        let text = comments_text(&reference, &[comment]);
+        assert!(
+            text.contains("comment 7 by plusky at 2026-11-22T19:52:58Z on openSUSE:Factory/vim src/vim.c:42: please fix this"),
+            "text: {text}"
+        );
+        // The anchor's target/file are attacker-influenced package
+        // names: control and bidi bytes in them are stripped from
+        // the text render, while the JSON payload keeps the raw values.
+        let mut nasty = fixture_comment();
+        nasty.body = "please fix this".to_string();
+        nasty.diff_target = Some("open\u{1b}[2JSUSE:Factory/vim".to_string());
+        nasty.diff_file = Some("src/vim\u{202e}.c".to_string());
+        nasty.diff_line = Some(42);
+        let payload = comments_payload(&reference, &[nasty.clone()]).unwrap();
+        assert_eq!(
+            payload["comments"][0]["diff_target"],
+            "open\u{1b}[2JSUSE:Factory/vim"
+        );
+        assert_eq!(payload["comments"][0]["diff_file"], "src/vim\u{202e}.c");
+        let text = comments_text(&reference, &[nasty]);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(
+            text.contains("comment 7 by plusky at 2026-11-22T19:52:58Z on open\u{2026}[2JSUSE:Factory/vim src/vim\u{2026}.c:42: please fix this"),
             "text: {text}"
         );
     }

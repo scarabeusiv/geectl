@@ -364,6 +364,17 @@ pub struct ReviewComment {
     /// comments do not thread.
     #[serde(default)]
     pub parent_id: Option<u64>,
+    /// The target the comment discusses, when it is a comment on a
+    /// diff. `None` on a plain comment, and on Gitea — issue comments
+    /// carry no diff position.
+    #[serde(default)]
+    pub diff_target: Option<String>,
+    /// The file the diff comment is on.
+    #[serde(default)]
+    pub diff_file: Option<String>,
+    /// The line the diff comment is on.
+    #[serde(default)]
+    pub diff_line: Option<u64>,
 }
 
 /// One pull request, read the same way on both backends. Fields a
@@ -1034,6 +1045,9 @@ impl<'a> PullRequestClient<'a> {
                         // to the terminal.
                         body: strip_terminal_controls(&comment.body),
                         parent_id: comment.parent_id,
+                        diff_target: comment.diff.as_ref().map(|diff| diff.target.clone()),
+                        diff_file: comment.diff.as_ref().map(|diff| diff.file.clone()),
+                        diff_line: comment.diff.as_ref().map(|diff| diff.line),
                     })
                     .ok_or_else(|| {
                         GeectlError::new(
@@ -1074,6 +1088,9 @@ impl<'a> PullRequestClient<'a> {
                     // terminal.
                     body: strip_terminal_controls(&comment.body),
                     parent_id: None,
+                    diff_target: None,
+                    diff_file: None,
+                    diff_line: None,
                 }))
             }
         }
@@ -1130,6 +1147,9 @@ impl<'a> PullRequestClient<'a> {
                         // to the terminal.
                         body: strip_terminal_controls(&comment.body),
                         parent_id: comment.parent_id,
+                        diff_target: comment.diff.as_ref().map(|diff| diff.target.clone()),
+                        diff_file: comment.diff.as_ref().map(|diff| diff.file.clone()),
+                        diff_line: comment.diff.as_ref().map(|diff| diff.line),
                     })
                     .collect())
             }
@@ -1155,6 +1175,9 @@ impl<'a> PullRequestClient<'a> {
                         // to the terminal.
                         body: strip_terminal_controls(&comment.body),
                         parent_id: None,
+                        diff_target: None,
+                        diff_file: None,
+                        diff_line: None,
                     })
                     .collect())
             }
@@ -3521,6 +3544,26 @@ mod tests {
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].id, 7);
         assert_eq!(comments[0].author, "scarabeus_iv");
+    }
+
+    #[test]
+    fn comments_obs_surfaces_diff_comments() {
+        let http = FakeHttp::new().with_get(
+            "https://api.opensuse.org/comments/request/1398977",
+            r#"<comments><comment id="9" who="jengelh" when="2025-09-23T07:58:24Z">Inline comment for target: 'openSUSE:Factory/vim', file: 'src/vim.c', and line: 42:
+
+please fix this</comment></comments>"#,
+        );
+        let obs = obs_client(&http);
+        let comments = act_client(Some(&obs), None).comments(&obs_ref()).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "please fix this");
+        assert_eq!(
+            comments[0].diff_target.as_deref(),
+            Some("openSUSE:Factory/vim")
+        );
+        assert_eq!(comments[0].diff_file.as_deref(), Some("src/vim.c"));
+        assert_eq!(comments[0].diff_line, Some(42));
     }
 
     #[test]

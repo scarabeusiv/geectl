@@ -2134,6 +2134,9 @@ fn comment_json(comment: &RequestComment) -> Value {
         "when": comment.when,
         "parent_id": comment.parent_id,
         "body": comment.body,
+        "diff_target": comment.diff.as_ref().map(|diff| &diff.target),
+        "diff_file": comment.diff.as_ref().map(|diff| &diff.file),
+        "diff_line": comment.diff.as_ref().map(|diff| diff.line),
     })
 }
 
@@ -2734,12 +2737,18 @@ fn render_comments_text(id: &str, comments: &[RequestComment]) -> String {
     let mut lines = vec![format!("id: {id}")];
     lines.extend(comments.iter().map(|comment| {
         let mut line = format!(
-            "comment {} by {} at {}: {}",
-            comment.id,
-            comment.who,
-            comment.when,
-            markdown_to_plaintext(&comment.body)
+            "comment {} by {} at {}",
+            comment.id, comment.who, comment.when,
         );
+        if let Some(diff) = &comment.diff {
+            line.push_str(&format!(
+                " on {} {}:{}",
+                strip_terminal_controls_marked(&diff.target),
+                strip_terminal_controls_marked(&diff.file),
+                diff.line
+            ));
+        }
+        line.push_str(&format!(": {}", markdown_to_plaintext(&comment.body)));
         if let Some(parent) = comment.parent_id {
             line.push_str(&format!(" (reply to {parent})"));
         }
@@ -3088,6 +3097,38 @@ mod tests {
         assert!(text.contains("a reply"));
         assert!(text.contains("(reply to 1)"));
         assert_eq!(render_comments_text("42", &[]), "no comments on request 42");
+    }
+
+    #[test]
+    fn comments_text_and_json_name_the_diff_anchor() {
+        let xml = "<comments request=\"42\">\n  <comment who=\"user1\" when=\"2010-12-29T10:00:00\" id=\"1\">Inline comment for target: 'openSUSE:Factory/vim', file: 'src/vim.c', and line: 42:\n\nplease fix this</comment>\n</comments>";
+        let comments = parse_comments(xml).expect("comments parse");
+        let text = render_comments_text("42", &comments);
+        assert!(
+            text.contains("comment 1 by user1 at 2010-12-29T10:00:00 on openSUSE:Factory/vim src/vim.c:42: please fix this"),
+            "text: {text}"
+        );
+        let payload = comment_json(&comments[0]);
+        assert_eq!(payload["diff_target"], "openSUSE:Factory/vim");
+        assert_eq!(payload["diff_file"], "src/vim.c");
+        assert_eq!(payload["diff_line"], 42);
+        assert_eq!(payload["body"], "please fix this");
+        // The anchor's target/file are attacker-influenced package
+        // names: control and bidi bytes in them are stripped from
+        // the text render, while the JSON payload keeps the raw values.
+        let xml = "<comments request=\"42\">\n  <comment who=\"user1\" when=\"2010-12-29T10:00:00\" id=\"2\">Inline comment for target: 'open\u{1b}[2JSUSE:Factory/vim', file: 'src/vim\u{202e}.c', and line: 7:\n\nplease fix this</comment>\n</comments>";
+        let comments = parse_comments(xml).expect("comments parse");
+        let text = render_comments_text("42", &comments);
+        assert!(!text.contains('\u{1b}'), "text: {text}");
+        assert!(!text.contains('\u{202e}'), "text: {text}");
+        assert!(
+            text.contains("comment 2 by user1 at 2010-12-29T10:00:00 on open\u{2026}[2JSUSE:Factory/vim src/vim\u{2026}.c:7: please fix this"),
+            "text: {text}"
+        );
+        let payload = comment_json(&comments[0]);
+        assert_eq!(payload["diff_target"], "open\u{1b}[2JSUSE:Factory/vim");
+        assert_eq!(payload["diff_file"], "src/vim\u{202e}.c");
+        assert_eq!(payload["diff_line"], 7);
     }
 
     const COMMENTS_MARKDOWN_XML: &str = r#"<comments request="42">

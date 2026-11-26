@@ -1963,6 +1963,57 @@ pub fn parse_request_collection_limited(body: &str, limit: Option<usize>) -> Opt
     Some(requests)
 }
 
+/// Where a diff comment is anchored: the target it discusses, the
+/// file, and the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffAnchor {
+    /// The target the comment discusses, `project/package`.
+    pub target: String,
+    /// The file the comment is on.
+    pub file: String,
+    /// The line the comment is on.
+    pub line: u64,
+}
+
+/// Split the diff anchor out of a comment body the server rendered
+/// for a comment on a diff: `Inline comment for target: '<target>',
+/// file: '<file>', and line: <line>:\n\n<body>`. The anchor is the
+/// server's rendering of the comment's diff position — the API
+/// carries no separate diff attributes — so the split is strict:
+/// anything that is not exactly that shape reads as a plain comment
+/// with its body untouched.
+pub(crate) fn split_inline_comment(body: &str) -> (Option<DiffAnchor>, &str) {
+    let Some(rest) = body.strip_prefix("Inline comment for target: '") else {
+        return (None, body);
+    };
+    let Some((target, rest)) = rest.split_once("', file: '") else {
+        return (None, body);
+    };
+    if target.is_empty() {
+        return (None, body);
+    }
+    let Some((file, rest)) = rest.split_once("', and line: ") else {
+        return (None, body);
+    };
+    if file.is_empty() {
+        return (None, body);
+    }
+    let Some((line, rest)) = rest.split_once(":\n\n") else {
+        return (None, body);
+    };
+    let Ok(line) = line.parse::<u64>() else {
+        return (None, body);
+    };
+    (
+        Some(DiffAnchor {
+            target: target.to_string(),
+            file: file.to_string(),
+            line,
+        }),
+        rest,
+    )
+}
+
 /// One comment on a request: who left it, when, what it says, and
 /// which comment it replies to, when it is a reply. Comments on a
 /// request and comments on its actions are listed together, in id
@@ -1980,6 +2031,11 @@ pub struct RequestComment {
     pub parent_id: Option<u64>,
     /// The comment's text.
     pub body: String,
+    /// Where the comment is anchored, when it is a comment on a
+    /// diff: the target it discusses, the file, and the line. `None`
+    /// on a plain comment — the server renders the anchor into the
+    /// body of a diff comment, and the parse splits it out.
+    pub diff: Option<DiffAnchor>,
 }
 
 /// Parse a `<comments>` document — the shape the comment list returns
@@ -2010,12 +2066,17 @@ pub fn parse_comments(body: &str) -> Option<Vec<RequestComment>> {
             None => None,
         };
         let body = leaf_text(child.inner)?;
+        // A comment on a diff carries its anchor in the body the
+        // server renders; the split recovers it, and the body keeps
+        // only the commenter's text.
+        let (diff, body) = split_inline_comment(&body);
         comments.push(RequestComment {
             id,
             who: who.to_string(),
             when: when.to_string(),
             parent_id,
-            body,
+            body: body.to_string(),
+            diff,
         });
     }
     Some(comments)
@@ -8439,6 +8500,38 @@ description</description>
         assert_eq!(comments[1].who, "user2");
         assert_eq!(comments[1].parent_id, Some(1));
         assert_eq!(comments[1].body, "a reply");
+    }
+
+    #[test]
+    fn parse_comments_splits_the_inline_comment_anchor() {
+        let xml = "<comments request=\"42\">\n  <comment who=\"user1\" when=\"2010-12-29T10:00:00\" id=\"1\">Inline comment for target: 'openSUSE:Factory/vim', file: 'src/vim.c', and line: 42:\n\nplease fix this</comment>\n</comments>";
+        let comments = parse_comments(xml).expect("comments parse");
+        assert_eq!(comments.len(), 1);
+        assert_eq!(
+            comments[0].diff,
+            Some(DiffAnchor {
+                target: "openSUSE:Factory/vim".to_string(),
+                file: "src/vim.c".to_string(),
+                line: 42,
+            })
+        );
+        assert_eq!(comments[0].body, "please fix this");
+    }
+
+    #[test]
+    fn split_inline_comment_rejects_near_misses() {
+        // The shape must be exact: a plain comment, a missing line
+        // separator, a non-numeric line, and an empty target or file
+        // all read as plain comments with their bodies untouched.
+        for body in [
+            "first comment",
+            "Inline comment for target: 'a/b', file: 'f.c', and line: 42: no blank line",
+            "Inline comment for target: 'a/b', file: 'f.c', and line: many:\n\nbody",
+            "Inline comment for target: '', file: 'f.c', and line: 42:\n\nbody",
+            "Inline comment for target: 'a/b', file: '', and line: 42:\n\nbody",
+        ] {
+            assert_eq!(split_inline_comment(body).0, None, "body: {body}");
+        }
     }
 
     #[test]
